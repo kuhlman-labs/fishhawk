@@ -1586,9 +1586,15 @@ func TestHandleApprovalCommand_AtCapApprove_Recorded(t *testing.T) {
 type slashRacingRunRepo struct {
 	*orchestratorRepo
 	advanceErr error
+	// fromCalls counts CAS entries, so a test asserting the ABSENCE of a reply
+	// can positively assert that the handler REACHED the advance rather than
+	// passing on an empty bodies slice a harness that never got there would
+	// also produce.
+	fromCalls int
 }
 
 func (r *slashRacingRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.fromCalls++
 	if r.advanceErr != nil {
 		return nil, r.advanceErr
 	}
@@ -1596,8 +1602,9 @@ func (r *slashRacingRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID
 }
 
 // slashApprovalReplies drives one slash/reply-comment approval against a repo
-// whose advance refuses, and returns the posted comment bodies.
-func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceErr error) []string {
+// whose advance refuses, and returns the posted comment bodies plus the repo,
+// whose CAS call count proves the handler reached the advance at all.
+func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceErr error) ([]string, *slashRacingRunRepo) {
 	t.Helper()
 	base := newOrchestratorRepo()
 	r := base.seedRun()
@@ -1636,7 +1643,7 @@ func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceEr
 	}); err != nil {
 		t.Fatalf("HandleApprovalCommand: %v", err)
 	}
-	return commentBodies(gh.calls())
+	return commentBodies(gh.calls()), rr
 }
 
 // TestHandleApprovalCommand_AdvanceStateChanged_AlreadyDecidedReply is the
@@ -1646,7 +1653,7 @@ func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceEr
 // advance. Any other advance error keeps today's generic wording byte for byte,
 // and the reply-comment channel stays silent on both.
 func TestHandleApprovalCommand_AdvanceStateChanged_AlreadyDecidedReply(t *testing.T) {
-	bodies := slashApprovalReplies(t, webhook.ApprovalSourceSlash, nil)
+	bodies, _ := slashApprovalReplies(t, webhook.ApprovalSourceSlash, nil)
 	var reply string
 	for _, b := range bodies {
 		if strings.Contains(b, "already decided") {
@@ -1671,7 +1678,7 @@ func TestHandleApprovalCommand_AdvanceStateChanged_AlreadyDecidedReply(t *testin
 // else-branch: a non-state-changed advance error keeps today's generic failure
 // reply, so the new wording is scoped to the raced case alone.
 func TestHandleApprovalCommand_AdvanceOtherError_KeepsGenericReply(t *testing.T) {
-	bodies := slashApprovalReplies(t, webhook.ApprovalSourceSlash, errors.New("boom"))
+	bodies, _ := slashApprovalReplies(t, webhook.ApprovalSourceSlash, errors.New("boom"))
 	var reply string
 	for _, b := range bodies {
 		if strings.Contains(b, "could not advance") {
@@ -1694,8 +1701,17 @@ func TestHandleApprovalCommand_AdvanceOtherError_KeepsGenericReply(t *testing.T)
 // TestHandleApprovalCommand_AdvanceStateChanged_ReplyCommentStaysSilent pins the
 // silent channel on the new branch: a reply-comment ("+1") approval posts no
 // per-call reply, raced or not.
+//
+// The absence assertions below are guarded by a POSITIVE one (implement-review
+// low/test-vacuity): an empty bodies slice is also what a harness that never
+// reached the advance would produce, so the test first proves the handler DID
+// enter the compare-and-swap and take the raced branch. It is self-standing
+// rather than leaning on its siblings sharing slashApprovalReplies.
 func TestHandleApprovalCommand_AdvanceStateChanged_ReplyCommentStaysSilent(t *testing.T) {
-	bodies := slashApprovalReplies(t, webhook.ApprovalSourceReplyComment, nil)
+	bodies, rr := slashApprovalReplies(t, webhook.ApprovalSourceReplyComment, nil)
+	if rr.fromCalls != 1 {
+		t.Fatalf("TransitionStageFrom calls = %d, want 1 (the handler must reach the raced advance for the silence below to mean anything)", rr.fromCalls)
+	}
 	for _, b := range bodies {
 		if strings.Contains(b, "already decided") || strings.Contains(b, "could not advance") {
 			t.Errorf("reply-comment channel must stay silent on a refused advance; got %q", b)
