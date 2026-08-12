@@ -2306,6 +2306,26 @@ func (c *apiClient) ResumeCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 	return &camp, nil
 }
 
+// CancelCampaign marks a campaign and its unfinished items cancelled via
+// `POST /v0/campaigns/{id}/cancel` (#2355) — the operator's clean shutdown of an
+// abandoned or rebuilt campaign so it stops showing as live `running` work in
+// GET /v0/campaigns. It cancels every NON-terminal item and then the campaign
+// itself; it deliberately does NOT cancel the linked RUNS (fishhawk_cancel_run
+// owns that). A write tool: requires write:campaigns. 4xx/5xx surfaces:
+//   - 400 validation_failed (campaign_id not a UUID)
+//   - 403 insufficient_scope (token lacks write:campaigns)
+//   - 404 campaign_not_found
+//   - 409 campaign_not_cancellable (the campaign is already terminal —
+//     succeeded/failed/cancelled — so there is nothing to cancel)
+//   - 503 campaign_repo_unconfigured
+func (c *apiClient) CancelCampaign(ctx context.Context, id uuid.UUID) (*Campaign, error) {
+	var camp Campaign
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/cancel", nil, &camp); err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+
 // startCampaignItemRunRequest mirrors the backend's POST
 // /v0/campaigns/{campaign_id}/runs body
 // (`backend/internal/server/campaigns.go::startCampaignItemRunRequest`).

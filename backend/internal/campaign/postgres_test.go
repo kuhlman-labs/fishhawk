@@ -466,6 +466,109 @@ func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
 	}
 }
 
+// TestSetCampaignItemAutonomy_RoundTrip drives the new persistence seam (#2355):
+// a stored autonomy:low item is overwritten to medium and the RETURNING row plus
+// a fresh GetCampaignItem read both carry the new tier.
+func TestSetCampaignItemAutonomy_RoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:2355",
+		Autonomy:   "low",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	updated, err := repo.SetCampaignItemAutonomy(ctx, item.ID, "medium")
+	if err != nil {
+		t.Fatalf("SetCampaignItemAutonomy: %v", err)
+	}
+	if updated.Autonomy != "medium" {
+		t.Errorf("returned autonomy = %q, want medium", updated.Autonomy)
+	}
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if got.Autonomy != "medium" {
+		t.Errorf("read-back autonomy = %q, want medium", got.Autonomy)
+	}
+}
+
+// TestSetCampaignItemAutonomy_NormalizesOutOfSetTier is the counterfactual for
+// the normalizeAutonomy call in postgresRepo.SetCampaignItemAutonomy: a tier
+// outside {low,medium,high} would otherwise trip the migration-0049 column CHECK
+// (SQLSTATE 23514). The item is seeded BY CONSTRUCTION with a valid "low" tier;
+// the bad tier is passed only to the control under test, so the RED lands on the
+// behavioral assertion (the write succeeds and persists "") rather than a
+// fixture-setup failure. Delete the normalizeAutonomy call and this test goes
+// RED with a CHECK violation.
+func TestSetCampaignItemAutonomy_NormalizesOutOfSetTier(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:2356",
+		Autonomy:   "low",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	updated, err := repo.SetCampaignItemAutonomy(ctx, item.ID, "critical")
+	if err != nil {
+		t.Fatalf("SetCampaignItemAutonomy with out-of-set tier errored (normalize missing?): %v", err)
+	}
+	if updated.Autonomy != "" {
+		t.Errorf("out-of-set tier persisted as %q, want empty (normalized)", updated.Autonomy)
+	}
+}
+
+// TestSetCampaignItemAutonomy_Idempotent asserts a same-value write is a
+// harmless no-op that returns the unchanged tier.
+func TestSetCampaignItemAutonomy_Idempotent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:2357",
+		Autonomy:   "high",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	updated, err := repo.SetCampaignItemAutonomy(ctx, item.ID, "high")
+	if err != nil {
+		t.Fatalf("idempotent SetCampaignItemAutonomy: %v", err)
+	}
+	if updated.Autonomy != "high" {
+		t.Errorf("autonomy = %q, want high", updated.Autonomy)
+	}
+}
+
+// TestSetCampaignItemAutonomy_NotFound asserts a missing item id maps to
+// ErrNotFound (pgx.ErrNoRows translation), mirroring SetCampaignItemRun.
+func TestSetCampaignItemAutonomy_NotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	if _, err := repo.SetCampaignItemAutonomy(ctx, uuid.New(), "medium"); !errors.Is(err, campaign.ErrNotFound) {
+		t.Fatalf("SetCampaignItemAutonomy(unknown) err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts is the routed
 // untested-path seam test (#1551 / E32.4 fix-up): it drives the FULL
 // Assemble→Persist path from an EpicChild carrying an OUT-OF-SET autonomy tier

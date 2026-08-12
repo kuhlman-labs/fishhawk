@@ -649,6 +649,67 @@ func TestResumeCampaign_NotFound_MapsActionableError(t *testing.T) {
 	}
 }
 
+// --- fishhawk_cancel_campaign (#2355) ---
+
+// TestCancelCampaignTool_RoundTrip drives the tool→client→wire→decode chain: the
+// path id round-trips to the backend and the cancelled campaign decodes back.
+func TestCancelCampaignTool_RoundTrip(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := uuid.New()
+	fb.cancelCampaignResp = Campaign{ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "cancelled", PausePolicy: "pause_campaign"}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.cancelCampaign(context.Background(), nil, CancelCampaignInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("cancelCampaign: %v", err)
+	}
+	if fb.cancelCampaignID != id {
+		t.Errorf("backend got cancel id %s, want %s", fb.cancelCampaignID, id)
+	}
+	if out.Campaign.State != "cancelled" {
+		t.Errorf("Campaign.State = %q, want cancelled", out.Campaign.State)
+	}
+}
+
+func TestCancelCampaign_InvalidUUID_FailsLocally(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelCampaign(context.Background(), nil, CancelCampaignInput{CampaignID: "nope"})
+	if err == nil || !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Fatalf("err = %v, want local UUID validation error", err)
+	}
+}
+
+func TestCancelCampaign_NotCancellable_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.cancelCampaignStatus = http.StatusConflict
+	fb.cancelCampaignErr = `{"error":{"code":"campaign_not_cancellable","message":"campaign is already in a terminal state and cannot be cancelled"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelCampaign(context.Background(), nil, CancelCampaignInput{CampaignID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("err = nil, want campaign_not_cancellable mapping")
+	}
+	for _, want := range []string{"campaign_not_cancellable", "already terminal"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCancelCampaign_NotFound_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.cancelCampaignStatus = http.StatusNotFound
+	fb.cancelCampaignErr = `{"error":{"code":"campaign_not_found","message":"no campaign with that id"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.cancelCampaign(context.Background(), nil, CancelCampaignInput{CampaignID: uuid.NewString()})
+	if err == nil || !strings.Contains(err.Error(), "campaign_not_found") {
+		t.Fatalf("err = %v, want campaign_not_found mapping", err)
+	}
+}
+
 // --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
 
 // TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem drives the whole

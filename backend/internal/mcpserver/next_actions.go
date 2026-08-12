@@ -1909,7 +1909,7 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 				Action:       "fishhawk_get_campaign_status",
 				Precondition: "the only deps-satisfied campaign item is autonomy:low (human-led); it is in the rollup's human_led slice, not eligible",
 				Consumes:     consumesNone,
-				Reason:       "campaign item " + na.IssueRef + " is deps-satisfied but autonomy:low — a human must lead it; do NOT start an agent run. Handle it out-of-band, then re-poll fishhawk_get_campaign_status to advance the campaign",
+				Reason:       "campaign item " + na.IssueRef + " is deps-satisfied but autonomy:low — a human must lead it; do NOT start an agent run. The human_led classification is re-read from the issue's autonomy:* label on every fishhawk_get_campaign_status poll (#2355): to drive this item agent-led instead, relabel the issue (e.g. autonomy:low -> autonomy:medium) and re-poll — it moves into eligible on the next poll. Otherwise handle it out-of-band, then re-poll to advance the campaign",
 			}},
 		}
 	case "wait":

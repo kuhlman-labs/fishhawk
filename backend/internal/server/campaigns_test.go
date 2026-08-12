@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +65,13 @@ type fakeCampaignRepo struct {
 	itemsErrOnCall int
 	itemsCalls     int
 
+	// transItemErrOnCall, when non-zero, fails TransitionCampaignItem on exactly
+	// that 1-based call number (others succeed), so the cancel verb's MID-loop
+	// partial-failure convergence can be driven — the first item cancels, the Nth
+	// errors, leaving the campaign GENUINELY half-cancelled (#2355 condition 2), a
+	// state a whole-loop transItemErr can never produce. transItemCalls counts.
+	transItemErrOnCall int
+
 	// lastListFilter records the most recent ListCampaigns filter so handler
 	// tests can assert the account-scope wire-up (ADR-057 / #1830).
 	lastListFilter campaign.ListCampaignsFilter
@@ -80,6 +88,13 @@ type fakeCampaignRepo struct {
 	setRunCalls    int
 	restartCalls   int
 	settleOOBCalls int
+
+	// setAutonomyErr injects a SetCampaignItemAutonomy failure so the
+	// best-effort refresh's fail-open branch is reachable (#2355);
+	// setAutonomyCalls counts invocations so the no-op-write guarantee can be
+	// asserted (an unchanged tier performs ZERO writes).
+	setAutonomyErr   error
+	setAutonomyCalls int
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -159,6 +174,9 @@ func (f *fakeCampaignRepo) TransitionCampaignItem(_ context.Context, id uuid.UUI
 	f.transItemCalls++
 	if f.transItemErr != nil {
 		return nil, f.transItemErr
+	}
+	if f.transItemErrOnCall != 0 && f.transItemCalls == f.transItemErrOnCall {
+		return nil, errInjected
 	}
 	for _, items := range f.itemsByCmp {
 		for _, it := range items {
@@ -248,6 +266,38 @@ func (f *fakeCampaignRepo) SettleCampaignItemOutOfBand(_ context.Context, id uui
 			}
 			it.State = campaign.ItemStateSucceeded
 			// Run link RETAINED (unlike RestartCampaignItem, which clears it).
+			it.UpdatedAt = time.Now().UTC()
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+// SetCampaignItemAutonomy overwrites an item's autonomy tier (found by id across
+// all campaigns), mirroring the Postgres adapter's normalize-then-write contract
+// (#2355) so the reconcile-on-read + start-verb autonomy refresh is exercised.
+// It normalizes an out-of-set tier to "" like normalizeAutonomy does, counts
+// invocations for the no-op-write assertion, and honors setAutonomyErr so the
+// fail-open branch is reachable.
+func (f *fakeCampaignRepo) SetCampaignItemAutonomy(_ context.Context, itemID uuid.UUID, autonomy string) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setAutonomyCalls++
+	if f.setAutonomyErr != nil {
+		return nil, f.setAutonomyErr
+	}
+	switch autonomy {
+	case "low", "medium", "high":
+		// permitted tiers pass through
+	default:
+		autonomy = "" // normalize an out-of-set tier to the unknown/default
+	}
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID != itemID {
+				continue
+			}
+			it.Autonomy = autonomy
 			it.UpdatedAt = time.Now().UTC()
 			return it, nil
 		}
@@ -4456,6 +4506,11 @@ func TestStartCampaignItemRun_ReconcileOnRead_RelistError_StillReturns200(t *tes
 type runlessIssue struct {
 	state       string
 	stateReason string
+	// labels is the issue's label name set, emitted as GitHub's label-object
+	// array so the autonomy refresh (#2355) reads the live autonomy:* tier off
+	// the SAME GetIssue the settle pass already performs. Empty/nil emits an
+	// empty array (a labelless issue), leaving every pre-#2355 test unchanged.
+	labels []string
 }
 
 // runlessGitHub configures a GitHub stub serving GET .../installation and
@@ -4509,7 +4564,13 @@ func newRunlessGitHubClient(t *testing.T, gh *runlessGitHub) *githubclient.Clien
 			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
 			return
 		}
-		fmt.Fprintf(w, `{"number":%d,"state":%q,"state_reason":%q}`, num, iss.state, iss.stateReason)
+		labelsJSON := make([]string, 0, len(iss.labels))
+		for _, l := range iss.labels {
+			b, _ := json.Marshal(l)
+			labelsJSON = append(labelsJSON, `{"name":`+string(b)+`}`)
+		}
+		fmt.Fprintf(w, `{"number":%d,"state":%q,"state_reason":%q,"labels":[%s]}`,
+			num, iss.state, iss.stateReason, strings.Join(labelsJSON, ","))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -5545,5 +5606,774 @@ func TestCampaignPointReads_RepoVisibility(t *testing.T) {
 				t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// --- #2355: reconcile-on-read autonomy refresh + cancel verb ---
+
+// newAutonomyRefreshServer wires a Server with the fake campaign repo, a run
+// repo, a recording audit repo, and the runlessGitHub stub (which now serves
+// issue labels) so the reconcile-on-read autonomy refresh (#2355) is exercised.
+func newAutonomyRefreshServer(t *testing.T, crepo *fakeCampaignRepo, ghState *runlessGitHub) (*Server, *campaignAuditRecorder) {
+	t.Helper()
+	aud := &campaignAuditRecorder{}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	return s, aud
+}
+
+// TestGetCampaignStatus_RefreshesStaleAutonomyEndToEnd is the headline
+// cross-boundary done-means for half 1 (#2355): a campaign whose item is stored
+// autonomy:low, whose GitHub issue now carries autonomy:medium, moves on a status
+// read from rollup.human_led to rollup.eligible with next_action start_run, AND
+// the re-read DB row carries "medium". It drives GET /status through the REAL
+// Postgres campaign repository so the seam from label parse -> column -> rollup is
+// proven, not just each end.
+//
+// COUNTERFACTUAL (#2355 condition 6 / plan cf-1): deleting the
+// SetCampaignItemAutonomy call in refreshItemAutonomyFromIssues turns this RED —
+// and because the control's effect is COMMITTED STATE, the test reads the
+// campaign_items row after the response returns, not only the response body.
+func TestGetCampaignStatus_RefreshesStaleAutonomyEndToEnd(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:100", Autonomy: "low",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	// The issue is OPEN (so the settle pass never fires) but relabelled medium.
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", labels: []string{"type:feature", "autonomy:medium"}},
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: repo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	// Wire rollup: the ref left human_led and entered eligible; next_action start_run.
+	if containsRefTest(st.Rollup.HumanLed, "issue:100") {
+		t.Errorf("rollup.HumanLed still contains issue:100 = %v; refresh should have moved it", st.Rollup.HumanLed)
+	}
+	if !containsRefTest(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, want it to contain issue:100 after refresh", st.Rollup.Eligible)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Errorf("next_action = %+v, want start_run issue:100", st.NextAction)
+	}
+	// COMMITTED STATE: re-read the DB row and assert the persisted tier is medium.
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("re-read item: %v", err)
+	}
+	if got.Autonomy != "medium" {
+		t.Errorf("persisted autonomy = %q, want medium (committed refresh)", got.Autonomy)
+	}
+}
+
+// TestGetCampaignStatus_RefreshesAutonomyOnRunlessTerminalItem is the
+// union-widening counterfactual (#2355, plan cf-6). A RUN-LESS failed item
+// (RunID nil) is OUTSIDE the settle classes A/B — the pre-#2355 fetch set — but
+// INSIDE the autonomy-relevant set, so only the widened fetch reaches it. Stored
+// autonomy:low keeps it in rollup.failed; the issue carries autonomy:medium, so
+// the refresh moves it to restartable (folded into the cancelled wire slice) with
+// next_action start_run. Reverting the Phase-1 fetch gate to isClassA||isClassB
+// leaves the item unfetched, unrefreshed, and stuck in rollup.failed — RED.
+//
+// (The plan named this ...RunLinkedTerminalItem; a run-LINKED terminal item is
+// class B and would still be fetched under the reverted gate, so the counterfactual
+// requires a RUN-LESS terminal item — documented in the PR notes.)
+func TestGetCampaignStatus_RefreshesAutonomyOnRunlessTerminalItem(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:100", Autonomy: "low",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	// Drive it run-less failed (pending -> failed keeps RunID nil).
+	if _, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateFailed); err != nil {
+		t.Fatalf("transition item to failed: %v", err)
+	}
+
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", labels: []string{"autonomy:medium"}},
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: repo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if containsRefTest(st.Rollup.Failed, "issue:100") {
+		t.Errorf("rollup.Failed still contains issue:100 = %v; widened refresh should divert it to restartable", st.Rollup.Failed)
+	}
+	// Restartable folds into the cancelled wire slice.
+	if !containsRefTest(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup.Cancelled (restartable fold) = %v, want issue:100", st.Rollup.Cancelled)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Errorf("next_action = %+v, want start_run issue:100 (restartable)", st.NextAction)
+	}
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("re-read item: %v", err)
+	}
+	if got.Autonomy != "medium" {
+		t.Errorf("persisted autonomy = %q, want medium", got.Autonomy)
+	}
+}
+
+// containsRefTest reports whether ref is in refs (test-local helper).
+func containsRefTest(refs []string, ref string) bool {
+	for _, r := range refs {
+		if r == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// seedHumanLedItemCampaign seeds a running campaign with a single run-less,
+// deps-satisfied autonomy:low item — the human-led shape whose tier the refresh
+// re-reads. Returns the campaign.
+func seedHumanLedItemCampaign(f *fakeCampaignRepo, repoName string) *campaign.Campaign {
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := f.seedCampaignWithItems(repoName, "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	return c
+}
+
+// assertHumanLedUnrefreshed asserts a status read still returned 200 with the
+// item in human_led (the pre-existing tier), proving the refresh's best-effort
+// guard never failed the read and never changed the tier.
+func assertHumanLedUnrefreshed(t *testing.T, st campaignStatusBody) {
+	t.Helper()
+	if !containsRefTest(st.Rollup.HumanLed, "issue:100") {
+		t.Errorf("rollup.HumanLed = %v, want issue:100 (tier left unrefreshed)", st.Rollup.HumanLed)
+	}
+}
+
+// TestRefreshAutonomy_NilGitHubClientSkips: GitHub unwired -> refresh skipped,
+// read still 200 with the stored tier.
+func TestRefreshAutonomy_NilGitHubClientSkips(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}}) // GitHub nil
+	st := getCampaignStatusBody(t, s, c.ID)
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (no GitHub, no refresh)", crepo.setAutonomyCalls)
+	}
+}
+
+// TestRefreshAutonomy_RepoNotOwnerNameSkips: a repo not in owner/name form -> the
+// settle+refresh pass short-circuits, read still 200.
+func TestRefreshAutonomy_RepoNotOwnerNameSkips(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "not-a-valid-repo")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	st := getCampaignStatusBody(t, s, c.ID)
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (bad repo, pass skipped)", crepo.setAutonomyCalls)
+	}
+}
+
+// TestRefreshAutonomy_InstallationResolveErrorSkips: the installation resolve
+// fails -> the whole pass is skipped, read still 200.
+func TestRefreshAutonomy_InstallationResolveErrorSkips(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installStatus: http.StatusInternalServerError, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	st := getCampaignStatusBody(t, s, c.ID)
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (install error, pass skipped)", crepo.setAutonomyCalls)
+	}
+}
+
+// TestRefreshAutonomy_GetIssueErrorLeavesTierUnchanged: a GetIssue error leaves
+// the item out of the fetched map, so it is not refreshed; read still 200.
+func TestRefreshAutonomy_GetIssueErrorLeavesTierUnchanged(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installID: 4242, issuesStatus: http.StatusInternalServerError, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	st := getCampaignStatusBody(t, s, c.ID)
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (GetIssue error, no refresh)", crepo.setAutonomyCalls)
+	}
+}
+
+// TestRefreshAutonomy_UnparseableIssueRefSkips: a non issue:N ref (a Jira key) has
+// no GitHub issue, so it is never fetched or refreshed; read still 200.
+func TestRefreshAutonomy_UnparseableIssueRefSkips(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	item := &campaign.Item{IssueRef: "PROJ-42", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateRunning
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (non issue:N ref never fetched)", crepo.setAutonomyCalls)
+	}
+	if ghState.issueCalls != 0 {
+		t.Errorf("issueCalls = %d, want 0 (a Jira key triggers no GitHub read)", ghState.issueCalls)
+	}
+}
+
+// TestRefreshAutonomy_UnchangedTierPerformsNoWrite: when the issue's tier matches
+// the stored tier, the refresh performs ZERO SetCampaignItemAutonomy calls — the
+// no-op-write guarantee. The item is stored autonomy:low and the issue carries
+// autonomy:low.
+func TestRefreshAutonomy_UnchangedTierPerformsNoWrite(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:low"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	st := getCampaignStatusBody(t, s, c.ID)
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (tier unchanged -> no write)", crepo.setAutonomyCalls)
+	}
+	// The issue IS fetched (autonomy-relevant), but no write follows.
+	if ghState.issueCalls != 1 {
+		t.Errorf("issueCalls = %d, want 1 (fetched once, no write)", ghState.issueCalls)
+	}
+}
+
+// TestRefreshAutonomy_SetAutonomyErrorNeverFailsTheRead: a SetCampaignItemAutonomy
+// failure is swallowed — the status read still returns 200 with the stored tier.
+func TestRefreshAutonomy_SetAutonomyErrorNeverFailsTheRead(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	crepo.setAutonomyErr = errInjected
+	c := seedHumanLedItemCampaign(crepo, "kuhlman-labs/fishhawk")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	s, _ := newAutonomyRefreshServer(t, crepo, ghState)
+	st := getCampaignStatusBody(t, s, c.ID)
+	// The write was attempted (and failed), but the read still succeeded and the
+	// tier is unchanged (the fake left it low because the write errored).
+	assertHumanLedUnrefreshed(t, st)
+	if crepo.setAutonomyCalls != 1 {
+		t.Errorf("setAutonomyCalls = %d, want 1 (attempted once, errored)", crepo.setAutonomyCalls)
+	}
+}
+
+// TestGetCampaignStatus_RefreshDeniedCallerCannotWrite is the explicit
+// visibility-gate assertion (#2355 condition 5): a caller who cannot see the repo
+// is refused 403 repo_forbidden BEFORE the reconcile-on-read pass, so the GET
+// performs NO durable autonomy write even though the issue carries a fresh tier.
+func TestGetCampaignStatus_RefreshDeniedCallerCannotWrite(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := seedHumanLedItemCampaign(crepo, "other/secret")
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{100: {state: "open", labels: []string{"autonomy:medium"}}}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+		GitHub: gh, AccountRoles: fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: newFakeRepoVisibility(map[string]bool{})})
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	rec := httptest.NewRecorder()
+	s.handleGetCampaignStatus(rec, withIdentity(req, memberIdentity()))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "repo_forbidden")
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (denied caller must not drive the write)", crepo.setAutonomyCalls)
+	}
+	if ghState.issueCalls != 0 {
+		t.Errorf("issueCalls = %d, want 0 (denied before any forge read)", ghState.issueCalls)
+	}
+}
+
+// TestStartCampaignItemRun_RefreshesAutonomyBeforeGate is the start-verb targeted
+// refresh (#2355, plan cf-5): a relabelled item (stored autonomy:low, issue now
+// autonomy:medium) is NOT refused item_human_led — the verb re-reads the tier
+// before the DAG gate and starts the run. Deleting the targeted refresh in
+// handleStartCampaignItemRun turns this RED (the item is refused item_human_led).
+func TestStartCampaignItemRun_RefreshesAutonomyBeforeGate(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	gh := autonomyStartGitHub(t, []string{"autonomy:medium"})
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: gh})
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — the relabelled item should start, not be refused item_human_led (body=%s)", w.Code, w.Body.String())
+	}
+	// The stored tier was refreshed to medium.
+	if got := crepo.itemsByCmp[c.ID][0].Autonomy; got != "medium" {
+		t.Errorf("item autonomy = %q, want medium (refreshed before gate)", got)
+	}
+}
+
+// TestStartCampaignItemRun_HumanLedNotRelabelled_StillRefused: the fail-open
+// control — when the issue still carries autonomy:low, the refresh is a no-op and
+// the item is refused item_human_led exactly as today, with the discoverability
+// remedy in the detail.
+func TestStartCampaignItemRun_HumanLedNotRelabelled_StillRefused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	gh := autonomyStartGitHub(t, []string{"autonomy:low"})
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "item_human_led" {
+		t.Errorf("code = %q, want item_human_led", code)
+	}
+	_ = details
+}
+
+// relistFakeRepo wraps the in-memory fakeCampaignRepo to (a) return SNAPSHOT
+// copies from ListCampaignItemsForCampaign — breaking the fake's pointer aliasing
+// so a stale post-refresh slice actually carries the PRE-refresh tier, exactly as
+// the real Postgres repo's value rows do — and (b) fail that list on precisely the
+// failOnCall-th call. Together they reproduce the start verb's relist-error-after-
+// change branch WITHOUT the campaign_items.run_id foreign key a real Postgres repo
+// would impose on the mint/link that follows the gate (which is why the
+// cross-boundary start tests run on the fake, not Postgres).
+type relistFakeRepo struct {
+	*fakeCampaignRepo
+	failOnCall int
+	calls      int
+}
+
+func (r *relistFakeRepo) ListCampaignItemsForCampaign(ctx context.Context, id uuid.UUID) ([]*campaign.Item, error) {
+	r.calls++
+	if r.calls == r.failOnCall {
+		return nil, errInjected
+	}
+	items, err := r.fakeCampaignRepo.ListCampaignItemsForCampaign(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Snapshot each item so a later in-place storage mutation (the autonomy
+	// refresh's SetCampaignItemAutonomy) is NOT visible through this returned slice
+	// — mirroring Postgres value rows, and undoing the fake's aliasing that would
+	// otherwise mask the stale-slice bug.
+	out := make([]*campaign.Item, len(items))
+	for i, it := range items {
+		cp := *it
+		out[i] = &cp
+	}
+	return out, nil
+}
+
+// TestStartCampaignItemRun_RefreshChangedButRelistFails_StillStarts is the fixup
+// counterfactual for the relist-error-after-change branch (#2355 fixup). With
+// snapshot list rows (relistFakeRepo, as the real repo behaves), a relabelled item
+// (stored autonomy:low, issue now autonomy:medium) has its tier refreshed before
+// the DAG gate, but the follow-up relist FAILS. The verb must still partition
+// NextEligible on the FRESH tier and start the run — not refuse item_human_led on
+// the stale pre-refresh slice. Deleting the else-branch patch in
+// handleStartCampaignItemRun turns this RED (409 item_human_led on the stale low
+// tier).
+func TestStartCampaignItemRun_RefreshChangedButRelistFails_StillStarts(t *testing.T) {
+	fake := newFakeCampaignRepo()
+	// Fail the post-refresh relist (call #2): #1 is the handler's initial list, #2
+	// is the relist after the tier changed, #3 is the pending->running derivation
+	// relist (which succeeds).
+	crepo := &relistFakeRepo{fakeCampaignRepo: fake, failOnCall: 2}
+	gh := autonomyStartGitHub(t, []string{"autonomy:medium"})
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := fake.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a relist failure after the tier changed must NOT refuse item_human_led on the stale slice (body=%s)", w.Code, w.Body.String())
+	}
+	// The persisted tier committed to medium before the relist failed.
+	if got := fake.itemsByCmp[c.ID][0].Autonomy; got != "medium" {
+		t.Errorf("item autonomy = %q, want medium (refreshed before gate)", got)
+	}
+}
+
+// TestGetCampaignStatus_PausedItemStaleTierStaysPaused pins condition 4 (#2355):
+// a PAUSED item is bucketed by NextEligible on STATE alone (engine.go: the paused
+// case precedes every autonomy check AND the running catch-all), so a STALE
+// autonomy:low tier on a paused item is provably harmless — it lands in
+// rollup.paused, never human_led. This is why the autonomy refresh deliberately
+// does NOT fetch paused items (their tier is never consulted). GitHub is unwired so
+// no refresh runs and the seeded stale tier is exactly what NextEligible sees.
+func TestGetCampaignStatus_PausedItemStaleTierStaysPaused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	// A paused item carrying a (stale) autonomy:low tier AND a run link — the
+	// paused shape (E25.7): a run gate handed off to a human. The run link makes
+	// this stronger: paused must win over the RunID-bearing running catch-all too.
+	runID := uuid.New()
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePaused, Autonomy: "low", RunID: &runID}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePaused
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}}) // GitHub nil: no refresh
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if !containsRefTest(st.Rollup.Paused, "issue:100") {
+		t.Errorf("rollup.Paused = %v, want issue:100 (paused bucketed on state, tier ignored)", st.Rollup.Paused)
+	}
+	if containsRefTest(st.Rollup.HumanLed, "issue:100") {
+		t.Errorf("rollup.HumanLed = %v, must NOT contain a paused item — its autonomy tier is never consulted", st.Rollup.HumanLed)
+	}
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (a paused item is never fetched or refreshed)", crepo.setAutonomyCalls)
+	}
+}
+
+// autonomyStartGitHub serves the endpoints handleStartCampaignItemRun's
+// mint+refresh path exercises: installation + workflow-spec (to reach
+// CreateRunForTrigger), issue comments (hydration), and GET issue with the given
+// labels (the targeted autonomy refresh reads them). The issue is OPEN.
+func autonomyStartGitHub(t *testing.T, labels []string) *githubclient.Client {
+	t.Helper()
+	specJSON := `{"path":".fishhawk/workflows.yaml","sha":"spec_sha","content":"` +
+		base64.StdEncoding.EncodeToString([]byte(gatedSpecYAML)) + `","encoding":"base64","type":"file"}`
+	labelsJSON := make([]string, 0, len(labels))
+	for _, l := range labels {
+		b, _ := json.Marshal(l)
+		labelsJSON = append(labelsJSON, `{"name":`+string(b)+`}`)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":12345,"app_id":1}`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, specJSON)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[]`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		num, _ := strconv.Atoi(r.PathValue("number"))
+		fmt.Fprintf(w, `{"number":%d,"title":"t","body":"b","state":"open","labels":[%s]}`, num, strings.Join(labelsJSON, ","))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+}
+
+// --- cancel verb (#2355) ---
+
+// postCancel POSTs to handleCancelCampaign with an operator identity (write scope
+// via withAuth).
+func postCancel(t *testing.T, s *Server, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+id+"/cancel", nil)
+	req.SetPathValue("campaign_id", id)
+	w := httptest.NewRecorder()
+	s.handleCancelCampaign(w, withAuth(req))
+	return w
+}
+
+// cancelledAuditPayload decodes the first campaign_cancelled audit payload.
+func cancelledAuditPayload(t *testing.T, aud *campaignAuditRecorder) map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	for _, e := range aud.entries {
+		if e.Category == categoryCampaignCancelled {
+			var p map[string]any
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode cancelled payload: %v", err)
+			}
+			return p
+		}
+	}
+	t.Fatal("no campaign_cancelled audit entry captured")
+	return nil
+}
+
+// TestCancelCampaign_MarksCampaignAndItemsCancelled is the done-means for half 2
+// (#2355): after the call the campaign is cancelled and every non-terminal item
+// is cancelled, so GET /v0/campaigns lists it in state cancelled — no longer
+// indistinguishable from live work. A terminal (succeeded) sibling is left as-is.
+//
+// COUNTERFACTUAL (#2355 condition 6 / plan cancel cf): deleting the
+// item-transition loop turns the item-state assertions RED — the items survive
+// the campaign's cancellation.
+func TestCancelCampaign_MarksCampaignAndItemsCancelled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateRunning),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+		cItem("issue:102", nil, campaign.ItemStateSucceeded), // terminal, left as-is
+	})
+	c.State = campaign.StateRunning
+
+	w := postCancel(t, s, c.ID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var resp campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.State != string(campaign.StateCancelled) {
+		t.Errorf("campaign state = %q, want cancelled", resp.State)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateCancelled {
+		t.Errorf("persisted campaign state = %q, want cancelled", got)
+	}
+	byRef := map[string]campaign.ItemState{}
+	for _, it := range crepo.itemsByCmp[c.ID] {
+		byRef[it.IssueRef] = it.State
+	}
+	if byRef["issue:100"] != campaign.ItemStateCancelled {
+		t.Errorf("issue:100 = %q, want cancelled", byRef["issue:100"])
+	}
+	if byRef["issue:101"] != campaign.ItemStateCancelled {
+		t.Errorf("issue:101 = %q, want cancelled", byRef["issue:101"])
+	}
+	if byRef["issue:102"] != campaign.ItemStateSucceeded {
+		t.Errorf("issue:102 = %q, want succeeded (terminal item untouched)", byRef["issue:102"])
+	}
+	// Audit: campaign_cancelled with items_cancelled=2 (the two non-terminal ones).
+	p := cancelledAuditPayload(t, aud)
+	if p["from"] != string(campaign.StateRunning) {
+		t.Errorf("audit from = %v, want running", p["from"])
+	}
+	if got, _ := p["items_cancelled"].(float64); int(got) != 2 {
+		t.Errorf("audit items_cancelled = %v, want 2", p["items_cancelled"])
+	}
+	// GET /v0/campaigns lists it cancelled.
+	listReq := httptest.NewRequest(http.MethodGet, "/v0/campaigns?state=cancelled", nil)
+	lw := httptest.NewRecorder()
+	s.handleListCampaigns(lw, withAuth(listReq))
+	if lw.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 (body=%s)", lw.Code, lw.Body.String())
+	}
+	if !strings.Contains(lw.Body.String(), c.ID.String()) {
+		t.Errorf("cancelled campaign %s not in state=cancelled listing: %s", c.ID, lw.Body.String())
+	}
+}
+
+// TestCancelCampaign_RefusesTerminalCampaign is the counterfactual for the
+// terminal-state guard: a succeeded campaign is refused 409
+// campaign_not_cancellable (error IDENTITY) and its row is untouched. Deleting
+// the guard turns this RED.
+func TestCancelCampaign_RefusesTerminalCampaign(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateSucceeded),
+	})
+	c.State = campaign.StateSucceeded
+
+	w := postCancel(t, s, c.ID.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_not_cancellable" {
+		t.Errorf("code = %q, want campaign_not_cancellable", code)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateSucceeded {
+		t.Errorf("campaign state = %q, want succeeded (untouched)", got)
+	}
+}
+
+// TestCancelCampaign_RequiresWriteScope is the counterfactual for the
+// requireWriteScope guard: a token lacking write:campaigns is refused 403
+// insufficient_scope. Deleting requireWriteScope turns this RED.
+func TestCancelCampaign_RequiresWriteScope(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateRunning),
+	})
+	c.State = campaign.StateRunning
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}})
+	id := Identity{Subject: "github:op", TokenID: "tok_no_campaigns", Scopes: []string{"write:runs"}}
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+c.ID.String()+"/cancel", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleCancelCampaign(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "insufficient_scope" {
+		t.Errorf("code = %q, want insufficient_scope", code)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Errorf("campaign state = %q, want running (no write on denied scope)", got)
+	}
+}
+
+// TestCancelCampaign_UnconfiguredRepoReturns503 asserts the nil-CampaignRepo guard
+// fires BEFORE the write-scope check.
+func TestCancelCampaign_UnconfiguredRepoReturns503(t *testing.T) {
+	s := New(Config{}) // no CampaignRepo
+	w := postCancel(t, s, uuid.New().String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_repo_unconfigured" {
+		t.Errorf("code = %q, want campaign_repo_unconfigured", code)
+	}
+}
+
+// TestCancelCampaign_UnknownCampaignReturns404.
+func TestCancelCampaign_UnknownCampaignReturns404(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), RunRepo: newFakeRepo()})
+	w := postCancel(t, s, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_not_found" {
+		t.Errorf("code = %q, want campaign_not_found", code)
+	}
+}
+
+// TestCancelCampaign_InvalidUUIDReturns400.
+func TestCancelCampaign_InvalidUUIDReturns400(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), RunRepo: newFakeRepo()})
+	w := postCancel(t, s, "not-a-uuid")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+}
+
+// TestCancelCampaign_LeavesLinkedRunsUntouched asserts the documented
+// non-behavior: cancelling a campaign does NOT cancel its linked runs. A running
+// item linked to a live run is cancelled, but the run itself keeps running.
+func TestCancelCampaign_LeavesLinkedRunsUntouched(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	runID := seedRunningRun(t, rrepo)
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: &campaignAuditRecorder{}})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateRunning, runID),
+	})
+	c.State = campaign.StateRunning
+
+	w := postCancel(t, s, c.ID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	// The item is cancelled...
+	if got := crepo.itemsByCmp[c.ID][0].State; got != campaign.ItemStateCancelled {
+		t.Errorf("item state = %q, want cancelled", got)
+	}
+	// ...but the linked run is UNTOUCHED (still running, not cancelled).
+	got, err := rrepo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.State == run.StateCancelled {
+		t.Errorf("linked run was cancelled; cancel_campaign must NOT touch runs (fishhawk_cancel_run owns that)")
+	}
+}
+
+// TestCancelCampaign_PartialFailureConvergence is the operator condition-2
+// recovery-contract test: the verb is idempotent and convergent. It drives a
+// GENUINE mid-loop partial failure — the FIRST item is cancelled and the SECOND
+// item's transition errors, so the campaign is left half-cancelled (some items
+// cancelled, campaign still running) — then re-invokes with the fault cleared and
+// asserts convergence. This is the defining error path condition 2 demands: a
+// failure AFTER some item already transitioned, not merely a failure before any
+// item moved (which cannot exercise re-entry over already-cancelled items).
+//
+// COUNTERFACTUAL: convergence hinges on the campaign transition running LAST — so
+// a mid-loop item failure leaves the campaign NON-terminal and therefore still
+// cancellable on re-invoke. Transitioning the campaign before/among the items (the
+// exact no-atomicity defect condition 2 warns of) strands it cancelled while
+// issue:101 survives, and this test's partial-state assertion (campaign still
+// running) goes RED. (The re-invoke's own re-entry over the already-cancelled
+// issue:100 rides idempotent same-state transitions, so the defensive
+// terminal-item skip is not itself load-bearing for convergence here.)
+func TestCancelCampaign_PartialFailureConvergence(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateRunning),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	// Fail the SECOND item transition: issue:100 cancels, issue:101 errors. This
+	// leaves the campaign genuinely HALF-cancelled — the state a whole-loop
+	// transItemErr (which fails the FIRST item, before any transition commits) can
+	// never reach.
+	crepo.transItemErrOnCall = 2
+	w := postCancel(t, s, c.ID.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("first cancel status = %d, want 500 (mid-loop failure) (body=%s)", w.Code, w.Body.String())
+	}
+	// Observable partial state: issue:100 IS cancelled, issue:101 is NOT, and the
+	// campaign is still running (the campaign transition runs last and was never
+	// reached). This is the half-cancelled state the recovery must converge from.
+	partial := map[string]campaign.ItemState{}
+	for _, it := range crepo.itemsByCmp[c.ID] {
+		partial[it.IssueRef] = it.State
+	}
+	if partial["issue:100"] != campaign.ItemStateCancelled {
+		t.Fatalf("issue:100 = %q, want cancelled (first item transitioned before the mid-loop fault)", partial["issue:100"])
+	}
+	if partial["issue:101"] == campaign.ItemStateCancelled {
+		t.Fatalf("issue:101 = %q, want NOT cancelled (the fault fired on its transition)", partial["issue:101"])
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Fatalf("after partial failure campaign state = %q, want running (still cancellable)", got)
+	}
+
+	// Clear the fault and re-invoke: convergence from the half-cancelled state. The
+	// already-cancelled issue:100 is terminal and skipped; issue:101 is cancelled;
+	// the campaign transitions cancelled.
+	crepo.transItemErrOnCall = 0
+	w2 := postCancel(t, s, c.ID.String())
+	if w2.Code != http.StatusOK {
+		t.Fatalf("re-invoke status = %d, want 200 (convergence) (body=%s)", w2.Code, w2.Body.String())
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateCancelled {
+		t.Errorf("after re-invoke campaign state = %q, want cancelled (converged)", got)
+	}
+	for _, it := range crepo.itemsByCmp[c.ID] {
+		if it.State != campaign.ItemStateCancelled {
+			t.Errorf("item %s = %q, want cancelled (converged)", it.IssueRef, it.State)
+		}
 	}
 }

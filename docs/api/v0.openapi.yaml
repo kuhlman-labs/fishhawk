@@ -8800,6 +8800,49 @@ paths:
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
 
+  /v0/campaigns/{campaign_id}/cancel:
+    post:
+      operationId: cancelCampaign
+      summary: Cancel a campaign
+      description: |
+        The operator's clean shutdown of an abandoned or rebuilt campaign
+        (#2355). Marks every NON-terminal item `cancelled` and then the campaign
+        itself `cancelled`, so an orphaned campaign stops showing as live
+        `running` work in `GET /v0/campaigns`.
+
+        Deliberately does NOT cancel the campaign's linked RUNS — a run still in
+        flight keeps running; cancel individual runs with `POST
+        /v0/runs/{run_id}/cancel` (the `fishhawk_cancel_run` tool). A
+        terminal campaign (succeeded/failed/cancelled) admits no further
+        transition and yields `409 campaign_not_cancellable`.
+
+        The verb is idempotent and convergent: the campaign transition runs
+        last, so a mid-loop failure leaves the campaign non-terminal and a
+        re-invoke completes the cancellation (a partial failure never strands a
+        campaign half-cancelled).
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The cancelled campaign (now `cancelled`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Campaign' }
+        '400':
+          description: "`validation_failed` — `campaign_id` is not a valid UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '409':
+          description: |
+            `campaign_not_cancellable` — the campaign is already terminal
+            (succeeded/failed/cancelled), so there is nothing to cancel.
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
   # ---------------------------------------------------------------------
   # Work-item filing
   # ---------------------------------------------------------------------

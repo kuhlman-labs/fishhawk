@@ -125,6 +125,19 @@ type Repository interface {
 	// updated_at. Returns ErrNotFound when the item doesn't exist.
 	SetCampaignItemRun(ctx context.Context, itemID uuid.UUID, runID *uuid.UUID) (*Item, error)
 
+	// SetCampaignItemAutonomy overwrites the item's autonomy tier — the routing
+	// metadata re-read from the issue's autonomy:* label on the reconcile-on-read
+	// refresh (#2355), so relabelling a child unblocks a campaign parked on
+	// attend_human_led instead of the tier staying frozen at assembly time. It
+	// NORMALIZES the input to the CHECK-permitted set ("", low, medium, high) —
+	// an out-of-set tier persists as "" (the unknown/default tier) rather than
+	// tripping the migration-0049 column CHECK. Idempotent when the tier is
+	// unchanged (the caller only writes on a real difference, but a same-value
+	// write is harmless). Returns ErrNotFound for a missing item. Deliberately
+	// NOT a lifecycle transition (autonomy is routing metadata, not state), so —
+	// unlike TransitionCampaignItem — it needs no FOR UPDATE state guard.
+	SetCampaignItemAutonomy(ctx context.Context, itemID uuid.UUID, autonomy string) (*Item, error)
+
 	// TransitionCampaignItem moves an item to the target state. Returns
 	// InvalidTransitionError if the item is in a state from which the
 	// target is not reachable. Same-state (idempotent) calls return the

@@ -238,6 +238,28 @@ func (r *postgresRepo) SetCampaignItemRun(ctx context.Context, itemID uuid.UUID,
 	return rowToCampaignItem(row), nil
 }
 
+// SetCampaignItemAutonomy overwrites the item's autonomy tier (#2355). It is a
+// single UPDATE, NOT a state transition — autonomy is routing metadata, not
+// lifecycle state — so it takes no FOR UPDATE lock. The input is normalized to
+// the CHECK-permitted set FIRST via normalizeAutonomy, so an out-of-set tier
+// persists as "" (the unknown/default tier) instead of violating the
+// migration-0049 column CHECK. pgx.ErrNoRows -> ErrNotFound for a missing item;
+// any other error is wrapped. Modelled on SetCampaignItemRun.
+func (r *postgresRepo) SetCampaignItemAutonomy(ctx context.Context, id uuid.UUID, autonomy string) (*Item, error) {
+	q := campaigndb.New(r.pool)
+	row, err := q.SetCampaignItemAutonomy(ctx, campaigndb.SetCampaignItemAutonomyParams{
+		ID:       id,
+		Autonomy: normalizeAutonomy(autonomy),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("set campaign item autonomy: %w", err)
+	}
+	return rowToCampaignItem(row), nil
+}
+
 func (r *postgresRepo) TransitionCampaignItem(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error) {
 	var result *Item
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
