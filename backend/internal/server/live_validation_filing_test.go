@@ -449,6 +449,18 @@ func TestFileOrLinkLiveValidationWalk_SingleFilingNoDoubleFile(t *testing.T) {
 // concurrent approvals of the same run serialize on the per-run lock, so the
 // idempotency guard holds — exactly one intent marker, one linked marker, and one
 // provider File across both.
+//
+// The per-run lock is NOT the primary guard in production (E50.16 / #2657):
+// since E50.15 / #2656 the approve advance is a compare-and-swap, so a raced
+// second approval is refused at advanceStage and never reaches the hook. This
+// test drives fileOrLinkLiveValidationWalk DIRECTLY, so it exercises the
+// retained subordinate lock with the CAS out of the picture, and it is
+// therefore that lock's counterfactual pin: deleting the lockLiveValWalk
+// acquisition reddens it here (measured under #2657: 19 of 20 -race iterations,
+// "provider File called 2 times ... want 1" — interleaving-dependent, as an
+// unsynchronized concurrency counterfactual is) while leaving the CAS-level
+// TestApproveAdvanceCAS_ConcurrentApprovals_HooksRunExactlyOncePerFilingPath
+// green on all 20.
 func TestFileOrLinkLiveValidationWalk_ConcurrentApprovals(t *testing.T) {
 	inst := int64(77)
 	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})

@@ -110,6 +110,37 @@ const liveValidationWalkArea = "area:backend"
 // across processes, mirroring the childNumberLocks note in workitems.go. The map
 // is never pruned (one small mutex per run for the process lifetime), bounded by
 // the number of runs whose approved plan carried a live-validation criterion.
+//
+// NOT THE PRIMARY GUARD ANY MORE (E50.16 / #2657 — an OPERATOR decision, not a
+// re-derivation). This mutex PREDATES the approve compare-and-swap and is
+// retained as belt-and-braces BEHIND it, not as the control that prevents
+// production double-filing. Since E50.15 / #2656 the approve advance is a CAS
+// anchored on the observed state (advanceStage → casTransitionFromObserved), so
+// a raced second approval is refused at the advance and NEVER reaches this hook.
+// Both hooks are invoked from exactly one production call site each, in
+// finishApprovalAdvance (approvals.go — fileSplitProposalChildren, then
+// fileOrLinkLiveValidationWalk), and the production RunRepo is the postgres one,
+// which implements run.StageCASTransitioner; the non-CAS degradation in
+// casTransitionFromObserved is reachable only by in-memory test fakes. So the
+// CAS covers every path a deployed daemon can take, and this mutex is load-
+// bearing only where the CAS is bypassed: a direct caller such as
+// TestFileOrLinkLiveValidationWalk_ConcurrentApprovals, which is why deleting
+// the acquisition below still reddens that test (measured: 19 of 20 -race
+// iterations, provider File called 2 times, want 1).
+//
+// Its sibling fileSplitProposalChildren (split_filing.go) deliberately holds NO
+// equivalent lock, and that asymmetry is NOT a principled difference between the
+// two hooks — at this layer there is none. It is retained here only because
+// removing a working guard buys nothing, and not added there only because it
+// would defend a path that cannot occur outside tests.
+//
+// THE RESIDUAL, stated plainly for whoever changes this next: if the CAS is ever
+// removed, or the run.StageCASTransitioner capability assert in
+// casTransitionFromObserved is dropped, BOTH hooks lose their protection — and
+// the split hook loses it FIRST and SILENTLY, because it has nothing underneath.
+// The #2656 evidence is the measurement: with the CAS deleted, split-child
+// filings went 3 → 6 (two split_children_filed markers) while the walk count
+// stayed at 1, held up by this mutex alone.
 var (
 	liveValWalkLocksMu sync.Mutex
 	liveValWalkLocks   = map[uuid.UUID]*sync.Mutex{}
@@ -150,6 +181,18 @@ func lockLiveValWalk(runID uuid.UUID) func() {
 // indistinguishable from "issue filed, linked-marker write failed" without a
 // forge query this hook deliberately avoids. Re-filing either would reopen the
 // double-file window the intent marker closes.
+//
+// MARKER ORDERING vs the sibling hook (E50.16 / #2657): this hook writes its
+// intent marker BEFORE the forge call; fileSplitProposalChildren
+// (split_filing.go) writes each per-phase work_item_filed marker AFTER each
+// child is filed. The difference follows from resume semantics, not from a
+// difference in how the two protect themselves. The walk is ONE all-or-nothing
+// filing with nothing to resume, so it can afford to burn the marker first and
+// accept the stranded-intent residual below (which degrades to the documented
+// operator-files-it-by-hand path) in exchange for never double-filing. Split
+// files N children and must know WHICH ordinals landed, so its marker records a
+// completed fact and it accepts the mirrored at-least-once residual instead — a
+// child filed whose marker never persisted re-files once on a re-approval.
 //
 // MANUAL RECOVERY (binding condition A(2)): a stranded intent-only marker — an
 // intent marker with no linked marker following it — degrades to the pre-#2045
