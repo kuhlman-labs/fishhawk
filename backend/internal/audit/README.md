@@ -35,6 +35,50 @@ Readers: `ListGlobal` returns the whole run-less set across partitions
 partition in append order — the view per-account verification walks and
 the JSON export emits per key.
 
+## Atomic retry-budget append (`RetryBudgetAppender`, #2518)
+
+`AppendChainedUnderBudget` / `AppendChainedUnderBudgetTx` are an **atomic
+check-and-consume** append: they count a run's existing entries of one category
+and append a fresh chained entry only when that count is below `maxEntries`,
+returning `ErrRetryBudgetExhausted` (writing nothing) when the budget is spent.
+The payload is built by a `stamp(attempt)` callback with `attempt = count+1`, so
+the recorded attempt number is truthful. They back the plan-retry budgets the
+server enforces on both the schema-retry (`plan_schema_retry`) and scope-retry
+(`plan_scope_retry`) paths, where the old count-then-append had a non-atomic
+window: two concurrent plan ships could both read a below-budget count and both
+consume the one-shot budget.
+
+**Ordering is load-bearing** and must stay: `LockRunForUpdate(run)` FIRST, THEN
+count, THEN append. Because the count runs *after* the row lock is granted, and
+Postgres READ COMMITTED takes a fresh snapshot per statement, a second
+transaction's count observes the first's committed entry — so the budget is
+strictly one-shot under concurrency. The transaction MUST run at the
+server-default READ COMMITTED isolation (`AppendChainedUnderBudget` sets no
+`TxOptions`): a REPEATABLE READ snapshot would predate the lock and could count
+zero after the lock is granted, reopening the race. The delegate to
+`AppendChainedTx` keeps the hashing/chaining path byte-identical to every other
+chained append (it re-locks the same run row inside the same transaction — a
+harmless re-entrant no-op).
+
+This is deliberately a **transactional read-modify-write, NOT a partial unique
+index** on `(run_id, category)` (contrast the three at-most-one indexes below).
+The audit table is append-only and hash-chained: the merge-verdict / parent-await
+/ approval-truncated indexes make a *distinct* category idempotent, and any
+pre-existing duplicate there could in principle be removed. A plan-retry budget
+guards a category the race can leave with genuine duplicates, and those cannot be
+de-duplicated to make an index buildable without deleting an audit row and
+breaking the very chain the verifier depends on. The read-modify-write asserts
+nothing about already-written rows: a populated database holding duplicate
+`plan_scope_retry` rows from the old race keeps them, verifies, and is bounded
+only going forward — there is no migration, no index, and no backfill.
+
+`RetryBudgetAppender` is an OPTIONAL capability kept OFF the `Repository`
+interface (mirroring `run.StageCASTransitioner`), so the ~20 manually-written
+full-interface fakes don't break; `postgres.go` carries a `var _
+RetryBudgetAppender = (*postgresRepo)(nil)` compile-time assertion so a
+production repo silently losing the capability is a build failure, and the
+server's fallback for a non-capable repo (in-memory fakes only) is loud-logged.
+
 ## At-most-one merge_verdict_recorded per run (0062 / #1983)
 
 The `merge_verdict_recorded` category (POST `/v0/runs/{run_id}/merge`) is

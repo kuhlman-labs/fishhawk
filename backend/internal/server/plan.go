@@ -172,9 +172,9 @@ const maxPlanSchemaRetries = 1
 // categoryPlanSchemaRetry is the audit-log category for the chained
 // entry trySchemaRetry writes when it re-opens a plan stage after a
 // transient schema-validation failure (#646). The entry is both the
-// budget counter (countSchemaRetries counts them) and the feedback
-// source (loadPriorSchemaValidationError reads the newest
-// validation_error back into the next plan prompt). The payload-key
+// budget counter (consumeRetryBudget counts them atomically, #2518)
+// and the feedback source (loadPriorSchemaValidationError reads the
+// newest validation_error back into the next plan prompt). The payload-key
 // contract (validation_error) is exercised end-to-end by the
 // cross-boundary seam test.
 const categoryPlanSchemaRetry = "plan_schema_retry"
@@ -198,8 +198,8 @@ const maxPlanScopeRetries = 1
 // categoryPlanScopeRetry is the audit-log category for the chained entry
 // tryScopeRetry writes when it refuses a plan whose revision UNDECLAREDLY
 // narrowed the revision base's scope (#2516). Like plan_schema_retry, the
-// entry is BOTH the budget counter (countScopeRetries counts them) and the
-// feedback source: loadScopeCarryForward reads the newest entry's
+// entry is BOTH the budget counter (consumeRetryBudget counts them atomically,
+// #2518) and the feedback source: loadScopeCarryForward reads the newest entry's
 // required_scope_files back into the re-dispatched plan prompt as the
 // enumerated carry-forward set, and its undeclared_removals as the refusal
 // notice. The payload-key contract is exercised end-to-end by the
@@ -861,24 +861,112 @@ func (s *Server) handleClarificationRequest(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// countSchemaRetries counts the run's plan_schema_retry audit entries
-// — the in-run schema-retry budget counter (#646). Returns 0 on any
-// error or when the AuditRepo is unconfigured (best-effort, same read
-// shape as loadLastDecomposeRejectionReason). A nil count degrades to
-// "no retries recorded", which is the conservative choice: at worst the
-// budget gate lets one extra retry through rather than wedging the run.
-func (s *Server) countSchemaRetries(ctx context.Context, runID uuid.UUID) int {
-	if s.cfg.AuditRepo == nil {
-		return 0
+// consumeRetryBudget performs the in-run plan-retry budget check-and-consume
+// ATOMICALLY across the schema-retry and scope-retry paths (#2518). It counts
+// the run's existing entries of category and, when below maxEntries, appends a
+// fresh chained entry whose payload is built by stamp(attempt) — returning
+// granted=true with the 1-based attempt on success, and granted=false (with
+// attempt 0) on exhaustion OR any failure.
+//
+// The read-modify-write is atomic when s.cfg.AuditRepo carries the
+// audit.RetryBudgetAppender capability (production postgresRepo, pinned by a
+// compile-time assertion): the count runs UNDER a row lock in the same
+// transaction as the append, so two ships racing on the same (run, category)
+// can no longer both read a below-budget count and both consume the budget.
+//
+// When the capability is ABSENT (in-memory fakes only), it degrades to a
+// non-atomic count-then-append behind a LOUD warning — preserving the old
+// window rather than flipping any unrelated test's behaviour. That fallback
+// FAILS CLOSED on a budget read error (declines the retry) for the SAME reason
+// the atomic path does: an unreadable budget is an unbounded one, and a
+// persistent read failure must never grant a retry on every corrective ship.
+//
+// Semantics are UNIFORM across both paths and both legs: granted=false for ANY
+// reason — budget exhausted, atomic check-and-consume failed, or fallback read
+// failed — declines the retry and hands control back to the caller's existing
+// fall-through. What that fall-through does is the caller's contract: the
+// scope path parks with the regression evidence (unchanged); the schema path
+// takes the pre-existing fail-B. Callers guard a nil AuditRepo BEFORE calling.
+func (s *Server) consumeRetryBudget(ctx context.Context, runID, stageID uuid.UUID, category string, maxEntries int, stamp func(attempt int) (json.RawMessage, error)) (granted bool, attempt int) {
+	captured := 0
+	wrapped := func(a int) (json.RawMessage, error) {
+		captured = a
+		return stamp(a)
 	}
-	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanSchemaRetry)
+	systemKind := audit.ActorKind("system")
+
+	if appender, ok := s.cfg.AuditRepo.(audit.RetryBudgetAppender); ok {
+		_, err := appender.AppendChainedUnderBudget(ctx, audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  category,
+			ActorKind: &systemKind,
+			// Payload is built by the stamp closure inside the primitive.
+		}, maxEntries, wrapped)
+		if errors.Is(err, audit.ErrRetryBudgetExhausted) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "plan upload: retry budget exhausted",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", category))
+			return false, 0
+		}
+		if err != nil {
+			// Decline on ANY non-exhaustion error (an unreadable/unwritable
+			// budget is an unbounded one). Fail closed rather than grant blind.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: atomic retry-budget consume failed; declining",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", category),
+				slog.String("error", err.Error()))
+			return false, 0
+		}
+		return true, captured
+	}
+
+	// Non-atomic fallback: in-memory fakes only — production wires the postgres
+	// repo (pinned by the compile-time RetryBudgetAppender assertion). Loud so
+	// a real deployment reaching this is conspicuous.
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"plan upload: audit repo lacks the atomic retry-budget capability; using the non-atomic count-then-append fallback",
+		slog.String("run_id", runID.String()),
+		slog.String("category", category))
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
 	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: count schema retries failed",
+		// Fail closed: an unreadable budget is an unbounded one — declining a
+		// legitimate retry is strictly cheaper than granting one on every ship.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: fallback retry-budget read failed; declining",
 			slog.String("run_id", runID.String()),
+			slog.String("category", category),
 			slog.String("error", err.Error()))
-		return 0
+		return false, 0
 	}
-	return len(entries)
+	if len(entries) >= maxEntries {
+		return false, 0
+	}
+	payload, serr := wrapped(len(entries) + 1)
+	if serr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: fallback retry-budget stamp failed; declining",
+			slog.String("run_id", runID.String()),
+			slog.String("category", category),
+			slog.String("error", serr.Error()))
+		return false, 0
+	}
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: fallback retry-budget append failed; declining",
+			slog.String("run_id", runID.String()),
+			slog.String("category", category),
+			slog.String("error", aerr.Error()))
+		return false, 0
+	}
+	return true, captured
 }
 
 // trySchemaRetry attempts a bounded in-run re-dispatch of a plan stage
@@ -912,38 +1000,32 @@ func (s *Server) trySchemaRetry(r *http.Request, runID, stageID uuid.UUID, repor
 	if s.cfg.Orchestrator == nil || s.cfg.AuditRepo == nil {
 		return false
 	}
-	attempt := s.countSchemaRetries(r.Context(), runID)
-	if attempt >= maxPlanSchemaRetries {
-		return false
-	}
 
 	validationErr := reportErr.Error()
 	if len(validationErr) > maxSchemaValidationErrorBytes {
 		validationErr = validationErr[:maxSchemaValidationErrorBytes] + "...[truncated]"
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"run_id":           runID.String(),
-		"stage_id":         stageID.String(),
-		"attempt":          attempt + 1,
-		"validation_error": validationErr,
-	})
-	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  categoryPlanSchemaRetry,
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); aerr != nil {
-		// Without the budget/feedback entry the retry is neither bounded
-		// nor steerable — fall back to fail-B rather than re-dispatching
-		// blind.
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"plan upload: append plan_schema_retry audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", aerr.Error()))
+	// The budget entry is BOTH the counter and the feedback source
+	// (loadPriorSchemaValidationError reads validation_error back). The stamp
+	// closure builds it with the atomic-consume's truthful attempt number.
+	stamp := func(attempt int) (json.RawMessage, error) {
+		return json.Marshal(map[string]any{
+			"run_id":           runID.String(),
+			"stage_id":         stageID.String(),
+			"attempt":          attempt,
+			"validation_error": validationErr,
+		})
+	}
+	granted, attempt := s.consumeRetryBudget(r.Context(), runID, stageID, categoryPlanSchemaRetry, maxPlanSchemaRetries, stamp)
+	if !granted {
+		// Budget exhausted, or the check-and-consume failed. Without a bounded
+		// and steerable budget entry the retry is neither — fall through to the
+		// terminal fail-B path rather than re-dispatching blind. This changes
+		// the schema path's behaviour on a persistent budget-read failure
+		// (previously a swallowed read error reported 0 and granted a retry on
+		// every ship, so the one-shot never exhausted); it now declines and
+		// falls to the operator-recoverable fail-B, the same bound the scope
+		// path already holds (#2517).
 		return false
 	}
 
@@ -982,36 +1064,8 @@ func (s *Server) trySchemaRetry(r *http.Request, runID, stageID uuid.UUID, repor
 		"plan upload: scheduled in-run schema retry",
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageID.String()),
-		slog.Int("attempt", attempt+1))
+		slog.Int("attempt", attempt))
 	return true
-}
-
-// countScopeRetries counts the run's plan_scope_retry audit entries — the
-// in-run scope-retry budget counter (#2516), the exact read shape
-// countSchemaRetries uses.
-//
-// It FAILS CLOSED: a read error returns the error, and tryScopeRetry then
-// refuses to refuse (falls through to park-with-evidence). Treating an
-// unreadable count as "no retries recorded" would make a PERSISTENT audit-list
-// failure grant a refusal on EVERY corrective ship — the one-shot budget would
-// never exhaust and the plan would never degrade to park-with-evidence, which
-// is the bound this gate is required to hold. Losing one legitimate refusal to
-// a transient read error is strictly the cheaper failure: the plan still parks
-// at the gate with the regression evidence and the refunded revise pass.
-// An unconfigured AuditRepo returns (0, nil) — tryScopeRetry rejects that case
-// on its own precondition before ever counting.
-func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, error) {
-	if s.cfg.AuditRepo == nil {
-		return 0, nil
-	}
-	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanScopeRetry)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: count scope retries failed",
-			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()))
-		return 0, err
-	}
-	return len(entries), nil
 }
 
 // tryScopeRetry REFUSES a revise pass whose new plan UNDECLAREDLY narrows the
@@ -1029,33 +1083,28 @@ func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, e
 // Preconditions (any false → return false → fall through):
 //   - Orchestrator and AuditRepo are wired (needed to re-dispatch and to
 //     record/count the budget).
-//   - countScopeRetries READS the budget successfully. A read error fails
-//     CLOSED (no refusal): an unreadable budget is an unbounded one, and a
-//     persistent audit-list failure would otherwise grant a refusal on every
-//     corrective ship, so the nominal one-shot would never exhaust.
-//   - countScopeRetries < maxPlanScopeRetries (budget remaining).
+//   - consumeRetryBudget GRANTS the refusal (below-budget count → committed
+//     entry). It declines — and this call returns false — on exhaustion OR any
+//     failure (an unreadable/unwritable budget is an unbounded one, so it fails
+//     CLOSED rather than granting a refusal on every corrective ship).
 //
-// The count→append window is NOT atomic, so two ships racing on the same run
-// can both read 0 and both record a refusal. The audit-first ordering keeps
-// that bounded in the direction that matters: each racing ship commits its own
-// entry BEFORE mutating any state, so the budget is over-consumed, never
-// under-consumed — the comparison is `>=`, so the next ship sees a count over
-// the cap and falls through to park-with-evidence. A race can therefore cost
-// an extra re-dispatch; it can never make the refusal unbounded. (The stage
-// transitions themselves are CAS-guarded, so at most one racer's re-open
-// wins; the loser's FailStage/RetryStage error returns false and falls
-// through.) Making the budget strictly one-shot under concurrency needs a
-// unique constraint on (run_id, category) — deliberately out of scope here.
+// The check-and-consume is ATOMIC under the production repo (#2518): the count
+// runs UNDER a row lock in the same transaction as the append (see
+// consumeRetryBudget / audit.AppendChainedUnderBudgetTx), so two ships racing
+// on the same (run, category) can no longer both read a below-budget count and
+// both record a refusal — the one-shot budget is strictly one-shot. This
+// supersedes the earlier audit-first over-consume argument and the unique-index
+// note: there is no over-consumption window to bound, and no index over the
+// append-only chain (which cannot be de-duplicated without breaking it).
 //
-// On a granted refusal, in order (audit-first, mirroring trySchemaRetry and
-// handleRetryStage so the retry intent is durable even if a later step
-// fails):
-//  1. Append a chained plan_scope_retry audit entry carrying run_id,
-//     stage_id, attempt, undeclared_removals, and required_scope_files — the
-//     base-scoped union MINUS the declared removals, i.e. the exact
-//     enumerated set the corrected plan must cover. This entry is BOTH the
-//     budget counter and the feedback source loadScopeCarryForward reads
-//     back into the re-dispatched plan prompt.
+// On a granted refusal, in order (consume-first, so the retry intent is
+// durable even if a later step fails):
+//  1. consumeRetryBudget has already committed the chained plan_scope_retry
+//     entry carrying run_id, stage_id, attempt, undeclared_removals, and
+//     required_scope_files — the base-scoped union MINUS the declared removals,
+//     i.e. the exact enumerated set the corrected plan must cover. This entry
+//     is BOTH the budget counter and the feedback source loadScopeCarryForward
+//     reads back into the re-dispatched plan prompt.
 //  2. Re-open the stage: FailStage(FailureA) walks it running/dispatched →
 //     failed (transient category A, never B), then RetryStage(pending) walks
 //     failed → pending and clears the transient failure metadata.
@@ -1063,8 +1112,9 @@ func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, e
 //
 // The per-step return contract mirrors trySchemaRetry's ACTUAL behaviour,
 // and each leg leaves a DIFFERENT observable state:
-//   - AppendChained failure → false. Nothing mutated; the caller's
-//     fall-through parks the stage at awaiting_approval with the evidence.
+//   - consumeRetryBudget decline → false. Nothing mutated (or, on an
+//     exhausted/over-consumed budget, no NEW entry); the caller's fall-through
+//     parks the stage at awaiting_approval with the evidence.
 //   - FailStage failure → false. The plan_scope_retry entry is already
 //     committed and the budget consumed, but the stage never left its state,
 //     so the fall-through still parks it at awaiting_approval.
@@ -1077,17 +1127,14 @@ func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, e
 //     stands; only the auto-dispatch is missing, which on the local runner
 //     is the normal case anyway (ADR-024: the operator re-drives with a
 //     fresh fishhawk_run_stage --stage plan).
+//
+// A racer that finds the stage already re-opened to pending is handled by
+// failStageCAS's bounded RE-ANCHOR loop (backend/internal/run/failure.go):
+// reanchorTarget re-anchors on any live, legally-failable Actual state, so it
+// re-fails and re-drives rather than erroring — the budget primitive, not the
+// stage CAS, is what bounds the refusal to one.
 func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regression *ScopeRegressionPayload, base *plan.Plan) bool {
 	if s.cfg.Orchestrator == nil || s.cfg.AuditRepo == nil {
-		return false
-	}
-	attempt, cerr := s.countScopeRetries(r.Context(), runID)
-	if cerr != nil {
-		// Fail closed: an unreadable budget is an UNBOUNDED budget, and a
-		// persistent read failure would refuse every corrective ship.
-		return false
-	}
-	if attempt >= maxPlanScopeRetries {
 		return false
 	}
 
@@ -1107,30 +1154,26 @@ func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regres
 		required = append(required, p)
 	}
 
-	payload, _ := json.Marshal(map[string]any{
-		"run_id":               runID.String(),
-		"stage_id":             stageID.String(),
-		"attempt":              attempt + 1,
-		"undeclared_removals":  regression.UndeclaredRemovals,
-		"required_scope_files": required,
-	})
-	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  categoryPlanScopeRetry,
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); aerr != nil {
-		// Without the budget/feedback entry the refusal is neither bounded
-		// nor steerable — fall through to the prior park-with-evidence
-		// rather than re-dispatching blind.
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"plan upload: append plan_scope_retry audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", aerr.Error()))
+	// The budget entry is BOTH the counter and the feedback source
+	// (loadScopeCarryForward reads required_scope_files / undeclared_removals
+	// back). The stamp closure builds it with the atomic-consume's truthful
+	// attempt number; consumeRetryBudget commits it only when the budget is not
+	// yet spent, atomically under the production repo.
+	stamp := func(attempt int) (json.RawMessage, error) {
+		return json.Marshal(map[string]any{
+			"run_id":               runID.String(),
+			"stage_id":             stageID.String(),
+			"attempt":              attempt,
+			"undeclared_removals":  regression.UndeclaredRemovals,
+			"required_scope_files": required,
+		})
+	}
+	granted, attempt := s.consumeRetryBudget(r.Context(), runID, stageID, categoryPlanScopeRetry, maxPlanScopeRetries, stamp)
+	if !granted {
+		// Budget exhausted, or the check-and-consume failed. Without a bounded
+		// and steerable budget entry the refusal is neither — fall through to
+		// the prior park-with-evidence (the revise handler refunds the pass).
+		// A refusal must never become a new way to lose a plan.
 		return false
 	}
 
@@ -1180,7 +1223,7 @@ func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regres
 		"plan upload: refused undeclared scope narrowing, scheduled in-run scope retry",
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageID.String()),
-		slog.Int("attempt", attempt+1),
+		slog.Int("attempt", attempt),
 		slog.Int("undeclared_removals", len(regression.UndeclaredRemovals)),
 		slog.Int("required_scope_files", len(required)))
 	return true
