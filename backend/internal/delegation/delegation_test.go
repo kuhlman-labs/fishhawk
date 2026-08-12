@@ -931,14 +931,15 @@ workflows:
 }
 
 // TestImplementReviewAuthority_NilReviewersBlockFromV2Spec is the RESOLVED
-// half of #2215 acceptance criterion 4, which says a spec with no reviewers
-// block "still defaults to {human: 1}". No consumer materializes that
-// literal: Stage.Reviewers stays nil and implementReviewAuthority maps nil
-// straight to gateless. What is TRUE — and what this asserts — is that nil
-// and {Human:1} are OBSERVATIONALLY EQUIVALENT here, because with zero agent
-// reviewers the human count cannot change the resolved mode. So the
-// documented default is unobservable rather than applied, and this slice
-// does not change that either way.
+// half of the absent-block contract at this consumer. A spec with no
+// reviewers block configures NO reviewers: Stage.Reviewers stays nil and
+// implementReviewAuthority maps nil straight to gateless. Nothing
+// materializes a {human:1} literal, and since E52.12 / #2322 no
+// documentation surface claims one. What this asserts is that nil and
+// {Human:1} are OBSERVATIONALLY EQUIVALENT here, because with zero agent
+// reviewers the human count cannot change the resolved mode — which is why
+// materializing the default would have been inert and the correction is
+// documentation-only.
 func TestImplementReviewAuthority_NilReviewersBlockFromV2Spec(t *testing.T) {
 	s, err := spec.ParseBytes([]byte(`version: "2"
 workflows:

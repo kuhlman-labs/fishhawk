@@ -495,8 +495,17 @@ const DefaultMaxRetries = 1
 // A non-empty Authority (E53.2 / #2225) WINS over that default — see the
 // Authority field doc.
 //
-// A nil pointer on Stage.Reviewers means the field was absent in the spec;
-// callers should treat nil as {Human:1} to preserve pre-ADR-027 behavior.
+// A nil pointer on Stage.Reviewers means the field was absent in the spec and
+// NO reviewers are configured: callers interpret that nil DIRECTLY, AgentCount
+// is 0, and planreview.ResolveAuthority resolves gateless. There is no
+// {Human:1} default — no consumer in the backend, runner or CLI materializes
+// one, and none should. Materializing it would be inert anyway:
+// ResolveAuthorityWithSource short-circuits on AgentCount()==0 BEFORE reading
+// Human, so Human participates only in the gating-vs-advisory tiebreak that is
+// unreachable with zero agent reviewers. A human approval requirement is
+// declared by a stage gate of type approval (read by webhook.hasApprovalGate),
+// NOT by reviewers.human — so an absent block never confers a human approval
+// gate that a {Human:1} default would appear to promise (E52.12 / #2322).
 //
 // Agents (#955) declares heterogeneous reviewers — one entry per
 // invocation, each naming its provider (and optionally model). When the

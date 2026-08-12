@@ -636,7 +636,7 @@ Declaring `authority: gating` engages the **run-creation reviewer-availability c
 
 The resolved mode and its provenance (`declared` | `derived`) are surfaced per stage on `GET /v0/runs/{id}` as `review_authority[]`, so an operator reads the mode instead of re-deriving it.
 
-**Absent `reviewers` block:** the backend treats the stage as `{human: 1}` — one human approver. A caller reading a nil block applies that default.
+**Absent `reviewers` block:** **no reviewers are configured**: `Stage.Reviewers` stays `nil`, the effective agent count is `0`, and the stage resolves **gateless** — consistent with `gateless` being the zero-agent outcome rather than a declarable policy. There is **no `{human: 1}` default**; nothing materializes one, and a caller reading a nil block interprets that nil directly rather than substituting a default. A human approval requirement is declared by a stage `gates:` entry of type `approval` (read by `hasApprovalGate`), **not** by `reviewers.human` (E52.12 / #2322).
 
 ## Inputs and `needs:`
 
@@ -1083,7 +1083,7 @@ test_conventions:
 | `reviewers.agents[].provider` | `anthropic` \| `claudecode` \| `codex` | must be a configured capability on the deployment |
 | `reviewers.agents[].reasoning_effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | codex-only |
 | `reviewers.agents[].optional` | `true` \| `false` (default `false`) | per-reviewer degradation policy |
-| `reviewers.human` | integer `>= 0` (default `0`) | absent block → the backend's `{human: 1}` default |
+| `reviewers.human` | integer `>= 0` (default `0`) | absent block → no reviewers configured; `Reviewers` nil; agent count `0`; resolves `gateless` (no `{human: 1}` default) |
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
 | Input `source` | `github_issue` \| `pull_request` | external trigger |
 | Input `artifact` | `plan` \| `pull_request` | what a later stage may consume |
