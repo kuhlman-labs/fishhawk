@@ -229,6 +229,22 @@ func (*BuildRequiredDriftError) Unwrap() error { return ErrCommittedTestsFailed 
 // ErrCommitWouldNotCompile / ErrCommittedTestsFailed.
 var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified by the committed-tree gates")
 
+// ErrVerifyInfraFailure is the infrastructure-failure sentinel for a verify
+// command that did not COMPLETE for a reason outside the diff (#2645): a
+// tool's global lock held by a concurrent process (golangci-lint's
+// `parallel golangci-lint is running`), a container-start timeout under
+// daemon load (#972), or — only where the SAME tree already verified once —
+// a command killed by a signal. That is MVP_SPEC §6 category-C
+// infrastructure: the stage is retryable in place via fishhawk_retry_stage
+// rather than parked for a re-scope/re-plan.
+//
+// It is deliberately NOT wrapped around ErrPushedTreeNotVerified or
+// ErrCommittedTestsFailed: errors.Is is disjunctive, so a wrap carrying both
+// would still match the category-B chain and the B verdict would survive.
+// The runner's pushFailureCategory checks this sentinel FIRST for the same
+// reason.
+var ErrVerifyInfraFailure = errors.New("gitops: verify command failed for an infrastructure reason")
+
 // ErrBaseRebaseConflict is the sentinel returned when reapplying the agent's
 // stashed working-tree edits onto a freshly-fetched authoritative base fails
 // with a merge conflict — the agent edited lines the base advanced past, so the

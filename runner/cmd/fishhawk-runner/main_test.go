@@ -8306,17 +8306,11 @@ func TestRun_ImplementStage_BindingAssertionGate(t *testing.T) {
 // category-C infra.
 func TestBindingAssertionUnsatisfied_ClassifiesCategoryB(t *testing.T) {
 	err := fmt.Errorf("%w: detail", gitops.ErrBindingAssertionUnsatisfied)
-	categoryB := errors.Is(err, upload.ErrPullRequestInvalid) ||
-		errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
-		errors.Is(err, gitops.ErrCommittedTestsFailed) ||
-		errors.Is(err, gitops.ErrCreatedOutOfScope) ||
-		errors.Is(err, gitops.ErrBaseRebaseConflict) ||
-		errors.Is(err, gitops.ErrCommitOutOfScope) ||
-		errors.Is(err, gitops.ErrScopeFilesMissing) ||
-		errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
-		errors.Is(err, gitops.ErrPushedTreeNotVerified)
-	if !categoryB {
-		t.Error("wrapped ErrBindingAssertionUnsatisfied must classify category-B")
+	// Calls the PRODUCTION classifier (#2645 extracted it from the inline
+	// chain at the push call site) rather than duplicating it, so this test
+	// tracks the real classification instead of a copy that can drift.
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("wrapped ErrBindingAssertionUnsatisfied classified %q, want category-B", got)
 	}
 }
 
@@ -9813,6 +9807,99 @@ func TestIsTestcontainersStartFlake(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isTestcontainersStartFlake(tt.output); got != tt.want {
 				t.Errorf("isTestcontainersStartFlake(...) = %v, want %v\noutput:\n%s", got, tt.want, tt.output)
+			}
+		})
+	}
+}
+
+// The two VERBATIM #2645 occurrence outputs (operator-binding plan condition):
+// the matchers must hold against the real observed text, not an abbreviation.
+//
+// lintLockOutput2645 is the golangci-lint global-lock contention captured in
+// the issue body — two concurrent local implement stages reached their verify
+// gate together and the loser's lint leg aborted on the third module.
+const lintLockOutput2645 = `>>> ./backend
+0 issues.
+>>> ./cli
+0 issues.
+>>> ./credstore
+Error: parallel golangci-lint is running
+The command is terminated due to an error: parallel golangci-lint is running`
+
+// segfaultOutput2656 is the second occurrence (run 62bea095, comment on #2645):
+// git itself segfaulted inside an untouched runner test while the policy gate
+// had already passed and `scripts/test verify` had recorded exit_code 0
+// pre-push. Note it also carries an ordinary `--- FAIL:` line — the ONLY
+// discriminator is the `signal: <name>` rendering.
+const segfaultOutput2656 = `--- FAIL: TestWorktreeIsolation_Integration (0.27s)
+    worktree_integration_test.go:320: lineage flow failed: provisionLineageWorktree:
+    worktreesDir: rev-parse --git-common-dir: signal: segmentation fault
+FAIL	github.com/kuhlman-labs/fishhawk/runner/cmd/fishhawk-runner`
+
+// TestIsVerifyInfraFailure pins BOTH matchers and, load-bearingly, the
+// NARROWING between them (#2645 operator condition 1): the signal-death rule
+// belongs only to the pre-push strict re-verify (isReverifyInfraFailure),
+// where the same tree is known to have already verified. The committed-tree
+// gates' matcher (isVerifyInfraFailure) must NOT claim a signal death, because
+// a diff can hang into a supervisor kill, OOM, or crash a subprocess.
+func TestIsVerifyInfraFailure(t *testing.T) {
+	tests := []struct {
+		name         string
+		output       string
+		wantInfra    bool // isVerifyInfraFailure (diff-independent only)
+		wantReverify bool // isReverifyInfraFailure (adds the signal rule)
+	}{
+		{"verbatim #2645 golangci-lint lock contention", lintLockOutput2645, true, true},
+		{"verbatim #2656 segfaulting git rev-parse", segfaultOutput2656, false, true},
+		{"OOM kill rendering", "--- FAIL: TestBig (12.00s)\n    big_test.go:9: exit status: signal: killed\nFAIL", false, true},
+		{"supervisor terminate rendering", "signal: terminated\nFAIL\texample.com/mod", false, true},
+		{"verbatim #972 approval-package failure", flakeOutputApproval, true, true},
+		{"verbatim #972 audit-package failure", flakeOutputAudit, true, true},
+		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false, false},
+		{"prose mentioning signals but no signal: <name> rendering", "--- FAIL: TestNotifier (0.01s)\n    notifier_test.go:12: expected a signal on the channel; got none (signal handling is async)\nFAIL", false, false},
+		{"empty output", "", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isVerifyInfraFailure(tt.output); got != tt.wantInfra {
+				t.Errorf("isVerifyInfraFailure(...) = %v, want %v\noutput:\n%s", got, tt.wantInfra, tt.output)
+			}
+			if got := isReverifyInfraFailure(tt.output); got != tt.wantReverify {
+				t.Errorf("isReverifyInfraFailure(...) = %v, want %v\noutput:\n%s", got, tt.wantReverify, tt.output)
+			}
+		})
+	}
+}
+
+// TestPushFailureCategory pins the extracted classifier: every category-B
+// sentinel still classifies B, plain infra stays C, and the new
+// ErrVerifyInfraFailure is C — including the load-bearing row where an error
+// wraps BOTH it and a category-B sentinel, which the FIRST-arm ordering is
+// what makes come out C.
+func TestPushFailureCategory(t *testing.T) {
+	both := fmt.Errorf("%w: outer; %w: inner", gitops.ErrVerifyInfraFailure, gitops.ErrPushedTreeNotVerified)
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"ErrPullRequestInvalid", fmt.Errorf("x: %w", upload.ErrPullRequestInvalid), "B"},
+		{"ErrCommitWouldNotCompile", fmt.Errorf("x: %w", gitops.ErrCommitWouldNotCompile), "B"},
+		{"ErrCommittedTestsFailed", fmt.Errorf("x: %w", gitops.ErrCommittedTestsFailed), "B"},
+		{"ErrCreatedOutOfScope", fmt.Errorf("x: %w", gitops.ErrCreatedOutOfScope), "B"},
+		{"ErrBaseRebaseConflict", fmt.Errorf("x: %w", gitops.ErrBaseRebaseConflict), "B"},
+		{"ErrCommitOutOfScope", fmt.Errorf("x: %w", gitops.ErrCommitOutOfScope), "B"},
+		{"ErrScopeFilesMissing", fmt.Errorf("x: %w", gitops.ErrScopeFilesMissing), "B"},
+		{"ErrBindingAssertionUnsatisfied", fmt.Errorf("x: %w", gitops.ErrBindingAssertionUnsatisfied), "B"},
+		{"ErrPushedTreeNotVerified", fmt.Errorf("x: %w", gitops.ErrPushedTreeNotVerified), "B"},
+		{"bare network error", errors.New("dial tcp: connection refused"), "C"},
+		{"ErrVerifyInfraFailure", fmt.Errorf("x: %w", gitops.ErrVerifyInfraFailure), "C"},
+		{"both sentinels wrapped — infra must win", both, "C"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pushFailureCategory(tt.err); got != tt.want {
+				t.Errorf("pushFailureCategory(%v) = %q, want %q", tt.err, got, tt.want)
 			}
 		})
 	}
@@ -12422,6 +12509,103 @@ func TestRunVerifyGateCommitted_FailReturnsEmptyTree(t *testing.T) {
 	}
 }
 
+// TestRunVerifyGateCommitted_InfraFailureClassifiesInfraSentinel: the
+// single-shot gate's #2645 arm. A failure whose output still carries a
+// diff-independent infra signature AFTER the absorb already re-ran it once is
+// category-C infrastructure (ErrVerifyInfraFailure), not the category-B red
+// tree ErrCommittedTestsFailed asserts.
+func TestRunVerifyGateCommitted_InfraFailureClassifiesInfraSentinel(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, lintLockOutput2645))
+	var logSink strings.Builder
+	events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
+	}
+	if errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Errorf("the infra failure must NOT also wrap the category-B sentinel: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "C" {
+		t.Errorf("pushFailureCategory = %q, want C", got)
+	}
+	if tree != "" {
+		t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+	}
+	var verifyRuns, retries int
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+		case "verify_infra_flake_retry":
+			retries++
+		}
+	}
+	if verifyRuns != 2 || retries != 1 {
+		t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
+	}
+}
+
+// TestRunVerifyGateCommitted_SignalDeathStaysCategoryB pins the NARROWING
+// (#2645 operator condition 1): at a committed-tree gate there is no prior
+// evidence that this tree ever verified, so a `signal: <name>` death does NOT
+// buy the infrastructure classification — a diff can hang into a supervisor
+// kill or crash a subprocess. Today's category-B verdict is left alone, and
+// the absorb never fires.
+func TestRunVerifyGateCommitted_SignalDeathStaysCategoryB(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, segfaultOutput2656))
+	var logSink strings.Builder
+	events, _, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("err = %v, want ErrCommittedTestsFailed", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("a signal death with no prior passing verification must NOT classify infra: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B", got)
+	}
+	for _, ev := range events {
+		if ev.Kind == "verify_infra_flake_retry" {
+			t.Error("the committed-tree absorb must not fire on a signal death")
+		}
+	}
+}
+
+// TestRunVerifyFixLoop_InfraFailureAbsorbedWithoutFixInvoke: the fix-loop
+// absorb widened to isVerifyInfraFailure (#2645). A lint-lock failure is
+// re-run in place once — the fix agent is never asked to fix another
+// process's lock, and no fix iteration is consumed.
+func TestRunVerifyFixLoop_InfraFailureAbsorbedWithoutFixInvoke(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, infraThenPassVerifyCmd(t, lintLockOutput2645))
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if tree == "" {
+		t.Errorf("the absorbed retry passed, so the loop must return a verified tree\n%s", logSink.String())
+	}
+	if reinvoked {
+		t.Error("an infra failure must not re-invoke the fix agent")
+	}
+	if strings.Contains(logSink.String(), "verify_fix_reinvoke") {
+		t.Errorf("no verify_fix_reinvoke may be logged for an infra failure:\n%s", logSink.String())
+	}
+	retries := 0
+	for _, ev := range res.Events {
+		if ev.Kind == "verify_infra_flake_retry" {
+			retries++
+		}
+	}
+	if retries != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1", retries)
+	}
+}
+
 // TestRunVerifyFixLoop_ReturnsVerifiedTreeSHA: the fix loop's passing
 // iteration returns the verified tree hash; exhaustion returns empty.
 func TestRunVerifyFixLoop_ReturnsVerifiedTreeSHA(t *testing.T) {
@@ -12518,11 +12702,27 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	moveBareMain(t, bare)
 
-	// The re-verify command fails → the push must be blocked.
+	// The re-verify command fails with an ORDINARY test failure (no infra
+	// signature) → the push must be blocked and the verdict stays category-B.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, ordinaryFailVerifyCmd(t)), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	// #2645 AC4 / operator condition 5: the infra reclassification must NOT
+	// swallow a genuine failure. It stays category-B (parked, not retried),
+	// the infra sentinel does not match, and the absorb never fired.
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("an ordinary test failure must NOT match the infra sentinel: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B for a genuine re-verify failure", got)
+	}
+	if n := strings.Count(logSink.String(), `"event":"verify_infra_flake_retry"`); n != 0 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 0 (the absorb must not fire on a real failure)", n)
+	}
+	if n := strings.Count(logSink.String(), `"event":"verify_run"`); n != 1 {
+		t.Errorf("re-verify verify_run events = %d, want exactly 1 (no extra run without an infra signature)", n)
 	}
 	if !strings.Contains(logSink.String(), `"event":"verified_tree_mismatch"`) {
 		t.Errorf("expected verified_tree_mismatch event:\n%s", logSink.String())
@@ -12539,6 +12739,243 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 	// No ref may have reached the bare remote — origin untouched.
 	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
 		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// scriptedVerifyCmd writes a verify script that prints the given text and
+// exits non-zero on EVERY invocation — the failure output is seeded BY
+// CONSTRUCTION so the assertions land on the classification, not on fixture
+// setup.
+func scriptedVerifyCmd(t *testing.T, output string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\ncat <<'FISHHAWK_VERIFY_EOF'\n"+output+"\nFISHHAWK_VERIFY_EOF\nexit 3\n")
+	return "sh " + script
+}
+
+// infraThenPassVerifyCmd writes a verify script that prints the given infra
+// signature and exits non-zero on its FIRST invocation (sentinel file outside
+// the worktree), then exits 0 on every later invocation — the one-shot
+// infrastructure failure the pre-push absorb is meant to swallow.
+func infraThenPassVerifyCmd(t *testing.T, output string) string {
+	t.Helper()
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "failed-once")
+	script := filepath.Join(dir, "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\n"+
+		"if [ ! -e "+sentinel+" ]; then\n"+
+		"  : > "+sentinel+"\n"+
+		"  cat <<'FISHHAWK_VERIFY_EOF'\n"+output+"\nFISHHAWK_VERIFY_EOF\n"+
+		"  exit 3\n"+
+		"fi\n"+
+		"exit 0\n")
+	return "sh " + script
+}
+
+// ordinaryFailOutput is a plain red-tree verify failure: an assertion failure
+// with no infrastructure signature of any kind (no container-start timeout, no
+// lint lock, no `signal: <name>` rendering).
+const ordinaryFailOutput = `--- FAIL: TestRegistryGet (0.00s)
+    reg_test.go:7: Get("x") = 0, want 42
+FAIL
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/registry	0.012s`
+
+func ordinaryFailVerifyCmd(t *testing.T) string {
+	t.Helper()
+	return scriptedVerifyCmd(t, ordinaryFailOutput)
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyRetriedThenPushes
+// is the #2645 recovery case: the base moved under the run, so the pre-push
+// strict re-verify runs — and fails ONCE for an infrastructure reason. The
+// absorb re-runs it in place against the same real head; the retry passes, so
+// the approved implement pass is pushed rather than discarded.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyRetriedThenPushes(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	var logSink strings.Builder
+	cfg := verifiedTreeCfg(repo, infraThenPassVerifyCmd(t, lintLockOutput2645))
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact = %v, want nil (the infra failure must be absorbed)\n%s", err, logSink.String())
+	}
+	logs := logSink.String()
+	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
+		t.Errorf("expected verified_tree_mismatch:\n%s", logs)
+	}
+	if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (once-per-stage bound)", n)
+	}
+	if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
+		t.Errorf("re-verify verify_run events = %d, want 2 (the failed re-verify AND its retry are both recorded)", n)
+	}
+	if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
+		t.Errorf("expected pushed_tree_reverified after the absorbed retry passed:\n%s", logs)
+	}
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should have run after the re-verified push")
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s missing from the bare remote after the absorbed retry passed: %v", branch, rerr)
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyClassifiesCategoryC
+// is the #2645 classification case: the re-verify fails for an infrastructure
+// reason BOTH times, so the absorb cannot save the pass — but the stage ends
+// category-C (retryable in place) instead of the category-B park that
+// discarded the approved implement pass twice. The push decision is unchanged:
+// origin stays untouched.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyClassifiesCategoryC(t *testing.T) {
+	for _, tc := range []struct{ name, output string }{
+		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
+		{"segfaulting git rev-parse (#2656 occurrence)", segfaultOutput2656},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, branch := verifiedTreeRepo(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+			if gerr != nil || verifiedTree == "" {
+				t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+			}
+
+			moveBareMain(t, bare)
+
+			var logSink strings.Builder
+			cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, tc.output))
+			err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+			if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
+				t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
+			}
+			if errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+				t.Errorf("the infra failure must NOT also wrap the category-B sentinel: %v", err)
+			}
+			if got := pushFailureCategory(err); got != "C" {
+				t.Errorf("pushFailureCategory = %q, want C (retryable in place)", got)
+			}
+			logs := logSink.String()
+			if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
+				t.Errorf("verify_infra_flake_retry events = %d, want exactly 1", n)
+			}
+			if fpr.gotArgs != nil {
+				t.Error("OpenPR must not run — the infra classification changes the recovery verb, never the push decision")
+			}
+			if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+				t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+			}
+		})
+	}
+}
+
+// TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB is #2645 AC4 /
+// operator condition 5 at its sharpest: the failure mode that matters is a
+// REAL scope violation slipping into a retry loop now that a previously
+// terminal classification is retryable. A stage that created a net-new file
+// outside its declared scope still fails category-B, with origin untouched.
+func TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seeded BY CONSTRUCTION: an undeclared net-new file in the working tree.
+	mustWrite(t, filepath.Join(repo, "created.txt"), "net-new, undeclared\n")
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrCreatedOutOfScope) {
+		t.Fatalf("err = %v, want ErrCreatedOutOfScope", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("a genuine scope violation must never match the infra sentinel: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B — a real scope violation must stay non-retryable", got)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a scope violation")
+	}
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the scope violation (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestVerifiedTreeMismatch_FailureMessageLeadsWithCommand is the done-means
+// behavioral test for #2645 AC3 / operator condition 7, which compilation
+// cannot enforce: BOTH pre-push failure messages must name the failing command
+// and what it printed BEFORE the tree-mismatch and scope-drift accounting that
+// sent the operator hunting for a scope problem that did not exist.
+func TestVerifiedTreeMismatch_FailureMessageLeadsWithCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name, output string
+		wantSentinel error
+	}{
+		{"infra failure (category-C)", lintLockOutput2645, gitops.ErrVerifyInfraFailure},
+		{"ordinary test failure (category-B)", ordinaryFailOutput, gitops.ErrPushedTreeNotVerified},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, _ := verifiedTreeRepo(t)
+			withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+			if gerr != nil || verifiedTree == "" {
+				t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+			}
+			moveBareMain(t, bare)
+
+			var logSink strings.Builder
+			cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, tc.output))
+			err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+			if !errors.Is(err, tc.wantSentinel) {
+				t.Fatalf("err = %v, want %v", err, tc.wantSentinel)
+			}
+			msg := err.Error()
+			cmdAt := strings.Index(msg, cfg.verifyCmd)
+			excerpt := verifyFailureExcerpt(tc.output)
+			excerptAt := strings.Index(msg, excerpt)
+			driftAt := strings.Index(msg, "excluded as scope drift")
+			treeAt := strings.Index(msg, "gates verified tree")
+			for _, probe := range []struct {
+				name string
+				at   int
+			}{{"verify command", cmdAt}, {"output excerpt", excerptAt}, {"scope-drift accounting", driftAt}, {"tree-mismatch clause", treeAt}} {
+				if probe.at < 0 {
+					t.Fatalf("message is missing its %s:\n%s", probe.name, msg)
+				}
+			}
+			if cmdAt > driftAt || cmdAt > treeAt {
+				t.Errorf("the failing command must lead the message, before the tree-mismatch and scope-drift accounting:\n%s", msg)
+			}
+			if excerptAt > driftAt || excerptAt > treeAt {
+				t.Errorf("the output excerpt must precede the tree-mismatch and scope-drift accounting:\n%s", msg)
+			}
+			// The full output is still there, unabridged, after the accounting.
+			if !strings.Contains(msg, tc.output) {
+				t.Errorf("the full verify output must still be appended:\n%s", msg)
+			}
+		})
 	}
 }
 

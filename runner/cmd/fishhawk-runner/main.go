@@ -2483,19 +2483,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// artifact does not meet a declared binding condition, so park
 				// for re-scope/re-plan. Everything else (network, git, GitHub
 				// API) is category-C infra.
-				if errors.Is(err, upload.ErrPullRequestInvalid) ||
-					errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
-					errors.Is(err, gitops.ErrCommittedTestsFailed) ||
-					errors.Is(err, gitops.ErrCreatedOutOfScope) ||
-					errors.Is(err, gitops.ErrBaseRebaseConflict) ||
-					errors.Is(err, gitops.ErrCommitOutOfScope) ||
-					errors.Is(err, gitops.ErrScopeFilesMissing) ||
-					errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
-					errors.Is(err, gitops.ErrPushedTreeNotVerified) {
-					res.FailureCategory = "B"
-				} else {
-					res.FailureCategory = "C"
-				}
+				// ErrVerifyInfraFailure (#2645) is category-C and is checked
+				// FIRST by pushFailureCategory — see its doc comment.
+				res.FailureCategory = pushFailureCategory(err)
 				res.FailureReason = err.Error()
 				invokeErr = err
 				// Bound the runner_failed line's detail (#1791): the detached
@@ -3766,6 +3756,36 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 // the existing non-blocking skip path (verify_fix_skipped), never category-A.
 const maxFixInvokeInfraRetries = 2
 
+// pushFailureCategory maps a failed implement push to its MVP_SPEC §6 failure
+// category. It is the extracted form of the classification chain the push call
+// site used inline, with ONE addition: gitops.ErrVerifyInfraFailure (#2645) is
+// checked FIRST and returns "C".
+//
+// That ordering is load-bearing, not cosmetic. errors.Is is disjunctive, so an
+// error that wrapped BOTH the infra sentinel and a category-B sentinel would
+// otherwise fall into the B chain and stay non-retryable — exactly the outcome
+// this change exists to remove. Checking the infra sentinel first makes the
+// category-C verdict survive such a wrap.
+//
+// Everything else (network, git, GitHub API) is category-C infra by default.
+func pushFailureCategory(err error) string {
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		return "C"
+	}
+	if errors.Is(err, upload.ErrPullRequestInvalid) ||
+		errors.Is(err, gitops.ErrCommitWouldNotCompile) ||
+		errors.Is(err, gitops.ErrCommittedTestsFailed) ||
+		errors.Is(err, gitops.ErrCreatedOutOfScope) ||
+		errors.Is(err, gitops.ErrBaseRebaseConflict) ||
+		errors.Is(err, gitops.ErrCommitOutOfScope) ||
+		errors.Is(err, gitops.ErrScopeFilesMissing) ||
+		errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
+		errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		return "B"
+	}
+	return "C"
+}
+
 // isTestcontainersStartFlake reports whether a failed verify's output matches
 // the testcontainers container-start-timeout signature (#972): under
 // full-suite parallel load a developer-Mac Docker daemon intermittently times
@@ -3799,6 +3819,123 @@ func isTestcontainersStartFlake(output string) bool {
 		}
 	}
 	return false
+}
+
+// golangciLintLockSignature is golangci-lint's refusal to start while another
+// process holds its global lock (#2645). Two concurrent local implement stages
+// reaching their verify gate at the same time make the loser's lint leg abort
+// with this line and a non-zero exit — contention between PROCESSES, which no
+// property of the diff under test can cause. The string is pinned by the
+// verbatim-occurrence row of TestIsVerifyInfraFailure; a golangci-lint upgrade
+// that reworded it simply stops matching (see the failure-safety note below).
+const golangciLintLockSignature = "parallel golangci-lint is running"
+
+// isVerifyInfraFailure reports whether a failed verify's output carries a
+// DIFF-INDEPENDENT infrastructure signature — one that cannot be caused by the
+// tree under test, so it is safe to recognize even where no prior verification
+// of that tree exists:
+//
+//   - the #972 testcontainers container-start timeout (isTestcontainersStartFlake);
+//   - golangci-lint's global-lock contention (golangciLintLockSignature).
+//
+// Both committed-tree gates use this to re-run the verify ONCE in place
+// (without invoking the fix agent and without consuming a fix iteration), and
+// the single-shot gate classifies a still-failing infra output as
+// gitops.ErrVerifyInfraFailure (category-C) rather than a category-B test
+// failure.
+//
+// It deliberately does NOT include the signal-death rule: see
+// isReverifyInfraFailure, which is restricted to the one site where the same
+// tree is known to have already verified.
+//
+// Failure is safe in both directions. A missed match degrades to today's
+// fail-the-stage behavior. A false positive costs at most one extra verify run
+// plus a RETRYABLE instead of parked category — it can never turn a red tree
+// green, because a push proceeds only on an explicit "passed" verify outcome
+// and a retry re-runs the same command.
+func isVerifyInfraFailure(output string) bool {
+	return isTestcontainersStartFlake(output) || strings.Contains(output, golangciLintLockSignature)
+}
+
+// signalDeathSignatures are the `signal: <name>` renderings os/exec produces
+// for a child killed by a signal (os.ProcessState.String → "signal: " +
+// syscall.Signal.String()). Matching the full two-token form — never the bare
+// word "signal" — keeps ordinary test prose that merely mentions signals from
+// matching.
+var signalDeathSignatures = []string{
+	"signal: segmentation fault",
+	"signal: bus error",
+	"signal: abort trap", // darwin rendering of SIGABRT
+	"signal: aborted",    // linux rendering of SIGABRT
+	"signal: illegal instruction",
+	"signal: floating point exception",
+	"signal: killed",
+	"signal: terminated",
+	"signal: hangup",
+}
+
+// isReverifyInfraFailure is the PRE-PUSH strict re-verify's matcher: the
+// diff-independent signatures above, PLUS a command that died on a signal
+// rather than exiting with a test verdict.
+//
+// The signal rule is deliberately scoped to this ONE call site because it is
+// the only one carrying prior evidence that the same tree already verified:
+// the committed-tree gate recorded a PASSING outcome for this diff, and the
+// strict re-verify of that same tree then died on a signal (both #2645
+// occurrences had exactly this shape — a green policy gate and `scripts/test
+// verify` at exit_code 0 before the push, then a lock-aborted lint leg and a
+// segfaulting `git rev-parse` respectively). Applied to a committed-tree gate
+// with NO such prior pass, a signal death does NOT support the
+// infrastructure claim: a diff can hang until a supervisor kills it, explode
+// memory into an OOM kill, or crash a subprocess it changed. Those gates keep
+// today's classification (isVerifyInfraFailure only).
+//
+// RESIDUAL, worth knowing before assuming infrastructure: even here,
+// "signal: killed" and "signal: terminated" can be rendered when a supervisor
+// kills a verify the DIFF itself made genuinely slow or hung — the prior pass
+// bounds but does not eliminate that, since the re-verify runs against a
+// different (base-advanced) tree. The classification stays failure-safe (the
+// push still requires an explicit "passed" outcome and a retry re-runs the
+// same command, so a red tree can never go green), but an operator seeing a
+// stage go category-C REPEATEDLY on this signature should inspect the change
+// for a hang or a memory blow-up rather than blame the host.
+func isReverifyInfraFailure(output string) bool {
+	if isVerifyInfraFailure(output) {
+		return true
+	}
+	for _, sig := range signalDeathSignatures {
+		if strings.Contains(output, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyFailureExcerpt returns a short, byte-capped tail of a failed verify's
+// output for the LEAD-IN of a failure message (#2645 AC3). The operator-facing
+// text must name the failing command and what it actually printed BEFORE the
+// tree-mismatch and scope-drift accounting; the full output is still appended
+// to the error unabridged.
+func verifyFailureExcerpt(out string) string {
+	const maxExcerptBytes = 512
+	const maxExcerptLines = 4
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, strings.TrimRight(line, "\r"))
+		}
+	}
+	if len(lines) == 0 {
+		return "(no output)"
+	}
+	if len(lines) > maxExcerptLines {
+		lines = lines[len(lines)-maxExcerptLines:]
+	}
+	excerpt := strings.Join(lines, " | ")
+	if len(excerpt) > maxExcerptBytes {
+		excerpt = "..." + excerpt[len(excerpt)-maxExcerptBytes:]
+	}
+	return excerpt
 }
 
 // runVerifyFixLoop is the committed-tree verify-fix loop (#651). It runs
@@ -3953,8 +4090,10 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			break
 		}
 
-		// Testcontainers start-timeout infra-flake absorb (#972): a failed
-		// verify whose output carries the container-start-timeout signature is
+		// Infrastructure-failure absorb (#972, widened by #2645): a failed
+		// verify whose output carries a diff-independent infra signature
+		// (isVerifyInfraFailure — container-start timeout or golangci-lint
+		// lock contention) is
 		// re-run ONCE in place — repeat the iteration via the existing loop
 		// body (re-stage, re-commit, re-verify) WITHOUT invoking the fix agent
 		// and WITHOUT advancing iter, mirroring the maxFixInvokeInfraRetries
@@ -3966,9 +4105,9 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// check so a flake on the last iteration is absorbed rather than
 		// demoting the stage category-A. Never silent: each absorb emits a
 		// verify_infra_flake_retry log line + trace event.
-		if !flakeRetried && isTestcontainersStartFlake(out) {
+		if !flakeRetried && isVerifyInfraFailure(out) {
 			flakeRetried = true
-			const detail = "testcontainers container-start timeout signature in verify output; re-running verify once without consuming a fix iteration"
+			const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once without consuming a fix iteration"
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, iter+1, detail)
@@ -4193,16 +4332,18 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
 	events := []agent.Event{ev}
 
-	// Testcontainers start-timeout infra-flake absorb (#972): a failed verify
-	// whose output carries the container-start-timeout signature is re-run
+	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
+	// whose output carries a diff-independent infra signature
+	// (isVerifyInfraFailure) is re-run
 	// ONCE against the SAME throwaway headSHA — still before the reset --soft
 	// below, so the (e)/(f) invariants are untouched. Both verify_run events
 	// plus the verify_infra_flake_retry event ship in the trace. Only if the
-	// retry also fails does the gate classify ErrCommittedTestsFailed as
-	// before; the single-shot gate has no loop, so the retry is inherently
+	// retry also fails does the gate classify the failure at (f) — as
+	// ErrVerifyInfraFailure when the signature persists, ErrCommittedTestsFailed
+	// otherwise; the single-shot gate has no loop, so the retry is inherently
 	// once-per-stage.
-	if outcome == "failed" && isTestcontainersStartFlake(out) {
-		const detail = "testcontainers container-start timeout signature in verify output; re-running verify once"
+	if outcome == "failed" && isVerifyInfraFailure(out) {
+		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, 1, detail)
@@ -4247,7 +4388,16 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 
 	// (f) Non-zero exit blocks as category-B, symmetric with #800. The infra
 	// "skipped" outcome stays tolerant here (reclassification is #959's scope).
+	// EXCEPT (#2645): a failure whose output STILL carries a diff-independent
+	// infra signature after the absorb above already re-ran it once is not a
+	// red tree — it is category-C infrastructure, so it wraps
+	// ErrVerifyInfraFailure and the stage stays retryable in place. A failure
+	// matching no infra signature keeps ErrCommittedTestsFailed verbatim.
 	if outcome == "failed" {
+		if isVerifyInfraFailure(out) {
+			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
+				gitops.ErrVerifyInfraFailure, cfg.verifyCmd, verifyFailureExcerpt(out), len(drift), strings.Join(drift, ", "), out)
+		}
 		return events, "", fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
 			gitops.ErrCommittedTestsFailed, cfg.verifyCmd, len(drift), strings.Join(drift, ", "), out)
 	}
@@ -6624,23 +6774,61 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// gating), so logSink — the channel carrying the rest of the
 		// invariant chain — is the record's home. `output` is omitted: the
 		// failure path embeds the full verify output in the returned
-		// ErrPushedTreeNotVerified error, and an unbounded blob would bloat
-		// a single JSONL line.
-		var evp struct {
-			Command  string `json:"command"`
-			HeadSHA  string `json:"head_sha"`
-			TreeSHA  string `json:"tree_sha"`
-			ExitCode int    `json:"exit_code"`
-			Outcome  string `json:"outcome"`
+		// ErrPushedTreeNotVerified / ErrVerifyInfraFailure error, and an
+		// unbounded blob would bloat a single JSONL line. Hoisted into a
+		// closure so the #2645 infra-absorb retry below records its own
+		// re-verify identically.
+		emitReverifyRun := func(ev agent.Event) {
+			var evp struct {
+				Command  string `json:"command"`
+				HeadSHA  string `json:"head_sha"`
+				TreeSHA  string `json:"tree_sha"`
+				ExitCode int    `json:"exit_code"`
+				Outcome  string `json:"outcome"`
+			}
+			_ = json.Unmarshal(ev.Payload, &evp)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_run","run_id":%q,"stage_id":%q,"command":%q,"head_sha":%q,"tree_sha":%q,"exit_code":%d,"outcome":%q}`+"\n",
+				cfg.runID, cfg.stageID, evp.Command, evp.HeadSHA, evp.TreeSHA, evp.ExitCode, evp.Outcome)
 		}
-		_ = json.Unmarshal(ev.Payload, &evp)
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"verify_run","run_id":%q,"stage_id":%q,"command":%q,"head_sha":%q,"tree_sha":%q,"exit_code":%d,"outcome":%q}`+"\n",
-			cfg.runID, cfg.stageID, evp.Command, evp.HeadSHA, evp.TreeSHA, evp.ExitCode, evp.Outcome)
+		emitReverifyRun(ev)
+		// Infrastructure-failure absorb for the STRICT RE-VERIFY (#2645), the
+		// pre-push sibling of the two committed-tree gates' absorb. This is the
+		// site where both recorded occurrences died: the gate had already
+		// passed this diff, an unrelated merge advanced the base so the real
+		// commit's tree differs, and the ONE re-verify then failed for an
+		// infrastructure reason — discarding an approved implement pass as
+		// category-B. Re-run it ONCE against the SAME real headSHA (bounded by
+		// the local once-flag), emitting the retry's verify_run record
+		// unconditionally exactly as the first re-verify does. Because the gate
+		// recorded a PASSING outcome for this diff, this site — and only this
+		// site — also treats a signal death as infrastructure
+		// (isReverifyInfraFailure).
+		if outcome != "passed" && isReverifyInfraFailure(out) {
+			const detail = "infrastructure-failure signature in the pre-push strict re-verify output; re-running the re-verify once against the same committed head"
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, 1, detail)
+			ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+			emitReverifyRun(ev)
+		}
 		if outcome != "passed" {
-			return fmt.Errorf("%w: gates verified tree %s but the staged commit %s carries tree %s, and the strict re-verify of %q did not pass (outcome %s); %d file(s) excluded as scope drift: %s\n%s",
-				gitops.ErrPushedTreeNotVerified, verifiedTreeSHA, headSHA, realTree,
-				cfg.verifyCmd, outcome, len(drift), strings.Join(drift, ", "), out)
+			// LEAD with the command that actually failed and a bounded excerpt
+			// of what it printed (#2645 AC3): both occurrences buried the real
+			// cause under the tree-mismatch and "N file(s) excluded as scope
+			// drift" accounting, which reads as a scope problem it is not. The
+			// full output is still appended unabridged.
+			lead := fmt.Sprintf("strict re-verify of %q did not pass (outcome %s): %s",
+				cfg.verifyCmd, outcome, verifyFailureExcerpt(out))
+			accounting := fmt.Sprintf("gates verified tree %s but the staged commit %s carries tree %s; %d file(s) excluded as scope drift: %s",
+				verifiedTreeSHA, headSHA, realTree, len(drift), strings.Join(drift, ", "))
+			// Split by cause: an infra failure that survived the absorb above
+			// is category-C (retryable in place), NOT the category-B park a
+			// genuine drift/test failure earns.
+			if isReverifyInfraFailure(out) {
+				return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrVerifyInfraFailure, lead, accounting, out)
+			}
+			return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrPushedTreeNotVerified, lead, accounting, out)
 		}
 		// The pushed SHA is now itself gate-verified. Stamp the forensic
 		// record with BOTH trees — verified_tree_sha is the ORIGINAL
