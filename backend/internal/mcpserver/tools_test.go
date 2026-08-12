@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,6 +35,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -6414,6 +6416,25 @@ func TestStartRun_LocalValidationCatchesBadInputs(t *testing.T) {
 // payload to ship.
 const validTrivialSpec = "version: \"0.3\"\nworkflows:\n  trivial:\n    stages:\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n"
 
+// specAtVersion renders the smallest schema-valid workflow body at the
+// given version string, mirroring backend/internal/spec's
+// minimalSpecAtVersion test helper. The workflows map is valid on its
+// own, so the ONLY possible schema violation is the version token —
+// the staleness-hint tests below depend on their fixtures violating
+// the spec exactly once BY CONSTRUCTION (#2326).
+func specAtVersion(version string) string {
+	return "version: \"" + version + "\"\n" + `workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+}
+
 // TestStartRun_AutoDiscoversSpecFromWorkingDir exercises the
 // headline #426 flow: an agent passes working_dir, the MCP server
 // walks for .fishhawk/workflows.yaml, ships the bytes inline, and
@@ -6499,10 +6520,23 @@ func TestStartRun_InlineSpec_InvalidYAMLFailsLocally(t *testing.T) {
 
 // TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint exercises
 // proposal 3 of #1422 at the startRun call site: an inline spec whose
-// version major is unsupported by the live binary surfaces the schema
-// error WITH the staleness/`/mcp` hint (the self-diagnosing path for a
-// silently-stale fishhawk-mcp), while the outer `workflow_spec:` prefix
-// from the call-site wrap is preserved.
+// version major is GENUINELY unsupported by the live binary surfaces
+// the schema error WITH the staleness/`/mcp` hint (the self-diagnosing
+// path for a silently-stale fishhawk-mcp), while the outer
+// `workflow_spec:` prefix from the call-site wrap is preserved.
+//
+// The fixture is anchored on major 3 because major 2 became routable
+// with workflow-v2 (ADR-067 / #2213) — a "2.0" spec is a SUPPORTED
+// major failing its version enum, not an unsupported version — and the
+// pre-#2326 two-violation fixture (`version: "2.0"` + `workflows: {}`)
+// left which of the two unordered schema causes surfaced to a coin
+// flip. An unrouted major fails closed in schemaForVersion BEFORE any
+// schema validation runs, and specAtVersion's workflows body is
+// schema-valid on its own, so this fixture has exactly one violation
+// by construction. The day a workflow-v3 schema joins the
+// embeddedSchemas routing table this anchor must move to the next
+// unrouted major — the same maintenance note carried by spec's
+// TestParse_UnsupportedMajorFailsClosed.
 func TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -6510,7 +6544,7 @@ func TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint(t *testing.T) {
 	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
 		Repo:         "x/y",
 		WorkflowID:   "trivial",
-		WorkflowSpec: "version: \"2.0\"\nworkflows: {}\n",
+		WorkflowSpec: specAtVersion("3.0"),
 	})
 	if err == nil {
 		t.Fatal("expected validation error")
@@ -6520,6 +6554,73 @@ func TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "/mcp") {
 		t.Errorf("unsupported-version error should gain the /mcp staleness hint: %v", err)
+	}
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err should unwrap to *spec.SchemaError through the hint wrap: %v", err)
+	}
+	if se.Path != "/version" {
+		t.Errorf("SchemaError.Path = %q, want \"/version\": %v", se.Path, err)
+	}
+	// Generic on the majors list (not the literal "0, 1, 2") so only the
+	// version token moves when major 3 lands.
+	if !strings.Contains(err.Error(), "unsupported spec version") ||
+		!strings.Contains(err.Error(), "major 3") {
+		t.Errorf("err should name the unsupported major: %v", err)
+	}
+	if strings.Contains(err.Error(), "/workflows") {
+		t.Errorf("err mentions /workflows — the fixture must violate the spec exactly once, on /version: %v", err)
+	}
+}
+
+// TestStartRun_InlineSpec_DottedV2Minor_GainsStaleHint covers the branch
+// the pre-#2326 fixture actually exercised: a SUPPORTED major whose
+// dotted minor form ("2.0") fails the workflow-v2 single-token version
+// enum. resolveV2Reuse reports this deterministically BEFORE schema
+// validation (#2216) as a *spec.SchemaError at Path "/version" with
+// message "value must be '2'" — NOT an unsupported-version message,
+// because major 2 routes. annotateStaleSpecError keys on the "/version"
+// PATH generally, not on unsupported-major specifically, which is why
+// this branch gains the /mcp hint too. The workflows body is
+// schema-valid on its own (construction guard below), so the fixture
+// has exactly one violation regardless of which layer reports it.
+func TestStartRun_InlineSpec_DottedV2Minor_GainsStaleHint(t *testing.T) {
+	// Construction guard: the same body under the valid single-token v2
+	// version parses green, proving the dotted version token is this
+	// fixture's only violation.
+	if _, err := spec.ParseBytes([]byte(specAtVersion("2"))); err != nil {
+		t.Fatalf("specAtVersion's workflows body must be schema-valid on its own: %v", err)
+	}
+
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: specAtVersion("2.0"),
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "workflow_spec") {
+		t.Errorf("err should retain the workflow_spec prefix: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/mcp") {
+		t.Errorf("dotted-v2-minor error should gain the /mcp staleness hint: %v", err)
+	}
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err should unwrap to *spec.SchemaError through the hint wrap: %v", err)
+	}
+	if se.Path != "/version" {
+		t.Errorf("SchemaError.Path = %q, want \"/version\": %v", se.Path, err)
+	}
+	if !strings.Contains(err.Error(), "value must be '2'") {
+		t.Errorf("err should carry the v2 version-enum message: %v", err)
+	}
+	if strings.Contains(err.Error(), "/workflows") {
+		t.Errorf("err mentions /workflows — the fixture must violate the spec exactly once, on /version: %v", err)
 	}
 }
 
