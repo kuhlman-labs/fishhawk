@@ -233,8 +233,9 @@ var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified 
 // command that did not COMPLETE for a reason outside the diff (#2645): a
 // tool's global lock held by a concurrent process (golangci-lint's
 // `parallel golangci-lint is running`), a container-start timeout under
-// daemon load (#972), or — only where the SAME tree already verified once —
-// a command killed by a signal. That is MVP_SPEC §6 category-C
+// daemon load (#972), or — only at the pre-push strict re-verify, and only
+// where the change's own in-scope content already ran this verify command to
+// completion — a command killed by a signal. That is MVP_SPEC §6 category-C
 // infrastructure: the stage is retryable in place via fishhawk_retry_stage
 // rather than parked for a re-scope/re-plan.
 //

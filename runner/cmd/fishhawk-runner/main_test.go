@@ -9838,34 +9838,75 @@ FAIL	github.com/kuhlman-labs/fishhawk/runner/cmd/fishhawk-runner`
 
 // TestIsVerifyInfraFailure pins BOTH matchers and, load-bearingly, the
 // NARROWING between them (#2645 operator condition 1): the signal-death rule
-// belongs only to the pre-push strict re-verify (isReverifyInfraFailure),
-// where the same tree is known to have already verified. The committed-tree
-// gates' matcher (isVerifyInfraFailure) must NOT claim a signal death, because
-// a diff can hang into a supervisor kill, OOM, or crash a subprocess.
+// belongs only to the pre-push strict re-verify (isReverifyInfraFailure), and
+// only when that site's evidence holds. The committed-tree gates' matcher
+// (isVerifyInfraFailure) must NOT claim a signal death, because a diff can hang
+// into a supervisor kill, OOM, or crash a subprocess — and neither must the
+// re-verify's matcher when the evidence is absent (signalRuleAdmissible=false),
+// which is the same-shaped assertion at the third column.
 func TestIsVerifyInfraFailure(t *testing.T) {
 	tests := []struct {
-		name         string
-		output       string
-		wantInfra    bool // isVerifyInfraFailure (diff-independent only)
-		wantReverify bool // isReverifyInfraFailure (adds the signal rule)
+		name      string
+		output    string
+		wantInfra bool // isVerifyInfraFailure (diff-independent only)
+		wantOK    bool // isReverifyInfraFailure with the signal rule ADMITTED
+		wantNotOK bool // isReverifyInfraFailure with the signal rule REFUSED
 	}{
-		{"verbatim #2645 golangci-lint lock contention", lintLockOutput2645, true, true},
-		{"verbatim #2656 segfaulting git rev-parse", segfaultOutput2656, false, true},
-		{"OOM kill rendering", "--- FAIL: TestBig (12.00s)\n    big_test.go:9: exit status: signal: killed\nFAIL", false, true},
-		{"supervisor terminate rendering", "signal: terminated\nFAIL\texample.com/mod", false, true},
-		{"verbatim #972 approval-package failure", flakeOutputApproval, true, true},
-		{"verbatim #972 audit-package failure", flakeOutputAudit, true, true},
-		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false, false},
-		{"prose mentioning signals but no signal: <name> rendering", "--- FAIL: TestNotifier (0.01s)\n    notifier_test.go:12: expected a signal on the channel; got none (signal handling is async)\nFAIL", false, false},
-		{"empty output", "", false, false},
+		{"verbatim #2645 golangci-lint lock contention", lintLockOutput2645, true, true, true},
+		{"verbatim #2656 segfaulting git rev-parse", segfaultOutput2656, false, true, false},
+		{"OOM kill rendering", "--- FAIL: TestBig (12.00s)\n    big_test.go:9: exit status: signal: killed\nFAIL", false, true, false},
+		{"supervisor terminate rendering", "signal: terminated\nFAIL\texample.com/mod", false, true, false},
+		{"verbatim #972 approval-package failure", flakeOutputApproval, true, true, true},
+		{"verbatim #972 audit-package failure", flakeOutputAudit, true, true, true},
+		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false, false, false},
+		{"prose mentioning signals but no signal: <name> rendering", "--- FAIL: TestNotifier (0.01s)\n    notifier_test.go:12: expected a signal on the channel; got none (signal handling is async)\nFAIL", false, false, false},
+		{"empty output", "", false, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isVerifyInfraFailure(tt.output); got != tt.wantInfra {
 				t.Errorf("isVerifyInfraFailure(...) = %v, want %v\noutput:\n%s", got, tt.wantInfra, tt.output)
 			}
-			if got := isReverifyInfraFailure(tt.output); got != tt.wantReverify {
-				t.Errorf("isReverifyInfraFailure(...) = %v, want %v\noutput:\n%s", got, tt.wantReverify, tt.output)
+			if got := isReverifyInfraFailure(tt.output, true); got != tt.wantOK {
+				t.Errorf("isReverifyInfraFailure(..., admissible=true) = %v, want %v\noutput:\n%s", got, tt.wantOK, tt.output)
+			}
+			if got := isReverifyInfraFailure(tt.output, false); got != tt.wantNotOK {
+				t.Errorf("isReverifyInfraFailure(..., admissible=false) = %v, want %v\noutput:\n%s", got, tt.wantNotOK, tt.output)
+			}
+		})
+	}
+}
+
+// TestReverifySignalRuleAdmissible pins the #2645 operator-condition-1
+// narrowing at its decision point. The signal rule buys the infrastructure
+// classification only on evidence that the CHANGE's own content already ran
+// this verify command to completion: the verified-tree → committed-tree delta
+// must be resolved, non-empty, and confined to paths the change did not
+// declare. A delta touching a declared scope file means the content being
+// re-verified is NOT the content that passed, so the rule is refused and the
+// failure keeps today's category-B classification.
+func TestReverifySignalRuleAdmissible(t *testing.T) {
+	scope := []string{"a.txt", "backend/internal/server/handlers.go"}
+	tests := []struct {
+		name      string
+		delta     []string
+		resolved  bool
+		wantAdmit bool
+	}{
+		{"base-advance only", []string{"A\tb.txt", "M\tdocs/README.md"}, true, true},
+		{"delta touches a declared scope file", []string{"A\tb.txt", "M\ta.txt"}, true, false},
+		{"delta touches a nested declared scope file", []string{"M\tbackend/internal/server/handlers.go"}, true, false},
+		{"rename whose OLD path is a scope file", []string{"R100\ta.txt\tmoved.txt"}, true, false},
+		{"rename whose NEW path is a scope file", []string{"R100\tmoved.txt\ta.txt"}, true, false},
+		{"rename of base-only paths", []string{"R100\told.txt\tnew.txt"}, true, true},
+		{"delta unresolved (diff-tree failed, fail-open forensics)", []string{"A\tb.txt"}, false, false},
+		{"delta empty though the trees differ — an anomaly, not evidence", nil, true, false},
+		{"unparseable record is compared, not dropped", []string{"a.txt"}, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reverifySignalRuleAdmissible(tt.delta, tt.resolved, scope); got != tt.wantAdmit {
+				t.Errorf("reverifySignalRuleAdmissible(%q, resolved=%v) = %v, want %v", tt.delta, tt.resolved, got, tt.wantAdmit)
 			}
 		})
 	}
@@ -12772,6 +12813,25 @@ func infraThenPassVerifyCmd(t *testing.T, output string) string {
 	return "sh " + script
 }
 
+// firstThenRestVerifyCmd writes a verify script that fails with `first` on its
+// FIRST invocation and with `rest` on every later one — the MIXED-CAUSE shape
+// both absorb sites must split on the RETRY's output, not the first failure's.
+func firstThenRestVerifyCmd(t *testing.T, first, rest string) string {
+	t.Helper()
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "failed-once")
+	script := filepath.Join(dir, "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\n"+
+		"if [ ! -e "+sentinel+" ]; then\n"+
+		"  : > "+sentinel+"\n"+
+		"  cat <<'FISHHAWK_VERIFY_EOF'\n"+first+"\nFISHHAWK_VERIFY_EOF\n"+
+		"  exit 3\n"+
+		"fi\n"+
+		"cat <<'FISHHAWK_VERIFY_EOF'\n"+rest+"\nFISHHAWK_VERIFY_EOF\n"+
+		"exit 3\n")
+	return "sh " + script
+}
+
 // ordinaryFailOutput is a plain red-tree verify failure: an assertion failure
 // with no infrastructure signature of any kind (no container-start timeout, no
 // lint lock, no `signal: <name>` rendering).
@@ -12883,11 +12943,18 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyClassifiesCateg
 	}
 }
 
-// TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB is #2645 AC4 /
-// operator condition 5 at its sharpest: the failure mode that matters is a
-// REAL scope violation slipping into a retry loop now that a previously
-// terminal classification is retryable. A stage that created a net-new file
-// outside its declared scope still fails category-B, with origin untouched.
+// TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB pins the
+// created-out-of-scope path this change does not touch: a stage that created a
+// net-new file outside its declared scope still fails category-B, with origin
+// untouched.
+//
+// HONEST LABELLING (review of the first #2645 pass): this test does NOT
+// exercise the new reclassification — it fails before the pre-push re-verify
+// runs at all, so it would pass with the classification split deleted. The
+// AC4 / operator-condition-5 proof that a genuine scope-drift-induced strict
+// re-verify failure stays category-B is
+// TestOpenPRAndShipArtifact_ScopeDriftReverifyFailureStaysCategoryB below,
+// which does red when the split is removed.
 func TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB(t *testing.T) {
 	repo, bare, branch := verifiedTreeRepo(t)
 	fpr := withFakePROpenerOnly(t)
@@ -12915,6 +12982,217 @@ func TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB(t *testing.T) {
 	}
 	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
 		t.Errorf("run branch %s reached the bare remote despite the scope violation (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// commitPushedBaseFile commits `name` on top of the fixture's base and pushes
+// it to the bare origin, so it is part of the authoritative base FreshFetchBase
+// re-fetches. It stages ONLY that file, leaving the fixture's dirty in-scope
+// edit alone.
+func commitPushedBaseFile(t *testing.T, repo, name, content string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(repo, name), content)
+	for _, args := range [][]string{{"add", name}, {"commit", "-m", "base file " + name}, {"push", "origin", "main"}} {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+// TestOpenPRAndShipArtifact_ScopeDriftReverifyFailureStaysCategoryB is the
+// #2645 AC4 / operator-condition-5 proof, at the site this change actually
+// alters. A stage carrying REAL scope drift (a dirty tracked file outside its
+// declared scope, excluded from the commit) reaches the pre-push strict
+// re-verify because the base moved, and the re-verify fails for an ORDINARY
+// reason. That is the failure mode that must not slip into a retry loop now
+// that a previously terminal classification is retryable: it stays
+// ErrPushedTreeNotVerified / category-B, the drift is still accounted for, and
+// origin is untouched.
+//
+// Unlike TestOpenPRAndShipArtifact_GenuineOutOfScopeStaysCategoryB, this one
+// runs THROUGH the new classification split, so deleting the split reddens it.
+func TestOpenPRAndShipArtifact_ScopeDriftReverifyFailureStaysCategoryB(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seeded BY CONSTRUCTION: a tracked file that is NOT in scope.files, dirtied
+	// in the working tree — StageScoped excludes it and reports it as drift.
+	commitPushedBaseFile(t, repo, "drift.txt", "tracked, out of scope\n")
+	mustWrite(t, filepath.Join(repo, "drift.txt"), "dirtied out-of-scope edit\n")
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	var logSink strings.Builder
+	cfg := verifiedTreeCfg(repo, ordinaryFailVerifyCmd(t))
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("a genuine re-verify failure on a drift-carrying stage must NOT classify infra: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B — a real scope-drift failure must stay non-retryable", got)
+	}
+	if !strings.Contains(err.Error(), "drift.txt") || !strings.Contains(err.Error(), "excluded as scope drift") {
+		t.Errorf("the message must still account for the excluded drift:\n%s", err)
+	}
+	if n := strings.Count(logSink.String(), `"event":"verify_infra_flake_retry"`); n != 0 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 0 (the absorb must not fire on a real failure)", n)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a blocked push")
+	}
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestOpenPRAndShipArtifact_SignalDeathWithScopeDeltaStaysCategoryB is the
+// integration proof of the #2645 operator-condition-1 NARROWING. The signal
+// rule buys the infrastructure classification only when the change's own
+// declared content is byte-identical to what the gate already verified. Here it
+// is NOT: the in-scope file is edited again AFTER the gate passed, so the
+// verified-tree → committed-tree delta touches a.txt and the re-verified tree
+// contains change content that never ran this verify command. A signal death
+// then proves nothing about infrastructure, and the failure keeps today's
+// category-B classification.
+func TestOpenPRAndShipArtifact_SignalDeathWithScopeDeltaStaysCategoryB(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	// Seeded BY CONSTRUCTION: the in-scope file changes AFTER the gate's pass,
+	// so the tree about to be pushed carries change content the gate never ran.
+	mustWrite(t, filepath.Join(repo, "a.txt"), "agent change, edited again after the gate\n")
+
+	var logSink strings.Builder
+	cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, segfaultOutput2656))
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("a signal death on a tree whose IN-SCOPE content never verified must NOT classify infra: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B", got)
+	}
+	logs := logSink.String()
+	if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 0 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 0 (the signal rule is inadmissible here)", n)
+	}
+	if n := strings.Count(logs, `"event":"verify_run"`); n != 1 {
+		t.Errorf("re-verify verify_run events = %d, want exactly 1 (no absorb retry)", n)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a blocked push")
+	}
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestOpenPRAndShipArtifact_MixedCauseReverifyClassifiesCategoryB covers the
+// MIXED-CAUSE path at the pre-push absorb: the FIRST re-verify fails with an
+// infra signature (so the absorb fires) and the RETRY then fails for an
+// ORDINARY reason. The split must read the RETRY's output — the tree is red,
+// so the verdict is ErrPushedTreeNotVerified / category-B, not the category-C
+// the first failure alone would have bought.
+func TestOpenPRAndShipArtifact_MixedCauseReverifyClassifiesCategoryB(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	var logSink strings.Builder
+	cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, lintLockOutput2645, ordinaryFailOutput))
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Fatalf("err = %v, want ErrPushedTreeNotVerified (the RETRY's ordinary failure decides)", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("the first failure's infra signature must not survive an ordinary retry failure: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B", got)
+	}
+	if !strings.Contains(err.Error(), ordinaryFailOutput) {
+		t.Errorf("the message must carry the RETRY's output, not the absorbed first failure's:\n%s", err)
+	}
+	logs := logSink.String()
+	if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (the absorb did fire)", n)
+	}
+	if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
+		t.Errorf("re-verify verify_run events = %d, want 2 (both the absorbed failure and its retry)", n)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a blocked push")
+	}
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+}
+
+// TestRunVerifyGateCommitted_MixedCauseClassifiesCommittedTestsFailed is the
+// same MIXED-CAUSE shape at the single-shot committed-tree gate: an infra
+// failure absorbed once, then an ordinary failure on the retry. The gate must
+// classify from the retry's output — ErrCommittedTestsFailed / category-B.
+func TestRunVerifyGateCommitted_MixedCauseClassifiesCommittedTestsFailed(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, lintLockOutput2645, ordinaryFailOutput))
+	var logSink strings.Builder
+	events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("err = %v, want ErrCommittedTestsFailed (the RETRY's ordinary failure decides)", err)
+	}
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Errorf("the absorbed first failure's infra signature must not decide the verdict: %v", err)
+	}
+	if got := pushFailureCategory(err); got != "B" {
+		t.Errorf("pushFailureCategory = %q, want B", got)
+	}
+	if tree != "" {
+		t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+	}
+	var verifyRuns, retries int
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+		case "verify_infra_flake_retry":
+			retries++
+		}
+	}
+	if verifyRuns != 2 || retries != 1 {
+		t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
 	}
 }
 

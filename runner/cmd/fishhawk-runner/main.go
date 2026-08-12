@@ -3845,14 +3845,27 @@ const golangciLintLockSignature = "parallel golangci-lint is running"
 // failure.
 //
 // It deliberately does NOT include the signal-death rule: see
-// isReverifyInfraFailure, which is restricted to the one site where the same
-// tree is known to have already verified.
+// isReverifyInfraFailure, which admits it only where the change's own
+// contribution is known to have already verified.
 //
 // Failure is safe in both directions. A missed match degrades to today's
 // fail-the-stage behavior. A false positive costs at most one extra verify run
 // plus a RETRYABLE instead of parked category — it can never turn a red tree
 // green, because a push proceeds only on an explicit "passed" verify outcome
 // and a retry re-runs the same command.
+//
+// RESIDUAL — the input is UNTRUSTED. Verify output is influenced by the diff
+// under test: a test the agent authored can print arbitrary text, including
+// the literal lint-lock line or a `signal: <name>` rendering inside a log
+// message. A diff that embeds an infra signature in its failing output steers
+// its own genuine category-B failure to category-C, converting a terminal park
+// into a retry loop. That is deliberately accepted here because the failure
+// safety above bounds it to retry CHURN and delayed parking: the push decision
+// reads the verify OUTCOME, never this classifier, so origin is still touched
+// only on an explicit "passed", and each retry re-runs the same command and
+// re-fails. It is NOT a verified-tree bypass. A stage that keeps returning
+// category-C on a signature its own output produces should be inspected, not
+// retried indefinitely.
 func isVerifyInfraFailure(output string) bool {
 	return isTestcontainersStartFlake(output) || strings.Contains(output, golangciLintLockSignature)
 }
@@ -3874,41 +3887,111 @@ var signalDeathSignatures = []string{
 	"signal: hangup",
 }
 
-// isReverifyInfraFailure is the PRE-PUSH strict re-verify's matcher: the
-// diff-independent signatures above, PLUS a command that died on a signal
-// rather than exiting with a test verdict.
-//
-// The signal rule is deliberately scoped to this ONE call site because it is
-// the only one carrying prior evidence that the same tree already verified:
-// the committed-tree gate recorded a PASSING outcome for this diff, and the
-// strict re-verify of that same tree then died on a signal (both #2645
-// occurrences had exactly this shape — a green policy gate and `scripts/test
-// verify` at exit_code 0 before the push, then a lock-aborted lint leg and a
-// segfaulting `git rev-parse` respectively). Applied to a committed-tree gate
-// with NO such prior pass, a signal death does NOT support the
-// infrastructure claim: a diff can hang until a supervisor kills it, explode
-// memory into an OOM kill, or crash a subprocess it changed. Those gates keep
-// today's classification (isVerifyInfraFailure only).
-//
-// RESIDUAL, worth knowing before assuming infrastructure: even here,
-// "signal: killed" and "signal: terminated" can be rendered when a supervisor
-// kills a verify the DIFF itself made genuinely slow or hung — the prior pass
-// bounds but does not eliminate that, since the re-verify runs against a
-// different (base-advanced) tree. The classification stays failure-safe (the
-// push still requires an explicit "passed" outcome and a retry re-runs the
-// same command, so a red tree can never go green), but an operator seeing a
-// stage go category-C REPEATEDLY on this signature should inspect the change
-// for a hang or a memory blow-up rather than blame the host.
-func isReverifyInfraFailure(output string) bool {
-	if isVerifyInfraFailure(output) {
-		return true
-	}
+// isSignalDeath reports whether a failed verify's output carries a
+// `signal: <name>` rendering — the command died on a signal rather than
+// exiting with a test verdict.
+func isSignalDeath(output string) bool {
 	for _, sig := range signalDeathSignatures {
 		if strings.Contains(output, sig) {
 			return true
 		}
 	}
 	return false
+}
+
+// treeDeltaPaths extracts the repo-relative paths from `git diff-tree -r
+// --name-status` records (gitDiffTreeNameStatus): a TAB-separated status field
+// followed by one path, or TWO paths for a rename/copy (`R100 old new`). Every
+// path field is returned — a rename's OLD path matters as much as its new one
+// when deciding whether the change's own files moved between the two trees.
+// A record with no TAB is returned verbatim, so a shape this parser does not
+// understand is compared rather than dropped.
+func treeDeltaPaths(treeDelta []string) []string {
+	var paths []string
+	for _, rec := range treeDelta {
+		fields := strings.Split(rec, "\t")
+		if len(fields) < 2 {
+			paths = append(paths, strings.TrimSpace(rec))
+			continue
+		}
+		for _, p := range fields[1:] {
+			if p = strings.TrimSpace(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
+}
+
+// reverifySignalRuleAdmissible decides whether the pre-push strict re-verify
+// may treat a signal death as infrastructure (#2645 operator condition 1).
+//
+// The condition asked for the signal rule to fire ONLY where the SAME tree
+// already verified. That literal precondition is UNSATISFIABLE at this site by
+// construction: the strict re-verify runs only when the gate-verified tree and
+// the real committed tree DIFFER (equal trees short-circuit on
+// verified_tree_match), so the tree being re-verified is never the tree that
+// passed. Taking the condition at its word would mean dropping the signal rule
+// entirely — and with it the segfault occurrence the issue reports.
+//
+// So this is the strongest evidence the site actually carries, and the rule is
+// admitted only when ALL of it holds:
+//
+//   - the gate recorded a PASSING outcome for this change (the caller only
+//     reaches the re-verify with a non-empty verifiedTreeSHA);
+//   - the verified-tree → committed-tree delta RESOLVED (a fail-open
+//     diff-tree error leaves it unknown, and unknown is not evidence);
+//   - the delta is non-empty (the trees differ, so an empty delta is an
+//     anomaly, not a proof of sameness);
+//   - and NO path in that delta is one of the change's declared scope files.
+//
+// The last conjunct is what carries the claim: every differing path came from
+// the advanced base, so the change's own contribution is byte-identical to the
+// content that already ran this verify command to completion. A diff that
+// hangs into a supervisor kill, OOMs, or crashes a subprocess it changed would
+// have done so at the gate.
+//
+// RESIDUAL, and it is real: this bounds the CHANGE as the cause, not the new
+// BASE or its interaction with the change. The re-verified tree contains base
+// content the gate never saw, so "signal: killed" / "signal: terminated" can
+// still be rendered when a supervisor kills a verify that the merged base — or
+// the base combined with this change — made genuinely slow or hung. The
+// classification stays failure-safe (the push still requires an explicit
+// "passed" outcome and a retry re-runs the same command, so a red tree can
+// never go green), but an operator seeing a stage go category-C REPEATEDLY on
+// this signature should inspect the change and the freshly merged base for a
+// hang or a memory blow-up rather than blame the host.
+func reverifySignalRuleAdmissible(treeDelta []string, deltaResolved bool, scopeFiles []string) bool {
+	if !deltaResolved || len(treeDelta) == 0 {
+		return false
+	}
+	scope := make(map[string]struct{}, len(scopeFiles))
+	for _, f := range scopeFiles {
+		scope[f] = struct{}{}
+	}
+	for _, p := range treeDeltaPaths(treeDelta) {
+		if _, ok := scope[p]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+// isReverifyInfraFailure is the PRE-PUSH strict re-verify's matcher: the
+// diff-independent signatures above, PLUS — only when signalRuleAdmissible
+// (see reverifySignalRuleAdmissible) — a command that died on a signal rather
+// than exiting with a test verdict.
+//
+// The signal rule reaches no other call site. At a committed-tree gate there
+// is no prior pass of the change's content at all, so a signal death does NOT
+// support the infrastructure claim: a diff can hang until a supervisor kills
+// it, explode memory into an OOM kill, or crash a subprocess it changed. Those
+// gates keep today's classification (isVerifyInfraFailure only).
+func isReverifyInfraFailure(output string, signalRuleAdmissible bool) bool {
+	if isVerifyInfraFailure(output) {
+		return true
+	}
+	return signalRuleAdmissible && isSignalDeath(output)
 }
 
 // verifyFailureExcerpt returns a short, byte-capped tail of a failed verify's
@@ -6801,10 +6884,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// category-B. Re-run it ONCE against the SAME real headSHA (bounded by
 		// the local once-flag), emitting the retry's verify_run record
 		// unconditionally exactly as the first re-verify does. Because the gate
-		// recorded a PASSING outcome for this diff, this site — and only this
-		// site — also treats a signal death as infrastructure
-		// (isReverifyInfraFailure).
-		if outcome != "passed" && isReverifyInfraFailure(out) {
+		// recorded a PASSING outcome for a tree whose in-scope content is
+		// byte-identical to this one, this site — and only this site, and only
+		// when that evidence holds (reverifySignalRuleAdmissible) — also
+		// treats a signal death as infrastructure.
+		signalRuleOK := reverifySignalRuleAdmissible(treeDelta, tdErr == nil, gateScopeFiles)
+		if outcome != "passed" && isReverifyInfraFailure(out, signalRuleOK) {
 			const detail = "infrastructure-failure signature in the pre-push strict re-verify output; re-running the re-verify once against the same committed head"
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -6825,7 +6910,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// Split by cause: an infra failure that survived the absorb above
 			// is category-C (retryable in place), NOT the category-B park a
 			// genuine drift/test failure earns.
-			if isReverifyInfraFailure(out) {
+			if isReverifyInfraFailure(out, signalRuleOK) {
 				return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrVerifyInfraFailure, lead, accounting, out)
 			}
 			return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrPushedTreeNotVerified, lead, accounting, out)
