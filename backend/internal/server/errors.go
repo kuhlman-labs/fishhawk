@@ -28,6 +28,8 @@ type errorBody struct {
 	// on 4xx and when no requestID middleware ran, so 4xx bytes are unchanged.
 	// It is the caller's own X-Request-ID echoed back, NOT a server-authenticated
 	// identifier — a client may supply its own X-Request-ID (middleware.go:155).
+	// TestWriteError_5xxWithoutRequestIDOmitsErrorRef pins the omitted-when-no-
+	// request-id claim (E67.30 / #2636) on the shipped bytes.
 	ErrorRef string `json:"error_ref,omitempty"`
 }
 
