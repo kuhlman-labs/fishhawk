@@ -496,7 +496,9 @@ type AcceptanceCriterion struct {
 	// default-deny egress sandbox cannot produce). When true, ExpectationBasis
 	// is required (enforced by the schema's presence-aware if/then). A plan
 	// whose every criterion is so marked short-circuits acceptance dispatch to a
-	// passed verdict (AcceptanceBasisAllSkipWithBasis). Additive-optional (#1748).
+	// plan.AcceptanceVerdictNotValidated verdict (basis
+	// AcceptanceBasisAllSkipWithBasis), having verified ZERO criteria —
+	// merge-eligible but NOT a validated pass (#2347). Additive-optional (#1748).
 	SkipExpected bool `json:"skip_expected,omitempty"`
 	// ExpectationBasis cites where the criterion's expectation is actually
 	// validated (e.g. the integration/e2e test with a fake). Required when
