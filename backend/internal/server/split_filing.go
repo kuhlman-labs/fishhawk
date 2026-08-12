@@ -165,6 +165,39 @@ type filedChild struct {
 // whose provider File succeeded but whose marker never persisted re-files once
 // on a re-approval — is the same at-least-once seam ExecuteFiling documents
 // (GitHub's issue-create API offers no idempotency key to close it).
+//
+// NO IN-PROCESS LOCK, AND THAT IS A RECORDED DECISION (E50.16 / #2657 — the
+// OPERATOR's, not an oversight and not a re-derivation). The completion-marker
+// dedup below is an unlocked list-then-append, and this hook holds no mutex
+// around it, while its sibling fileOrLinkLiveValidationWalk
+// (live_validation_filing.go) holds a per-run one. That is NOT a principled
+// difference between the two hooks — at this layer there is none. The concurrent
+// double-file this hook exhibited before E50.15 / #2656 is closed UPSTREAM by
+// the approve compare-and-swap (advanceStage → casTransitionFromObserved): a
+// raced second approval is refused at the advance and never reaches
+// finishApprovalAdvance's hook tail, which is this hook's only production call
+// site (approvals.go). The production RunRepo is the postgres one, which
+// implements run.StageCASTransitioner, so casTransitionFromObserved's non-CAS
+// degradation is reachable only by in-memory test fakes. The CAS therefore
+// covers every path a deployed daemon can take, and a second in-process mutex
+// here would defend only a path that cannot occur outside tests — while implying
+// a cross-process guarantee an in-process map cannot make.
+//
+// THE RESIDUAL, stated plainly for whoever changes this next: if the CAS is ever
+// removed, or the run.StageCASTransitioner capability assert is dropped, BOTH
+// hooks lose their protection — and THIS one loses it FIRST and SILENTLY,
+// because it has nothing underneath. That is measured, not asserted: with the
+// CAS deleted, split-child filings went 3 → 6 (two split_children_filed markers)
+// while the walk's count stayed at 1, held up by its retained mutex alone
+// (approve_advance_cas_test.go's concurrent case).
+//
+// MARKER ORDERING vs the sibling hook: this hook writes each per-phase
+// work_item_filed marker AFTER the child is filed, which preserves per-ordinal
+// resume across a partial N-child run at the cost of the at-least-once residual
+// above. The walk writes its intent marker BEFORE the forge call, buying
+// duplicate prevention for a single all-or-nothing filing at the cost of a
+// stranded-intent residual. The difference follows from resume semantics, not
+// from a difference in self-protection.
 func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage) {
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
 		return
