@@ -29,6 +29,13 @@ import (
 //   - trace.go deployEnvironmentForRun returns the FIRST non-empty entry's
 //     first element → `staging`.
 //
+// E23.18 / #2324 UPDATE: deployEnvironmentForRun is now only the FALLBACK the
+// deploy record uses when NO explicit `--environment=` approval is recorded. So
+// this first-wins/last-wins disagreement survives ONLY on that no-explicit-approval
+// fallback path — the assertion below still pins it there. When an explicit
+// approval IS recorded, the record reports the approved (gate-admitted) value and
+// AGREES with the gate (TestDeployEnvironment_LegacyDuplicate_ApprovedEnvironmentMatchesGate).
+//
 // Three mutually inconsistent folds cannot be preserved under one canonical
 // resolution, which is exactly why the shipped mechanism is NOT a canonical
 // resolution: the v0/v1 path keeps its list representation, a v2 object
@@ -97,6 +104,27 @@ func TestDeployEnvironmentForRun_LegacyDuplicate_FirstWinsUnchanged(t *testing.T
 	if got := s.deployEnvironmentForRun(context.Background(), runRow.ID); got != "staging" {
 		t.Errorf("deployEnvironmentForRun = %q, want %q (FIRST-wins, deliberately the opposite of the gate's last-wins %q)",
 			got, "staging", "prod")
+	}
+}
+
+// TestDeployEnvironment_LegacyDuplicate_ApprovedEnvironmentMatchesGate closes
+// #2324's second, narrower defect on the SAME duplicate-kind document. The gate
+// permits only `prod` (last-wins); previously the record said `staging`
+// (first-wins), contradicting it. With the gate-admitted `--environment=prod`
+// approval recorded, the record now reports `prod`, AGREEING with the gate. The
+// first-wins disagreement pinned above survives only on the no-explicit-approval
+// fallback path — this exercises the explicit-approval path on the same fixture.
+func TestDeployEnvironment_LegacyDuplicate_ApprovedEnvironmentMatchesGate(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, runRow := seedDeployRun(rr, "release", deploySpecLegacyDuplicateEnvs)
+	// The gate permits only prod on this document; submitting it admits AND
+	// records the approval on the deploy stage.
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"--environment=prod"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("prod approval status = %d, want 200 (last-wins allow-list):\n%s", w.Code, w.Body.String())
+	}
+	if got := s.deployEnvironmentForStage(context.Background(), runRow.ID, stage.ID); got != "prod" {
+		t.Errorf("deployEnvironmentForStage = %q, want %q (record now agrees with the gate)", got, "prod")
 	}
 }
 

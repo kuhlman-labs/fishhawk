@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
@@ -872,6 +873,105 @@ func TestResolveDeploymentRollbackFromPollState_Idempotent(t *testing.T) {
 	}
 	if n := countByCategory(au, CategoryDeploymentRollbackCompleted); n != 1 {
 		t.Errorf("deployment_rollback_completed entries = %d, want 1 (idempotent re-call)", n)
+	}
+}
+
+// ---- E23.18 / #2324: approved-environment threaded into the deploy record ----
+
+// payloadForCategory returns the first appended audit payload of the given
+// category, for asserting the environment label the resolver wrote.
+func payloadForCategory(au *auditFake, category string) []byte {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == category {
+			return e.Payload
+		}
+	}
+	return nil
+}
+
+// newApprovedResolverServer is the sibling of newResolverServer wiring the
+// approved-environment path: the seeded deploy run carries a real
+// multi-environment deploy WorkflowSpec ([staging, prod]) and the server is
+// wired with a fakeApprovalRepo holding an --environment=prod APPROVE on the
+// deploy stage. It exercises the full spec-fold → approval-store → resolver
+// seam, unlike newResolverServer (no ApprovalRepo, no cached spec) which is the
+// nil-wiring proof.
+func newApprovedResolverServer(t *testing.T) (*Server, *deployStageRepo, *fakeArtifactRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	rr := newDeployStageRepo()
+	rr.stages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy, State: run.StageStateAwaitingDeployment}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "octo/repo", WorkflowID: "release", WorkflowSpec: []byte(deploySpecMultiEnv)}
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	app := newFakeApprovalRepo()
+	comment := "--environment=prod"
+	app.all = append(app.all, &approval.Approval{
+		ID:          uuid.New(),
+		StageID:     stageID,
+		Decision:    approval.DecisionApprove,
+		Comment:     &comment,
+		Surface:     approval.SurfaceAPI,
+		SubmittedAt: time.Now().UTC(),
+	})
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  newSigningFake(),
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ApprovalRepo: app,
+	})
+	return s, rr, ar, au, runID, stageID
+}
+
+// TestResolveDeploymentFromPollState_RecordsApprovedEnvironment crosses the
+// spec-fold → approval-store → artifact → audit seam: on a run whose cached spec
+// declares allowed_environments [staging, prod] with an --environment=prod
+// approve persisted on the deploy stage, the persisted deployment artifact AND
+// the deployment_outcome_recorded audit payload both read "prod" — the operator's
+// approved environment, not the first-allowed_environments derivation ("staging").
+// Fails on a comment-only/no-op touch of the resolve call site.
+func TestResolveDeploymentFromPollState_RecordsApprovedEnvironment(t *testing.T) {
+	s, _, ar, au, runID, stageID := newApprovedResolverServer(t)
+	wr := &githubclient.WorkflowRun{ID: 777, HTMLURL: "https://gh/run/777", Status: "completed", Conclusion: "success"}
+
+	if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcomeSucceeded, "main", wr); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("want 1 deployment artifact, got %d", len(ar.all))
+	}
+	if !strings.Contains(string(ar.all[0].Content), `"environment":"prod"`) {
+		t.Errorf("artifact content = %s, want the approved environment %q", ar.all[0].Content, "prod")
+	}
+	payload := payloadForCategory(au, CategoryDeploymentOutcomeRecorded)
+	if !strings.Contains(string(payload), `"environment":"prod"`) {
+		t.Errorf("deployment_outcome_recorded payload = %s, want the approved environment %q", payload, "prod")
+	}
+}
+
+// TestResolveDeploymentRollbackFromPollState_RecordsApprovedEnvironment asserts
+// the same approved-environment threading on the rollback record.
+func TestResolveDeploymentRollbackFromPollState_RecordsApprovedEnvironment(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newApprovedResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded // deploy already terminal
+	wr := &githubclient.WorkflowRun{ID: 778, HTMLURL: "https://gh/run/778", Status: "completed", Conclusion: "success"}
+
+	if err := s.ResolveDeploymentRollbackFromPollState(context.Background(), runID, stageID, "release", wr); err != nil {
+		t.Fatalf("resolve rollback: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("want 1 deployment artifact, got %d", len(ar.all))
+	}
+	if !strings.Contains(string(ar.all[0].Content), `"environment":"prod"`) {
+		t.Errorf("rollback artifact content = %s, want the approved environment %q", ar.all[0].Content, "prod")
+	}
+	payload := payloadForCategory(au, CategoryDeploymentOutcomeRecorded)
+	if !strings.Contains(string(payload), `"environment":"prod"`) {
+		t.Errorf("rollback deployment_outcome_recorded payload = %s, want the approved environment %q", payload, "prod")
 	}
 }
 
