@@ -6030,6 +6030,69 @@ func TestAdvanceForDecision_AcceptanceStage_GenericGate(t *testing.T) {
 	}
 }
 
+// casApprovalRunRepo gives approvalRunRepo the run.StageCASTransitioner
+// capability with an HONEST compare, mirroring postgresRepo.TransitionStageFrom.
+// It is the vehicle for the no-narrowing guard below: without the capability the
+// approve advance takes the plain-TransitionStage fallback and the anchor is
+// never evaluated at all.
+type casApprovalRunRepo struct {
+	*approvalRunRepo
+	fromCalls []casTransitionCall
+}
+
+func (r *casApprovalRunRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	r.fromCalls = append(r.fromCalls, casTransitionCall{StageID: id, From: from, To: to})
+	st, ok := r.stages[id]
+	if !ok {
+		r.mu.Unlock()
+		return nil, run.ErrNotFound
+	}
+	cur := st.State
+	r.mu.Unlock()
+	if cur != from {
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: cur}
+	}
+	return r.TransitionStage(ctx, id, to, c)
+}
+
+// TestSubmitApproval_NonParkedStage_StillAdvances is the NO-NARROWING guard for
+// E50.15 / #2656 (operator binding condition 2). The approve advance is a
+// compare-and-swap, but it is anchored on the state the handler ALREADY
+// OBSERVED — not on the literal awaiting_approval. handleSubmitApproval has no
+// stage-state admission gate, so approving a stage in another state the
+// transition table admits (running → succeeded) succeeds today; it must keep
+// succeeding, because turning a live-surface 200 into a 409 is exactly the
+// behavioral narrowing the observed-state anchor exists to avoid.
+//
+// Counterfactual: re-anchoring the CAS on the literal
+// run.StageStateAwaitingApproval turns this 200 into a 409.
+func TestSubmitApproval_NonParkedStage_StillAdvances(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	cas := &casApprovalRunRepo{approvalRunRepo: rr}
+	s.cfg.RunRepo = cas
+	stage := rr.seedStage(run.StageStateRunning)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a non-parked approve the endpoint admits today must not become a 409):\n%s",
+			w.Code, w.Body.String())
+	}
+	cur, err := rr.GetStage(context.Background(), stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if cur.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", cur.State)
+	}
+	if len(cas.fromCalls) != 1 {
+		t.Fatalf("TransitionStageFrom calls = %d, want 1: %+v", len(cas.fromCalls), cas.fromCalls)
+	}
+	if got := cas.fromCalls[0].From; got != run.StageStateRunning {
+		t.Errorf("CAS anchored on %q, want the OBSERVED state running", got)
+	}
+}
+
 // --- E39.4 (#1709): quorum evaluation + additive approval enrichment -------
 
 // quorumApprovalsSpec builds a version 1.0 workflow whose acceptance stage

@@ -702,6 +702,20 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var aerr *approveActionError
 		if errors.As(err, &aerr) && aerr.failedAt == gateActionAdvance {
+			// Raced second approval (E50.15 / #2656): the approve advance is a
+			// compare-and-swap anchored on the state this request observed, so a
+			// concurrent approval that already advanced the stage refuses here
+			// instead of silently re-running the post-approval hooks. Rendered
+			// as the endpoint's ALREADY-DOCUMENTED 409 invalid_state_transition
+			// — the losing approval is recorded, but it did not advance the run.
+			var sce run.StageStateChangedError
+			if errors.As(aerr.err, &sce) {
+				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+					aerr.err.Error(),
+					map[string]any{"stage_id": stageID.String(),
+						"from": sce.Expected, "state": sce.Actual})
+				return
+			}
 			var inv run.InvalidTransitionError
 			if errors.As(aerr.err, &inv) {
 				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
@@ -1542,17 +1556,49 @@ func (s *Server) findPriorApproval(ctx context.Context, stageID uuid.UUID, subje
 // stage-type parameter through every call site (see handleSubmitApproval's
 // advanceForDecision). advanceStage keeps the generic approve → succeeded
 // semantics every non-deploy gated stage relies on.
-func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision approval.Decision) (*run.Stage, error) {
+//
+// APPROVE IS A COMPARE-AND-SWAP (E50.15 / #2656). The approve leg anchors the
+// transition on the state the CALLER ALREADY OBSERVED (stage.State), so it
+// means "nothing changed since I looked" rather than "the stage must be
+// parked". A concurrent approval that flipped the stage between this caller's
+// load and this call refuses atomically with run.StageStateChangedError instead
+// of falling into transitionStage's `from == to` short-circuit, which returns a
+// SILENT SUCCESS and would walk the loser straight into finishApprovalAdvance's
+// post-approval hooks (fileSplitProposalChildren / fileOrLinkLiveValidationWalk)
+// a second time. Anchoring on the observed state — not on the literal
+// awaiting_approval — keeps every transition the endpoint admits today
+// admissible: an approve of a non-parked stage that succeeds now still
+// succeeds, so no live-surface 200 becomes a 409.
+//
+// The REJECT leg is deliberately left on run.FailStage, which already CASes
+// internally (backend/internal/run/failure.go:113, re-anchoring on the actual
+// state) and additionally refuses a terminal stage via ValidStageTransition. It
+// needs no change here.
+func (s *Server) advanceStage(ctx context.Context, stage *run.Stage, decision approval.Decision) (*run.Stage, error) {
 	switch decision {
 	case approval.DecisionApprove:
-		return s.cfg.RunRepo.TransitionStage(ctx, stageID,
-			run.StageStateSucceeded, nil)
+		return s.casTransitionFromObserved(ctx, stage, run.StageStateSucceeded)
 	case approval.DecisionReject:
-		return run.FailStage(ctx, s.cfg.RunRepo, stageID,
+		return run.FailStage(ctx, s.cfg.RunRepo, stage.ID,
 			run.FailureD, "gate rejected by approver")
 	}
 	// Unreachable — decision was validated earlier.
 	return nil, errors.New("approval: unknown decision (programmer error)")
+}
+
+// casTransitionFromObserved moves stage to `to`, anchored under the repository
+// row lock on the state the caller observed when it loaded the stage. It is the
+// same runtime capability-assert convention markStageRunningOnPromptFetch
+// (prompt.go) and handleHostDispatch (host_dispatch.go) already use: the
+// production postgresRepo implements run.StageCASTransitioner and gets the
+// atomic compare-and-swap; an in-memory RunRepo that does NOT implement it
+// degrades to the plain table-validated TransitionStage — today's behavior
+// exactly, no panic.
+func (s *Server) casTransitionFromObserved(ctx context.Context, stage *run.Stage, to run.StageState) (*run.Stage, error) {
+	if cas, ok := s.cfg.RunRepo.(run.StageCASTransitioner); ok {
+		return cas.TransitionStageFrom(ctx, stage.ID, stage.State, to, nil)
+	}
+	return s.cfg.RunRepo.TransitionStage(ctx, stage.ID, to, nil)
 }
 
 // advanceForDecision applies the gate decision for a stage, special-casing
@@ -1567,16 +1613,20 @@ func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision a
 // trigger error, fails the stage category C (returning the failed stage) rather
 // than silently parking at dispatched. A nil error from triggerDeploy means the
 // approval response should reflect the returned stage state.
+//
+// The deploy pre-execution advance is the SHARPER of the two approve legs and
+// gets the same observed-state compare-and-swap (E50.15 / #2656): the hook it
+// guards is an EXTERNAL delegating-pipeline fire, so a silently-succeeding
+// second advance means a duplicate release trigger.
 func (s *Server) advanceForDecision(ctx context.Context, stage *run.Stage, decision approval.Decision) (*run.Stage, error) {
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypeDeploy {
-		dispatched, err := s.cfg.RunRepo.TransitionStage(ctx, stage.ID,
-			run.StageStateDispatched, nil)
+		dispatched, err := s.casTransitionFromObserved(ctx, stage, run.StageStateDispatched)
 		if err != nil {
 			return nil, err
 		}
 		return s.triggerDeploy(ctx, dispatched)
 	}
-	return s.advanceStage(ctx, stage.ID, decision)
+	return s.advanceStage(ctx, stage, decision)
 }
 
 // checkApproverAuthorization returns true when subject is allowed

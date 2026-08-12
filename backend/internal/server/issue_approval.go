@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -200,8 +201,30 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	advanced, err := s.advanceStage(ctx, stage.ID, decision)
+	advanced, err := s.advanceStage(ctx, stage, decision)
 	if err != nil {
+		// Raced second decision (E50.15 / #2656): the approve advance is a
+		// compare-and-swap anchored on the state this handler observed, so a
+		// concurrent decision that already moved the stage refuses here rather
+		// than silently re-running the run's post-approval side effects. That is
+		// NOT a failure of this approver's action — it was superseded — so it
+		// logs at WARN and the reply says the gate was ALREADY DECIDED rather
+		// than that the approval could not be applied.
+		var sce run.StageStateChangedError
+		if errors.As(err, &sce) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"slash-command approval: gate already decided by a concurrent decision",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("observed_state", string(sce.Expected)),
+				slog.String("actual_state", string(sce.Actual)))
+			if silent {
+				return nil
+			}
+			s.replyApproval(ctx, p, fmt.Sprintf(
+				"This gate was already decided by another approval; the stage is now `%s`. Your `%s` is recorded, but it did not advance the run.",
+				sce.Actual, decision))
+			return nil
+		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 			"slash-command approval: advance stage failed",
 			slog.String("stage_id", stage.ID.String()),

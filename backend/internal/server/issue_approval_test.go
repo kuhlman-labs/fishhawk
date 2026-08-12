@@ -1576,3 +1576,129 @@ func TestHandleApprovalCommand_AtCapApprove_Recorded(t *testing.T) {
 		t.Errorf("decision = %q, want approve", ar.all[0].Decision)
 	}
 }
+
+// --- E50.15 / #2656: the raced-advance reply wording ---
+
+// slashRacingRunRepo models a concurrent decision landing between the
+// slash-command handler's stage load and its compare-and-swap. advanceErr, when
+// set, replaces the state-changed refusal with an ordinary advance error so the
+// GENERIC reply branch is exercised too.
+type slashRacingRunRepo struct {
+	*orchestratorRepo
+	advanceErr error
+}
+
+func (r *slashRacingRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	if r.advanceErr != nil {
+		return nil, r.advanceErr
+	}
+	return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: run.StageStateSucceeded}
+}
+
+// slashApprovalReplies drives one slash/reply-comment approval against a repo
+// whose advance refuses, and returns the posted comment bodies.
+func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceErr error) []string {
+	t.Helper()
+	base := newOrchestratorRepo()
+	r := base.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	stage := base.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	rr := &slashRacingRunRepo{orchestratorRepo: base, advanceErr: advanceErr}
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: base},
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: base, Audit: au, ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         source,
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	return commentBodies(gh.calls())
+}
+
+// TestHandleApprovalCommand_AdvanceStateChanged_AlreadyDecidedReply is the
+// criterion pinning the slash-path reply WORDING (operator binding condition 4).
+// A superseded approver's action did not FAIL — it lost a race — so the reply
+// must say the gate was ALREADY DECIDED and must not claim the run could not
+// advance. Any other advance error keeps today's generic wording byte for byte,
+// and the reply-comment channel stays silent on both.
+func TestHandleApprovalCommand_AdvanceStateChanged_AlreadyDecidedReply(t *testing.T) {
+	bodies := slashApprovalReplies(t, webhook.ApprovalSourceSlash, nil)
+	var reply string
+	for _, b := range bodies {
+		if strings.Contains(b, "already decided") {
+			reply = b
+		}
+	}
+	if reply == "" {
+		t.Fatalf("expected an already-decided reply; got %v", bodies)
+	}
+	if !strings.Contains(reply, "`succeeded`") {
+		t.Errorf("reply should name the state the stage is now in: %q", reply)
+	}
+	if !strings.Contains(reply, "recorded") {
+		t.Errorf("reply should say the approval is still recorded: %q", reply)
+	}
+	if strings.Contains(reply, "could not advance") {
+		t.Errorf("reply must not frame a superseded approval as a failure: %q", reply)
+	}
+}
+
+// TestHandleApprovalCommand_AdvanceOtherError_KeepsGenericReply pins the
+// else-branch: a non-state-changed advance error keeps today's generic failure
+// reply, so the new wording is scoped to the raced case alone.
+func TestHandleApprovalCommand_AdvanceOtherError_KeepsGenericReply(t *testing.T) {
+	bodies := slashApprovalReplies(t, webhook.ApprovalSourceSlash, errors.New("boom"))
+	var reply string
+	for _, b := range bodies {
+		if strings.Contains(b, "could not advance") {
+			reply = b
+		}
+	}
+	if reply == "" {
+		t.Fatalf("expected the generic advance-failure reply; got %v", bodies)
+	}
+	if reply != "Approval recorded but the run could not advance. Check the dashboard." {
+		t.Errorf("generic reply text drifted: %q", reply)
+	}
+	for _, b := range bodies {
+		if strings.Contains(b, "already decided") {
+			t.Errorf("a non-raced advance error must not claim the gate was already decided: %q", b)
+		}
+	}
+}
+
+// TestHandleApprovalCommand_AdvanceStateChanged_ReplyCommentStaysSilent pins the
+// silent channel on the new branch: a reply-comment ("+1") approval posts no
+// per-call reply, raced or not.
+func TestHandleApprovalCommand_AdvanceStateChanged_ReplyCommentStaysSilent(t *testing.T) {
+	bodies := slashApprovalReplies(t, webhook.ApprovalSourceReplyComment, nil)
+	for _, b := range bodies {
+		if strings.Contains(b, "already decided") || strings.Contains(b, "could not advance") {
+			t.Errorf("reply-comment channel must stay silent on a refused advance; got %q", b)
+		}
+	}
+}
