@@ -65,6 +65,13 @@ type fakeCampaignRepo struct {
 	itemsErrOnCall int
 	itemsCalls     int
 
+	// transItemErrOnCall, when non-zero, fails TransitionCampaignItem on exactly
+	// that 1-based call number (others succeed), so the cancel verb's MID-loop
+	// partial-failure convergence can be driven — the first item cancels, the Nth
+	// errors, leaving the campaign GENUINELY half-cancelled (#2355 condition 2), a
+	// state a whole-loop transItemErr can never produce. transItemCalls counts.
+	transItemErrOnCall int
+
 	// lastListFilter records the most recent ListCampaigns filter so handler
 	// tests can assert the account-scope wire-up (ADR-057 / #1830).
 	lastListFilter campaign.ListCampaignsFilter
@@ -167,6 +174,9 @@ func (f *fakeCampaignRepo) TransitionCampaignItem(_ context.Context, id uuid.UUI
 	f.transItemCalls++
 	if f.transItemErr != nil {
 		return nil, f.transItemErr
+	}
+	if f.transItemErrOnCall != 0 && f.transItemCalls == f.transItemErrOnCall {
+		return nil, errInjected
 	}
 	for _, items := range f.itemsByCmp {
 		for _, it := range items {
@@ -5949,6 +5959,102 @@ func TestStartCampaignItemRun_HumanLedNotRelabelled_StillRefused(t *testing.T) {
 	_ = details
 }
 
+// relistFakeRepo wraps the in-memory fakeCampaignRepo to (a) return SNAPSHOT
+// copies from ListCampaignItemsForCampaign — breaking the fake's pointer aliasing
+// so a stale post-refresh slice actually carries the PRE-refresh tier, exactly as
+// the real Postgres repo's value rows do — and (b) fail that list on precisely the
+// failOnCall-th call. Together they reproduce the start verb's relist-error-after-
+// change branch WITHOUT the campaign_items.run_id foreign key a real Postgres repo
+// would impose on the mint/link that follows the gate (which is why the
+// cross-boundary start tests run on the fake, not Postgres).
+type relistFakeRepo struct {
+	*fakeCampaignRepo
+	failOnCall int
+	calls      int
+}
+
+func (r *relistFakeRepo) ListCampaignItemsForCampaign(ctx context.Context, id uuid.UUID) ([]*campaign.Item, error) {
+	r.calls++
+	if r.calls == r.failOnCall {
+		return nil, errInjected
+	}
+	items, err := r.fakeCampaignRepo.ListCampaignItemsForCampaign(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Snapshot each item so a later in-place storage mutation (the autonomy
+	// refresh's SetCampaignItemAutonomy) is NOT visible through this returned slice
+	// — mirroring Postgres value rows, and undoing the fake's aliasing that would
+	// otherwise mask the stale-slice bug.
+	out := make([]*campaign.Item, len(items))
+	for i, it := range items {
+		cp := *it
+		out[i] = &cp
+	}
+	return out, nil
+}
+
+// TestStartCampaignItemRun_RefreshChangedButRelistFails_StillStarts is the fixup
+// counterfactual for the relist-error-after-change branch (#2355 fixup). With
+// snapshot list rows (relistFakeRepo, as the real repo behaves), a relabelled item
+// (stored autonomy:low, issue now autonomy:medium) has its tier refreshed before
+// the DAG gate, but the follow-up relist FAILS. The verb must still partition
+// NextEligible on the FRESH tier and start the run — not refuse item_human_led on
+// the stale pre-refresh slice. Deleting the else-branch patch in
+// handleStartCampaignItemRun turns this RED (409 item_human_led on the stale low
+// tier).
+func TestStartCampaignItemRun_RefreshChangedButRelistFails_StillStarts(t *testing.T) {
+	fake := newFakeCampaignRepo()
+	// Fail the post-refresh relist (call #2): #1 is the handler's initial list, #2
+	// is the relist after the tier changed, #3 is the pending->running derivation
+	// relist (which succeeds).
+	crepo := &relistFakeRepo{fakeCampaignRepo: fake, failOnCall: 2}
+	gh := autonomyStartGitHub(t, []string{"autonomy:medium"})
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"}
+	c := fake.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a relist failure after the tier changed must NOT refuse item_human_led on the stale slice (body=%s)", w.Code, w.Body.String())
+	}
+	// The persisted tier committed to medium before the relist failed.
+	if got := fake.itemsByCmp[c.ID][0].Autonomy; got != "medium" {
+		t.Errorf("item autonomy = %q, want medium (refreshed before gate)", got)
+	}
+}
+
+// TestGetCampaignStatus_PausedItemStaleTierStaysPaused pins condition 4 (#2355):
+// a PAUSED item is bucketed by NextEligible on STATE alone (engine.go: the paused
+// case precedes every autonomy check AND the running catch-all), so a STALE
+// autonomy:low tier on a paused item is provably harmless — it lands in
+// rollup.paused, never human_led. This is why the autonomy refresh deliberately
+// does NOT fetch paused items (their tier is never consulted). GitHub is unwired so
+// no refresh runs and the seeded stale tier is exactly what NextEligible sees.
+func TestGetCampaignStatus_PausedItemStaleTierStaysPaused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	// A paused item carrying a (stale) autonomy:low tier AND a run link — the
+	// paused shape (E25.7): a run gate handed off to a human. The run link makes
+	// this stronger: paused must win over the RunID-bearing running catch-all too.
+	runID := uuid.New()
+	item := &campaign.Item{IssueRef: "issue:100", State: campaign.ItemStatePaused, Autonomy: "low", RunID: &runID}
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StatePaused
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}}) // GitHub nil: no refresh
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if !containsRefTest(st.Rollup.Paused, "issue:100") {
+		t.Errorf("rollup.Paused = %v, want issue:100 (paused bucketed on state, tier ignored)", st.Rollup.Paused)
+	}
+	if containsRefTest(st.Rollup.HumanLed, "issue:100") {
+		t.Errorf("rollup.HumanLed = %v, must NOT contain a paused item — its autonomy tier is never consulted", st.Rollup.HumanLed)
+	}
+	if crepo.setAutonomyCalls != 0 {
+		t.Errorf("setAutonomyCalls = %d, want 0 (a paused item is never fetched or refreshed)", crepo.setAutonomyCalls)
+	}
+}
+
 // autonomyStartGitHub serves the endpoints handleStartCampaignItemRun's
 // mint+refresh path exercises: installation + workflow-spec (to reach
 // CreateRunForTrigger), issue comments (hydration), and GET issue with the given
@@ -6203,10 +6309,22 @@ func TestCancelCampaign_LeavesLinkedRunsUntouched(t *testing.T) {
 }
 
 // TestCancelCampaign_PartialFailureConvergence is the operator condition-2
-// recovery-contract test: the verb is idempotent and convergent. A mid-loop
-// failure leaves some items cancelled and the campaign NOT cancelled; a re-invoke
-// (with the fault cleared) completes the cancellation. Proves a partial failure
-// never strands a campaign half-cancelled.
+// recovery-contract test: the verb is idempotent and convergent. It drives a
+// GENUINE mid-loop partial failure — the FIRST item is cancelled and the SECOND
+// item's transition errors, so the campaign is left half-cancelled (some items
+// cancelled, campaign still running) — then re-invokes with the fault cleared and
+// asserts convergence. This is the defining error path condition 2 demands: a
+// failure AFTER some item already transitioned, not merely a failure before any
+// item moved (which cannot exercise re-entry over already-cancelled items).
+//
+// COUNTERFACTUAL: convergence hinges on the campaign transition running LAST — so
+// a mid-loop item failure leaves the campaign NON-terminal and therefore still
+// cancellable on re-invoke. Transitioning the campaign before/among the items (the
+// exact no-atomicity defect condition 2 warns of) strands it cancelled while
+// issue:101 survives, and this test's partial-state assertion (campaign still
+// running) goes RED. (The re-invoke's own re-entry over the already-cancelled
+// issue:100 rides idempotent same-state transitions, so the defensive
+// terminal-item skip is not itself load-bearing for convergence here.)
 func TestCancelCampaign_PartialFailureConvergence(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{}})
@@ -6216,20 +6334,36 @@ func TestCancelCampaign_PartialFailureConvergence(t *testing.T) {
 	})
 	c.State = campaign.StateRunning
 
-	// Fail the FIRST item transition to simulate a mid-loop failure.
-	crepo.transItemErr = errInjected
+	// Fail the SECOND item transition: issue:100 cancels, issue:101 errors. This
+	// leaves the campaign genuinely HALF-cancelled — the state a whole-loop
+	// transItemErr (which fails the FIRST item, before any transition commits) can
+	// never reach.
+	crepo.transItemErrOnCall = 2
 	w := postCancel(t, s, c.ID.String())
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("first cancel status = %d, want 500 (partial failure) (body=%s)", w.Code, w.Body.String())
+		t.Fatalf("first cancel status = %d, want 500 (mid-loop failure) (body=%s)", w.Code, w.Body.String())
 	}
-	// Observable partial state: the campaign is NOT cancelled (still running) —
-	// the campaign transition runs last and was never reached.
+	// Observable partial state: issue:100 IS cancelled, issue:101 is NOT, and the
+	// campaign is still running (the campaign transition runs last and was never
+	// reached). This is the half-cancelled state the recovery must converge from.
+	partial := map[string]campaign.ItemState{}
+	for _, it := range crepo.itemsByCmp[c.ID] {
+		partial[it.IssueRef] = it.State
+	}
+	if partial["issue:100"] != campaign.ItemStateCancelled {
+		t.Fatalf("issue:100 = %q, want cancelled (first item transitioned before the mid-loop fault)", partial["issue:100"])
+	}
+	if partial["issue:101"] == campaign.ItemStateCancelled {
+		t.Fatalf("issue:101 = %q, want NOT cancelled (the fault fired on its transition)", partial["issue:101"])
+	}
 	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
 		t.Fatalf("after partial failure campaign state = %q, want running (still cancellable)", got)
 	}
 
-	// Clear the fault and re-invoke: convergence.
-	crepo.transItemErr = nil
+	// Clear the fault and re-invoke: convergence from the half-cancelled state. The
+	// already-cancelled issue:100 is terminal and skipped; issue:101 is cancelled;
+	// the campaign transitions cancelled.
+	crepo.transItemErrOnCall = 0
 	w2 := postCancel(t, s, c.ID.String())
 	if w2.Code != http.StatusOK {
 		t.Fatalf("re-invoke status = %d, want 200 (convergence) (body=%s)", w2.Code, w2.Body.String())

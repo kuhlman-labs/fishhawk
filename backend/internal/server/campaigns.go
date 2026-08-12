@@ -1389,6 +1389,22 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 					break
 				}
 			}
+		} else {
+			// Relist FAILED after the tier changed (#2355 fixup): the initial `items`
+			// slice still carries the PRE-refresh tier for this item (against the real
+			// repo its rows are value snapshots, so the SetCampaignItemAutonomy write
+			// does not reach them). Patch the refreshed item into the stale slice IN
+			// PLACE so the NextEligible gate below partitions on the FRESH tier. Without
+			// this the gate reads the pre-refresh autonomy:low and refuses a
+			// just-promoted item item_human_led even though its persisted tier is now
+			// medium — the one branch where the best-effort refresh's fail-open works
+			// against the operator.
+			for i, it := range items {
+				if it.IssueRef == req.IssueRef {
+					items[i] = refreshed
+					break
+				}
+			}
 		}
 	}
 
