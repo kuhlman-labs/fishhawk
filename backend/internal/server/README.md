@@ -44,6 +44,30 @@ the same joined log record. Because the strip is unconditional it is not a new
 disclosure surface if someone forgets the allow-list
 (`TestWriteError_AlwaysStripsInternalCauseKey` pins the strip on a 4xx).
 
+**Both halves of that channel are unconditional (E67.31 / #2637).** The strip
+always was; the FOLD was not. Until #2637 the `cause` log attribute was appended
+only inside the `status >= 500` branch, so a call site handing a cause through
+the channel at a 4xx lost it entirely — stripped from the body (correctly) and
+never logged, reaching neither the caller nor the operator. The append now runs
+at any status. The `cause != ""` guard is retained, so a call with no cause (or
+an empty one) still emits NO `cause` attribute and the common-path record is
+byte-identical. `details` deliberately stays 5xx-gated: at 4xx those details
+already ship verbatim in the body, so re-logging them is noise.
+
+The residual asymmetry, stated rather than implied away: at 4xx the LOG RECORD
+carries `error_ref` (it is in `writeError`'s unconditional attr slice, alongside
+status/code/message/path/method) but the 4xx BODY does not — 4xx bytes stay
+byte-identical to pre-#2587. So the operator can correlate a 4xx cause by
+request id while the caller is handed no correlation handle; the channel is
+operator-only at 4xx by design. Giving the 4xx body an `error_ref` would be a
+client-visible contract change and is out of scope. No production call site
+passes `internalCauseKey` at a 4xx today (the four producers are recover.go's
+three 500s and campaigns.go's 501), so this closed a latent branch rather than
+changing a shipped response. `TestWriteError_4xxLogsInternalCauseToOperator` is
+the pin — one case per branch (4xx with a cause, 4xx with no cause key, 4xx with
+an EMPTY cause value, and a 5xx control asserting the pre-existing fold of both
+`cause` and the pre-redaction `details` is unregressed).
+
 **Per-exemption security finding (why the three prior raw-cause exemptions were
 removed).** The prior plan kept `slice_integration_error`,
 `work_item_filing_failed`, and `product_report_failed` disclosing

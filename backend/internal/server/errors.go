@@ -36,12 +36,23 @@ type errorBody struct {
 // internalCauseKey is a details key carrying the full, non-client-facing
 // error cause (E67.15 / #2587, CONDITION 1). writeError ALWAYS strips it
 // from the response body — regardless of status AND regardless of the 5xx
-// allow-list — and folds its value into the ONE server-side log record
-// keyed by error_ref, so a single record joins the reference and the cause
-// (the correlation the operator's blocking criterion requires). Because the
-// strip is unconditional it is NOT a new disclosure surface if someone
-// forgets the allow-list: TestWriteError_AlwaysStripsInternalCauseKey pins
-// the unconditional removal on a 4xx (where the allow-list does not run).
+// allow-list — and ALWAYS folds its value into the ONE "http error response"
+// server-side log record, at any status (E67.31 / #2637). Both halves are
+// unconditional, so a cause handed through this channel reaches the operator
+// and never the caller, whatever the status.
+//
+// The two statuses differ in WHO can correlate, and only there. At 5xx the
+// body also carries error_ref, so the caller holds the same handle as the log
+// record and can quote it to the operator. At 4xx the body is byte-identical
+// to pre-#2587 — no error_ref member — while the LOG RECORD still carries the
+// error_ref attribute (it is in writeError's unconditional attr slice), so the
+// operator can correlate by request id but the caller was handed no handle.
+// The 4xx channel is operator-only by design; it is never silently dropped.
+//
+// Because the strip is unconditional it is NOT a new disclosure surface if
+// someone forgets the allow-list: TestWriteError_AlwaysStripsInternalCauseKey
+// pins the unconditional removal on a 4xx (where the allow-list does not run),
+// and TestWriteError_4xxLogsInternalCauseToOperator pins the 4xx fold.
 // Call sites that would otherwise pass a raw cause as the message argument
 // (a syntax the redactor cannot see) instead pass a static literal message
 // and hand the cause through this channel.
@@ -153,10 +164,13 @@ func splitInternalCause(details map[string]any) (cause string, client map[string
 // request id so the caller can correlate with the operator log, and (c) emits
 // ONE log record joining that ref with the FULL pre-redaction cause — so the
 // caller sees a stable diagnostic while the operator keeps everything. The
-// non-client-facing internalCauseKey channel is stripped unconditionally at
-// ANY status. 4xx responses are byte-identical to pre-#2587: no allow-list,
-// no error_ref, details verbatim. The logger surfaces 5xx at LevelError and
-// 4xx at LevelInfo so misuse vs. server faults are easy to filter.
+// non-client-facing internalCauseKey channel is stripped from the body AND
+// folded into that log record unconditionally at ANY status (E67.31 / #2637).
+// 4xx responses are byte-identical to pre-#2587: no allow-list, no error_ref,
+// details verbatim — so a 4xx cause is operator-visible in the log (keyed by
+// the error_ref attribute) but the 4xx caller gets no correlation handle. The
+// logger surfaces 5xx at LevelError and 4xx at LevelInfo so misuse vs. server
+// faults are easy to filter.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string, details map[string]any) {
 	ref := RequestIDFrom(r.Context())
 
@@ -196,15 +210,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 		slog.String("error_ref", ref),
 	}
 	if status >= 500 {
-		// The caller's 5xx body is redacted; the operator keeps the FULL
-		// pre-redaction details plus the internal cause, joined to the same
-		// error_ref in THIS one record — no split across two log lines.
+		// The caller's 5xx body is redacted, so the operator keeps the FULL
+		// pre-redaction details here, joined to the same error_ref in THIS one
+		// record — no split across two log lines. `details` stays 5xx-gated
+		// while `cause` (below) does not: at 4xx the details already ship
+		// verbatim in the body, so re-logging them is pure noise, whereas the
+		// cause is stripped from the body at EVERY status and would otherwise
+		// reach nobody at all (E67.31 / #2637).
 		if len(clientDetails) > 0 {
 			attrs = append(attrs, slog.Any("details", clientDetails))
 		}
-		if cause != "" {
-			attrs = append(attrs, slog.String("cause", cause))
-		}
+	}
+	// Unconditional: an internalCauseKey value is stripped from the body at any
+	// status, so the log record is its ONLY destination. The cause != "" guard
+	// keeps the common-path record byte-identical — a call with no cause (or an
+	// empty one) emits no `cause` attribute at all.
+	if cause != "" {
+		attrs = append(attrs, slog.String("cause", cause))
 	}
 	s.cfg.Logger.LogAttrs(r.Context(), level, "http error response", attrs...)
 }
