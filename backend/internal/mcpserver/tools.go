@@ -261,6 +261,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerStartCampaignItemRun(srv, resolver)
 	registerGetCampaignStatus(srv, resolver)
 	registerResumeCampaign(srv, resolver)
+	registerCancelCampaign(srv, resolver)
 	registerCancelRun(srv, resolver)
 	registerConsolidateSlices(srv, resolver)
 	registerResetRunBranch(srv, resolver)

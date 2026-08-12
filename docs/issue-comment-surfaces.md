@@ -1574,6 +1574,29 @@ Notes:
   actor, best-effort (a marshal/append failure WARN-logs and never unwinds the
   restart). Still NOT an issue-comment surface — listed here only so a future
   reader grepping the audit categories doesn't mistake it for a comment surface.
+- The campaign **item-autonomy-refresh** marker — `campaign_item_autonomy_refreshed`
+  (E25.20 / #2355) — is a **system-actor GLOBAL-chain audit kind, NOT an
+  issue-comment surface**, of the same family as the driver kinds. Two request-
+  triggered paths in `backend/internal/server/campaigns.go` write it: the
+  reconcile-on-read autonomy refresh (`refreshItemAutonomyFromIssues`, folded
+  into `GET /v0/campaigns/{id}/status`) and the operator start verb's targeted
+  refresh (`refreshOneItemAutonomy`, in `handleStartCampaignItemRun`). When an
+  item's stored autonomy tier DIFFERS from the tier re-read off its GitHub
+  issue's `autonomy:*` label, the item is overwritten via
+  `campaign.Repository.SetCampaignItemAutonomy` and this marker is emitted with
+  payload `{campaign_id, issue_ref, from, to}` — so relabelling a child
+  (`autonomy:low` → `autonomy:medium`) unblocks a campaign parked on
+  `attend_human_led` without a rebuild. Best-effort (a write/marshal failure
+  WARN-logs and never fails the read). Still NOT an issue-comment surface.
+- The campaign **cancel** marker — `campaign_cancelled` (E25.20 / #2355) — is a
+  **system-actor GLOBAL-chain audit kind, NOT an issue-comment surface**. The
+  operator cancel verb (`POST /v0/campaigns/{id}/cancel` →
+  `handleCancelCampaign`) is the SOLE writer: it marks every non-terminal item
+  `cancelled` and then the campaign itself `cancelled`, then emits
+  `campaign_cancelled` with payload `{campaign_id, from, items_cancelled}`
+  (`from` is the pre-cancel campaign state; `items_cancelled` is the count this
+  invocation transitioned). It deliberately does NOT cancel linked runs
+  (`fishhawk_cancel_run` owns that). Best-effort like the other campaign kinds.
 - The campaign **pause** marker — `campaign_paused` (E25.7 / #1446, ADR-047
   Track C) — is also a **system-actor GLOBAL-chain audit kind, NOT an
   issue-comment surface**. The campaign-driver ticker

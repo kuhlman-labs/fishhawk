@@ -78,6 +78,11 @@ func (BaseFake) SetCampaignItemRun(_ context.Context, _ uuid.UUID, _ *uuid.UUID)
 	return nil, ErrNotFound
 }
 
+// SetCampaignItemAutonomy returns nil, ErrNotFound.
+func (BaseFake) SetCampaignItemAutonomy(_ context.Context, _ uuid.UUID, _ string) (*Item, error) {
+	return nil, ErrNotFound
+}
+
 // TransitionCampaignItem returns nil, ErrNotFound.
 func (BaseFake) TransitionCampaignItem(_ context.Context, _ uuid.UUID, _ ItemState) (*Item, error) {
 	return nil, ErrNotFound

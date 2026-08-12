@@ -70,6 +70,16 @@ type ResumeCampaignOutput struct {
 	Campaign Campaign `json:"campaign"`
 }
 
+// CancelCampaignInput is the fishhawk_cancel_campaign tool's input.
+type CancelCampaignInput struct {
+	CampaignID string `json:"campaign_id" jsonschema:"the campaign UUID to cancel (marks it and its unfinished items cancelled)"`
+}
+
+// CancelCampaignOutput carries the updated (cancelled) campaign row.
+type CancelCampaignOutput struct {
+	Campaign Campaign `json:"campaign"`
+}
+
 // registerStartCampaign wires the fishhawk_start_campaign tool (E25.8 / #1447).
 //
 // Auth: a write tool — operator-side fhk_* tokens with scope write:campaigns
@@ -424,4 +434,54 @@ func (r *runResolver) resumeCampaign(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, ResumeCampaignOutput{}, fmt.Errorf("resume campaign: %w", err)
 	}
 	return nil, ResumeCampaignOutput{Campaign: *updated}, nil
+}
+
+// registerCancelCampaign wires the fishhawk_cancel_campaign tool (#2355).
+//
+// Auth: a write tool — operator-side fhk_* tokens with write:campaigns scope.
+func registerCancelCampaign(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_cancel_campaign",
+		Description: strings.TrimSpace(`
+Cancel a campaign. Use this to cleanly shut down an abandoned or rebuilt
+campaign so it stops showing as live work in the campaign list. It marks the
+campaign AND every one of its unfinished (non-terminal) items cancelled, so an
+orphaned campaign left in 'running' from a rebuild workaround no longer looks
+indistinguishable from a real in-flight campaign.
+
+It deliberately does NOT cancel the campaign's linked RUNS — a run still in
+flight keeps running. Cancel individual runs with fishhawk_cancel_run; this verb
+only cancels the campaign and its item rows. A write tool: needs an operator
+token with write:campaigns scope (a runner-bound token is rejected 403). An
+already-terminal campaign (succeeded/failed/cancelled) returns
+campaign_not_cancellable; an unknown id returns campaign_not_found. The verb is
+idempotent and convergent — re-invoking after a partial failure completes the
+cancellation.
+`),
+	}, resolver.cancelCampaign)
+}
+
+// cancelCampaign is the tool handler.
+func (r *runResolver) cancelCampaign(ctx context.Context, _ *mcp.CallToolRequest, in CancelCampaignInput) (*mcp.CallToolResult, CancelCampaignOutput, error) {
+	id, err := uuid.Parse(in.CampaignID)
+	if err != nil {
+		return nil, CancelCampaignOutput{}, fmt.Errorf("campaign_id %q is not a valid UUID: %w", in.CampaignID, err)
+	}
+
+	updated, err := r.api.CancelCampaign(ctx, id)
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			switch ae.Code {
+			case "campaign_not_cancellable":
+				return nil, CancelCampaignOutput{}, fmt.Errorf(
+					"campaign_not_cancellable: campaign %s is already terminal (succeeded/failed/cancelled) — there is nothing to cancel", id)
+			case "campaign_not_found":
+				return nil, CancelCampaignOutput{}, fmt.Errorf(
+					"campaign_not_found: no campaign with id %s — pass the id fishhawk_start_campaign returned", id)
+			}
+		}
+		return nil, CancelCampaignOutput{}, fmt.Errorf("cancel campaign: %w", err)
+	}
+	return nil, CancelCampaignOutput{Campaign: *updated}, nil
 }

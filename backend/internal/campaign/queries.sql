@@ -90,6 +90,16 @@ UPDATE campaign_items
  WHERE id = $1
 RETURNING *;
 
+-- name: SetCampaignItemAutonomy :one
+-- Sets the item's autonomy tier — routing metadata re-read from the issue's
+-- autonomy:* label on the reconcile-on-read refresh (#2355). NOT a lifecycle
+-- transition, so it needs no FOR UPDATE state guard; the caller normalizes the
+-- tier to the CHECK-permitted set ("", low, medium, high) before this write.
+UPDATE campaign_items
+   SET autonomy = $2
+ WHERE id = $1
+RETURNING *;
+
 -- name: SetCampaignItemPause :one
 -- Pauses an item: sets state='paused' and records the pause_reason JSONB,
 -- applied under the existing LockCampaignItemForUpdate FOR UPDATE lock so the

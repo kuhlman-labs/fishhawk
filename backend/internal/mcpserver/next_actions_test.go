@@ -1529,6 +1529,15 @@ func TestCampaignNextActionsFor_AttendHumanLed(t *testing.T) {
 	if got.Consumes != consumesNone {
 		t.Errorf("consumes = %q, want none (no run minted for human-led work)", got.Consumes)
 	}
+	// The reason now names the relabel-and-re-poll remedy: the human_led
+	// classification is re-read from the issue's autonomy:* label on each poll
+	// (#2355), so an operator can drive the item agent-led by relabelling and
+	// re-polling. Assert the discoverability wording is present.
+	for _, want := range []string{"re-read", "autonomy:", "relabel", "re-poll"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("attend_human_led reason %q missing %q", got.Reason, want)
+		}
+	}
 }
 
 func TestCampaignNextActionsFor_Wait(t *testing.T) {

@@ -59,6 +59,8 @@ var exportBaseline = []string{
 	"CampaignPauseReason",
 	"CampaignRollup",
 	"CampaignStatus",
+	"CancelCampaignInput",
+	"CancelCampaignOutput",
 	"CancelRunInput",
 	"CancelRunOutput",
 	"CategoryRunAutoDriven",

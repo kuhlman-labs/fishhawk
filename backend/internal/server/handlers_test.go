@@ -291,6 +291,26 @@ func TestResumeCampaignRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestCancelCampaignRouteRegistered guards the route table: POST
+// /v0/campaigns/{campaign_id}/cancel (#2355) must reach handleCancelCampaign.
+// With no CampaignRepo configured the handler returns 503 — an UNregistered
+// route would instead 404 — so a 503 here proves the route is wired in
+// handlers.go. (handleCancelCampaign checks the nil-CampaignRepo guard BEFORE the
+// write-scope check precisely so this idiom reaches the handler.)
+func TestCancelCampaignRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+"00000000-0000-0000-0000-000000000000"+"/cancel", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handler with no CampaignRepo)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "campaign_repo_unconfigured") {
+		t.Errorf("body = %s, want campaign_repo_unconfigured (handleCancelCampaign reached)", rec.Body.String())
+	}
+}
+
 // TestReviveRouteRegistered guards the route table: POST
 // /v0/runs/{run_id}/revive (#1915) must reach handleReviveRun through the mux.
 // The anonymous request reaches the handler's auth ladder and returns 401 — an

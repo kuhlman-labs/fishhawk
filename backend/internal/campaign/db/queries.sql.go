@@ -435,6 +435,40 @@ func (q *Queries) SetCampaignItemRun(ctx context.Context, arg SetCampaignItemRun
 	return i, err
 }
 
+const setCampaignItemAutonomy = `-- name: SetCampaignItemAutonomy :one
+UPDATE campaign_items
+   SET autonomy = $2
+ WHERE id = $1
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+`
+
+type SetCampaignItemAutonomyParams struct {
+	ID       uuid.UUID `json:"id"`
+	Autonomy string    `json:"autonomy"`
+}
+
+// Sets the item's autonomy tier — routing metadata re-read from the issue's
+// autonomy:* label on the reconcile-on-read refresh (#2355). NOT a lifecycle
+// transition, so it needs no FOR UPDATE state guard; the caller normalizes the
+// tier to the CHECK-permitted set ("", low, medium, high) before this write.
+func (q *Queries) SetCampaignItemAutonomy(ctx context.Context, arg SetCampaignItemAutonomyParams) (CampaignItem, error) {
+	row := q.db.QueryRow(ctx, setCampaignItemAutonomy, arg.ID, arg.Autonomy)
+	var i CampaignItem
+	err := row.Scan(
+		&i.ID,
+		&i.CampaignID,
+		&i.IssueRef,
+		&i.DependsOn,
+		&i.RunID,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PauseReason,
+		&i.Autonomy,
+	)
+	return i, err
+}
+
 const updateCampaignItemState = `-- name: UpdateCampaignItemState :one
 UPDATE campaign_items
    SET state = $2

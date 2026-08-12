@@ -1155,7 +1155,14 @@ per-tool contract). Internals not covered there:
   (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`.
 - **`next_actions` mapping.** `fishhawk_get_campaign_status` maps `next_action` onto a legal operator move via
   `campaignNextActionsFor`, so the agent never reads an unclassified state. `fishhawk_resume_campaign` is legal only
-  when `next_action` is `resume`.
+  when `next_action` is `resume`. The `attend_human_led` classification names the relabel-and-re-poll remedy: the
+  `human_led` verdict is re-read from the issue's `autonomy:*` label on every `fishhawk_get_campaign_status` poll
+  (E25.20 / #2355), so relabelling a child (`autonomy:low` → `autonomy:medium`) and re-polling moves it into `eligible`.
+- **`fishhawk_cancel_campaign` (E25.20 / #2355).** `campaign_id` only. Marks the campaign AND every unfinished
+  (non-terminal) item `cancelled` so an abandoned/rebuilt campaign stops showing as live work in the campaign list;
+  it does NOT cancel the linked RUNS (`fishhawk_cancel_run` owns that). Idempotent + convergent — re-invoking after a
+  partial failure completes the cancellation. Maps `campaign_not_cancellable` (already terminal) / `campaign_not_found`
+  onto actionable tool errors.
 - The campaign-scoped operator procedure lives in the operator role spec's `conventions.campaign`
   (`docs/spec/operator-role.md`), not hard-coded here.
 - **Batch-as-campaign local drive.** The step-by-step operator procedure for driving a multi-issue batch

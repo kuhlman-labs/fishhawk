@@ -447,6 +447,15 @@ type fakeBackend struct {
 	resumeCampaignStatus int
 	resumeCampaignErr    string
 
+	// cancelCampaignID captures the last POST /v0/campaigns/{id}/cancel path id.
+	// cancelCampaignResp seeds the cancelled campaign (the fake fills
+	// ID/State=cancelled when unset). cancelCampaignStatus drives the HTTP status
+	// (default 200); cancelCampaignErr, when set, is written verbatim (#2355).
+	cancelCampaignID     uuid.UUID
+	cancelCampaignResp   Campaign
+	cancelCampaignStatus int
+	cancelCampaignErr    string
+
 	// E26.2 fixtures: POST /v0/campaigns/{id}/runs (#1481).
 	// startCampaignItemRunBody captures the last decoded request body so tests
 	// can assert issue_ref/workflow_id/workflow_ref/runner_kind round-trip;
@@ -547,6 +556,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		campaignStatusByID:            map[uuid.UUID]CampaignStatus{},
 		campaignStatusStatus:          http.StatusOK,
 		resumeCampaignStatus:          http.StatusOK,
+		cancelCampaignStatus:          http.StatusOK,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -1143,6 +1153,35 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if resp.State == "" {
 			resp.State = "running"
+		}
+		if resp.PausePolicy == "" {
+			resp.PausePolicy = "pause_campaign"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("campaign_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.cancelCampaignID = id
+		status := fb.cancelCampaignStatus
+		errBody := fb.cancelCampaignErr
+		resp := fb.cancelCampaignResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.ID == "" {
+			resp.ID = id.String()
+		}
+		if resp.State == "" {
+			resp.State = "cancelled"
 		}
 		if resp.PausePolicy == "" {
 			resp.PausePolicy = "pause_campaign"
@@ -2733,7 +2772,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E48.64 (#2491) adds exactly ONE tool — fishhawk_await_stage, the terminal
 	// wait on the durable (run_id, stage_id) handle fishhawk_dispatch_stage
 	// returns — taking the total 46 -> 47.
-	const wantToolCount = 47
+	//
+	// E25.20 (#2355) adds exactly ONE tool — fishhawk_cancel_campaign, the
+	// operator clean-shutdown of an abandoned/rebuilt campaign that marks it and
+	// its unfinished items cancelled — taking the total 47 -> 48.
+	const wantToolCount = 48
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

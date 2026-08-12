@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -1084,6 +1085,131 @@ func (s *Server) handleResumeCampaign(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(updated))
 }
 
+// handleCancelCampaign implements POST /v0/campaigns/{campaign_id}/cancel: the
+// operator's clean shutdown of an abandoned or rebuilt campaign (#2355). It marks
+// every NON-terminal item cancelled and then the campaign itself cancelled, so an
+// orphaned campaign stops showing as live `running` work in GET /v0/campaigns.
+//
+// RECOVERY CONTRACT — IDEMPOTENT AND CONVERGENT (operator condition 2). The
+// cancellation is N independent item transitions followed by the campaign
+// transition, WITHOUT a single wrapping transaction. It is safe because it is
+// convergent: the campaign transition runs LAST, so any mid-loop failure leaves
+// the campaign in a still-cancellable (non-terminal) state, and a re-invoke
+// re-lists the items, skips the ones already cancelled (now terminal, excluded
+// from the non-terminal filter — and TransitionCampaignItem is idempotent on a
+// same-state item anyway), cancels the remainder, then transitions the campaign.
+// So a partial failure never strands the campaign half-cancelled: re-invoking the
+// verb completes it. Each item transition is individually state-guarded under the
+// repo's SELECT FOR UPDATE, so a concurrent driver cannot race it into an
+// inconsistent state.
+//
+// Cancelling a campaign deliberately does NOT cancel the linked RUNS — a run in
+// flight keeps running; fishhawk_cancel_run owns run cancellation. The refusal,
+// the tool description, and the API docs all say so.
+//
+// The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
+// unconfigured deployment answers 503 (not 401), matching the other campaign
+// write handlers and the 503-vs-404 route-registration idiom.
+func (s *Server) handleCancelCampaign(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CampaignRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "campaign_repo_unconfigured",
+			"campaigns endpoint requires a configured campaign repository", nil)
+		return
+	}
+	if !s.requireWriteScope(w, r, "write:campaigns") {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("campaign_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"campaign_id must be a valid UUID",
+			map[string]any{"field": "campaign_id", "got": r.PathValue("campaign_id")})
+		return
+	}
+
+	c, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, campaign.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "campaign_not_found",
+				"no campaign with that id", map[string]any{"campaign_id": id.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Terminal-state guard: a succeeded/failed/cancelled campaign admits no
+	// further transition (campaign.State.IsTerminal), so cancel is refused 409
+	// campaign_not_cancellable and the campaign row is left untouched.
+	if c.State.IsTerminal() {
+		s.writeError(w, r, http.StatusConflict, "campaign_not_cancellable",
+			"campaign is already in a terminal state and cannot be cancelled",
+			map[string]any{"campaign_id": id.String(), "state": string(c.State)})
+		return
+	}
+
+	items, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list campaign items failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Capture the pre-transition campaign state for the audit BEFORE any write:
+	// TransitionCampaign may mutate the shared campaign pointer (the in-memory fake
+	// aliases it), so reading c.State after the write would report "cancelled" for
+	// the audit "from" — same aliasing guard deriveCampaignAfterChange applies.
+	fromState := c.State
+
+	// Cancel every NON-terminal item (pending/blocked/running/paused -> cancelled
+	// are all valid edges in campaignItemTransitions; a terminal item is left as
+	// it stands). A transition failure surfaces an error and leaves the campaign
+	// non-terminal, so a re-invoke re-lists and completes the cancellation.
+	itemsCancelled := 0
+	for _, it := range items {
+		if it.State.IsTerminal() {
+			continue
+		}
+		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(r.Context(), it.ID, campaign.ItemStateCancelled); err != nil {
+			var inv campaign.InvalidTransitionError
+			if errors.As(err, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_transition",
+					err.Error(), map[string]any{"item_id": it.ID.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"cancel campaign item failed",
+				map[string]any{"error": err.Error(), "item_id": it.ID.String()})
+			return
+		}
+		itemsCancelled++
+	}
+
+	// Cancel the campaign itself (pending/running/paused -> cancelled are all
+	// valid). Runs last so the whole verb is convergent under a partial failure.
+	updated, err := s.cfg.CampaignRepo.TransitionCampaign(r.Context(), id, campaign.StateCancelled)
+	if err != nil {
+		var inv campaign.InvalidTransitionError
+		if errors.As(err, &inv) {
+			s.writeError(w, r, http.StatusConflict, "invalid_transition",
+				err.Error(), map[string]any{"campaign_id": id.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"cancel campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	s.emitCampaignAudit(r.Context(), categoryCampaignCancelled, map[string]any{
+		"campaign_id":     id.String(),
+		"from":            string(fromState),
+		"items_cancelled": itemsCancelled,
+	})
+
+	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(updated))
+}
+
 // Campaign audit categories the operator-driven start + reconcile-on-read path
 // emits on the GLOBAL audit chain (E26.2 / #1481). They are the SAME free-form
 // category strings the campaigndriver emits (campaigndriver/driver.go) — a
@@ -1097,6 +1223,14 @@ const (
 	categoryCampaignIssueSettled   = "campaign_issue_settled"
 	categoryCampaignAdvanced       = "campaign_advanced"
 	categoryCampaignIssueRestarted = "campaign_issue_restarted"
+	// categoryCampaignItemAutonomyRefreshed marks a reconcile-on-read autonomy
+	// refresh: an item's stored tier was overwritten from the issue's live
+	// autonomy:* label so a relabel unblocks a human-led item (#2355).
+	categoryCampaignItemAutonomyRefreshed = "campaign_item_autonomy_refreshed"
+	// categoryCampaignCancelled marks the operator cancel verb marking a
+	// campaign and its unfinished items cancelled (#2355). It does NOT cancel
+	// the linked runs (fishhawk_cancel_run owns that).
+	categoryCampaignCancelled = "campaign_cancelled"
 )
 
 // startCampaignItemRunRequest is the POST /v0/campaigns/{campaign_id}/runs body.
@@ -1235,6 +1369,27 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 			"no campaign item with that issue_ref",
 			map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef})
 		return
+	}
+
+	// Targeted autonomy refresh (#2355): re-read the ONE named item's autonomy:*
+	// label BEFORE the DAG gate so a relabel-then-start succeeds without an
+	// intervening status poll — an operator who relabels autonomy:low ->
+	// autonomy:medium and immediately starts the item is not refused item_human_led
+	// on a stale tier. Best-effort and fail-open on every guard; when it DID change
+	// the tier, re-list so NextEligible below partitions on the fresh value. It runs
+	// AFTER the campaign-state gate above, so it never widens the campaign-state
+	// refusal surface (a paused/terminal campaign still refuses with no forge call).
+	if refreshed, changed := s.refreshOneItemAutonomy(r.Context(), c, item); changed {
+		item = refreshed
+		if relisted, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id); lerr == nil {
+			items = relisted
+			for _, it := range items {
+				if it.IssueRef == req.IssueRef {
+					item = it
+					break
+				}
+			}
+		}
 	}
 
 	// DAG gate: refuse unless the item is eligible OR restartable per the pure
@@ -1445,7 +1600,7 @@ func ineligibilityDetail(item *campaign.Item, items []*campaign.Item) string {
 // ineligibilityDetail, does NOT tell the caller to start a ref — a human-led
 // item's next_action names no startable ref (#1697).
 func humanLedDetail() string {
-	return "item is deps-satisfied but autonomy:low (human-led); a human must lead it — do not start an agent run (next_action: attend_human_led)"
+	return "item is deps-satisfied but autonomy:low (human-led); a human must lead it — do not start an agent run (next_action: attend_human_led). The tier shown is re-read from the issue's autonomy:* label on each status poll and on this start verb (#2355); to drive it agent-led, relabel the issue (e.g. autonomy:low -> autonomy:medium) and re-poll fishhawk_get_campaign_status — if it still refuses, the label did not land"
 }
 
 // firstUnmetDependency returns the item's first depends_on ref whose target
@@ -1655,12 +1810,24 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		}
 	}
 
-	// Phase 1 (GitHub reads, at most ONCE per item): collect the run-less
-	// pending/blocked items whose issue is CLOSED as completed. Every fail-closed
-	// guard applies here EXCEPT the depends_on gate — Phase 2 enforces that
-	// in-memory so the closed-status read happens exactly once per item and the
-	// fixpoint never re-reads GitHub.
+	// Phase 1 (GitHub reads, at most ONCE per item): the ONE GetIssue per item
+	// serves BOTH the settle candidacy check AND the autonomy refresh (#2355), so
+	// no new GitHub call CLASS is introduced. The fetch set is the AUTONOMY-RELEVANT
+	// set — any item in pending/blocked/failed/cancelled, i.e. every state where
+	// campaign.NextEligible still consults Autonomy to partition (running/succeeded/
+	// paused route nothing on autonomy: running/succeeded don't consult it, and a
+	// PAUSED item is bucketed by NextEligible BEFORE any autonomy check, so its tier
+	// is never read — leaving it unfetched is correct). The settle candidate classes
+	// A and B are a SUBSET of that set, so the union equals the autonomy-relevant
+	// set; the widening does add reads on some polls — for run-less terminal
+	// (cancelled/failed with no run link) and run-linked non-running (pending/blocked
+	// carrying a run link) items — over the settle-only fetch, honestly NOT parity.
+	// Each fetched issue is kept in `fetched` keyed by item id for the refresh pass.
+	// Every fail-closed guard applies here EXCEPT the depends_on gate — Phase 2
+	// enforces that in-memory so the closed-status read happens exactly once per item
+	// and the fixpoint never re-reads GitHub.
 	var candidates []*campaign.Item
+	fetched := make(map[uuid.UUID]*githubclient.Issue, len(items))
 	var scope forge.CredentialScope
 	instResolved := false
 	for _, it := range items {
@@ -1677,7 +1844,13 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			(it.State == campaign.ItemStatePending || it.State == campaign.ItemStateBlocked)
 		isClassB := it.RunID != nil &&
 			(it.State == campaign.ItemStateCancelled || it.State == campaign.ItemStateFailed)
-		if !isClassA && !isClassB {
+		// Autonomy-relevant: every state where NextEligible partitions on the tier.
+		// Class A/B are a subset, so this predicate governs the whole fetch set.
+		autonomyRelevant := it.State == campaign.ItemStatePending ||
+			it.State == campaign.ItemStateBlocked ||
+			it.State == campaign.ItemStateFailed ||
+			it.State == campaign.ItemStateCancelled
+		if !autonomyRelevant {
 			continue
 		}
 		number, ok := parseIssueTriggerRef(it.IssueRef)
@@ -1689,7 +1862,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		if !instResolved {
 			id, err := s.cfg.GitHub.GetRepoInstallation(ctx, forge.RepoRef{Owner: owner, Name: name})
 			if err != nil {
-				s.cfg.Logger.Warn("reconcile-on-read: resolve installation failed; run-less settle pass skipped",
+				s.cfg.Logger.Warn("reconcile-on-read: resolve installation failed; run-less settle + autonomy refresh pass skipped",
 					"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
 				return false
 			}
@@ -1698,17 +1871,31 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		}
 		issue, err := s.cfg.GitHub.GetIssue(ctx, scope, forge.RepoRef{Owner: owner, Name: name}, number)
 		if err != nil {
-			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled",
+			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled and tier unrefreshed",
 				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef, "error", err.Error())
 			continue
 		}
-		// Settle ONLY a genuine completion: closed AND state_reason=completed. An
-		// open issue or a not_planned closure is left unsettled.
+		// Keep the issue for the autonomy refresh (its Labels carry the live tier).
+		fetched[it.ID] = issue
+		// Settle candidacy is class A/B AND a genuine completion: closed AND
+		// state_reason=completed. An open issue or a not_planned closure is left
+		// unsettled (but its tier is still refreshed below from the same fetch).
+		if !isClassA && !isClassB {
+			continue
+		}
 		if issue.State != "closed" || issue.StateReason != "completed" {
 			continue
 		}
 		candidates = append(candidates, it)
 	}
+
+	// Autonomy refresh (#2355): fold the fresh tier of every fetched item through
+	// SetCampaignItemAutonomy when it DIFFERS from the stored tier, so a relabelled
+	// child (autonomy:low -> autonomy:medium) unblocks a campaign parked on
+	// attend_human_led on the SAME poll. This runs off the labels the settle fetch
+	// already read — no extra GitHub call. It is reported as `refreshedAny` so the
+	// caller re-reads items and the rollup reflects the fresh tier.
+	refreshedAny := s.refreshItemAutonomyFromIssues(ctx, c, items, fetched)
 
 	// Phase 2 (in-memory fixpoint, no further GitHub calls): settle any candidate
 	// whose depends_on refs are all in the done-set, add its ref to the done-set,
@@ -1778,7 +1965,103 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			break
 		}
 	}
-	return settledAny
+	// The pass CHANGED state (so the caller re-reads) when it settled an item OR
+	// refreshed a tier (#2355).
+	return settledAny || refreshedAny
+}
+
+// refreshItemAutonomyFromIssues folds the live autonomy:* tier of each fetched
+// issue back onto its campaign item (#2355), so relabelling a child unblocks a
+// campaign parked on attend_human_led without a rebuild. For every item present
+// in `fetched` (the autonomy-relevant items settleIssueClosedItems' Phase 1 read
+// exactly once), it parses workmgmt.ParseAutonomyLabel(issue.Labels) and — ONLY
+// when the parsed tier DIFFERS from the stored tier — calls
+// SetCampaignItemAutonomy, emits a campaign_item_autonomy_refreshed audit, and
+// reports changed. An unchanged tier performs NO write (the no-op-write
+// guarantee). It is BEST-EFFORT and NEVER fails the read: a SetCampaignItemAutonomy
+// error logs and leaves the tier stale. Returns whether it refreshed anything.
+func (s *Server) refreshItemAutonomyFromIssues(ctx context.Context, c *campaign.Campaign, items []*campaign.Item, fetched map[uuid.UUID]*githubclient.Issue) bool {
+	refreshedAny := false
+	for _, it := range items {
+		issue, ok := fetched[it.ID]
+		if !ok {
+			continue // not fetched (non-autonomy-relevant state, non issue:N ref, or a GetIssue error).
+		}
+		want := workmgmt.ParseAutonomyLabel(issue.Labels)
+		// No-op-write guarantee: only a genuine tier change is persisted. Both
+		// sides are already in the normalized set {"", low, medium, high}, so the
+		// comparison is exact.
+		if want == it.Autonomy {
+			continue
+		}
+		if _, err := s.cfg.CampaignRepo.SetCampaignItemAutonomy(ctx, it.ID, want); err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: refresh item autonomy failed; tier left stale (read still succeeds)",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef,
+				"from", it.Autonomy, "to", want, "error", err.Error())
+			continue
+		}
+		s.emitCampaignAudit(ctx, categoryCampaignItemAutonomyRefreshed, map[string]any{
+			"campaign_id": c.ID.String(),
+			"issue_ref":   it.IssueRef,
+			"from":        it.Autonomy,
+			"to":          want,
+		})
+		refreshedAny = true
+	}
+	return refreshedAny
+}
+
+// refreshOneItemAutonomy re-reads the single named item's autonomy:* label from
+// its GitHub issue and persists the fresh tier when it differs (#2355) — the
+// targeted refresh the operator start verb runs so a relabel-then-start works
+// without an intervening status poll. It returns the (possibly-updated) item and
+// whether it changed the stored tier. BEST-EFFORT and FAIL-OPEN on every guard —
+// GitHub unwired, a repo not in owner/name form, an installation-resolve error, a
+// non issue:N ref, a GetIssue error, or a SetCampaignItemAutonomy error each
+// leaves the item on its stored tier and reports changed=false, so the DAG gate
+// runs exactly as it would today.
+func (s *Server) refreshOneItemAutonomy(ctx context.Context, c *campaign.Campaign, item *campaign.Item) (*campaign.Item, bool) {
+	if s.cfg.GitHub == nil {
+		return item, false
+	}
+	owner, name, ok := splitRepoFullName(c.Repo)
+	if !ok {
+		return item, false
+	}
+	number, ok := parseIssueTriggerRef(item.IssueRef)
+	if !ok {
+		return item, false // a non issue:N ref (e.g. a Jira key) has no GitHub issue to read.
+	}
+	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, forge.RepoRef{Owner: owner, Name: name})
+	if err != nil {
+		s.cfg.Logger.Warn("start-verb autonomy refresh: resolve installation failed; item keeps stored tier",
+			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "error", err.Error())
+		return item, false
+	}
+	scope := forge.FromGitHubInstallationID(instID)
+	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, forge.RepoRef{Owner: owner, Name: name}, number)
+	if err != nil {
+		s.cfg.Logger.Warn("start-verb autonomy refresh: get issue failed; item keeps stored tier",
+			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "issue_ref", item.IssueRef, "error", err.Error())
+		return item, false
+	}
+	want := workmgmt.ParseAutonomyLabel(issue.Labels)
+	if want == item.Autonomy {
+		return item, false
+	}
+	updated, err := s.cfg.CampaignRepo.SetCampaignItemAutonomy(ctx, item.ID, want)
+	if err != nil {
+		s.cfg.Logger.Warn("start-verb autonomy refresh: persist tier failed; item keeps stored tier",
+			"campaign_id", c.ID.String(), "item_id", item.ID.String(), "from", item.Autonomy, "to", want, "error", err.Error())
+		return item, false
+	}
+	s.emitCampaignAudit(ctx, categoryCampaignItemAutonomyRefreshed, map[string]any{
+		"campaign_id": c.ID.String(),
+		"issue_ref":   item.IssueRef,
+		"from":        item.Autonomy,
+		"to":          want,
+	})
+	return updated, true
 }
 
 // depsSatisfiedRefs reports whether every dep ref is in the done set. An empty
