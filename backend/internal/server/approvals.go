@@ -3579,15 +3579,7 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 			map[string]any{"workflow_id": runRow.WorkflowID})
 		return false
 	}
-	var deployStage spec.Stage
-	foundDeploy := false
-	for _, st := range wf.Stages {
-		if st.Type == spec.StageTypeDeploy {
-			deployStage = st
-			foundDeploy = true
-			break
-		}
-	}
+	deployStage, foundDeploy := firstDeployStage(wf)
 	if !foundDeploy {
 		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
 			"deploy pre-flight cannot be evaluated: no deploy stage found in the run's workflow; an unverifiable deploy is denied (fail-closed)", nil)
@@ -3599,16 +3591,19 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 	// — there is nothing to enforce, and fail-closed targets the
 	// can't-evaluate path, not the nothing-declared case.
 	var (
-		allowedEnvs   []string
 		changeFreeze  bool
 		requiredUp    []string
 		hasConstraint bool
 	)
+	// allowed_environments uses the shared last-wins fold so the record-side
+	// membership re-check (deployApprovedEnvironment) enforces the exact
+	// allow-list this gate admits against (E23.18 / #2324). The change_freeze /
+	// required_upstream arms stay inline — their folds are gate-only.
+	allowedEnvs := lastWinsAllowedEnvironments(deployStage)
+	if len(allowedEnvs) > 0 {
+		hasConstraint = true
+	}
 	for _, c := range deployStage.Constraints {
-		if len(c.AllowedEnvironments) > 0 {
-			allowedEnvs = c.AllowedEnvironments
-			hasConstraint = true
-		}
 		if c.ChangeFreeze != nil {
 			changeFreeze = *c.ChangeFreeze
 			hasConstraint = true
@@ -3751,6 +3746,41 @@ func sliceContains(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// firstDeployStage selects the deploy stage a workflow's gate and deploy
+// record both key on: the FIRST stage whose type is deploy (E23.18 / #2324).
+// It is the ONE implementation of that selection — the pre-execution gate
+// (checkDeployPreflight) and the record-side resolver (deployStageForRun) both
+// call it, so neither can drift to a different stage than the other. First-stage
+// keying is the shared, pre-existing behavior in multi-deploy-stage workflows;
+// centralizing it here does NOT change or endorse it (that latent defect is
+// tracked separately, out of #2324's scope). Returns ok=false when the workflow
+// declares no deploy stage.
+func firstDeployStage(wf spec.Workflow) (spec.Stage, bool) {
+	for _, st := range wf.Stages {
+		if st.Type == spec.StageTypeDeploy {
+			return st, true
+		}
+	}
+	return spec.Stage{}, false
+}
+
+// lastWinsAllowedEnvironments folds a deploy stage's allowed_environments
+// pre-flight constraint the way the approval gate admits an environment: the
+// LAST non-empty allowed_environments entry across the stage's constraints wins
+// (E23.18 / #2324). This is a literal transcription of checkDeployPreflight's
+// in-loop `allowedEnvs = c.AllowedEnvironments` assignment, extracted so the
+// record-side membership re-check enforces the SAME allow-list the gate did and
+// cannot drift from it. Returns nil when no constraint declares one.
+func lastWinsAllowedEnvironments(st spec.Stage) []string {
+	var allowed []string
+	for _, c := range st.Constraints {
+		if len(c.AllowedEnvironments) > 0 {
+			allowed = c.AllowedEnvironments
+		}
+	}
+	return allowed
 }
 
 // deployEvalRun resolves WHICH run the deploy pre-flight gate evaluates
