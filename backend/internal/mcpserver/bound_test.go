@@ -972,10 +972,148 @@ func TestElisions_BelowFloorAdvertisement_ReportsCouldNotHonour(t *testing.T) {
 	}
 }
 
+// wireDTOLiteral is one detected wire-DTO composite-literal construction: the
+// exported name it builds (Elisions or ElidedField) and the position of the
+// literal that builds it.
+type wireDTOLiteral struct {
+	Name string
+	Pos  token.Pos
+}
+
+// wireDTOTypeIdent returns the *ast.Ident naming Elisions or ElidedField when
+// expr is a type expression that DENOTES one of those wire DTOs, unwrapping the
+// compound type forms that still denote it — *ast.ArrayType (its Elt, covering
+// []T, [N]T and [...]T alike, since the array length lives in ArrayType.Len and
+// never on Elt), *ast.StarExpr (its X) and *ast.ParenExpr (its X) — recursively.
+// It returns nil for every other shape.
+//
+// It deliberately does NOT unwrap *ast.MapType: a map type has two independent
+// positions (key and value) that must be attributed separately, so the walk
+// resolves Key and Value with their own wireDTOTypeIdent calls rather than
+// collapsing them here. It also does NOT match *ast.SelectorExpr: a package
+// cannot import itself, so a qualified `mcpserver.Elisions` cannot occur in this
+// package's own production files, and matching a bare Sel name would fire on an
+// unrelated package's identically-named type.
+//
+// The name comparison is an EXACT match against "Elisions" / "ElidedField", so
+// the unexported accumulator `elidedField` never matches.
+func wireDTOTypeIdent(expr ast.Expr) *ast.Ident {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		if t.Name == "Elisions" || t.Name == "ElidedField" {
+			return t
+		}
+		return nil
+	case *ast.ArrayType:
+		return wireDTOTypeIdent(t.Elt)
+	case *ast.StarExpr:
+		return wireDTOTypeIdent(t.X)
+	case *ast.ParenExpr:
+		return wireDTOTypeIdent(t.X)
+	default:
+		return nil
+	}
+}
+
+// wireDTOLiterals walks n and returns one finding per wire-DTO construction:
+// every CompositeLit whose OWN Type denotes Elisions / ElidedField (via
+// wireDTOTypeIdent), PLUS every IMPLICITLY-typed (nil-Type) inner element whose
+// position inside a matched container resolves to the DTO. An explicitly-typed
+// inner element (`[]ElidedField{ElidedField{...}}`) is emitted EXACTLY ONCE, by
+// its own standalone visit; parent-driven emission is restricted to nil-Type
+// children, so no literal is double-counted. A nil-Type literal never matches
+// the standalone path, so it is only ever reached through its parent's type.
+func wireDTOLiterals(n ast.Node) []wireDTOLiteral {
+	var found []wireDTOLiteral
+	ast.Inspect(n, func(node ast.Node) bool {
+		lit, ok := node.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		// Standalone match: the literal's own spelled type denotes the DTO.
+		if id := wireDTOTypeIdent(lit.Type); id != nil {
+			found = append(found, wireDTOLiteral{Name: id.Name, Pos: lit.Pos()})
+		}
+		// Parent-driven emission for this literal's implicitly-typed elements,
+		// resolved against its own spelled container type. A nil-Type literal
+		// carries no container type here, so its elements are attributed when
+		// its PARENT walks it (below), never twice.
+		if lit.Type != nil {
+			found = append(found, wireDTOImplicitElements(lit, lit.Type)...)
+		}
+		return true
+	})
+	return found
+}
+
+// wireDTOImplicitElements emits a finding for every implicitly-typed (nil-Type)
+// element of lit whose position resolves to the DTO, given lit's resolved
+// container type typ (its spelled type at the top level, or the element/key/
+// value type handed down by a parent during recursion). It recurses into a
+// nil-Type element that is itself a container so a nested
+// `[][]ElidedField{{{...}}}` is covered.
+func wireDTOImplicitElements(lit *ast.CompositeLit, typ ast.Expr) []wireDTOLiteral {
+	var out []wireDTOLiteral
+	switch t := unparenType(typ).(type) {
+	case *ast.ArrayType:
+		for _, el := range lit.Elts {
+			e := el
+			// An indexed element (`[]T{0: {...}}`) is a KeyValueExpr whose Key
+			// is the index, not a DTO position; the Value is the element.
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				e = kv.Value
+			}
+			out = append(out, resolveImplicitElement(e, t.Elt)...)
+		}
+	case *ast.MapType:
+		for _, el := range lit.Elts {
+			kv, ok := el.(*ast.KeyValueExpr)
+			if !ok {
+				continue // a well-formed map literal element is always a KeyValueExpr
+			}
+			out = append(out, resolveImplicitElement(kv.Key, t.Key)...)
+			out = append(out, resolveImplicitElement(kv.Value, t.Value)...)
+		}
+	}
+	return out
+}
+
+// resolveImplicitElement attributes one container element, occupying a position
+// of type elemType, to the DTO — but ONLY when it is an implicitly-typed
+// (nil-Type) composite literal. An explicitly-typed element is left to its own
+// standalone visit (so it is not double-counted), and a non-composite element
+// (a BasicLit map key, an identifier) is not a construction at all.
+func resolveImplicitElement(expr ast.Expr, elemType ast.Expr) []wireDTOLiteral {
+	cl, ok := expr.(*ast.CompositeLit)
+	if !ok || cl.Type != nil {
+		return nil
+	}
+	var out []wireDTOLiteral
+	if id := wireDTOTypeIdent(elemType); id != nil {
+		out = append(out, wireDTOLiteral{Name: id.Name, Pos: cl.Pos()})
+	}
+	// The element's resolved type is elemType; descend into ITS implicitly-typed
+	// elements against elemType's element/key/value positions.
+	out = append(out, wireDTOImplicitElements(cl, elemType)...)
+	return out
+}
+
+// unparenType strips enclosing parentheses from a type expression so a
+// `([]ElidedField)` container is resolved like the bare form.
+func unparenType(expr ast.Expr) ast.Expr {
+	for {
+		p, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = p.X
+	}
+}
+
 // TestProjectionIsSoleProducerOfWireDTO parses the package's own .go files and
-// asserts every composite literal of Elisions / ElidedField outside the test
-// files occurs inside wire() / wireField(). A second construction path bypasses
-// the validation pass, so it must fail the package tests.
+// asserts every composite literal that constructs Elisions / ElidedField outside
+// the test files occurs inside wire() / wireField(). A second construction path
+// bypasses the validation pass, so it must fail the package tests.
 //
 // The enclosing scope is DERIVED from the declaration being walked — each
 // *ast.FuncDecl is inspected under its own name and every other declaration
@@ -987,16 +1125,24 @@ func TestElisions_BelowFloorAdvertisement_ReportsCouldNotHonour(t *testing.T) {
 // wrong scope (#2514). Deriving the scope per declaration makes the verdict
 // independent of source position.
 //
-// What this pin does NOT establish: it matches a composite literal whose Type
-// is an *ast.Ident, so it sees `Elisions{...}`, `ElidedField{...}` and the
-// address-of form `&Elisions{...}` (the & is a UnaryExpr wrapping a still
-// Ident-typed literal) — and it does NOT see a compound-typed construction such
-// as `[]ElidedField{...}`, whose Type is an *ast.ArrayType, nor that literal's
-// implicitly-typed inner elements (`{{Field: "f"}}`), which carry no Type node
-// at all. Both limits were measured, not inferred; widening the match to that
-// class is deliberately out of scope for #2514. So the guarantee is "an
-// Ident-typed literal is caught at any source position", not "no second
-// construction path exists". This is defence in depth behind
+// What this pin matches (widened in #2652 from the earlier Ident-only form):
+// via wireDTOLiterals it now catches an Ident-typed literal (`Elisions{...}`,
+// `ElidedField{...}`, and the address-of `&Elisions{...}` — the & is a
+// UnaryExpr wrapping a still Ident-typed literal), AND a COMPOUND-typed
+// construction that denotes the DTO — a slice or array `[]ElidedField{...}` /
+// `[2]ElidedField{...}` / `[...]ElidedField{...}` (all reached through the
+// *ast.ArrayType.Elt traversal), a pointer element `[]*Elisions{...}`, and a
+// map whose key or value is the DTO — PLUS each of those literals'
+// implicitly-typed inner elements (`{{Field: "f"}}`, which carry no Type node),
+// resolved from the PARENT literal's element/key/value type rather than guessed.
+// The map key/value positions are resolved independently, so
+// `map[ElidedField]otherType{...}` attributes the key and NOT the value.
+//
+// What it still does NOT establish: it does not resolve a NAMED container type
+// (`type Fields []ElidedField; Fields{{...}}`), a type-aliased or cross-package
+// spelling, or a literal built through reflection. So the guarantee is "a
+// syntactically-denoted construction is caught at any source position", not "no
+// second construction path exists". This remains defence in depth behind
 // validateWireElisions, which runs inside wire() and is the actual runtime
 // enforcement — not a substitute for it.
 func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
@@ -1024,26 +1170,18 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		// inspectDecl reports every Elisions / ElidedField literal under decl,
-		// attributed to enclosing. The scope is a PARAMETER — supplied by the
-		// caller from the declaration it is about to walk — so it cannot leak
-		// from one declaration into the next.
-		inspectDecl := func(decl ast.Node, enclosing string) {
-			ast.Inspect(decl, func(n ast.Node) bool {
-				node, ok := n.(*ast.CompositeLit)
-				if !ok {
-					return true
-				}
-				id, ok := node.Type.(*ast.Ident)
-				if !ok || (id.Name != "Elisions" && id.Name != "ElidedField") {
-					return true
-				}
-				if !allowedIn[enclosing] {
-					t.Errorf("%s:%d: %s composite literal in %q — the wire DTO has exactly one producer, (elisionLedger).wire()/wireField(), so every entry passes validateWireElisions",
-						name, fset.Position(node.Pos()).Line, id.Name, enclosing)
-				}
-				return true
-			})
+		// reportDecl flags every wire-DTO literal under decl, attributed to
+		// enclosing. The scope is a PARAMETER — supplied by the caller from the
+		// declaration it is about to walk — so it cannot leak from one
+		// declaration into the next.
+		reportDecl := func(decl ast.Node, enclosing string) {
+			if allowedIn[enclosing] {
+				return
+			}
+			for _, lit := range wireDTOLiterals(decl) {
+				t.Errorf("%s:%d: %s composite literal in %q — the wire DTO has exactly one producer, (elisionLedger).wire()/wireField(), so every entry passes validateWireElisions",
+					name, fset.Position(lit.Pos).Line, lit.Name, enclosing)
+			}
 		}
 		for _, decl := range file.Decls {
 			// Inspect the whole FuncDecl, not just its Body: a nil body (an
@@ -1051,11 +1189,143 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 			// receivers, signatures and nested func literals stay attributed to
 			// the named function that owns them.
 			if fn, ok := decl.(*ast.FuncDecl); ok {
-				inspectDecl(fn, fn.Name.Name)
+				reportDecl(fn, fn.Name.Name)
 				continue
 			}
-			inspectDecl(decl, packageScope)
+			reportDecl(decl, packageScope)
 		}
+	}
+}
+
+// TestWireDTOLiteralMatch is the committed pin for the widened matcher: it
+// parses a small snippet per row and asserts the EXACT set of findings (name +
+// line), not a non-zero count. It is the counterfactual vehicle for #2652 —
+// deleting the compound-type unwrapping reddens the slice/array/map/pointer
+// rows, deleting the nil-Type parent-resolution branch reddens the
+// implicit-inner-element rows — and it carries the positive control as negative
+// rows that must return ZERO findings, so an over-matching widening reddens here
+// as well as on the live package walk.
+func TestWireDTOLiteralMatch(t *testing.T) {
+	fset := token.NewFileSet()
+	findings := func(t *testing.T, src string) []string {
+		t.Helper()
+		f, err := parser.ParseFile(fset, "snippet.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse: %v\nsource:\n%s", err, src)
+		}
+		var out []string
+		for _, lit := range wireDTOLiterals(f) {
+			out = append(out, fmt.Sprintf("%s:%d", lit.Name, fset.Position(lit.Pos).Line))
+		}
+		sort.Strings(out)
+		return out
+	}
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		// --- positive: each widened spelling as its OWN row --------------------
+		{
+			name: "bare Elisions",
+			src:  "package p\nvar _ = Elisions{}\n",
+			want: []string{"Elisions:2"},
+		},
+		{
+			name: "address-of Elisions",
+			src:  "package p\nvar _ = &Elisions{}\n",
+			want: []string{"Elisions:2"},
+		},
+		{
+			name: "slice: outer plus implicit inner",
+			src:  "package p\nvar _ = []ElidedField{\n\t{Field: \"f\"},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3"},
+		},
+		{
+			// Condition 2: an EXPLICITLY-typed inner element is reported EXACTLY
+			// ONCE — by its own standalone visit, never also via the parent walk.
+			// A third finding here would be the double-count defect.
+			name: "slice: explicitly-typed inner element reported exactly once",
+			src:  "package p\nvar _ = []ElidedField{\n\tElidedField{Field: \"f\"},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3"},
+		},
+		{
+			name: "fixed array: outer plus two implicit inners",
+			src:  "package p\nvar _ = [2]ElidedField{\n\t{},\n\t{},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3", "ElidedField:4"},
+		},
+		{
+			// Condition 1: [...]T is a fixed array whose Ellipsis is ArrayType.Len,
+			// NOT its Elt — so it is covered by the SAME ArrayType.Elt traversal as
+			// []T and [N]T, not by any *ast.Ellipsis branch (there is none).
+			name: "ellipsis-length array: covered by the Elt traversal",
+			src:  "package p\nvar _ = [...]ElidedField{\n\t{Field: \"f\"},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3"},
+		},
+		{
+			name: "pointer element slice",
+			src:  "package p\nvar _ = []*Elisions{\n\t{Tier: \"x\"},\n}\n",
+			want: []string{"Elisions:2", "Elisions:3"},
+		},
+		{
+			name: "map value: outer not reported, value resolves",
+			src:  "package p\nvar _ = map[string]ElidedField{\n\t\"a\": {Field: \"f\"},\n}\n",
+			want: []string{"ElidedField:3"},
+		},
+		{
+			name: "map key resolves",
+			src:  "package p\nvar _ = map[ElidedField]string{\n\t{Field: \"f\"}: \"x\",\n}\n",
+			want: []string{"ElidedField:3"},
+		},
+		{
+			name: "nested slice recursion",
+			src:  "package p\nvar _ = [][]ElidedField{\n\t{\n\t\t{Field: \"f\"},\n\t},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3", "ElidedField:4"},
+		},
+		// --- negative: the positive control (must return ZERO findings) --------
+		{
+			// The unexported accumulator — production carries five of these. The
+			// exact-case name comparison is what separates it from ElidedField.
+			name: "unexported accumulator elidedField",
+			src:  "package p\nvar _ = []elidedField{\n\t{field: \"f\"},\n}\n",
+			want: nil,
+		},
+		{
+			name: "unrelated string slice",
+			src:  "package p\nvar _ = []string{\"a\"}\n",
+			want: nil,
+		},
+		{
+			name: "unrelated empty-struct map",
+			src:  "package p\nvar _ = map[string]struct{}{}\n",
+			want: nil,
+		},
+		{
+			name: "unrelated reflect.Type map",
+			src:  "package p\nvar _ = map[string]reflect.Type{}\n",
+			want: nil,
+		},
+		{
+			name: "unrelated named-struct slice",
+			src:  "package p\nvar _ = []otherType{\n\t{},\n}\n",
+			want: nil,
+		},
+		{
+			// Precision row: the KEY position is the DTO and fires; the VALUE
+			// position is unrelated and must NOT — the resolution is per position,
+			// not "any implicit literal under a DTO-mentioning container".
+			name: "map key fires, value does not",
+			src:  "package p\nvar _ = map[ElidedField]otherType{\n\t{Field: \"f\"}: {},\n}\n",
+			want: []string{"ElidedField:3"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findings(t, tc.src)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("wireDTOLiterals findings = %v, want %v\nsource:\n%s", got, tc.want, tc.src)
+			}
+		})
 	}
 }
 
