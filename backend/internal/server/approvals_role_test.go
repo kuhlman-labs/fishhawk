@@ -74,8 +74,18 @@ func (r *approvalGateRunRepo) SetRunPullRequestURL(context.Context, uuid.UUID, s
 func (r *approvalGateRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
 	return nil, errors.New("not used")
 }
-func (r *approvalGateRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+
+// ListStagesForRun returns the run's seeded stage. The stage-scoped deploy
+// selection (#2642) reads the run's stage rows to compute a deploy stage's
+// ordinal, so this fake must surface the seeded stage — returning an error
+// would make the deploy gate fail closed on an otherwise-admissible approval.
+func (r *approvalGateRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stage != nil && r.stage.RunID == runID {
+		return []*run.Stage{r.stage}, nil
+	}
+	return nil, nil
 }
 func (r *approvalGateRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")

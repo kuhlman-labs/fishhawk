@@ -370,6 +370,41 @@ func TestSubmitApproval_Deploy_EndToEnd_TriggersAndParks(t *testing.T) {
 	}
 }
 
+// TestResolveDeployDelegate_SecondDeployStage_UsesOwnWorkflowRef is the #2642
+// trigger proof (binding condition 6): on a two-deploy-stage workflow, the
+// trigger resolves the SECOND stage row to its OWN delegate, so it fires the
+// second stage's workflow_ref (deploy-prod.yml), never the first stage's
+// (deploy-staging.yml). Without the shared-chokepoint routing a correctly gated
+// second deploy stage would still fire the FIRST stage's ref. This is
+// counterfactual (a)'s vehicle on the trigger side: restoring first-match inside
+// deployStageForRunStage reddens it (workflow_ref becomes deploy-staging.yml).
+func TestResolveDeployDelegate_SecondDeployStage_UsesOwnWorkflowRef(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	first, _ := seedDispatchedDeploy(rr, twoDeployStagesSpec, instID(99))
+	second := seedSecondDeployStage(rr, first, run.StageStateDispatched)
+
+	delegate, _, failed, err := s.resolveDeployDelegate(context.Background(), second)
+	if err != nil || failed != nil {
+		t.Fatalf("resolveDeployDelegate(second) = (failed=%v, err=%v), want a resolved delegate", failed, err)
+	}
+	if delegate == nil {
+		t.Fatal("resolveDeployDelegate(second) delegate is nil, want the second stage's delegate")
+	}
+	if delegate.WorkflowRef != "deploy-prod.yml" {
+		t.Errorf("delegate.WorkflowRef = %q, want %q (second stage's own workflow_ref)", delegate.WorkflowRef, "deploy-prod.yml")
+	}
+
+	// The FIRST row still resolves to its OWN ref, proving stage-scoped (not
+	// last-match) selection on the trigger side too.
+	firstDelegate, _, ffailed, ferr := s.resolveDeployDelegate(context.Background(), first)
+	if ferr != nil || ffailed != nil || firstDelegate == nil {
+		t.Fatalf("resolveDeployDelegate(first) = (delegate=%v, failed=%v, err=%v)", firstDelegate, ffailed, ferr)
+	}
+	if firstDelegate.WorkflowRef != "deploy-staging.yml" {
+		t.Errorf("first delegate.WorkflowRef = %q, want %q", firstDelegate.WorkflowRef, "deploy-staging.yml")
+	}
+}
+
 const deploySpecWebhookFmt = `
 version: "1.0"
 workflows:

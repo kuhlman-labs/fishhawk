@@ -91,6 +91,16 @@ func (s *Server) triggerDeploy(ctx context.Context, stage *run.Stage) (*run.Stag
 // here is an infrastructure-class surprise) and returns a nil delegate alongside
 // the failed stage + error for the caller to propagate. On success it returns
 // the delegate + run with a nil stage/error.
+//
+// It routes the stage lookup through the shared resolveDeploySpecStage chokepoint
+// (E23.19 / #2642) so the trigger fires THIS stage's workflow_ref: on a
+// multi-deploy-stage workflow, first-match would fire the FIRST deploy stage's
+// ref while the gate admitted a LATER stage for its own environment — a worse
+// end state than today's consistently-wrong behavior. Because the resolver's
+// typed reason is a diagnostic the trigger does not surface distinctly (every
+// spec-resolution failure here is the same category-C surprise), the two
+// distinct trigger messages are "the deploy stage could not be resolved" and
+// "the gated deploy stage declares no executor.delegate".
 func (s *Server) resolveDeployDelegate(ctx context.Context, stage *run.Stage) (*spec.DelegateConfig, *run.Run, *run.Stage, error) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if err != nil {
@@ -98,29 +108,22 @@ func (s *Server) resolveDeployDelegate(ctx context.Context, stage *run.Stage) (*
 			map[string]any{"error": err.Error()})
 		return nil, nil, failed, ferr
 	}
-	if len(runRow.WorkflowSpec) == 0 {
-		failed, ferr := s.failDeployTrigger(ctx, stage, "deploy trigger: run carries no cached workflow spec", nil)
-		return nil, nil, failed, ferr
-	}
-	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
-	if err != nil {
-		failed, ferr := s.failDeployTrigger(ctx, stage, "deploy trigger: cached workflow spec does not parse",
-			map[string]any{"error": err.Error()})
-		return nil, nil, failed, ferr
-	}
-	wf, ok := parsed.Workflows[runRow.WorkflowID]
-	if !ok {
-		failed, ferr := s.failDeployTrigger(ctx, stage, "deploy trigger: run's workflow not in cached spec",
-			map[string]any{"workflow_id": runRow.WorkflowID})
-		return nil, nil, failed, ferr
-	}
-	for _, st := range wf.Stages {
-		if st.Type == spec.StageTypeDeploy && st.Executor.Delegate != nil {
-			return st.Executor.Delegate, runRow, nil, nil
+	st, reason, rerr := s.resolveDeploySpecStage(ctx, runRow, stage)
+	if reason != deployStageResolveOK {
+		details := map[string]any{"resolve_reason": int(reason)}
+		if rerr != nil {
+			details["error"] = rerr.Error()
 		}
+		failed, ferr := s.failDeployTrigger(ctx, stage,
+			"deploy trigger: the deploy stage could not be resolved from the run's cached spec", details)
+		return nil, nil, failed, ferr
 	}
-	failed, ferr := s.failDeployTrigger(ctx, stage, "deploy trigger: no delegating deploy stage in cached spec", nil)
-	return nil, nil, failed, ferr
+	if st.Executor.Delegate == nil {
+		failed, ferr := s.failDeployTrigger(ctx, stage,
+			"deploy trigger: the gated deploy stage declares no executor.delegate", nil)
+		return nil, nil, failed, ferr
+	}
+	return st.Executor.Delegate, runRow, nil, nil
 }
 
 // triggerDeployGitHubActions dispatches the customer's deploy workflow via

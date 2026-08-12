@@ -673,6 +673,23 @@ func (r *deployStageRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, err
 	return nil, run.ErrNotFound
 }
 
+// ListStagesForRun returns every seeded stage sharing runID. The stage-scoped
+// deploy selection (#2642) reads the run's stage rows to compute a deploy
+// stage's ordinal, so this fake must model the real repo — BaseFake's default
+// nil,nil would make the record resolve no stage and label the deploy "".
+func (r *deployStageRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*run.Stage
+	for _, s := range r.stages {
+		if s.RunID == runID {
+			cp := *s
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
 func (r *deployStageRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
