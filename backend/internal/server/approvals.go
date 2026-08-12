@@ -3691,31 +3691,7 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 	// stage. The typed reason preserves each precondition's distinct refusal
 	// message (operator binding condition 3).
 	deployStage, reason, rerr := s.resolveDeploySpecStage(ctx, runRow, stage)
-	switch reason {
-	case deployStageResolveOK:
-		// resolved — fall through to constraint collection below.
-	case deployStageResolveNoSpec:
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the run carries no cached workflow spec; an unverifiable deploy is denied (fail-closed)", nil)
-		return false
-	case deployStageResolveSpecParse:
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the cached workflow spec does not parse; an unverifiable deploy is denied (fail-closed)",
-			map[string]any{"error": rerr.Error()})
-		return false
-	case deployStageResolveWorkflowMissing:
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the run's workflow is not in its cached spec; an unverifiable deploy is denied (fail-closed)",
-			map[string]any{"workflow_id": runRow.WorkflowID})
-		return false
-	case deployStageResolveRowsUnavailable:
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the run's stage rows could not be listed; an unverifiable deploy is denied (fail-closed)",
-			map[string]any{"error": rerr.Error()})
-		return false
-	case deployStageResolveOrdinalUnmatched:
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: no deploy stage in the run's workflow matches this stage row's deploy position; an unverifiable deploy is denied (fail-closed)", nil)
+	if s.refuseDeployForResolveReason(w, r, stage, runRow, reason, rerr) {
 		return false
 	}
 
@@ -3900,6 +3876,52 @@ const (
 	deployStageResolveRowsUnavailable                           // the run's stage rows could not be listed
 	deployStageResolveOrdinalUnmatched                          // no deploy spec stage at the stage row's deploy ordinal
 )
+
+// refuseDeployForResolveReason maps a resolveDeploySpecStage reason to the
+// deploy gate's fail-closed refusal (E23.19 / #2642). It returns false ONLY for
+// deployStageResolveOK — meaning the caller may proceed to constraint
+// collection with the resolved spec stage; for every other reason it writes the
+// precondition's distinct 422 refusal (operator binding condition 3) and
+// returns true so checkDeployPreflight refuses.
+//
+// The trailing default arm is load-bearing, not decorative: a future reason
+// constant added to resolveDeploySpecStage without a matching case here must
+// STILL refuse rather than proceed with a zero-value spec.Stage. Deleting it
+// stops this function compiling (missing return) — the fail-closed posture is
+// STRUCTURAL (ADR-038), not contingent on a future editor extending the switch.
+func (s *Server) refuseDeployForResolveReason(w http.ResponseWriter, r *http.Request, stage *run.Stage, runRow *run.Run, reason deployStageResolveReason, rerr error) bool {
+	switch reason {
+	case deployStageResolveOK:
+		return false
+	case deployStageResolveNoSpec:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run carries no cached workflow spec; an unverifiable deploy is denied (fail-closed)", nil)
+		return true
+	case deployStageResolveSpecParse:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the cached workflow spec does not parse; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": rerr.Error()})
+		return true
+	case deployStageResolveWorkflowMissing:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run's workflow is not in its cached spec; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"workflow_id": runRow.WorkflowID})
+		return true
+	case deployStageResolveRowsUnavailable:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run's stage rows could not be listed; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": rerr.Error()})
+		return true
+	case deployStageResolveOrdinalUnmatched:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: no deploy stage in the run's workflow matches this stage row's deploy position; an unverifiable deploy is denied (fail-closed)", nil)
+		return true
+	default:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			fmt.Sprintf("deploy pre-flight cannot be evaluated: unrecognized deploy-stage resolve reason %d; an unverifiable deploy is denied (fail-closed)", reason), nil)
+		return true
+	}
+}
 
 // resolveDeploySpecStage is the ONE deploy-stage selection chokepoint the gate
 // (checkDeployPreflight), the record (deploySpecStageForStage), and the trigger

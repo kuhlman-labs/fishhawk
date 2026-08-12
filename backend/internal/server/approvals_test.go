@@ -5971,6 +5971,47 @@ func TestDeployGate_FailClosed_NilRunRepo(t *testing.T) {
 	}
 }
 
+// FAIL CLOSED: the reason-dispatch helper's default arm. resolveDeploySpecStage
+// returns only the six enumerated reasons today, so this branch is unreachable
+// through the real resolver — it is defensive hardening for a future reason
+// constant added without a matching case (#2642 fix-up). Because the branch
+// cannot be reached via checkDeployPreflight without a resolver seam, the helper
+// is exercised directly with an out-of-range reason value: it must WRITE a 422
+// deploy_preflight_unevaluable refusal and return true (refuse), never fall
+// through to constraint collection. Deleting the default arm stops the helper
+// compiling (missing return), so this test — and the whole package — go red.
+func TestDeployGate_FailClosed_UnknownResolveReason(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newApprovalAuditFake()})
+	stage := &run.Stage{ID: uuid.New(), RunID: uuid.New(), Type: run.StageTypeDeploy}
+	runRow := &run.Run{ID: stage.RunID}
+	// A reason value past the last enumerated constant — the case a default arm
+	// exists to catch. deployStageResolveOrdinalUnmatched is the highest defined
+	// reason; +1 is guaranteed unenumerated.
+	unknown := deployStageResolveOrdinalUnmatched + 1
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	if !s.refuseDeployForResolveReason(w, withAuth(req), stage, runRow, unknown, nil) {
+		t.Fatal("refuseDeployForResolveReason returned false (proceed) for an unrecognized reason; it must fail closed")
+	}
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
+	}
+	if body := decodeErrorEnvelope(t, w); body.Code != "deploy_preflight_unevaluable" {
+		t.Errorf("error code = %q, want deploy_preflight_unevaluable", body.Code)
+	}
+
+	// Control: the OK reason proceeds (returns false) and writes nothing, so the
+	// helper's refuse path is what produced the 422 above, not an unconditional
+	// write.
+	okW := httptest.NewRecorder()
+	if s.refuseDeployForResolveReason(okW, withAuth(req), stage, runRow, deployStageResolveOK, nil) {
+		t.Fatal("refuseDeployForResolveReason returned true for deployStageResolveOK; OK must proceed")
+	}
+	if okW.Code != http.StatusOK || okW.Body.Len() != 0 {
+		t.Errorf("OK reason wrote a response (code=%d, body=%q); it must write nothing", okW.Code, okW.Body.String())
+	}
+}
+
 // A deploy-gate REJECT fails the stage category-D and never runs the
 // pre-flight gate (deploy delegation covers approve only).
 func TestDeployGate_Reject_FailsCategoryD(t *testing.T) {
