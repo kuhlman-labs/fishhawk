@@ -228,6 +228,29 @@ func acceptanceSlotItemTerminal(state string) bool {
 	}
 }
 
+// acceptanceSlotIncompleteReason names WHY an inspection was incomplete —
+// truncation at the candidate cap, failed candidate stage reads, or both — so a
+// caller can say that an unverifiable verdict is a CLASSIFICATION gap rather
+// than a probe result. Returns "" when the inspection was complete.
+//
+// Shared by the two sites that must refuse to answer positively on an
+// incomplete inspection: the no-participant block, and the refused-probe arm
+// that would otherwise report `free` while an un-inspected item could hold the
+// slot (#2503).
+func acceptanceSlotIncompleteReason(truncated bool, readFailures []string) string {
+	var reasons []string
+	if truncated {
+		reasons = append(reasons, fmt.Sprintf(
+			"inspection was truncated at the %d-item cap", acceptanceSlotMaxItemReads))
+	}
+	if len(readFailures) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"%d candidate item stage read(s) failed (%s)",
+			len(readFailures), strings.Join(readFailures, ", ")))
+	}
+	return strings.Join(reasons, "; ")
+}
+
 // acceptanceSlotFor builds the acceptance-slot visibility block from the
 // campaign's items (E48.71 / #2503), or returns nil when no item is at or near
 // the acceptance gate (the block is then omitted from the response entirely).
@@ -331,20 +354,7 @@ func (r *runResolver) acceptanceSlotFor(ctx context.Context, items []CampaignIte
 			return nil
 		}
 		host, source := resolveAcceptanceSlotHost(r.getenv)
-		// Name WHY the inspection was incomplete (truncation, failed reads, or both)
-		// so the operator knows the unverifiable verdict is a classification gap, not
-		// a probe result.
-		var reasons []string
-		if truncated {
-			reasons = append(reasons, fmt.Sprintf(
-				"inspection was truncated at the %d-item cap", acceptanceSlotMaxItemReads))
-		}
-		if len(readFailures) > 0 {
-			reasons = append(reasons, fmt.Sprintf(
-				"%d candidate item stage read(s) failed (%s)",
-				len(readFailures), strings.Join(readFailures, ", ")))
-		}
-		reason := strings.Join(reasons, "; ")
+		reason := acceptanceSlotIncompleteReason(truncated, readFailures)
 		return &AcceptanceSlot{
 			Shared:           true,
 			TargetHost:       host,
@@ -404,6 +414,23 @@ func (r *runResolver) acceptanceSlotFor(ctx context.Context, items []CampaignIte
 			slot.Note = fmt.Sprintf(
 				"acceptance validates against ONE shared preview slot at %s; signals DISAGREE — the probe got connection refused (the slot looks unbound) while item %s's acceptance stage is %s (a live holder). Reporting unverifiable rather than free: verify the preview host and whether the probe reached the right target (the probe runs from the process serving the tool).",
 				host, heldBy.IssueRef, heldBy.StageState)
+		} else if truncated || len(readFailures) > 0 {
+			// A positive `free` requires a COMPLETE inspection. The probe says the
+			// slot is unbound and no CLASSIFIED item holds it — but an item we never
+			// classified (truncated away at the cap, or whose stage read failed) may
+			// hold a live acceptance stage. This is the same probe-versus-stage
+			// disagreement the heldBy arm above resolves to unverifiable; it differs
+			// only in that the potential holder is one we could not read rather than
+			// one we did, which is a reason for LESS confidence, not more. Reporting
+			// free here would be exactly the confidently-wrong answer this block
+			// exists to prevent (#2503, conditions 1 & 2).
+			//
+			// Reachable only when a waiter was classified: with no holder AND no
+			// waiter the incomplete-inspection guard above has already returned.
+			slot.State = "unverifiable"
+			slot.Note = fmt.Sprintf(
+				"acceptance validates against ONE shared preview slot at %s; the probe got connection refused (the slot looks unbound) and no classified item holds it, but %s — so an un-inspected item could hold the slot. Reporting unverifiable rather than free: re-check after the affected items settle, or inspect the individual item runs.",
+				host, acceptanceSlotIncompleteReason(truncated, readFailures))
 		} else {
 			slot.State = "free"
 			slot.Note = fmt.Sprintf(

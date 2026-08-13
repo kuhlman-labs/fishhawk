@@ -303,6 +303,52 @@ func TestAcceptanceSlotFor_Free(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSlot_IncompleteInspectionWithWaiter_IsNotFree pins the refused-probe
+// arm's completeness requirement: a positive `free` demands a COMPLETE inspection.
+//
+// A classified WAITER bypasses the no-participant incomplete-inspection guard
+// (which requires heldBy == nil AND len(waiting) == 0), after which the
+// slotProbeRefused arm decided on heldBy alone. So a refused probe plus a candidate
+// whose stage read failed reported `free` — while that unread item could hold a live
+// acceptance stage. That is the same probe-versus-stage disagreement the heldBy arm
+// resolves to unverifiable, differing only in that the potential holder is one we
+// could not read.
+//
+// This is the DISCRIMINATING SIBLING of TestAcceptanceSlotFor_Free: identical setup
+// minus the failed read, which legitimately yields `free`. The pair is what makes the
+// control falsifiable — deleting the `truncated || len(readFailures) > 0` arm reddens
+// THIS test while leaving TestAcceptanceSlotFor_Free green, so the two tests pin
+// different behavior rather than the same one twice.
+func TestAcceptanceSlot_IncompleteInspectionWithWaiter_IsNotFree(t *testing.T) {
+	shrinkSlotProbeTimeout(t, 200*time.Millisecond)
+	fb, srv := newFakeBackend(t)
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	refusedHost := hostOf(closed.URL)
+	closed.Close()
+
+	// #26 waits: a participant, so the no-participant guard does not fire, and no
+	// holder is classified.
+	waiter, _ := seedItemWithAcceptanceStage(t, fb, "#26", "running", "pending")
+	// #27 IS actually holding the slot (running acceptance stage) — but its stage
+	// read 500s, so it degrades away unclassified. The inspection cannot see the
+	// very holder that would contradict a `free` verdict.
+	unread, unreadRun := seedItemWithAcceptanceStage(t, fb, "#27", "running", "running")
+	fb.stagesStatusByRun[unreadRun] = http.StatusInternalServerError
+
+	r := newSlotResolver(srv, map[string]string{acceptancePreviewAddrEnv: refusedHost})
+	slot := r.acceptanceSlotFor(context.Background(), []CampaignItem{waiter, unread})
+	if slot == nil {
+		t.Fatal("expected a block (a waiter is present)")
+	}
+	if slot.State != "unverifiable" {
+		t.Fatalf("state = %q, want unverifiable: the probe was refused and no holder was CLASSIFIED, but item #27's stage read failed so it could be holding the slot; note=%s",
+			slot.State, slot.Note)
+	}
+	if len(slot.ReadFailures) != 1 || slot.ReadFailures[0] != "#27" {
+		t.Fatalf("ReadFailures = %+v, want [#27] — the unverifiable verdict must name the item it could not classify", slot.ReadFailures)
+	}
+}
+
 // --- Bound / degrade controls (plan counterfactuals) ---
 
 // slotHostFromCountingHealthz stands up a /healthz that counts requests and serves
