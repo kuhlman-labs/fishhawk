@@ -2649,7 +2649,12 @@ components:
       type: object
       description: |
         Echoed by `POST /v0/runs/{run_id}/pull-request`. `idempotent`
-        is true when the upload matched an existing artifact.
+        is true when the upload matched an existing artifact. On such an
+        idempotent replay the handler ALSO drives a still-`running` implement
+        stage to its terminal state (`#2630`), so a re-ship of an already-
+        persisted artifact terminalises the stage rather than leaving it
+        un-settled. The wire shape is unchanged; only the documented behavior
+        widens.
       required: [id, stage_id, content_hash, pr_number, pr_url, head_sha, idempotent]
       properties:
         id: { $ref: '#/components/schemas/UUID' }

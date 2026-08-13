@@ -18,7 +18,7 @@ import (
 // driveSpawnFunc is the injectable spawn seam for fishhawk_drive_run. It
 // matches spawnRunnerStageDetached exactly; production uses that function,
 // tests inject a recording spawner.
-type driveSpawnFunc func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error)
+type driveSpawnFunc func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error)
 
 // runnerLivenessVerdict is the three-valued result of the host runner-liveness
 // probe fishhawk_drive_run runs on a stale 'dispatched' stage (#1955). The MCP
@@ -825,7 +825,8 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
 				return e
 			}
-			if _, spwErr := spawn(binary, argv, env, runUUID.String(), disp.ID, report); spwErr != nil {
+			probe := r.stageStateProbe(runUUID, disp.ID)
+			if _, spwErr := spawn(binary, argv, env, runUUID.String(), disp.ID, report, probe); spwErr != nil {
 				out.StoppedReason = stoppedStageFailed
 				out.Warnings = append(out.Warnings,
 					fmt.Sprintf("spawn of %s stage failed: %v", disp.Type, spwErr))

@@ -72,6 +72,18 @@ type DispatchStageOutput struct {
 // the shared canonical autoDriveDispatchActionName for both callers (#1905).
 const dispatchStageSourceTag = "fishhawk_dispatch_stage"
 
+// dispatchSpawnDetached is fishhawk_dispatch_stage's detached-spawn seam (#2630).
+// Production points at the real spawnRunnerStageDetached; a test overrides it
+// (serially, with cleanup — the mcpserver tests run without t.Parallel, the same
+// posture runStageCommand/runStageLookPath use) to observe the arguments this verb
+// threads into the spawn without launching a runner. It is READ synchronously
+// inside dispatchStage before the call returns, so — unlike the reaper's
+// reapProbeBackoff — no goroutine reads it after the verb returns, and a serial
+// test override cannot race a leaked reaper. Kept SEPARATE from the drive loop's
+// r.driveSpawn field so a manual dispatch stays distinguishable from a drive-loop
+// spawn in the shared-fake recovery tests.
+var dispatchSpawnDetached = spawnRunnerStageDetached
+
 // autoDriveRecordableStage reports whether a manual-dispatch stage type is in
 // the /auto-drive/acts endpoint's closed dispatch-stage set (plan|implement|
 // acceptance). A review dispatch is NOT recordable — the endpoint would 400 an
@@ -410,7 +422,19 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
 	}
 
-	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report)
+	probe := r.stageStateProbe(runUUID, resolvedStageID)
+
+	// dispatchSpawnDetached is the detached-spawn seam (default: the real
+	// spawnRunnerStageDetached). It exists so a test can observe the
+	// (binary, argv, probe) THIS call site threads WITHOUT launching a real
+	// runner + reaper goroutine — the wiring pin for the #2630 non-nil probe
+	// (TestDispatchStage_ThreadsNonNilProbeToSpawn). A full detached-spawn
+	// end-to-end could assert the same property only by racing the package-global
+	// reap settle-window against a leaked reaper goroutine (CI run 31660448999).
+	// It is deliberately NOT the drive loop's r.driveSpawn seam: this verb's manual
+	// dispatch must stay distinct from a drive-loop spawn for the shared-fake
+	// recovery tests (TestDriveRun_StaleRecoveryConvergence_EndToEnd).
+	logPath, err := dispatchSpawnDetached(binary, argv, env, runUUID.String(), resolvedStageID, report, probe)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}

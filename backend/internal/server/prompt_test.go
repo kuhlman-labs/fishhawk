@@ -9106,6 +9106,38 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 		assertNoExemptKeys(t, keys, "a stage RE-PARKED after an earlier exempt")
 	})
 
+	// #2630 SELF-INVALIDATION: an `exempted` decision SUPERSEDED by a newer
+	// lineage entry — the PR opened, a fix-up landed, or a child pushed — is no
+	// longer the newest, so the widened category walk demotes it and the gate
+	// emits nothing. Without the invalidator categories in the walk the exempted
+	// entry would stay newest and the runner would re-enter the PR-open
+	// short-circuit on the next dispatch (the sticky re-entry #2630 exists to
+	// close). COUNTERFACTUAL: removing `pull_request_opened` from the widened list
+	// reddens exempt_superseded_by_pull_request_opened.
+	t.Run("exempt_superseded_by_pull_request_opened", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+			scopeDecisionEntry(stageID, "pull_request_opened", 3),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt SUPERSEDED by a newer pull_request_opened")
+	})
+
+	t.Run("exempt_superseded_by_fixup_pushed", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+			scopeDecisionEntry(stageID, "fixup_pushed", 3),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt SUPERSEDED by a newer fixup_pushed")
+	})
+
+	t.Run("exempt_superseded_by_child_pushed", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+			scopeDecisionEntry(stageID, "child_pushed", 3),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt SUPERSEDED by a newer child_pushed")
+	})
+
 	t.Run("nil_audit_repo_fails_closed", func(t *testing.T) {
 		// The chain is UNREADABLE because it is not configured at all — the
 		// second enumerated fail-closed branch. The park itself looks fully
@@ -9201,6 +9233,65 @@ func TestPromptRenderExemptFields_EmissionGate(t *testing.T) {
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessFailed, 2),
 		})
 		assertNoExemptKeys(t, keys, "/prompt-render on a FAIL-decided park")
+	})
+}
+
+// fixupTriggerEntry is a stage_fixup_triggered audit entry carrying one routed
+// concern — the shape the fix-up handler writes to re-open an implement stage
+// for a bounded fix-up pass. Its presence for THIS stage is what makes
+// handleGetStagePrompt / handleGetStagePromptRender derive fixup=true.
+func fixupTriggerEntry(stageID uuid.UUID, seq int64) *audit.Entry {
+	id := stageID
+	return &audit.Entry{
+		Sequence: seq, StageID: &id, Category: CategoryStageFixupTriggered,
+		Payload: []byte(`{"concerns":[{"severity":"high","category":"correctness","note":"fix the thing"}]}`),
+	}
+}
+
+// TestPromptExemptFields_FixupDispatchRefusesEmission is the #2630 TRIGGER fix,
+// asserted through the REAL prompt handler over httptest (operator condition 4),
+// not only the unit resolver: a fix-up dispatch onto an exempt-resolved park
+// must NOT emit the held-commit fields. Emitting them would send the runner to
+// its pre-agent openHeldCommitPR short-circuit and discard the 15KB fix-up
+// prompt it just fetched — the sticky re-entry that stranded a stage in
+// `running` forever. Both the runner-facing /prompt (the dispatch path) and the
+// SPA-readable /prompt-render are covered, because both handlers derive `fixup`
+// identically and the two responses MUST stay byte-consistent (a divergence
+// would show the operator a preview the runner never receives).
+//
+// COUNTERFACTUAL: deleting the `if fixup` refusal in resolveHeldCommitExemption
+// makes both subtests emit the held-commit fields and turns them red. The
+// control below (identical exempt state WITHOUT the fix-up trigger) DOES emit,
+// so each RED lands on the fixup guard rather than a broken fixture.
+func TestPromptExemptFields_FixupDispatchRefusesEmission(t *testing.T) {
+	stageID := uuid.New() // placeholder; the helpers rewrite StageID
+
+	exemptEntries := func() []*audit.Entry {
+		return []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+			fixupTriggerEntry(stageID, 3),
+		}
+	}
+
+	// CONTROL: the SAME exempt state WITHOUT the fix-up trigger emits the golden
+	// projection, proving the refusals below discriminate the fixup guard.
+	control := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}, nil)
+	assertGoldenExemptProjection(t, control, "/prompt control (no fix-up trigger)")
+
+	t.Run("dispatch", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), exemptEntries(), nil)
+		assertNoExemptKeys(t, keys,
+			"a fix-up dispatch on an exempt-resolved park must run the fix-up, never emit held-commit fields")
+	})
+
+	t.Run("render", func(t *testing.T) {
+		keys := exemptRenderKeys(t, exemptPark(), exemptEntries())
+		assertNoExemptKeys(t, keys,
+			"the SPA render must stay byte-consistent with the runner-facing fix-up refusal")
 	})
 }
 

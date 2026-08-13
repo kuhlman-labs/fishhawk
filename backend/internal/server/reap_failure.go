@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -29,6 +31,41 @@ const CategoryDispatchReaperFailed = "dispatch_reaper_failed"
 // handful of small fields (category, reason, detail, exit_code), so 32 KB is
 // well above any realistic payload and well below trace's 64 MiB cap.
 const maxReapFailureBodyBytes = 32 * 1024
+
+// reapProtectedParkStates is the set of NON-terminal stage states the reap
+// handler must NEVER collapse to failed — the ONE shared predicate behind BOTH
+// reap guards (#2630). Each is a LIVE park owned by a resolver OTHER than the
+// reaper: a runner legitimately exits 0 into it, or a concurrent advance drives
+// the stage into it. The reaper's authority is exactly {dispatched, running} —
+// the states that mean a spawned runner exited WITHOUT settling the stage; every
+// other non-terminal state is a park it must leave alone.
+//
+//   - awaiting_children       — decomposition fan-in park (#1891/#1903)
+//   - awaiting_approval       — plan/gate park
+//   - awaiting_input          — clarification park
+//   - awaiting_scope_decision — scope-completeness park
+//   - awaiting_host_dispatch  — local-spawn park (#1912)
+//
+// This GENERALIZES the pre-#2630 awaiting_children-only protection to all five
+// through one predicate: a sixth park state is protected by being added HERE
+// rather than by remembering to touch a fifth open-coded comparison. Keeping the
+// set closed (an explicit allow-list of parks, not !IsTerminal) is deliberate —
+// a future non-terminal state a runner exits into that is NOT a park (a new
+// reapable phase) must fail CLOSED to reapable, not silently protected.
+var reapProtectedParkStates = map[run.StageState]bool{
+	run.StageStateAwaitingChildren:      true,
+	run.StageStateAwaitingApproval:      true,
+	run.StageStateAwaitingInput:         true,
+	run.StageStateAwaitingScopeDecision: true,
+	run.StageStateAwaitingHostDispatch:  true,
+}
+
+// isReapProtectedPark reports whether state is a live park the reap handler must
+// never reap. It is the shared predicate for GUARD 1 (the load-time fast path)
+// and GUARD 2 (the reap-scoped CAS re-anchor refusal in reapFailCAS).
+func isReapProtectedPark(state run.StageState) bool {
+	return reapProtectedParkStates[state]
+}
 
 // reapFailureRequest is the wire shape the MCP host's detached reaper POSTs
 // (#1747). category is exactly "B" or "C" (mirroring pullrequest.go's
@@ -185,27 +222,30 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Protected-park FAST PATH (#1891): a stage already in awaiting_children
-	// at load time is a LIVE decomposition park owned by its child slices,
-	// not a stuck spawn. A spawn-phase failure report can reach here when a
-	// runner is (mis-)dispatched against a decomposed parent's implement
-	// stage — the doomed runner 409s on prompt fetch and its detached reaper
-	// reports the exit. Return the benign no-op WITHOUT reaching FailStage:
-	// 200 {transitioned:false}, NO dispatch_reaper_failed audit entry, NO
-	// orchestrator advance.
+	// Protected-park FAST PATH — GUARD 1 of 2 (#1891/#1903, generalized for the
+	// #2630 stale-probe TOCTOU): a stage already in ANY protected park at load
+	// time is a LIVE park owned by a resolver other than the reaper, not a stuck
+	// spawn. Return the benign no-op WITHOUT reaching the transition: 200
+	// {transitioned:false}, NO dispatch_reaper_failed audit entry, NO orchestrator
+	// advance.
 	//
-	// This pre-check is the fast path, NOT the sole guarantor of the
-	// park-protection invariant — it only catches a park already visible at
-	// load. The invariant is actually held by run.FailStage itself: it
-	// REFUSES an awaiting_children stage up-front (ErrStageParked) and drives
-	// its transitions through a row-locked compare-and-swap, so a park that
-	// lands AFTER this pre-check (the residual TOCTOU, #1903) is refused
-	// there rather than destroyed. Both refusal shapes surface in the
-	// post-FailStage error branch below, where the re-load classifies them as
-	// the same benign no-op. The pre-check remains as the cheap common case
-	// and as the fail-closed backstop even if the MCP admission guard
-	// (guardSiblingStageInFlight) is skipped.
-	if stage.State == run.StageStateAwaitingChildren {
+	// This is the AUTHORITATIVE close of the introduced TOCTOU: the detached
+	// reaper's zero-exit strand probe (mcpserver run_stage.go) is read BEFORE this
+	// POST is sent, so the stage can move running/dispatched → a park in the
+	// seconds between that probe and this handler processing the report. Each
+	// retry is a FRESH POST re-checked here, so a park that arrives between report
+	// attempts is caught too. The runner-side allow-list probe narrows but cannot
+	// close that race — no re-probe is atomic with a transition happening on the
+	// server; only this handler, re-reading the CURRENT state, is. So a stale
+	// positive probe never reaps a park that is live when the report lands.
+	//
+	// GUARD 1 only catches a park VISIBLE at load. A park landing AFTER this
+	// pre-check but before the transition (the mid-transition half of the TOCTOU)
+	// is refused by GUARD 2 (failStageForReap), whose refusal surfaces in the
+	// post-transition error branch below and re-loads to the same benign no-op.
+	// Pre-#2630 only awaiting_children was protected here (and only it was refused
+	// mid-flight by run.FailStage); the four other parks were reaped.
+	if isReapProtectedPark(stage.State) {
 		s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
 			Transitioned: false,
 			StageState:   string(stage.State),
@@ -215,43 +255,45 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 
 	// Fail the stage → append the dispatch_reaper_failed audit entry → advance
 	// the run, in the exact order and with the exact best-effort logging the
-	// dispatch watchdog uses (dispatchwatchdog.go). FailStage walks the canonical
-	// path from whichever non-terminal state the stage is in (e.g. dispatched →
-	// running → failed), so the spawn-phase 'dispatched' case is handled.
-	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, req.Reason); err != nil {
-		// This branch now fires for a NARROW, well-classified set, because
-		// FailStage's #1907 re-anchor loop ABSORBS every benign concurrent
-		// ADVANCE to a still-live, legally-failable state (e.g. a
-		// dispatched → running or running → awaiting_approval flip landing
-		// mid-window): those no longer reach here as a refusal — FailStage
-		// re-anchors and lands failed, so this call returns success. What
-		// still lands here is:
+	// dispatch watchdog uses (dispatchwatchdog.go). failStageForReap walks the
+	// canonical path from whichever reapable state the stage is in (e.g.
+	// dispatched → running → failed), so the spawn-phase 'dispatched' case is
+	// handled — but, UNLIKE run.FailStage, it refuses to re-anchor into any
+	// protected park that lands mid-transition (GUARD 2, #2630).
+	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason); err != nil {
+		// This branch fires for a NARROW, well-classified set, because
+		// failStageForReap's re-anchor loop ABSORBS every benign concurrent
+		// ADVANCE to another still-live, REAPABLE state (e.g. a dispatched →
+		// running flip landing mid-window): those no longer reach here as a
+		// refusal — the loop re-anchors and lands failed, so this call returns
+		// success. What still lands here is:
 		//
 		//   (a) A concurrent writer SETTLED the stage terminal (a double-report
 		//       or a race with the dispatch watchdog / runner's own terminal
-		//       report) — FailStage returns the typed StageStateChangedError
-		//       unchanged. Re-load: the stage is terminal, the winner did the
-		//       work, so return the benign {transitioned:false} no-op — no audit
-		//       entry, no advance.
-		//   (b) A concurrent fanout PARKED the stage awaiting_children (the
-		//       decomposed-parent race, #1903). FailStage REFUSES that park
-		//       rather than taking the legal awaiting_children → failed edge and
-		//       destroying it — either up-front (ErrStageParked, park visible at
-		//       FailStage's load) or via the row-locked CAS
-		//       (StageStateChangedError, park landing mid-flight OR after a
-		//       re-anchor). Re-load: the stage is a live park, so return the same
-		//       benign no-op. Never fail a restored/live park (#1891/#1903).
-		//   (c) FailStage retry EXHAUSTION under pathological livelock, or a
-		//       genuine repo error — the stage is still non-terminal and
-		//       non-park, so the re-load falls through to the 500 below. That
-		//       500 is the DELIBERATE, retryable contract (#1907): the detached
-		//       reaper may re-POST, and the ~1h dispatch watchdog is the eventual
-		//       backstop for a genuinely stuck stage.
+		//       report) — the typed StageStateChangedError is returned unchanged.
+		//       Re-load: the stage is terminal, the winner did the work, so return
+		//       the benign {transitioned:false} no-op — no audit entry, no advance.
+		//   (b) A concurrent writer PARKED the stage in any protected park — the
+		//       #1903 decomposed-parent race (awaiting_children), OR the #2630
+		//       running/dispatched → awaiting_approval/input/scope_decision race
+		//       (the mid-transition half of the stale-probe TOCTOU).
+		//       failStageForReap REFUSES the park rather than taking the legal
+		//       park → failed edge and destroying it — either up-front (park
+		//       visible at its load) or via the row-locked CAS (park landing
+		//       mid-flight OR after a re-anchor). Re-load: the stage is a live
+		//       park, so return the same benign no-op. Never fail a live park
+		//       (#1891/#1903/#2630).
+		//   (c) Retry EXHAUSTION under pathological livelock, or a genuine repo
+		//       error — the stage is still non-terminal and non-park, so the
+		//       re-load falls through to the 500 below. That 500 is the DELIBERATE,
+		//       retryable contract (#1907): the detached reaper may re-POST, and
+		//       the ~1h dispatch watchdog is the eventual backstop for a genuinely
+		//       stuck stage.
 		//
-		// The re-load's terminal-or-park check is exactly the benign set (a)+(b);
-		// no classification code changed for the #1907 semantics.
+		// The re-load's terminal-or-park check is exactly the benign set (a)+(b),
+		// using the same shared isReapProtectedPark predicate GUARD 2 refuses on.
 		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
-			(cur.State.IsTerminal() || cur.State == run.StageStateAwaitingChildren) {
+			(cur.State.IsTerminal() || isReapProtectedPark(cur.State)) {
 			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
 				Transitioned: false,
 				StageState:   string(cur.State),
@@ -310,4 +352,114 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		Transitioned: true,
 		StageState:   string(run.StageStateFailed),
 	})
+}
+
+// reapFailMaxAttempts bounds reapFailCAS's re-anchor loop, mirroring run's
+// failStageCASMaxAttempts: each attempt absorbs one benign concurrent advance to
+// another reapable state; four is far beyond any realistic interleaving yet caps
+// a pathological livelock so the loop terminates and the handler returns the
+// documented 500-and-retry contract.
+const reapFailMaxAttempts = 4
+
+// failStageForReap is the reap-scoped compare-and-swap fail — GUARD 2 of 2
+// (#2630). It is the reap path's replacement for run.FailStage. run.FailStage
+// RE-ANCHORS its walk through whatever live state a concurrent advance produced
+// and, for the four non-children parks (awaiting_approval / awaiting_input /
+// awaiting_scope_decision / awaiting_host_dispatch), takes the legal park →
+// failed edge — its reanchorTarget refuses ONLY awaiting_children, because those
+// four ARE legitimately failable by their gate owners (the approval-SLA path, the
+// deploy trigger, the trace-policy path). That absorption is correct for THOSE
+// callers but WRONG for the reaper: a park landing between this handler's load
+// and the transition is a LIVE park the reaper must not collapse (the
+// mid-transition half of the #2630 stale-probe TOCTOU). So this walk refuses to
+// re-anchor into ANY protected park (isReapProtectedPark) — awaiting_children as
+// before, plus the four others — while still ABSORBING a benign advance to
+// another reapable state (dispatched → running) exactly as FailStage does, so a
+// genuinely-stuck stage is still reaped. A refusal surfaces the typed
+// StageStateChangedError unchanged for the handler's post-transition re-load to
+// classify as the benign no-op.
+//
+// run.FailStage is intentionally left UNCHANGED: reversing its #1907 absorption
+// globally would break the callers that MUST fail an awaiting_approval /
+// awaiting_input / awaiting_scope_decision stage (the approval-SLA, deploy, and
+// trace paths). Only the reap path takes this stricter, park-refusing policy.
+//
+// It anchors the walk to `from` — the state the HANDLER already loaded (never a
+// park: GUARD 1 short-circuits a park visible at that load, and the terminal
+// pre-check a terminal state, so `from` is a reapable {pending, dispatched,
+// running}). It deliberately does NOT re-read the stage: a park landing between
+// the handler's load and the CAS is the mid-transition window GUARD 2 owns, and
+// the CAS itself observes it (Actual=park → reapReanchor refuses). Re-reading
+// here would instead make GUARD 1 redundant (a load-visible park would be caught
+// twice) and leave GUARD 1 unable to serve as an independent, counterfactual-able
+// guard. It falls back to run.FailStage when the repo lacks the CAS capability:
+// an in-memory fake that cannot race; production (postgresRepo) always takes the
+// CAS path.
+func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string) (*run.Stage, error) {
+	cas, ok := repo.(run.StageCASTransitioner)
+	if !ok {
+		return run.FailStage(ctx, repo, stageID, cat, reason)
+	}
+	return reapFailCAS(ctx, cas, stageID, from, cat, reason)
+}
+
+// reapFailCAS is failStageForReap's bounded re-anchor loop, mirroring run's
+// failStageCAS but with a reap-scoped re-anchor guard (reapReanchor): it ABSORBS
+// a benign advance to another reapable state and REFUSES any protected park.
+// The dispatched → running → failed walk matches FailStage's so the spawn-phase
+// 'dispatched' case and the #1907 benign dispatched → running absorption both
+// hold; only the park-refusal diverges.
+func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string) (*run.Stage, error) {
+	var lastErr error
+	for attempt := 0; attempt < reapFailMaxAttempts; attempt++ {
+		if from == run.StageStateDispatched {
+			running, err := cas.TransitionStageFrom(ctx, stageID, run.StageStateDispatched, run.StageStateRunning, nil)
+			if err != nil {
+				next, retry := reapReanchor(err)
+				if !retry {
+					return nil, err
+				}
+				from, lastErr = next, err
+				continue
+			}
+			from = running.State
+		}
+		out, err := cas.TransitionStageFrom(ctx, stageID, from, run.StageStateFailed, &run.StageCompletion{
+			FailureCategory: &cat,
+			FailureReason:   &reason,
+		})
+		if err != nil {
+			next, retry := reapReanchor(err)
+			if !retry {
+				return nil, err
+			}
+			from, lastErr = next, err
+			continue
+		}
+		return out, nil
+	}
+	// Retry exhaustion under pathological livelock: surface the last typed
+	// refusal so the handler's re-load yields the documented 500.
+	return nil, lastErr
+}
+
+// reapReanchor classifies a CAS refusal for reapFailCAS. It returns
+// (Actual, true) — re-anchor and retry — ONLY when the row-locked Actual state is
+// still reapable (non-terminal AND not a protected park). A terminal state, or
+// ANY protected park (isReapProtectedPark: awaiting_children as before, plus the
+// four the #2630 concern adds), returns ("", false) so the error propagates
+// unchanged for the handler to classify as the benign no-op. This single
+// predicate swap — isReapProtectedPark in place of run.reanchorTarget's
+// awaiting_children-only check — is the ONLY behavioral divergence from
+// run.FailStage, and it is what refuses the four non-children parks the reaper
+// must never collapse.
+func reapReanchor(err error) (run.StageState, bool) {
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		return "", false
+	}
+	if sce.Actual.IsTerminal() || isReapProtectedPark(sce.Actual) {
+		return "", false
+	}
+	return sce.Actual, true
 }

@@ -843,6 +843,148 @@ func TestDispatchStage_ReaperReportsSpawnFailure(t *testing.T) {
 	}
 }
 
+// TestDispatchStage_StageStateProbe is the call-site wiring test for the #2630
+// zero-exit strand probe: `stageStateProbe` is the production `detachedStageStateProbe`
+// dispatchStage (and drive_run) thread into spawnRunnerStageDetached, so what the
+// reaper observes on a zero exit is exactly what this builder reads. Driving it
+// directly against an httptest backend is race-free (unlike a full detached-spawn
+// end-to-end, whose reaper goroutine outlives the test and would race a global
+// settle-window override) and pins the two branches the reaper's fail-open posture
+// depends on: a present stage returns its state; an absent one returns an ERROR
+// (so the reaper reports nothing rather than false-stranding). The reaper's
+// strand DECISION over these states is pinned exhaustively by the unit-level
+// TestReapDetachedRunner_ZeroExitStrandMatrix.
+func TestDispatchStage_StageStateProbe(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	var state string // served state for the target stage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every request is a stage-list read.
+		items := []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: state}}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	}))
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// Present stage → its state (the reaper classifies this against the allow-list).
+	state = "dispatched"
+	probe := r.stageStateProbe(runID, stageID.String())
+	got, err := probe(context.Background())
+	if err != nil {
+		t.Fatalf("probe on a present stage: unexpected error %v", err)
+	}
+	if got != "dispatched" {
+		t.Errorf("probe state = %q, want dispatched", got)
+	}
+
+	// Absent stage → an ERROR (the fail-open source: the reaper reports nothing on
+	// a probe error rather than false-stranding a stage it cannot read).
+	missing := r.stageStateProbe(runID, uuid.New().String())
+	if _, err := missing(context.Background()); err == nil {
+		t.Error("probe on an absent stage must return an error so the reaper fails open")
+	}
+}
+
+// TestDispatchStage_ThreadsNonNilProbeToSpawn is the call-site wiring pin for the
+// #2630 zero-exit strand probe at the dispatch_stage spawn (concern
+// medium/test-coverage). TestDispatchStage_StageStateProbe pins the probe BUILDER
+// and TestReapDetachedRunner_ZeroExitStrandMatrix pins the reaper's decision over
+// an injected probe, but neither asserts dispatchStage THREADS a non-nil probe
+// into spawnRunnerStageDetached. A regression that reverts the call site to pass
+// nil (dropping `probe := r.stageStateProbe(...)`) would keep every other test
+// green while silently disabling the entire #2630 recovery — reapZeroExitStrand
+// short-circuits on a nil probe.
+//
+// This mirrors the sibling TestDriveRun_ThreadsNonNilProbeToSpawn: it wraps the
+// injectable detached-spawn seam (the dispatchSpawnDetached package var — kept
+// separate from the drive loop's r.driveSpawn so a manual dispatch stays
+// distinguishable from a drive-loop spawn) and asserts the probe argument the
+// call site threads is NON-NIL, WITHOUT launching a real exit-0 runner. The
+// property under test (this call site threads a non-nil probe) does not require
+// driving a real runner to observe, and driving one would spawn a reaper
+// goroutine that races the package-global reap settle-window (reapProbeBackoff)
+// against a reaper leaked from an earlier test — the -race failure this pin
+// originally introduced (CI run 31660448999). The seam observes the argument with
+// no runner, no reaper, no global mutation, and no race. The reaper's DECISION
+// over the probe's states is pinned exhaustively by the unit-level
+// TestReapDetachedRunner_ZeroExitStrandMatrix, and the probe BUILDER by
+// TestDispatchStage_StageStateProbe.
+//
+// COUNTERFACTUAL (condition 5): reverting dispatch_stage.go's spawn call to pass a
+// nil probe reddens this on the probeNonNil assertion.
+func TestDispatchStage_ThreadsNonNilProbeToSpawn(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// A minimal stateful backend serving only the pre-spawn guard reads
+	// dispatchStage makes before it reaches the spawn seam (GET run unlocked,
+	// GET stages present+pending, the best-effort record-act POST, the
+	// host-dispatch marker POST). No reap-failure endpoint and no runner: the
+	// seam short-circuits the spawn.
+	var mu sync.Mutex
+	stageState := "pending"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch"):
+			mu.Lock()
+			stageState = "dispatched"
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			mu.Lock()
+			st := stageState
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: st}},
+			})
+		default:
+			// guardHostDispatch's GET /v0/runs/{id} (unlocked so the guard passes)
+			// and the best-effort POST /auto-drive record-act both tolerate this.
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+		}
+	}))
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// Override the detached-spawn seam to observe the probe argument the dispatch
+	// call site threads. Returning nil error WITHOUT spawning keeps this race-free
+	// — no real runner, no reaper goroutine. Restored via t.Cleanup; the mcpserver
+	// tests run serially (no t.Parallel), so the package-var override is race-free.
+	var probeSeen, probeNonNil bool
+	savedSpawn := dispatchSpawnDetached
+	dispatchSpawnDetached = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		probeSeen = true
+		probeNonNil = probe != nil
+		return "/dev/null", nil
+	}
+	t.Cleanup(func() { dispatchSpawnDetached = savedSpawn })
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+
+	if !probeSeen {
+		t.Fatal("dispatch never reached the spawn seam")
+	}
+	if !probeNonNil {
+		t.Fatal("dispatch_stage spawn call site threaded a NIL probe — the #2630 zero-exit strand recovery is silently disabled at this call site")
+	}
+}
+
 // --- (T9/T10) manual-dispatch spawn-evidence vocabulary pin (#1905) ----------
 
 // dispatchAutoDriveFake is a self-contained backend for the record-act tests:
