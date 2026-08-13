@@ -25,6 +25,21 @@ On the all-succeeded path, `resolveParent` calls the nil-safe `Sweeper.Integrate
 - A non-conflict error leaves the parent parked (the next tick re-enters; merges are idempotent).
 - A nil `Integrate` (dev posture / pre-#1142) skips integration entirely, preserving the prior resolve behavior.
 
+## Between-wave fan-in (#2363)
+
+The fan-in above is the SETTLING one: it runs only once every child is terminal. A decomposition with `depends_on` also needs a fan-in at each WAVE boundary, because a dependent child must spawn against a base carrying its predecessors' commits. That re-base used to be the blocking `fishhawk_run_children` driver's job (a client-side `POST /integrate-wave` between waves), so a fan-out with no client alive never advanced past a wave boundary.
+
+`resolveParent`'s NOT-all-terminal branch now calls the nil-safe `Sweeper.WaveIntegrate` (a `WaveIntegrator` whose serve.go adapter delegates to `orchestrator.IntegrateCompletedWave`) IMMEDIATELY BEFORE the `Dispatch` backstop. The ordering is load-bearing: topping the dispatch up first would hand a newly-unblocked child to a host-dispatch that refuses it `409 wave_not_integrated`.
+
+`IntegrateCompletedWave` attempts a merge only when a NON-TERMINAL child's slice declares dependencies that have all succeeded AND are not already covered by the newest `slices_integrated` entry (the steady-state short-circuit — see `backend/internal/orchestrator/README.md`), so the sweeper does not re-merge on every tick for the rest of the fan-out.
+
+Failure posture — this runs on a parent MID-FAN-OUT that it must never settle:
+
+- **error** → WARN + swallow. The parent stays parked; the next tick re-enters (merges are idempotent). It increments the SAME per-parent consecutive-error counter as the settling path for log-spam bounding (past `maxIntegrationAttempts` the line drops to debug) but deliberately NOT its give-up transition: failing a parent whose fan-out is still running is the all-terminal path's decision, and doing it here too would race that path. One observable coupling follows from sharing the counter: a parent that accumulated failing between-wave attempts reaches the all-terminal give-up sooner. That is the correct direction (the integration has been failing all along), but it is deliberate, not accidental.
+- **conflict** → WARN + emit `slice_integration_conflict` (so `next_actions`/`children_status` surface it through the existing arm) and NO transition. The dependent child then stays refused at the host-dispatch `409` rather than spawning on a base missing its predecessors. Emission is **deduped per distinct conflict** (`{slice_index}/{child_run_id}`): the coverage predicate stays false for as long as the wave is blocked, so an undeduped emit would append an identical audit entry every tick forever. A DIFFERENT conflict still emits; a clean integration clears the key so a recurrence after a fix is surfaced again.
+- **clean** → clears both the error counter and the conflict key. Still no transition.
+- **nil `WaveIntegrate`** → total no-op (pre-#2363 posture, and what every behavioral test that omits the field gets). `newChildCompletionSweeper` wires it non-nil, pinned by `cmd/fishhawkd`'s `TestNewChildCompletionSweeper_WiresDispatchBackstop`.
+
 ## Bounded-retry give-up (#1243)
 
 A deterministically-failing `IntegrateSlices` (e.g. the pre-#1243 consolidated-branch D/F conflict) would otherwise be retried every 60s tick forever, log-spamming an unfixable error.

@@ -112,6 +112,26 @@ The server-side ADR-035 lineage guard (`backend/internal/server/lineage.go::buil
 
 The #1806 false positive predated #1775 (which only changed the consolidated PR title/body and added no commit) — the gap was the pre-existing terminal-only recording, not that regression.
 
+## Between-wave fan-in (#2363)
+
+`IntegrateCompletedWave(ctx, parentRunID) (integrated bool, conflict *SliceConflict, err error)` is the fan-in for a WAVE boundary rather than the settle: it merges the already-succeeded slice branches onto the consolidated branch **while the fan-out is still in flight**, so a dependent wave's children can spawn against a base carrying their predecessors' commits.
+
+It exists because that re-base used to be the CLIENT's job — the blocking `fishhawk_run_children` driver POSTed `/integrate-wave` between waves — so a fan-out with no client alive never advanced past a wave boundary. The child-completion sweeper calls it from the NOT-all-terminal branch, immediately before its dispatch backstop (see `backend/internal/childcompletion/README.md`).
+
+It **never** transitions a stage and **never** calls `Advance`. Settling a decomposed parent stays owned by the all-terminal paths.
+
+Predicate — a merge is attempted only when ALL THREE hold:
+
+1. at least one child is in run state `succeeded` (there is something to merge);
+2. at least one NON-TERMINAL child's slice declares a non-empty `depends_on` whose EVERY dependency slice has a minted sibling in state `succeeded` (a dependent wave is genuinely unblocked); and
+3. **the steady-state short-circuit** — that dependent's dependencies are NOT already covered by the parent's newest `slices_integrated` entry. Without (3) the predicate stays true for the whole time a dependent child runs and the sweeper would re-merge on EVERY tick for the rest of the fan-out. Idempotency makes that safe, but the remote git load is real and unnecessary.
+
+(3) is evaluated with `backend/internal/wavecoverage.Covered` — the SAME shared predicate the host-dispatch marker admits on and the MCP await verb releases on, deliberately not a second reconstruction (the duplicated-reconstruction drift class the `SliceBranch`/`childSliceBranch` note above already names). The coverage set is `child_run_ids` off the NEWEST `slices_integrated` entry, which is the complete merged set at that moment because `integrateSlices` always merges every succeeded slice ascending on each pass.
+
+Degrades — each of these is an ABSENT input, not a violation, and returns `(false, nil, nil)` with a WARN, never an error: a nil plan, a nil `Decomposition`, a `slice_index` out of range for `sub_plans`, or a child with a nil `SliceIndex` (the same defensive degrade `server.resolveSliceDependencies` takes). A plan-LOAD error or a child-listing error propagates as `err` (retryable). An AUDIT-READ failure degrades to NOT-covered, i.e. it INTEGRATES: the merge is idempotent, so a spurious extra pass costs one round trip, whereas a spuriously skipped integration would strand the next wave behind the host-dispatch `409 wave_not_integrated` until the following tick.
+
+The merge itself is the existing `IntegrateSlices` primitive — the same one `/consolidate` and `/integrate-wave` use — so conflict provenance, pagination, incremental merge-SHA recording and idempotency are inherited rather than reimplemented.
+
 ## Startup run-completion recovery (#727)
 
 `ReconcileStuckRuns(ctx)` is a one-shot self-heal called from `serve.go` at boot (gated only on `Orchestrator != nil && RunRepo != nil`, best-effort/non-fatal).

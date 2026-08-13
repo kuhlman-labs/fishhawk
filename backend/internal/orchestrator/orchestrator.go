@@ -43,6 +43,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/wavecoverage"
 )
 
 // GitHubAPI is the slice of githubclient.Client the orchestrator
@@ -2147,6 +2148,184 @@ func (o *Orchestrator) DispatchDecomposedChildren(ctx context.Context, parentRun
 		slog.Int("cap", cap),
 	)
 	return dispatched, nil
+}
+
+// IntegrateCompletedWave is the BETWEEN-WAVE fan-in (#2363): it merges a
+// decomposed parent's already-succeeded slice branches onto the consolidated
+// branch WHILE the fan-out is still in flight, so a dependent wave's children
+// can spawn against a base that carries their predecessors' commits. Before
+// this existed the re-base was the client's job — the blocking run_children
+// driver POSTed /integrate-wave between waves — which meant a fan-out with no
+// client alive never advanced past a wave boundary.
+//
+// It NEVER transitions a stage and NEVER calls Advance: it is the non-settling
+// per-wave fan-in, identical in posture to handleIntegrateWave. Settling a
+// decomposed parent stays owned by the all-terminal paths (the sweeper's and
+// maybeAdvanceDecomposedParent's).
+//
+// The predicate is pure and total. It attempts an integration only when ALL
+// THREE hold:
+//
+//  1. at least one child is in run state succeeded (there is something to
+//     merge);
+//  2. at least one NON-TERMINAL child's slice declares a non-empty depends_on
+//     whose EVERY dependency slice has a minted sibling in state succeeded (a
+//     dependent wave is actually unblocked and waiting); and
+//  3. that dependent child's dependencies are NOT ALREADY COVERED by the
+//     parent's newest slices_integrated entry — the STEADY-STATE SHORT-CIRCUIT.
+//
+// Without (3) the predicate would stay true for the whole time a dependent
+// child runs and the sweeper would re-merge on EVERY tick for the rest of the
+// fan-out. Idempotency makes that safe but the remote git load is real and
+// unnecessary. (3) is evaluated with the SAME wavecoverage.Covered function the
+// host-dispatch marker admits on — not a second reconstruction — against the
+// child_run_ids of the newest slices_integrated entry.
+//
+// Degrades (false, nil, nil) with a WARN and NEVER an error on ABSENT input: a
+// nil plan, a nil Decomposition, a slice index out of range for sub_plans, or a
+// child with a nil SliceIndex — the same defensive degrade
+// server.resolveSliceDependencies takes. A plan-LOAD error or a child-listing
+// error propagates as err (retryable). An AUDIT-READ failure degrades to
+// NOT-covered, i.e. it integrates: the merge is idempotent, so a spurious extra
+// pass costs one round trip whereas a spuriously skipped integration would
+// strand the next wave behind the host-dispatch 409 until the following tick.
+//
+// Returns (true, nil, nil) on a clean integration, (false, conflict, nil) when
+// a slice failed to merge, and (false, nil, nil) when no integration was
+// attempted.
+func (o *Orchestrator) IntegrateCompletedWave(ctx context.Context, parentRunID uuid.UUID) (bool, *SliceConflict, error) {
+	if o.Runs == nil {
+		return false, nil, errors.New("orchestrator: Runs is nil")
+	}
+	stages, err := o.Runs.ListStagesForRun(ctx, parentRunID)
+	if err != nil {
+		return false, nil, fmt.Errorf("orchestrator: list parent stages for wave integration: %w", err)
+	}
+	p, _, err := o.loadApprovedPlan(ctx, stages)
+	if err != nil {
+		return false, nil, fmt.Errorf("orchestrator: load approved plan for wave integration: %w", err)
+	}
+	if p == nil || p.Decomposition == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: no decomposition plan; skipping between-wave integration",
+			slog.String("parent_run_id", parentRunID.String()))
+		return false, nil, nil
+	}
+	children, err := o.listAllDecomposedChildren(ctx, parentRunID)
+	if err != nil {
+		return false, nil, fmt.Errorf("orchestrator: list decomposed children for wave integration: %w", err)
+	}
+
+	// slice index → child run id, plus the set of slices whose child has
+	// succeeded. A child with no slice index has no derivable slice branch and
+	// cannot participate in either map — WARN rather than guess an index.
+	sliceRunID := make(map[int]string, len(children))
+	succeededSlice := make(map[int]bool, len(children))
+	anySucceeded := false
+	for _, c := range children {
+		if c.SliceIndex == nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed child missing slice_index; excluded from wave-integration predicate",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("child_run_id", c.ID.String()))
+			continue
+		}
+		sliceRunID[*c.SliceIndex] = c.ID.String()
+		if c.State == run.StateSucceeded {
+			succeededSlice[*c.SliceIndex] = true
+			anySucceeded = true
+		}
+	}
+	if !anySucceeded {
+		return false, nil, nil
+	}
+
+	integratedIDs := o.integratedChildRunIDs(ctx, parentRunID)
+	needsIntegration := false
+	for _, c := range children {
+		if c.State.IsTerminal() || c.SliceIndex == nil {
+			continue
+		}
+		idx := *c.SliceIndex
+		if idx < 0 || idx >= len(p.Decomposition.SubPlans) {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed child slice_index out of range for sub_plans; excluded from wave-integration predicate",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("child_run_id", c.ID.String()),
+				slog.Int("slice_index", idx),
+				slog.Int("sub_plans", len(p.Decomposition.SubPlans)))
+			continue
+		}
+		deps := p.Decomposition.SubPlans[idx].DependsOn
+		if len(deps) == 0 {
+			continue
+		}
+		unblocked := true
+		for _, dep := range deps {
+			if !succeededSlice[dep] {
+				unblocked = false
+				break
+			}
+		}
+		if !unblocked {
+			continue
+		}
+		if covered, _ := wavecoverage.Covered(deps, sliceRunID, integratedIDs); covered {
+			// Steady state: this dependent's predecessors are already on the
+			// consolidated branch. Re-merging every tick would buy nothing.
+			continue
+		}
+		needsIntegration = true
+		break
+	}
+	if !needsIntegration {
+		return false, nil, nil
+	}
+
+	conflict, err := o.IntegrateSlices(ctx, parentRunID)
+	if err != nil {
+		return false, nil, err
+	}
+	if conflict != nil {
+		return false, conflict, nil
+	}
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated a completed wave mid-fan-out",
+		slog.String("parent_run_id", parentRunID.String()))
+	return true, nil, nil
+}
+
+// integratedChildRunIDs reads child_run_ids back from the parent's NEWEST
+// slices_integrated audit entry — the complete set of child runs merged onto
+// the consolidated branch at that moment, because integrateSlices always merges
+// EVERY succeeded slice ascending on each pass. It is the same reader
+// server.consolidatedBranchFromAudit uses over the same entry, differing only
+// in which field it decodes.
+//
+// Returns nil on every absent/unreadable/undecodable path (nil Audit, list
+// error, no entry, malformed payload). nil means "nothing is covered", which
+// makes the caller INTEGRATE — deliberately the safe direction, see
+// IntegrateCompletedWave's audit-read note.
+func (o *Orchestrator) integratedChildRunIDs(ctx context.Context, parentRunID uuid.UUID) []string {
+	if o.Audit == nil {
+		return nil
+	}
+	entries, err := o.Audit.ListForRunByCategory(ctx, parentRunID, "slices_integrated")
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: read slices_integrated for wave coverage failed; treating the wave as un-integrated",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	var payload struct {
+		ChildRunIDs []string `json:"child_run_ids"`
+	}
+	if err := json.Unmarshal(entries[len(entries)-1].Payload, &payload); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decode slices_integrated payload for wave coverage failed; treating the wave as un-integrated",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	return payload.ChildRunIDs
 }
 
 // recordChildDispatch emits the RuleChildrenDispatch run_auto_advanced
