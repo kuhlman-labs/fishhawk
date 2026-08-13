@@ -358,6 +358,13 @@ func TestExtractDiff_RoundTripsPatch(t *testing.T) {
 	if got.Patch != patch {
 		t.Errorf("Patch = %q, want %q", got.Patch, patch)
 	}
+	// patch_truncated rides across the same wire (#2660): the
+	// comment-only detector refuses a truncated patch outright, so
+	// dropping the flag here would let a cut patch's comment-only prefix
+	// vacuously satisfy tests_added_or_updated.
+	if !got.PatchTruncated {
+		t.Error("PatchTruncated = false, want true — the flag must round-trip into policy.Diff")
+	}
 	if len(got.ChangedFiles) != 1 || got.ChangedFiles[0].Path != "a.go" {
 		t.Errorf("ChangedFiles = %+v, want single a.go", got.ChangedFiles)
 	}
@@ -376,6 +383,12 @@ func TestExtractDiff_OlderBundleDecodesEmptyPatch(t *testing.T) {
 	}
 	if got.Patch != "" {
 		t.Errorf("Patch = %q, want empty for a bundle without the field", got.Patch)
+	}
+	// An older bundle omits patch_truncated too, which decodes to false
+	// and — combined with the absent patch — lands on the detector's
+	// patch_absent refusal (#2660).
+	if got.PatchTruncated {
+		t.Error("PatchTruncated = true, want false for a bundle without the field")
 	}
 	if len(got.ChangedFiles) != 1 {
 		t.Errorf("ChangedFiles = %+v, want one file", got.ChangedFiles)

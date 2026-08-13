@@ -1020,6 +1020,17 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 	// nothing when there is simply nothing to measure).
 	constraints.DiffCoverageSignal = diffCoverageSignalFromBundle(bundleBytes)
 
+	// Comment-only-Go verdict (#2660): same discipline as its two
+	// siblings above — derived ONCE here at trace-upload time, from the
+	// SAME bundle's last git_diff event, then carried on Constraints.
+	// The post-CI re-evaluation rebuilds the diff from the audit payload
+	// (file names, never the patch), so recomputing it downstream would
+	// evaluate an empty patch and flip a satisfied `tests_added_or_updated`
+	// into a violation; carrying the verdict makes the round trip
+	// lossless. The detector is fail-closed — a nil-ish (CommentOnly
+	// false) verdict changes nothing.
+	constraints.CommentOnly = policy.DetectCommentOnlyGo(diff)
+
 	// Happy path: real evaluation. EmitEvaluation handles the empty-
 	// constraints case cleanly — Evaluate returns no violations, the
 	// row carries Applied={} and Passed=true. SPA renders "Policy

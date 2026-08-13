@@ -3219,6 +3219,14 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 			diffBaseRef, perr.Error())
 		patch, truncated = "", false
 	}
+	// Carry the SAME patch the git_diff event ships onto the returned
+	// diff (#2660), so the in-line constraint evaluation enforceConstraints
+	// runs later sees exactly the text the backend will re-evaluate. A
+	// RunPatch failure already reset both to their empty values above,
+	// which the comment-only detector refuses as patch_absent.
+	d.Patch = patch
+	d.PatchTruncated = truncated
+
 	ins, dels := computeDiffNumstat(context.Background(), diffBaseRef, repoDir, logSink)
 	events = append(events, makeGitDiffEventStats(baseRef, d, patch, truncated, ins, dels))
 	return d, events, nil

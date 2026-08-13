@@ -75,3 +75,11 @@ The workflow-v1.6 `diff_coverage` constraint kind is **carried but not evaluated
 Same rationale as `verification_reported`: this in-line check fires on the implement push path, BEFORE the coverage command has run — the measurement happens after the committed-tree verify gate, in `runner/cmd/fishhawk-runner/main.go`'s `runDiffCoverageGate`. There is nothing truthful the runner could assert locally, and asserting anything would either fail every opted-in run before its work was measured or invent a pass. The backend re-evaluates from the uploaded bundle's `gate_evidence`, where the measurement IS available.
 
 The type is a LOCAL mirror (`constraint.DiffCoverage`), not an import: this package is deliberately dependency-free on the backend's policy package.
+
+## Comment-only Go corrections — evaluated IN-LINE (#2660)
+
+`commentonly.go` is a logic-identical port of `backend/internal/policy/commentonly.go`, and — unlike `verification_reported` and `diff_coverage` above — this evaluator does NOT defer to the backend. `checkRequiredOutcomes` gains a third `tests_added_or_updated` case that calls `DetectCommentOnlyGo(diff)` directly, because the runner's in-line check fires on the implement push path: if it deferred, it would fail the stage category-B before the backend ever saw the trace, and the exemption would be unreachable.
+
+It proves the same NARROW SYNTACTIC PROPERTY (a `.go`-only `A`/`M` change set whose emitted changed lines are blank or ordinary `//` comments, no directive, no backtick in the section) over `Diff.Patch` — which `computeAndEmitDiff` now carries alongside `Diff.PatchTruncated`, the SAME text the `git_diff` event ships, so the runner and the backend read one patch. Every other input is fail-closed against the same closed `Reason` set. It is NOT behavioral emptiness, and it knowingly admits the raw-string-outside-context residual documented in `backend/internal/policy/README.md`.
+
+The one structural asymmetry with the backend: the backend derives the verdict once at trace-upload time and CARRIES it on `policy.Constraints` so its post-CI re-evaluation (which has no patch) can re-emit it; the runner has no signal channel and no audit round trip, so it recomputes. Change the two copies together.

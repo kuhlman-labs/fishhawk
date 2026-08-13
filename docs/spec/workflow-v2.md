@@ -733,9 +733,11 @@ Evaluated **after** the stage runs, against the produced diff. A hit is a catego
 
 | Member | Satisfied when |
 |---|---|
-| `tests_added_or_updated` | the diff contains a test-*named* file. Filename-shape-aware: it does not inspect the file's contents. |
+| `tests_added_or_updated` | the diff contains a test-*named* file. Filename-shape-aware: it does not inspect the file's contents. Two vacuous-satisfaction carve-outs: a non-empty diff touching no unit-testable source at all (docs/scripts/config only, #610), and a **comment-only Go correction** (#2660) — see below. |
 | `ci_green` | required checks pass. The one outcome whose missing signal **defers** to branch protection. |
 | `verification_reported` | the stage's committed-tree verify gate reported `passed`. |
+
+**Comment-only Go corrections (#2660).** `tests_added_or_updated` is also vacuously satisfied when the stage's emitted unified diff proves a narrow syntactic property: every changed testable-source file is a `.go` file with status `A`/`M`, every one has a patch section, every changed line in those sections is blank or an ordinary `//` line comment (never a Go directive such as `//go:build`), and no backtick appears anywhere in the section. This makes a doc-comment fix landable through `feature_change`, which previously required a test file for a change with no behavior to test. It is **fail-closed** on every other input (absent or truncated patch, binary or C-quoted section, non-`.go` source, a delete/rename, a directive line, any other changed line) and it is NOT a claim of behavioral emptiness: a changed `//`-shaped line inside a raw-string literal whose delimiters lie outside the emitted context is admitted, per occurrence. The plan-approval gate refuses the statically-knowable unlandable case up front (`plan_missing_required_tests`), with `--comment-only` as the escape for exactly this case. Contract: `backend/internal/policy/README.md`.
 
 `verification_reported` is the substance-aware sibling of `tests_added_or_updated`: it gates on what the stage actually **ran**, not on a filename.
 

@@ -4020,11 +4020,22 @@ func newScopeCapServer(t *testing.T, workflowSpec []byte, scopeFiles []plan.Scop
 	return s, app, rr, au, stage
 }
 
+// scopeCapFiles builds an n-entry modify-only scope for the cap fixtures.
+// Entry 0 is TEST-shaped (#2660): the shared fixture spec declares
+// required_outcomes: tests_added_or_updated, so a scope of nothing but
+// non-test .go files is now refused by checkPlanRequiredTests before the
+// cap tests can observe the cap gate. The count — the only thing the cap
+// arithmetic reads — is unchanged, and a declared test file is what a real
+// feature_change plan carries anyway.
 func scopeCapFiles(n int) []plan.ScopeFile {
 	out := make([]plan.ScopeFile, 0, n)
 	for i := 0; i < n; i++ {
+		path := fmt.Sprintf("backend/file%d.go", i)
+		if i == 0 {
+			path = "backend/file0_test.go"
+		}
 		out = append(out, plan.ScopeFile{
-			Path:      fmt.Sprintf("backend/file%d.go", i),
+			Path:      path,
 			Operation: plan.FileOpModify,
 		})
 	}
@@ -4035,11 +4046,14 @@ func scopeCapFiles(n int) []plan.ScopeFile {
 // minimum PHYSICAL count fits it: 2 creates + 2 deletes = 4 declared entries but
 // max(2,2)=2 physical files, since git can collapse each declared delete+create
 // pair into one rename row. It is the fixture for the case where
-// --override-scope-cap legitimately still works (#2415).
+// --override-scope-cap legitimately still works (#2415). One create is
+// test-shaped so the fixture also clears the required-tests gate (#2660),
+// which the shared spec's required_outcomes would otherwise refuse; the
+// create/delete counts the physical estimate reads are unchanged.
 func renameShapedScope() []plan.ScopeFile {
 	return []plan.ScopeFile{
 		{Path: "backend/new0.go", Operation: plan.FileOpCreate},
-		{Path: "backend/new1.go", Operation: plan.FileOpCreate},
+		{Path: "backend/new1_test.go", Operation: plan.FileOpCreate},
 		{Path: "backend/old0.go", Operation: plan.FileOpDelete},
 		{Path: "backend/old1.go", Operation: plan.FileOpDelete},
 	}
@@ -4253,7 +4267,7 @@ func TestSubmitApproval_ScopeCap_AddScopeFilesDedupedAgainstPlan(t *testing.T) {
 	s, _, _, _, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(3))
 
 	w := submitApproval(t, s, stage.ID,
-		`{"decision":"approve","add_scope_files":["backend/file0.go"]}`)
+		`{"decision":"approve","add_scope_files":["backend/file0_test.go"]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (duplicate path must not push over cap):\n%s", w.Code, w.Body.String())
 	}
@@ -8639,7 +8653,11 @@ func TestRemoveScopeFiles_NonPlanStageApprove_RecordsNothing(t *testing.T) {
 // passes on the merits rather than by being skipped.
 func TestScopeFileChannels_PlanStageApprove_StillRecords(t *testing.T) {
 	s, au, stage := newScopeChannelPlanServer(t, []plan.ScopeFile{
-		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		// a_test.go, not a.go: the fixture spec requires
+		// tests_added_or_updated, and a scope with no declared test path is
+		// refused by checkPlanRequiredTests (#2660). b.go stays the removal
+		// target, so the surviving scope keeps its test path.
+		{Path: "backend/a_test.go", Operation: plan.FileOpModify},
 		{Path: "backend/b.go", Operation: plan.FileOpModify},
 	})
 
@@ -8665,7 +8683,11 @@ func TestScopeFileChannels_PlanStageApprove_StillRecords(t *testing.T) {
 // value onto a plan-block local must carry the trimming with it.
 func TestRemoveScopeFiles_PlanStageApprove_RecordsTrimmedPath(t *testing.T) {
 	s, au, stage := newScopeChannelPlanServer(t, []plan.ScopeFile{
-		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		// a_test.go, not a.go: the fixture spec requires
+		// tests_added_or_updated, and a scope with no declared test path is
+		// refused by checkPlanRequiredTests (#2660). b.go stays the removal
+		// target, so the surviving scope keeps its test path.
+		{Path: "backend/a_test.go", Operation: plan.FileOpModify},
 		{Path: "backend/b.go", Operation: plan.FileOpModify},
 	})
 

@@ -365,6 +365,15 @@ func approveCASPlanBytes(t *testing.T) []byte {
 	if err := json.Unmarshal(splitPlanBytes(t, true), &p); err != nil {
 		t.Fatalf("unmarshal split plan: %v", err)
 	}
+	// Declare the test file the change would add (#2660): the harness spec
+	// requires tests_added_or_updated, and checkPlanRequiredTests refuses an
+	// approve whose scope declares testable source and no test path — so
+	// without this the fixture is a plan that could never land and both CAS
+	// tests would assert against a state the product no longer permits.
+	p.Scope.Files = append(p.Scope.Files, plan.ScopeFile{
+		Path:      "backend/internal/foo/foo_test.go",
+		Operation: plan.FileOpCreate,
+	})
 	p.Verification.AcceptanceCriteria = append(p.Verification.AcceptanceCriteria,
 		plan.AcceptanceCriterion{
 			ID:                     "ac-live",

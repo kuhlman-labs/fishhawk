@@ -678,3 +678,98 @@ func TestAggregateCIGreen_Table(t *testing.T) {
 		})
 	}
 }
+
+// TestReevaluateCIPolicy_PreservesCommentOnlySignal pins the audit
+// round-trip invariant for the comment-only exemption (#2660), modelled on
+// its verification_reported sibling above. This is the SECOND half of the
+// cross-boundary seam: the re-eval rebuilds the diff from the audit payload,
+// which carries file names and NEVER the patch, so the verdict MUST ride on
+// applied_constraints. Were the field untagged or dropped, the re-emitted
+// evaluation would flip the satisfied tests_added_or_updated outcome into a
+// "no test files added or updated" violation on the next CI event — failing
+// the run for a reason that has nothing to do with CI.
+func TestReevaluateCIPolicy_PreservesCommentOnlySignal(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType: "implement",
+		// A single non-test .go file: without the carried verdict this
+		// diff violates tests_added_or_updated.
+		Diff: []policy.DiffEntry{{Path: "backend/foo.go", Status: policy.StatusModified}},
+		Applied: policy.Constraints{
+			RequiredOutcomes: []string{"ci_green", "tests_added_or_updated"},
+			CommentOnly: &policy.CommentOnlySignal{
+				CommentOnly: true,
+				Files:       []string{"backend/foo.go"},
+			},
+		},
+		Passed:           true,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if got.Applied.CommentOnly == nil {
+		t.Fatal("Applied.CommentOnly = nil after re-eval; the verdict was dropped on the round-trip")
+	}
+	if !got.Applied.CommentOnly.CommentOnly {
+		t.Errorf("CommentOnly = false after re-eval, want true")
+	}
+	if len(got.Violations) != 0 {
+		t.Errorf("Violations = %+v, want none (the carried verdict still satisfies the outcome)", got.Violations)
+	}
+	if !got.Passed {
+		t.Error("Passed = false, want true")
+	}
+}
+
+// TestReevaluateCIPolicy_LegacyRowWithoutCommentOnly_UnchangedVerdict is the
+// backward-compatibility half: an audit row written before #2660 carries no
+// comment_only key at all, and must re-evaluate exactly as it does today — a
+// nil verdict reads as NOT comment-only, so the source-only diff still
+// violates and no comment_only key appears on the re-emitted row.
+func TestReevaluateCIPolicy_LegacyRowWithoutCommentOnly_UnchangedVerdict(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType: "implement",
+		Diff:      []policy.DiffEntry{{Path: "backend/foo.go", Status: policy.StatusModified}},
+		Applied: policy.Constraints{
+			RequiredOutcomes: []string{"ci_green", "tests_added_or_updated"},
+			// CommentOnly absent — a pre-#2660 row.
+		},
+		Passed:           false,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if got.Applied.CommentOnly != nil {
+		t.Errorf("Applied.CommentOnly = %+v, want nil for a legacy row", got.Applied.CommentOnly)
+	}
+	if len(got.Violations) != 1 {
+		t.Fatalf("Violations = %+v, want the unchanged tests_added_or_updated violation", got.Violations)
+	}
+	if got.Passed {
+		t.Error("Passed = true; a legacy source-only row must still violate")
+	}
+	// omitempty keeps the serialized payload byte-identical to a pre-#2660
+	// row: no comment_only key is written at all.
+	raw, err := json.Marshal(got.Applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "comment_only") {
+		t.Errorf("legacy applied_constraints gained a comment_only key: %s", raw)
+	}
+}

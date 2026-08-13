@@ -3400,6 +3400,21 @@ re-checks the real diff against a cap that is fixed for the run. In
 that case drop declared paths via remove_scope_files, or raise
 max_files_changed through a governed spec change and start a fresh run.
 
+Required-tests gate (#2660, also PRE-Submit): when the implement stage
+declares required_outcomes: tests_added_or_updated and the effective
+scope declares testable source but NO test-shaped path, the approve is
+refused 422 plan_missing_required_tests — the category-B failure that
+would otherwise land after a full implement run. Two remedies, both in
+the message: declare the test file you intend to add via
+add_scope_files, or — for a comment-only correction to a .go file —
+put --comment-only in the reason. --comment-only is CONDITIONAL like
+--override-scope-cap: it is refused outright (422
+plan_comment_only_override_unavailable) when the scope declares
+non-.go testable source, because the comment-only exemption is .go-only
+and no override can authorize that landing. An honored --comment-only
+covers the PLAN gate only; the implement stage re-derives the
+comment-only verdict from the REAL diff.
+
 binding_assertions (#1171, optional): declare deterministic,
 machine-checkable conditions alongside (or instead of) free-text in
 'reason'. Each is a typed substring check — type 'file_contains' or

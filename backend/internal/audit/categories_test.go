@@ -182,3 +182,36 @@ func TestKnownCategories_AcceptanceTriageArbitrated(t *testing.T) {
 		t.Fatal("acceptance_triage_arbitrated is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_PlanMissingRequiredTests pins the E67.35 / #2660
+// category: the plan-approval required-tests gate writes it when it refuses
+// an approve whose effective scope declares no test-shaped path while the
+// implement stage requires tests_added_or_updated. An unregistered category
+// is un-awaitable — an operator could not arm fishhawk_await_audit on their
+// own refusal — and categories_completeness_test.go's AST sweep would fail
+// the build the moment the emit site lands.
+func TestKnownCategories_PlanMissingRequiredTests(t *testing.T) {
+	if !IsKnownCategory("plan_missing_required_tests") {
+		t.Fatal("plan_missing_required_tests is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_PlanCommentOnlyOverrideRefused pins the E67.35 /
+// #2660 categorical refusal marker: --comment-only cannot authorize a scope
+// carrying a non-.go testable-source path, and the refusal must be readable
+// from the run record.
+func TestKnownCategories_PlanCommentOnlyOverrideRefused(t *testing.T) {
+	if !IsKnownCategory("plan_comment_only_override_refused") {
+		t.Fatal("plan_comment_only_override_refused is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_PlanCommentOnlyOverrideAcknowledged pins the E67.35 /
+// #2660 honored-override marker, which records that the override covers the
+// plan gate only — the implement stage re-derives the comment-only verdict
+// from the REAL diff.
+func TestKnownCategories_PlanCommentOnlyOverrideAcknowledged(t *testing.T) {
+	if !IsKnownCategory("plan_comment_only_override_acknowledged") {
+		t.Fatal("plan_comment_only_override_acknowledged is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

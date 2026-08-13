@@ -866,3 +866,112 @@ func TestConstraints_DiffCoverageRoundTrip(t *testing.T) {
 		t.Errorf("bare constraints = %s, want no diff_coverage member", bare)
 	}
 }
+
+// --- comment-only Go exemption (#2660) ---------------------------------
+
+// commentOnlyGoDiff is a modified .go file whose only changed lines are a
+// `//` comment and a blank line — no test file anywhere in the diff.
+func commentOnlyGoDiff() Diff {
+	return Diff{
+		ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+		Patch: "diff --git a/backend/foo.go b/backend/foo.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/backend/foo.go\n" +
+			"+++ b/backend/foo.go\n" +
+			"@@ -1,5 +1,5 @@\n" +
+			" package foo\n" +
+			" \n" +
+			"-// Foo does a thing.\n" +
+			"+// Foo does the thing.\n" +
+			" func Foo() {}\n",
+	}
+}
+
+// TestRequiredOutcomes_CommentOnlySignal_Satisfies is the shipped-behavior
+// assertion for the envelope half of #2660: a comment-only .go diff with
+// no test file satisfies tests_added_or_updated once the carried verdict
+// says so.
+func TestRequiredOutcomes_CommentOnlySignal_Satisfies(t *testing.T) {
+	d := commentOnlyGoDiff()
+	sig := DetectCommentOnlyGo(d)
+	if !sig.CommentOnly {
+		t.Fatalf("fixture is not comment-only: %+v", sig)
+	}
+	v := Evaluate(d, Constraints{
+		RequiredOutcomes: []string{"tests_added_or_updated"},
+		CommentOnly:      sig,
+	})
+	if len(v) != 0 {
+		t.Fatalf("expected the comment-only diff to satisfy the outcome, got %+v", v)
+	}
+}
+
+// TestRequiredOutcomes_CommentOnlySignal_NilOrFalseStillViolates pins the
+// two ways the branch must NOT fire: a nil signal (every pre-#2660 audit
+// row) and an explicit not-comment-only verdict both leave today's
+// violation exactly as it is.
+func TestRequiredOutcomes_CommentOnlySignal_NilOrFalseStillViolates(t *testing.T) {
+	d := commentOnlyGoDiff()
+	cases := []struct {
+		name string
+		sig  *CommentOnlySignal
+	}{
+		{"nil signal (legacy row)", nil},
+		{"explicit not-comment-only", &CommentOnlySignal{CommentOnly: false, Reason: ReasonNonCommentLineChanged}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Evaluate(d, Constraints{
+				RequiredOutcomes: []string{"tests_added_or_updated"},
+				CommentOnly:      tc.sig,
+			})
+			if len(v) != 1 || !strings.Contains(v[0].Detail, "no test files") {
+				t.Fatalf("expected the unchanged violation, got %+v", v)
+			}
+		})
+	}
+}
+
+// TestRequiredOutcomes_CommentOnly_StatementTouchingDiffStillFails is
+// issue AC2: a diff that changes a statement is refused by the detector,
+// so the outcome still violates end to end (detector → constraint →
+// evaluate).
+func TestRequiredOutcomes_CommentOnly_StatementTouchingDiffStillFails(t *testing.T) {
+	d := Diff{
+		ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+		Patch: "diff --git a/backend/foo.go b/backend/foo.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/backend/foo.go\n" +
+			"+++ b/backend/foo.go\n" +
+			"@@ -1,4 +1,4 @@\n" +
+			" func Foo() int {\n" +
+			"-\treturn 1\n" +
+			"+\treturn 2\n",
+	}
+	v := Evaluate(d, Constraints{
+		RequiredOutcomes: []string{"tests_added_or_updated"},
+		CommentOnly:      DetectCommentOnlyGo(d),
+	})
+	if len(v) != 1 || !strings.Contains(v[0].Detail, "no test files") {
+		t.Fatalf("expected the statement-touching diff to violate, got %+v", v)
+	}
+}
+
+// TestCommentOnly_DoesNotAffectVerificationOrDeferrals: the new signal is
+// scoped to tests_added_or_updated. verification_reported keeps its
+// fail-closed posture on the same comment-only diff, and the outcome stays
+// undeferrable.
+func TestCommentOnly_DoesNotAffectVerificationOrDeferrals(t *testing.T) {
+	d := commentOnlyGoDiff()
+	c := Constraints{
+		RequiredOutcomes: []string{"tests_added_or_updated", "verification_reported"},
+		CommentOnly:      DetectCommentOnlyGo(d),
+	}
+	v := Evaluate(d, c)
+	if len(v) != 1 || !strings.Contains(v[0].Detail, "no verification evidence") {
+		t.Fatalf("expected only the verification violation, got %+v", v)
+	}
+	if got := DeferredRequiredOutcomes(c); len(got) != 0 {
+		t.Fatalf("comment-only must defer nothing, got %v", got)
+	}
+}

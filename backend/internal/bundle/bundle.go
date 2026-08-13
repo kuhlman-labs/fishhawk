@@ -547,11 +547,17 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 		}
 		d := policy.Diff{
 			ChangedFiles: make([]policy.ChangedFile, 0, len(payload.Files)),
-			// Additive content for the implement-review prompt only;
-			// the policy engine never reads Patch. Empty when the
-			// bundle predates the field or the runner couldn't compute
-			// the patch (#585).
+			// Content for the implement-review prompt (#585) and, since
+			// #2660, for policy.DetectCommentOnlyGo — the one evaluator
+			// that reads Patch. Empty when the bundle predates the field
+			// or the runner couldn't compute the patch, which the
+			// detector refuses as patch_absent.
 			Patch: payload.Patch,
+			// Carried alongside Patch so the detector can refuse a patch
+			// the runner cut at its 256 KiB cap rather than reading the
+			// surviving prefix (#2660). Older bundles omit the field and
+			// decode to false.
+			PatchTruncated: payload.PatchTruncated,
 		}
 		for _, f := range payload.Files {
 			d.ChangedFiles = append(d.ChangedFiles, policy.ChangedFile{

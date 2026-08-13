@@ -420,3 +420,46 @@ func TestEvaluate_DiffCoverageDoesNotSuppressSiblings(t *testing.T) {
 		t.Errorf("violations = %+v, want the max_files_changed violation", v)
 	}
 }
+
+// TestRequiredOutcomes_CommentOnlyGo_Satisfies mirrors the backend's
+// third tests_added_or_updated case (#2660): a comment-only .go diff with
+// no test file must NOT fail the stage category-B in the runner's in-line
+// check, or the backend never gets to admit it.
+func TestRequiredOutcomes_CommentOnlyGo_Satisfies(t *testing.T) {
+	d := Diff{
+		ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+		Patch: "diff --git a/backend/foo.go b/backend/foo.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/backend/foo.go\n" +
+			"+++ b/backend/foo.go\n" +
+			"@@ -1,5 +1,5 @@\n" +
+			" package foo\n" +
+			" \n" +
+			"-// Foo does a thing.\n" +
+			"+// Foo does the thing.\n" +
+			" func Foo() {}\n",
+	}
+	v := Evaluate(d, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}})
+	if len(v) != 0 {
+		t.Fatalf("expected the comment-only diff to satisfy the outcome, got %+v", v)
+	}
+
+	// Mirror-image: the same file with a statement change still violates,
+	// and a comment-only diff whose patch never arrived (patch_absent)
+	// violates too — the runner is fail-closed exactly like the backend.
+	stmt := d
+	stmt.Patch = "diff --git a/backend/foo.go b/backend/foo.go\n" +
+		"--- a/backend/foo.go\n" +
+		"+++ b/backend/foo.go\n" +
+		"@@ -1,3 +1,3 @@\n" +
+		" func Foo() int {\n" +
+		"-\treturn 1\n" +
+		"+\treturn 2\n"
+	if v := Evaluate(stmt, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}}); len(v) != 1 {
+		t.Fatalf("expected a violation for the statement-touching diff, got %+v", v)
+	}
+	noPatch := Diff{ChangedFiles: d.ChangedFiles}
+	if v := Evaluate(noPatch, Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}}); len(v) != 1 {
+		t.Fatalf("expected a violation when no patch reached the check, got %+v", v)
+	}
+}

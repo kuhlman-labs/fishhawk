@@ -19856,3 +19856,139 @@ func TestVerifyCommit_FixupBuildRequiredUnchanged(t *testing.T) {
 	}
 	_ = bare
 }
+
+// commentOnlyFixturePath is the SHARED WIRE FIXTURE (#2660, binding approval
+// condition 1): the git_diff event payload this test generates through the
+// runner's REAL emit path (computeAndEmitDiff → makeGitDiffEventStats) over a
+// real git repo, committed so the BACKEND's trace-side test
+// (backend/internal/server/trace_policy_test.go) can consume the SAME BYTES.
+//
+// runner and backend are separate Go modules that cannot import each other,
+// so this file is the only vehicle that asserts the wire contract instead of
+// assuming it: the runner side asserts byte-equality against it, and the
+// backend side wraps it as its bundle's git_diff event. A drift at EITHER end
+// reddens.
+//
+// REGENERATION: when the emitter legitimately changes, run
+//
+//	FISHHAWK_UPDATE_GOLDEN=1 go test ./cmd/fishhawk-runner/ -run TestComputeAndEmitDiff_CommentOnlyWireFixture
+//
+// from the runner module, then re-run the backend's
+// TestReEvaluatePolicy_CommentOnlyGo_* tests, which consume the rewritten
+// bytes. Never hand-edit the file.
+const commentOnlyFixturePath = "testdata/git_diff_comment_only.json"
+
+// TestComputeAndEmitDiff_CommentOnlyWireFixture asserts two things at once:
+// that computeAndEmitDiff carries the captured Patch and PatchTruncated onto
+// the constraint.Diff the in-line evaluation reads (#2660), and that the
+// git_diff event payload it emits still matches the committed shared fixture
+// the backend consumes.
+func TestComputeAndEmitDiff_CommentOnlyWireFixture(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := gitRunnerFor(t, repo)
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	// Pin the abbreviation length so the `index <sha>..<sha>` header is
+	// byte-stable across git versions and repo sizes — the fixture is
+	// compared byte-for-byte.
+	runGit("config", "core.abbrev", "40")
+
+	const before = "package foo\n\n// Foo does a thing.\nfunc Foo() {}\n"
+	const after = "package foo\n\n// Foo does the thing.\nfunc Foo() {}\n"
+	mustWrite(t, filepath.Join(repo, "foo.go"), before)
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+
+	// The comment-only correction: one changed line, a doc comment.
+	mustWrite(t, filepath.Join(repo, "foo.go"), after)
+
+	cfg := config{workingDir: repo, checkBaseRef: "HEAD", stageID: "s-2660", scopeFiles: []upload.ScopeFile{{Path: "foo.go", Operation: "modify"}}}
+	var sink bytes.Buffer
+	d, events, err := computeAndEmitDiff(cfg, &sink)
+	if err != nil {
+		t.Fatalf("computeAndEmitDiff: %v", err)
+	}
+
+	// The returned diff carries the SAME patch the event ships, so the
+	// runner's in-line comment-only check and the backend's re-evaluation
+	// read one text.
+	if d.Patch == "" {
+		t.Fatal("returned Diff.Patch is empty; the in-line constraint check would see patch_absent")
+	}
+	if d.PatchTruncated {
+		t.Fatal("returned Diff.PatchTruncated = true for a two-line patch")
+	}
+	if got := constraint.Evaluate(d, constraint.Constraints{
+		RequiredOutcomes: []string{"tests_added_or_updated"},
+	}); len(got) != 0 {
+		t.Fatalf("the runner must admit its own comment-only diff, got %+v", got)
+	}
+
+	var payload []byte
+	for _, e := range events {
+		if e.Kind == "git_diff" {
+			payload = e.Payload
+		}
+	}
+	if payload == nil {
+		t.Fatal("no git_diff event emitted")
+	}
+	if d.Patch != gitDiffEventPatch(t, payload) {
+		t.Fatal("the returned Diff.Patch and the emitted event's patch diverged")
+	}
+
+	// Resolve the fixture against the SOURCE directory, not the process CWD:
+	// this package's TestMain chdirs into a throwaway git repo, so a relative
+	// path would write and read a temp-dir copy and the golden comparison
+	// would be vacuous.
+	golden := filepath.Join(packageSourceDir(t), commentOnlyFixturePath)
+	if os.Getenv("FISHHAWK_UPDATE_GOLDEN") != "" {
+		if err := os.MkdirAll(filepath.Dir(golden), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(golden, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("regenerated %s", golden)
+	}
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatalf("read shared wire fixture %s (regenerate with FISHHAWK_UPDATE_GOLDEN=1): %v", golden, err)
+	}
+	if string(payload) != string(want) {
+		t.Fatalf("emitted git_diff payload no longer matches the shared wire fixture %s.\n"+
+			"The backend's trace-side test consumes these exact bytes; if the emitter changed on purpose, "+
+			"regenerate with FISHHAWK_UPDATE_GOLDEN=1 and re-run the backend's comment-only trace tests.\n"+
+			"got:  %s\nwant: %s", commentOnlyFixturePath, payload, want)
+	}
+}
+
+// gitDiffEventPatch decodes the `patch` field out of an emitted git_diff
+// event payload.
+func gitDiffEventPatch(t *testing.T, payload []byte) string {
+	t.Helper()
+	var p struct {
+		Patch string `json:"patch"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatalf("decode git_diff payload: %v", err)
+	}
+	return p.Patch
+}
+
+// packageSourceDir returns the directory holding this test's source file, so
+// a fixture path resolves against the repository rather than the process CWD
+// (this package's TestMain chdirs into a throwaway git repo).
+func packageSourceDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate the package source dir")
+	}
+	return filepath.Dir(file)
+}

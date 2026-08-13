@@ -53,7 +53,15 @@ import "sort"
 // minimum physical changed-file count already exceeds the run-immutable
 // max_files_changed cap — the override cannot authorize a landing the implement
 // stage re-check will reject, so the gate fails fast at approval instead of after
-// a full implement run. When a new canonical category is introduced, add it here so
+// a full implement run. E67.35 / #2660 added the required-tests plan gate's three
+// markers — plan_missing_required_tests (an approve refused because the effective
+// scope declares no test-shaped path while the implement stage requires
+// tests_added_or_updated), plan_comment_only_override_refused (a --comment-only
+// approve refused because the scope carries a non-.go testable-source path the
+// comment-only exemption provably cannot cover), and
+// plan_comment_only_override_acknowledged (the honored override, recording that
+// the implement stage re-derives the verdict from the REAL diff). When a new
+// canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
 // non-test backend audit-write emits a category absent from this map.
@@ -138,9 +146,12 @@ var KnownCategories = map[string]struct{}{
 	"plan_add_scope_files_fans_into_slices":   {},
 	"plan_budget_override_acknowledged":       {},
 	"plan_coerced":                            {},
+	"plan_comment_only_override_acknowledged": {},
+	"plan_comment_only_override_refused":      {},
 	"plan_decomposed":                         {},
 	"plan_generated":                          {},
 	"plan_missing_for_implement":              {},
+	"plan_missing_required_tests":             {},
 	"plan_periodic_budget_tier_acknowledged":  {},
 	"plan_reaction_observed":                  {},
 	"plan_reused_from":                        {},

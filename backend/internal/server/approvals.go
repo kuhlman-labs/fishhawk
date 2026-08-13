@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -578,6 +579,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// the flattened union rides in alongside add_scope_files so the number
 		// the gate reports stays equal to the scope the prompt builder assembles.
 		if !s.checkPlanScopeCap(w, r, stage, req.Comment,
+			unionScopeAdds(addScopeFiles, sliceAdds), removeScopeFiles) {
+			return
+		}
+		// Required-tests gate (#2660): refuse an approve whose effective
+		// scope declares no test-shaped path while the implement stage
+		// requires `tests_added_or_updated` and the scope carries testable
+		// source — the deterministic category-B failure this shifts left.
+		// Placed AFTER the cap gate (whose message is the more specific one
+		// when a plan trips both) and BEFORE the budget gate. PRE-Submit for
+		// the same ADR-036 reason as every sibling: a refused approve
+		// inserts no row, so a corrected retry flows normally.
+		if !s.checkPlanRequiredTests(w, r, stage, req.Comment,
 			unionScopeAdds(addScopeFiles, sliceAdds), removeScopeFiles) {
 			return
 		}
@@ -3402,6 +3415,144 @@ func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage
 	}
 	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_scope_cap",
 		msg,
+		basePayload)
+	return false
+}
+
+// checkPlanRequiredTests enforces the required-tests gate on plan-stage
+// approvals (#2660). Returns true when the approval should proceed; returns
+// false (having written a 422 and appended the matching audit entry) when
+// the plan PROVABLY cannot satisfy the implement stage's
+// `required_outcomes: [tests_added_or_updated]`.
+//
+// The gate fires only when ALL of:
+//   - the implement stage requires tests_added_or_updated, AND
+//   - the effective scope (plan scope.files ∪ add_scope_files ∖
+//     remove_scope_files, the same set the cap gate counts) contains at
+//     least one testable-source path, AND
+//   - NO effective path is test-shaped (policy.IsTestPath).
+//
+// The second condition is load-bearing: a docs-only scope satisfies the
+// outcome at implement via the #610 vacuous branch, so refusing it would be
+// wrong.
+//
+// `--comment-only` in the comment is the escape for the one case the
+// envelope admits — a comment-only correction to a .go file (the
+// policy.DetectCommentOnlyGo exemption). Its posture is CONDITIONAL, mirroring
+// --override-scope-cap (#2415): honored when every testable-source path in
+// scope is a .go file, and REFUSED CATEGORICALLY (422
+// plan_comment_only_override_unavailable) when any is not, because the
+// exemption is Go-only and no override can authorize that landing. The honored
+// path records that the override covers the PLAN gate only — the implement
+// stage re-derives the verdict from the REAL diff.
+//
+// Fail-open matching its siblings: an unreadable run, an unresolved spec or
+// implement stage, and an unresolved effective scope all skip the check, so a
+// degraded backend can never brick the approval path.
+func (s *Server) checkPlanRequiredTests(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string, addScopeFiles, removeScopeFiles []string) bool {
+	ctx := r.Context()
+	if s.cfg.RunRepo == nil {
+		return true
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "required-tests gate: get run failed",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("error", err.Error()))
+		return true
+	}
+	outcomes, ok := s.resolveImplementRequiredOutcomes(ctx, runRow)
+	if !ok {
+		return true
+	}
+	required := false
+	for _, o := range outcomes {
+		if o == "tests_added_or_updated" {
+			required = true
+			break
+		}
+	}
+	if !required {
+		return true
+	}
+
+	paths, _, ok := s.effectiveScopePathSet(ctx, stage.RunID, addScopeFiles, removeScopeFiles)
+	if !ok {
+		return true
+	}
+
+	var testable, nonGo []string
+	for _, p := range paths {
+		if policy.IsTestPath(p) {
+			// A declared test path satisfies the outcome by construction.
+			return true
+		}
+		if policy.IsTestableSourcePath(p) {
+			testable = append(testable, p)
+			if !strings.HasSuffix(strings.ToLower(p), ".go") {
+				nonGo = append(nonGo, p)
+			}
+		}
+	}
+	if len(testable) == 0 {
+		// Docs/scripts/config only: the #610 vacuous branch satisfies the
+		// outcome at implement, so refusing here would be wrong.
+		return true
+	}
+
+	basePayload := map[string]any{
+		"stage_id":              stage.ID.String(),
+		"required_outcome":      "tests_added_or_updated",
+		"scoped_files":          len(paths),
+		"testable_source_files": len(testable),
+		"non_go_source_files":   nonGo,
+		"test_paths_declared":   0,
+	}
+	systemKind := audit.ActorKind("system")
+	appendEntry := func(category string) {
+		if s.cfg.AuditRepo == nil {
+			return
+		}
+		payload, _ := json.Marshal(basePayload)
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  category,
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for required-tests gate",
+				"run_id", stage.RunID, "stage_id", stage.ID, "category", category, "error", err.Error())
+		}
+	}
+
+	if strings.Contains(comment, "--comment-only") {
+		if len(nonGo) > 0 {
+			// Categorical: the comment-only exemption is .go-only, so no
+			// override can authorize a landing that changes another
+			// language's source without a test.
+			appendEntry("plan_comment_only_override_refused")
+			s.writeError(w, r, http.StatusUnprocessableEntity, "plan_comment_only_override_unavailable",
+				"--comment-only cannot authorize this landing. The comment-only exemption for "+
+					"required_outcomes: tests_added_or_updated covers .go files ONLY, and this scope declares "+
+					"non-.go testable source ("+strings.Join(nonGo, ", ")+"). Declare the test file you intend to "+
+					"add via add_scope_files, or re-plan the change so the non-.go source is out of scope.",
+				basePayload)
+			return false
+		}
+		basePayload["note"] = "override covers the plan gate only; the implement stage re-derives the comment-only verdict from the real diff"
+		appendEntry("plan_comment_only_override_acknowledged")
+		return true
+	}
+
+	appendEntry("plan_missing_required_tests")
+	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_missing_required_tests",
+		"the implement stage declares required_outcomes: tests_added_or_updated, but the effective scope "+
+			"(plan scope.files plus add_scope_files minus remove_scope_files) declares no test file while it "+
+			"does declare testable source. The implement stage would fail this constraint as category-B after a "+
+			"full run. Declare the test file you intend to add via add_scope_files, or — for a comment-only "+
+			"correction to a .go file — approve with --comment-only in the comment.",
 		basePayload)
 	return false
 }
