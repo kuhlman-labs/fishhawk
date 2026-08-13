@@ -255,8 +255,17 @@ type fakeBackend struct {
 	// stranded 'dispatched'. reapFailureStatus (0 -> 200) drives the
 	// report-itself-fails branch.
 	hostDispatchBaseBranch string
-	reapFailureByStage     map[uuid.UUID][]reapFailureRequest
-	reapFailureStatus      int
+	// hostDispatchWaveNotIntegrated models the SERVER's per-wave integration
+	// refusal (E50.13 / #2363), keyed by stage id: a marked stage answers 409
+	// wave_not_integrated WITHOUT transitioning, exactly as the real server
+	// refuses a dependent child whose predecessors have succeeded but are not yet
+	// merged onto the consolidated branch. The default handler flips any seeded
+	// pending|awaiting_host_dispatch stage to dispatched, which would over-model
+	// a premature dependent child as dispatched; this set lets a fan-out test
+	// keep such a child parked at awaiting_host_dispatch until its wave integrates.
+	hostDispatchWaveNotIntegrated map[string]bool
+	reapFailureByStage            map[uuid.UUID][]reapFailureRequest
+	reapFailureStatus             int
 	// decideFlipsListStatus makes the amendment decision POST also update the
 	// matching row in amendmentsByRun, so a modelled child polling
 	// ListScopeAmendments observes the decision land. Opt-in: the existing
@@ -535,6 +544,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryCalledByID:               map[uuid.UUID]int{},
 		admissionCalledByID:           map[uuid.UUID]int{},
 		hostDispatchCalledByID:        map[uuid.UUID]int{},
+		hostDispatchWaveNotIntegrated: map[string]bool{},
 		reapFailureByStage:            map[uuid.UUID][]reapFailureRequest{},
 		fixupResp:                     map[uuid.UUID]Stage{},
 		fixupStatus:                   http.StatusOK,
@@ -732,6 +742,15 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		fb.hostDispatchCalledByID[id]++
+		// The per-wave integration refusal (E50.13 / #2363): a marked stage
+		// answers 409 wave_not_integrated and is NOT transitioned, modelling the
+		// server refusing a dependent child whose wave has not integrated yet.
+		if fb.hostDispatchWaveNotIntegrated[id.String()] {
+			fb.mu.Unlock()
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"wave_not_integrated","message":"dependency slices have succeeded but are not yet integrated onto the consolidated branch"}}`))
+			return
+		}
 		status := fb.hostDispatchStatus
 		errBody := fb.hostDispatchErrBody
 		forceNoop := fb.hostDispatchForceNoop

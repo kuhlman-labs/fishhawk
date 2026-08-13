@@ -106,7 +106,11 @@ func TestAwaitChildren_SucceededButNotCoveredDoesNotRelease(t *testing.T) {
 	fb, r := newAwaitResolver(t)
 	parent, a, b := uuid.New(), uuid.New(), uuid.New()
 	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
-	seedChildWithSlice(fb, b, "pending", "awaiting_host_dispatch", 1, []int{0})
+	// B is parked by RuleChildrenDispatch: its RUN state is 'running' (#1237)
+	// while its implement STAGE waits at awaiting_host_dispatch. The release
+	// keys on the stage state, so it must still become dispatchable once the
+	// integration covers A — a run-state predicate would skip B forever.
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, []int{0})
 	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
 	// A slices_integrated entry EXISTS but covers nothing relevant — the stale
 	// case. Blocked would be false here (slice 0 succeeded); coverage is not.
@@ -177,6 +181,16 @@ func TestAwaitChildren_TimeoutIsResumable(t *testing.T) {
 	}
 	if out.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
 		t.Errorf("poll_interval_seconds = %d, want %d", out.PollIntervalSeconds, suggestedStageWaitPollIntervalSeconds)
+	}
+	// The contract requires EVERY release — timeout included — to carry the
+	// ChildrenStatus snapshot and a re-arm next_step.
+	if out.Children == nil {
+		t.Error("timeout release carried no ChildrenStatus snapshot")
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_await_children" {
+		t.Errorf("next_step = %+v, want a fishhawk_await_children re-arm", out.NextStep)
+	} else if out.NextStep.Params["run_id"] != parent.String() {
+		t.Errorf("re-arm run_id = %q, want the parent %s", out.NextStep.Params["run_id"], parent)
 	}
 }
 
@@ -338,20 +352,23 @@ func TestAwaitChildren_NotDecomposedErrors(t *testing.T) {
 
 // TestAwaitChildrenDispatchableIsPure exercises the release predicate directly
 // across its branches, including the not-minted fail-closed case wavecoverage
-// owns.
+// owns. It keys on ImplementStageState, NOT the run-level State: the parked
+// children r1/r2 carry run state 'running' (the RuleChildrenDispatch reality,
+// #1237) with their implement stage at awaiting_host_dispatch, so a predicate
+// that read the run state would find NONE dispatchable and this would fail.
 func TestAwaitChildrenDispatchableIsPure(t *testing.T) {
 	cs := &ChildrenStatus{
 		Children: []ChildStatus{
-			{RunID: "r0", SliceIndex: 0, State: "succeeded"},
-			{RunID: "r1", SliceIndex: 1, State: "pending", DependsOn: []int{0}},
-			{RunID: "r2", SliceIndex: 2, State: "pending", DependsOn: []int{5}}, // not minted
-			{RunID: "r3", SliceIndex: 3, State: "running"},                      // in flight
+			{RunID: "r0", SliceIndex: 0, State: "succeeded", ImplementStageState: "succeeded"},
+			{RunID: "r1", SliceIndex: 1, State: "running", ImplementStageState: "awaiting_host_dispatch", DependsOn: []int{0}},
+			{RunID: "r2", SliceIndex: 2, State: "running", ImplementStageState: "awaiting_host_dispatch", DependsOn: []int{5}}, // not minted
+			{RunID: "r3", SliceIndex: 3, State: "running", ImplementStageState: "running"},                                     // in flight
 		},
 		IntegratedChildRunIDs: []string{"r0"},
 	}
 	got := awaitChildrenDispatchable(cs)
 	if len(got) != 1 || got[0] != "r1" {
-		t.Fatalf("dispatchable = %v, want [r1] (r2's dependency slice is not minted; r3 is in flight)", got)
+		t.Fatalf("dispatchable = %v, want [r1] (r2's dependency slice is not minted; r3's stage is in flight)", got)
 	}
 	cs.IntegratedChildRunIDs = nil
 	if got := awaitChildrenDispatchable(cs); len(got) != 0 {

@@ -557,19 +557,30 @@ func TestResolveDependentChildBase_EmptyDependsOn_Admits(t *testing.T) {
 	}
 }
 
-// (3) UNCONFIGURED audit reads as ABSENT, not as a violation: a deployment
-// without an audit repository admits with no derived base rather than having
-// every dependent dispatch wedged behind a 409 it can never clear. Same
-// three-way partition resolveSliceDependencies documents.
-func TestResolveDependentChildBase_NilAuditRepo_Admits(t *testing.T) {
+// (3) A nil AuditRepo for a DEPENDENT child REFUSES (fail-closed): with no audit
+// repository there is no integration record to prove the child's predecessors
+// are merged, so admitting would spawn it on an unproven base (the #1302
+// stale-base class). A wave-0 child with no dependencies still admits (test (2)),
+// so an unconfigured deployment's independent dispatches are never wedged — only
+// a genuinely dependent child is refused.
+func TestResolveDependentChildBase_NilAuditRepo_Refuses(t *testing.T) {
 	s, rr, art := newGuardServer(t) // no AuditRepo
 	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
 	seedGuardChild(rr, parent, 0, run.StateSucceeded)
 	child := seedGuardChild(rr, parent, 1, run.StateRunning)
 
 	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
-	if err != nil || waveErr != nil || base != "" {
-		t.Fatalf("got (%q, %v, %v), want (\"\", nil, nil) — an unconfigured audit repo is ABSENT input", base, waveErr, err)
+	if err != nil {
+		t.Fatalf("err = %v, want nil — a nil AuditRepo is a refusal, not an errored read", err)
+	}
+	if waveErr == nil || base != "" {
+		t.Fatalf("got (%q, %v), want a refusal with no base — a dependent child must not admit without a proven integration", base, waveErr)
+	}
+	if waveErr.consolidatedBranchPresent {
+		t.Error("consolidated_branch_present = true, want false — no branch was read")
+	}
+	if len(waveErr.missing) != 1 || waveErr.missing[0] != 0 {
+		t.Errorf("missing = %v, want [0] — every declared dependency slice is uncovered with no audit record", waveErr.missing)
 	}
 }
 

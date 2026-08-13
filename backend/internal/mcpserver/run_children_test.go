@@ -1457,10 +1457,17 @@ func TestFanOut_ChildAmendmentParkedAndDecidedMidFanOut(t *testing.T) {
 
 		parent, childA, childB := uuid.New(), uuid.New(), uuid.New()
 		stageA := seedChildWithSlice(fb, childA, "pending", "awaiting_host_dispatch", 0, nil)
-		seedChildWithSlice(fb, childB, "pending", "awaiting_host_dispatch", 1, []int{0})
+		stageB := seedChildWithSlice(fb, childB, "pending", "awaiting_host_dispatch", 1, []int{0})
 		seedPlanDecomposed(fb, parent, []string{childA.String(), childB.String()}, 0)
 		fb.mu.Lock()
 		fb.decideFlipsListStatus = true
+		// childB depends on slice 0, which has not integrated at fan-out time, so
+		// the SERVER refuses its host dispatch (wave_not_integrated) and childB's
+		// implement stage stays awaiting_host_dispatch — the state its later
+		// dispatchable release is keyed on (#1237). Without this the fake would
+		// over-transition childB to 'dispatched' at the initial fan-out and it
+		// could never become dispatchable again.
+		fb.hostDispatchWaveNotIntegrated[stageB.String()] = true
 		fb.mu.Unlock()
 
 		m := &modelledRunner{filed: make(chan struct{}), proceeded: make(chan struct{})}

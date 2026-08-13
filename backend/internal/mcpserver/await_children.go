@@ -172,7 +172,7 @@ func (r *runResolver) awaitChildren(ctx context.Context, req *mcp.CallToolReques
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, awaitChildrenTimeoutOutput(parentUUID.String(), timeout, start, heartbeat, capSeconds), nil
+			return nil, r.awaitChildrenTimeout(ctx, parentUUID, timeout, start, heartbeat, capSeconds), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in), mirroring
 			// await_stage: emitted only when the caller supplied a progressToken
@@ -192,7 +192,7 @@ func (r *runResolver) awaitChildren(ctx context.Context, req *mcp.CallToolReques
 				// A deadline hit mid-poll cancels the in-flight request; that is a
 				// timeout, not a transport failure.
 				if pollCtx.Err() != nil {
-					return nil, awaitChildrenTimeoutOutput(parentUUID.String(), timeout, start, heartbeat, capSeconds), nil
+					return nil, r.awaitChildrenTimeout(ctx, parentUUID, timeout, start, heartbeat, capSeconds), nil
 				}
 				return nil, AwaitChildrenOutput{}, eerr
 			}
@@ -305,7 +305,27 @@ func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uui
 	if err != nil {
 		return nil, fmt.Errorf("read parent audit: %w", err)
 	}
-	return r.childrenStatusFor(ctx, parentUUID, entries)
+	cs, err := r.childrenStatusFor(ctx, parentUUID, entries)
+	if err != nil || cs == nil {
+		return cs, err
+	}
+	// Enrich each child with its IMPLEMENT-stage state so the dispatchable
+	// predicate keys on the stage state (#1237), not the run state. A parked
+	// local child has run state 'running' while its implement stage waits at
+	// awaiting_host_dispatch; keying on run state would skip it. Best-effort in
+	// the same direction as the amendment arm's probe: a child whose stage
+	// cannot be resolved keeps an empty ImplementStageState (not dispatchable),
+	// never failing the whole snapshot.
+	for i := range cs.Children {
+		childUUID, perr := uuid.Parse(cs.Children[i].RunID)
+		if perr != nil {
+			continue
+		}
+		if stage, serr := r.resolveStage(ctx, childUUID, "implement", ""); serr == nil {
+			cs.Children[i].ImplementStageState = stage.State
+		}
+	}
+	return cs, nil
 }
 
 // awaitChildrenAuditLimit bounds the parent-audit window the snapshot decodes
@@ -359,15 +379,21 @@ func (r *runResolver) awaitChildrenPendingAmendment(ctx context.Context, cs *Chi
 // awaitChildrenDispatchable returns the run ids of every child the SERVER would
 // admit right now, in ascending slice order.
 //
-// The predicate is deliberately in two halves. (a) The child's implement stage
-// awaits a host dispatch — modelled here by the child's RUN state, because a
-// decomposed child parked by RuleChildrenDispatch has run state 'pending' until
-// a host dispatch drives it; a 'running' child already has a runner. (b) Its
-// dependency slices are COVERED per wavecoverage.Covered — the identical
-// function the sweeper's short-circuit and the host-dispatch marker's admission
-// use. Reconstructing (b) from ChildStatus.Blocked would be wrong in a way
-// invisible to this package's own tests: Blocked keys on predecessor run STATE,
-// which flips to succeeded BEFORE the integration runs.
+// The predicate is deliberately in two halves. (a) The child's IMPLEMENT STAGE
+// awaits a host dispatch — keyed on ImplementStageState via
+// implementStageDispatchable, the SAME {pending, awaiting_host_dispatch}
+// partition fishhawk_run_children's own dispatch loop uses (#1237). It is NOT
+// keyed on the run-level State: a decomposed child parked by RuleChildrenDispatch
+// has run state 'running' while its implement stage sits at
+// awaiting_host_dispatch, so a run-state predicate would skip the entire
+// primary locked-local parked population — announcing nothing until the sweeper
+// integrated. A 'dispatched'/'running' stage already has a runner in flight and
+// is not re-dispatched (#1912). (b) Its dependency slices are COVERED per
+// wavecoverage.Covered — the identical function the sweeper's short-circuit and
+// the host-dispatch marker's admission use. Reconstructing (b) from
+// ChildStatus.Blocked would be wrong in a way invisible to this package's own
+// tests: Blocked keys on predecessor run STATE, which flips to succeeded BEFORE
+// the integration runs.
 func awaitChildrenDispatchable(cs *ChildrenStatus) []string {
 	sliceRunID := make(map[int]string, len(cs.Children))
 	for _, c := range cs.Children {
@@ -383,7 +409,7 @@ func awaitChildrenDispatchable(cs *ChildrenStatus) []string {
 	})
 	var out []string
 	for _, c := range ordered {
-		if c.State != "pending" {
+		if !implementStageDispatchable(c.ImplementStageState) {
 			continue
 		}
 		if covered, _ := wavecoverage.Covered(c.DependsOn, sliceRunID, cs.IntegratedChildRunIDs); covered {
@@ -421,8 +447,26 @@ func amendmentPathList(item *ScopeAmendmentItem) string {
 	return strings.Join(paths, ", ")
 }
 
+// awaitChildrenTimeout builds the resumable timeout response, best-effort
+// enriched with the current ChildrenStatus snapshot so a timeout release carries
+// the same per-child block EVERY other release does (the contract requires it on
+// every release, timeout included). The snapshot read uses the caller's ctx —
+// NOT the expired poll ctx — and degrades to no snapshot on a read failure
+// rather than turning a resumable timeout into an error. The re-arm NextStep is
+// attached unconditionally by awaitChildrenTimeoutOutput.
+func (r *runResolver) awaitChildrenTimeout(ctx context.Context, parentUUID uuid.UUID, timeout int, start time.Time, heartbeat bool, capSeconds int) AwaitChildrenOutput {
+	out := awaitChildrenTimeoutOutput(parentUUID.String(), timeout, start, heartbeat, capSeconds)
+	if cs, err := r.childrenStatusForAwait(ctx, parentUUID); err == nil && cs != nil {
+		out.Children = cs
+	}
+	return out
+}
+
 // awaitChildrenTimeoutOutput builds the resumable timeout response. The wait
 // holds no server state, so a timeout is an idempotent checkpoint, not an error.
+// It carries a re-arm NextStep (fishhawk_await_children) so the contract's
+// "every release returns a next_step" holds on the timeout path too — a timeout
+// is a checkpoint to resume, not a terminal state.
 func awaitChildrenTimeoutOutput(runID string, timeout int, start time.Time, heartbeat bool, capSeconds int) AwaitChildrenOutput {
 	return AwaitChildrenOutput{
 		Status:              "timeout",
@@ -431,6 +475,13 @@ func awaitChildrenTimeoutOutput(runID string, timeout int, start time.Time, hear
 		PollIntervalSeconds: suggestedStageWaitPollIntervalSeconds,
 		Heartbeat:           heartbeat,
 		TimeoutCapSeconds:   capSeconds,
+		NextStep: &SuggestedAction{
+			Action:       "fishhawk_await_children",
+			Params:       map[string]string{"run_id": runID},
+			Precondition: "the wait timed out with no release; it holds no server state",
+			Consumes:     "none",
+			Reason:       "re-arm the in-band wait — a timeout is a resumable idempotent checkpoint, not a terminal state",
+		},
 		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, or settled within %ds. "+
 			"The wait holds nothing: re-call fishhawk_await_children to resume it (a safe idempotent no-op), "+
 			"or poll fishhawk_get_run_status every %ds (the authoritative path).",

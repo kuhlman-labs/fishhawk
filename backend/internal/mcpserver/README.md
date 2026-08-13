@@ -395,15 +395,22 @@ detection anywhere in the verb. A transition-keyed release could neither fire be
 | Status | Releases when | `next_step` |
 |---|---|---|
 | `amendment_pending` | some child has a pending mid-stage scope amendment (the strict [#2588](https://github.com/kuhlman-labs/fishhawk/issues/2588) predicate, reused verbatim per child) | `fishhawk_decide_scope_amendment`, pre-filled |
-| `children_dispatchable` | some child's implement stage awaits a host dispatch **and** its dependency slices are COVERED per the shared `wavecoverage.Covered` predicate | `fishhawk_run_children` |
+| `children_dispatchable` | some child's **implement-stage** state is host-dispatchable (`{pending, awaiting_host_dispatch}`) **and** its dependency slices are COVERED per the shared `wavecoverage.Covered` predicate | `fishhawk_run_children` |
 | `children_settled` | every child reached a terminal run state | `fishhawk_consolidate_slices` |
-| `timeout` | none of the above within the window (resumable; the wait holds no server state) | — |
+| `timeout` | none of the above within the window (resumable; the wait holds no server state) | `fishhawk_await_children` (re-arm) |
 
-`children_dispatchable` keys on **coverage**, not on `blocked`. Predecessor run state flips to `succeeded` **before**
-the between-wave integration runs, so a `blocked`-keyed release would announce a dispatch the server then refuses 409
-`wave_not_integrated`. The predicate is the ONE shared `backend/internal/wavecoverage` function the sweeper's
-short-circuit and the host-dispatch marker's admission also use — a duplicated reconstruction is the drift class this
-repo already names as load-bearing.
+Every release — **including `timeout`** — carries the same `ChildrenStatus` snapshot and a `next_step`; a timeout's
+`next_step` re-arms the wait, since a timeout is a resumable checkpoint, not a terminal state.
+
+`children_dispatchable` keys on the child's **implement-stage** state, NOT its run-level state. A local decomposed
+child parked by `RuleChildrenDispatch` has its RUN advanced to `running` while its implement stage sits at
+`awaiting_host_dispatch` ([#1237](https://github.com/kuhlman-labs/fishhawk/issues/1237)), so a run-state predicate would
+skip the entire primary locked-local parked population — the same `{pending, awaiting_host_dispatch}` partition
+`fishhawk_run_children`'s own dispatch loop uses (`implementStageDispatchable`). It keys on **coverage**, not on
+`blocked`: predecessor run state flips to `succeeded` **before** the between-wave integration runs, so a `blocked`-keyed
+release would announce a dispatch the server then refuses 409 `wave_not_integrated`. The coverage predicate is the ONE
+shared `backend/internal/wavecoverage` function the sweeper's short-circuit and the host-dispatch marker's admission
+also use — a duplicated reconstruction is the drift class this repo already names as load-bearing.
 
 ### Concurrent child amendments are SERIAL BY CONTRACT
 

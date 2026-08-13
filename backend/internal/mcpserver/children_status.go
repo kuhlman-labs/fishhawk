@@ -37,6 +37,16 @@ type ChildStatus struct {
 	RunID      string `json:"run_id" jsonschema:"the child run UUID"`
 	SliceIndex int    `json:"slice_index" jsonschema:"the child's authoritative slice index from its run row (its sub_plan position in the parent's decomposition); falls back to the position in child_run_ids only for an older backend that omits slice_index"`
 	State      string `json:"state" jsonschema:"the child run's lifecycle state: pending, running, succeeded, failed, or unknown when the per-child read failed"`
+	// ImplementStageState is the child's IMPLEMENT stage state — the value
+	// dispatchability is actually keyed on (#1237), NOT the run-level State
+	// above. A local decomposed child parked by RuleChildrenDispatch has its RUN
+	// advanced to 'running' while its implement STAGE sits at
+	// pending/awaiting_host_dispatch awaiting the host fan-out, so keying
+	// dispatchability on the run state would skip exactly the parked population
+	// fishhawk_run_children exists to spawn. Populated best-effort by the await
+	// path (childrenStatusForAwait resolves each child's implement stage); left
+	// empty on the plain get_run_status snapshot, which does not need it.
+	ImplementStageState string `json:"implement_stage_state,omitempty" jsonschema:"the child's implement-stage state (pending, awaiting_host_dispatch, dispatched, running, or a terminal state) — the value dispatchability is keyed on, distinct from the run-level state; populated on the fishhawk_await_children path"`
 	// DependsOn lists the slice indices this child depends on (E48.99 / #2546),
 	// mirrored from the child run row's slice_depends_on (resolved from the
 	// parent's approved plan on the single-run read). Omitted for a wave-0

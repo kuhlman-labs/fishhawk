@@ -335,17 +335,23 @@ func (s *Server) latestSlicesIntegrated(ctx context.Context, parentRunID uuid.UU
 // Three outcomes:
 //
 //   - ADMIT with an empty base ("", nil, nil) — the run is not a fan-out child,
-//     its slice declares no dependencies, the parent plan did not resolve, or
-//     no AuditRepo is configured. The caller keeps whatever base it had, i.e.
-//     byte-identical to pre-#2363 behaviour. ABSENT input is not a violation,
-//     the same three-way partition resolveSliceDependencies documents (an
-//     unconfigured deployment must not have every dependent dispatch wedged).
+//     its slice declares no dependencies, or the parent plan did not resolve.
+//     The caller keeps whatever base it had, i.e. byte-identical to pre-#2363
+//     behaviour. ABSENT dependency input is not a violation, the same three-way
+//     partition resolveSliceDependencies documents.
 //   - ADMIT with the consolidated branch (branch, nil, nil) — dependencies are
 //     covered by the newest integration AND that entry names a branch.
-//   - REFUSE (a non-nil *waveIntegrationError) — no integration, an empty
-//     branch, or a STALE integration whose child_run_ids does not cover every
-//     dependency slice. A NON-EMPTY consolidated branch is deliberately NOT
-//     sufficient on its own: that is exactly the stale case.
+//   - REFUSE (a non-nil *waveIntegrationError) — the child DECLARES dependencies
+//     but no integration proves them merged: no AuditRepo to read the record at
+//     all, no integration entry, an empty branch, or a STALE integration whose
+//     child_run_ids does not cover every dependency slice. A NON-EMPTY
+//     consolidated branch is deliberately NOT sufficient on its own: that is
+//     exactly the stale case. A nil AuditRepo for a DEPENDENT child is a REFUSAL,
+//     not an admit (fail-closed): admitting would spawn the child on a base with
+//     no evidence its predecessors' work is present — the #1302 stale-base class
+//     this guard exists to close. (A wave-0 child with no dependencies already
+//     admitted above, so an unconfigured deployment's independent dispatches are
+//     never wedged.)
 //
 // A required read that ERRORS returns err so the caller 500s
 // dependency_check_failed (retryable), never a silent admit.
@@ -358,7 +364,19 @@ func (s *Server) resolveDependentChildBase(ctx context.Context, runRow *run.Run)
 		return "", nil, nil
 	}
 	if s.cfg.AuditRepo == nil {
-		return "", nil, nil
+		// This child DECLARES dependencies but there is no audit repository to
+		// read an integration record from, so no integration can be proven to
+		// cover them. Fail CLOSED: refuse rather than admit onto an unproven
+		// base (the #1302 stale-base class). Every declared slice is uncovered,
+		// and no consolidated branch was read.
+		deps := append([]int(nil), dependsOn...)
+		sort.Ints(deps)
+		return "", &waveIntegrationError{
+			sliceIndex:                *runRow.SliceIndex,
+			dependsOn:                 deps,
+			missing:                   deps,
+			consolidatedBranchPresent: false,
+		}, nil
 	}
 	branch, integrated, err := s.latestSlicesIntegrated(ctx, *runRow.DecomposedFrom)
 	if err != nil {

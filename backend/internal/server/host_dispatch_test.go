@@ -536,12 +536,26 @@ func TestHostDispatch_AdmissionWalkInFlight_MarkerBlocksThen409(t *testing.T) {
 // implement stage id + the dependency sibling run id.
 func decomposedHostDispatchServer(t *testing.T, depSliceState run.State) (*Server, *guardCountingRepo, uuid.UUID, uuid.UUID, uuid.UUID) {
 	t.Helper()
-	s, rr, art := newGuardServer(t)
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	au := newAuditCompleteAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au})
 	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
 	sib := seedGuardChild(rr, parentID, 0, depSliceState)
 	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
 	stage := rr.seedStage(child.ID, 0, run.StageStateAwaitingHostDispatch)
 	stage.Type = run.StageTypeImplement
+	// When the dependency slice has SUCCEEDED, also record the between-wave
+	// integration that MERGED it onto the consolidated branch. The per-wave
+	// integration guard (resolveDependentChildBase, #2363) admits a dependent
+	// child only when recorded integration COVERS its dependencies — a
+	// succeeded-but-unintegrated dependency is refused wave_not_integrated — so
+	// the admit-path tests must seed this to reach the transition. The pending
+	// case seeds no integration: the wave-ORDER guard refuses it first, before
+	// the integration decision is ever reached.
+	if depSliceState == run.StateSucceeded {
+		seedSlicesIntegrated(t, au, parentID, waveConsolidatedBranch, []string{sib.ID.String()})
+	}
 	return s, rr, child.ID, stage.ID, sib.ID
 }
 
@@ -761,7 +775,8 @@ func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	runRepo := run.NewPostgresRepository(pool)
 	artRepo := artifact.NewPostgresRepository(pool)
-	s := New(Config{RunRepo: runRepo, ArtifactRepo: artRepo})
+	auditRepo := audit.NewPostgresRepository(pool)
+	s := New(Config{RunRepo: runRepo, ArtifactRepo: artRepo, AuditRepo: auditRepo})
 
 	newRun := func(sliceIdx *int, parent *uuid.UUID) *run.Run {
 		t.Helper()
@@ -834,12 +849,30 @@ func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
 		t.Errorf("persisted stage = %q, want awaiting_host_dispatch (refusal committed no state)", cur.State)
 	}
 
-	// (b) advance child0's RUN to succeeded → the same dispatch admits.
+	// (b) advance child0's RUN to succeeded AND record the between-wave
+	// integration that merged it onto the consolidated branch → the same
+	// dispatch admits. Succeeded alone is NOT sufficient under the per-wave
+	// integration guard (#2363): a dependent child is admitted only once
+	// recorded integration covers its dependency slices, so the slices_integrated
+	// entry naming child0 is what makes the admit legitimate rather than a
+	// stale-base dispatch.
 	if _, err := runRepo.TransitionRun(ctx, child0.ID, run.StateRunning); err != nil {
 		t.Fatalf("child0 → running: %v", err)
 	}
 	if _, err := runRepo.TransitionRun(ctx, child0.ID, run.StateSucceeded); err != nil {
 		t.Fatalf("child0 → succeeded: %v", err)
+	}
+	integratedPayload, err := json.Marshal(map[string]any{
+		"consolidated_branch": waveConsolidatedBranch,
+		"child_run_ids":       []string{child0.ID.String()},
+	})
+	if err != nil {
+		t.Fatalf("marshal slices_integrated payload: %v", err)
+	}
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: parent.ID, Timestamp: time.Now(), Category: "slices_integrated", Payload: integratedPayload,
+	}); err != nil {
+		t.Fatalf("append slices_integrated: %v", err)
 	}
 	w = postHostDispatch(t, s, child1.ID, child1Stage.ID, withHostDispatchOperator)
 	if w.Code != http.StatusOK {

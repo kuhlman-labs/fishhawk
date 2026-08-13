@@ -591,11 +591,17 @@ nothing.
   wave-order violation must never be reported as an integration wait, since
   waiting would never clear it). `base_branch` also rides the idempotent
   already-`dispatched` arm, because that caller re-spawns.
-- **Absent vs errored**, the same three-way partition the wave-order guard uses:
-  a non-fan-out run, an empty `depends_on`, an unresolvable parent plan, or an
-  UNCONFIGURED `AuditRepo` are ABSENT — admit with no `base_branch`, i.e.
-  byte-identical to pre-#2363 behaviour, so a deployment without an audit
-  repository is not wedged behind a 409 it can never clear. An undecodable
+- **Absent vs errored**, the same partition the wave-order guard uses: a
+  non-fan-out run, an empty `depends_on`, or an unresolvable parent plan are
+  ABSENT — admit with no `base_branch`, i.e. byte-identical to pre-#2363
+  behaviour. A DEPENDENT child (non-empty `depends_on`) with an UNCONFIGURED
+  `AuditRepo` is NOT absent — it REFUSES (fail-closed): with no audit repository
+  there is no integration record to prove its predecessors merged, and admitting
+  would spawn it onto an unproven base (the #1302 stale-base class the guard
+  exists to close). A wave-0 child with no dependencies still admits, so an
+  unconfigured deployment's INDEPENDENT dispatches are never wedged — only a
+  genuinely dependent child is refused, and in practice `AuditRepo` is always
+  configured (`serve.go`), so this is a test-posture fail-closed. An undecodable
   newest payload is ABSENT for the coverage question and therefore REFUSES
   (it must not admit on bytes the server could not read). An ERRORED read
   (plan load, audit list, sibling list) is `500 dependency_check_failed`,
@@ -613,8 +619,9 @@ nothing.
 
 Tests: `decomposition_dispatch_guard_test.go` (`TestResolveDependentChildBase_*`
 — one case per admit/refuse/degrade branch, including the unconfigured-audit
-degrade, the undecodable payload, the covered-but-empty-branch refusal and the
-cross-entry splice pin), `host_dispatch_test.go`
+refusal for a dependent child, the undecodable payload, the
+covered-but-empty-branch refusal and the cross-entry splice pin),
+`host_dispatch_test.go`
 (`TestHostDispatch_DependentChild_EndToEnd`, the two counterfactual controls
 `TestHostDispatch_RefusesDependentChildWhenWaveNotIntegrated` /
 `…WhenIntegrationIsStale` — each asserting error IDENTITY *and* reading the
