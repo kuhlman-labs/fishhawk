@@ -7167,12 +7167,14 @@ paths:
         `retry_stage` returning 422 and no audit entry written.
 
         It is the eager, event-driven complement to the off-by-default ~1h
-        dispatch watchdog, and mirrors that watchdog's contract exactly:
-        `run.FailStage` (category `C` is the retryable infrastructure class)
-        → append a `dispatch_reaper_failed` audit entry (actor `system`) →
-        `orchestrator.Advance`. After it lands the stage is `failed`
-        (category `C`), the audit trail names the reason, and `retry_stage`
-        is applicable.
+        dispatch watchdog: a reap-scoped compare-and-swap walk (category `C`
+        is the retryable infrastructure class) that refuses to re-anchor into
+        any live park → append a `dispatch_reaper_failed` audit entry (actor
+        `system`) → `orchestrator.Advance`. After it lands the stage is
+        `failed` (category `C`), the audit trail names the reason, and
+        `retry_stage` is applicable. Unlike `run.FailStage`, the reap path
+        will NOT collapse a park that lands mid-flight (#2630) and REQUIRES a
+        CAS-capable run repository rather than degrading to it (#2672).
 
         **Idempotent.** A report against an already-terminal stage (a
         double-report, or a race with the dispatch watchdog reaping the same
@@ -7275,8 +7277,14 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The run or audit repositories are not wired
-            (`reap_failure_unconfigured`).
+            A wiring fault. `reap_failure_unconfigured` — the run or audit
+            repositories are not wired. `reap_failure_repo_not_cas` — the run
+            repository does not implement the compare-and-swap capability the
+            reap path requires (#2672); the reap path refuses rather than
+            degrade to a fallback that could fail a live park, so nothing is
+            transitioned and no audit entry is written. Unreachable in a
+            correctly-wired daemon (the postgres repository has the
+            capability, and startup refuses a repository that lacks it).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

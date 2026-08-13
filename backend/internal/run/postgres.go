@@ -571,6 +571,14 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 	return r.transitionStage(ctx, id, to, completion, nil)
 }
 
+// Compile-time assertion that the concrete postgres repo carries the
+// StageCASTransitioner capability (#2672, in the #2518 shape). Removing or
+// renaming TransitionStageFrom now fails the BUILD rather than degrading a
+// caller at runtime: the reap path (backend/internal/server/reap_failure.go)
+// hard-REQUIRES this capability and REFUSES a repo that lacks it instead of
+// falling back to run.FailStage — a fallback that could destroy a live park.
+var _ StageCASTransitioner = (*postgresRepo)(nil)
+
 // TransitionStageFrom is the compare-and-swap sibling of TransitionStage
 // (StageCASTransitioner): it applies the move ONLY when the stage's
 // row-locked current state still equals `from`. Because the comparison

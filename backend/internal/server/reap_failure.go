@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,21 @@ import (
 // dispatchwatchdog.CategoryDispatchWatchdogElapsed precedent — a stable string
 // so log scrapers can index on it.
 const CategoryDispatchReaperFailed = "dispatch_reaper_failed"
+
+// errReapRepoNotCAS is the sentinel failStageForReap returns when the run
+// repository does NOT implement run.StageCASTransitioner (#2672). The reap path
+// hard-REQUIRES that capability: its only alternative, run.FailStage, re-anchors
+// its walk through whatever live state a concurrent advance produced and would
+// take the legal park → failed edge on the four non-children parks — exactly the
+// live-park destruction GUARD 2 exists to prevent. Rather than degrade to that
+// hazard, the reap path REFUSES loudly. handleReapStageFailure classifies this
+// sentinel BEFORE its post-transition re-load so a concurrent park cannot mask a
+// misconfiguration as the benign {transitioned:false} no-op. The condition is
+// unreachable in a deployed daemon: postgresRepo implements the capability (the
+// compile-time assertion in run/postgres.go guarantees it), and serve.go's boot
+// check (runRepoCASWiringError) refuses startup for any non-nil RunRepo lacking
+// it.
+var errReapRepoNotCAS = errors.New("reap path requires a run repository implementing run.StageCASTransitioner")
 
 // maxReapFailureBodyBytes caps the request body. The reap-failure report is a
 // handful of small fields (category, reason, detail, exit_code), so 32 KB is
@@ -261,6 +277,28 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// handled — but, UNLIKE run.FailStage, it refuses to re-anchor into any
 	// protected park that lands mid-transition (GUARD 2, #2630).
 	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason); err != nil {
+		// (d) WIRING FAULT — the run repository does not implement
+		// run.StageCASTransitioner (#2672). This is classified FIRST, ahead of
+		// the re-load below, and is load-bearing: the re-load's terminal-or-park
+		// check would otherwise report a misconfiguration as the benign
+		// {transitioned:false} 200 whenever a concurrent writer parked the stage,
+		// collapsing an uncertain configuration fault into a definite no-op
+		// answer. 503 matches the endpoint's existing wiring-fault class
+		// (reap_failure_unconfigured); the distinct CODE is what pins this arm. No
+		// audit entry and no orchestrator advance are written — the early return
+		// precedes both. Unreachable in a booted daemon (postgres has the
+		// capability and the boot check refuses a repo that does not).
+		if errors.Is(err, errReapRepoNotCAS) {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"reap-failure: run repository does not implement run.StageCASTransitioner",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("repo_type", fmt.Sprintf("%T", s.cfg.RunRepo)))
+			s.writeError(w, r, http.StatusServiceUnavailable, "reap_failure_repo_not_cas",
+				"reap-failure endpoint requires a run repository implementing run.StageCASTransitioner",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
 		// This branch fires for a NARROW, well-classified set, because
 		// failStageForReap's re-anchor loop ABSORBS every benign concurrent
 		// ADVANCE to another still-live, REAPABLE state (e.g. a dispatched →
@@ -392,13 +430,24 @@ const reapFailMaxAttempts = 4
 // the CAS itself observes it (Actual=park → reapReanchor refuses). Re-reading
 // here would instead make GUARD 1 redundant (a load-visible park would be caught
 // twice) and leave GUARD 1 unable to serve as an independent, counterfactual-able
-// guard. It falls back to run.FailStage when the repo lacks the CAS capability:
-// an in-memory fake that cannot race; production (postgresRepo) always takes the
-// CAS path.
+// guard.
+//
+// The walk no longer DEGRADES when the repo lacks the CAS capability. run.FailStage
+// (the former fallback) re-anchors through whatever live state a concurrent advance
+// produced and would take the legal park → failed edge on the four non-children
+// parks (awaiting_approval / awaiting_input / awaiting_scope_decision /
+// awaiting_host_dispatch) — i.e. exactly the live-park destruction GUARD 2 exists
+// to prevent. So a repo without run.StageCASTransitioner makes the reap FAIL LOUDLY
+// with errReapRepoNotCAS instead. run.FailStage is now UNREFERENCED from this file
+// (the reap path can no longer call it), so the dangerous re-anchor-into-a-live-park
+// edge no longer exists here rather than being merely unreached. The compile-time
+// assertion in run/postgres.go plus serve.go's boot check (runRepoCASWiringError)
+// make this refusal unreachable in a deployed daemon: production (postgresRepo)
+// always has the capability.
 func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string) (*run.Stage, error) {
 	cas, ok := repo.(run.StageCASTransitioner)
 	if !ok {
-		return run.FailStage(ctx, repo, stageID, cat, reason)
+		return nil, fmt.Errorf("%w (repo type %T)", errReapRepoNotCAS, repo)
 	}
 	return reapFailCAS(ctx, cas, stageID, from, cat, reason)
 }

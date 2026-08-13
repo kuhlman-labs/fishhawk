@@ -335,6 +335,23 @@ inference-configured but ALSO enables a `claudecode`/`codex` subprocess adapter 
 a spec-declared `reviewers.agents[i].provider = claudecode/codex`; fully locking a regional cell to
 region-pinned Anthropic only is a broader change than #2107.
 
+### The run repository refuses to boot without the reap-path CAS capability (#2672)
+
+`runRepoCASWiringError(cfg.RunRepo)` is a second **startup refusal**, called ONCE immediately before
+`server.New` — after every decorator has been applied to `cfg.RunRepo` — mirroring the #2107
+convention: the helper returns the error and the call site is the single distinctive point that logs
+it (`run repository wiring refused startup`) and returns `exitFailure`. A non-nil `RunRepo` that does
+NOT implement `run.StageCASTransitioner` refuses startup, because the reap-failure endpoint
+(`POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure`) HARD-REQUIRES that capability: rather than
+degrade to `run.FailStage` (which can fail a live park), the reap path refuses every report at runtime
+with `503 reap_failure_repo_not_cas`, so a daemon whose reap path is inert must not boot. The check is
+scoped to a **non-nil** repo: a database-less boot legitimately leaves `RunRepo` nil (the reap endpoint
+already answers `503 reap_failure_unconfigured`) and is unaffected. It is **inert for the postgres
+repository** — `postgresRepo` implements the capability (guaranteed by a compile-time assertion in
+`backend/internal/run/postgres.go`), so this refusal is unreachable in a real deployment; it exists as
+defence-in-depth so a future non-CAS `RunRepo` wiring fails at boot instead of silently at the first
+reap report.
+
 ## Work-management provider registration at startup (#1104)
 
 `workmgmt_wiring.go` — `registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)`, called from
