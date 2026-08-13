@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // deployTriggerGitHub is a minimal api.github.com stub for the deploy trigger:
@@ -26,6 +27,22 @@ type deployTriggerGitHub struct {
 	dispatchHits   int
 	dispatchInputs map[string]string
 	listBody       string
+	// httpHits counts EVERY request that reaches the stub server, matched
+	// route or not. dispatchHits alone cannot carry a "no outbound call was
+	// made" assertion: it increments only inside the workflow_dispatch route,
+	// so a request the mux does not match (a dispatch URL built from an empty
+	// workflow_ref carries an empty path segment) would leave it at 0 and the
+	// assertion would pass under the very guard deletion it exists to catch.
+	httpHits int
+}
+
+// hits reports how many requests reached the stub server. Read under the mutex
+// because the httptest handler runs on the server's own goroutine and the suite
+// runs under -race.
+func (g *deployTriggerGitHub) hits() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.httpHits
 }
 
 func newDeployTriggerGitHub(t *testing.T) (*deployTriggerGitHub, *githubclient.Client) {
@@ -53,7 +70,14 @@ func newDeployTriggerGitHub(t *testing.T) (*deployTriggerGitHub, *githubclient.C
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(body))
 		})
-	srv := httptest.NewServer(mux)
+	// Count every request that reaches the process, then delegate to the mux.
+	counting := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stub.mu.Lock()
+		stub.httpHits++
+		stub.mu.Unlock()
+		mux.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(counting)
 	t.Cleanup(srv.Close)
 	return stub, &githubclient.Client{
 		BaseURL: srv.URL,
@@ -186,8 +210,8 @@ func TestTriggerDeploy_Webhook_PostsAndParks(t *testing.T) {
 	}))
 	t.Cleanup(hook.Close)
 
-	spec := fmt.Sprintf(deploySpecWebhookFmt, hook.URL)
-	stage, _ := seedDispatchedDeploy(rr, spec, instID(99))
+	specYAML := fmt.Sprintf(deploySpecWebhookFmt, hook.URL)
+	stage, _ := seedDispatchedDeploy(rr, specYAML, instID(99))
 
 	got, err := s.triggerDeploy(context.Background(), stage)
 	if err != nil {
@@ -402,6 +426,139 @@ func TestResolveDeployDelegate_SecondDeployStage_UsesOwnWorkflowRef(t *testing.T
 	}
 	if firstDelegate.WorkflowRef != "deploy-staging.yml" {
 		t.Errorf("first delegate.WorkflowRef = %q, want %q", firstDelegate.WorkflowRef, "deploy-staging.yml")
+	}
+}
+
+// (9) github_actions with an EMPTY workflow_ref refuses BEFORE any outbound
+// call (deploy_trigger.go:135-138). The distinguishing property of this arm —
+// what separates it from the already-covered dispatch-error and non-2xx arms —
+// is that nothing leaves the process at all: the refusal is config validation,
+// not a network failure. The GitHub client IS wired, so the refusal is proven
+// to fire ahead of the nil-client not-wired posture rather than being masked
+// by it.
+//
+// Entry is at the unexported per-target method, not s.triggerDeploy: the
+// workflow-v1 schema declares delegate.workflow_ref required with minLength:1,
+// so a spec carrying an empty one fails spec.ParseBytes and the run diverts to
+// resolveDeployDelegate's already-covered spec-resolution refusal before this
+// guard is ever reached. TestDeployDelegate_EmptyRequiredField_RejectedBySpecParse
+// pins that claim.
+func TestTriggerDeployGitHubActions_MissingWorkflowRef_RefusesBeforeAnyDispatch(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, runRow := seedDispatchedDeploy(rr, deploySpecNoConstraints, instID(99))
+
+	// WorkflowRef left at its zero value BY CONSTRUCTION — the bad state is
+	// built here, never produced by calling the control under test.
+	got, err := s.triggerDeployGitHubActions(context.Background(), stage, runRow,
+		&spec.DelegateConfig{Target: spec.DelegateTargetGitHubActions})
+	if err != nil {
+		t.Fatalf("triggerDeployGitHubActions returned error (want a refusal, nil err): %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C", got.FailureCategory)
+	}
+	if n := countAppendedCategory(au, categoryDeploymentDispatchFailed); n != 1 {
+		t.Errorf("deployment_dispatch_failed entries = %d, want 1", n)
+	}
+	if n := countAppendedCategory(au, CategoryDeploymentDispatched); n != 0 {
+		t.Errorf("deployment_dispatched entries = %d, want 0 (nothing was dispatched)", n)
+	}
+	// Reason IDENTITY, not merely "a refusal happened": a sibling arm's refusal
+	// (nil client, no installation id, dispatch error) cannot satisfy this.
+	p := auditPayload(t, au, categoryDeploymentDispatchFailed)
+	const wantReason = "deploy trigger: github_actions delegate is missing workflow_ref"
+	if p["reason"] != wantReason {
+		t.Errorf("audit reason = %v, want %q", p["reason"], wantReason)
+	}
+	// LOAD-BEARING: no outbound call may be made at all.
+	if h := stub.hits(); h != 0 {
+		t.Errorf("stub server received %d request(s), want 0 — the missing-workflow_ref refusal must fire before any outbound call", h)
+	}
+}
+
+// (10) webhook with an EMPTY url refuses BEFORE any POST leaves the process
+// (deploy_trigger.go:220-223). Same distinguishing property as (9): a config
+// refusal, not a network failure — the webhook server is genuinely reachable
+// and a POST would land if one were made.
+func TestTriggerDeployWebhook_MissingURL_RefusesBeforeAnyPost(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	var hookMu sync.Mutex
+	hookHits := 0
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hookMu.Lock()
+		hookHits++
+		hookMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(hook.Close)
+	stage, runRow := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookFmt, hook.URL), instID(99))
+
+	// URL left at its zero value BY CONSTRUCTION.
+	got, err := s.triggerDeployWebhook(context.Background(), stage, runRow,
+		&spec.DelegateConfig{Target: spec.DelegateTargetWebhook})
+	if err != nil {
+		t.Fatalf("triggerDeployWebhook returned error (want a refusal, nil err): %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C", got.FailureCategory)
+	}
+	if n := countAppendedCategory(au, categoryDeploymentDispatchFailed); n != 1 {
+		t.Errorf("deployment_dispatch_failed entries = %d, want 1", n)
+	}
+	if n := countAppendedCategory(au, CategoryDeploymentDispatched); n != 0 {
+		t.Errorf("deployment_dispatched entries = %d, want 0 (nothing was POSTed)", n)
+	}
+	// Reason IDENTITY. This assertion is ALSO this arm's counterfactual
+	// vehicle: deleting the url guard does NOT redden the zero-requests
+	// assertion below, because a request built from an empty URL never leaves
+	// the process — it fails locally with a different reason.
+	p := auditPayload(t, au, categoryDeploymentDispatchFailed)
+	const wantReason = "deploy trigger: webhook delegate is missing url"
+	if p["reason"] != wantReason {
+		t.Errorf("audit reason = %v, want %q", p["reason"], wantReason)
+	}
+	// LOAD-BEARING: the reachable webhook server received nothing.
+	hookMu.Lock()
+	h := hookHits
+	hookMu.Unlock()
+	if h != 0 {
+		t.Errorf("webhook server received %d request(s), want 0 — the missing-url refusal must fire before any POST", h)
+	}
+}
+
+// TestDeployDelegate_EmptyRequiredField_RejectedBySpecParse pins WHY the two
+// refusal tests above enter at the unexported per-target methods rather than at
+// s.triggerDeploy: workflow-v1's delegate oneOf declares workflow_ref and url
+// required with minLength:1, so a spec carrying an empty one matches zero
+// branches and never parses. The two guards are defense-in-depth against a
+// DelegateConfig constructed in Go, not a path a parseable spec can reach — so
+// they are not dead code, and a spec-driven fixture could not reach them.
+func TestDeployDelegate_EmptyRequiredField_RejectedBySpecParse(t *testing.T) {
+	const emptyWorkflowRefSpec = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: ""
+`
+	if _, err := spec.ParseBytes([]byte(emptyWorkflowRefSpec)); err == nil {
+		t.Error("spec.ParseBytes accepted an empty workflow_ref; the guard IS reachable from a parseable spec — drive the refusal test end-to-end through triggerDeploy instead")
+	}
+	if _, err := spec.ParseBytes([]byte(fmt.Sprintf(deploySpecWebhookFmt, `""`))); err == nil {
+		t.Error("spec.ParseBytes accepted an empty url; the guard IS reachable from a parseable spec — drive the refusal test end-to-end through triggerDeploy instead")
 	}
 }
 
