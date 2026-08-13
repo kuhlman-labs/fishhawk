@@ -291,78 +291,148 @@ A clean run under fully delegated knobs goes `start_run` → `merged` with **no 
 
 Output: ordered `steps_taken[]` (each labeled mechanical vs delegated), the final run/stage state, `stopped_reason` (`merged` | `paged:<event>` | `decision_required:<state>` — where `<state>` includes `human_quorum_required` / `delegated_approval_no_progress` (server-side, #2381) and `delegated_act_no_progress` (driver-side no-progress bound) alongside `fixup_budget_exhausted` / `fixup_ceiling_reached` — | `timeout` | `stalled` | `stage_failed` | `unrecorded_act` | `host_dispatch_failed` | `run_failed` | `cancelled` | `gate_error` | `amendment_check_failed` | `dispatch_check_failed` | `dispatched_stale` | `context_cancelled`), and a `next_actions` pointer on a parked stop. **Every outcome is resumable** by re-invoking with the same `run_id`. Inputs: `{run_id, working_dir, github_repo, base_branch, runner_binary, max_minutes (clamped [1,240], default 60)}`. A **write** tool requiring `write:approvals`; local-only, requires the `fishhawk-runner` binary on the MCP host.
 
-## Parallel decomposed children (`fishhawk_run_children`, [#1144](https://github.com/kuhlman-labs/fishhawk/issues/1144))
+## Non-blocking decomposed fan-out (`fishhawk_run_children` + `fishhawk_await_children`, [#1144](https://github.com/kuhlman-labs/fishhawk/issues/1144), rewritten by [#2363](https://github.com/kuhlman-labs/fishhawk/issues/2363))
 
-`fishhawk_run_children` is the fan-out sibling of `fishhawk_run_stage`: where `run_stage` drives **one** stage of **one** run, `run_children` drives **all** of a decomposed parent's pending children **concurrently**. Pass the decomposed **parent's** `run_id`; the tool:
+`fishhawk_run_children` **dispatches** a decomposed parent's currently-dispatchable children **detached** and returns
+immediately. It does **not** await any child. `fishhawk_await_children` is the in-band wait that replaced the old
+blocking await-all.
 
-- **Discovers** the children from the parent's `plan_decomposed` audit entry (`child_run_ids` + `effective_max_parallel`); a run with no such entry is a clean error (it is not a decomposed parent).
-- **Partitions** by freshly-read state — only children awaiting a host spawn (`pending` or `awaiting_host_dispatch`, #1912) are spawned; in-flight (`dispatched`/`running`, a spawn attempt already exists) and terminal children are reported as-is, so a re-invocation is **idempotent**.
-- **Spawns** each pending child's implement stage as a `fishhawk-runner` subprocess (the same `spawnRunnerStage` process-group/SIGKILL core `run_stage` uses) with `--parallel-isolate` appended, so each child provisions its **own isolated per-child git worktree** (`run-<child>`) — concurrent siblings, which already own distinct per-slice sole-writer branches (E24.1), never race a shared checkout, and the operator's tracked tree stays untouched.
-- **Bounds** concurrency with an `errgroup` whose limit is the orchestrator-resolved effective cap, **clamp-DOWN-only** against an optional `max_parallel` override (it can lower an unlimited/looser cap, never raise it; `effective_max_parallel == 0` means unlimited and skips the limit).
-- **Awaits ALL with no sibling-cancel.** A child failure is **data**, not a tool error: every child is awaited and surfaces in `children[]` with its `exit_code`, `outcome`, and `stage_state` regardless of success.
+This is the whole point of #2363. The old verb held **one** MCP session and awaited every child, so a child that filed
+a mid-stage scope amendment could not have it decided in-band: its `?wait` long-poll expired **UNDECIDED** (the request
+stays pending server-side — an **expiry**, not a denial). The fix is structural, not a mitigation: the session is free
+the moment the dispatch returns, so the decision is possible **by construction**.
 
-Returns `children[]` (one entry per discovered child, in `plan_decomposed` order), `dispatched_count` (how many were pending and spawned), and `effective_cap` (the cap used; 0 = unlimited). Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
+Pass the decomposed **parent's** `run_id`; `run_children`:
 
-### Pending scope amendment surfacing ([#2095](https://github.com/kuhlman-labs/fishhawk/issues/2095) gap #1)
+- **Discovers** the children from the parent's `plan_decomposed` audit entry (`child_run_ids` +
+  `effective_max_parallel`); a run with no such entry is a clean error (it is not a decomposed parent).
+- **Partitions** by freshly-read implement-STAGE state — only children awaiting a host spawn (`pending` or
+  `awaiting_host_dispatch`, #1912) are dispatched; in-flight (`dispatched`/`running`) and terminal children are
+  reported as-is, so re-invocation is **idempotent**.
+- **Marks then spawns**, per child, in a **plain sequential loop** with no goroutines, no `errgroup`, no mutex and no
+  shared result map. That absence is load-bearing: the five rejected designs before this one all failed on the same
+  shape — a handler returning while its goroutines kept writing into the value it returned. Detaching the spawn
+  removes the shape rather than relocating it. `TestRunChildren_SourceHasNoConcurrencyShape` pins the deletion.
+- **Uses the SAME detached machinery `fishhawk_dispatch_stage` uses** (`spawnRunnerStageDetached`, ADR-037 / #1232),
+  which forks through the detached-runner registry — so `fishhawk_cancel_run`'s `terminateRunners` reaps these
+  children. That **subsumes [#2679](https://github.com/kuhlman-labs/fishhawk/issues/2679)**, which reports exactly the
+  missing capability; `TestRunChildren_RegistersChildrenForCancelReap` proves it with the real spawn rather than a
+  faked seam.
+- **Passes `--parallel-isolate`**, so each child provisions its **own isolated per-child git worktree**
+  (`run-<child>`) — concurrent siblings never race a shared checkout and the operator's tracked tree stays untouched.
 
-Because `run_children` holds **one** MCP session and **awaits every child**, a child that files a mid-stage scope amendment cannot have it decided **in-band** — the child's `?wait` long-poll times out and proceeds **as denied**, after which the child either **fails** (the #2095 primary incident) or ships an **inferior fallback** without the amendment. `run_children` observes the child's already-emitted `scope_amendment_pending` runner event (the same `{event, amendment_id, paths}` JSONL seam `run_stage` relays) **post-hoc** and surfaces it:
+Returns `children[]` (`{run_id, stage_id, dispatched, stage_state, log_path, warnings}`, in `plan_decomposed` order),
+`dispatched_count`, `effective_cap`, `resolved_working_dir`, and a `next_step` pointing at `fishhawk_await_children`.
+There is **no** `exit_code` and **no** terminal `outcome`: a detached child is still running when the call returns.
 
-- Each affected child carries `pending_amendments[]` (`amendment_id` + requested `paths`), and their run ids are listed in the top-level `pending_amendment_children`.
-- A **terminal-state-accurate** recovery warning is appended per child, because re-invoking `run_children` only re-runs children still in a **dispatchable** state (`pending`/`awaiting_host_dispatch`) and **skips terminal ones**:
-  - **Failed child:** `fishhawk_decide_scope_amendment` → `fishhawk_retry_stage` (return the failed implement stage to a dispatchable state) → then re-invoke `fishhawk_run_children` / `fishhawk_dispatch_stage`. Re-invoking `run_children` **alone is a no-op** for a failed child.
-  - **Succeeded child:** it already shipped **without** the amendment; a re-run will **not** reopen it. Decide the amendment, then bring the change in via `fishhawk_fixup_stage` (or review the child's PR).
-  - **Indeterminate child:** when the child's terminal outcome cannot be read from the runner stream (a spawn error, a cancellation, or a missing `runner_completed` event — an empty `outcome`), the guidance **hedges** rather than asserting FAILED: it names **both** the failed-path (`fishhawk_retry_stage`) and succeeded-path (`fishhawk_fixup_stage`) recovery and tells the operator to **inspect the child's `stage_state`** first. Emitting an unconditional `retry_stage` here would be incorrect if the stage were actually succeeded/running/dispatchable.
-- The scan surfaces the runner's **park event**, not the amendment's **current decision state**, so each warning is **hedged** ("appears to have timed out UNDECIDED") and points at `fishhawk_list_scope_amendments` to confirm — under the single-session blocking premise the long-poll times out with the request still pending (an expiry, not a denial), but a second operator session or an auto-approver could have decided it within the poll window, in which case the child already proceeded **with** the decision and no recovery is needed.
+### Server-side wave ordering, integration and re-base
 
-**Limitation (accepted, bounded).** This is **post-hoc** surfacing: it converts a silent timeout into an actionable signal but does **not** prevent the **first-attempt** timeout — the operator still cannot decide the amendment in-band while the blocking fan-out holds the session. True in-band decision needs an out-of-scope runner rearchitecture (detach children + server-side wave sequencing, or a runner-side park-in-progress mechanism); a follow-up tracks it.
+Three things the client loop used to own now live server-side:
 
-### Topological-wave dispatch (E24.X / [#1278](https://github.com/kuhlman-labs/fishhawk/issues/1278) slice B)
+- **Wave ORDER** is enforced by the host-dispatch marker's wave-order guard (E48.99 / #2546), which 409s
+  `dependency_not_satisfied`.
+- **Between-wave INTEGRATION** moves into the child-completion sweeper (`orchestrator.IntegrateCompletedWave`), so a
+  dependent wave's predecessors are merged with **no client alive**.
+- **The per-wave RE-BASE** is answered by the marker itself: it returns the `base_branch` a dependent child must spawn
+  against, and 409s `wave_not_integrated` when that child's predecessors have succeeded but are not yet merged.
+  `run_children` uses the marker's `base_branch` when non-empty and the `base_branch` input only as a fallback — the
+  client derives **nothing**.
 
-Decompositions whose `sub_plans` declare `depends_on` edges are dispatched in **topological waves** rather than one
-global fan-out.
+So a dependent wave's children simply become dispatchable on a **later** invocation. The `wave_not_integrated` arm is
+not a failure: it records the child `dispatched:false` with a warning naming the between-wave integration and pointing
+at `fishhawk_await_children`.
 
-- **`plan_decomposed` `waves`.** `orchestrator.go::fanoutIfDecomposed` computes `waves [][]int` via
-  `plan.Waves(decomposition)` (slice A, #1280 — a pure Kahn topological sort of the sub_plans' `depends_on` edges) and
-  threads it through `emitPlanDecomposed` into the `plan_decomposed` audit payload alongside
-  `child_run_ids`/`effective_max_parallel`. The waves carry SLICE INDICES that positionally index `child_run_ids`
-  (`child_run_ids[i]` is slice `i`). A should-be-impossible `Waves` error (the plan was already validated in slice A)
-  falls back to a single all-indices wave (`singleAllIndicesWave`) with a WARN. `waves` is additive: the audit map
-  always carries it, and the MCP `PlanDecomposed.Waves` mirror decodes it `omitempty` (nil → single wave).
-- **Non-settling per-wave fan-in.** `backend/internal/server/consolidate.go::handleIntegrateWave`
-  (`POST /v0/runs/{run_id}/integrate-wave`; client method `apiClient.IntegrateWave`) reuses the EXACT same exported
-  `IntegrateSlices` primitive `/consolidate` uses (no new git-merge code) to merge the slices SUCCEEDED SO FAR onto the
-  consolidated branch — but, UNLIKE `/consolidate`, it does NOT require all children terminal, does NOT transition the
-  parent stage, and does NOT advance/open the PR (the parent stage is identical before/after on BOTH the `integrated`
-  and `slice_conflict` outcomes; the terminal fan-in stays `/consolidate`'s job after the last wave). It shares
-  `/consolidate`'s auth + decomposed-parent precondition posture (`agent_token_forbidden`/`insufficient_scope` 403,
-  `not_a_decomposed_parent` 400, `slice_integration_error` 502) minus the terminal-children gates.
-- **`run_children` wave loop.** `run_children.go` replaces the single global errgroup with an ordered per-wave loop:
-  each wave's pending children dispatch concurrently under the cap against `currentBase` (passed as both
-  `--base-branch` and `--check-base-ref`, so wave N cuts from the prior wave's merged tree), then between waves it
-  calls `IntegrateWave` and re-bases the next wave on the returned `consolidated_branch`. A nil/empty `waves` (an old
-  entry, or a no-`depends_on` decomposition) collapses to a single all-indices wave dispatched against `main` and
-  NEVER calls integrate-wave — byte-for-byte the pre-#1278 behavior.
-- **Guards** (each surfaced as a warning; the loop stops): a dispatched wave-N child that did not succeed (no
-  partial-wave integration), a `slice_conflict` or transport error from integrate-wave, and an empty
-  `consolidated_branch` (the GitHub-not-wired graceful skip — `currentBase` is kept unchanged rather than dispatching
-  against an empty ref). A waves index out of range is a loud tool error.
-- **Loud zero-dispatch guard** ([#1980](https://github.com/kuhlman-labs/fishhawk/issues/1980)): `dispatched_count == 0`
-  with one or more children whose implement stage reads `dispatched` is the legacy pre-#1980 park signature (a
-  decomposed child of a locked-local parent flipped to `dispatched` with no runner ever spawned). Rather than return a
-  SILENT zero-dispatch success, `run_children` appends a top-level warning naming each stuck child and pointing at
-  per-child `fishhawk_dispatch_stage` run **SEQUENTIALLY** (concurrent manual dispatches share the parent lineage
-  worktree and race the lineage lock, run 780f1bb6). It stays a warning, not a tool error: a concurrent
-  `run_children`/`drive_run` invocation can legitimately own the in-flight children, and the tool has no host-process
-  view for children it did not spawn.
-- **Wave-integrity guard** ([#1980](https://github.com/kuhlman-labs/fishhawk/issues/1980)): before integrating a wave
-  and dispatching the DEPENDENT next wave, every NON-attempted child of the current wave must be terminal-`succeeded`.
-  The partial-wave guard above only inspects children ATTEMPTED this call, so a wave whose children were all
-  partitioned out as in-flight (e.g. legacy `dispatched` park children) passed it vacuously — then integrate-wave ran
-  against nothing (the bogus empty-consolidated-branch warning) and the next wave dispatched against a base missing its
-  predecessors. A non-attempted child that is not `succeeded` now STOPS the loop loudly (naming each blocker, with the
-  sequential `fishhawk_dispatch_stage` pointer for a `dispatched` one) before integrate-wave. Idempotent
-  re-invocation is preserved: a wave whose non-attempted children are all terminal-`succeeded` still integrates and
-  dispatches the next wave.
+### `effective_cap` is a per-invocation dispatch budget — and nothing more
+
+`effective_cap` bounds how many children **this call** spawns, computed against a **point-in-time snapshot** of the
+children whose implement stage reads `dispatched`/`running` during this invocation's partition (0 means unlimited).
+
+It does **NOT** bound the number of live detached runners for the parent. Two concurrent invocations can each snapshot
+the same in-flight count and each spend a full budget against it: the per-stage host-dispatch CAS prevents them
+double-spawning the **same** child, but the loser simply proceeds to a different one. Bounding live runners would need
+a server-side reservation the host-dispatch marker does not offer. Children left undispatched by the budget are named
+in a warning; re-invoke once slots free.
+
+### The spawn-error compensation, and its disclosed residual strand
+
+The host-dispatch CAS commits **before** the spawn (the #1912 fail-closed ordering), so between the CAS and a
+successful spawn the stage is `dispatched`. A failed spawn has **no reaper at all** — the reaper goroutine starts only
+after the registry registration succeeds — so left uncompensated the stage sits `dispatched` forever, every later
+invocation reads `transitioned:false` and treats it as already-dispatched, and the child can never be retried. That is
+the permanent-strand class [#2630](https://github.com/kuhlman-labs/fishhawk/issues/2630) exists to remove.
+
+- **A cancel-refused spawn is NOT compensated.** `errRunCancelledBeforeSpawn` means a cancel for this run already
+  landed and the registry refused the fork; failing the stage would relabel a cancelled run as failed, and the cancel
+  path owns the run's terminal state.
+- **Any other spawn error is reported as a category-C stage failure** through the same `POST
+  /v0/runs/{run_id}/stages/{stage_id}/reap-failure` closure the reaper would have used. This is authorized by
+  construction: the reap handler's `reapProtectedParkStates` is a **closed allow-list of five PARK states** it must
+  never collapse, and `dispatched` is deliberately **not** among them — the reaper's authority is exactly
+  `{dispatched, running}`. The stage lands `failed`/category-C, which `fishhawk_retry_stage` recovers (for a local run
+  it parks the stage back at `awaiting_host_dispatch`, which `run_children` admits), so a subsequent `run_children`
+  re-spawns the child.
+- **DISCLOSED RESIDUAL: if the report ITSELF fails, the child is STRANDED** in `dispatched` with no runner and no
+  reaper. `fishhawk_retry_stage` does **not** clear it — `run.RetryStage` admits only a stage already in state
+  `failed`, and refuses anything else `ErrRetryNotApplicable`. The verb that actually clears it is the reap-failure
+  REST endpoint the compensation just failed to reach: `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` with
+  `{"category":"C","reason":"runner_spawn_failed"}`, after which `fishhawk_retry_stage` becomes applicable. There is no
+  MCP verb for the reap, which is why the second warning names the endpoint literally. This is a disclosed residual,
+  not a claimed recovery; `TestRunChildren_FailedCompensationDisclosesStrand` pins the honest behaviour.
+
+**Pre-existing, unfixed, and stated plainly:** `fishhawk_dispatch_stage` has the SAME uncompensated shape today — it
+marks the host dispatch, spawns, and returns a spawn error bare, leaving the single stage `dispatched` with no runner.
+This change does not fix it (that would expand past the founder's decision for #2363); the operator files it
+separately.
+
+### The in-band wait (`fishhawk_await_children`)
+
+`fishhawk_await_children` is **read-only**: it polls server state, spawns nothing, cancels nothing, holds no handle.
+Because it owns no result, a return can never race a write. Every release condition is an **ABSOLUTE property of the
+current snapshot**, evaluated on **every poll including the first** — there is no baseline and no transition
+detection anywhere in the verb. A transition-keyed release could neither fire before the integration it waits for, nor
+(when the interesting change already happened before the call) ever fire at all.
+
+| Status | Releases when | `next_step` |
+|---|---|---|
+| `amendment_pending` | some child has a pending mid-stage scope amendment (the strict [#2588](https://github.com/kuhlman-labs/fishhawk/issues/2588) predicate, reused verbatim per child) | `fishhawk_decide_scope_amendment`, pre-filled |
+| `children_dispatchable` | some child's implement stage awaits a host dispatch **and** its dependency slices are COVERED per the shared `wavecoverage.Covered` predicate | `fishhawk_run_children` |
+| `children_settled` | every child reached a terminal run state | `fishhawk_consolidate_slices` |
+| `timeout` | none of the above within the window (resumable; the wait holds no server state) | — |
+
+`children_dispatchable` keys on **coverage**, not on `blocked`. Predecessor run state flips to `succeeded` **before**
+the between-wave integration runs, so a `blocked`-keyed release would announce a dispatch the server then refuses 409
+`wave_not_integrated`. The predicate is the ONE shared `backend/internal/wavecoverage` function the sweeper's
+short-circuit and the host-dispatch marker's admission also use — a duplicated reconstruction is the drift class this
+repo already names as load-bearing.
+
+### Concurrent child amendments are SERIAL BY CONTRACT
+
+Several children can have open amendment windows at once, and `await_children` surfaces exactly **one** amendment per
+release. The selection is **deterministic**, not implementation-defined:
+
+- children are examined in **ascending slice index**, ties broken by run id so the order is total and stable;
+- within a child, the **oldest** pending request wins — the endpoint returns items oldest-first, so that is the one
+  closest to expiring.
+
+The loop is: await releases on one amendment → decide it → re-invoke await, which releases on the next pending one →
+repeat until it releases `children_dispatchable` or `children_settled`. Because every child's window runs concurrently
+while the session is free, serial decisions still land inside their individual windows — which is exactly the property
+this change exists to create. `TestAwaitChildren_TwoPendingAmendments_DeterministicSelectionAndReArm` pins it.
+
+### What an expired amendment window actually means ([#2601](https://github.com/kuhlman-labs/fishhawk/issues/2601))
+
+A child whose amendment window elapses with no decision is **UNDECIDED**, not denied.
+This document previously claimed the child "proceeds as denied" and ships an inferior fallback; both are retired wording and were **wrong** (#2601).
+What actually happens: the request **stays pending** server-side, the runner emits `scope_amendment_undecided`, the
+verify-fix reinvoke is **withheld**, **nothing is reverted**, and the agent's only permitted branches are (a) adapt
+within the ORIGINAL scope with disclosure, or (b) stop and fail loud. A late decision is still honored on a
+`fishhawk_retry_stage` of the same stage.
+
+The **post-hoc** amendment surfacing this document previously described (`pending_amendments[]`,
+`pending_amendment_children`, and the three terminal-state-accurate recovery warnings) has been **removed** along with
+its code: it existed to mitigate a timeout that no longer occurs on this path, and it scanned an event stream a
+detached child does not return.
+
 
 ### Decomposed-parent observability (`children_status`, [#1147](https://github.com/kuhlman-labs/fishhawk/issues/1147))
 

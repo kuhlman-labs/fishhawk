@@ -246,6 +246,22 @@ type fakeBackend struct {
 	hostDispatchErrBody    string
 	hostDispatchForceNoop  bool
 	hostDispatchCalledByID map[uuid.UUID]int
+	// E50.13 / #2363 fixtures. hostDispatchBaseBranch is echoed on the 200 body
+	// as base_branch (the per-wave re-base the SERVER is authoritative for).
+	// reapFailureByStage records every POST
+	// /v0/runs/{run_id}/stages/{stage_id}/reap-failure body per stage id — the
+	// spawn-error compensation's channel — and, on a 200, flips the seeded stage
+	// to "failed" so a committed-state read can tell a fired compensation from a
+	// stranded 'dispatched'. reapFailureStatus (0 -> 200) drives the
+	// report-itself-fails branch.
+	hostDispatchBaseBranch string
+	reapFailureByStage     map[uuid.UUID][]reapFailureRequest
+	reapFailureStatus      int
+	// decideFlipsListStatus makes the amendment decision POST also update the
+	// matching row in amendmentsByRun, so a modelled child polling
+	// ListScopeAmendments observes the decision land. Opt-in: the existing
+	// decision tests assert on decideAmendmentResp and must stay unchanged.
+	decideFlipsListStatus bool
 
 	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
 	// fixupBody captures the last decoded request body so tests can
@@ -519,6 +535,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryCalledByID:               map[uuid.UUID]int{},
 		admissionCalledByID:           map[uuid.UUID]int{},
 		hostDispatchCalledByID:        map[uuid.UUID]int{},
+		reapFailureByStage:            map[uuid.UUID][]reapFailureRequest{},
 		fixupResp:                     map[uuid.UUID]Stage{},
 		fixupStatus:                   http.StatusOK,
 		fixupCalledByID:               map[uuid.UUID]int{},
@@ -718,6 +735,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.hostDispatchStatus
 		errBody := fb.hostDispatchErrBody
 		forceNoop := fb.hostDispatchForceNoop
+		baseBranch := fb.hostDispatchBaseBranch
 		// Model the CAS marker: flip a seeded pending|awaiting_host_dispatch stage
 		// to dispatched (transitioned:true); an already-dispatched stage is the
 		// idempotent no-op (transitioned:false). The resulting state is echoed back.
@@ -755,7 +773,39 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			}
 			return
 		}
-		_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: transitioned, StageState: state})
+		_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: transitioned, StageState: state, BaseBranch: baseBranch})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body reapFailureRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		status := fb.reapFailureStatus
+		if status == 0 || status == http.StatusOK {
+			fb.reapFailureByStage[id] = append(fb.reapFailureByStage[id], body)
+			// Model the reaper's authority over {dispatched, running}: the stage
+			// lands 'failed' so a committed-state read tells a fired compensation
+			// from a stranded 'dispatched'.
+			for _, stages := range fb.stagesByRun {
+				for i := range stages {
+					if stages[i].ID == id.String() {
+						stages[i].State = "failed"
+					}
+				}
+			}
+		}
+		fb.mu.Unlock()
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"reap-failure boom"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -935,6 +985,20 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.decideAmendmentState
 		errBody := fb.decideAmendmentErr
 		resp, ok := fb.decideAmendmentResp[amendmentID]
+		if fb.decideFlipsListStatus && (status == 0 || status == http.StatusOK) && errBody == "" {
+			decided := "approved"
+			if body.Decision == "deny" {
+				decided = "denied"
+			}
+			for rid := range fb.amendmentsByRun {
+				items := fb.amendmentsByRun[rid]
+				for i := range items {
+					if items[i].ID == amendmentID.String() {
+						items[i].Status = decided
+					}
+				}
+			}
+		}
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
@@ -2788,7 +2852,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E25.20 (#2355) adds exactly ONE tool — fishhawk_cancel_campaign, the
 	// operator clean-shutdown of an abandoned/rebuilt campaign that marks it and
 	// its unfinished items cancelled — taking the total 47 -> 48.
-	const wantToolCount = 48
+	const wantToolCount = 49
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

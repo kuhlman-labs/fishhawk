@@ -332,3 +332,29 @@ func TestToolDescriptionsRenderWindowConstant(t *testing.T) {
 		}
 	}
 }
+
+// TestStaleAmendmentWording_MatchesBareAsDenied pins the tightened tripwire
+// (E50.13 / #2363). The bare "as denied" literal is neither a substring of
+// "as if denied" nor of "proceed-as-denied", which is exactly why
+// backend/internal/mcpserver/README.md's "proceeds as denied" sentence survived
+// #2601 and #2617 untouched.
+func TestStaleAmendmentWording_MatchesBareAsDenied(t *testing.T) {
+	// The historical README:282 sentence, verbatim in shape.
+	const stale = "the child proceeds as denied and ships an inferior fallback"
+	got := staleAmendmentWordingFindings(stale)
+	if len(got) != 1 || got[0] != findingProceedAsDenied {
+		t.Fatalf("findings for the bare 'as denied' line = %v, want [%s]", got, findingProceedAsDenied)
+	}
+	// The NEGATIVE pair: a deliberate #2601-citing historical correction record
+	// carrying the same literal stays exempt.
+	const historical = "this doc previously said the child proceeds as denied; that was wrong (#2601)"
+	if got := staleAmendmentWordingFindings(historical); got != nil {
+		t.Errorf("findings for a #2601 historical citation = %v, want none", got)
+	}
+	// And a bare #2601 reference with NO historical marker is still a finding,
+	// so the exemption stays narrow.
+	const citedButBare = "the child proceeds as denied (#2601)"
+	if got := staleAmendmentWordingFindings(citedButBare); len(got) == 0 {
+		t.Error("a #2601 citation with no historical marker must still be a finding")
+	}
+}

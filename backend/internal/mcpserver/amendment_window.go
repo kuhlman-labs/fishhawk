@@ -104,7 +104,12 @@ func staleAmendmentWordingFindings(line string) []string {
 	}
 	lower := strings.ToLower(line)
 	var findings []string
-	if strings.Contains(lower, "as if denied") || strings.Contains(lower, "proceed-as-denied") {
+	// The BARE "as denied" literal is a third disjunct, not a substring of the
+	// other two: "as if denied" does not contain "as denied" and vice versa. Its
+	// absence is what let backend/internal/mcpserver/README.md keep a
+	// "proceeds as denied" sentence through #2601 and #2617 (E50.13 / #2363).
+	if strings.Contains(lower, "as if denied") || strings.Contains(lower, "proceed-as-denied") ||
+		strings.Contains(lower, "as denied") {
 		findings = append(findings, findingProceedAsDenied)
 	}
 	if staleAmendmentFigureRE.MatchString(line) {
