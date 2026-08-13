@@ -481,7 +481,11 @@ func TestNewStageOrchestrator_ThreadsExternalURL(t *testing.T) {
 // must carry a non-nil Dispatch backstop (the childCompletionAdvancer
 // adapter), so the fail-closed concurrent-dispatch top-up can't be
 // silently omitted. Advance + Integrate are asserted alongside so the
-// extraction can't regress the pre-existing wiring either.
+// extraction can't regress the pre-existing wiring either, and WaveIntegrate
+// (#2363) is asserted for the same reason the Dispatch assertion exists: the
+// between-wave fan-in is injected directly by every behavioral test, so an
+// unwired adapter here would leave a real deployment never integrating at a
+// wave boundary while the sweeper tests stayed green.
 func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
 	sw := newChildCompletionSweeper(server.Config{}, slog.Default(), time.Minute)
 	if sw == nil {
@@ -495,6 +499,9 @@ func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
 	}
 	if sw.Integrate == nil {
 		t.Error("sweeper Integrate adapter is nil")
+	}
+	if sw.WaveIntegrate == nil {
+		t.Error("sweeper WaveIntegrate is nil; a dependent wave would never be integrated between waves (#2363)")
 	}
 }
 

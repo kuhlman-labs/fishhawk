@@ -59,6 +59,23 @@ type Integrator interface {
 	IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*SliceConflict, error)
 }
 
+// WaveIntegrator is the slice of orchestrator.Orchestrator the sweeper calls
+// for the BETWEEN-WAVE fan-in (#2363): while a decomposed parent's children are
+// NOT all terminal, it merges the already-succeeded slice branches onto the
+// consolidated branch so a dependent wave's children can spawn against a base
+// carrying their predecessors' commits. Before this, that re-base was the
+// blocking run_children driver's job, so a fan-out with no client alive never
+// advanced past a wave boundary.
+//
+// It reports (integrated, conflict, err): integrated=true means a merge pass
+// ran cleanly, a non-nil conflict means a slice failed to merge, and
+// (false, nil, nil) means no integration was needed. It NEVER settles the
+// parent. Extracted as an interface for the same import-graph reason as
+// Advancer/Integrator — childcompletion never imports orchestrator.
+type WaveIntegrator interface {
+	IntegrateCompletedWave(ctx context.Context, parentRunID uuid.UUID) (bool, *SliceConflict, error)
+}
+
 // ChildDispatcher is the slice of orchestrator.Orchestrator the sweeper
 // calls as the fail-closed backstop for decomposed-child dispatch (E24.3
 // / #1143): when a parent's children are not all terminal, it re-tops-up
@@ -90,6 +107,16 @@ type Sweeper struct {
 	// dev posture and existing tests.
 	Integrate Integrator
 
+	// WaveIntegrate is the between-wave fan-in (#2363): on a tick where the
+	// parent's children are NOT all terminal, the sweeper merges the
+	// already-succeeded slices onto the consolidated branch so a dependent
+	// wave becomes spawnable with no client alive. It runs IMMEDIATELY BEFORE
+	// the Dispatch backstop below, so a newly-unblocked child is only ever
+	// re-topped-up after its predecessors are merged. Nil-safe: a nil
+	// WaveIntegrate disables between-wave integration entirely, preserving the
+	// pre-#2363 posture for dev and existing tests.
+	WaveIntegrate WaveIntegrator
+
 	// Dispatch is the fail-closed backstop for concurrent decomposed-child
 	// dispatch (E24.3 / #1143): when a parent's children are not all
 	// terminal, the sweeper re-tops-up the dispatch to the resolved cap so
@@ -110,7 +137,23 @@ type Sweeper struct {
 	// restart resets the count, which is acceptable — it retries
 	// maxIntegrationAttempts more times then gives up again, still bounding
 	// steady-state log spam.
+	//
+	// The BETWEEN-WAVE path (#2363) shares this counter for log-spam bounding
+	// but NOT its give-up transition. Sharing is deliberate — consecutive
+	// integration errors are the same phenomenon whichever path observed them
+	// — and has one observable consequence worth stating: a parent that
+	// accumulated failing between-wave attempts reaches the all-terminal
+	// path's give-up sooner. That is the correct direction (the integration
+	// has been failing all along) but it is a real coupling, not an accident.
 	integrationErrs map[uuid.UUID]int
+	// waveConflicts remembers the last between-wave slice conflict EMITTED per
+	// parent, keyed by conflicting slice + child run id. The coverage
+	// predicate never becomes true while a wave stays blocked, so without this
+	// the sweeper would append an identical slice_integration_conflict entry
+	// every tick, forever — an unbounded audit stream is its own
+	// operator-facing defect. A DISTINCT conflict still emits; a clean
+	// integration clears the key so a recurrence after a fix emits again.
+	waveConflicts map[uuid.UUID]string
 }
 
 // maxIntegrationAttempts bounds how many CONSECUTIVE non-conflict
@@ -217,6 +260,15 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		}
 	}
 	if !allTerminal {
+		// Between-wave fan-in (#2363), BEFORE the dispatch backstop: merge the
+		// already-succeeded slices so a dependent wave's children spawn against
+		// a base carrying their predecessors' commits. Ordering is
+		// load-bearing — topping the dispatch up first would hand a
+		// newly-unblocked child to a host-dispatch that refuses it 409
+		// wave_not_integrated. Never settles the parent; see
+		// integrateCompletedWave for the exhaustive failure posture.
+		s.integrateCompletedWave(ctx, parentRunID, parentStage.ID)
+
 		// Fail-closed backstop (E24.3 / #1143): the parent stays parked
 		// (some child is still in flight), but a slot may be free — re-top
 		// the concurrent dispatch to the resolved cap so a parent whose
@@ -364,6 +416,93 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		slog.Int("child_count", len(children)),
 	)
 	return nil
+}
+
+// integrateCompletedWave runs the between-wave fan-in for a parent whose
+// children are NOT all terminal (#2363). Its failure posture is stated
+// exhaustively because it runs on a parent MID-FAN-OUT that it must never
+// settle:
+//
+//   - a nil WaveIntegrate is a total no-op (pre-#2363 posture);
+//   - an ERROR is WARN-logged and swallowed — the parent stays parked and the
+//     next tick re-enters, because merges are idempotent. It increments the
+//     EXISTING per-parent consecutive-error counter for log-spam bounding but
+//     deliberately NOT its give-up transition: the all-terminal path already
+//     owns failing the parent on integration failure, and doing it here too
+//     would race that path and fail a parent whose fan-out is still running;
+//   - a CONFLICT is WARN-logged and emits slice_integration_conflict (so
+//     next_actions and children_status surface it through the existing
+//     slice_integration_conflict arm) but does NOT transition the parent. The
+//     dependent child then stays refused at the host-dispatch 409 rather than
+//     spawning on a base missing its predecessors. Emission is deduped per
+//     DISTINCT conflict — the coverage predicate stays false for as long as the
+//     wave is blocked, so an undeduped emit would append an identical entry
+//     every tick forever.
+func (s *Sweeper) integrateCompletedWave(ctx context.Context, parentRunID, parentStageID uuid.UUID) {
+	if s.WaveIntegrate == nil {
+		return
+	}
+	integrated, conflict, err := s.WaveIntegrate.IntegrateCompletedWave(ctx, parentRunID)
+	switch {
+	case err != nil:
+		attempts := s.recordIntegrationError(parentRunID)
+		level := slog.LevelWarn
+		if attempts > maxIntegrationAttempts {
+			// Bounded spam: past the cap the same error drops to debug rather
+			// than emitting a WARN every tick for the life of the fan-out.
+			level = slog.LevelDebug
+		}
+		s.logger().LogAttrs(ctx, level, "childcompletion: between-wave slice integration error; parent parked, will retry",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("parent_stage_id", parentStageID.String()),
+			slog.Int("attempt", attempts),
+			slog.String("error", err.Error()),
+		)
+	case conflict != nil:
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: between-wave slice integration conflict; dependent wave stays blocked",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("parent_stage_id", parentStageID.String()),
+			slog.String("conflicting_child_run_id", conflict.ChildRunID.String()),
+			slog.Int("conflicting_slice_index", conflict.SliceIndex),
+		)
+		if s.recordWaveConflict(parentRunID, conflict) {
+			s.emitSliceIntegrationConflict(ctx, parentRunID, parentStageID, conflict)
+		}
+	case integrated:
+		s.clearIntegrationError(parentRunID)
+		s.clearWaveConflict(parentRunID)
+		s.logger().LogAttrs(ctx, slog.LevelInfo, "childcompletion: integrated a completed wave mid-fan-out",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("parent_stage_id", parentStageID.String()),
+		)
+	}
+}
+
+// recordWaveConflict reports whether this between-wave conflict is NEW for the
+// parent — i.e. whether slice_integration_conflict should be emitted for it —
+// and remembers it either way. A repeat of the same (slice, child) conflict
+// returns false so the tick loop cannot append an unbounded stream of identical
+// audit entries while the wave stays blocked.
+func (s *Sweeper) recordWaveConflict(parentRunID uuid.UUID, conflict *SliceConflict) bool {
+	key := fmt.Sprintf("%d/%s", conflict.SliceIndex, conflict.ChildRunID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waveConflicts == nil {
+		s.waveConflicts = make(map[uuid.UUID]string)
+	}
+	if s.waveConflicts[parentRunID] == key {
+		return false
+	}
+	s.waveConflicts[parentRunID] = key
+	return true
+}
+
+// clearWaveConflict forgets the parent's last emitted between-wave conflict so a
+// recurrence after a clean integration is surfaced again.
+func (s *Sweeper) clearWaveConflict(parentRunID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.waveConflicts, parentRunID)
 }
 
 // failedChildrenAllRecoverable reports whether every failed child run's

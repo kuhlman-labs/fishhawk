@@ -1510,3 +1510,369 @@ func TestDecomposedPlanShape(t *testing.T) {
 		t.Fatalf("decomposition not parsed correctly: %+v", p.Decomposition)
 	}
 }
+
+// --- Between-wave fan-in (#2363) -------------------------------------------
+
+// undecomposedPlanBytes is decomposedPlanBytes without the decomposition block:
+// a valid standard_v1 plan whose Decomposition parses nil, for the
+// absent-input degrade table.
+func undecomposedPlanBytes(t *testing.T) []byte {
+	t.Helper()
+	b := decomposedPlanBytes(t, []string{"A"})
+	var body map[string]any
+	if err := json.Unmarshal(b, &body); err != nil {
+		t.Fatalf("unmarshal plan: %v", err)
+	}
+	delete(body, "decomposition")
+	out, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return out
+}
+
+// waveFixture is the ordinary wave-boundary situation IntegrateCompletedWave
+// exists for: a decomposed parent parked in awaiting_children whose approved
+// plan declares slice 1 depending on slice 0, with slice 0's child SUCCEEDED and
+// slice 1's child still in flight.
+type waveFixture struct {
+	o        *Orchestrator
+	rs       *fanoutRunsRepo
+	gh       *stubGitHub
+	au       *recordingAudit
+	parent   *run.Run
+	children []*run.Run
+}
+
+// newWaveFixture seeds that fixture. specs drives the plan's sub_plans;
+// childStates gives each slice's child run state positionally (index == slice).
+func newWaveFixture(t *testing.T, specs []subPlanSpec, childStates []run.State) *waveFixture {
+	t.Helper()
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(77), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		stages[0].ID: {{
+			ID:            uuid.New(),
+			StageID:       stages[0].ID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &schemaV,
+			Content:       decomposedPlanBytesWithDeps(t, specs),
+			CreatedAt:     time.Now().UTC(),
+		}},
+	}}
+	au := &recordingAudit{}
+	gh := &stubGitHub{branchSHAs: map[string]string{"main": "basesha"}}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Logger: slog.Default(), Artifacts: arts, Audit: au, DefaultRef: "main"}
+
+	children := make([]*run.Run, 0, len(childStates))
+	for i, st := range childStates {
+		c, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(77), nil)
+		pid := parent.ID
+		c.DecomposedFrom = &pid
+		c.State = st
+		idx := i
+		c.SliceIndex = &idx
+		children = append(children, c)
+	}
+	return &waveFixture{o: o, rs: rs, gh: gh, au: au, parent: parent, children: children}
+}
+
+func (f *waveFixture) mergeCount() int {
+	f.gh.mu.Lock()
+	defer f.gh.mu.Unlock()
+	return len(f.gh.mergeCalls)
+}
+
+// TestIntegrateCompletedWave_IntegratesUnblockedDependent covers the core mode:
+// an unblocked dependent whose dependencies are NOT yet covered triggers exactly
+// one IntegrateSlices pass, merging slice 0 onto the consolidated branch while
+// slice 1 is still in flight.
+func TestIntegrateCompletedWave_IntegratesUnblockedDependent(t *testing.T) {
+	f := newWaveFixture(t,
+		[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+		[]run.State{run.StateSucceeded, run.StatePending})
+
+	integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateCompletedWave: %v", err)
+	}
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil", conflict)
+	}
+	if !integrated {
+		t.Error("integrated = false, want true (slice 0 succeeded and slice 1 depends on it)")
+	}
+	if got := f.mergeCount(); got != 1 {
+		t.Fatalf("MergeBranch calls = %d, want 1 (only the succeeded slice merges)", got)
+	}
+	f.gh.mu.Lock()
+	defer f.gh.mu.Unlock()
+	if want := sliceBranch(f.parent.ID, 0); f.gh.mergeCalls[0].Head != want {
+		t.Errorf("merged head = %q, want %q", f.gh.mergeCalls[0].Head, want)
+	}
+	if want := consolidatedBranch(f.parent.ID); f.gh.mergeCalls[0].Base != want {
+		t.Errorf("merged base = %q, want %q", f.gh.mergeCalls[0].Base, want)
+	}
+}
+
+// TestIntegrateCompletedWave_ShortCircuitsOnceCovered is the steady-state
+// short-circuit (the reviewer's re-merge-every-tick concern), asserted across
+// TWO consecutive calls: the SECOND call must attempt nothing.
+//
+// The coverage set it reads is NOT hand-written. The first call runs the real
+// integrateSlices, whose real emitSlicesIntegrated writes the real
+// slices_integrated payload into the recording audit — so the key the decoder
+// reads (child_run_ids) is the key the emitter actually wrote. A rename on
+// either side reddens here rather than staying green against a hand-authored
+// fixture (binding condition 3, the #2660 wire-fixture lesson applied to this
+// decode).
+func TestIntegrateCompletedWave_ShortCircuitsOnceCovered(t *testing.T) {
+	f := newWaveFixture(t,
+		[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+		[]run.State{run.StateSucceeded, run.StatePending})
+	ctx := context.Background()
+
+	if integrated, _, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID); err != nil || !integrated {
+		t.Fatalf("first call: integrated=%v err=%v, want true/nil", integrated, err)
+	}
+	afterFirst := f.mergeCount()
+
+	// Prove the coverage set really came off the emitter, not from a
+	// hand-written key: the recorded payload must name slice 0's child run.
+	p := auditPayload(t, f.au, "slices_integrated")
+	ids, _ := p["child_run_ids"].([]any)
+	if len(ids) != 1 || ids[0] != f.children[0].ID.String() {
+		t.Fatalf("slices_integrated child_run_ids = %v, want [%s]", p["child_run_ids"], f.children[0].ID)
+	}
+
+	integrated, conflict, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+	if err != nil || conflict != nil {
+		t.Fatalf("second call: conflict=%+v err=%v, want nil/nil", conflict, err)
+	}
+	if integrated {
+		t.Error("second call integrated = true, want false (slice 1's dependency is already covered)")
+	}
+	if got := f.mergeCount(); got != afterFirst {
+		t.Errorf("MergeBranch calls = %d after the second call, want %d unchanged (no re-merge every tick)", got, afterFirst)
+	}
+}
+
+// TestIntegrateCompletedWave_AuditReadErrorIntegrates pins the degrade
+// direction: an unreadable slices_integrated history is treated as NOT covered,
+// so the wave integrates. The opposite degrade would strand the next wave behind
+// the host-dispatch 409 until a later tick.
+func TestIntegrateCompletedWave_AuditReadErrorIntegrates(t *testing.T) {
+	f := newWaveFixture(t,
+		[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+		[]run.State{run.StateSucceeded, run.StatePending})
+	ctx := context.Background()
+	if integrated, _, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID); err != nil || !integrated {
+		t.Fatalf("seed integration: integrated=%v err=%v", integrated, err)
+	}
+	afterFirst := f.mergeCount()
+
+	// Same fixture, same covered state — but the audit read now fails.
+	f.o.Audit = &erroringCategoryAudit{recordingAudit: f.au}
+	integrated, _, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateCompletedWave: %v", err)
+	}
+	if !integrated {
+		t.Error("integrated = false on an audit-read error, want true (degrade to integrating is the safe direction)")
+	}
+	if got := f.mergeCount(); got <= afterFirst {
+		t.Errorf("MergeBranch calls = %d, want more than %d (the merge is idempotent; skipping it is the unsafe direction)", got, afterFirst)
+	}
+}
+
+// erroringCategoryAudit fails only ListForRunByCategory, leaving AppendChained
+// intact so the integration path itself still works.
+type erroringCategoryAudit struct {
+	*recordingAudit
+}
+
+func (e *erroringCategoryAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
+	return nil, errors.New("audit unavailable")
+}
+
+// TestIntegrateCompletedWave_NoIntegrationModes covers every branch that must
+// attempt NO integration, each as its own mode rather than a subset.
+func TestIntegrateCompletedWave_NoIntegrationModes(t *testing.T) {
+	cases := []struct {
+		name   string
+		specs  []subPlanSpec
+		states []run.State
+		reason string
+	}{
+		{
+			name:   "no succeeded child",
+			specs:  []subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			states: []run.State{run.StateRunning, run.StatePending},
+			reason: "nothing has been produced to merge",
+		},
+		{
+			name:   "succeeded child but no dependent slice",
+			specs:  []subPlanSpec{{title: "A"}, {title: "B"}},
+			states: []run.State{run.StateSucceeded, run.StatePending},
+			reason: "no slice declares depends_on, so no wave boundary exists",
+		},
+		{
+			name:   "dependent's dependencies not all succeeded",
+			specs:  []subPlanSpec{{title: "A"}, {title: "B"}, {title: "C", dependsOn: []int{0, 1}}},
+			states: []run.State{run.StateSucceeded, run.StateRunning, run.StatePending},
+			reason: "slice 1 has not succeeded, so slice 2 is still blocked by wave order",
+		},
+		{
+			name:   "only dependent is already terminal",
+			specs:  []subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			states: []run.State{run.StateSucceeded, run.StateSucceeded},
+			reason: "no non-terminal dependent is waiting; the all-terminal settling path owns this",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWaveFixture(t, tc.specs, tc.states)
+			integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+			if err != nil || conflict != nil {
+				t.Fatalf("integrated=%v conflict=%+v err=%v, want no-op", integrated, conflict, err)
+			}
+			if integrated {
+				t.Errorf("integrated = true, want false (%s)", tc.reason)
+			}
+			if got := f.mergeCount(); got != 0 {
+				t.Errorf("MergeBranch calls = %d, want 0 (%s)", got, tc.reason)
+			}
+		})
+	}
+}
+
+// TestIntegrateCompletedWave_AbsentInputDegrades covers the defensive-degrade
+// table: each of these is a MISSING input, not a violation, so it returns
+// no-integration with NO error rather than propagating.
+func TestIntegrateCompletedWave_AbsentInputDegrades(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no plan artifact", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		f.o.Artifacts = &fakeArtifacts{}
+		integrated, conflict, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil)", integrated, conflict, err)
+		}
+	})
+
+	t.Run("plan carries no decomposition", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		stages, _ := f.rs.ListStagesForRun(ctx, f.parent.ID)
+		schemaV := "standard_v1"
+		f.o.Artifacts = &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+			stages[0].ID: {{
+				ID: uuid.New(), StageID: stages[0].ID, Kind: artifact.KindPlan,
+				SchemaVersion: &schemaV, Content: undecomposedPlanBytes(t), CreatedAt: time.Now().UTC(),
+			}},
+		}}
+		integrated, conflict, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil)", integrated, conflict, err)
+		}
+	})
+
+	t.Run("dependent slice index out of range for sub_plans", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		out := 9
+		f.children[1].SliceIndex = &out
+		integrated, conflict, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil)", integrated, conflict, err)
+		}
+		if got := f.mergeCount(); got != 0 {
+			t.Errorf("MergeBranch calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("dependent child has a nil slice index", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		f.children[1].SliceIndex = nil
+		integrated, conflict, err := f.o.IntegrateCompletedWave(ctx, f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil)", integrated, conflict, err)
+		}
+		if got := f.mergeCount(); got != 0 {
+			t.Errorf("MergeBranch calls = %d, want 0", got)
+		}
+	})
+}
+
+// TestIntegrateCompletedWave_ConflictSurfaces asserts a slice that cannot merge
+// is returned as a *SliceConflict rather than swallowed, so the sweeper can
+// surface it and the dependent child stays refused at the host-dispatch 409.
+func TestIntegrateCompletedWave_ConflictSurfaces(t *testing.T) {
+	f := newWaveFixture(t,
+		[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+		[]run.State{run.StateSucceeded, run.StatePending})
+	f.gh.mergeErrByHead = map[string]error{sliceBranch(f.parent.ID, 0): forge.ErrMergeConflict}
+
+	integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateCompletedWave: %v", err)
+	}
+	if integrated {
+		t.Error("integrated = true on a conflict, want false")
+	}
+	if conflict == nil {
+		t.Fatal("conflict = nil, want the slice-0 conflict")
+	}
+	if conflict.SliceIndex != 0 || conflict.ChildRunID != f.children[0].ID {
+		t.Errorf("conflict = %+v, want slice 0 / child %s", conflict, f.children[0].ID)
+	}
+}
+
+// TestIntegrateCompletedWave_ErrorsPropagate covers the RETRYABLE reads: a
+// child-listing failure and a merge failure both surface as err so the sweeper
+// parks the parent and re-enters, rather than silently reporting no-op.
+func TestIntegrateCompletedWave_ErrorsPropagate(t *testing.T) {
+	t.Run("child listing error", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		f.rs.listRunsErr = errors.New("db down")
+		if _, _, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID); err == nil {
+			t.Error("err = nil on a child-listing failure, want a retryable error")
+		}
+	})
+
+	t.Run("merge error", func(t *testing.T) {
+		f := newWaveFixture(t,
+			[]subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}},
+			[]run.State{run.StateSucceeded, run.StatePending})
+		f.gh.mergeErrByHead = map[string]error{sliceBranch(f.parent.ID, 0): errors.New("github 500")}
+		integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+		if err == nil {
+			t.Fatal("err = nil on a merge failure, want a retryable error")
+		}
+		if integrated || conflict != nil {
+			t.Errorf("got (%v, %+v) alongside the error, want (false, nil)", integrated, conflict)
+		}
+	})
+}
+
+// TestIntegrateCompletedWave_NilRunsRepo pins the configuration-error guard.
+func TestIntegrateCompletedWave_NilRunsRepo(t *testing.T) {
+	o := &Orchestrator{Logger: slog.Default()}
+	if _, _, err := o.IntegrateCompletedWave(context.Background(), uuid.New()); err == nil {
+		t.Error("err = nil with a nil Runs repository, want a configuration error")
+	}
+}
