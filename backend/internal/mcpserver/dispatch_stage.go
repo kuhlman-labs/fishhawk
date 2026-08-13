@@ -410,7 +410,9 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
 	}
 
-	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report)
+	probe := r.stageStateProbe(runUUID, resolvedStageID)
+
+	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report, probe)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}

@@ -1099,9 +1099,12 @@ func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo,
 //
 // report is the backend reporter the reaper calls on a non-zero exit; nil
 // disables reporting (the runner's dispatch watchdog remains the backstop).
+// probe reads this stage's state so the reaper can convert a zero-exit STRAND
+// (the runner exited 0 having settled nothing, #2630) into a category-C failure
+// retry_stage can recover; nil keeps the pre-#2630 zero-exit no-op.
 //
 // Returns the log path (always set when spawn succeeded) and any spawn error.
-func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 	cmd := runStageCommand(binary, argv...)
 	cmd.Env = env
 
@@ -1152,7 +1155,7 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 	// Deregistering is DEFERRED so it also runs on the reaper's early returns.
 	go func() {
 		defer detachedRunners.deregister(h)
-		reapDetachedRunner(cmd, logPath, runID, stageID, report)
+		reapDetachedRunner(cmd, logPath, runID, stageID, report, probe)
 	}()
 
 	return logPath, nil
@@ -1166,6 +1169,67 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 // before falling back to the stderr diagnostic + dispatch watchdog (#1763). nil
 // disables reporting.
 type detachedFailureReporter func(ctx context.Context, category, reason, detail string, exitCode int) error
+
+// detachedStageStateProbe reads THIS stage's current state from the backend so
+// the reaper can tell a healthy zero exit (the runner settled the stage) from a
+// zero-exit STRAND (the runner exited 0 having settled nothing, #2630). It
+// returns the stage state as its wire string (matching Stage.State) and any read
+// error. A nil probe keeps the reaper's pre-#2630 zero-exit no-op.
+type detachedStageStateProbe func(ctx context.Context) (state string, err error)
+
+// reapStrandAllowList is the POSITIVE set of stage states the zero-exit reaper
+// treats as a strand (#2630). It is DELIBERATELY an allow-list, not
+// !stageStateIsTerminal(state): awaiting_scope_decision (a scope-completeness
+// park), awaiting_input (a clarification park), awaiting_children (a decomposed
+// parent), awaiting_approval (a gate), and awaiting_host_dispatch (a child
+// awaiting host dispatch) are all NON-terminal states a runner LEGITIMATELY
+// exits 0 into, and reaping any of them would destroy a live park — the exact
+// class reap_failure.go already refuses server-side for awaiting_children. Only
+// 'dispatched' and 'running' mean the runner exited without settling the stage.
+// A future state a runner exits 0 into is ignored by this allow-list (fail open,
+// no report) rather than reaped — the safe direction. Keys are the canonical
+// run.StageState wire strings (backend/internal/run/run.go); this package models
+// Stage.State as a plain string, so they are compared as literals.
+var reapStrandAllowList = map[string]bool{
+	"dispatched": true,
+	"running":    true,
+}
+
+// stageStateProbe builds the production detachedStageStateProbe wired at the two
+// detached spawn call sites (dispatch_stage.go, drive_run.go), off the same r.api
+// the report closure captures. It reads the (run, stage) pair's current state via
+// ListRunStages, matching the stage by id. Any list error propagates so the
+// reaper fails OPEN (an unreadable state is not proof of a strand), and a stage
+// missing from the list — a genuine anomaly — is surfaced as an error for the
+// same fail-open reason rather than silently treated as settled. A bounded
+// per-probe timeout keeps a hung backend from wedging the detached reaper.
+func (r *runResolver) stageStateProbe(runUUID uuid.UUID, stageID string) detachedStageStateProbe {
+	return func(ctx context.Context) (string, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		stages, err := r.api.ListRunStages(probeCtx, runUUID)
+		if err != nil {
+			return "", err
+		}
+		for _, st := range stages {
+			if st.ID == stageID {
+				return st.State, nil
+			}
+		}
+		return "", fmt.Errorf("stage %s not found in run %s stage list", stageID, runUUID)
+	}
+}
+
+// reapProbeBackoff is the zero-exit settle window (#2630): the between-probe
+// sleep schedule the reaper uses to absorb the exit race. A healthy runner exits
+// within milliseconds of the backend committing its terminal transition, so an
+// immediate single probe could observe a still-'running' stage whose transition
+// has not yet been read back and false-strand it. The reaper re-probes on this
+// schedule and reports ONLY when the state is STILL in the allow-list at the end.
+// Like reapReportBackoff it is a package var so tests inject a fast (zero-
+// duration) schedule; the reaper tests run serially (no t.Parallel), so the
+// override is race-free.
+var reapProbeBackoff = []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
 
 // reapReportBackoff is the between-attempt sleep schedule for the reaper's
 // reap-failure POST (#1763). Its length is the number of RETRIES after the first
@@ -1188,9 +1252,22 @@ var reapReportBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 8 * ti
 // stuck-'dispatched' window (#1763). A zero exit, a non-ExitError wait failure
 // (no exit code to report), or a nil report is a no-op: the runner reported its
 // own outcome, or the dispatch watchdog is the backstop.
-func reapDetachedRunner(cmd *exec.Cmd, logPath, runID, stageID string, report detachedFailureReporter) {
+//
+// On a ZERO exit the reaper no longer trusts the clean exit outright (#2630): a
+// runner can exit 0 having settled NOTHING — the #2630 runner re-entered its
+// completed PR-open short-circuit, opened no PR, shipped nothing, and left its
+// implement stage 'running' forever with no verb short of cancel_run. probe reads
+// the stage state and, ONLY when it is STILL in the positive allow-list
+// {dispatched, running} after a bounded settle window, the reaper reports a
+// category-C strand so the stage lands 'failed' and retry_stage can recover it.
+// Fail OPEN on every uncertainty (nil probe, any probe error, a state outside the
+// allow-list) — the dispatch watchdog stays the backstop, and the allow-list, not
+// !stageStateIsTerminal, is what protects the park/gate states a runner
+// legitimately exits 0 into.
+func reapDetachedRunner(cmd *exec.Cmd, logPath, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) {
 	waitErr := cmd.Wait()
 	if waitErr == nil {
+		reapZeroExitStrand(runID, stageID, report, probe)
 		return
 	}
 	var exitErr *exec.ExitError
@@ -1208,13 +1285,59 @@ func reapDetachedRunner(cmd *exec.Cmd, logPath, runID, stageID string, report de
 		// happened.
 		reason = fmt.Sprintf("runner exited %d before reporting a terminal state", exitCode)
 	}
-	// Retry the report with bounded backoff so a transient failure of the POST
-	// itself (backend down, network blip, 5xx) does not drop the report and leave
-	// the stage stuck 'dispatched' — the #1747 failure mode moved one hop out
-	// (#1763). The report is idempotent on the backend (reap_failure.go's
-	// already-terminal branch treats a re-report of an already-failed stage as a
-	// no-op), so retrying after an unobserved response is safe. Each attempt gets
-	// a FRESH 30s context; between attempts we sleep reapReportBackoff[i].
+	reportDetachedFailureWithRetry(runID, stageID, reason, detail, exitCode, report)
+}
+
+// reapZeroExitStrand converts a zero-exit STRAND into a category-C failure
+// (#2630). It probes the stage state across a bounded settle window
+// (reapProbeBackoff) to absorb the exit race — a healthy runner exits within
+// milliseconds of the backend committing its terminal transition, so the first
+// probe can observe a still-'running' stage whose transition has not yet been
+// read back — and reports ONLY when the state is STILL in the reapStrandAllowList
+// {dispatched, running} at the END of the window. Fail OPEN on a nil probe, a nil
+// report, any probe error, or a state that leaves the allow-list at any point:
+// report nothing and leave the dispatch watchdog as the backstop.
+func reapZeroExitStrand(runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) {
+	if probe == nil || report == nil {
+		return
+	}
+	var state string
+	for attempt := 0; ; attempt++ {
+		st, err := probe(context.Background())
+		if err != nil {
+			// Fail open: an unreadable state is not proof of a strand.
+			return
+		}
+		state = st
+		if !reapStrandAllowList[state] {
+			// The stage settled — a terminal state, or a legitimate park/gate the
+			// runner exited 0 into. No strand.
+			return
+		}
+		if attempt >= len(reapProbeBackoff) {
+			break
+		}
+		time.Sleep(reapProbeBackoff[attempt])
+	}
+	// Confirmed strand: the state is STILL {dispatched, running} after the settle
+	// window. Report category C (exit code 0, no runner_failed detail) so the stage
+	// lands 'failed' and retry_stage becomes available.
+	reason := fmt.Sprintf("runner exited 0 without settling the stage (state=%s)", state)
+	reportDetachedFailureWithRetry(runID, stageID, reason, "", 0, report)
+}
+
+// reportDetachedFailureWithRetry runs the bounded-backoff reap-failure POST loop
+// shared by the non-zero-exit path (#1763) and the zero-exit strand check
+// (#2630). category is always "C" — the retryable infrastructure class. It
+// retries so a transient failure of the POST itself (backend down, network blip,
+// 5xx) does not drop the report and leave the stage stuck; the report is
+// idempotent on the backend (reap_failure.go's already-terminal branch treats a
+// re-report of an already-failed stage as a no-op), so retrying after an
+// unobserved response is safe. Each attempt gets a FRESH 30s context; between
+// attempts we sleep reapReportBackoff[i]. On exhaustion it surfaces to stderr —
+// a detached goroutine has no request logger — and the dispatch watchdog remains
+// the eventual backstop.
+func reportDetachedFailureWithRetry(runID, stageID, reason, detail string, exitCode int, report detachedFailureReporter) {
 	var reportErr error
 	for attempt := 0; attempt <= len(reapReportBackoff); attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1227,9 +1350,6 @@ func reapDetachedRunner(cmd *exec.Cmd, logPath, runID, stageID string, report de
 			time.Sleep(reapReportBackoff[attempt])
 		}
 	}
-	// Every attempt failed. Detached goroutine with no request logger — surface to
-	// stderr (the same diagnostic stream the redirected runner log rides). The
-	// failure is not fatal: the dispatch watchdog remains the eventual backstop.
 	fmt.Fprintf(os.Stderr,
 		"fishhawk-mcp: reap detached runner failure report failed after %d attempts (run=%s stage=%s): %v\n",
 		len(reapReportBackoff)+1, runID, stageID, reportErr)

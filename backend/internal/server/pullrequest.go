@@ -511,6 +511,25 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
 			return
 		}
+		// Terminalise on the idempotent replay (#2630). #1396 self-healed the
+		// governance audit entry on this short-circuit but never drove the stage
+		// transition, so a re-ship of an already-persisted artifact left a still-
+		// `running` implement stage un-terminalised — the amplifier that turned
+		// the #2630 sticky re-entry into a permanently stranded stage: the terminal
+		// transition rode ONLY on the create-path PR-open event, so an idempotent-
+		// suppressed upload settled nothing. Drive it here under EXACTLY the create
+		// path's guard (line ~697): implement && running. That guard is what keeps
+		// this safe without re-running the create path's gating-reject and lineage
+		// checks — both of those leave the stage terminally `failed`, never
+		// `running`, so a stage that failed either can never reach this advance. A
+		// replay against an already-terminal stage (a prior ship having advanced it)
+		// fails the running guard and is an unchanged no-op — no double transition,
+		// no second orchestrator advance. Best-effort like the create path: a
+		// transition error is WARN-logged inside the helper and never unwinds the
+		// 200. The response body stays byte-unchanged (still idempotent:true).
+		if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+			s.advanceImplementStageAfterPR(r, runID, stage)
+		}
 		s.writeJSON(w, r, http.StatusOK, pullRequestResponse{
 			ID:          existing.ID,
 			StageID:     existing.StageID,

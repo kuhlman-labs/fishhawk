@@ -5910,6 +5910,80 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_Fixup_IgnoresHeldCommitFields is the #2630 runner-side
+// DEFENCE IN DEPTH (D1): a fetched prompt carrying BOTH fixup:true AND
+// open_pr_from_held_commit:true must run the FIX-UP — the agent IS invoked and
+// the pre-agent held-commit short-circuit is NOT taken, so no
+// scope_completeness_pr_opened event is emitted and the
+// held_commit_fields_ignored_on_fixup diagnostic IS. The backend gate
+// (resolveHeldCommitExemption's fix-up refusal) is the control; a current
+// backend never sends both, but this backstop keeps a NEW runner correct against
+// an OLD backend that predates the gate.
+//
+// COUNTERFACTUAL (condition 5): deleting the runner's fixup-wins guard makes the
+// runner take the short-circuit — open_pr_from_held_commit wins, the agent is
+// never invoked, and a scope_completeness_pr_opened event is emitted — turning
+// every assertion here red.
+func TestRun_ImplementStage_Fixup_IgnoresHeldCommitFields(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	existingBranch := "fishhawk/run-11111111/stage-22222222"
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: existingBranch,
+		// An OLD backend predating resolveHeldCommitExemption's fix-up refusal
+		// could still emit these alongside the fix-up fields; the runner must win
+		// for the fix-up and ignore them.
+		OpenPRFromHeldCommit: true,
+		HeldCommitSHA:        "deadbeefcafef00ddeadbeefcafef00ddeadbeef",
+		HeldCommitBranch:     "fishhawk/run-stale/held",
+		HeldCommitBaseSHA:    "cafef00ddeadbeefcafef00ddeadbeefcafef00d",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// The agent IS invoked — the fix-up runs rather than the held-commit short-circuit.
+	if invoker.callIdx != 1 {
+		t.Errorf("invoker called %d times, want 1 (the fix-up must run the agent, not the held-commit short-circuit)", invoker.callIdx)
+	}
+	// The held-commit short-circuit was NOT taken (openHeldCommitPR emits this).
+	if strings.Contains(stderr.String(), `"event":"scope_completeness_pr_opened"`) {
+		t.Errorf("a fix-up dispatch must not take the held-commit short-circuit:\n%s", stderr.String())
+	}
+	// openHeldCommitPR would have opened a fresh PR from the stale held commit.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not be called: the fix-up updates the existing PR, it must not open from the held commit")
+	}
+	// The backstop announced itself.
+	if !strings.Contains(stderr.String(), `"event":"held_commit_fields_ignored_on_fixup"`) {
+		t.Errorf("missing held_commit_fields_ignored_on_fixup diagnostic:\n%s", stderr.String())
+	}
+	// It really took the ordinary fix-up path.
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Fatalf("fix-up must report fixup_pushed, got %+v", fu.gotPRArgs)
+	}
+}
+
 // TestRun_ImplementStage_Fixup_ConsumesCommitMessageSidecar (#1572, mode 1 e2e):
 // the fix-up agent writes the per-pass commit-message sidecar DURING its invoke
 // (after the pre-invoke sweep); the runner plumbs its subject+body onto the

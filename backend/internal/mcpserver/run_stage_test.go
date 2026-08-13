@@ -1990,7 +1990,7 @@ func TestReapDetachedRunner_ParsesRunnerFailed(t *testing.T) {
 		got = capturedReap{called: true, category: category, reason: reason, detail: detail, exitCode: exitCode}
 		return nil
 	}
-	reapDetachedRunner(cmd, logPath, "run-1", "stage-1", report)
+	reapDetachedRunner(cmd, logPath, "run-1", "stage-1", report, nil)
 
 	if !got.called {
 		t.Fatal("report was not called on a non-zero exit with a runner_failed line")
@@ -2019,7 +2019,7 @@ func TestReapDetachedRunner_NoCategoryFieldDefaultsC(t *testing.T) {
 	reapDetachedRunner(cmd, logPath, "r", "s", func(_ context.Context, category, reason, detail string, exitCode int) error {
 		got = capturedReap{called: true, category: category, reason: reason}
 		return nil
-	})
+	}, nil)
 	if !got.called || got.category != "C" {
 		t.Errorf("category = %q (called=%v), want C", got.category, got.called)
 	}
@@ -2037,7 +2037,7 @@ func TestReapDetachedRunner_SynthesizesReasonWhenNoLine(t *testing.T) {
 	reapDetachedRunner(cmd, logPath, "r", "s", func(_ context.Context, category, reason, detail string, exitCode int) error {
 		got = capturedReap{called: true, category: category, reason: reason, exitCode: exitCode}
 		return nil
-	})
+	}, nil)
 	if !got.called {
 		t.Fatal("report was not called on a non-zero exit with no runner_failed line")
 	}
@@ -2049,8 +2049,9 @@ func TestReapDetachedRunner_SynthesizesReasonWhenNoLine(t *testing.T) {
 	}
 }
 
-// (3) Zero exit → no report (the runner reported its own outcome).
-func TestReapDetachedRunner_ZeroExitNoReport(t *testing.T) {
+// (3) Zero exit with a NIL probe → no report (the pre-#2630 behavior: a caller
+// that wired no probe keeps the zero-exit no-op). This is C9 (backward compat).
+func TestReapDetachedRunner_ZeroExitNilProbeNoReport(t *testing.T) {
 	logPath := writeReapLog(t, `{"event":"runner_completed","outcome":"ok"}`)
 	cmd := startedShellCmd(t, "exit 0")
 
@@ -2058,9 +2059,9 @@ func TestReapDetachedRunner_ZeroExitNoReport(t *testing.T) {
 	reapDetachedRunner(cmd, logPath, "r", "s", func(context.Context, string, string, string, int) error {
 		called = true
 		return nil
-	})
+	}, nil)
 	if called {
-		t.Error("report was called on a zero exit; it must be a no-op")
+		t.Error("report was called on a zero exit with a nil probe; it must be a no-op")
 	}
 }
 
@@ -2068,7 +2069,7 @@ func TestReapDetachedRunner_ZeroExitNoReport(t *testing.T) {
 // backend client). Nothing to assert but the absence of a panic.
 func TestReapDetachedRunner_NilReporterNoPanic(t *testing.T) {
 	cmd := startedShellCmd(t, "exit 1")
-	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"runner_failed","reason":"x"}`), "r", "s", nil)
+	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"runner_failed","reason":"x"}`), "r", "s", nil, nil)
 }
 
 // zeroReapBackoff overrides reapReportBackoff with a same-length slice of
@@ -2102,7 +2103,7 @@ func TestReapDetachedRunner_ReportRetriedThenSucceeds(t *testing.T) {
 		}
 		got = capturedReap{called: true, category: category, reason: reason, detail: detail, exitCode: exitCode}
 		return nil
-	})
+	}, nil)
 
 	if calls != failFirst+1 {
 		t.Fatalf("report called %d times, want %d (K failures then success)", calls, failFirst+1)
@@ -2124,10 +2125,153 @@ func TestReapDetachedRunner_ReportExhaustsRetries(t *testing.T) {
 	reapDetachedRunner(cmd, logPath, "r", "s", func(context.Context, string, string, string, int) error {
 		calls++
 		return fmt.Errorf("always fails")
-	})
+	}, nil)
 
 	if want := len(reapReportBackoff) + 1; calls != want {
 		t.Errorf("report called %d times, want %d (the bound must hold)", calls, want)
+	}
+}
+
+// zeroReapProbeBackoff overrides reapProbeBackoff with a same-length slice of
+// zero-duration sleeps under t.Cleanup, so the settle-window loop runs without
+// real sleeps while preserving the poll bound (len+1). Restored on cleanup.
+func zeroReapProbeBackoff(t *testing.T) {
+	t.Helper()
+	saved := reapProbeBackoff
+	reapProbeBackoff = make([]time.Duration, len(saved))
+	t.Cleanup(func() { reapProbeBackoff = saved })
+}
+
+// TestReapDetachedRunner_ZeroExitStrandMatrix is the #2630 RECOVERY matrix
+// (verification C1–C7 plus the awaiting_host_dispatch case operator condition 2
+// required). Each case drives the REAL reapDetachedRunner over a REAL exit-0
+// child with an injected constant-state probe and a recording reporter. Only
+// 'dispatched' and 'running' — the states that mean the runner exited WITHOUT
+// settling the stage — report a category-C strand; every non-terminal park/gate
+// state and every terminal state must be a NO-OP, because reaping a
+// legitimately-parked stage would destroy a live park.
+//
+// The allow-list, NOT !stageStateIsTerminal, is what makes this correct:
+// awaiting_scope_decision / awaiting_input / awaiting_children / awaiting_approval
+// / awaiting_host_dispatch are all NON-terminal yet legitimate zero-exit landing
+// states. COUNTERFACTUAL (condition 5): replacing the positive allow-list with
+// `!stageStateIsTerminal(state)` reddens awaiting_scope_decision (C3) and every
+// other non-terminal park row here — proving the allow-list is load-bearing.
+// Deleting the zero-exit probe entirely reddens the running_strand row (C1).
+func TestReapDetachedRunner_ZeroExitStrandMatrix(t *testing.T) {
+	zeroReapProbeBackoff(t)
+	for _, tc := range []struct {
+		name       string
+		state      string
+		wantReport bool
+	}{
+		{"running_strand", "running", true},                                // C1
+		{"dispatched_strand", "dispatched", true},                          // C2
+		{"awaiting_scope_decision_park", "awaiting_scope_decision", false}, // C3
+		{"awaiting_input_park", "awaiting_input", false},                   // C4
+		{"awaiting_children_park", "awaiting_children", false},             // C5
+		{"awaiting_approval_gate", "awaiting_approval", false},             // C6
+		{"succeeded_terminal", "succeeded", false},                         // C7
+		{"awaiting_host_dispatch_park", "awaiting_host_dispatch", false},   // condition 2
+		{"failed_terminal", "failed", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := startedShellCmd(t, "exit 0")
+			calls := 0
+			var got capturedReap
+			report := func(_ context.Context, category, reason, detail string, exitCode int) error {
+				calls++
+				got = capturedReap{called: true, category: category, reason: reason, exitCode: exitCode}
+				return nil
+			}
+			state := tc.state
+			probe := func(context.Context) (string, error) { return state, nil }
+			reapDetachedRunner(cmd, writeReapLog(t, `{"event":"runner_completed"}`), "r", "s", report, probe)
+
+			if tc.wantReport {
+				if calls != 1 {
+					t.Fatalf("report called %d times, want exactly 1 for a %q strand", calls, state)
+				}
+				if got.category != "C" {
+					t.Errorf("category = %q, want C", got.category)
+				}
+				if !strings.Contains(got.reason, "runner exited 0 without settling the stage") ||
+					!strings.Contains(got.reason, state) {
+					t.Errorf("reason = %q, want it to name the un-settled state %q", got.reason, state)
+				}
+				if got.exitCode != 0 {
+					t.Errorf("exit_code = %d, want 0 (a clean-exit strand)", got.exitCode)
+				}
+			} else if calls != 0 {
+				t.Errorf("report called %d times on state %q, want 0 (a park/terminal state must not be reaped)", calls, state)
+			}
+		})
+	}
+}
+
+// TestReapDetachedRunner_ZeroExitProbeErrorFailsOpen is C8: a probe that errors
+// reports NOTHING — an unreadable state is not proof of a strand, so the reaper
+// fails open and leaves the dispatch watchdog as the backstop.
+func TestReapDetachedRunner_ZeroExitProbeErrorFailsOpen(t *testing.T) {
+	zeroReapProbeBackoff(t)
+	cmd := startedShellCmd(t, "exit 0")
+	called := false
+	report := func(context.Context, string, string, string, int) error { called = true; return nil }
+	probe := func(context.Context) (string, error) { return "", fmt.Errorf("backend down") }
+	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"x"}`), "r", "s", report, probe)
+	if called {
+		t.Error("report was called after a probe error; the reaper must fail open")
+	}
+}
+
+// TestReapDetachedRunner_ZeroExitSettleWindowAbsorbsRace is C10: the exit-race
+// absorber. A probe that returns 'running' on the first poll and a terminal
+// state on a later poll must report NOTHING — the runner's terminal transition
+// became visible within the settle window. COUNTERFACTUAL (condition 5):
+// deleting the settle-window re-probe (reporting on the first probe alone)
+// reddens this, because the first poll observed the not-yet-settled 'running'.
+func TestReapDetachedRunner_ZeroExitSettleWindowAbsorbsRace(t *testing.T) {
+	zeroReapProbeBackoff(t)
+	cmd := startedShellCmd(t, "exit 0")
+	called := false
+	report := func(context.Context, string, string, string, int) error { called = true; return nil }
+	polls := 0
+	probe := func(context.Context) (string, error) {
+		polls++
+		if polls == 1 {
+			return "running", nil // the terminal transition is not yet visible
+		}
+		return "succeeded", nil // settled by the next poll
+	}
+	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"x"}`), "r", "s", report, probe)
+	if called {
+		t.Error("report was called despite the stage settling within the window; the settle window must absorb the exit race")
+	}
+	if polls < 2 {
+		t.Errorf("probe polled %d times, want >=2 (the settle window must re-probe before reporting)", polls)
+	}
+}
+
+// TestReapDetachedRunner_ZeroExitStrandReportRetries is C1's report-retry
+// companion: a confirmed strand reuses the SAME bounded-backoff report loop the
+// non-zero-exit path uses (reportDetachedFailureWithRetry), so a transient POST
+// failure is retried rather than dropping the strand report.
+func TestReapDetachedRunner_ZeroExitStrandReportRetries(t *testing.T) {
+	zeroReapProbeBackoff(t)
+	zeroReapBackoff(t)
+	cmd := startedShellCmd(t, "exit 0")
+	calls := 0
+	report := func(_ context.Context, category, reason, detail string, exitCode int) error {
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("transient POST failure")
+		}
+		return nil
+	}
+	probe := func(context.Context) (string, error) { return "running", nil }
+	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"x"}`), "r", "s", report, probe)
+	if calls != 2 {
+		t.Errorf("strand report called %d times, want 2 (one transient failure then success)", calls)
 	}
 }
 
@@ -2197,7 +2341,7 @@ func TestSpawnRunnerStageDetached_ReaperReportsOverHTTP(t *testing.T) {
 	t.Cleanup(func() { runStageCommand = origCmd })
 
 	logPath, err := spawnRunnerStageDetached("/fake/runner", nil, os.Environ(),
-		runID.String(), stageID.String(), report)
+		runID.String(), stageID.String(), report, nil)
 	if err != nil {
 		t.Fatalf("spawnRunnerStageDetached: %v", err)
 	}
@@ -3110,7 +3254,7 @@ func TestSpawnRunnerStageDetached_RefusesAfterCancel(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
-			os.Environ(), runID, "stage-1", nil)
+			os.Environ(), runID, "stage-1", nil, nil)
 		if !errors.Is(err, errRunCancelledBeforeSpawn) {
 			t.Fatalf("refusal %d: err = %v, want errRunCancelledBeforeSpawn", i, err)
 		}

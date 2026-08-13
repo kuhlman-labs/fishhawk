@@ -843,6 +843,53 @@ func TestDispatchStage_ReaperReportsSpawnFailure(t *testing.T) {
 	}
 }
 
+// TestDispatchStage_StageStateProbe is the call-site wiring test for the #2630
+// zero-exit strand probe: `stageStateProbe` is the production `detachedStageStateProbe`
+// dispatchStage (and drive_run) thread into spawnRunnerStageDetached, so what the
+// reaper observes on a zero exit is exactly what this builder reads. Driving it
+// directly against an httptest backend is race-free (unlike a full detached-spawn
+// end-to-end, whose reaper goroutine outlives the test and would race a global
+// settle-window override) and pins the two branches the reaper's fail-open posture
+// depends on: a present stage returns its state; an absent one returns an ERROR
+// (so the reaper reports nothing rather than false-stranding). The reaper's
+// strand DECISION over these states is pinned exhaustively by the unit-level
+// TestReapDetachedRunner_ZeroExitStrandMatrix.
+func TestDispatchStage_StageStateProbe(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	var state string // served state for the target stage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every request is a stage-list read.
+		items := []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: state}}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	}))
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// Present stage → its state (the reaper classifies this against the allow-list).
+	state = "dispatched"
+	probe := r.stageStateProbe(runID, stageID.String())
+	got, err := probe(context.Background())
+	if err != nil {
+		t.Fatalf("probe on a present stage: unexpected error %v", err)
+	}
+	if got != "dispatched" {
+		t.Errorf("probe state = %q, want dispatched", got)
+	}
+
+	// Absent stage → an ERROR (the fail-open source: the reaper reports nothing on
+	// a probe error rather than false-stranding a stage it cannot read).
+	missing := r.stageStateProbe(runID, uuid.New().String())
+	if _, err := missing(context.Background()); err == nil {
+		t.Error("probe on an absent stage must return an error so the reaper fails open")
+	}
+}
+
 // --- (T9/T10) manual-dispatch spawn-evidence vocabulary pin (#1905) ----------
 
 // dispatchAutoDriveFake is a self-contained backend for the record-act tests:

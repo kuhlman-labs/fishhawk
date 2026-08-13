@@ -752,6 +752,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// already on the run branch) and its position here is exactly what
 	// guarantees the agent invoker is never spawned. openHeldCommitPR branches
 	// on the kind for the extra remote-tip guard that resume needs.
+	// DEFENCE IN DEPTH (#2630): a fix-up dispatch carries a fix-up prompt the
+	// runner MUST run — taking the held-commit short-circuit would re-open the PR
+	// from the stale held commit and DISCARD the fix the operator requested. The
+	// backend gate (resolveHeldCommitExemption) already refuses to emit the
+	// held-commit fields on a fix-up, so a current backend never sends both; but a
+	// NEW runner against an OLD backend that predates that gate could still receive
+	// both. The prompt is the authoritative statement of what the dispatch was FOR,
+	// and it carries cfg.fixup — so honor the fix-up and ignore the held-commit
+	// fields, falling through to the ordinary agent fix-up path below. This is a
+	// BACKSTOP, not the control: the backend gate is the control.
+	if exemptOpenPR && cfg.fixup {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"held_commit_fields_ignored_on_fixup","run_id":%q,"stage_id":%q,"held_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, exemptHeldSHA)
+		exemptOpenPR = false
+	}
 	if exemptOpenPR {
 		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, logSink, client, issuedKey)
 	}

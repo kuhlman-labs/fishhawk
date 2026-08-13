@@ -1302,8 +1302,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// Scope-completeness EXEMPT resolution (#2501): emit the held-commit
 		// fields ONLY for a park whose newest decision entry is `exempted`, so the
 		// re-dispatched runner opens the PR from the held commit with no agent
-		// re-run. Fail-closed — see resolveHeldCommitExemption.
-		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage); exempt {
+		// re-run. Fail-closed — see resolveHeldCommitExemption. A fix-up dispatch
+		// is refused inside the resolver (#2630) so the fetched fix-up prompt runs
+		// instead of the pre-agent held-commit short-circuit.
+		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = heldSHA
 			resp.HeldCommitBranch = heldBranch
@@ -1811,8 +1813,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		resp.ImplementModel = rm.Value
 		// Scope-completeness EXEMPT resolution (#2501), same derivation as the
 		// dispatch path so the rendered (SPA-readable) prompt response stays
-		// byte-consistent with the runner-facing one.
-		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage); exempt {
+		// byte-consistent with the runner-facing one. A fix-up dispatch is refused
+		// inside the resolver (#2630) identically to the dispatch path.
+		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = heldSHA
 			resp.HeldCommitBranch = heldBranch
@@ -3087,14 +3090,29 @@ func (s *Server) resolveAcceptanceExpectedHeadSHAWalkingParents(ctx context.Cont
 	return ""
 }
 
-// scopeCompletenessDecisionCategories are the three audit kinds that record a
-// scope-completeness park's lifecycle. resolveHeldCommitExemption resolves the
-// NEWEST entry across all three (not just the exempted one) so a stage that
-// parked AGAIN after an earlier exempt emits nothing.
-var scopeCompletenessDecisionCategories = []string{
+// scopeCompletenessDecisionInvalidatorCategories is the audit-category set
+// resolveHeldCommitExemption walks to find THIS stage's newest terminal
+// implement outcome. It is a DECISION-plus-INVALIDATOR set, not just the three
+// scope_completeness_* lifecycle kinds: like pushCheckpointCategories it must
+// contain every category that can SUPERSEDE an `exempted` decision, not only
+// the three that record the park's own lifecycle. The three scope_completeness_*
+// kinds are the decision carriers; pull_request_opened / fixup_pushed /
+// child_pushed are the invalidators — a stage that opened its PR, pushed a
+// fix-up, or pushed a child AFTER an earlier exempt has moved past that
+// exemption, and the newest-wins comparison below is what makes the gate
+// self-invalidating rather than incidentally correct: with only the three
+// lifecycle kinds a superseding pull_request_opened / fixup_pushed / child_pushed
+// never demotes a stale `exempted`, so the gate would re-emit the held-commit
+// fields on a later dispatch (the #2630 sticky re-entry). The newestParked walk
+// below stays restricted to CategoryScopeCompletenessParked, so widening this
+// list does NOT change which entry supplies the #2563 base-SHA fallback.
+var scopeCompletenessDecisionInvalidatorCategories = []string{
 	CategoryScopeCompletenessParked,
 	CategoryScopeCompletenessExempted,
 	CategoryScopeCompletenessFailed,
+	"pull_request_opened",
+	"fixup_pushed",
+	"child_pushed",
 }
 
 // resolveHeldCommitExemption is the emission GATE for the four exempt
@@ -3103,13 +3121,24 @@ var scopeCompletenessDecisionCategories = []string{
 // following hold:
 //
 //   - the stage is an implement stage carrying a ScopeCompletenessPark, and
-//   - the NEWEST audit entry for THIS stage across the three
-//     scope_completeness_* categories is `exempted`, and
+//   - the dispatch is NOT a fix-up (see the fix-up refusal below), and
+//   - the NEWEST audit entry for THIS stage across
+//     scopeCompletenessDecisionInvalidatorCategories is `exempted`, and
 //   - a non-empty base SHA resolves (park field, or the audit fallback below).
 //
-// The newest-wins rule across all three categories is what makes a re-park
-// after an earlier exempt emit nothing: the later `parked` entry wins and the
-// runner takes its ordinary agent path.
+// FIX-UP REFUSAL (#2630). A fix-up dispatch MUST re-invoke the agent — emitting
+// the held-commit fields sends the runner to its pre-agent openHeldCommitPR
+// short-circuit, which discards the fix-up prompt it just fetched and re-opens
+// the PR from the stale held commit, running none of the fix the operator
+// requested (the #2630 sticky re-entry that stranded a stage in `running`). The
+// sibling resolvePushCheckpointResume already refuses a fix-up for the same
+// reason; this gate mirrors it exactly so both held-commit emission paths agree.
+//
+// The newest-wins rule across every category is what makes the gate
+// self-invalidating: a re-park after an earlier exempt emits nothing because the
+// later `parked` entry wins, AND — with the invalidator categories now in the
+// walk — a superseding pull_request_opened / fixup_pushed / child_pushed demotes
+// a stale `exempted` so the runner takes its ordinary agent path.
 //
 // BASE SHA SOURCE ORDER (#2563): (a) park.BaseSHA when non-empty — every park
 // recorded since #2563 carries it; (b) fallback — the base_sha of the NEWEST
@@ -3128,8 +3157,15 @@ var scopeCompletenessDecisionCategories = []string{
 // unproven or unshippable exemption. A missing base SHA fails closed here
 // because the runner would otherwise open the PR and then fail category-B
 // shipping an artifact the backend rejects (#2563), orphaning the PR.
-func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage) (sha, branch, baseSHA string, ok bool) {
+func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (sha, branch, baseSHA string, ok bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement || stage.ScopeCompletenessPark == nil {
+		return "", "", "", false
+	}
+	// FIX-UP REFUSAL (#2630): a fix-up dispatch carries a fix-up prompt the
+	// runner MUST run; emitting the held-commit fields would send it to the
+	// pre-agent openHeldCommitPR short-circuit and discard that prompt. Mirror
+	// the sibling resolvePushCheckpointResume's refusal exactly.
+	if fixup {
 		return "", "", "", false
 	}
 	if s.cfg.AuditRepo == nil {
@@ -3142,7 +3178,7 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 	var newest *audit.Entry
 	var newestCategory string
 	var newestParked *audit.Entry
-	for _, cat := range scopeCompletenessDecisionCategories {
+	for _, cat := range scopeCompletenessDecisionInvalidatorCategories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,

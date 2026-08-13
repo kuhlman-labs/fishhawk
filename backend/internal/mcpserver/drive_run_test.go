@@ -381,7 +381,7 @@ func newDriveResolver(t *testing.T, f *driveFakeBackend, rec *spawnRecorder) (*r
 		api:               newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
 		getenv:            func(string) string { return "" },
 		drivePollInterval: time.Millisecond,
-		driveSpawn: func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+		driveSpawn: func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 			typ := f.typeForStageID(stageID)
 			rec.add(typ)
 			if rec.fail {
@@ -4226,7 +4226,7 @@ func TestDriveRun_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
 	defer srv.Close()
 	var mu sync.Mutex
 	var gotArgv []string
-	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 		mu.Lock()
 		gotArgv = append([]string(nil), argv...)
 		mu.Unlock()
@@ -4280,7 +4280,7 @@ func TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	r.httpTransport = true
 	var mu sync.Mutex
 	var gotArgv []string
-	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 		mu.Lock()
 		gotArgv = append([]string(nil), argv...)
 		mu.Unlock()
@@ -4333,7 +4333,7 @@ func TestDriveRun_InheritsBoundWorkingDir(t *testing.T) {
 	r.httpTransport = true
 	var mu sync.Mutex
 	var gotArgv []string
-	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 		mu.Lock()
 		gotArgv = append([]string(nil), argv...)
 		mu.Unlock()

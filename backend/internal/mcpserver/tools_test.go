@@ -11458,7 +11458,7 @@ func TestCancelRun_TerminatesDetachedRunner(t *testing.T) {
 	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y"}
 
 	logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
-		os.Environ(), runID.String(), "stage-1", nil)
+		os.Environ(), runID.String(), "stage-1", nil, nil)
 	if err != nil {
 		t.Fatalf("spawnRunnerStageDetached: %v", err)
 	}

@@ -603,6 +603,168 @@ func TestShipPullRequest_SuccessDrivesImplementTerminal(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_IdempotentReplay_TerminalisesRunningStage is the #2630
+// AMPLIFIER half — the defect that turned the sticky re-entry into a permanently
+// stranded run. #1396 self-healed the governance audit entry on the idempotent
+// short-circuit but never drove the stage transition, so a re-ship of an
+// already-persisted artifact left a still-`running` implement stage
+// un-terminalised: the terminal transition rode ONLY on the create-path PR-open
+// event, and an idempotent-suppressed upload settled nothing.
+//
+// This is a COMMITTED-STATE control (counterfactual trap (a)): it asserts on a
+// RE-READ of the stage row after the second ship, NOT the 200 body — a fix that
+// fired and rolled back would return a byte-identical idempotent:true. Deleting
+// the advanceImplementStageAfterPR call on the idempotent path leaves the stage
+// `running` on the re-read and turns this red.
+//
+// The stage is put back into `running` BY CONSTRUCTION between ships (a direct
+// state mutation, not by calling the control), so the RED lands on the terminal-
+// state assertion rather than on fixture setup.
+func TestShipPullRequest_IdempotentReplay_TerminalisesRunningStage(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := validPRBytes(t)
+
+	// Ship 1: the create path persists the artifact and drives the terminal
+	// transition (running → awaiting_approval).
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// BY CONSTRUCTION: put the implement stage back into `running`, modelling the
+	// #2630 shape where the runner exited having settled nothing and the stage was
+	// never terminalised. A direct mutation of the seeded pointer, not a call into
+	// the control under test.
+	rr.mu.Lock()
+	implStage.State = run.StageStateRunning
+	rr.mu.Unlock()
+
+	// Ship 2: identical body → GetByHash hits → the idempotent short-circuit. With
+	// the fix it ALSO drives the terminal transition; without it the stage stays
+	// running.
+	w2 := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second ship status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var resp pullRequestResponse
+	if err := json.NewDecoder(w2.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Idempotent {
+		t.Error("second ship should be marked idempotent=true")
+	}
+
+	// The COMMITTED-STATE assertion: re-read the stage row, do not trust the 200.
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State after idempotent replay = %q, want awaiting_approval (the replay must terminalise a still-running implement stage)", got.State)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (no duplicate on replay)", len(ar.all))
+	}
+	if n := countByCategory(au, "pull_request_opened"); n != 1 {
+		t.Errorf("pull_request_opened entries = %d, want 1 (healed, not duplicated)", n)
+	}
+}
+
+// TestShipPullRequest_IdempotentReplay_AlreadyTerminalNoOp is B2: a replay
+// against a stage that is NOT `running` must not transition it. This pins the
+// SAFETY argument for extending the idempotent path — the create-path guard
+// (implement && running) is what keeps the advance from re-running the gating-
+// reject and lineage checks, because both leave the stage terminally `failed`,
+// never `running`. A stage that failed either check therefore fails this guard
+// and the replay is an unchanged no-op.
+func TestShipPullRequest_IdempotentReplay_AlreadyTerminalNoOp(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := validPRBytes(t)
+
+	// Ship 1 persists the artifact (so the second ship hits GetByHash).
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// BY CONSTRUCTION: drive the stage to a terminal `failed`, modelling a stage
+	// the create path failed on a lineage/gating check.
+	rr.mu.Lock()
+	implStage.State = run.StageStateFailed
+	catB := run.FailureB
+	implStage.FailureCategory = &catB
+	rr.mu.Unlock()
+
+	w2 := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second ship status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("stage.State after replay = %q, want failed unchanged (the guard must not transition a terminal stage)", got.State)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+	if n := countByCategory(au, "pull_request_opened"); n != 1 {
+		t.Errorf("pull_request_opened entries = %d, want 1 (no extra row on the no-op replay)", n)
+	}
+}
+
+// TestShipPullRequest_IdempotentReplay_NonImplementNoTransition is B3: the
+// idempotent-path advance is guarded on Type == implement, so a replay against a
+// non-implement stage must never transition. Deleting the Type guard on the
+// idempotent path (leaving only running) would advance this review stage.
+func TestShipPullRequest_IdempotentReplay_NonImplementNoTransition(t *testing.T) {
+	s, sf, ar, _, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	reviewStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	reviewStage.Type = run.StageTypeReview
+	reviewStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := validPRBytes(t)
+
+	// Ship 1: create path persists the artifact; the advance guard (Type ==
+	// implement) is false so the review stage stays running.
+	if w := shipPRRequest(t, s, runRow.ID, reviewStage.ID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	rr.mu.Lock()
+	reviewStage.State = run.StageStateRunning // keep it running for the replay
+	rr.mu.Unlock()
+
+	w2 := shipPRRequest(t, s, runRow.ID, reviewStage.ID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second ship status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), reviewStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Errorf("non-implement stage.State after replay = %q, want running unchanged (the Type guard must exclude it)", got.State)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+}
+
 // TestShipPullRequest_FailureOutcome_FailsStageC is the #742 failure half:
 // a runner-reported commit/push/PR-open failure body must fail the gated
 // implement stage (category C, retryable) and advance the run — it must
