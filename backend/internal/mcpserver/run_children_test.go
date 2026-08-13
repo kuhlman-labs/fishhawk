@@ -559,6 +559,14 @@ func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree(t *testing
 	// (3) Real operator git repo with a seed commit (worktree add needs one).
 	repo := t.TempDir()
 	gitRunT(t, repo, "init", "-q")
+	// Seed an identity explicitly, the convention the rest of the suite follows.
+	// A fresh temp repo inherits none, and git only falls back to an OS-derived
+	// ident when that ident is usable: the CI runner's is EMPTY, so the commit
+	// below died `exit status 128 / fatal: empty ident name`. It passed locally
+	// only because a developer machine derives a populated name — an
+	// environment dependency, not a property of the test.
+	gitRunT(t, repo, "config", "user.email", "seed@example.com")
+	gitRunT(t, repo, "config", "user.name", "seed")
 	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
