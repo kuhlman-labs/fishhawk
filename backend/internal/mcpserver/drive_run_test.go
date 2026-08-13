@@ -2048,6 +2048,64 @@ func assertDispatchedStaleWarning(t *testing.T, warnings []string) {
 	}
 }
 
+// --- (#2630) production-wiring pin: the spawn call site threads a NON-NIL probe ---
+
+// TestDriveRun_ThreadsNonNilProbeToSpawn is the call-site wiring pin for the
+// #2630 zero-exit strand probe at the drive_run spawn (concern
+// medium/test-coverage). TestReapDetachedRunner_ZeroExitStrandMatrix pins the
+// reaper's DECISION over an injected probe and TestDispatchStage_StageStateProbe
+// pins the probe BUILDER, but neither asserts drive_run.go actually threads a
+// non-nil detachedStageStateProbe into the spawn seam. A regression that reverts
+// the call site to pass nil (dropping `probe := r.stageStateProbe(...)`) would
+// keep every other test green while silently disabling the entire #2630 recovery
+// — reapZeroExitStrand short-circuits on a nil probe — degrading fail-open to the
+// pre-fix permanent-strand behavior with only the ~1h dispatch watchdog as
+// backstop. This wraps the injectable spawn seam to observe the exact probe
+// argument the call site passes, closing the gap without the reaper-goroutine
+// race a full detached-spawn end-to-end would introduce.
+//
+// COUNTERFACTUAL (condition 5): reverting drive_run.go's spawn call to pass a nil
+// probe reddens this on the probeNonNil assertion.
+func TestDriveRun_ThreadsNonNilProbeToSpawn(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0),
+	})
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "plan" {
+			f.setState("plan", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	// Wrap newDriveResolver's recording spawner (which discards the probe) to
+	// observe the probe argument the drive spawn call site threads.
+	var probeSeen, probeNonNil bool
+	inner := r.driveSpawn
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		probeSeen = true
+		probeNonNil = probe != nil
+		return inner(binary, argv, env, runID, stageID, report, probe)
+	}
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged", out.StoppedReason)
+	}
+	if !probeSeen {
+		t.Fatal("drive never reached the spawn seam")
+	}
+	if !probeNonNil {
+		t.Fatal("drive_run spawn call site threaded a NIL probe — the #2630 zero-exit strand recovery is silently disabled at this call site")
+	}
+}
+
 // --- (#1955) dead probe -> auto-re-dispatch (primary done-means) --------------
 
 func TestDriveRun_DispatchedStale_DeadProbe_AutoRedispatches(t *testing.T) {
