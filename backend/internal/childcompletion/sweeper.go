@@ -456,7 +456,11 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 //     DISTINCT conflict — the coverage predicate stays false for as long as the
 //     wave is blocked, so an undeduped emit would append an identical entry
 //     every tick forever → SHORT-CIRCUIT (return false);
-//   - a CLEAN integration (or nothing to integrate) → PROCEED (return true).
+//   - a CLEAN integration OR a no-op (nothing to integrate) → clears BOTH the
+//     shared error counter and the conflict dedup key, then PROCEED (return
+//     true). Clearing on the no-op — not only the integrated=true case — keeps
+//     non-consecutive between-wave errors out of the all-terminal give-up and
+//     lets a conflict that recurs after an external fix be surfaced again.
 func (s *Sweeper) integrateCompletedWave(ctx context.Context, parentRunID, parentStageID uuid.UUID) bool {
 	if s.WaveIntegrate == nil {
 		return true
@@ -489,9 +493,19 @@ func (s *Sweeper) integrateCompletedWave(ctx context.Context, parentRunID, paren
 			s.emitSliceIntegrationConflict(ctx, parentRunID, parentStageID, conflict)
 		}
 		return false
-	case integrated:
-		s.clearIntegrationError(parentRunID)
-		s.clearWaveConflict(parentRunID)
+	}
+	// A CLEAN result — either an integration ran (integrated=true) or nothing
+	// needed integrating (false, nil, nil). BOTH are non-failing, so reset the
+	// SHARED consecutive-error counter AND the conflict dedup key. This must
+	// happen on the no-op too, not only integrated=true: a no-op after prior
+	// errors means those errors were NOT consecutive, so leaving the counter
+	// set would feed them into the all-terminal path's bounded give-up and
+	// trip a premature failure; and a no-op after a prior conflict — e.g. an
+	// external/manual integration resolved it — must clear the dedup key, or a
+	// later recurrence of the same conflict is silently suppressed.
+	s.clearIntegrationError(parentRunID)
+	s.clearWaveConflict(parentRunID)
+	if integrated {
 		s.logger().LogAttrs(ctx, slog.LevelInfo, "childcompletion: integrated a completed wave mid-fan-out",
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("parent_stage_id", parentStageID.String()),

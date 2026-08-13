@@ -1145,6 +1145,128 @@ func TestSweeper_WaveIntegrationDistinctConflictEmitsAgain(t *testing.T) {
 	}
 }
 
+// TestSweeper_WaveIntegrationNoOpAfterConflictEmitsRecurrence covers the
+// error/conflict → clean no-op → recurrence gap (the fix-up concern): a clean
+// no-op result (false, nil, nil) must clear the conflict dedup key, so the SAME
+// conflict recurring after an external/manual integration resolved it (the
+// intervening no-op tick) is surfaced AGAIN rather than suppressed. Sequence:
+// conflict1 (emit) → no-op (clears the key) → conflict1 (emit again). Deleting
+// clearWaveConflict from the no-op path leaves the key set, deduping the third
+// tick down to a single emission and reddening the two-emission assertion.
+func TestSweeper_WaveIntegrationNoOpAfterConflictEmitsRecurrence(t *testing.T) {
+	_, _, rs := midFanOutParent()
+	au := &fakeAudit{}
+	conflict := &SliceConflict{SliceIndex: 1, ChildRunID: uuid.New(), Detail: "slice 1"}
+	wi := &recordingWaveIntegrator{conflict: conflict}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Logger: slog.Default()}
+
+	// Tick 1: the conflict is emitted and its dedup key remembered.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("conflict Tick: %v", err)
+	}
+	// Tick 2: a clean no-op (false, nil, nil) — nothing needed integrating, as
+	// after an external/manual integration resolved the conflict. It must clear
+	// the dedup key.
+	wi.mu.Lock()
+	wi.conflict = nil // integrated stays false, returnErr nil → the no-op
+	wi.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("no-op Tick: %v", err)
+	}
+	// Tick 3: the SAME conflict recurs and must be surfaced again.
+	wi.mu.Lock()
+	wi.conflict = conflict
+	wi.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("recurrence Tick: %v", err)
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == "slice_integration_conflict" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("slice_integration_conflict entries = %d, want 2 (a no-op must clear the dedup key so the recurring conflict re-emits)", n)
+	}
+}
+
+// TestSweeper_WaveIntegrationNoOpResetsErrorCounter covers the counter half of
+// the same concern: a clean no-op must reset the SHARED consecutive-error
+// counter, so accumulated between-wave errors are not carried, as
+// non-consecutive attempts, into the all-terminal settling path's bounded
+// give-up. Sequence: (maxIntegrationAttempts-1) between-wave errors accumulate
+// the counter; a clean no-op resets it; then the children go all-terminal and
+// the settling Integrate errors — which must take the FULL maxIntegrationAttempts
+// fresh ticks to give up. Deleting clearIntegrationError from the no-op path
+// leaves the counter at maxIntegrationAttempts-1, so the FIRST settling error
+// trips the give-up and reddens the no-premature-transition assertion.
+func TestSweeper_WaveIntegrationNoOpResetsErrorCounter(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	succeeded := mkChild(uuid.New(), run.StateSucceeded)
+	pending := mkChild(uuid.New(), run.StatePending)
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {succeeded, pending},
+		},
+	}
+	au := &fakeAudit{}
+	wi := &recordingWaveIntegrator{returnErr: errors.New("github down")}
+	integ := &recordingIntegrator{returnErr: errors.New("consolidated branch D/F conflict")}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Integrate: integ, Logger: slog.Default()}
+
+	// maxIntegrationAttempts-1 between-wave error ticks accumulate the shared counter.
+	for i := 1; i < maxIntegrationAttempts; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("between-wave error Tick %d: %v", i, err)
+		}
+	}
+
+	// A clean no-op between-wave tick (false, nil, nil) must reset the counter.
+	wi.mu.Lock()
+	wi.returnErr = nil // integrated stays false → (false, nil, nil)
+	wi.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("no-op Tick: %v", err)
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 0 {
+		t.Fatalf("transitions after no-op = %v, want 0 (mid-fan-out parent is never settled)", rs.transitions)
+	}
+	// Children now all terminal → the all-terminal settling path runs next tick.
+	rs.childrenByParent[parentRun] = []*run.Run{succeeded, mkChild(pending.ID, run.StateSucceeded)}
+	rs.mu.Unlock()
+
+	// First maxIntegrationAttempts-1 settling error ticks must NOT give up — the
+	// counter was reset by the no-op, so the earlier between-wave errors do not
+	// count toward this give-up.
+	for i := 1; i < maxIntegrationAttempts; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("settling error Tick %d: %v", i, err)
+		}
+		rs.mu.Lock()
+		n := len(rs.transitions)
+		rs.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("give-up fired after %d settling error(s); the no-op did not reset the counter (want the full %d fresh attempts)", i, maxIntegrationAttempts)
+		}
+	}
+	// The maxIntegrationAttempts-th settling error gives up.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("give-up Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateFailed {
+		t.Fatalf("transitions = %v, want one to failed on the maxIntegrationAttempts-th settling error", rs.transitions)
+	}
+}
+
 // TestSweeper_WaveIntegrationErrorSkipsDispatchBackstop pins the short-circuit
 // (the fix-up concern): after a between-wave integration ERROR the tick must
 // return BEFORE the dispatch backstop. The consolidated base is not carrying its
