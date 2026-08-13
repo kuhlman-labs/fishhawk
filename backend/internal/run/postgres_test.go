@@ -1100,6 +1100,24 @@ func TestPostgres_TransitionStageFrom_MatchTransitions(t *testing.T) {
 	}
 }
 
+// TestNewPostgresRepository_ImplementsStageCASTransitioner closes the
+// interface-erasure half the concrete `var _ StageCASTransitioner =
+// (*postgresRepo)(nil)` assertion cannot cover (#2672): the constructor's
+// declared return type is the Repository INTERFACE, so a future decorator
+// returned from NewPostgresRepository could erase the CAS capability while the
+// concrete-value assertion stayed green. Asserting the returned VALUE satisfies
+// run.StageCASTransitioner pins that the reap path's hard requirement survives
+// whatever the constructor wraps around the repo. Pool-free: the constructor
+// only stores the field (postgres.go:37) and never dereferences it, so this
+// needs no testcontainer.
+func TestNewPostgresRepository_ImplementsStageCASTransitioner(t *testing.T) {
+	repo := run.NewPostgresRepository(nil)
+	if _, ok := repo.(run.StageCASTransitioner); !ok {
+		t.Fatalf("NewPostgresRepository(nil) returned a %T that does not implement run.StageCASTransitioner; "+
+			"the reap path would refuse it at runtime", repo)
+	}
+}
+
 func TestPostgres_ListStagesForRun_OrderedBySequence(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)

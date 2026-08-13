@@ -247,6 +247,59 @@ func TestResolveReviewResolution(t *testing.T) {
 	})
 }
 
+// TestRunRepoCASWiringError pins the boot-time CAS-capability refusal (#2672):
+// a nil repo and a CAS-capable repo boot clean; a non-nil repo lacking
+// run.StageCASTransitioner refuses startup with an error naming the missing
+// interface. runpkg.BaseFake is the no-capability vehicle (it implements
+// Repository but not TransitionStageFrom); runpkg.NewPostgresRepository(nil) is
+// the CAS-capable vehicle, constructed pool-free.
+func TestRunRepoCASWiringError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		repo    runpkg.Repository
+		wantErr bool
+	}{
+		{"nil repo boots (DB-less)", nil, false},
+		{"non-CAS repo refuses startup", runpkg.BaseFake{}, true},
+		{"postgres repo boots", runpkg.NewPostgresRepository(nil), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fail fast if the no-capability vehicle silently regained the
+			// capability — a vacuous pass otherwise.
+			if _, ok := tc.repo.(runpkg.StageCASTransitioner); ok && tc.wantErr {
+				t.Fatalf("vehicle %T unexpectedly implements StageCASTransitioner", tc.repo)
+			}
+			err := runRepoCASWiringError(tc.repo)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("runRepoCASWiringError(%T) = nil, want an error", tc.repo)
+				}
+				if !strings.Contains(err.Error(), "StageCASTransitioner") {
+					t.Errorf("error does not name the missing interface: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("runRepoCASWiringError(%T) = %v, want nil", tc.repo, err)
+			}
+		})
+	}
+}
+
+// TestServe_BootsWithNilRunRepo pins that the nil-RunRepo branch of the #2672
+// boot check stays inert: a database-less runServe leaves cfg.RunRepo nil and
+// must NOT emit "run repository wiring refused startup". The bootstrapAbortFlag
+// carries startup past the boot check (which precedes server.New) to a
+// deliberately-invalid --review-resolution, so reaching exitFailure without the
+// refusal log proves the nil branch did not fire.
+func TestServe_BootsWithNilRunRepo(t *testing.T) {
+	code, log := serveWithProfile(t, bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid --review-resolution, AFTER the boot check); log:\n%s", code, exitFailure, log)
+	}
+	if strings.Contains(log, "run repository wiring refused startup") {
+		t.Errorf("a DB-less boot (nil RunRepo) must not emit the wiring-refusal log:\n%s", log)
+	}
+}
+
 // TestResolveImplementModelConfig covers the implement-model deployment config
 // resolution (#1013): the default model env/flag and the per-adapter
 // allowed-model policy parse, plus the empty/fail-open default.

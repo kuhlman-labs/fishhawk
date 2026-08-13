@@ -574,6 +574,38 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) (server
 	return set, nil
 }
 
+// runRepoCASWiringError is the boot-time refusal for a run repository that
+// cannot serve the reap path (#2672). It is a STARTUP check, never per-request:
+// runServe calls it exactly once, immediately before server.New, after every
+// decorator has been applied to cfg.RunRepo.
+//
+//   - A nil repo returns nil: a database-less boot legitimately leaves RunRepo
+//     nil and the reap endpoint already answers 503 reap_failure_unconfigured.
+//   - A repo implementing runpkg.StageCASTransitioner returns nil (production
+//     postgresRepo always does — guaranteed by the compile-time assertion in
+//     run/postgres.go).
+//   - Any other non-nil repo returns an error naming the concrete type and the
+//     missing interface: the reap path would refuse EVERY report at runtime
+//     (failStageForReap → errReapRepoNotCAS → 503 reap_failure_repo_not_cas)
+//     rather than degrade to run.FailStage, which could destroy a live park. So
+//     this cell refuses to boot rather than run a daemon whose reap path is
+//     inert.
+//
+// The error is RETURNED (not logged here) so the runServe call site is the
+// single distinctive point that logs the refusal and returns exitFailure,
+// mirroring the #2107 resolvePlanReviewers convention.
+func runRepoCASWiringError(repo runpkg.Repository) error {
+	if repo == nil {
+		return nil
+	}
+	if _, ok := repo.(runpkg.StageCASTransitioner); ok {
+		return nil
+	}
+	return fmt.Errorf("run repository %T does not implement run.StageCASTransitioner; the reap-failure path "+
+		"(POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure) would refuse every report at runtime rather than "+
+		"degrade to run.FailStage, which can fail a live park. Wire a CAS-capable run repository", repo)
+}
+
 // regionPinOptions carries the two env values that decide whether this cell
 // participates in regional handoffs (ADR-062, E44.7 / #1831).
 type regionPinOptions struct {
@@ -2340,6 +2372,20 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.Bool("database", pool != nil),
 			slog.Bool("identity_provider", cfg.IdentityProvider != nil),
 			slog.String("ref", "#2071"))
+	}
+
+	// Fail FAST at wiring time if the run repository cannot serve the reap path
+	// (#2672). Called ONCE here — after every decorator has been applied to
+	// cfg.RunRepo — so the check sees the final wired value. A DB-less boot
+	// leaves RunRepo nil and is unaffected (the reap endpoint already answers 503
+	// reap_failure_unconfigured); a non-nil repo lacking run.StageCASTransitioner
+	// would make the reap path refuse every report at runtime, so we refuse to
+	// boot instead. The error is returned by the helper and logged HERE, at the
+	// single distinctive call site (#2107 convention), so a call site that
+	// discarded it would emit no refusal log at all.
+	if err := runRepoCASWiringError(cfg.RunRepo); err != nil {
+		logger.Error("run repository wiring refused startup", slog.String("error", err.Error()), slog.String("ref", "#2672"))
+		return exitFailure
 	}
 
 	srv := server.New(cfg)
