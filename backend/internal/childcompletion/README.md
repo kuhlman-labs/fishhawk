@@ -31,6 +31,8 @@ The fan-in above is the SETTLING one: it runs only once every child is terminal.
 
 `resolveParent`'s NOT-all-terminal branch now calls the nil-safe `Sweeper.WaveIntegrate` (a `WaveIntegrator` whose serve.go adapter delegates to `orchestrator.IntegrateCompletedWave`) IMMEDIATELY BEFORE the `Dispatch` backstop. The ordering is load-bearing: topping the dispatch up first would hand a newly-unblocked child to a host-dispatch that refuses it `409 wave_not_integrated`.
 
+`integrateCompletedWave` returns whether the tick may PROCEED to the dispatch backstop. An **error** or a **conflict** returns false and `resolveParent` short-circuits (`return nil`) rather than falling through to `DispatchChildren`: the consolidated base is not carrying its predecessors' commits, so a child topped up now is refused `409 wave_not_integrated`, and — on the error path — a dispatch attempt would mask the un-integrated state behind a spawn. A **clean** integration (or nothing to integrate, or a nil `WaveIntegrate`) returns true so a newly-unblocked wave is still topped up. `TestSweeper_WaveIntegration{Error,Conflict}SkipsDispatchBackstop` pin the short-circuit; `TestSweeper_WaveIntegrationCleanRunsDispatchBackstop` discriminates it from a blanket skip.
+
 `IntegrateCompletedWave` attempts a merge only when a NON-TERMINAL child's slice declares dependencies that have all succeeded AND are not already covered by the newest `slices_integrated` entry (the steady-state short-circuit — see `backend/internal/orchestrator/README.md`), so the sweeper does not re-merge on every tick for the rest of the fan-out.
 
 Failure posture — this runs on a parent MID-FAN-OUT that it must never settle:

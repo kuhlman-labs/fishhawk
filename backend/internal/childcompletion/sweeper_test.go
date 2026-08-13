@@ -1145,6 +1145,71 @@ func TestSweeper_WaveIntegrationDistinctConflictEmitsAgain(t *testing.T) {
 	}
 }
 
+// TestSweeper_WaveIntegrationErrorSkipsDispatchBackstop pins the short-circuit
+// (the fix-up concern): after a between-wave integration ERROR the tick must
+// return BEFORE the dispatch backstop. The consolidated base is not carrying its
+// predecessors' commits, so topping the dispatch up would hand a child to a
+// host-dispatch that refuses it 409 wave_not_integrated. Deleting the
+// `if !s.integrateCompletedWave(...) { return nil }` guard reddens the
+// zero-dispatch assertion.
+func TestSweeper_WaveIntegrationErrorSkipsDispatchBackstop(t *testing.T) {
+	_, _, rs := midFanOutParent()
+	wi := &recordingWaveIntegrator{returnErr: errors.New("github down")}
+	disp := &recordingDispatcher{returnN: 1}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Dispatch: disp, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	disp.mu.Lock()
+	defer disp.mu.Unlock()
+	if len(disp.calls) != 0 {
+		t.Errorf("DispatchChildren calls = %v, want none (a between-wave error must short-circuit the tick before the dispatch backstop)", disp.calls)
+	}
+}
+
+// TestSweeper_WaveIntegrationConflictSkipsDispatchBackstop pins the same
+// short-circuit for the CONFLICT arm: the dependent child must stay refused at
+// the host-dispatch 409, which the sweeper enforces by not attempting the
+// dispatch at all once the between-wave merge conflicts. Deleting the guard
+// reddens the zero-dispatch assertion.
+func TestSweeper_WaveIntegrationConflictSkipsDispatchBackstop(t *testing.T) {
+	_, _, rs := midFanOutParent()
+	wi := &recordingWaveIntegrator{conflict: &SliceConflict{SliceIndex: 1, ChildRunID: uuid.New(), Detail: "slice 1"}}
+	disp := &recordingDispatcher{returnN: 1}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Dispatch: disp, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	disp.mu.Lock()
+	defer disp.mu.Unlock()
+	if len(disp.calls) != 0 {
+		t.Errorf("DispatchChildren calls = %v, want none (a between-wave conflict must short-circuit the tick before the dispatch backstop)", disp.calls)
+	}
+}
+
+// TestSweeper_WaveIntegrationCleanRunsDispatchBackstop is the positive control
+// discriminating the short-circuit from a blanket skip: on a CLEAN between-wave
+// integration the tick must still reach the dispatch backstop so a
+// newly-unblocked wave gets topped up. If the guard were `return nil`
+// unconditionally, this reddens.
+func TestSweeper_WaveIntegrationCleanRunsDispatchBackstop(t *testing.T) {
+	parentRun, _, rs := midFanOutParent()
+	wi := &recordingWaveIntegrator{integrated: true}
+	disp := &recordingDispatcher{returnN: 1}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Dispatch: disp, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	disp.mu.Lock()
+	defer disp.mu.Unlock()
+	if len(disp.calls) != 1 || disp.calls[0] != parentRun {
+		t.Errorf("DispatchChildren calls = %v, want one for parent %s (a clean between-wave integration must proceed to the dispatch backstop)", disp.calls, parentRun)
+	}
+}
+
 // TestSweeper_NilWaveIntegrateIsNoOp asserts the nil-safe field preserves the
 // pre-#2363 posture exactly: the not-all-terminal branch still returns cleanly
 // with no transition and no panic.
