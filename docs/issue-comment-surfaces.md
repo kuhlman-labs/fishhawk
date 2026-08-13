@@ -1148,10 +1148,16 @@ Notes:
   rows. Nothing in `issuecomment` POSTS either (a timeline render, not a comment
   surface).
   `server/scope_amendment.go` writes the requested entry (agent actor, payload
-  `{amendment_id, paths, reason, remaining_budget}`) when the implement agent files
-  a mid-stage scope amendment request, and the decided entry (user actor, payload
-  `{amendment_id, decision, reason, decided_by}`) when the operator approves or
-  denies it. The requested entry doubles as the operator's `fishhawk_await_audit`
+  `{amendment_id, paths, reason, remaining_budget}`, plus the optional #983
+  headroom pair `effective_scope_files_after_approval` + `max_files_changed` when
+  a cap resolves, plus — when the #2540 deadline derivation does NOT fail open —
+  the deadline observability pair `stage_deadline_seconds_remaining` +
+  `amendment_poll_window_seconds` (display numbers only, never a refusal — #2540
+  approval condition 1); a fail-open derivation carries neither, keeping the base
+  key set byte-identical)
+  when the implement agent files a mid-stage scope amendment request, and the
+  decided entry (user actor, payload `{amendment_id, decision, reason,
+  decided_by}`) when the operator approves or denies it. The requested entry doubles as the operator's `fishhawk_await_audit`
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.

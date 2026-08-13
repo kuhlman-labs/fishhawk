@@ -1741,15 +1741,21 @@ func writeFixupPriorDiff(b *strings.Builder, t Trigger) {
 // MIRRORED by the mcpserver package constant amendmentPollWindowMinutes in
 // backend/internal/mcpserver/amendment_window.go, from which the operator-facing
 // fishhawk_decide_scope_amendment / fishhawk_await_stage / fishhawk_dispatch_stage
-// tool docs render the same figure. That constant unifies the mcpserver Go
-// surfaces only — it cannot render this prompt text or the operator READMEs — so
-// a correction to the number is three edits (here, the constant, the READMEs),
-// kept honest by the mcpserver guard test rather than a single source of truth.
+// tool docs render the same figure, and by backend/internal/server's
+// AmendmentPollWindowSeconds (900), the SERVER-side window it surfaces
+// OBSERVABILITY-ONLY on a request response (stage_deadline_seconds_remaining +
+// amendment_poll_window_seconds, #2540) — a display figure, never a refusal. No
+// single constant unifies all four — the packages cannot share one without
+// dragging deps across binaries — so a correction to the number is four edits
+// (here, the mcpserver constant, the server constant, the READMEs). The
+// server↔mcpserver copies are pinned equal by a cross-package test
+// (mcpserver/stage_wait_test.go), and the retired-wording tripwire keeps this
+// text honest, rather than a single source of truth.
 func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("### Mid-stage scope amendments\n\n")
 	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
 	b.WriteString("\n")
-	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
+	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files. The POST response also reports this stage's remaining wall clock (`stage_deadline_seconds_remaining`) against the amendment poll window (`amendment_poll_window_seconds`, ~15 minutes) when it can derive them — observability so you can gauge whether a decision is likely to land in time; they are informational only and never a refusal.\n")
 	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed. Then take the branch that matches what you observed, and note the difference between the two ways the wait can end: a `denied` status is a DECISION — the operator answered no and left you a `decision_reason` (step 4). A request still `pending` at the ~15-minute cap is an EXPIRY — the operator has not answered, your request stays live, and you MUST NOT treat it as a refusal or state that the operator denied it (step 5).\n")
 	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
 	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope ONLY if the adaptation still satisfies the issue's done-means. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN. If the correct change is genuinely impossible without the denied path, STOP and fail loud: surface it in your final response and commit NO done-means-violating implementation, rather than shipping a green-but-wrong workaround of the boundary (run 5aaf89fa / #1170).\n")

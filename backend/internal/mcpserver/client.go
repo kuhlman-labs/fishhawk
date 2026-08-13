@@ -2866,8 +2866,17 @@ type Stage struct {
 	EndedAt         *time.Time    `json:"ended_at,omitempty"`
 	FailureCategory *string       `json:"failure_category,omitempty"`
 	FailureReason   *string       `json:"failure_reason,omitempty"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
+	// AgentTimeoutSeconds mirrors the backend stageResponse.agent_timeout_seconds
+	// (#2540): the spec-resolved agent wall clock the runner enforces for this
+	// stage. The stage-wait deadline derivation reads it to report a non-terminal
+	// stage's remaining budget (deadline_seconds_remaining). Zero when the
+	// backend could not resolve it (legacy row, absent/unparseable spec) or on an
+	// older backend that omits the key — the derivation then reports no deadline
+	// (nil), the mixed-version degrade. The json tag MUST byte-match the backend
+	// or the field silently decodes to zero — the #371-class wire-mirror trap.
+	AgentTimeoutSeconds int       `json:"agent_timeout_seconds,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // StageExecutor mirrors the OpenAPI sub-schema. The closed-set

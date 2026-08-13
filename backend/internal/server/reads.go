@@ -45,6 +45,17 @@ type stageResponse struct {
 	// (handleGetStage, handleListRunStages); the action endpoints that
 	// build a stageResponse leave it at the empty default.
 	ResolvedModel string `json:"resolved_model"`
+	// AgentTimeoutSeconds is the spec-resolved agent wall clock the runner
+	// enforces for this stage (agent_timeout_seconds), surfaced so the operator
+	// can see a stage's remaining budget — and, folded against elapsed by the
+	// MCP StageWaitStatus, whether a mid-stage scope amendment can still be
+	// decided in time (#2540). Plain int (NOT omitempty), mirroring
+	// resolved_model: the response always carries the field; 0 means unresolved
+	// (a legacy run, an absent/unparseable workflow_spec, or a stage not matched
+	// in the spec — resolveAgentTimeout is fail-open). Populated only by the two
+	// observability read handlers (handleGetStage, handleListRunStages); the
+	// action endpoints that build a stageResponse leave it at the zero default.
+	AgentTimeoutSeconds int `json:"agent_timeout_seconds"`
 }
 
 type stageExecutor struct {
@@ -148,10 +159,21 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch the run row ONCE and reuse it across the stage loop for the
+	// spec-resolved agent_timeout_seconds (#2540). A run-fetch failure leaves
+	// runRow nil and every stage's budget at 0 — fail open, mirroring
+	// resolveAgentTimeout's own absent/unparseable-spec degrade.
+	var runRow *run.Run
+	if rr, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID); gerr == nil {
+		runRow = rr
+	}
 	items := make([]stageResponse, 0, len(stages))
 	for _, st := range stages {
 		resp := toStageResponse(st)
 		resp.ResolvedModel = s.resolvedModelForStage(r.Context(), st)
+		if runRow != nil {
+			resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, st.Type)
+		}
 		items = append(items, resp)
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"items": items})
@@ -185,6 +207,11 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := toStageResponse(got)
 	resp.ResolvedModel = s.resolvedModelForStage(r.Context(), got)
+	// Spec-resolved agent wall clock (#2540), fetched by the stage's run id.
+	// Fail open to 0 on a run-fetch error or unparseable spec.
+	if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), got.RunID); gerr == nil {
+		resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, got.Type)
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

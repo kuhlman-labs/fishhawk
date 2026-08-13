@@ -1566,8 +1566,8 @@ type GetRunStatusOutput struct {
 	// terminal per the ADR-036 #874 backstop). Distinct from the *ReviewStatus
 	// pair above, which tracks a stage's REVIEW rather than its execution.
 	// Omitted (nil) when no stage of that type exists in the run.
-	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no plan stage exists"`
-	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no implement stage exists"`
+	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no plan stage exists"`
+	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — a filed scope amendment needs at least the amendment poll window of remaining budget to be decidable. Omitted when no implement stage exists"`
 	// AcceptanceStageWaitStatus summarizes the acceptance stage's EXECUTION
 	// lifecycle (E31.9 / ADR-049), computed via the same generic
 	// stageWaitStatusFor helper. Omitted (nil) when the workflow declares no
@@ -1575,7 +1575,7 @@ type GetRunStatusOutput struct {
 	// FAILED acceptance VERDICT leaves the stage 'succeeded' — this field
 	// tracks stage EXECUTION, not the verdict; read the acceptance_outcome_recorded
 	// audit entry (and next_actions) for the verdict + triage disposition.
-	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
+	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -1717,7 +1717,12 @@ await a stage's terminal status: while the status is non-terminal
 (pending/running) the StageWaitStatus carries a server-suggested
 poll_interval_seconds (30s) — re-call get_run_status on that cadence until
 the status goes terminal. (The interval is dropped once the run itself is
-terminal, so the wait never strands.) A client that BACKGROUNDS long tool
+terminal, so the wait never strands.) A non-terminal StageWaitStatus also
+carries the stage's remaining agent budget when the wall clock is known —
+elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — so an
+operator can see how much runtime is left; a mid-stage scope amendment needs at
+least the amendment poll window of remaining budget to be decidable before the
+runner kills the stage. A client that BACKGROUNDS long tool
 calls needs no polling at all — the blocking verbs (fishhawk_run_stage /
 fishhawk_run_children) give it clean async semantics for free; and after a
 fishhawk_dispatch_stage, fishhawk_await_stage is the single terminal wait to

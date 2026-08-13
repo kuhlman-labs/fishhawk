@@ -619,6 +619,14 @@ var runStatusPathTable = []pathClassification{
 	{Path: "stages[].type", Tier: tierNever},
 	{Path: "stages[].state", Tier: tierNever},
 	{Path: "stages[].failure_category", Tier: tierNever},
+	// agent_timeout_seconds (#2540) is a small spec-resolved scalar that is a
+	// REDUNDANT decode-mirror of the authoritative operator-facing budget carried
+	// on {plan,implement,acceptance}_stage_wait_status.agent_timeout_seconds (each
+	// a tierNever leaf). Being redundant it is not worth a per-tier elision entry
+	// — classifying it tierNever (like type/state) rides it along without adding a
+	// skeleton-ledger entry, so it neither bypasses the budget nor perturbs the
+	// diagnosis-skeleton size the floor assertions pin.
+	{Path: "stages[].agent_timeout_seconds", Tier: tierNever},
 	{Path: "stages[].failure_reason", Tier: "T7", Class: classOversizedCapable, Surfaces: restStages, Unbounded: unboundedStages},
 	{Path: "stages[].id", Tier: "skeleton", Class: classStored, Surfaces: restStages},
 	{Path: "stages[].run_id", Tier: "skeleton", Class: classStored, Surfaces: restStages},

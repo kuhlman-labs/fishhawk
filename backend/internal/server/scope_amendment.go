@@ -38,6 +38,41 @@ const CategoryScopeAmendmentDecided = "scope_amendment_decided"
 // budget posture (defaultMaxFixupPasses).
 const maxScopeAmendmentsPerStage = 2
 
+// AmendmentPollWindowSeconds is the server-side mirror of the mid-stage
+// scope-amendment poll window — the length of time the implement agent keeps
+// polling a filed amendment before it gives up (an EXPIRY; the request stays
+// `pending`, an expiry is NOT a denial). It is surfaced OBSERVABILITY-ONLY on a
+// freshly-filed amendment's request response (amendment_poll_window_seconds)
+// beside the stage's remaining agent wall clock (stage_deadline_seconds_remaining),
+// so an operator can see whether a race against the deadline is already lost
+// (#2540). It is NOT a refusal threshold: the server never tells the agent to
+// skip its wait, because the remaining-budget estimate is uncertain in the
+// pessimistic direction (started_at precedes the real agent clock, and an
+// operator retry can leave a cumulative started_at), so a computed "too short"
+// remainder can be a false positive — and refusing a WINNABLE amendment is
+// strictly worse than the race it would guard against (#2540 approval
+// condition 1). The value is displayed, not acted on.
+//
+// It is EXPORTED for ONE reason: the cross-package drift guard condition #2540
+// requires. The same figure lives on FOUR surfaces that must not silently
+// desynchronize, because the observability comparison is only meaningful while
+// the copies agree:
+//
+//   - this constant (900s — the window the server surfaces),
+//   - backend/internal/prompt/prompt.go's writeScopeAmendments (the "~15
+//     minutes" text the agent actually follows),
+//   - backend/internal/mcpserver/amendment_window.go's amendmentPollWindowMinutes
+//     (15 — the operator-facing tool-doc figure),
+//   - backend/internal/mcpserver/README.md (operator prose).
+//
+// The next correction to the figure is that known edit set. Package boundaries
+// prevent a single shared constant (mcpserver deliberately does not import this
+// package — it would drag pgx into fishhawk-mcp), so the sync is pinned instead
+// by a cross-package equality test: mcpserver/stage_wait_test.go asserts
+// AmendmentPollWindowSeconds == amendmentPollWindowMinutes*60, so a change to
+// either side reddens rather than silently desyncing the surfaced window.
+const AmendmentPollWindowSeconds = 900
+
 // maxScopeAmendmentWaitSeconds caps the opt-in server-side long-poll on
 // GET /v0/runs/{run_id}/scope-amendments (?wait=<seconds>, #1035). A
 // single ?wait holds the connection at most this long before returning
@@ -90,6 +125,86 @@ type scopeAmendmentResponse struct {
 	// misleading.
 	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty"`
 	MaxFilesChanged                  *int `json:"max_files_changed,omitempty"`
+	// Deadline observability (#2540), OBSERVABILITY-ONLY. On a REQUEST response
+	// (and only when the deadline derivation did NOT fail open):
+	// StageDeadlineSecondsRemaining is the executing implement stage's REMAINING
+	// agent wall clock and AmendmentPollWindowSeconds is the agent's poll window
+	// (AmendmentPollWindowSeconds constant), so an operator can see whether a race
+	// against the deadline is already lost. There is DELIBERATELY no refusal
+	// signal: the remainder can be understated (started_at precedes the real agent
+	// clock; an operator retry can leave a cumulative started_at), so a "too short"
+	// remainder can be a false positive, and refusing a winnable amendment is the
+	// regression #2540 approval condition 1 forbids — the numbers are displayed,
+	// never acted on. Both are omitted when the derivation failed open (see
+	// amendmentDeadlineRemaining) so the wire shape is then byte-identical to
+	// pre-#2540. Absent on list/decision responses.
+	StageDeadlineSecondsRemaining *int `json:"stage_deadline_seconds_remaining,omitempty"`
+	AmendmentPollWindowSeconds    *int `json:"amendment_poll_window_seconds,omitempty"`
+}
+
+// amendmentDeadline is the resolved, non-fail-open deadline derivation for a
+// freshly-filed amendment: the executing implement stage's remaining agent
+// wall clock and the agent's poll window, surfaced OBSERVABILITY-ONLY so an
+// operator can see how tight the race is. Nil whenever amendmentDeadlineRemaining
+// failed open — in which case the response and audit carry no deadline fields
+// and behave exactly as pre-#2540. Deliberately carries no "undecidable" verdict:
+// the remainder can be understated, so a refusal computed from it could kill a
+// winnable amendment (#2540 approval condition 1).
+type amendmentDeadline struct {
+	remaining int
+	window    int
+}
+
+// amendmentDeadlineRemaining derives the executing implement stage's REMAINING
+// agent wall clock: the spec-resolved agent_timeout_seconds budget minus the
+// stage's elapsed time. It gates ONLY the OBSERVABILITY numbers on the request
+// response (stage_deadline_seconds_remaining + amendment_poll_window_seconds):
+// it returns ok=true with the remainder when that remainder is meaningfully
+// derivable, and otherwise FAILS OPEN (ok=false), which the caller treats as
+// "surface no deadline numbers, behave exactly as pre-#2540". It NEVER drives a
+// refusal — the remainder is uncertain in the pessimistic direction, so a
+// computed "too short" could kill a WINNABLE amendment, the regression #2540
+// approval condition 1 forbids. It fails open in four named uncertainty cases:
+//
+//	(a) budgetSeconds <= 0  — the spec budget is unresolvable (absent /
+//	    unparseable workflow_spec, or the stage is not matched in the spec);
+//	    resolveAgentTimeout already returns 0 there.
+//	(b) startedAt == nil    — the stage has never started, so there is no clock
+//	    to measure elapsed against.
+//	(c) remaining <= 0      — elapsed already meets/exceeds the whole budget. A
+//	    LIVE agent posting this request proves the deadline has NOT literally
+//	    passed, so a non-positive remainder evidences a bad derivation (the
+//	    stage's recorded started_at precedes the agent's real clock start), not
+//	    a passed deadline — refusing on it would be a false positive.
+//	(d) selfRetryCount > 0  — stages.started_at is written under
+//	    COALESCE(started_at, $3) and never overwritten, so a re-spawned stage's
+//	    elapsed is CUMULATIVE and its remainder UNDERSTATED (the same caveat
+//	    documented on stageElapsed in backend/internal/mcpserver/stage_wait.go).
+//
+// Because the remainder is only ever DISPLAYED, never used to refuse, these
+// cases cost nothing when they misfire: the worst outcome is that a slightly
+// understated (but still ok=true) remainder is shown, or that the numbers are
+// omitted entirely on a fail-open. There is deliberately no attempt to detect
+// the operator-retry-without-SelfRetryCount case (which leaves a cumulative
+// started_at indistinguishable from a first run) — a refusal built on it could
+// kill a winnable amendment, the regression #2540 approval condition 1 forbids,
+// so no refusal is built at all. Pure and table-testable; the handler supplies
+// the clock.
+func amendmentDeadlineRemaining(budgetSeconds int, startedAt *time.Time, selfRetryCount int, now time.Time) (remaining int, ok bool) {
+	if budgetSeconds <= 0 { // (a)
+		return 0, false
+	}
+	if startedAt == nil { // (b)
+		return 0, false
+	}
+	if selfRetryCount > 0 { // (d)
+		return 0, false
+	}
+	remaining = budgetSeconds - int(now.Sub(*startedAt).Seconds())
+	if remaining <= 0 { // (c)
+		return 0, false
+	}
+	return remaining, true
 }
 
 // scopeAmendmentListResponse is the GET list envelope.
@@ -267,8 +382,30 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	}
 
 	effective, maxFiles := s.amendmentHeadroom(r.Context(), amendment)
+
+	// Derive the executing implement stage's remaining agent wall clock for the
+	// #2540 OBSERVABILITY numbers (stage_deadline_seconds_remaining +
+	// amendment_poll_window_seconds), so an operator can see how tight the race
+	// against the deadline is. The budget is the spec-resolved
+	// agent_timeout_seconds the runner enforces; a run-fetch failure degrades to
+	// budget 0, i.e. FAIL OPEN (resolveAgentTimeout is already fail-open on an
+	// absent/unparseable spec), so the numbers are simply omitted when the
+	// remainder is not meaningfully derivable. The remainder NEVER refuses the
+	// amendment — it is displayed, not acted on (#2540 approval condition 1).
+	budgetSeconds := 0
+	if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID); gerr == nil {
+		budgetSeconds = s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)
+	}
+	var deadline *amendmentDeadline
+	if remaining, ok := amendmentDeadlineRemaining(budgetSeconds, stage.StartedAt, stage.SelfRetryCount, time.Now().UTC()); ok {
+		deadline = &amendmentDeadline{
+			remaining: remaining,
+			window:    AmendmentPollWindowSeconds,
+		}
+	}
+
 	s.writeScopeAmendmentRequestedAudit(r, amendment, id.Subject,
-		maxScopeAmendmentsPerStage-used-1, effective, maxFiles)
+		maxScopeAmendmentsPerStage-used-1, effective, maxFiles, deadline)
 
 	// Fire the page-class ping immediately (#1786): a scope-amendment request
 	// is a must_page_human event that always parks for an operator decision
@@ -280,6 +417,11 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	resp := amendmentToResponse(amendment)
 	resp.EffectiveScopeFilesAfterApproval = effective
 	resp.MaxFilesChanged = maxFiles
+	if deadline != nil {
+		remaining, window := deadline.remaining, deadline.window
+		resp.StageDeadlineSecondsRemaining = &remaining
+		resp.AmendmentPollWindowSeconds = &window
+	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
@@ -577,7 +719,7 @@ func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID
 // chain entry. Best-effort: a failure logs but doesn't unwind the
 // request — the row is the durable record; the audit entry is the
 // operator's await anchor (fishhawk_await_audit, #977).
-func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int) {
+func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int, deadline *amendmentDeadline) {
 	actorKind := audit.ActorAgent
 	payloadMap := map[string]any{
 		"amendment_id":     a.ID.String(),
@@ -588,6 +730,15 @@ func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamen
 	if effectiveAfterApproval != nil && maxFiles != nil {
 		payloadMap["effective_scope_files_after_approval"] = *effectiveAfterApproval
 		payloadMap["max_files_changed"] = *maxFiles
+	}
+	// Deadline observability (#2540): carried ONLY when the derivation did not
+	// fail open, so a fail-open request keeps the pre-#2540 key set
+	// {amendment_id, paths, reason, remaining_budget} byte-identical — the
+	// fishhawk_await_audit anchor and the page-class ping are unchanged. These are
+	// display numbers only; there is no undecidable/refusal key (condition 1).
+	if deadline != nil {
+		payloadMap["stage_deadline_seconds_remaining"] = deadline.remaining
+		payloadMap["amendment_poll_window_seconds"] = deadline.window
 	}
 	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID

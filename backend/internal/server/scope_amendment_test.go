@@ -268,6 +268,275 @@ func TestRequestScopeAmendment_HappyPath(t *testing.T) {
 	}
 }
 
+// implementSpec3600 is a feature_change workflow whose implement stage declares
+// an explicit 60m executor timeout, so resolveAgentTimeout(implement) resolves a
+// known 3600s budget (no plan artifact / calibration widens it) — the
+// deadline-derivation handler tests seed the stage's started_at relative to it.
+const implementSpec3600 = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: 60m
+        produces:
+          - artifact: pull_request
+`
+
+// scopeAmendmentServerWithBudget is scopeAmendmentServer with the run given a
+// spec whose implement stage resolves a positive agent_timeout_seconds, so the
+// #2540 deadline derivation runs instead of failing open on an absent spec.
+func scopeAmendmentServerWithBudget(t *testing.T) (*Server, *fakeScopeAmendmentRepo, *auditCapture, *run.Run, *run.Stage) {
+	t.Helper()
+	s, _, sa, au, runRow, stage := scopeAmendmentServer(t)
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = []byte(implementSpec3600)
+	return s, sa, au, runRow, stage
+}
+
+// requireDeadlineFieldsAbsent asserts the response and audit payload carry NONE
+// of the #2540 deadline fields — the fail-open wire shape, byte-identical to
+// pre-#2540. It checks BOTH the decoded struct (pointers nil) AND the raw JSON
+// bytes for key absence, so a regression that started serializing a zero-valued
+// field cannot pass this vacuously (test-vacuity guard).
+func requireDeadlineFieldsAbsent(t *testing.T, w *httptest.ResponseRecorder, au *auditCapture) {
+	t.Helper()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StageDeadlineSecondsRemaining != nil {
+		t.Errorf("stage_deadline_seconds_remaining = %v, want absent (fail open)", *resp.StageDeadlineSecondsRemaining)
+	}
+	if resp.AmendmentPollWindowSeconds != nil {
+		t.Errorf("amendment_poll_window_seconds = %v, want absent (fail open)", *resp.AmendmentPollWindowSeconds)
+	}
+	// Raw-body key absence: pin the byte-level wire, not just the decoded struct.
+	// The removed undecidable_before_deadline key must never reappear, and the two
+	// deadline keys must be absent on a fail open.
+	for _, key := range []string{"undecidable_before_deadline", "stage_deadline_seconds_remaining", "amendment_poll_window_seconds"} {
+		if strings.Contains(w.Body.String(), key) {
+			t.Errorf("response body carries %q key on a fail open, want absent:\n%s", key, w.Body.String())
+		}
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	// The base key set must be byte-identical to pre-#2540: the fishhawk_await_audit
+	// anchor and page-class ping depend on it.
+	wantKeys := map[string]bool{"amendment_id": true, "paths": true, "reason": true, "remaining_budget": true}
+	for k := range payload {
+		if !wantKeys[k] {
+			t.Errorf("audit payload carries unexpected key %q (fail open must add none): %v", k, payload)
+		}
+	}
+	for k := range wantKeys {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("audit payload missing base key %q: %v", k, payload)
+		}
+	}
+}
+
+// TestAmendmentDeadlineRemaining is the pure-function table pinning the deadline
+// derivation and — decisively (#2540 approval condition 1) — the FAIL-OPEN
+// direction of every uncertainty case: an uncertain input must PARK (ok=false)
+// so the observability numbers are simply omitted. The derivation NEVER drives a
+// refusal, so a misfire costs at most a hidden number, never a killed amendment.
+// It is the counterfactual vehicle for the selfRetryCount and
+// non-positive-remainder clauses: deleting either fail-open clause makes its row
+// return a positive remainder with ok=true and reddens.
+func TestAmendmentDeadlineRemaining(t *testing.T) {
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	ago := func(sec int) *time.Time { tt := now.Add(-time.Duration(sec) * time.Second); return &tt }
+	for _, tc := range []struct {
+		name          string
+		budget        int
+		startedAt     *time.Time
+		selfRetry     int
+		wantOK        bool
+		wantRemaining int // only checked when wantOK
+	}{
+		// Ample / tight remainders both resolve ok=true — whether to display the
+		// number is the caller's job; the derivation never refuses.
+		{name: "ample remainder", budget: 3600, startedAt: ago(60), wantOK: true, wantRemaining: 3540},
+		{name: "tight remainder", budget: 3600, startedAt: ago(3540), wantOK: true, wantRemaining: 60},
+		// (a) unresolvable spec budget → fail open.
+		{name: "fail-open (a) zero budget", budget: 0, startedAt: ago(60), wantOK: false},
+		{name: "fail-open (a) negative budget", budget: -1, startedAt: ago(60), wantOK: false},
+		// (b) never-started stage → fail open.
+		{name: "fail-open (b) nil startedAt", budget: 3600, startedAt: nil, wantOK: false},
+		// (c) non-positive remainder → fail open (a live agent posting proves the
+		// deadline has not literally passed, so this is a bad derivation).
+		{name: "fail-open (c) elapsed exceeds budget", budget: 3600, startedAt: ago(3700), wantOK: false},
+		{name: "fail-open (c) elapsed equals budget", budget: 3600, startedAt: ago(3600), wantOK: false},
+		// (d) self-retried stage → fail open EVEN with a tight remainder (a
+		// cumulative started_at understates it); proves the clause is load-bearing.
+		{name: "fail-open (d) self-retried tight-looking", budget: 3600, startedAt: ago(3540), selfRetry: 1, wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotRemaining, gotOK := amendmentDeadlineRemaining(tc.budget, tc.startedAt, tc.selfRetry, now)
+			if gotOK != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (remaining=%d)", gotOK, tc.wantOK, gotRemaining)
+			}
+			if tc.wantOK && gotRemaining != tc.wantRemaining {
+				t.Errorf("remaining = %d, want %d", gotRemaining, tc.wantRemaining)
+			}
+		})
+	}
+}
+
+// TestRequestScopeAmendment_TightRemainderNeverRefuses is the decisive #2540
+// approval-condition-1 pin: an implement stage whose started_at leaves ~60s of a
+// 3600s budget — well inside the 900s poll window — files an amendment, and the
+// server must STILL only surface the two observability numbers and NEVER a
+// refusal. It is the counterfactual vehicle for the removed control: if a future
+// edit reintroduces an undecidable_before_deadline refusal keyed on
+// `remaining < AmendmentPollWindowSeconds`, this tight-remainder case is exactly
+// where it would fire, so the never-a-refusal assertions (struct field gone AND
+// the key absent from the raw body/audit) redden. The bad state is seeded BY
+// CONSTRUCTION (a started_at literal computed from the resolved budget), never by
+// calling the control in setup.
+func TestRequestScopeAmendment_TightRemainderNeverRefuses(t *testing.T) {
+	s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+	budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+	if budget <= AmendmentPollWindowSeconds {
+		t.Fatalf("test precondition: resolved budget %d must exceed window %d", budget, AmendmentPollWindowSeconds)
+	}
+	started := time.Now().UTC().Add(-time.Duration(budget-60) * time.Second)
+	stage.StartedAt = &started
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The two observability numbers ARE present even on a tight remainder.
+	if resp.AmendmentPollWindowSeconds == nil || *resp.AmendmentPollWindowSeconds != AmendmentPollWindowSeconds {
+		t.Errorf("amendment_poll_window_seconds = %v, want %d", resp.AmendmentPollWindowSeconds, AmendmentPollWindowSeconds)
+	}
+	if resp.StageDeadlineSecondsRemaining == nil {
+		t.Fatal("stage_deadline_seconds_remaining absent, want ~60")
+	}
+	if rem := *resp.StageDeadlineSecondsRemaining; rem < 30 || rem >= AmendmentPollWindowSeconds {
+		t.Errorf("stage_deadline_seconds_remaining = %d, want ~60 (in [30,900))", rem)
+	}
+	// But NO refusal signal, on the wire OR in the audit — a tight race is shown,
+	// never acted on (condition 1). Raw-body key absence, not just a struct field.
+	if strings.Contains(w.Body.String(), "undecidable_before_deadline") {
+		t.Errorf("response carries undecidable_before_deadline on a tight remainder, want none:\n%s", w.Body.String())
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if _, ok := payload["undecidable_before_deadline"]; ok {
+		t.Errorf("audit carries undecidable_before_deadline, want none: %v", payload)
+	}
+	// The two observability keys still ride the scope_amendment_requested audit.
+	if payload["amendment_poll_window_seconds"] != float64(AmendmentPollWindowSeconds) {
+		t.Errorf("audit amendment_poll_window_seconds = %v, want %d", payload["amendment_poll_window_seconds"], AmendmentPollWindowSeconds)
+	}
+	if _, ok := payload["stage_deadline_seconds_remaining"]; !ok {
+		t.Errorf("audit missing stage_deadline_seconds_remaining: %v", payload)
+	}
+}
+
+// TestRequestScopeAmendment_DeadlineAmpleRemainder pins the ample-remainder path
+// (NOT a fail-open): a stage with lots of budget left files an amendment, so the
+// two observability numbers are present, letting the agent and operator see the
+// headroom on a fresh request.
+func TestRequestScopeAmendment_DeadlineAmpleRemainder(t *testing.T) {
+	s, _, _, runRow, stage := scopeAmendmentServerWithBudget(t)
+	budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+	if budget <= AmendmentPollWindowSeconds {
+		t.Fatalf("test precondition: resolved budget %d must exceed window %d", budget, AmendmentPollWindowSeconds)
+	}
+	started := time.Now().UTC().Add(-60 * time.Second) // remaining ~ budget-60 >> window
+	stage.StartedAt = &started
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StageDeadlineSecondsRemaining == nil || *resp.StageDeadlineSecondsRemaining < AmendmentPollWindowSeconds {
+		t.Errorf("stage_deadline_seconds_remaining = %v, want present and >= window", resp.StageDeadlineSecondsRemaining)
+	}
+	if resp.AmendmentPollWindowSeconds == nil || *resp.AmendmentPollWindowSeconds != AmendmentPollWindowSeconds {
+		t.Errorf("amendment_poll_window_seconds = %v, want %d", resp.AmendmentPollWindowSeconds, AmendmentPollWindowSeconds)
+	}
+}
+
+// TestRequestScopeAmendment_DeadlineFailOpen drives each of the FOUR fail-open
+// modes through the real handler and asserts the response omits both deadline
+// numbers AND the audit key set stays exactly today's. Mode (d) is the
+// end-to-end counterfactual for the selfRetryCount clause: with a tight remainder
+// that a cumulative started_at understates, only the clause keeps it fail-open —
+// delete the clause and this row reddens by surfacing the two deadline numbers.
+func TestRequestScopeAmendment_DeadlineFailOpen(t *testing.T) {
+	agent := func(runID uuid.UUID) func(*http.Request) *http.Request {
+		return func(r *http.Request) *http.Request {
+			return withRunBoundIdentity(r, runID, "mcp:read", "write:scope-amendments")
+		}
+	}
+	t.Run("(a) unresolvable spec budget", func(t *testing.T) {
+		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+		runRow.WorkflowSpec = []byte("this: is: not: valid: yaml: {[") // parse error → resolveAgentTimeout 0
+		started := time.Now().UTC().Add(-60 * time.Second)
+		stage.StartedAt = &started
+		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
+	})
+	t.Run("(b) never-started stage", func(t *testing.T) {
+		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+		stage.StartedAt = nil
+		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
+	})
+	t.Run("(c) non-positive remainder", func(t *testing.T) {
+		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+		budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+		started := time.Now().UTC().Add(-time.Duration(budget+120) * time.Second) // elapsed > budget
+		stage.StartedAt = &started
+		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
+	})
+	t.Run("(d) self-retried stage with tight-looking remainder", func(t *testing.T) {
+		s, _, au, runRow, stage := scopeAmendmentServerWithBudget(t)
+		budget := s.resolveAgentTimeout(context.Background(), runRow, run.StageTypeImplement)
+		started := time.Now().UTC().Add(-time.Duration(budget-60) * time.Second) // tight, but cumulative
+		stage.StartedAt = &started
+		stage.SelfRetryCount = 1 // but the self-retry clause fails open
+		requireDeadlineFieldsAbsent(t, postAmendment(t, s, runRow.ID, validAmendmentBody, agent(runRow.ID)), au)
+	})
+}
+
 // TestRequestScopeAmendment_FiresPageClassHook is one of the four
 // binding-condition-#2 site assertions (#1786): the scope-amendment request
 // handler invokes the pings-only immediate hook at its append site so the

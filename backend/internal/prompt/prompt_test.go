@@ -7178,6 +7178,62 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 	}
 }
 
+// TestBuildImplement_ScopeAmendmentDeadlineObservability pins the #2540 prose
+// after approval condition 1 narrowed the control to observability-only: step 1
+// reports the remaining wall clock against the poll window as INFORMATIONAL
+// numbers and NEVER as a refusal, so the prompt must name both fields and state
+// they are informational, and must NOT carry any of the retired
+// undecidable-refusal wording that told the agent to skip its wait-poll (that
+// wording could kill a winnable amendment). A companion assertion mirrors
+// mcpserver's staleAmendmentWordingFindings intent: the text carries neither the
+// retired "as if denied" phrasing nor a bare five-minute figure.
+func TestBuildImplement_ScopeAmendmentDeadlineObservability(t *testing.T) {
+	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	for _, want := range []string{
+		// Step 1 surfaces the two observability numbers...
+		"stage_deadline_seconds_remaining",
+		"amendment_poll_window_seconds",
+		// ...explicitly as informational, never a refusal.
+		"informational only and never a refusal",
+	} {
+		if !strings.Contains(impl, want) {
+			t.Errorf("implement prompt missing deadline-observability anchor %q", want)
+		}
+	}
+	// The retired undecidable-REFUSAL wording must be gone: no flag the agent
+	// keys off, and no instruction to skip the wait-poll. Its survival would
+	// reintroduce the condition-1 regression (refusing a winnable amendment).
+	for _, banned := range []string{
+		"undecidable_before_deadline",
+		"do NOT enter the step-2 wait-poll",
+		"5. On EXPIRY OR an UNDECIDABLE request",
+	} {
+		if strings.Contains(impl, banned) {
+			t.Errorf("implement prompt still carries retired undecidable-refusal wording %q (#2540 condition 1)", banned)
+		}
+	}
+
+	// Retired-wording tripwire, mirroring mcpserver/amendment_window.go's
+	// staleAmendmentWordingFindings intent, scoped to the scope-amendment block:
+	// the deadline prose must not reintroduce the proceed-as-denied framing or a
+	// bare ~5-minute figure (the real window is ~15 minutes).
+	var b strings.Builder
+	writeScopeAmendments(&b)
+	block := b.String()
+	if strings.Contains(block, "as if denied") || strings.Contains(block, "proceed-as-denied") {
+		t.Error("scope-amendment block reintroduced the retired proceed-as-denied wording")
+	}
+	// Same lookbehind-free pattern as staleAmendmentFigureRE: a bare "5 minute(s)"
+	// not preceded by a digit/dot (so "~15 minutes" and "5.5 minutes" don't trip).
+	staleFive := regexp.MustCompile(`(^|[^0-9.])~? ?5[- ]minutes?|five[- ]minutes?`)
+	if staleFive.MatchString(block) {
+		t.Errorf("scope-amendment block carries a bare ~5-minute figure (the real window is ~15 minutes)")
+	}
+}
+
 // acceptanceFixturePlan returns a standard_v1 plan carrying two blocking
 // acceptance criteria (one explicit, one inferred) plus an out_of_scope entry,
 // used by the acceptance-prompt tests.
