@@ -80,6 +80,18 @@ type ChildrenStatus struct {
 	// surfaced from the slice_integration_conflict audit payload — the same
 	// structured value the next_actions slices_integration_conflict arm reads.
 	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty" jsonschema:"the child run whose slice branch failed to merge during fan-in; from the slice_integration_conflict audit payload, present only in the integration_conflict phase"`
+	// IntegratedChildRunIDs is the child_run_ids recorded on the NEWEST
+	// slices_integrated audit entry (E50.13 / #2363) — the complete set of slice
+	// branches merged onto ConsolidatedBranch at that moment. It is decoded from
+	// the SAME entry ConsolidatedBranch comes from, so the branch and the
+	// coverage set can never come from different entries.
+	//
+	// It exists so a reader can answer the COVERAGE question — "are this
+	// dependent child's predecessors actually merged?" — with the same
+	// wavecoverage.Covered predicate the server admits on, rather than with the
+	// weaker Blocked flag. Blocked keys on predecessor run STATE, which flips to
+	// succeeded BEFORE the between-wave integration runs.
+	IntegratedChildRunIDs []string `json:"integrated_child_run_ids,omitempty" jsonschema:"the child run ids already merged onto consolidated_branch, from the NEWEST slices_integrated audit payload; the coverage set a dependent child's dispatchability is decided against"`
 }
 
 // classifyIntegrationPhase is the pure phase classifier (#1147).
@@ -232,7 +244,11 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		case "slices_integrated":
 			if e.Sequence > integratedSeq {
 				integratedSeq = e.Sequence
+				// Both fields come from the SAME newest entry (E50.13 / #2363):
+				// a branch paired with an older entry's coverage set would
+				// admit a dependent child onto a base missing its predecessors.
 				cs.ConsolidatedBranch = decodeConsolidatedBranch(e.Payload)
+				cs.IntegratedChildRunIDs = decodeIntegratedChildRunIDs(e.Payload)
 			}
 		case "slice_integration_conflict":
 			if e.Sequence > conflictSeq {
@@ -246,21 +262,54 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 	return cs, nil
 }
 
-// decodeConsolidatedBranch pulls consolidated_branch from a slices_integrated
-// payload (shape {child_run_ids, consolidated_branch, slice_count}). Returns
-// "" when absent or unparseable — best-effort, like the other audit decodes.
-func decodeConsolidatedBranch(payload any) string {
+// slicesIntegratedPayload is the ONE declaration of the slices_integrated audit
+// payload's shape on the read side. Both decoders below share it deliberately:
+// ConsolidatedBranch and ChildRunIDs are read from the SAME entry and a
+// divergence between two hand-written anonymous structs is exactly the drift a
+// coverage decision cannot survive.
+//
+// THE KEYS ARE TIED TO THE EMITTER, NOT HAND-MAINTAINED. The producer is
+// orchestrator.emitSlicesIntegrated, in another package and unexported, so this
+// package cannot call it; instead TestSlicesIntegratedPayloadKeysMatchEmitter
+// reflects these json tags and asserts each one appears verbatim in that
+// emitter's payload literal on disk. A rename on either side reddens. That
+// closes the #2660 blind spot for this decode: a test fixture hand-writing the
+// same key the decoder reads would stay green in every mode test while the real
+// verb never released.
+type slicesIntegratedPayload struct {
+	ConsolidatedBranch string   `json:"consolidated_branch"`
+	ChildRunIDs        []string `json:"child_run_ids"`
+}
+
+// decodeSlicesIntegrated decodes a slices_integrated payload. A marshal or
+// unmarshal failure yields the zero value — best-effort, like the other audit
+// decodes.
+func decodeSlicesIntegrated(payload any) slicesIntegratedPayload {
+	var p slicesIntegratedPayload
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return ""
-	}
-	var p struct {
-		ConsolidatedBranch string `json:"consolidated_branch"`
+		return slicesIntegratedPayload{}
 	}
 	if json.Unmarshal(raw, &p) != nil {
-		return ""
+		return slicesIntegratedPayload{}
 	}
-	return p.ConsolidatedBranch
+	return p
+}
+
+// decodeConsolidatedBranch pulls consolidated_branch from a slices_integrated
+// payload (shape {child_run_ids, consolidated_branch, slice_count}). Returns
+// "" when absent or unparseable.
+func decodeConsolidatedBranch(payload any) string {
+	return decodeSlicesIntegrated(payload).ConsolidatedBranch
+}
+
+// decodeIntegratedChildRunIDs pulls child_run_ids from a slices_integrated
+// payload (E50.13 / #2363) — the complete set of slice branches merged onto the
+// consolidated branch at that entry. Returns nil when absent or unparseable,
+// which the coverage predicate reads as "nothing is merged yet" and so FAILS
+// CLOSED: a dependent child is not announced as dispatchable.
+func decodeIntegratedChildRunIDs(payload any) []string {
+	return decodeSlicesIntegrated(payload).ChildRunIDs
 }
 
 // decodeConflictingChildRunID pulls conflicting_child_run_id from a

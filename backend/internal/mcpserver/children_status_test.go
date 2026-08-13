@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -718,5 +722,108 @@ func TestChildrenStatusFor_UnparseableChildID(t *testing.T) {
 	}
 	if cs.Children[1].State != "unknown" {
 		t.Errorf("unparseable child state = %q, want unknown", cs.Children[1].State)
+	}
+}
+
+// --- E50.13 / #2363: the integrated-child-run-ids decode ---
+
+// slicesIntegratedPayloadMap builds a slices_integrated audit payload whose KEY
+// NAMES come from slicesIntegratedPayload's json tags rather than from a
+// hand-written literal. Every fixture that seeds this entry goes through here,
+// so no test can accidentally hand-write a key that agrees with a WRONG decoder.
+func slicesIntegratedPayloadMap(t *testing.T, branch string, childRunIDs []string) map[string]any {
+	t.Helper()
+	typ := reflect.TypeOf(slicesIntegratedPayload{})
+	out := map[string]any{}
+	for i := 0; i < typ.NumField(); i++ {
+		tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if tag == "" {
+			t.Fatalf("slicesIntegratedPayload field %s has no json tag", typ.Field(i).Name)
+		}
+		switch typ.Field(i).Name {
+		case "ConsolidatedBranch":
+			out[tag] = branch
+		case "ChildRunIDs":
+			out[tag] = childRunIDs
+		default:
+			t.Fatalf("slicesIntegratedPayloadMap does not know how to fill %s", typ.Field(i).Name)
+		}
+	}
+	return out
+}
+
+// TestSlicesIntegratedPayloadKeysMatchEmitter closes the #2660 blind spot for
+// the OTHER new decode (binding condition 3). IntegratedChildRunIDs feeds the
+// coverage-keyed release decision, and a fixture that hand-writes the same key
+// a WRONG decoder reads stays green in every mode test while the real verb never
+// releases. The producer — orchestrator.emitSlicesIntegrated — lives in another
+// package and is unexported, so this cannot call it; instead it reflects the
+// decoder's json tags and asserts each appears VERBATIM in that emitter's
+// payload literal on disk. A rename on either side reddens.
+func TestSlicesIntegratedPayloadKeysMatchEmitter(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "orchestrator", "orchestrator.go"))
+	if err != nil {
+		t.Fatalf("read the emitter source: %v", err)
+	}
+	body := string(src)
+	const marker = "func (o *Orchestrator) emitSlicesIntegrated("
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		t.Fatalf("emitSlicesIntegrated not found in orchestrator.go — the producer moved; retarget this pin")
+	}
+	// Bound the search to the emitter's own body so an identically-named key
+	// elsewhere in the file cannot satisfy the assertion vacuously.
+	rest := body[idx:]
+	if end := strings.Index(rest, "\nfunc "); end > 0 {
+		rest = rest[:end]
+	}
+	typ := reflect.TypeOf(slicesIntegratedPayload{})
+	for i := 0; i < typ.NumField(); i++ {
+		tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if !strings.Contains(rest, `"`+tag+`"`) {
+			t.Errorf("decoder key %q is absent from emitSlicesIntegrated's payload literal — the read side and the write side have drifted", tag)
+		}
+	}
+}
+
+// TestChildrenStatus_DecodesIntegratedChildRunIDs pins that the branch and the
+// coverage set come from the SAME (newest) entry: an older entry must not
+// supply the coverage set for a newer branch.
+func TestChildrenStatus_DecodesIntegratedChildRunIDs(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildRun(fb, a, "succeeded")
+	seedChildRun(fb, b, "succeeded")
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+
+	recent := []AuditEntry{
+		{Sequence: 5, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "old-branch", []string{a.String()})},
+		{Sequence: 9, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "new-branch", []string{a.String(), b.String()})},
+	}
+	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	if cs.ConsolidatedBranch != "new-branch" {
+		t.Errorf("consolidated_branch = %q, want new-branch", cs.ConsolidatedBranch)
+	}
+	if len(cs.IntegratedChildRunIDs) != 2 {
+		t.Fatalf("integrated_child_run_ids = %v, want both children from the NEWEST entry", cs.IntegratedChildRunIDs)
+	}
+}
+
+// TestDecodeIntegratedChildRunIDs_FailsClosed pins the degrade: an absent or
+// unparseable payload yields nil, which the coverage predicate reads as
+// "nothing merged" — a dependent child is NOT announced as dispatchable.
+func TestDecodeIntegratedChildRunIDs_FailsClosed(t *testing.T) {
+	if got := decodeIntegratedChildRunIDs(nil); got != nil {
+		t.Errorf("nil payload -> %v, want nil", got)
+	}
+	if got := decodeIntegratedChildRunIDs(map[string]any{"child_run_ids": "not-a-list"}); got != nil {
+		t.Errorf("unparseable payload -> %v, want nil", got)
+	}
+	if got := decodeIntegratedChildRunIDs(map[string]any{"consolidated_branch": "b"}); got != nil {
+		t.Errorf("payload without the key -> %v, want nil", got)
 	}
 }
