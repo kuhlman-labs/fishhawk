@@ -478,6 +478,86 @@ func TestAcceptanceSlot_TruncatedNoParticipant_SurfacesUnverifiable(t *testing.T
 	}
 }
 
+// TestAcceptanceSlot_AllReadsFail_SurfacesUnverifiable pins the #2503 fix-up
+// high-concern edge path: a sole candidate — or all candidates — whose stage
+// reads FAIL can be AT the acceptance gate, but the classification cannot tell.
+// Without this guard the block is omitted entirely (no holder, no waiter, not
+// truncated → the bare `return nil`), presenting an incomplete inspection as "no
+// acceptance participation" and dropping the read_failures signal — the same
+// trustworthy-observability failure shape as the truncation boundary. The block
+// must be surfaced with state unverifiable, no probe, and the failed ref in
+// read_failures. Deleting the `len(readFailures) == 0` term from the short-circuit
+// guard (reverting to `if !truncated`) reddens this on the non-nil assertion. No
+// /healthz target is wired because this path issues no probe — asserting a nil
+// block cannot be a fixture-setup failure.
+func TestAcceptanceSlot_AllReadsFail_SurfacesUnverifiable(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	// A sole candidate whose stage read 500s: it might be at the acceptance gate,
+	// but we cannot classify it. Non-terminal item state + parseable run id → it
+	// qualifies as a candidate before the read fails.
+	item, failRun := seedItemWithAcceptanceStage(t, fb, "#26", "running", "running")
+	fb.stagesStatusByRun[failRun] = http.StatusInternalServerError
+	r := newSlotResolver(srv, nil)
+
+	slot := r.acceptanceSlotFor(context.Background(), []CampaignItem{item})
+	if slot == nil {
+		t.Fatal("all candidate reads failing must still surface the block (read_failures signal), got nil")
+	}
+	if slot.State != "unverifiable" {
+		t.Fatalf("state = %q, want unverifiable (classification incomplete; a candidate may be at the acceptance gate); detail=%s", slot.State, slot.Detail)
+	}
+	if len(slot.ReadFailures) != 1 || slot.ReadFailures[0] != "#26" {
+		t.Fatalf("ReadFailures = %+v, want [#26] (the failed read is recorded, not silently dropped)", slot.ReadFailures)
+	}
+	if slot.HeldBy != nil {
+		t.Errorf("HeldBy = %+v, want nil (no participant could be classified)", slot.HeldBy)
+	}
+	if len(slot.Waiting) != 0 {
+		t.Errorf("Waiting = %+v, want empty (no participant could be classified)", slot.Waiting)
+	}
+	if slot.Truncated {
+		t.Errorf("Truncated = true, want false (the cap was not hit; the read failed)")
+	}
+}
+
+// TestAcceptanceSlot_TruncatedAndReadFailure_SurfacesBothReasons proves the
+// incomplete-inspection block names BOTH reasons when the inspection was truncated
+// AND a read failed: read_failures carries the failed ref and Truncated is true,
+// so neither signal is dropped.
+func TestAcceptanceSlot_TruncatedAndReadFailure_SurfacesBothReasons(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	// cap+extra candidates so the inspection truncates; the FIRST inspected item's
+	// read 500s so read_failures is also populated. None is a participant (all have
+	// only a plan stage except the failing one, whose read never returns).
+	total := acceptanceSlotMaxItemReads + 3
+	items := make([]CampaignItem, 0, total)
+	failItem, failRun := seedItemWithAcceptanceStage(t, fb, "#26", "running", "running")
+	fb.stagesStatusByRun[failRun] = http.StatusInternalServerError
+	items = append(items, failItem)
+	for i := 0; i < total-1; i++ {
+		runID := uuid.New()
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "running"},
+		}
+		items = append(items, CampaignItem{ID: uuid.NewString(), IssueRef: "#" + uuid.NewString()[:4], RunID: runID.String(), State: "running"})
+	}
+	r := newSlotResolver(srv, nil)
+
+	slot := r.acceptanceSlotFor(context.Background(), items)
+	if slot == nil {
+		t.Fatal("expected an incomplete-inspection block, got nil")
+	}
+	if slot.State != "unverifiable" {
+		t.Fatalf("state = %q, want unverifiable; detail=%s", slot.State, slot.Detail)
+	}
+	if !slot.Truncated {
+		t.Errorf("Truncated = false, want true (more candidates than the cap)")
+	}
+	if len(slot.ReadFailures) != 1 || slot.ReadFailures[0] != "#26" {
+		t.Errorf("ReadFailures = %+v, want [#26] (the failed read is recorded alongside truncation)", slot.ReadFailures)
+	}
+}
+
 // TestAcceptanceSlotFor_TerminalItem_SkippedNoRead proves a terminal item state
 // short-circuits in pass 1 with no stage read (the cost bound). A single terminal
 // item yields nil (no participant) and issues no read.

@@ -314,34 +314,52 @@ func (r *runResolver) acceptanceSlotFor(ctx context.Context, items []CampaignIte
 
 	// Cost short-circuit: a campaign nowhere near acceptance issues ZERO network
 	// calls and the block is omitted entirely — BUT only when the inspection was
-	// complete. If it was TRUNCATED at the cap before any participant was found, a
-	// participant may exist among the un-inspected items beyond the cap, so
-	// omitting the block would drop both the acceptance_slot AND the truncation
-	// signal despite an item possibly being at the acceptance gate (#2503 high
-	// concern). Surface a truncation-only block instead: state unverifiable, no
-	// probe. No probe is issued because without a known participant a refused
-	// probe could not distinguish free from a holder we never inspected — it could
-	// only mislead (conditions 1 & 2 on #2503).
+	// COMPLETE. Two ways it can be incomplete while no participant emerged, each of
+	// which may hide a candidate at the acceptance gate: (a) it was TRUNCATED at the
+	// cap before any participant was found, so one may exist among the items beyond
+	// the cap; (b) one or more candidate stage reads FAILED, so a sole candidate —
+	// or all candidates — at the acceptance gate could have been the very reads that
+	// failed. Omitting the block in either case would present an incomplete
+	// inspection as "no acceptance participation" and drop both the acceptance_slot
+	// AND its truncation / read_failures signal (#2503 high concern). Surface an
+	// incomplete-inspection block instead: state unverifiable, no probe. No probe is
+	// issued because without a known participant a refused probe could not
+	// distinguish free from a holder we never classified — it could only mislead
+	// (conditions 1 & 2 on #2503).
 	if heldBy == nil && len(waiting) == 0 {
-		if !truncated {
+		if !truncated && len(readFailures) == 0 {
 			return nil
 		}
 		host, source := resolveAcceptanceSlotHost(r.getenv)
+		// Name WHY the inspection was incomplete (truncation, failed reads, or both)
+		// so the operator knows the unverifiable verdict is a classification gap, not
+		// a probe result.
+		var reasons []string
+		if truncated {
+			reasons = append(reasons, fmt.Sprintf(
+				"inspection was truncated at the %d-item cap", acceptanceSlotMaxItemReads))
+		}
+		if len(readFailures) > 0 {
+			reasons = append(reasons, fmt.Sprintf(
+				"%d candidate item stage read(s) failed (%s)",
+				len(readFailures), strings.Join(readFailures, ", ")))
+		}
+		reason := strings.Join(reasons, "; ")
 		return &AcceptanceSlot{
 			Shared:           true,
 			TargetHost:       host,
 			TargetHostSource: source,
 			State:            "unverifiable",
 			Detail: fmt.Sprintf(
-				"inspection truncated at the %d-item cap before any acceptance participant was found; a candidate item at the acceptance gate may exist beyond the cap, so the slot state cannot be positively decided. No slot probe was issued.",
-				acceptanceSlotMaxItemReads),
+				"%s, and no acceptance participant was found among the items that WERE classified; a candidate item at the acceptance gate may exist among the un-inspected items, so the slot state cannot be positively decided. No slot probe was issued.",
+				reason),
 			ReadFailures:    readFailures,
 			ItemsInspected:  len(candidates),
 			InspectionLimit: acceptanceSlotMaxItemReads,
-			Truncated:       true,
+			Truncated:       truncated,
 			Note: fmt.Sprintf(
-				"acceptance validates against ONE shared preview slot at %s; the campaign has more non-terminal items than the %d-item inspection cap and none of the inspected prefix was at the acceptance gate, so slot contention cannot be ruled out — re-check after the leading items settle, or inspect the individual item runs.",
-				host, acceptanceSlotMaxItemReads),
+				"acceptance validates against ONE shared preview slot at %s; %s, and none of the classified items was at the acceptance gate, so slot contention cannot be ruled out — re-check after the affected items settle, or inspect the individual item runs.",
+				host, reason),
 		}
 	}
 
