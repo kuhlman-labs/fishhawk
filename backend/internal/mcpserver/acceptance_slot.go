@@ -313,9 +313,36 @@ func (r *runResolver) acceptanceSlotFor(ctx context.Context, items []CampaignIte
 	}
 
 	// Cost short-circuit: a campaign nowhere near acceptance issues ZERO network
-	// calls and the block is omitted entirely.
+	// calls and the block is omitted entirely — BUT only when the inspection was
+	// complete. If it was TRUNCATED at the cap before any participant was found, a
+	// participant may exist among the un-inspected items beyond the cap, so
+	// omitting the block would drop both the acceptance_slot AND the truncation
+	// signal despite an item possibly being at the acceptance gate (#2503 high
+	// concern). Surface a truncation-only block instead: state unverifiable, no
+	// probe. No probe is issued because without a known participant a refused
+	// probe could not distinguish free from a holder we never inspected — it could
+	// only mislead (conditions 1 & 2 on #2503).
 	if heldBy == nil && len(waiting) == 0 {
-		return nil
+		if !truncated {
+			return nil
+		}
+		host, source := resolveAcceptanceSlotHost(r.getenv)
+		return &AcceptanceSlot{
+			Shared:           true,
+			TargetHost:       host,
+			TargetHostSource: source,
+			State:            "unverifiable",
+			Detail: fmt.Sprintf(
+				"inspection truncated at the %d-item cap before any acceptance participant was found; a candidate item at the acceptance gate may exist beyond the cap, so the slot state cannot be positively decided. No slot probe was issued.",
+				acceptanceSlotMaxItemReads),
+			ReadFailures:    readFailures,
+			ItemsInspected:  len(candidates),
+			InspectionLimit: acceptanceSlotMaxItemReads,
+			Truncated:       true,
+			Note: fmt.Sprintf(
+				"acceptance validates against ONE shared preview slot at %s; the campaign has more non-terminal items than the %d-item inspection cap and none of the inspected prefix was at the acceptance gate, so slot contention cannot be ruled out — re-check after the leading items settle, or inspect the individual item runs.",
+				host, acceptanceSlotMaxItemReads),
+		}
 	}
 
 	host, source := resolveAcceptanceSlotHost(r.getenv)

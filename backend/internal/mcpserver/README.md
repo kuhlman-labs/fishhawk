@@ -263,8 +263,8 @@ Acceptance validates against **ONE** fixed, shared preview slot, so a campaign d
 
 **Three bounding controls** (each pinned by a deletion counterfactual in `acceptance_slot_test.go`):
 
-- **No-probe short-circuit** — when pass 2 yields no holder and no waiter, return `nil` (block omitted) **without probing**: a campaign nowhere near acceptance issues **zero** network calls.
-- **Per-item read cap** (`acceptanceSlotMaxItemReads` = 12) — more candidates than the cap sets `truncated:true` + `items_inspected`/`inspection_limit` rather than capping silently.
+- **No-probe short-circuit** — when pass 2 yields no holder and no waiter **and the inspection was complete** (not truncated), return `nil` (block omitted) **without probing**: a campaign nowhere near acceptance issues **zero** network calls.
+- **Per-item read cap** (`acceptanceSlotMaxItemReads` = 12) — more candidates than the cap sets `truncated:true` + `items_inspected`/`inspection_limit` rather than capping silently. **When the cap is hit before any participant is found**, the block is **still surfaced** (state `unverifiable`, no probe) rather than omitted — otherwise a candidate at the acceptance gate *beyond* the cap would silently drop both the block and the `truncated` signal (#2503). No probe runs on that path: without a known participant a refused probe could not distinguish `free` from a holder never inspected, so it could only mislead.
 - **Best-effort degrade** — a per-item `ListRunStages` failure degrades that item (recorded in `read_failures` so the block is honestly partial) and never fails the campaign-status snapshot (the `children_status.go` contract).
 
 `note` names the remediation (`scripts/dev preview <head>`) and that the slot is shared. The whole block is `omitempty`, so a campaign with no acceptance participant is byte-identical to the prior response.

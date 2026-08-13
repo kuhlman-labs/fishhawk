@@ -434,6 +434,50 @@ func TestAcceptanceSlot_CandidateCap_TruncatesAndReports(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSlot_TruncatedNoParticipant_SurfacesUnverifiable pins the #2503
+// high-concern edge path: MORE than the cap of non-terminal, parseable-run-id
+// candidate items, NONE of which is at the acceptance gate WITHIN the inspected
+// prefix, but the reads are capped so a participant could exist BEYOND it. The
+// block must still be surfaced with truncated=true and state unverifiable — not
+// omitted, which would silently drop BOTH the block and the truncation signal
+// despite an item possibly being at the acceptance gate. Deleting the
+// `if truncated { ... }` branch (reverting to the bare `return nil`) reddens this
+// on the non-nil assertion. No /healthz target is wired because this path issues
+// no probe — asserting a nil block cannot be a fixture-setup failure.
+func TestAcceptanceSlot_TruncatedNoParticipant_SurfacesUnverifiable(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	// cap+extra items, each with ONLY a non-acceptance (plan) stage so none is a
+	// participant, all non-terminal with parseable run ids so all qualify as
+	// candidates and the cap is hit before any participant is found.
+	total := acceptanceSlotMaxItemReads + 3
+	items := make([]CampaignItem, 0, total)
+	for i := 0; i < total; i++ {
+		runID := uuid.New()
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "running"},
+		}
+		items = append(items, CampaignItem{ID: uuid.NewString(), IssueRef: "#" + uuid.NewString()[:4], RunID: runID.String(), State: "running"})
+	}
+	r := newSlotResolver(srv, nil)
+
+	slot := r.acceptanceSlotFor(context.Background(), items)
+	if slot == nil {
+		t.Fatal("truncated inspection with no found participant must still surface the block (truncation signal), got nil")
+	}
+	if !slot.Truncated {
+		t.Errorf("Truncated = false, want true (more candidates than the cap)")
+	}
+	if slot.State != "unverifiable" {
+		t.Fatalf("state = %q, want unverifiable (a participant may exist beyond the cap; the slot cannot be positively decided); detail=%s", slot.State, slot.Detail)
+	}
+	if slot.ItemsInspected != acceptanceSlotMaxItemReads {
+		t.Errorf("ItemsInspected = %d, want %d", slot.ItemsInspected, acceptanceSlotMaxItemReads)
+	}
+	if slot.HeldBy != nil {
+		t.Errorf("HeldBy = %+v, want nil (no participant was found)", slot.HeldBy)
+	}
+}
+
 // TestAcceptanceSlotFor_TerminalItem_SkippedNoRead proves a terminal item state
 // short-circuits in pass 1 with no stage read (the cost bound). A single terminal
 // item yields nil (no participant) and issues no read.
