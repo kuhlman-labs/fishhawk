@@ -3055,12 +3055,9 @@ func seedSettledKind(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID
 // (which the gate view reads) did not. Asserting only that a row was MINTED,
 // as the guard matrix below does, passes with both fields dropped.
 func TestPersistReviewConcerns_CarriesEvidenceOntoMintedRow(t *testing.T) {
-	// evidenceConcernRepo, not guardServer's bare fakeConcernRepo: that shared
-	// fake predates these two columns and drops them, which would make this test
-	// fail on a FAKE gap rather than on the production mapping under test. The
-	// real repository's round-trip is pinned against Postgres by
+	// The real repository's round-trip is pinned against Postgres by
 	// concern.TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries.
-	cr := evidenceConcernRepo{newFakeConcernRepo()}
+	cr := newFakeConcernRepo()
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newAuditFake(), ConcernRepo: cr})
 	runID, stageID := uuid.New(), uuid.New()
 	const evidence = "gofmt -l reports backend/internal/server/trace.go at HEAD; the fixup never ran it"

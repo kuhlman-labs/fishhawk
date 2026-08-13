@@ -323,47 +323,11 @@ func TestGateView_MalformedPayload_SkippedWarnOnly(t *testing.T) {
 
 // --- behavioral done-means ----------------------------------------------
 
-// evidenceConcernRepo makes the package's shared in-memory fakeConcernRepo
-// faithful for the two #2353 columns. That fake builds its concern.Concern
-// literal field-by-field and predates new_evidence / settled_ref, so it drops
-// them — an artifact of the FAKE, not of the production repository (whose
-// round-trip is pinned against real Postgres by
-// concern.TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries).
-//
-// It is wrapped rather than amended in place because fakeConcernRepo lives in
-// backend/internal/server/fixup_test.go, outside this change's declared scope.
-// The rows are pointers into the fake's own slice, so writing through them
-// fixes the STORED rows too — every later read (GetByIDs, ListByRun,
-// ListOpenByRun) sees the evidence.
-type evidenceConcernRepo struct{ *fakeConcernRepo }
-
-func (f evidenceConcernRepo) InsertRaised(ctx context.Context, p concern.InsertRaisedParams) ([]*concern.Concern, error) {
-	rows, err := f.fakeConcernRepo.InsertRaised(ctx, p)
-	if err != nil {
-		return nil, err
-	}
-	for i, row := range rows {
-		row.NewEvidence = p.Concerns[i].NewEvidence
-		row.SettledRef = p.Concerns[i].SettledRef
-	}
-	return rows, nil
-}
-
-// evidenceGateViewServer is gateViewServer with the evidence-faithful concern
-// repo wired in.
-func evidenceGateViewServer(t *testing.T) (*Server, *fakeRepo, evidenceConcernRepo) {
-	t.Helper()
-	repo := newFakeRepo()
-	cr := evidenceConcernRepo{newFakeConcernRepo()}
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: newAuditFake(), ConcernRepo: cr})
-	return s, repo, cr
-}
-
 // seedGateConcernWithEvidence seeds one concern carrying the #2353 evidence
 // fields. A separate helper rather than two more positional parameters on the
 // already-11-argument seedGateConcern, whose call sites are unrelated to this
 // change.
-func seedGateConcernWithEvidence(t *testing.T, cr evidenceConcernRepo, runID, stageID uuid.UUID,
+func seedGateConcernWithEvidence(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID,
 	seq int64, note, evidence, settledRef string) *concern.Concern {
 	t.Helper()
 	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
@@ -390,7 +354,7 @@ func seedGateConcernWithEvidence(t *testing.T, cr evidenceConcernRepo, runID, st
 // unsupported assertion. Both the OPEN list and the SETTLED ledger must carry
 // new_evidence AND settled_ref verbatim.
 func TestGateView_RendersConcernEvidence(t *testing.T) {
-	s, repo, cr := evidenceGateViewServer(t)
+	s, repo, _, cr := gateViewServer(t)
 	runID := seedGateRun(t, repo)
 	const openEvidence = "backend/internal/server/gateview.go:441 maps SuggestedPatch but not NewEvidence; the field is dropped at the render boundary"
 	const settledEvidence = "reproduced on run 90e0ea6a: the concern minted with new_evidence='' despite the verdict carrying it"
@@ -439,7 +403,7 @@ func TestGateView_RendersConcernEvidence(t *testing.T) {
 // no evidence" when the truth is that this concern never had any, and it also
 // keeps the payload byte-identical for the common no-evidence concern.
 func TestGateView_OmitsEmptyConcernEvidence(t *testing.T) {
-	s, repo, cr := evidenceGateViewServer(t)
+	s, repo, _, cr := gateViewServer(t)
 	runID := seedGateRun(t, repo)
 	seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 10, "bare open concern", "", "")
 	settled := seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 11, "bare settled concern", "", "")

@@ -1636,6 +1636,10 @@ func (a *seqAuditFake) entriesByCategory(cat string) []*audit.Entry {
 // the fake cannot drift from the production lifecycle rules. The
 // Postgres adapter is exercised separately in
 // backend/internal/concern/postgres_test.go via testcontainers.
+// InsertRaised carries new_evidence/settled_ref because production does
+// (backend/internal/server/trace.go) — keep this fake field-for-field
+// with concern.Concern so a future edit here doesn't silently reopen
+// the gap #2675 closed.
 type fakeConcernRepo struct {
 	mu          sync.Mutex
 	rows        []*concern.Concern
@@ -1670,6 +1674,8 @@ func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaised
 			Category:             c.Category,
 			Note:                 c.Note,
 			SuggestedPatch:       c.SuggestedPatch,
+			NewEvidence:          c.NewEvidence,
+			SettledRef:           c.SettledRef,
 			State:                concern.StateRaised,
 		}
 		f.rows = append(f.rows, row)
