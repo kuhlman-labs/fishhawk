@@ -10814,6 +10814,42 @@ paths:
               paths the change will not touch via `remove_scope_files`,
               or raise `max_files_changed` through a governed spec
               change and start a fresh run.
+            - `plan_missing_required_tests` — #2660: the implement
+              stage declares `required_outcomes: tests_added_or_updated`,
+              and the effective scope (plan `scope.files` ∪
+              `add_scope_files` ∖ `remove_scope_files`) declares
+              testable source but NO test-shaped path — a landing the
+              implement stage would fail as category-B after a full run.
+              Refused BEFORE any approval row is recorded (stage
+              untouched), appending a `plan_missing_required_tests`
+              audit entry. `details` includes `stage_id`,
+              `required_outcome`, `scoped_files`,
+              `testable_source_files`, `non_go_source_files`, and
+              `test_paths_declared`. Fail-OPEN on every degraded read
+              (unreadable run, absent or unparseable spec, no implement
+              stage, unresolvable effective scope) and inert when the
+              scope declares no testable source at all (a docs-only
+              scope is vacuously satisfied at implement, #610). To
+              unblock: declare the test file you intend to add via
+              `add_scope_files`, or — for a comment-only correction to a
+              `.go` file — include `--comment-only` in the comment.
+            - `plan_comment_only_override_unavailable` — #2660: an
+              approve carrying `--comment-only` was REFUSED because the
+              effective scope declares NON-`.go` testable source. The
+              comment-only exemption for `tests_added_or_updated`
+              (`backend/internal/policy`'s `DetectCommentOnlyGo`) covers
+              `.go` files only, so no override can authorize that
+              landing — the refusal is categorical, mirroring
+              `plan_scope_cap_override_unavailable`'s posture. Refused
+              BEFORE any approval row is recorded, appending a
+              `plan_comment_only_override_refused` audit entry; the
+              HONORED override appends
+              `plan_comment_only_override_acknowledged` instead,
+              recording that it covers the plan gate only (the
+              implement stage re-derives the comment-only verdict from
+              the REAL diff). `details` carries the same keys as
+              `plan_missing_required_tests`, with `non_go_source_files`
+              naming the offending paths.
             - `plan_add_scope_files_fans_into_slices` — #2103: the
               request supplied `add_scope_files` on a DECOMPOSED plan
               (one carrying `decomposition.sub_plans`). An operator-added

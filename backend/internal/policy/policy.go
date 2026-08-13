@@ -56,12 +56,24 @@ type Diff struct {
 
 	// Patch is the full unified-diff hunk text for the stage, carried
 	// for downstream content consumers (the implement-review prompt,
-	// #585) ONLY. It is deliberately NOT read by Evaluate or any check
-	// function — constraints operate purely on ChangedFiles, so
-	// constraint evaluation is identical whether or not Patch is set.
-	// Empty for older bundles that predate the patch field and for
-	// stages whose runner could not compute the patch.
+	// #585) and, since #2660, read by ONE evaluator:
+	// DetectCommentOnlyGo, whose verdict the `tests_added_or_updated`
+	// outcome consumes via Constraints.CommentOnly. Every other check
+	// function still operates purely on ChangedFiles. Empty for older
+	// bundles that predate the patch field and for stages whose runner
+	// could not compute the patch — which the detector treats as
+	// patch_absent, i.e. fail-closed.
 	Patch string
+
+	// PatchTruncated is the fail-closed companion to Patch: true when
+	// the runner cut the captured patch at its 256 KiB cap
+	// (runner/internal/gitdiff). A truncated patch can hide a
+	// behavioral hunk behind a comment-only prefix, so
+	// DetectCommentOnlyGo refuses outright rather than reading the
+	// surviving text. Older bundles omit the field and decode to false,
+	// which combined with an absent Patch is already the patch_absent
+	// refusal.
+	PatchTruncated bool
 }
 
 // Constraints is the parsed shape of the workflow-spec stage's
@@ -130,6 +142,22 @@ type Constraints struct {
 	// would silently drop the constraint or its signal on re-eval and
 	// flip a satisfied outcome into a violation.
 	DiffCoverageSignal *DiffCoverageSignal `json:"diff_coverage_signal,omitempty"`
+	// CommentOnly is the comment-only-Go verdict (#2660), derived at
+	// trace-upload time by DetectCommentOnlyGo from the SAME bundle's
+	// git_diff event and carried here — not recomputed downstream.
+	// `tests_added_or_updated` reads it as a third satisfying case.
+	//
+	// nil is read as NOT comment-only, so every pre-#2660 audit row
+	// re-evaluates byte-identically.
+	//
+	// The json tag is load-bearing for the audit round trip, exactly as
+	// Verification's and DiffCoverageSignal's are: the post-CI
+	// re-evaluation (backend/internal/server/policy_reeval.go) decodes
+	// EvaluationPayload.Applied and re-emits it against a diff
+	// reconstructed from the audit payload, which carries file names and
+	// NEVER the patch. An untagged field would silently drop the verdict
+	// and flip a satisfied outcome into a violation on re-eval.
+	CommentOnly *CommentOnlySignal `json:"comment_only,omitempty"`
 }
 
 // DiffCoverageConfig is the stage's declared `diff_coverage` constraint,
@@ -231,7 +259,7 @@ func Evaluate(diff Diff, c Constraints) []Violation {
 		out = append(out, checkMaxFiles(diff, c.MaxFilesChanged)...)
 	}
 	if len(c.RequiredOutcomes) > 0 {
-		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen, c.Verification)...)
+		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen, c.Verification, c.CommentOnly)...)
 	}
 	if c.DiffCoverage != nil {
 		out = append(out, checkDiffCoverage(*c.DiffCoverage, c.DiffCoverageSignal)...)
@@ -442,7 +470,7 @@ func IsGeneratedPath(p string) bool {
 	return false
 }
 
-func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verification *VerificationSignal) []Violation {
+func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verification *VerificationSignal, commentOnly *CommentOnlySignal) []Violation {
 	var v []Violation
 	for _, o := range outcomes {
 		switch o {
@@ -456,6 +484,21 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verifica
 				// vacuously satisfied (#610). The len()>0 guard keeps an
 				// EMPTY diff failing — that still signals "stage produced
 				// nothing."
+			case commentOnly != nil && commentOnly.CommentOnly:
+				// Comment-only Go correction (#2660): the detector proved
+				// the NARROW SYNTACTIC PROPERTY that every changed
+				// testable-source file is a .go file whose emitted changed
+				// lines are blank or ordinary `//` comments — never a
+				// directive, never inside a visible raw string. A doc-comment
+				// fix has no behavior to test, so the outcome is vacuously
+				// satisfied rather than failed, exactly as the docs-only
+				// branch above is.
+				//
+				// Ordered AFTER both cases above so a diff that already
+				// satisfies the outcome never consults the detector, and the
+				// verdict rides on Constraints (never recomputed here) so the
+				// post-CI re-evaluation — which has no patch — re-emits it
+				// instead of flipping it. nil reads as NOT comment-only.
 			default:
 				v = append(v, Violation{
 					Constraint: "required_outcomes",
@@ -592,7 +635,14 @@ func diffTouchesTests(diff Diff) bool {
 	return false
 }
 
-func isTestPath(p string) bool {
+func isTestPath(p string) bool { return IsTestPath(p) }
+
+// IsTestPath reports whether p matches a recognized test-file convention.
+// Exported (#2660) so the plan-gate's required-tests check shares ONE
+// definition with the post-implement `tests_added_or_updated` evaluation
+// rather than growing a second heuristic that can drift; the unexported
+// isTestPath delegates here.
+func IsTestPath(p string) bool {
 	low := strings.ToLower(p)
 	base := filepathBase(low)
 	switch {
@@ -642,11 +692,23 @@ func diffTouchesTestableCode(diff Diff) bool {
 		if f.Status == StatusDeleted {
 			continue
 		}
-		low := strings.ToLower(f.Path)
-		for _, ext := range testableSourceExts {
-			if strings.HasSuffix(low, ext) {
-				return true
-			}
+		if IsTestableSourcePath(f.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTestableSourcePath reports whether p carries a recognized
+// unit-testable source extension (testableSourceExts). Exported (#2660)
+// for the same one-definition reason as IsTestPath: the plan gate and
+// DetectCommentOnlyGo both need the per-path form that
+// diffTouchesTestableCode folds over.
+func IsTestableSourcePath(p string) bool {
+	low := strings.ToLower(p)
+	for _, ext := range testableSourceExts {
+		if strings.HasSuffix(low, ext) {
+			return true
 		}
 	}
 	return false

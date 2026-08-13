@@ -52,6 +52,19 @@ type ChangedFile struct {
 // changes (which is itself a constraint check for some stages).
 type Diff struct {
 	ChangedFiles []ChangedFile
+
+	// Patch is the full unified-diff hunk text the runner captured for
+	// this same staged index (#2660). Read by exactly one evaluator —
+	// DetectCommentOnlyGo, whose verdict `tests_added_or_updated`
+	// consumes — so every other check still operates purely on
+	// ChangedFiles. Empty when the patch capture failed, which the
+	// detector refuses as patch_absent.
+	Patch string
+	// PatchTruncated is true when the patch was cut at the runner's
+	// 256 KiB cap (internal/gitdiff). A truncated patch can hide a
+	// behavioral hunk behind a comment-only prefix, so the detector
+	// refuses outright.
+	PatchTruncated bool
 }
 
 // Constraints is the parsed shape of the workflow-spec stage's
@@ -286,6 +299,14 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 				// vacuously satisfied (#610). The len()>0 guard keeps an
 				// EMPTY diff failing — that still signals "stage produced
 				// nothing."
+			case isCommentOnlyGo(diff):
+				// Comment-only Go correction (#2660): mirrors the backend's
+				// third case so the runner does NOT fail the stage
+				// category-B on a diff the authoritative evaluator admits.
+				// Computed IN-LINE from diff.Patch — the runner has no
+				// signal channel and no audit round trip, so unlike the
+				// backend there is nothing to carry (see the ASYMMETRY note
+				// in commentonly.go).
 			default:
 				v = append(v, Violation{
 					Constraint: "required_outcomes",
@@ -406,14 +427,33 @@ func diffTouchesTestableCode(diff Diff) bool {
 		if f.Status == StatusDeleted {
 			continue
 		}
-		low := strings.ToLower(f.Path)
-		for _, ext := range testableSourceExts {
-			if strings.HasSuffix(low, ext) {
-				return true
-			}
+		if isTestableSourcePath(f.Path) {
+			return true
 		}
 	}
 	return false
+}
+
+// isTestableSourcePath reports whether p carries a recognized
+// unit-testable source extension. The per-path form of the fold above,
+// shared with DetectCommentOnlyGo (#2660) so the two read one definition.
+// Mirrors backend/internal/policy.IsTestableSourcePath.
+func isTestableSourcePath(p string) bool {
+	low := strings.ToLower(p)
+	for _, ext := range testableSourceExts {
+		if strings.HasSuffix(low, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCommentOnlyGo is the in-line comment-only verdict the
+// tests_added_or_updated switch consumes (#2660). Thin wrapper over
+// DetectCommentOnlyGo so the switch reads as a boolean case.
+func isCommentOnlyGo(diff Diff) bool {
+	sig := DetectCommentOnlyGo(diff)
+	return sig != nil && sig.CommentOnly
 }
 
 // testableSourceExts is the set of file extensions that count as

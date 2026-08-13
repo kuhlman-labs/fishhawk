@@ -201,6 +201,46 @@ func (s *Server) resolveImplementConstraints(ctx context.Context, runRow *run.Ru
 	return policy.Constraints{}, "", false
 }
 
+// resolveImplementRequiredOutcomes returns the first implement stage's
+// flattened `required_outcomes` for the run's cached workflow spec (#2660).
+// It performs the SAME spec walk as resolveImplementConstraints and shares
+// its fail-open contract: ok=false when the spec is absent, unparseable, the
+// workflow is missing, or it has no implement stage.
+//
+// This is deliberately a SEPARATE reader rather than a loosening of
+// flattenPathConstraints: that helper feeds the ADVISORY plan_scope_precheck,
+// which drops required_outcomes on purpose (see resolveImplementConstraints),
+// and the required-tests gate below is a distinct, BLOCKING check. Keeping
+// them apart leaves the advisory pre-check byte-identical.
+func (s *Server) resolveImplementRequiredOutcomes(ctx context.Context, runRow *run.Run) ([]string, bool) {
+	if runRow == nil || runRow.WorkflowSpec == nil {
+		return nil, false
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "required-tests gate: parse workflow spec failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, false
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil, false
+	}
+	for _, st := range wf.Stages {
+		if st.Type != spec.StageTypeImplement {
+			continue
+		}
+		var outcomes []string
+		for _, c := range st.Constraints {
+			outcomes = append(outcomes, c.RequiredOutcomes...)
+		}
+		return outcomes, true
+	}
+	return nil, false
+}
+
 // flattenPathConstraints collapses the implement stage's []spec.Constraint
 // (each carries exactly one non-zero field per the schema's
 // maxProperties:1) into a single policy.Constraints, keeping only the

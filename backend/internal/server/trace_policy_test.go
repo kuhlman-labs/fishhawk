@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1253,5 +1254,201 @@ func TestMergeConstraints_DiffCoverage(t *testing.T) {
 	}
 	if isEmptyConstraints(got) {
 		t.Error("a stage whose only constraint is diff_coverage was treated as constraint-free")
+	}
+}
+
+// --- comment-only Go exemption, end to end (#2660) ---------------------
+
+// runnerWireFixturePath is the shared wire fixture the RUNNER generates
+// through its real emit path (computeAndEmitDiff → makeGitDiffEventStats)
+// in runner/cmd/fishhawk-runner/main_test.go's
+// TestComputeAndEmitDiff_CommentOnlyWireFixture, committed so THIS side can
+// consume the SAME BYTES (binding approval condition 1).
+//
+// runner and backend are separate Go modules that cannot import each other,
+// so this file is what turns a link-by-link chain into an asserted wire
+// contract: the runner asserts byte-equality against it, the tests below
+// wrap it VERBATIM as the bundle's git_diff `data`, and a drift at either
+// end reddens both. Regenerate with FISHHAWK_UPDATE_GOLDEN=1 on the runner
+// test — never by hand.
+const runnerWireFixturePath = "../../../runner/cmd/fishhawk-runner/testdata/git_diff_comment_only.json"
+
+// readRunnerWireFixture returns the runner-produced git_diff payload. A
+// missing or unreadable fixture FAILS — degrading to a synthetic payload
+// would silently restore the gap this vehicle exists to close.
+func readRunnerWireFixture(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(runnerWireFixturePath)
+	if err != nil {
+		t.Fatalf("read the runner-produced wire fixture (regenerate with "+
+			"FISHHAWK_UPDATE_GOLDEN=1 go test ./cmd/fishhawk-runner/ -run "+
+			"TestComputeAndEmitDiff_CommentOnlyWireFixture from the runner module): %v", err)
+	}
+	return b
+}
+
+// bundleWithRawGitDiff packs a bundle whose git_diff event carries the given
+// payload bytes VERBATIM as its `data`, so no backend-side re-marshalling can
+// launder a wire-shape difference.
+func bundleWithRawGitDiff(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(map[string]any{"bundle_schema": "v1"})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+	diffLine, err := json.Marshal(map[string]any{
+		"seq": 2, "kind": "git_diff", "data": json.RawMessage(payload),
+	})
+	if err != nil {
+		t.Fatalf("marshal git_diff line: %v", err)
+	}
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return gz.Bytes()
+}
+
+// mutateWireFixture returns the fixture payload with its `patch` field
+// replaced, keeping every other key and its ordering intact — the vehicle for
+// the mirror-image cases below.
+func mutateWireFixture(t *testing.T, payload []byte, patch string) []byte {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil {
+		t.Fatalf("decode wire fixture: %v", err)
+	}
+	enc, _ := json.Marshal(patch)
+	m["patch"] = enc
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("re-encode wire fixture: %v", err)
+	}
+	return out
+}
+
+// shipCommentOnlyBundle drives the whole seam — runner-produced git_diff
+// payload → bundle → trace handler → bundle.ExtractDiff → DetectCommentOnlyGo
+// → policy.Evaluate → policy_evaluated audit entry — and returns the emitted
+// evaluation payload.
+func shipCommentOnlyBundle(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	s, sf, repo, au := newPolicyTraceServer(t, nil)
+	repo.runRow.WorkflowSpec = []byte(testWorkflowSpecRequireTests)
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv,
+		bundleWithRawGitDiff(t, payload), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := len(au.appended) - 1; i >= 0; i-- {
+		if au.appended[i].Category != "policy_evaluated" {
+			continue
+		}
+		var out map[string]any
+		if err := json.Unmarshal(au.appended[i].Payload, &out); err != nil {
+			t.Fatalf("decode policy_evaluated payload: %v", err)
+		}
+		return out
+	}
+	t.Fatal("no policy_evaluated audit entry")
+	return nil
+}
+
+// TestShipTrace_PolicyReEval_CommentOnlyGo_WireFixture_Passes is the
+// CROSS-BOUNDARY assertion for the envelope (#2660): a bundle whose git_diff
+// payload was produced by the RUNNER's real emit path — one modified .go file
+// whose only changed lines are a doc comment — satisfies
+// required_outcomes: tests_added_or_updated with no test file in the diff,
+// and the emitted audit entry carries the derived verdict under
+// applied_constraints.comment_only.
+func TestShipTrace_PolicyReEval_CommentOnlyGo_WireFixture_Passes(t *testing.T) {
+	payload := shipCommentOnlyBundle(t, readRunnerWireFixture(t))
+
+	if passed, _ := payload["passed"].(bool); !passed {
+		t.Fatalf("expected the comment-only landing to pass, got %v", payload)
+	}
+	applied, ok := payload["applied_constraints"].(map[string]any)
+	if !ok {
+		t.Fatalf("applied_constraints missing: %v", payload)
+	}
+	co, ok := applied["comment_only"].(map[string]any)
+	if !ok {
+		t.Fatalf("applied_constraints.comment_only missing — the verdict must ride on the audit payload "+
+			"or the post-CI re-evaluation cannot re-emit it: %v", applied)
+	}
+	if got, _ := co["comment_only"].(bool); !got {
+		t.Fatalf("comment_only = false, want true: %v", co)
+	}
+}
+
+// TestShipTrace_PolicyReEval_CommentOnlyGo_WireFixture_MirrorImages is the
+// fail-closed half of the same seam, built from the SAME runner-produced
+// payload so only the tested property differs: a patch that touches a
+// statement violates, and a patch_truncated bundle violates.
+func TestShipTrace_PolicyReEval_CommentOnlyGo_WireFixture_MirrorImages(t *testing.T) {
+	fixture := readRunnerWireFixture(t)
+
+	t.Run("statement-touching patch violates", func(t *testing.T) {
+		statement := "diff --git a/foo.go b/foo.go\n" +
+			"--- a/foo.go\n" +
+			"+++ b/foo.go\n" +
+			"@@ -1,4 +1,4 @@\n" +
+			" package foo\n" +
+			"-func Foo() int { return 1 }\n" +
+			"+func Foo() int { return 2 }\n"
+		payload := shipCommentOnlyBundle(t, mutateWireFixture(t, fixture, statement))
+		assertNoTestFilesViolation(t, payload)
+	})
+
+	t.Run("truncated patch violates", func(t *testing.T) {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(fixture, &m); err != nil {
+			t.Fatalf("decode wire fixture: %v", err)
+		}
+		m["patch_truncated"] = json.RawMessage("true")
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("re-encode wire fixture: %v", err)
+		}
+		payload := shipCommentOnlyBundle(t, raw)
+		assertNoTestFilesViolation(t, payload)
+	})
+}
+
+// assertNoTestFilesViolation asserts the evaluation failed on the unchanged
+// tests_added_or_updated detail, and that the carried verdict says NOT
+// comment-only.
+func assertNoTestFilesViolation(t *testing.T, payload map[string]any) {
+	t.Helper()
+	if passed, _ := payload["passed"].(bool); passed {
+		t.Fatalf("expected a violation, got a pass: %v", payload)
+	}
+	body, _ := json.Marshal(payload)
+	if !strings.Contains(string(body), "no test files added or updated") {
+		t.Fatalf("expected the unchanged tests_added_or_updated violation: %s", body)
+	}
+	applied, _ := payload["applied_constraints"].(map[string]any)
+	co, ok := applied["comment_only"].(map[string]any)
+	if !ok {
+		t.Fatalf("applied_constraints.comment_only missing: %v", applied)
+	}
+	if got, _ := co["comment_only"].(bool); got {
+		t.Fatalf("comment_only = true on a refused diff: %v", co)
+	}
+	if reason, _ := co["reason"].(string); reason == "" {
+		t.Fatalf("a refusal must carry a closed-set reason code: %v", co)
 	}
 }

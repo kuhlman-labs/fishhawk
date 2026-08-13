@@ -6,7 +6,7 @@ Backend-side source of truth for the closed set of workflow-spec constraints (`f
 
 | Outcome | Reads | Satisfied when |
 |---|---|---|
-| `tests_added_or_updated` | the diff's file **names** (`isTestPath`) | a test-named file was added/modified — or the diff touches no unit-testable source at all (docs/scripts/config only, #610) |
+| `tests_added_or_updated` | the diff's file **names** (`isTestPath`) — plus, as a third case, the emitted **patch** via `DetectCommentOnlyGo` (#2660) | a test-named file was added/modified — or the diff touches no unit-testable source at all (docs/scripts/config only, #610) — or the carried comment-only verdict says every changed testable-source file is a `.go` file whose emitted changed lines are blank or ordinary `//` comments |
 | `verification_reported` (v1.5, #1886 / ADR-059) | the stage's **machine-verified verify result** | the committed-tree verify gate reported `passed` — nothing else |
 | `diff_coverage` (v1.6, #1888 / ADR-059) — a constraint KIND, not a required outcome | the stage's **measured new-line coverage** | the runner measured coverage at or above `min_new_line_coverage`, OR measured zero new coverable lines |
 
@@ -31,6 +31,34 @@ Two deliberate omissions, both load-bearing:
 
 It is also **not deferrable**. `DeferredRequiredOutcomes` still returns only `ci_green` (whose missing signal defers to branch protection per #251 / ADR-017). Adding `verification_reported` there would reconstruct the vacuous pass it exists to remove.
 
+## The comment-only Go exemption (#2660)
+
+A doc-comment correction to a `.go` file has no behavior to test, yet `feature_change` requires `tests_added_or_updated` and `routine_change` forbids non-test `.go` paths — so it was unlandable through either workflow. `DetectCommentOnlyGo` (`commentonly.go`) adds the third satisfying case.
+
+**What it proves is a NARROW SYNTACTIC PROPERTY over the emitted unified diff — never behavioral emptiness in general:**
+
+- every changed testable-source file is a `.go` file with status `A` or `M`;
+- every one of those files has **exactly one** section in the emitted patch, and that section carries at least one `@@` hunk;
+- inside each section, every changed (`+`/`-`) line is blank or an ordinary `//` line comment — never a Go directive comment (`isGoDirectiveComment`); and
+- neither a backtick nor `import "C"` appears anywhere in the section, context lines included.
+
+Every other input is **fail-closed**, each with one code from the closed `Reason` set (the signal lands in the `policy_evaluated` audit payload, so a reason NEVER echoes diff content): `empty_diff`, `no_go_source_changed`, `non_go_source_changed`, `unsupported_status`, `patch_absent`, `patch_truncated`, `binary_patch`, `quoted_patch_path`, `patch_path_unmatched`, `file_missing_from_patch`, `duplicate_patch_section`, `section_without_hunks`, `raw_string_delimiter_in_section`, `cgo_import_in_section`, `directive_changed`, `non_comment_line_changed`.
+
+Two of those codes exist because a per-path map and a vacuous loop are both fail-OPEN shapes: `duplicate_patch_section` refuses a malformed patch carrying two sections for one path (the later would overwrite the earlier, so a comment-only section could mask a behavioral one for the same file), and `section_without_hunks` refuses a `.go` section carrying no `@@` hunk at all — a mode-only change — which would otherwise clear the file on zero changed lines.
+
+`isGoDirectiveComment` is a PORT, not a delegation: **`go/ast.IsDirective` does not exist** (verified against go1.26.3 — `go/ast` exports only `IsExported` and `IsGenerated`). It reproduces `go/ast`'s unexported `isDirective` (`line `/`extern `/`export ` prefixes plus the `[a-z0-9]+:[a-z0-9]` tool-directive shape) and extends it conservatively with the legacy `+build` tag and the cgo `#` preamble forms. The untrimmed remainder is load-bearing: `//go:build` is a directive, `// go:build` (with a space) is an ordinary comment. A table test pins both.
+
+**Why the verdict rides on `Constraints`, not on `Diff.Patch`.** It is derived ONCE at trace-upload time (`trace.go`) and carried as `Constraints.CommentOnly` — the same audit-round-trip discipline `Verification` and `DiffCoverageSignal` follow. The post-CI re-evaluation rebuilds the diff from the audit payload, which carries file names and never the patch, so recomputing downstream would evaluate an empty patch and flip a satisfied outcome into a violation. `nil` reads as NOT comment-only, so every pre-#2660 row re-evaluates byte-identically.
+
+**Runner/backend division of labour.** Unlike `verification_reported`, the runner does NOT defer here: `runner/internal/constraint/commentonly.go` is a logic-identical port evaluated IN-LINE from the patch the runner just captured, because otherwise the runner would fail the stage category-B before the backend ever saw it. The runner has no signal channel and no audit round trip, so it recomputes rather than carries. Change the two copies together.
+
+**THE RESIDUALS (accepted deliberately).** Behavioral emptiness is not decidable from a unified diff, and the in-section scans close only what the emitted window shows. **Two** residuals are admitted, both of the same shape — a changed line whose disqualifying context lies OUTSIDE the emitted hunk:
+
+1. **Raw string.** A changed blank or `//`-shaped line that actually sits inside a Go raw-string literal whose backtick delimiters lie entirely outside the emitted context.
+2. **cgo preamble.** In a file that uses cgo, the ordinary `//` lines immediately preceding `import "C"` are compiled C code (e.g. `// int foo() { return 1; }`). Such a line is not a directive — the ported `#` arm of `isGoDirectiveComment` catches only the `#cgo`/`#include` preprocessor forms, not plain C declarations — so when the `import "C"` lies outside the emitted context, a change to it is admitted as an ordinary comment. The `cgo_import_in_section` scan closes the case where the import IS emitted; it cannot close the case where it is not. Exploiting this additionally requires a pre-existing `import "C"` file: introducing one is itself a non-comment change the detector refuses.
+
+Each costs one vacuous satisfaction of `tests_added_or_updated` **per occurrence** — neither is bounded at one ever, and this document does not claim they are. Both are strictly narrower than the already-accepted #610 docs-only vacuous branch; the human plan gate (including its `--comment-only` override) and the implement review still apply to any such change; and closing them needs file contents — a runner-side AST or lexer signal, where the working tree exists — which neither a patch nor the trace bundle carries. `commentonly_test.go` pins each as a named KNOWN FALSE POSITIVE.
+
 ## Signal derivation
 
 The signal is derived at trace-upload time by `verificationSignalFromBundle` in `backend/internal/server/trace.go` — this package stays free of any `bundle` import. It reads the runner's single pre-redacted `gate_evidence` event (#963), which already digests every machine-verified verify result, so no new runner emission was needed:
@@ -52,6 +80,7 @@ Returns **nil** (read as a violation, never a pass) when: the bundle carries no 
 
 ## Anchors
 
+- #2660 — the comment-only Go exemption, its plan-gate sibling (`plan_missing_required_tests`), and the runner mirror.
 - #1886 / ADR-059 — substance-aware `verification_reported` (workflow-v1.5).
 - #610 / #601 — the `tests_added_or_updated` heuristic and its docs-only scoping.
 - #297 / #251 (ADR-017) — deferred outcomes and branch protection.
