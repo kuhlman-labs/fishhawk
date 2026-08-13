@@ -900,40 +900,36 @@ func TestDispatchStage_StageStateProbe(t *testing.T) {
 // green while silently disabling the entire #2630 recovery — reapZeroExitStrand
 // short-circuits on a nil probe.
 //
-// This drives dispatchStage end-to-end over a fake runner that exits 0 having
-// settled NOTHING (the served stage state stays 'running', inside the strand
-// allow-list), so the ONLY way the reaper POSTs reap-failure is a non-nil probe.
-// The reaper's settle-window is zeroed via zeroReapProbeBackoff; the reaper
-// goroutine race the StageStateProbe test comment cites is avoided because the
-// mcpserver reaper tests run serially (no t.Parallel), so the package-var
-// override is race-free — the same posture TestDispatchStage_ReaperReportsSpawnFailure
-// uses for the non-zero-exit reporter path.
+// This mirrors the sibling TestDriveRun_ThreadsNonNilProbeToSpawn: it wraps the
+// injectable detached-spawn seam (the dispatchSpawnDetached package var — kept
+// separate from the drive loop's r.driveSpawn so a manual dispatch stays
+// distinguishable from a drive-loop spawn) and asserts the probe argument the
+// call site threads is NON-NIL, WITHOUT launching a real exit-0 runner. The
+// property under test (this call site threads a non-nil probe) does not require
+// driving a real runner to observe, and driving one would spawn a reaper
+// goroutine that races the package-global reap settle-window (reapProbeBackoff)
+// against a reaper leaked from an earlier test — the -race failure this pin
+// originally introduced (CI run 31660448999). The seam observes the argument with
+// no runner, no reaper, no global mutation, and no race. The reaper's DECISION
+// over the probe's states is pinned exhaustively by the unit-level
+// TestReapDetachedRunner_ZeroExitStrandMatrix, and the probe BUILDER by
+// TestDispatchStage_StageStateProbe.
 //
 // COUNTERFACTUAL (condition 5): reverting dispatch_stage.go's spawn call to pass a
-// nil probe reddens this — reapZeroExitStrand short-circuits, no reap-failure POST
-// arrives, and the wait times out.
+// nil probe reddens this on the probeNonNil assertion.
 func TestDispatchStage_ThreadsNonNilProbeToSpawn(t *testing.T) {
-	zeroReapProbeBackoff(t)
 	runID := uuid.New()
 	stageID := uuid.New()
 
-	gotCh := make(chan reapFailureRequest, 1)
-	// The served stage state flips 'pending' -> 'dispatched' on the host-dispatch
-	// marker, mirroring the real CAS-flip: 'pending' lets the pre-spawn guards
-	// (resolveStageID + sibling-in-flight) admit the dispatch, and 'dispatched' —
-	// inside the strand allow-list — is what the reaper's post-exit probe reads, so
-	// a NON-NIL probe drives a category-C strand report while a nil probe would
-	// short-circuit with no POST.
+	// A minimal stateful backend serving only the pre-spawn guard reads
+	// dispatchStage makes before it reaches the spawn seam (GET run unlocked,
+	// GET stages present+pending, the best-effort record-act POST, the
+	// host-dispatch marker POST). No reap-failure endpoint and no runner: the
+	// seam short-circuits the spawn.
 	var mu sync.Mutex
 	stageState := "pending"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reap-failure"):
-			var b reapFailureRequest
-			_ = json.NewDecoder(r.Body).Decode(&b)
-			gotCh <- b
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch"):
 			mu.Lock()
 			stageState = "dispatched"
@@ -948,8 +944,8 @@ func TestDispatchStage_ThreadsNonNilProbeToSpawn(t *testing.T) {
 				"items": []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: st}},
 			})
 		default:
-			// guardHostDispatch's GET /v0/runs/{id} (an unlocked run so the guard
-			// passes).
+			// guardHostDispatch's GET /v0/runs/{id} (unlocked so the guard passes)
+			// and the best-effort POST /auto-drive record-act both tolerate this.
 			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
 		}
 	}))
@@ -960,29 +956,32 @@ func TestDispatchStage_ThreadsNonNilProbeToSpawn(t *testing.T) {
 		getenv: func(string) string { return "" },
 	}
 
-	// A runner that exits 0 having settled NOTHING — the #2630 zero-exit strand shape.
-	withFakeRunner(t, `exit 0`)
+	// Override the detached-spawn seam to observe the probe argument the dispatch
+	// call site threads. Returning nil error WITHOUT spawning keeps this race-free
+	// — no real runner, no reaper goroutine. Restored via t.Cleanup; the mcpserver
+	// tests run serially (no t.Parallel), so the package-var override is race-free.
+	var probeSeen, probeNonNil bool
+	savedSpawn := dispatchSpawnDetached
+	dispatchSpawnDetached = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		probeSeen = true
+		probeNonNil = probe != nil
+		return "/dev/null", nil
+	}
+	t.Cleanup(func() { dispatchSpawnDetached = savedSpawn })
 
 	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
 		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
 		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
 	}); err != nil {
 		t.Fatalf("dispatchStage: %v", err)
 	}
 
-	select {
-	case b := <-gotCh:
-		if b.Category != "C" {
-			t.Errorf("category = %q, want C", b.Category)
-		}
-		if !strings.Contains(b.Reason, "runner exited 0 without settling the stage") {
-			t.Errorf("reason = %q, want the zero-exit strand reason", b.Reason)
-		}
-		if b.ExitCode != 0 {
-			t.Errorf("exit_code = %d, want 0 (a clean-exit strand)", b.ExitCode)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reaper did not POST reap-failure within 5s — dispatchStage threaded a NIL probe, silently disabling #2630 zero-exit strand recovery")
+	if !probeSeen {
+		t.Fatal("dispatch never reached the spawn seam")
+	}
+	if !probeNonNil {
+		t.Fatal("dispatch_stage spawn call site threaded a NIL probe — the #2630 zero-exit strand recovery is silently disabled at this call site")
 	}
 }
 
