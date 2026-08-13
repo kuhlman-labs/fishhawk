@@ -549,6 +549,130 @@ func TestReapStageFailure_ParkLandsMidTransition(t *testing.T) {
 	assertBenignParkNoOp(t, w, rr, au, runRow.ID, stage.ID)
 }
 
+// casCountReapRepo counts the reap path's compare-and-swap calls against ONE
+// target stage (id == stageID, so an unrelated stage's traffic can never inflate
+// the count). It mutates NO state — the seeded anchor stays put until
+// reapFailCAS's own CAS moves it — so the count is purely the SHAPE of the walk
+// the reap path took: 1 for a pending anchor's single pending → failed CAS, 2
+// for a walk routed through an intermediate hop.
+type casCountReapRepo struct {
+	*orchestratorRepo
+	stageID  uuid.UUID
+	casCalls int
+}
+
+func (r *casCountReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if id == r.stageID {
+		// Counted under the embedded mutex, released before the delegate
+		// re-locks it (sync.Mutex is not reentrant) — the livelockReapRepo
+		// ListStagesForRun precedent.
+		r.mu.Lock()
+		r.casCalls++
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+// (b11) SUCCEEDING pending-anchor reap — the single-CAS shape (#2678). Every
+// other test that reaches reapFailCAS with from == pending asserts a REFUSAL
+// (AwaitingChildrenParkAtLoad, ParkLandsMidTransition), so the pending anchor's
+// SUCCESS path — the one reapFailCAS documents as taking a distinct shape,
+// because the `from == run.StageStateDispatched` pre-walk in reapFailCAS
+// (reap_failure.go) is skipped for it — had no coverage at all.
+//
+// The outcome assertions below (200 {transitioned:true, stage_state:failed}, the
+// persisted stage at failed with category C and the posted reason, exactly one
+// dispatch_reaper_failed entry with ActorSystem, the run advanced to failed) are
+// shape-BLIND: they hold equally for a walk that reached failed via an
+// intermediate hop. What makes this test specific to the pending anchor is the
+// casCalls == 1 assertion — WITHOUT it the test would pass against a 2-hop
+// shape. Its counterfactual sibling is TestReapStageFailure_ParkLandsMidTransition
+// (same pending anchor, opposite outcome: a park landing mid-transition refuses).
+func TestReapStageFailure_PendingAnchorSingleCAS(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStatePending)
+	counter := &casCountReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   counter,
+		AuditRepo: au,
+		// The RAW rr, deliberately NOT the counter: Advance's own repo traffic
+		// must never inflate casCalls, or the single-CAS assertion stops being
+		// scoped to the reap path and becomes unsound.
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	const reason = "pending stage never spawned a runner"
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: reason}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (pending is a first-class reapable anchor):\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Transitioned {
+		t.Error("transitioned = false, want true")
+	}
+	if resp.StageState != string(run.StageStateFailed) {
+		t.Errorf("stage_state = %q, want failed", resp.StageState)
+	}
+
+	// Persisted state, read after the call returned: failed, category C, and the
+	// posted reason recorded on the stage row.
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	if cur.FailureCategory == nil || *cur.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C", cur.FailureCategory)
+	}
+	if cur.FailureReason == nil || *cur.FailureReason != reason {
+		t.Errorf("failure reason = %v, want %q", cur.FailureReason, reason)
+	}
+
+	// Exactly one dispatch_reaper_failed entry, actor system, naming the reason.
+	entries := reapAudit(au)
+	if len(entries) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(entries))
+	}
+	if entries[0].ActorKind == nil || *entries[0].ActorKind != audit.ActorSystem {
+		t.Errorf("actor kind = %v, want system", entries[0].ActorKind)
+	}
+	var payload struct {
+		Reason          string `json:"reason"`
+		FailureCategory string `json:"failure_category"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Reason != reason || payload.FailureCategory != "C" {
+		t.Errorf("payload = %+v, want reason %q / category C", payload, reason)
+	}
+
+	// Advance ran: the run's only stage is failed, so the run walked to failed.
+	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
+	if curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance invoked)", curRun.State)
+	}
+
+	// THE DISTINGUISHING ASSERTION: the pending anchor takes ONE CAS. A 2 means
+	// the `from == dispatched` pre-walk was taken for a pending anchor — the
+	// stage was routed through an intermediate hop rather than the single
+	// pending → failed edge the shape documents.
+	rr.mu.Lock()
+	got := counter.casCalls
+	rr.mu.Unlock()
+	if got != 1 {
+		t.Errorf("TransitionStageFrom calls on the target stage = %d, want 1 "+
+			"(a pending anchor skips the dispatched pre-walk; %d means the reap "+
+			"routed the stage through an intermediate hop)", got, got)
+	}
+}
+
 // midFlightFlipReapRepo models a concurrent state flip landing between the
 // handler's load and the reap transition's CAS. It flips the target stage to
 // flipTo on the FIRST TransitionStageFrom attempt, then delegates — so that CAS
