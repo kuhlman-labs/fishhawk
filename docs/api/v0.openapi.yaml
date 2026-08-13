@@ -7349,6 +7349,21 @@ paths:
                   stage_state:
                     type: string
                     description: The resulting stage state (always `dispatched` on 200).
+                  base_branch:
+                    type: string
+                    description: |
+                      The branch a DECOMPOSED FAN-OUT CHILD must spawn against
+                      (E50.13 / #2363) — the parent's consolidated branch,
+                      returned only once every dependency slice this child
+                      declares is provably MERGED onto it (its child run id
+                      appears in the newest `slices_integrated` audit entry's
+                      `child_run_ids`). Omitted for every other caller — a
+                      non-decomposed run, the parent's own re-dispatch, and a
+                      wave-0 child declaring no dependencies — and an absent
+                      value means "keep the base you already had". The server
+                      is the authority on the per-wave re-base; a caller must
+                      not derive one of its own. Returned on the idempotent
+                      already-`dispatched` arm too, since that caller re-spawns.
         '400':
           description: |
             A malformed `run_id` or `stage_id` path value
@@ -7372,7 +7387,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            One of two refusals:
+            One of three refusals:
 
             - `dispatch_not_admissible` — the stage is in a `running`,
               terminal, or `awaiting_*` gate state, a run locked to a
@@ -7405,6 +7420,24 @@ paths:
               and a plan revised between that read and the transition can leave
               the check evaluating a stale dependency set. That case is not
               covered by the guarantee above.
+            - `wave_not_integrated` — the per-wave integration guard (E50.13 /
+              #2363): this fan-out child's declared dependency slices have all
+              reached `succeeded` (so the wave-order refusal above does not
+              apply) but are NOT yet merged onto the parent's consolidated
+              branch. Run state flips to `succeeded` BEFORE the between-wave
+              integration merges the slice branches, so admitting on state
+              alone would spawn the dependent slice on a base missing its
+              predecessors' symbols. `details` carries `slice_index`,
+              `depends_on`, `missing_dependency_slices` (the dependency slices
+              not covered by the newest integration — empty when the branch
+              itself is what is absent) and `consolidated_branch_present`
+              (`false` = the fan-out has never been integrated; `true` = an
+              integration exists but is STALE, i.e. a non-empty consolidated
+              branch is deliberately NOT sufficient on its own). The refusal
+              fires BEFORE the state CAS, so no state is committed and the
+              child stays cleanly re-dispatchable. Nothing must be dispatched
+              first to clear it: the server integrates between waves, so the
+              action is to retry the dispatch shortly.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -7412,9 +7445,11 @@ paths:
           description: |
             `dependency_check_failed` — the wave-order guard could not resolve
             the run's parent plan or list its decomposition siblings to
-            validate wave order (E48.99 / #2546). Retryable: the guard fails
-            closed on a read error rather than admitting out of order, and
-            commits no state.
+            validate wave order (E48.99 / #2546), or the per-wave integration
+            guard could not read the parent's `slices_integrated` history to
+            derive `base_branch` (E50.13 / #2363). Retryable: both fail closed
+            on a read error rather than admitting out of order or on an
+            unverified base, and commit no state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -6,6 +6,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -877,4 +882,369 @@ func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
 				cur0.State, esc.name)
 		}
 	}
+}
+
+// --- Per-wave integration guard + base_branch derivation (E50.13 / #2363) ---
+
+// slicesIntegratedPayload renders a slices_integrated audit payload for the
+// coverage fixtures below. Its KEY NAMES are not taken on trust:
+// TestLatestSlicesIntegrated_DecodesRealEmitterPayload drives the REAL fan-in
+// (orchestrator.IntegrateSlices → emitSlicesIntegrated) and asserts this
+// helper's key set equals the emitter's, so a hand-seeded fixture can never
+// disagree with production bytes (#2660's wire-fixture lesson applied to the
+// audit decode).
+func slicesIntegratedPayload(t *testing.T, consolidatedBranch string, childRunIDs []string) json.RawMessage {
+	t.Helper()
+	if childRunIDs == nil {
+		childRunIDs = []string{}
+	}
+	b, err := json.Marshal(map[string]any{
+		"child_run_ids":           childRunIDs,
+		"consolidated_branch":     consolidatedBranch,
+		"slice_count":             len(childRunIDs),
+		"integration_commit_shas": []string{},
+	})
+	if err != nil {
+		t.Fatalf("marshal slices_integrated payload: %v", err)
+	}
+	return b
+}
+
+func seedSlicesIntegrated(t *testing.T, au *auditCompleteAuditFake, parentID uuid.UUID,
+	consolidatedBranch string, childRunIDs []string) {
+	t.Helper()
+	au.appendChained(t, parentID, nil, "slices_integrated", slicesIntegratedPayload(t, consolidatedBranch, childRunIDs))
+}
+
+// slicesIntegratedErrAudit fails ONLY the slices_integrated read, leaving every
+// other category delegating normally — so the audit-read fail-closed branch is
+// reachable in isolation.
+type slicesIntegratedErrAudit struct {
+	*auditCompleteAuditFake
+	err error
+}
+
+func (a *slicesIntegratedErrAudit) ListForRunByCategory(ctx context.Context, id uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == "slices_integrated" {
+		return nil, a.err
+	}
+	return a.auditCompleteAuditFake.ListForRunByCategory(ctx, id, category)
+}
+
+// waveConsolidatedBranch is the fixed consolidated-branch name the dependent
+// child fixtures integrate onto. Fixed (not a fresh uuid) because
+// backend/internal/server/testdata/host_dispatch_dependent_child.json is a
+// BYTE-EXACT wire fixture and must be stable.
+const waveConsolidatedBranch = "fishhawk/run-11111111-1111-1111-1111-111111111111-consolidated"
+
+// waveDispatchFixture is a decomposed parent with a succeeded slice-0 child and
+// a slice-1 child (depends_on [0]) whose implement stage is parked at
+// awaiting_host_dispatch — i.e. a child the wave-ORDER guard admits, so every
+// test below lands on the per-wave INTEGRATION decision and nothing else.
+type waveDispatchFixture struct {
+	s        *Server
+	rr       *guardCountingRepo
+	au       *auditCompleteAuditFake
+	parentID uuid.UUID
+	dep      *run.Run
+	child    *run.Run
+	stage    *run.Stage
+}
+
+func seedWaveDispatchFixture(t *testing.T) *waveDispatchFixture {
+	t.Helper()
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	au := newAuditCompleteAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au})
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	dep := seedGuardChild(rr, parentID, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	stage := rr.seedStage(child.ID, 1, run.StageStateAwaitingHostDispatch)
+	stage.Type = run.StageTypeImplement
+	return &waveDispatchFixture{s: s, rr: rr, au: au, parentID: parentID, dep: dep, child: child, stage: stage}
+}
+
+// stageState reads the child's implement stage row back from the repository.
+// The controls below have their effect on COMMITTED STATE, and a refusal that
+// fired then rolled back returns a byte-identical error — so every refusal test
+// asserts this, not just the response code (the counterfactual trap (a)).
+func (f *waveDispatchFixture) stageState(t *testing.T) run.StageState {
+	t.Helper()
+	st, err := f.rr.GetStage(context.Background(), f.stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	return st.State
+}
+
+// TestHostDispatch_DependentChild_EndToEnd is the cross-boundary happy path: a
+// fan-out child whose dependency slice is BOTH succeeded and merged is admitted
+// with the parent's consolidated branch as base_branch, and its stage flips to
+// dispatched.
+func TestHostDispatch_DependentChild_EndToEnd(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, []string{f.dep.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if !resp.Transitioned {
+		t.Error("transitioned = false, want true")
+	}
+	if resp.BaseBranch != waveConsolidatedBranch {
+		t.Errorf("base_branch = %q, want %q", resp.BaseBranch, waveConsolidatedBranch)
+	}
+	if got := f.stageState(t); got != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched", got)
+	}
+}
+
+// TestHostDispatch_DependentChild_ResponseMatchesWireFixture proves the shared
+// wire fixture IS the server's own 200 body, byte for byte. The MCP client test
+// serves these same bytes to a real apiClient, so the client's decode boundary
+// is asserted against production output rather than against a re-marshal of the
+// client's own struct (the #2660 lesson: a fake that encodes the struct the
+// client decodes round-trips a wrong json tag symmetrically). A renamed or
+// dropped tag on hostDispatchResponse reddens HERE.
+func TestHostDispatch_DependentChild_ResponseMatchesWireFixture(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, []string{f.dep.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	fixture, err := os.ReadFile(filepath.Join("testdata", "host_dispatch_dependent_child.json"))
+	if err != nil {
+		t.Fatalf("read wire fixture: %v", err)
+	}
+	if got, want := w.Body.String(), string(fixture); got != want {
+		t.Errorf("response body is not byte-identical to the wire fixture:\n got: %q\nwant: %q", got, want)
+	}
+	var gotMap, wantMap map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &gotMap); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if err := json.Unmarshal(fixture, &wantMap); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if !reflect.DeepEqual(gotMap, wantMap) {
+		t.Errorf("decoded shapes differ:\n got: %+v\nwant: %+v", gotMap, wantMap)
+	}
+}
+
+// C1 — the no-integration refusal. Bad state is seeded BY CONSTRUCTION: the
+// fixture simply omits the slices_integrated entry, so no setup guard calls the
+// control. Asserts error IDENTITY *and* reads the stage row back, because the
+// control's effect is committed state and a fired-then-rolled-back refusal
+// returns a byte-identical error.
+func TestHostDispatch_RefusesDependentChildWhenWaveNotIntegrated(t *testing.T) {
+	f := seedWaveDispatchFixture(t) // no slices_integrated entry at all
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "wave_not_integrated" {
+		t.Errorf("code = %q, want wave_not_integrated", code)
+	}
+	if got := f.stageState(t); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %q, want awaiting_host_dispatch — the refusal must commit NO state", got)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"consolidated_branch_present":false`) {
+		t.Errorf("body = %s, want consolidated_branch_present:false", body)
+	}
+}
+
+// C2 — the STALE-integration refusal, a control DISTINCT from C1. An
+// integration DID happen and names a non-empty consolidated branch (so
+// consolidatedBranchFromAudit alone would admit), but its child_run_ids covers
+// only an unrelated earlier child — exactly the later-wave situation. Deleting
+// the wavecoverage.Covered call (admitting on any non-empty branch) returns 200
+// with a stale base_branch and reddens both assertions.
+func TestHostDispatch_RefusesDependentChildWhenIntegrationIsStale(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	// An earlier wave's child, merged; THIS child's dependency (slice 0) is not.
+	earlier := seedGuardChild(f.rr, f.parentID, 7, run.StateSucceeded)
+	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, []string{earlier.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "wave_not_integrated" {
+		t.Errorf("code = %q, want wave_not_integrated", code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"missing_dependency_slices":[0]`) {
+		t.Errorf("body = %s, want missing_dependency_slices:[0]", body)
+	}
+	if !strings.Contains(body, `"consolidated_branch_present":true`) {
+		t.Errorf("body = %s, want consolidated_branch_present:true (the stale case, not the absent one)", body)
+	}
+	if got := f.stageState(t); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %q, want awaiting_host_dispatch — the refusal must commit NO state", got)
+	}
+}
+
+// The existing wave-ORDER guard must still fire FIRST when a dependency has not
+// succeeded — the new derivation runs after it and must not displace or reorder
+// it. Without this pin, a wave-order violation could start reporting as
+// wave_not_integrated, telling the operator to wait for an integration that
+// cannot happen.
+func TestHostDispatch_DependencyNotSucceeded_StillReportsWaveOrder(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	f.dep.State = run.StatePending // dependency not succeeded AND not integrated
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "dependency_not_satisfied" {
+		t.Errorf("code = %q, want dependency_not_satisfied (the wave-ORDER guard still decides first)", code)
+	}
+	if got := f.stageState(t); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %q, want awaiting_host_dispatch", got)
+	}
+}
+
+// A wave-0 child (no declared dependencies) is admitted with NO base_branch even
+// with an audit history present: it keeps whatever base it had.
+func TestHostDispatch_Wave0Child_AdmitsWithoutBaseBranch(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, nil)
+	stage := f.rr.seedStage(f.dep.ID, 1, run.StageStateAwaitingHostDispatch)
+
+	w := postHostDispatch(t, f.s, f.dep.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeHostDispatch(t, w); got.BaseBranch != "" {
+		t.Errorf("base_branch = %q, want empty for a wave-0 child", got.BaseBranch)
+	}
+}
+
+// A non-decomposed run is admitted with NO base_branch and no extra reads —
+// the inert path every ordinary dispatch takes.
+func TestHostDispatch_NonDecomposedRun_NoBaseBranch(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	plain := f.rr.seedRun()
+	stage := f.rr.seedStage(plain.ID, 0, run.StageStateAwaitingHostDispatch)
+
+	w := postHostDispatch(t, f.s, plain.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeHostDispatch(t, w); got.BaseBranch != "" {
+		t.Errorf("base_branch = %q, want empty for a non-decomposed run", got.BaseBranch)
+	}
+}
+
+// The idempotent already-dispatched arm (a dead-runner manual re-dispatch) must
+// carry the derived base too — the caller re-spawns from it, so omitting it
+// there would silently re-spawn on the wrong base.
+func TestHostDispatch_DependentChild_AlreadyDispatched_CarriesBaseBranch(t *testing.T) {
+	f := seedWaveDispatchFixture(t)
+	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, []string{f.dep.ID.String()})
+	f.stage.State = run.StageStateDispatched
+
+	w := postHostDispatch(t, f.s, f.child.ID, f.stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if resp.Transitioned {
+		t.Error("transitioned = true, want false (idempotent no-op)")
+	}
+	if resp.BaseBranch != waveConsolidatedBranch {
+		t.Errorf("base_branch = %q, want %q on the idempotent arm", resp.BaseBranch, waveConsolidatedBranch)
+	}
+}
+
+// An audit-read error is retryable and fails CLOSED: 500 dependency_check_failed
+// with the stage untransitioned, never a silent admit.
+func TestHostDispatch_DependentChild_AuditReadError_500(t *testing.T) {
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	au := &slicesIntegratedErrAudit{auditCompleteAuditFake: newAuditCompleteAuditFake(), err: errors.New("audit read boom")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au})
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	seedGuardChild(rr, parentID, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	stage := rr.seedStage(child.ID, 1, run.StageStateAwaitingHostDispatch)
+
+	w := postHostDispatch(t, s, child.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "dependency_check_failed" {
+		t.Errorf("code = %q, want dependency_check_failed", code)
+	}
+	if got, err := rr.GetStage(context.Background(), stage.ID); err != nil || got.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %v (err %v), want awaiting_host_dispatch — an errored read must never admit", got.State, err)
+	}
+}
+
+// TestLatestSlicesIntegrated_DecodesRealEmitterPayload ties this package's audit
+// DECODER to the orchestrator's real EMITTER, which is what makes the
+// hand-seeded fixtures above trustworthy. It drives the REAL fan-in through the
+// consolidate endpoint (orchestrator.IntegrateSlices → emitSlicesIntegrated),
+// then decodes that genuine entry: a renamed emitter key (child_run_ids →
+// childRunIds) makes the decode return nothing and reddens here, where every
+// hand-seeded coverage test would stay green. It also pins the seeding helper's
+// key set against the emitter's, so the two can never drift apart.
+func TestLatestSlicesIntegrated_DecodesRealEmitterPayload(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+	if w := postConsolidate(t, f.s, f.parent.ID, withAuth); w.Code != http.StatusOK {
+		t.Fatalf("consolidate status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	branch, ids, err := f.s.latestSlicesIntegrated(context.Background(), f.parent.ID)
+	if err != nil {
+		t.Fatalf("latestSlicesIntegrated: %v", err)
+	}
+	gh.mu.Lock()
+	created := append([]string(nil), gh.createdRefs...)
+	gh.mu.Unlock()
+	if len(created) != 1 || branch != created[0] {
+		t.Errorf("branch = %q, want the branch the real fan-in created (%v)", branch, created)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("child_run_ids = %v, want the 2 child run ids the real emitter recorded", ids)
+	}
+	for _, id := range ids {
+		if _, perr := uuid.Parse(id); perr != nil {
+			t.Errorf("child_run_ids entry %q is not a run id", id)
+		}
+	}
+
+	// The emitter's key set IS the seeding helper's key set, so a hand-seeded
+	// coverage fixture cannot decode differently from production bytes.
+	real := consolidateAuditPayload(t, f.au, f.parent.ID, "slices_integrated")
+	var seeded map[string]any
+	if err := json.Unmarshal(slicesIntegratedPayload(t, "b", []string{"r"}), &seeded); err != nil {
+		t.Fatalf("decode seeded payload: %v", err)
+	}
+	realKeys, seededKeys := mapKeys(real), mapKeys(seeded)
+	if !reflect.DeepEqual(realKeys, seededKeys) {
+		t.Errorf("slices_integrated keys: emitter %v, seeding helper %v — the hand-seeded fixtures must match production bytes", realKeys, seededKeys)
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -495,3 +495,235 @@ func TestSliceDependencyError_Message(t *testing.T) {
 		t.Errorf("details = %+v, want the four structured keys", d)
 	}
 }
+
+// --- resolveDependentChildBase: the per-wave re-base + integration guard (#2363) ---
+
+// nthListRunsErrRepo fails the Nth ListRuns call (1-indexed) and delegates the
+// rest. resolveDependentChildBase's sibling walk is the SECOND ListRuns on the
+// host-dispatch path (guardDecompositionWaveOrder makes the first), so a repo
+// that fails every call would redden on the guard's walk instead and never
+// reach the branch under test.
+type nthListRunsErrRepo struct {
+	*guardCountingRepo
+	failOnCall int
+	calls      int
+	err        error
+}
+
+func (r *nthListRunsErrRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	r.calls++
+	if r.calls == r.failOnCall {
+		return nil, r.err
+	}
+	return r.guardCountingRepo.ListRuns(ctx, f)
+}
+
+// newBaseServer wires a server with the counting run repo, a fake artifact repo
+// AND an audit fake, so resolveDependentChildBase can read the parent's
+// slices_integrated history. newGuardServer deliberately wires no AuditRepo
+// (the wave-ORDER guard needs none), which is why this has its own harness.
+func newBaseServer(t *testing.T) (*Server, *guardCountingRepo, *fakeArtifactRepo, *auditCompleteAuditFake) {
+	t.Helper()
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	au := newAuditCompleteAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au})
+	return s, rr, art, au
+}
+
+// (1) a run that is not a fan-out child admits with NO base — the caller keeps
+// whatever base it had, byte-identical to pre-#2363 behaviour.
+func TestResolveDependentChildBase_NotDecomposed_Admits(t *testing.T) {
+	s, rr, _, _ := newBaseServer(t)
+	child := rr.seedRun()
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr != nil || base != "" {
+		t.Fatalf("got (%q, %v, %v), want (\"\", nil, nil)", base, waveErr, err)
+	}
+}
+
+// (2) a wave-0 child (empty depends_on) admits with NO base: there is nothing
+// to integrate, so it spawns on the base it already had.
+func TestResolveDependentChildBase_EmptyDependsOn_Admits(t *testing.T) {
+	s, rr, art, au := newBaseServer(t)
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parent, 0, run.StateRunning)
+	seedSlicesIntegrated(t, au, parent, "fishhawk/run-x-consolidated", nil)
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr != nil || base != "" {
+		t.Fatalf("got (%q, %v, %v), want (\"\", nil, nil) — a wave-0 child gets no derived base", base, waveErr, err)
+	}
+}
+
+// (3) UNCONFIGURED audit reads as ABSENT, not as a violation: a deployment
+// without an audit repository admits with no derived base rather than having
+// every dependent dispatch wedged behind a 409 it can never clear. Same
+// three-way partition resolveSliceDependencies documents.
+func TestResolveDependentChildBase_NilAuditRepo_Admits(t *testing.T) {
+	s, rr, art := newGuardServer(t) // no AuditRepo
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr != nil || base != "" {
+		t.Fatalf("got (%q, %v, %v), want (\"\", nil, nil) — an unconfigured audit repo is ABSENT input", base, waveErr, err)
+	}
+}
+
+// (4) a plan-LOAD error fails closed (retryable), never a silent admit.
+func TestResolveDependentChildBase_PlanLoadError_FailsClosed(t *testing.T) {
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	art.listErr = errors.New("artifact store down")
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: newAuditCompleteAuditFake()})
+	parent := rr.seedRun()
+	rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
+	child := seedGuardChild(rr, parent.ID, 1, run.StateRunning)
+
+	if _, _, err := s.resolveDependentChildBase(context.Background(), child); err == nil {
+		t.Fatal("err = nil, want the plan-load error propagated (fail closed)")
+	}
+}
+
+// (5) an audit LIST error fails closed — the refusal must never be decided on a
+// read that did not happen.
+func TestResolveDependentChildBase_AuditListError_FailsClosed(t *testing.T) {
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	au := &slicesIntegratedErrAudit{auditCompleteAuditFake: newAuditCompleteAuditFake(), err: errors.New("audit read boom")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au})
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+
+	_, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err == nil {
+		t.Fatal("err = nil, want the audit-read error propagated (fail closed)")
+	}
+	if waveErr != nil {
+		t.Errorf("waveErr = %+v, want nil — an errored read is retryable, not a refusal", waveErr)
+	}
+}
+
+// (6) a sibling-LIST error fails closed. The failure is injected on the SECOND
+// ListRuns so the wave-order guard's own walk succeeds and execution genuinely
+// reaches resolveDependentChildBase's walk.
+func TestResolveDependentChildBase_SiblingListError_FailsClosed(t *testing.T) {
+	inner := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	rr := &nthListRunsErrRepo{guardCountingRepo: inner, failOnCall: 1, err: errors.New("list runs boom")}
+	art := newFakeArtifactRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: newAuditCompleteAuditFake()})
+	parent := seedParentDecompPlan(t, inner, art, [][]int{nil, {0}})
+	seedGuardChild(inner, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(inner, parent, 1, run.StateRunning)
+
+	if _, _, err := s.resolveDependentChildBase(context.Background(), child); err == nil {
+		t.Fatal("err = nil, want the sibling-list error propagated (fail closed)")
+	}
+}
+
+// (7) an UNDECODABLE newest payload reads as ABSENT and REFUSES — it must not
+// admit on a payload the server could not understand.
+func TestResolveDependentChildBase_UndecodablePayload_Refuses(t *testing.T) {
+	s, rr, art, au := newBaseServer(t)
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+	au.appendChained(t, parent, nil, "slices_integrated", json.RawMessage(`"not-an-object"`))
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil {
+		t.Fatalf("err = %v, want nil (an undecodable payload is ABSENT, not an errored read)", err)
+	}
+	if waveErr == nil || base != "" {
+		t.Fatalf("got (%q, %v), want a refusal with no base", base, waveErr)
+	}
+	if waveErr.consolidatedBranchPresent {
+		t.Error("consolidated_branch_present = true, want false on an undecodable payload")
+	}
+}
+
+// (8) COVERED but with an EMPTY branch still refuses: the response's base_branch
+// is what the child spawns against, so an empty one would silently degrade to
+// the caller's default base — the #1302 stale-base class this guard exists for.
+func TestResolveDependentChildBase_CoveredWithEmptyBranch_Refuses(t *testing.T) {
+	s, rr, art, au := newBaseServer(t)
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	dep := seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+	seedSlicesIntegrated(t, au, parent, "", []string{dep.ID.String()})
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr == nil || base != "" {
+		t.Fatalf("got (%q, %v, %v), want a refusal with no base", base, waveErr, err)
+	}
+	if waveErr.consolidatedBranchPresent {
+		t.Error("consolidated_branch_present = true, want false on an empty branch")
+	}
+	if len(waveErr.missing) != 0 {
+		t.Errorf("missing = %v, want empty — coverage held; the branch is what was absent", waveErr.missing)
+	}
+}
+
+// (9) the happy path: covered dependencies + a named branch admits WITH that
+// branch as the derived base.
+func TestResolveDependentChildBase_Covered_ReturnsConsolidatedBranch(t *testing.T) {
+	s, rr, art, au := newBaseServer(t)
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	dep := seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+	seedSlicesIntegrated(t, au, parent, "fishhawk/run-abc-consolidated", []string{dep.ID.String()})
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr != nil {
+		t.Fatalf("got (%v, %v), want an admit", waveErr, err)
+	}
+	if base != "fishhawk/run-abc-consolidated" {
+		t.Errorf("base = %q, want the consolidated branch from the newest entry", base)
+	}
+}
+
+// (10) the branch and the coverage set must come from THE SAME entry. An older
+// entry naming a branch plus a newer one covering the dependency (but naming no
+// branch) must NOT be spliced into an admit — latestSlicesIntegrated reads one
+// entry, which is the whole point of the single helper.
+func TestResolveDependentChildBase_DoesNotSpliceAcrossEntries(t *testing.T) {
+	s, rr, art, au := newBaseServer(t)
+	parent := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	dep := seedGuardChild(rr, parent, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parent, 1, run.StateRunning)
+	seedSlicesIntegrated(t, au, parent, "fishhawk/run-old-consolidated", nil)
+	seedSlicesIntegrated(t, au, parent, "", []string{dep.ID.String()})
+
+	base, waveErr, err := s.resolveDependentChildBase(context.Background(), child)
+	if err != nil || waveErr == nil || base != "" {
+		t.Fatalf("got (%q, %v, %v), want a refusal — the older entry's branch must not be spliced onto the newer entry's coverage", base, waveErr, err)
+	}
+}
+
+// TestWaveIntegrationError_MessageAndDetails pins both refusal shapes and the
+// structured payload the 409 body carries.
+func TestWaveIntegrationError_MessageAndDetails(t *testing.T) {
+	none := &waveIntegrationError{sliceIndex: 2, dependsOn: []int{0, 1}, consolidatedBranchPresent: false}
+	if got := none.message(); !strings.Contains(got, "no consolidated branch") || !strings.Contains(got, "slice 2") {
+		t.Errorf("no-integration message = %q, want it to name slice 2 and the absent consolidated branch", got)
+	}
+	stale := &waveIntegrationError{sliceIndex: 2, dependsOn: []int{0, 1}, missing: []int{1}, consolidatedBranchPresent: true}
+	if got := stale.message(); !strings.Contains(got, "stale consolidated branch") || !strings.Contains(got, "[1]") {
+		t.Errorf("stale message = %q, want it to name the stale branch and the uncovered slices", got)
+	}
+	d := stale.details()
+	if d["slice_index"] != 2 || d["consolidated_branch_present"] != true {
+		t.Errorf("details = %+v, want slice_index 2 and consolidated_branch_present true", d)
+	}
+	if got, ok := d["missing_dependency_slices"].([]int); !ok || len(got) != 1 || got[0] != 1 {
+		t.Errorf("missing_dependency_slices = %v, want [1]", d["missing_dependency_slices"])
+	}
+	// Always a non-nil array, so a consumer need not distinguish null from empty.
+	if got, ok := none.details()["missing_dependency_slices"].([]int); !ok || got == nil {
+		t.Errorf("missing_dependency_slices = %v, want a non-nil empty array", none.details()["missing_dependency_slices"])
+	}
+}

@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/wavecoverage"
 )
 
 // decompositionSiblingPageSize bounds each ListRuns page in the sibling walk.
@@ -227,4 +229,163 @@ func (s *Server) guardDecompositionWaveOrder(ctx context.Context, runRow *run.Ru
 		}
 	}
 	return nil, nil
+}
+
+// waveIntegrationError is the host-dispatch refusal a decomposed child produces
+// when its declared dependency slices have all SUCCEEDED — so the wave-order
+// guard above admits — but they are not yet merged onto the parent's
+// consolidated branch. Spawning there would build the dependent slice on a base
+// missing its predecessors' symbols (#1302), so the endpoint refuses 409
+// wave_not_integrated BEFORE the state CAS and the child stays cleanly
+// re-dispatchable once the between-wave integration lands.
+//
+// It carries BOTH refusal causes so an operator can tell them apart from the
+// 409 body alone:
+//
+//   - consolidatedBranchPresent=false — the parent has no slices_integrated
+//     entry yet (or one carrying an empty branch): the fan-out has never been
+//     integrated.
+//   - missing non-empty — an integration DID happen but its child_run_ids does
+//     not cover these dependency slices: a STALE integration (an earlier wave
+//     was merged; this child's newly-succeeded dependency was not).
+type waveIntegrationError struct {
+	sliceIndex                int
+	dependsOn                 []int
+	missing                   []int
+	consolidatedBranchPresent bool
+}
+
+// message names the wait, not a fault: the between-wave integration is a
+// background responsibility (the child-completion sweeper's
+// IntegrateCompletedWave), so the operator's action is to retry shortly rather
+// than to repair anything.
+func (e *waveIntegrationError) message() string {
+	if !e.consolidatedBranchPresent {
+		return fmt.Sprintf(
+			"slice %d depends on slices %v, which have succeeded but are not yet integrated: the parent has no consolidated branch recorded yet; the server integrates between waves — retry the dispatch shortly",
+			e.sliceIndex, e.dependsOn)
+	}
+	return fmt.Sprintf(
+		"slice %d depends on slices %v, and dependency slices %v are not covered by the parent's newest integration (a stale consolidated branch); the server integrates between waves — retry the dispatch shortly",
+		e.sliceIndex, e.dependsOn, e.missing)
+}
+
+// details is the structured 409 body payload. missing_dependency_slices is
+// always a non-nil array so a consumer need not distinguish null from empty.
+func (e *waveIntegrationError) details() map[string]any {
+	missing := e.missing
+	if missing == nil {
+		missing = []int{}
+	}
+	return map[string]any{
+		"slice_index":                 e.sliceIndex,
+		"depends_on":                  e.dependsOn,
+		"missing_dependency_slices":   missing,
+		"consolidated_branch_present": e.consolidatedBranchPresent,
+	}
+}
+
+// latestSlicesIntegrated reads the parent's NEWEST slices_integrated audit entry
+// and decodes BOTH the consolidated branch name and the child run ids merged
+// onto it — from THE SAME entry, which is the point of the helper. Reading the
+// two fields through separate walks would let the branch and the coverage set
+// come from different integrations, i.e. admit a dependent child onto a branch
+// whose coverage was proved by an older entry.
+//
+// The newest entry is the complete merged set at that moment because
+// orchestrator.IntegrateSlices always merges EVERY succeeded slice ascending on
+// each pass. Same reader (and same newest-entry convention) as
+// consolidatedBranchFromAudit, differing only in decoding child_run_ids too.
+//
+// Returns ("", nil, nil) when no entry exists or the newest payload does not
+// decode — ABSENT, which the caller turns into the 409 refusal rather than a
+// silent admit. A LIST error propagates so the caller can 500 (retryable).
+func (s *Server) latestSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID) (consolidatedBranch string, childRunIDs []string, err error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, parentRunID, "slices_integrated")
+	if err != nil {
+		return "", nil, err
+	}
+	if len(entries) == 0 {
+		return "", nil, nil
+	}
+	var payload struct {
+		ConsolidatedBranch string   `json:"consolidated_branch"`
+		ChildRunIDs        []string `json:"child_run_ids"`
+	}
+	if json.Unmarshal(entries[len(entries)-1].Payload, &payload) != nil {
+		return "", nil, nil
+	}
+	return payload.ConsolidatedBranch, payload.ChildRunIDs, nil
+}
+
+// resolveDependentChildBase answers the per-wave RE-BASE authoritatively: which
+// branch must THIS fan-out child's runner spawn against, and may it spawn at
+// all?
+//
+// It runs AFTER guardDecompositionWaveOrder, so a non-empty resolved depends_on
+// here means every dependency slice has already reached run state 'succeeded'.
+// That is NOT sufficient to spawn: run state flips to succeeded BEFORE the
+// between-wave integration merges the slice branches, so a child admitted on
+// state alone would build on a base missing its predecessors' symbols. The
+// admission is therefore keyed to the shared wavecoverage.Covered predicate —
+// the SAME function the sweeper's steady-state short-circuit and the MCP await
+// verb's dispatchable release use, so a release can never announce
+// dispatchability this endpoint would refuse.
+//
+// Three outcomes:
+//
+//   - ADMIT with an empty base ("", nil, nil) — the run is not a fan-out child,
+//     its slice declares no dependencies, the parent plan did not resolve, or
+//     no AuditRepo is configured. The caller keeps whatever base it had, i.e.
+//     byte-identical to pre-#2363 behaviour. ABSENT input is not a violation,
+//     the same three-way partition resolveSliceDependencies documents (an
+//     unconfigured deployment must not have every dependent dispatch wedged).
+//   - ADMIT with the consolidated branch (branch, nil, nil) — dependencies are
+//     covered by the newest integration AND that entry names a branch.
+//   - REFUSE (a non-nil *waveIntegrationError) — no integration, an empty
+//     branch, or a STALE integration whose child_run_ids does not cover every
+//     dependency slice. A NON-EMPTY consolidated branch is deliberately NOT
+//     sufficient on its own: that is exactly the stale case.
+//
+// A required read that ERRORS returns err so the caller 500s
+// dependency_check_failed (retryable), never a silent admit.
+func (s *Server) resolveDependentChildBase(ctx context.Context, runRow *run.Run) (string, *waveIntegrationError, error) {
+	dependsOn, resolved, err := s.resolveSliceDependencies(ctx, runRow)
+	if err != nil {
+		return "", nil, err
+	}
+	if !resolved || len(dependsOn) == 0 {
+		return "", nil, nil
+	}
+	if s.cfg.AuditRepo == nil {
+		return "", nil, nil
+	}
+	branch, integrated, err := s.latestSlicesIntegrated(ctx, *runRow.DecomposedFrom)
+	if err != nil {
+		return "", nil, err
+	}
+	siblings, err := s.listDecomposedSiblings(ctx, *runRow.DecomposedFrom)
+	if err != nil {
+		return "", nil, err
+	}
+	sliceRunID := make(map[int]string, len(siblings))
+	for _, sib := range siblings {
+		if sib.SliceIndex != nil {
+			sliceRunID[*sib.SliceIndex] = sib.ID.String()
+		}
+	}
+	covered, missing := wavecoverage.Covered(dependsOn, sliceRunID, integrated)
+	if !covered || branch == "" {
+		// Copy + sort the declared set for the operator-facing payload; it
+		// aliases the plan's own slice, which must not be mutated.
+		deps := append([]int(nil), dependsOn...)
+		sort.Ints(deps)
+		return "", &waveIntegrationError{
+			sliceIndex:                *runRow.SliceIndex,
+			dependsOn:                 deps,
+			missing:                   missing,
+			consolidatedBranchPresent: branch != "",
+		}, nil
+	}
+	return branch, nil, nil
 }

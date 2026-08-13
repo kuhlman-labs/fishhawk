@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -769,6 +771,118 @@ func TestHostDispatchStage_WireShape(t *testing.T) {
 		if !strings.Contains(err.Error(), "dispatch the blocking sibling first") ||
 			!strings.Contains(err.Error(), "fishhawk_get_run_status") {
 			t.Errorf("err = %v, want the wave-order ordering guidance pointing at get_run_status children[]", err)
+		}
+	})
+
+	// base_branch (#2363) decoded from a LITERAL body, not a re-marshal of
+	// HostDispatchResult: a struct-marshalling fake shares the json tag with the
+	// decoder, so a wrong tag round-trips symmetrically and is invisible. The
+	// literal here is the client's half of that assertion; the fixture subtest
+	// below is the half tied to the server's real bytes.
+	t.Run("200 decodes base_branch from a literal body", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched","base_branch":"fishhawk/run-abc-consolidated"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if res.BaseBranch != "fishhawk/run-abc-consolidated" {
+			t.Errorf("base_branch = %q, want fishhawk/run-abc-consolidated", res.BaseBranch)
+		}
+	})
+
+	// A body that omits base_branch (every non-fan-out caller, and any older
+	// backend) decodes to "" — which means "keep the base you already had".
+	t.Run("200 without base_branch decodes empty", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if res.BaseBranch != "" {
+			t.Errorf("base_branch = %q, want empty when the server omits it", res.BaseBranch)
+		}
+	})
+
+	// THE REAL DECODE BOUNDARY. The server serves the bytes in
+	// backend/internal/server/testdata/host_dispatch_dependent_child.json —
+	// proven byte-identical to handleHostDispatchStage's own 200 body by
+	// server.TestHostDispatch_DependentChild_ResponseMatchesWireFixture. Feeding
+	// THOSE bytes (os.ReadFile of the file, never a re-marshal) to a REAL
+	// apiClient is what makes a json-tag drift on either side fail: the fixture
+	// cannot drift from the server, and the client cannot share a wrong tag with
+	// it (#2660).
+	t.Run("200 decodes the server's own wire fixture bytes", func(t *testing.T) {
+		fixture, err := os.ReadFile(filepath.Join("..", "server", "testdata", "host_dispatch_dependent_child.json"))
+		if err != nil {
+			t.Fatalf("read server wire fixture: %v", err)
+		}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(fixture)
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if !res.Transitioned || res.StageState != "dispatched" {
+			t.Errorf("res = %+v, want transitioned:true stage_state:dispatched", res)
+		}
+		if res.BaseBranch == "" {
+			t.Fatal("base_branch decoded empty from the server's own wire bytes — the client json tag disagrees with hostDispatchResponse")
+		}
+		// Cross-check against the fixture's own value so the assertion cannot
+		// pass on a stray non-empty string.
+		var raw map[string]any
+		if err := json.Unmarshal(fixture, &raw); err != nil {
+			t.Fatalf("decode fixture: %v", err)
+		}
+		if want, _ := raw["base_branch"].(string); res.BaseBranch != want {
+			t.Errorf("base_branch = %q, want %q (the fixture's value)", res.BaseBranch, want)
+		}
+	})
+
+	// The per-wave integration refusal (409 wave_not_integrated, #2363) is
+	// annotated ONCE at the client: the error still errors.As into *apiError (so
+	// every fail-closed caller is unchanged) AND its message says the
+	// predecessors are integrating server-side and the action is to WAIT —
+	// deliberately different guidance from the wave-ORDER refusal, which says to
+	// dispatch a blocking sibling first.
+	t.Run("409 wave_not_integrated is annotated as an integration wait", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"wave_not_integrated","message":"slice 2 depends on slices [0 1]","details":{"missing_dependency_slices":[1]}}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		_, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err == nil {
+			t.Fatal("expected an error on 409 wave_not_integrated")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.Code != "wave_not_integrated" {
+			t.Errorf("err = %v, want the *apiError preserved in the chain", err)
+		}
+		if !strings.Contains(err.Error(), "not yet integrated") ||
+			!strings.Contains(err.Error(), "retry the dispatch shortly") {
+			t.Errorf("err = %v, want the integration-wait guidance", err)
+		}
+		// It must NOT inherit the wave-ORDER guidance: nothing needs dispatching
+		// first, so telling the operator to dispatch a blocking sibling would be
+		// wrong advice.
+		if strings.Contains(err.Error(), "dispatch the blocking sibling first") {
+			t.Errorf("wave_not_integrated must not carry the wave-order guidance: %v", err)
 		}
 	})
 }

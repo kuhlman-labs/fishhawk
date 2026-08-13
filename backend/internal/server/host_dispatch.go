@@ -16,9 +16,18 @@ import (
 // idempotent no-op path (the stage was already 'dispatched' — a legal manual
 // re-dispatch of a stage whose spawned runner died). StageState is the stage's
 // state after the call.
+//
+// BaseBranch (#2363) is the branch a DECOMPOSED FAN-OUT CHILD must spawn
+// against: the parent's consolidated branch, returned only once every
+// dependency slice this child declares is provably merged onto it. It is
+// omitted (empty) for every other caller — a non-decomposed run, the parent's
+// own re-dispatch, and a wave-0 child declaring no dependencies — and those
+// callers keep whatever base they had. The server is the authority on the
+// per-wave re-base; the client derives nothing.
 type hostDispatchResponse struct {
 	Transitioned bool   `json:"transitioned"`
 	StageState   string `json:"stage_state"`
+	BaseBranch   string `json:"base_branch,omitempty"`
 }
 
 // handleHostDispatchStage implements
@@ -198,13 +207,42 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Per-wave RE-BASE + integration guard (#2363). The wave-order guard above
+	// proves every dependency slice SUCCEEDED; this proves they are MERGED. Run
+	// state flips to succeeded before the between-wave integration merges the
+	// slice branches, so a child admitted on state alone would spawn on a base
+	// missing its predecessors' symbols (#1302). Admitting returns the parent's
+	// consolidated branch as base_branch — the server, not the client, is the
+	// authority on the re-base — and refusing 409 wave_not_integrated happens
+	// HERE, before the state switch/CAS below, so a refusal commits NO state and
+	// the child stays cleanly re-dispatchable once the sweeper integrates.
+	//
+	// A NON-EMPTY consolidated branch is deliberately not sufficient: the
+	// coverage predicate is keyed to the DEPENDENCY SET, so a stale integration
+	// (an earlier wave merged, this child's newly-succeeded dependency not) is
+	// refused too. See resolveDependentChildBase.
+	baseBranch, waveErr, werr := s.resolveDependentChildBase(r.Context(), runRow)
+	if werr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+			"could not resolve the parent's slice integration state to derive this child's base branch",
+			map[string]any{"run_id": runID.String(), "error": werr.Error()})
+		return
+	}
+	if waveErr != nil {
+		s.writeError(w, r, http.StatusConflict, "wave_not_integrated",
+			waveErr.message(), waveErr.details())
+		return
+	}
+
 	switch stage.State {
 	case run.StageStateDispatched:
 		// Idempotent no-op: a spawn attempt already exists. The manual
-		// dead-runner re-dispatch lands here; the caller proceeds and re-spawns.
+		// dead-runner re-dispatch lands here; the caller proceeds and re-spawns
+		// — so it needs the derived base too, exactly as the transitioned arm.
 		s.writeJSON(w, r, http.StatusOK, hostDispatchResponse{
 			Transitioned: false,
 			StageState:   string(stage.State),
+			BaseBranch:   baseBranch,
 		})
 		return
 	case run.StageStatePending, run.StageStateAwaitingHostDispatch:
@@ -242,6 +280,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 					s.writeJSON(w, r, http.StatusOK, hostDispatchResponse{
 						Transitioned: false,
 						StageState:   string(cur.State),
+						BaseBranch:   baseBranch,
 					})
 					return
 				}
@@ -260,6 +299,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	s.writeJSON(w, r, http.StatusOK, hostDispatchResponse{
 		Transitioned: true,
 		StageState:   string(updated.State),
+		BaseBranch:   baseBranch,
 	})
 }
 
