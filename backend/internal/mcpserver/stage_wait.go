@@ -43,6 +43,23 @@ type StageWaitStatus struct {
 	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', 'review', or 'acceptance'"`
 	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status is non-terminal (pending/running); present only while non-terminal, omitted on terminal. Poll get_run_status on this cadence as the authoritative path to a terminal stage status"`
+	// ElapsedSeconds / AgentTimeoutSeconds / DeadlineSecondsRemaining are the
+	// stage's remaining-budget observability (#2540): how long the stage has been
+	// running, the spec-resolved agent wall clock the runner enforces, and the
+	// budget left before the runner SIGKILLs it. Populated ONLY while non-terminal
+	// (a terminal stage has no remaining budget, mirroring PollIntervalSeconds) and
+	// ONLY when the backend resolved a positive agent_timeout_seconds. They let an
+	// operator see whether a mid-stage scope amendment can still be decided in time
+	// — a filed amendment needs at least the ~15-minute poll window of remaining
+	// budget to be decidable; less, and the race is already lost.
+	//
+	// DeadlineSecondsRemaining is a POINTER so a genuine 0 (the deadline-reached
+	// case, clamped up from a negative) is distinguishable from "unknown" (nil,
+	// when the budget was unresolved). ElapsedSeconds/AgentTimeoutSeconds are
+	// omitempty scalars — absent when the budget is unknown or the stage terminal.
+	ElapsedSeconds           int  `json:"elapsed_seconds,omitempty" jsonschema:"seconds the stage has been running (from its server-recorded started_at); present only while non-terminal and when the agent wall clock is known"`
+	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for this stage; present only while non-terminal and when resolved"`
+	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of agent budget left before the runner kills the stage (agent_timeout_seconds - elapsed_seconds, clamped at 0); present only while non-terminal and when the budget is known. A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
 }
 
 // suggestedStageWaitPollIntervalSeconds is the FLOOR of the derived stage-wait
@@ -139,6 +156,24 @@ func derivedStageWaitPollInterval(run *Run, stage *Stage) int {
 	)
 }
 
+// stageDeadlineRemaining derives the agent budget left for a stage (#2540):
+// agentTimeoutSeconds minus elapsed, as a POINTER so the deadline-reached case
+// (0) is distinguishable from unknown (nil). It returns nil — "unknown" — when
+// agentTimeoutSeconds <= 0 (the backend could not resolve the spec budget, or an
+// older backend omitted the field), and otherwise CLAMPS a negative remainder to
+// 0 so an OVERRUNNING stage reports 0 rather than a nonsensical negative. Pure
+// and table-testable; the caller supplies elapsed.
+func stageDeadlineRemaining(agentTimeoutSeconds int, elapsed time.Duration) *int {
+	if agentTimeoutSeconds <= 0 {
+		return nil
+	}
+	remaining := agentTimeoutSeconds - int(elapsed.Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return &remaining
+}
+
 // stageStateIsTerminal reports whether a backend stage state is one past which
 // the stage can no longer make progress. The terminal set —
 // succeeded / failed / cancelled — is compared INLINE here against the
@@ -201,10 +236,32 @@ func classifyStageWaitStatus(stageType, stageState, runState string, startedAt *
 // stage supplies its own started_at. Callers that hold several wait statuses
 // from one snapshot should capture now ONCE and pass the same value to each,
 // so the advertised cadences agree.
+// It also folds the stage's remaining-budget observability (#2540) onto the
+// resolved status: for a NON-terminal stage it reads the matched Stage's
+// agent_timeout_seconds and derives elapsed + deadline_seconds_remaining. This
+// is done HERE rather than inside classifyStageWaitStatus deliberately: the two
+// DIRECT classifyStageWaitStatus callers (await_stage.go, run_stage.go) both
+// classify SETTLED/terminal stages, whose deadline fields are omitted anyway, so
+// threading the budget through classify's signature would break an out-of-scope
+// caller for no observable gain. The non-terminal guard mirrors the one classify
+// uses for PollIntervalSeconds, so the deadline fields appear on exactly the
+// statuses the poll cadence does.
 func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMinutes int, now time.Time) *StageWaitStatus {
 	for _, s := range stages {
 		if s.Type == stageType {
-			return classifyStageWaitStatus(stageType, s.State, runState, s.StartedAt, predictedMinutes, now)
+			st := classifyStageWaitStatus(stageType, s.State, runState, s.StartedAt, predictedMinutes, now)
+			if !stageStateIsTerminal(s.State) && !runStateIsTerminal(runState) {
+				elapsed := stageElapsed(s.StartedAt, now)
+				st.AgentTimeoutSeconds = s.AgentTimeoutSeconds
+				st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, elapsed)
+				// ElapsedSeconds is meaningful only alongside a known budget, so it
+				// rides the same positive-budget condition (kept absent otherwise so
+				// the wire shape is byte-identical to pre-#2540 for an unknown budget).
+				if s.AgentTimeoutSeconds > 0 {
+					st.ElapsedSeconds = int(elapsed.Seconds())
+				}
+			}
+			return st
 		}
 	}
 	return nil

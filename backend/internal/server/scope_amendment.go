@@ -38,6 +38,35 @@ const CategoryScopeAmendmentDecided = "scope_amendment_decided"
 // budget posture (defaultMaxFixupPasses).
 const maxScopeAmendmentsPerStage = 2
 
+// AmendmentPollWindowSeconds is the server-side mirror of the mid-stage
+// scope-amendment poll window — the length of time the implement agent keeps
+// polling a filed amendment before it gives up (an EXPIRY; the request stays
+// `pending`, an expiry is NOT a denial). handleRequestScopeAmendment compares
+// the executing implement stage's REMAINING agent wall clock against this
+// figure to decide whether a freshly-filed amendment is UNDECIDABLE by
+// construction — the race #2540 fixes, where the agent enters a ~15-minute
+// wait that outlives the stage's remaining budget and is SIGKILLed mid-poll.
+//
+// It is EXPORTED for ONE reason: the cross-package drift guard condition #2540
+// requires. The same figure lives on FOUR surfaces that must not silently
+// desynchronize, because a desync here flips this control from conservative to
+// wrong:
+//
+//   - this constant (900s — the server's undecidability threshold),
+//   - backend/internal/prompt/prompt.go's writeScopeAmendments (the "~15
+//     minutes" text the agent actually follows),
+//   - backend/internal/mcpserver/amendment_window.go's amendmentPollWindowMinutes
+//     (15 — the operator-facing tool-doc figure),
+//   - backend/internal/mcpserver/README.md (operator prose).
+//
+// The next correction to the figure is that known edit set. Package boundaries
+// prevent a single shared constant (mcpserver deliberately does not import this
+// package — it would drag pgx into fishhawk-mcp), so the sync is pinned instead
+// by a cross-package equality test: mcpserver/stage_wait_test.go asserts
+// AmendmentPollWindowSeconds == amendmentPollWindowMinutes*60, so a change to
+// either side reddens rather than silently mis-tuning the control.
+const AmendmentPollWindowSeconds = 900
+
 // maxScopeAmendmentWaitSeconds caps the opt-in server-side long-poll on
 // GET /v0/runs/{run_id}/scope-amendments (?wait=<seconds>, #1035). A
 // single ?wait holds the connection at most this long before returning
@@ -90,6 +119,80 @@ type scopeAmendmentResponse struct {
 	// misleading.
 	EffectiveScopeFilesAfterApproval *int `json:"effective_scope_files_after_approval,omitempty"`
 	MaxFilesChanged                  *int `json:"max_files_changed,omitempty"`
+	// Deadline observability + undecidability control (#2540). On a REQUEST
+	// response (and only when the deadline derivation did NOT fail open):
+	// StageDeadlineSecondsRemaining is the executing implement stage's REMAINING
+	// agent wall clock and AmendmentPollWindowSeconds is the agent's poll window
+	// (AmendmentPollWindowSeconds constant). UndecidableBeforeDeadline is true
+	// ONLY when the remainder is provably shorter than the window — a decision
+	// cannot land before the stage is SIGKILLed, so the agent is told up front
+	// not to enter a wait it cannot finish. All three are omitted when the
+	// derivation failed open (see amendmentDeadlineRemaining) so an uncertain
+	// estimate NEVER refuses a winnable amendment — the wire shape is then
+	// byte-identical to pre-#2540. Absent on list/decision responses.
+	UndecidableBeforeDeadline     bool `json:"undecidable_before_deadline,omitempty"`
+	StageDeadlineSecondsRemaining *int `json:"stage_deadline_seconds_remaining,omitempty"`
+	AmendmentPollWindowSeconds    *int `json:"amendment_poll_window_seconds,omitempty"`
+}
+
+// amendmentDeadline is the resolved, non-fail-open deadline derivation for a
+// freshly-filed amendment: the executing implement stage's remaining agent
+// wall clock, the agent's poll window, and whether the remainder is provably
+// too short for a decision to land. Nil whenever amendmentDeadlineRemaining
+// failed open — in which case the response and audit carry no deadline fields
+// and behave exactly as pre-#2540.
+type amendmentDeadline struct {
+	remaining   int
+	window      int
+	undecidable bool
+}
+
+// amendmentDeadlineRemaining derives the executing implement stage's REMAINING
+// agent wall clock: the spec-resolved agent_timeout_seconds budget minus the
+// stage's elapsed time. It returns ok=true with the remainder ONLY when that
+// remainder is PROVABLE; otherwise it FAILS OPEN (ok=false), which the caller
+// treats as "park normally, behave exactly as today" — an uncertain estimate
+// must never refuse a winnable amendment (the decisive #2540 approval
+// condition). It fails open in four named uncertainty cases:
+//
+//	(a) budgetSeconds <= 0  — the spec budget is unresolvable (absent /
+//	    unparseable workflow_spec, or the stage is not matched in the spec);
+//	    resolveAgentTimeout already returns 0 there.
+//	(b) startedAt == nil    — the stage has never started, so there is no clock
+//	    to measure elapsed against.
+//	(c) remaining <= 0      — elapsed already meets/exceeds the whole budget. A
+//	    LIVE agent posting this request proves the deadline has NOT literally
+//	    passed, so a non-positive remainder evidences a bad derivation (the
+//	    stage's recorded started_at precedes the agent's real clock start), not
+//	    a passed deadline — refusing on it would be a false positive.
+//	(d) selfRetryCount > 0  — stages.started_at is written under
+//	    COALESCE(started_at, $3) and never overwritten, so a re-spawned stage's
+//	    elapsed is CUMULATIVE and its remainder UNDERSTATED (the same caveat
+//	    documented on stageElapsed in backend/internal/mcpserver/stage_wait.go).
+//
+// A residual false-positive band survives (d): an operator fishhawk_retry_stage
+// that re-opens the stage WITHOUT bumping SelfRetryCount also carries a
+// cumulative started_at, so 0 < understated remainder < window can still trip
+// the control. That band is accepted and documented (backend/internal/server/
+// README.md) rather than papered over — losing an occasionally-undecidable
+// amendment is the status quo; refusing a winnable one is the regression this
+// fail-open posture refuses to ship. Pure and table-testable; the handler
+// supplies the clock.
+func amendmentDeadlineRemaining(budgetSeconds int, startedAt *time.Time, selfRetryCount int, now time.Time) (remaining int, ok bool) {
+	if budgetSeconds <= 0 { // (a)
+		return 0, false
+	}
+	if startedAt == nil { // (b)
+		return 0, false
+	}
+	if selfRetryCount > 0 { // (d)
+		return 0, false
+	}
+	remaining = budgetSeconds - int(now.Sub(*startedAt).Seconds())
+	if remaining <= 0 { // (c)
+		return 0, false
+	}
+	return remaining, true
 }
 
 // scopeAmendmentListResponse is the GET list envelope.
@@ -267,8 +370,29 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	}
 
 	effective, maxFiles := s.amendmentHeadroom(r.Context(), amendment)
+
+	// Derive whether this amendment is UNDECIDABLE by construction (#2540): the
+	// executing implement stage's remaining agent wall clock against the agent's
+	// poll window. The budget is the spec-resolved agent_timeout_seconds the
+	// runner enforces; a run-fetch failure degrades to budget 0, i.e. FAIL OPEN
+	// (resolveAgentTimeout is already fail-open on an absent/unparseable spec),
+	// so an uncertain estimate parks normally and never refuses a winnable
+	// amendment.
+	budgetSeconds := 0
+	if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID); gerr == nil {
+		budgetSeconds = s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)
+	}
+	var deadline *amendmentDeadline
+	if remaining, ok := amendmentDeadlineRemaining(budgetSeconds, stage.StartedAt, stage.SelfRetryCount, time.Now().UTC()); ok {
+		deadline = &amendmentDeadline{
+			remaining:   remaining,
+			window:      AmendmentPollWindowSeconds,
+			undecidable: remaining < AmendmentPollWindowSeconds,
+		}
+	}
+
 	s.writeScopeAmendmentRequestedAudit(r, amendment, id.Subject,
-		maxScopeAmendmentsPerStage-used-1, effective, maxFiles)
+		maxScopeAmendmentsPerStage-used-1, effective, maxFiles, deadline)
 
 	// Fire the page-class ping immediately (#1786): a scope-amendment request
 	// is a must_page_human event that always parks for an operator decision
@@ -280,6 +404,12 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	resp := amendmentToResponse(amendment)
 	resp.EffectiveScopeFilesAfterApproval = effective
 	resp.MaxFilesChanged = maxFiles
+	if deadline != nil {
+		remaining, window := deadline.remaining, deadline.window
+		resp.StageDeadlineSecondsRemaining = &remaining
+		resp.AmendmentPollWindowSeconds = &window
+		resp.UndecidableBeforeDeadline = deadline.undecidable
+	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
@@ -577,7 +707,7 @@ func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID
 // chain entry. Best-effort: a failure logs but doesn't unwind the
 // request — the row is the durable record; the audit entry is the
 // operator's await anchor (fishhawk_await_audit, #977).
-func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int) {
+func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int, deadline *amendmentDeadline) {
 	actorKind := audit.ActorAgent
 	payloadMap := map[string]any{
 		"amendment_id":     a.ID.String(),
@@ -588,6 +718,15 @@ func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamen
 	if effectiveAfterApproval != nil && maxFiles != nil {
 		payloadMap["effective_scope_files_after_approval"] = *effectiveAfterApproval
 		payloadMap["max_files_changed"] = *maxFiles
+	}
+	// Deadline observability (#2540): carried ONLY when the derivation did not
+	// fail open, so a fail-open request keeps the pre-#2540 key set
+	// {amendment_id, paths, reason, remaining_budget} byte-identical — the
+	// fishhawk_await_audit anchor and the page-class ping are unchanged.
+	if deadline != nil {
+		payloadMap["stage_deadline_seconds_remaining"] = deadline.remaining
+		payloadMap["amendment_poll_window_seconds"] = deadline.window
+		payloadMap["undecidable_before_deadline"] = deadline.undecidable
 	}
 	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID

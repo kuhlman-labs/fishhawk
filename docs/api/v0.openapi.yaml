@@ -674,6 +674,41 @@ components:
             The implement stage's resolved `max_files_changed` cap
             (#983). Absent when no cap is configured or the
             computation failed open.
+        undecidable_before_deadline:
+          type: boolean
+          description: |
+            Deadline-race control (#2540), on the REQUEST response only.
+            `true` when the executing implement stage's remaining agent
+            wall clock (`stage_deadline_seconds_remaining`) is PROVABLY
+            shorter than the amendment poll window
+            (`amendment_poll_window_seconds`) — a decision cannot land
+            before the runner kills the stage, so the agent is told up
+            front not to enter a wait it cannot finish. The row is still
+            created and still `pending` (a late decision plus
+            `fishhawk_retry_stage` still folds the paths). Absent
+            (defaulting to `false`) whenever the derivation is uncertain
+            for ANY reason — unresolvable spec budget, a never-started
+            stage, a non-positive remainder, or a self-retried stage
+            whose cumulative `started_at` understates the remainder — so
+            an uncertain estimate never refuses a winnable amendment.
+        stage_deadline_seconds_remaining:
+          type: integer
+          description: |
+            The executing implement stage's remaining agent wall clock
+            (seconds) at request time (#2540): the spec-resolved
+            `agent_timeout_seconds` budget minus the stage's elapsed
+            time. Present on the REQUEST response only, and only when the
+            deadline derivation did not fail open (see
+            `undecidable_before_deadline`); absent otherwise.
+        amendment_poll_window_seconds:
+          type: integer
+          description: |
+            The agent's amendment poll window (seconds) the server
+            compares `stage_deadline_seconds_remaining` against (#2540) —
+            the length of time the agent keeps polling before the request
+            EXPIRES UNDECIDED. Present on the REQUEST response only, and
+            only when the deadline derivation did not fail open.
+          example: 900
 
     Run:
       type: object
@@ -2391,6 +2426,21 @@ components:
             — the adapter-default spawn, and every stage of a run
             approved before per-stage model selection landed.
           example: claude-opus-4-8
+        agent_timeout_seconds:
+          type: integer
+          description: |
+            The spec-resolved agent wall clock (seconds) the runner
+            enforces for this stage (#2540), surfaced so an operator
+            can see the stage's total budget and — folded against
+            elapsed by the MCP stage-wait status — whether a mid-stage
+            scope amendment can still be decided before the runner kills
+            the stage. `0` when unresolved: a legacy run, an
+            absent/unparseable `workflow_spec`, or a stage not matched
+            in the spec (the resolution is fail-open). Populated only on
+            the observability read paths (`GET /v0/stages/{stage_id}`
+            and `GET /v0/runs/{run_id}/stages`); `0` on the
+            action-endpoint responses that build a Stage.
+          example: 3600
         created_at:
           type: string
           format: date-time

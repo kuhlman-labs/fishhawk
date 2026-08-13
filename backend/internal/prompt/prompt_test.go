@@ -7121,8 +7121,10 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 		// The DECISION branch (step 4) is unchanged and still present.
 		"4. On `denied` (read the `decision_reason`)",
 		// The EXPIRY branch (step 5) is textually distinct and names the cap.
-		"5. On EXPIRY (still `pending` at the ~15-minute cap",
-		"this is NOT a denial",
+		// Its heading also folds in the #2540 undecidable entry point.
+		"5. On EXPIRY OR an UNDECIDABLE request",
+		"an EXPIRY: still `pending` at the ~15-minute cap",
+		"it is NOT a denial",
 		// Path (i): adapt in-scope only if done-means is fully satisfied, and
 		// DISCLOSE the undecided request.
 		"FULLY satisfies the issue's done-means",
@@ -7175,6 +7177,59 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 	}
 	if !strings.Contains(fixup, block) {
 		t.Error("fix-up prompt does not carry the shared scope-amendment block verbatim (shared-writer contract)")
+	}
+}
+
+// TestBuildImplement_ScopeAmendmentUndecidableBranch is the done-means
+// behavioural pin for the #2540 prose change: the rendered implement prompt must
+// carry the undecidable branch (step 1 reacting to `undecidable_before_deadline`),
+// the explicit do-not-enter-the-wait-poll instruction, the requirement to name
+// the amendment id + paths + remaining seconds, and the never-call-it-a-denial
+// clause — so a comment-only or partial edit of writeScopeAmendments fails where
+// a scope-completeness presence check would pass. A companion assertion mirrors
+// mcpserver's staleAmendmentWordingFindings intent: the new text carries neither
+// the retired "as if denied" phrasing nor a bare five-minute figure.
+func TestBuildImplement_ScopeAmendmentUndecidableBranch(t *testing.T) {
+	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	for _, want := range []string{
+		// Step 1 reacts to the server's undecidability flag.
+		"undecidable_before_deadline: true",
+		"stage_deadline_seconds_remaining",
+		"amendment_poll_window_seconds",
+		// Do NOT enter the wait-poll it cannot finish; route to step 5.
+		"do NOT enter the step-2 wait-poll",
+		"go straight to the step-5 branch",
+		// Name the amendment id, paths, and remaining seconds.
+		"naming the amendment id, the requested paths, and the remaining seconds",
+		// Not a denial; a late decision plus a retry still folds the paths.
+		"This is NOT a denial",
+		"fishhawk_retry_stage still folds the paths later",
+		// Step 5's heading folds the undecidable entry point in alongside expiry.
+		"5. On EXPIRY OR an UNDECIDABLE request",
+	} {
+		if !strings.Contains(impl, want) {
+			t.Errorf("implement prompt missing undecidable-branch anchor %q", want)
+		}
+	}
+
+	// Retired-wording tripwire, mirroring mcpserver/amendment_window.go's
+	// staleAmendmentWordingFindings intent, scoped to the scope-amendment block:
+	// the deadline prose must not reintroduce the proceed-as-denied framing or a
+	// bare ~5-minute figure (the real window is ~15 minutes).
+	var b strings.Builder
+	writeScopeAmendments(&b)
+	block := b.String()
+	if strings.Contains(block, "as if denied") || strings.Contains(block, "proceed-as-denied") {
+		t.Error("scope-amendment block reintroduced the retired proceed-as-denied wording")
+	}
+	// Same lookbehind-free pattern as staleAmendmentFigureRE: a bare "5 minute(s)"
+	// not preceded by a digit/dot (so "~15 minutes" and "5.5 minutes" don't trip).
+	staleFive := regexp.MustCompile(`(^|[^0-9.])~? ?5[- ]minutes?|five[- ]minutes?`)
+	if staleFive.MatchString(block) {
+		t.Errorf("scope-amendment block carries a bare ~5-minute figure (the real window is ~15 minutes)")
 	}
 }
 

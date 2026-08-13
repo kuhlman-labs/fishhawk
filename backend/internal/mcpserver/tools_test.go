@@ -9443,6 +9443,80 @@ func TestGetRunStatus_AcceptanceStageWaitStatus_PresentAndOmitted(t *testing.T) 
 	})
 }
 
+// TestGetRunStatus_StageDeadlineFields is the tools-layer done-means test for
+// the #2540 remaining-budget observability: get_run_status over a run whose
+// implement stage read carries agent_timeout_seconds (3600) and started 600s ago
+// must surface elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining
+// on the wait status — internally consistent (elapsed + remaining == timeout) —
+// while a terminal stage and an unknown-budget stage omit all three.
+func TestGetRunStatus_StageDeadlineFields(t *testing.T) {
+	t.Run("running stage with a known budget surfaces the deadline", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+		implStarted := time.Now().UTC().Add(-600 * time.Second)
+		fb.stagesByRun[runID] = []Stage{
+			// Terminal plan stage carrying a budget: must still omit the fields.
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded", AgentTimeoutSeconds: 1800},
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running", StartedAt: &implStarted, AgentTimeoutSeconds: 3600},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		ws := out.ImplementStageWaitStatus
+		if ws == nil {
+			t.Fatal("ImplementStageWaitStatus is nil")
+		}
+		if ws.AgentTimeoutSeconds != 3600 {
+			t.Errorf("agent_timeout_seconds = %d, want 3600", ws.AgentTimeoutSeconds)
+		}
+		if ws.ElapsedSeconds < 600 || ws.ElapsedSeconds > 630 {
+			t.Errorf("elapsed_seconds = %d, want ~600", ws.ElapsedSeconds)
+		}
+		if ws.DeadlineSecondsRemaining == nil {
+			t.Fatal("deadline_seconds_remaining is nil, want present")
+		}
+		if ws.ElapsedSeconds+*ws.DeadlineSecondsRemaining != ws.AgentTimeoutSeconds {
+			t.Errorf("elapsed + remaining != agent_timeout: %d + %d != %d",
+				ws.ElapsedSeconds, *ws.DeadlineSecondsRemaining, ws.AgentTimeoutSeconds)
+		}
+		// Terminal plan stage omits all three despite carrying a budget.
+		if out.PlanStageWaitStatus == nil {
+			t.Fatal("PlanStageWaitStatus is nil")
+		}
+		if p := out.PlanStageWaitStatus; p.AgentTimeoutSeconds != 0 || p.ElapsedSeconds != 0 || p.DeadlineSecondsRemaining != nil {
+			t.Errorf("terminal plan carries deadline fields: %+v", p)
+		}
+	})
+
+	t.Run("running stage with an unknown budget omits the deadline", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+		implStarted := time.Now().UTC().Add(-600 * time.Second)
+		fb.stagesByRun[runID] = []Stage{
+			// agent_timeout_seconds 0 (legacy/older backend): fail open to omitted.
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "implement", State: "running", StartedAt: &implStarted},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		ws := out.ImplementStageWaitStatus
+		if ws == nil {
+			t.Fatal("ImplementStageWaitStatus is nil")
+		}
+		if ws.AgentTimeoutSeconds != 0 || ws.ElapsedSeconds != 0 || ws.DeadlineSecondsRemaining != nil {
+			t.Errorf("unknown-budget stage carries deadline fields: %+v", ws)
+		}
+	})
+}
+
 // TestGetRunStatus_DerivedStageWaitPollInterval is the DONE-MEANS behavioral
 // test for E48.62 / #2489: get_run_status driven end to end over a run carrying
 // predicted_runtime_minutes: 115 and an implement stage started 5400s ago must
