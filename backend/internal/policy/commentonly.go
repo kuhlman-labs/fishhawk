@@ -67,10 +67,26 @@ const (
 	// ReasonFileMissingFromPatch — a changed .go file has no section in
 	// the patch, so its content changes are unproven.
 	ReasonFileMissingFromPatch = "file_missing_from_patch"
+	// ReasonDuplicatePatchSection — the patch carries more than one
+	// section for the same path. A later section would overwrite an
+	// earlier one in the per-path map, so a comment-only section could
+	// mask a behavioral one for the SAME file; the detector refuses the
+	// whole malformed patch rather than picking a section.
+	ReasonDuplicatePatchSection = "duplicate_patch_section"
+	// ReasonSectionWithoutHunks — a cleared .go file's section carries no
+	// `@@` hunk at all (a mode-only change emits only `old mode`/`new
+	// mode` header lines). Zero changed lines would pass the line
+	// inspection vacuously, so the detector refuses instead.
+	ReasonSectionWithoutHunks = "section_without_hunks"
 	// ReasonRawStringDelimiterInSection — a backtick appears anywhere in
 	// a .go section (context lines included), so a changed line could sit
 	// inside a raw-string literal whose delimiters are visible.
 	ReasonRawStringDelimiterInSection = "raw_string_delimiter_in_section"
+	// ReasonCgoImportInSection — `import "C"` appears anywhere in a .go
+	// section (context lines included). In a cgo file the ordinary `//`
+	// lines immediately preceding that import are COMPILED C code, so a
+	// changed comment-shaped line in such a window is behavioral.
+	ReasonCgoImportInSection = "cgo_import_in_section"
 	// ReasonDirectiveChanged — a changed line is a Go compiler/tool
 	// directive comment (//go:build, //line, // +build, // #cgo …), which
 	// is behavioral despite being comment-shaped.
@@ -85,28 +101,42 @@ const (
 // general, and no caller may read it that way. The property is:
 //
 //   - every changed testable-source file is a .go file with status A or M;
-//   - every one of those files has a section in the emitted patch;
+//   - every one of those files has EXACTLY ONE section in the emitted
+//     patch, and that section carries at least one `@@` hunk;
 //   - within each such section, every changed (+/-) line is blank or an
 //     ordinary `//` line comment — never a Go directive comment
 //     (isGoDirectiveComment); and
-//   - no backtick appears anywhere in the section, context lines included.
+//   - neither a backtick nor `import "C"` appears anywhere in the
+//     section, context lines included.
 //
 // It is fail-closed on every other input: an empty diff, a non-.go
 // testable-source change, any status other than A/M, an absent or
 // truncated patch, a binary or C-quoted section header, a patch section
-// naming an unknown path, a changed .go file with no section, a directive
-// line, or any other changed line. Each refusal carries one Reason code
-// from the closed set above.
+// naming an unknown path, a changed .go file with no section, two
+// sections for one path, a section carrying no hunk, a directive line, or
+// any other changed line. Each refusal carries one Reason code from the
+// closed set above.
 //
 // HONEST LIMIT (binding, #2660): behavioral emptiness is NOT decidable
-// from a unified diff. A changed blank or `//`-shaped line that actually
-// sits inside a Go raw-string literal whose backtick delimiters lie
-// entirely OUTSIDE the emitted context is admitted as comment-only. That
-// residual is accepted deliberately; it costs one vacuous satisfaction of
-// `tests_added_or_updated` PER OCCURRENCE — it is not bounded at one ever
-// — and closing it needs file contents (a runner-side AST or lexer
+// from a unified diff, and the in-section scans above close only what the
+// emitted window shows. TWO residuals are admitted:
+//
+//   - RAW STRING: a changed blank or `//`-shaped line that actually sits
+//     inside a Go raw-string literal whose backtick delimiters lie
+//     entirely OUTSIDE the emitted context.
+//   - CGO PREAMBLE: a changed ordinary `//` line that is cgo preamble C
+//     code (e.g. `// int foo() { return 1; }`) in a file whose
+//     `import "C"` lies entirely OUTSIDE the emitted context. The ported
+//     `#` arm of isGoDirectiveComment catches only the `#cgo`/`#include`
+//     preprocessor forms, not plain C declarations.
+//
+// Both are accepted deliberately; each costs one vacuous satisfaction of
+// `tests_added_or_updated` PER OCCURRENCE — neither is bounded at one
+// ever — and closing them needs file contents (a runner-side AST or lexer
 // signal, where the working tree exists), which a patch plus the trace
-// bundle do not carry. See backend/internal/policy/README.md.
+// bundle do not carry. Exploiting the cgo residual additionally requires a
+// pre-existing `import "C"` file: introducing one is itself a non-comment
+// change this detector refuses. See backend/internal/policy/README.md.
 func DetectCommentOnlyGo(diff Diff) *CommentOnlySignal {
 	if len(diff.ChangedFiles) == 0 {
 		return refuse(ReasonEmptyDiff)
@@ -175,6 +205,11 @@ func DetectCommentOnlyGo(diff Diff) *CommentOnlySignal {
 	return &CommentOnlySignal{CommentOnly: true, Files: goFiles}
 }
 
+// cgoImportMarker is the import statement that turns the `//` lines
+// immediately above it into compiled C. Its presence anywhere in an
+// emitted section makes that section's comment-shaped lines unprovable.
+const cgoImportMarker = `import "C"`
+
 func refuse(reason string) *CommentOnlySignal {
 	return &CommentOnlySignal{CommentOnly: false, Reason: reason}
 }
@@ -204,6 +239,13 @@ func splitPatchSections(patch string) (map[string][]string, string) {
 			// A section whose header named no usable path: treat it as a
 			// path we cannot match against the change set.
 			return ReasonPatchPathUnmatched
+		}
+		if _, dup := sections[curPath]; dup {
+			// A malformed patch carrying two sections for one path.
+			// Storing the later one would silently DROP the earlier — a
+			// comment-only section could mask a behavioral section for the
+			// same file — so refuse the whole patch.
+			return ReasonDuplicatePatchSection
 		}
 		sections[curPath] = cur
 		return ""
@@ -296,13 +338,27 @@ func headerPath(body string) (string, string) {
 // reason code, or "" when every changed line is blank or an ordinary line
 // comment.
 //
-// The backtick scan covers the WHOLE section — context lines included —
-// because a raw-string delimiter anywhere in the emitted window means a
-// changed `//`-shaped line could be string data rather than a comment.
+// A section with no body at all carries no `@@` hunk (git emits a
+// mode-only change as header lines alone). Zero changed lines would pass
+// the loops below vacuously, so it is refused rather than cleared.
+//
+// The backtick and `import "C"` scans cover the WHOLE section — context
+// lines included — because a raw-string delimiter anywhere in the emitted
+// window means a changed `//`-shaped line could be string data rather than
+// a comment, and an `import "C"` anywhere in it means a changed `//` line
+// could be cgo preamble C code rather than a comment.
 func inspectGoSection(body []string) string {
+	if len(body) == 0 {
+		return ReasonSectionWithoutHunks
+	}
 	for _, line := range body {
 		if strings.ContainsRune(line, '`') {
 			return ReasonRawStringDelimiterInSection
+		}
+	}
+	for _, line := range body {
+		if strings.Contains(line, cgoImportMarker) {
+			return ReasonCgoImportInSection
 		}
 	}
 	for _, line := range body {

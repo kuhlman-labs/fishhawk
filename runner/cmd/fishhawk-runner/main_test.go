@@ -19873,9 +19873,16 @@ func TestVerifyCommit_FixupBuildRequiredUnchanged(t *testing.T) {
 //
 //	FISHHAWK_UPDATE_GOLDEN=1 go test ./cmd/fishhawk-runner/ -run TestComputeAndEmitDiff_CommentOnlyWireFixture
 //
-// from the runner module, then re-run the backend's
-// TestReEvaluatePolicy_CommentOnlyGo_* tests, which consume the rewritten
-// bytes. Never hand-edit the file.
+// from the runner module, then re-run the backend tests that consume the
+// rewritten bytes — from the BACKEND module:
+//
+//	go test ./internal/server/ -run 'TestShipTrace_PolicyReEval_CommentOnlyGo_WireFixture'
+//
+// (that pattern matches both _Passes and _MirrorImages in
+// backend/internal/server/trace_policy_test.go). Use those exact names: a
+// `-run` pattern matching nothing exits 0 having run zero tests, silently
+// skipping the cross-boundary re-check this shared fixture exists to force.
+// Never hand-edit the file.
 const commentOnlyFixturePath = "testdata/git_diff_comment_only.json"
 
 // TestComputeAndEmitDiff_CommentOnlyWireFixture asserts two things at once:

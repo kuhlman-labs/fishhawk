@@ -220,6 +220,60 @@ func TestDetectCommentOnlyGo_Refusals(t *testing.T) {
 			},
 			want: ReasonNonCommentLineChanged,
 		},
+		{
+			// A malformed patch carrying TWO sections for one path. The
+			// later section must not overwrite — and so MASK — the earlier
+			// one: here the first section changes a statement and the
+			// second is comment-only, which is exactly the shape that
+			// would otherwise clear a behavioral change.
+			name: "duplicate sections for one path",
+			diff: Diff{
+				ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+				Patch: goSection("backend/foo.go", "@@ -1,3 +1,3 @@\n"+
+					" func Foo() int {\n"+
+					"-\treturn 1\n"+
+					"+\treturn 2\n") +
+					goSection("backend/foo.go", commentOnlyBody),
+			},
+			want: ReasonDuplicatePatchSection,
+		},
+		{
+			// A section carrying no `@@` hunk at all (a mode-only change).
+			// Zero changed lines would clear the file VACUOUSLY, so the
+			// detector refuses. git's own mode-only emission carries no
+			// `---`/`+++` headers either and is refused one step earlier as
+			// patch_path_unmatched; this pins the header-bearing shape that
+			// does reach the section inspection.
+			name: "section with no hunk",
+			diff: Diff{
+				ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+				Patch: "diff --git a/backend/foo.go b/backend/foo.go\n" +
+					"old mode 100644\n" +
+					"new mode 100755\n" +
+					"--- a/backend/foo.go\n" +
+					"+++ b/backend/foo.go\n",
+			},
+			want: ReasonSectionWithoutHunks,
+		},
+		{
+			// In a cgo file the ordinary `//` lines immediately above
+			// `import "C"` are COMPILED C code, so a comment-shaped change
+			// in that window is behavioral. The line below is neither a
+			// directive (the ported `#` arm catches only the
+			// `#cgo`/`#include` preprocessor forms) nor backticked, so the
+			// `import "C"` scan is what refuses it.
+			name: "cgo import in the emitted section",
+			diff: Diff{
+				ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+				Patch: goSection("backend/foo.go", "@@ -1,5 +1,5 @@\n"+
+					" package foo\n"+
+					" \n"+
+					"-// int foo() { return 1; }\n"+
+					"+// int foo() { return 2; }\n"+
+					" import \"C\"\n"),
+			},
+			want: ReasonCgoImportInSection,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,6 +341,38 @@ func TestDetectCommentOnlyGo_KnownFalsePositive_RawStringDelimitersOutsideContex
 			" // heading\n"+
 			"-// this line is string data, not a comment\n"+
 			"+// this line is DIFFERENT string data, still not a comment\n"),
+	})
+	if sig == nil || !sig.CommentOnly {
+		t.Fatalf("KNOWN FALSE POSITIVE: this case is admitted today; got %+v", sig)
+	}
+}
+
+// TestDetectCommentOnlyGo_KnownFalsePositive_CgoPreambleOutsideContext
+// records the SECOND residual (#2660): in a file that uses cgo, the
+// ordinary `//` lines immediately preceding `import "C"` are compiled C
+// code. The in-section `import "C"` scan refuses that window when the
+// import is emitted (see the refusal table), but when the import lies
+// entirely OUTSIDE the emitted context the changed C line is admitted as
+// an ordinary comment — the same shape, and the same honest limit, as the
+// raw-string residual above.
+//
+// Exploiting it requires a pre-existing `import "C"` file: introducing one
+// is itself a non-comment change the detector refuses. If a future change
+// makes this case return false, that is an IMPROVEMENT: update this test
+// rather than reverting the change.
+func TestDetectCommentOnlyGo_KnownFalsePositive_CgoPreambleOutsideContext(t *testing.T) {
+	// The real file reads:
+	//
+	//	// int foo() { return 1; }
+	//	import "C"
+	//
+	// but the emitted hunk's context window excludes the import line.
+	sig := DetectCommentOnlyGo(Diff{
+		ChangedFiles: []ChangedFile{{Path: "backend/foo.go", Status: StatusModified}},
+		Patch: goSection("backend/foo.go", "@@ -10,3 +10,3 @@\n"+
+			" // preamble\n"+
+			"-// int foo() { return 1; }\n"+
+			"+// int foo() { return 2; }\n"),
 	})
 	if sig == nil || !sig.CommentOnly {
 		t.Fatalf("KNOWN FALSE POSITIVE: this case is admitted today; got %+v", sig)
