@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -585,6 +586,91 @@ func TestGetCampaignStatus_NotFound_MapsActionableError(t *testing.T) {
 	_, _, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: uuid.NewString()})
 	if err == nil || !strings.Contains(err.Error(), "campaign_not_found") {
 		t.Fatalf("err = %v, want campaign_not_found mapping", err)
+	}
+}
+
+// TestGetCampaignStatus_AcceptanceSlot_EndToEnd drives the REAL getCampaignStatus
+// handler across the three seams this feature spans (E48.71 / #2503): the
+// campaign-status read, the per-run stage read, and the live network probe. One
+// item's acceptance stage is running (the holder), another's is
+// awaiting_host_dispatch (a waiter), and a live httptest /healthz serves a git_sha
+// reached via a FISHHAWK_PREVIEW_ADDR env override on newResolver. Per-layer units
+// would each pass while the seam between them broke, so this asserts the shipped
+// values: the held_by issue ref, the waiting issue ref, the held state, and the
+// serving git_sha the probe target actually served — a scope-satisfying no-op edit
+// fails it.
+func TestGetCampaignStatus_AcceptanceSlot_EndToEnd(t *testing.T) {
+	shrinkSlotProbeTimeout(t, 300*time.Millisecond)
+	fb, srv := newFakeBackend(t)
+	hz := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+
+	holder, holderRun := seedItemWithAcceptanceStage(t, fb, "#26", "running", "running")
+	waiter, _ := seedItemWithAcceptanceStage(t, fb, "#27", "running", "awaiting_host_dispatch")
+
+	id := uuid.New()
+	fb.campaignStatusByID[id] = CampaignStatus{
+		Campaign:   Campaign{ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+		Items:      []CampaignItem{holder, waiter},
+		Rollup:     CampaignRollup{Running: []string{"#26", "#27"}, Eligible: []string{}, Blocked: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+		NextAction: CampaignNextAction{Action: "wait", Detail: "items are running"},
+	}
+	r := newResolver(srv, map[string]string{acceptancePreviewAddrEnv: hostOf(hz.URL)})
+
+	_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.AcceptanceSlot == nil {
+		t.Fatal("acceptance_slot should be present when an item is at the acceptance gate")
+	}
+	slot := out.AcceptanceSlot
+	if !slot.Shared {
+		t.Error("Shared should be true (acceptance validates against ONE shared slot)")
+	}
+	if slot.TargetHost != hostOf(hz.URL) || slot.TargetHostSource != "env" {
+		t.Errorf("TargetHost,Source = %q,%q; want %q,env", slot.TargetHost, slot.TargetHostSource, hostOf(hz.URL))
+	}
+	if slot.State != "held" || slot.ServingGitSHA != "abc1234def" {
+		t.Errorf("State,ServingGitSHA = %q,%q; want held,abc1234def", slot.State, slot.ServingGitSHA)
+	}
+	if slot.HeldBy == nil || slot.HeldBy.IssueRef != "#26" || slot.HeldBy.RunID != holderRun.String() {
+		t.Errorf("HeldBy = %+v, want issue #26 run %s", slot.HeldBy, holderRun)
+	}
+	if len(slot.Waiting) != 1 || slot.Waiting[0].IssueRef != "#27" {
+		t.Errorf("Waiting = %+v, want one entry for #27", slot.Waiting)
+	}
+}
+
+// TestGetCampaignStatus_NoAcceptanceParticipant_OmitsSlot is the companion
+// negative (E48.71 / #2503): a campaign with no acceptance-participating item
+// returns AcceptanceSlot == nil and leaves the pre-existing rollup / next_actions
+// assertions intact.
+func TestGetCampaignStatus_NoAcceptanceParticipant_OmitsSlot(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := uuid.New()
+	fb.campaignStatusByID[id] = CampaignStatus{
+		Campaign: Campaign{ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+		Items: []CampaignItem{
+			{ID: uuid.NewString(), IssueRef: "#26", DependsOn: []string{}, State: "eligible"},
+		},
+		Rollup:     CampaignRollup{Eligible: []string{"#26"}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+		NextAction: CampaignNextAction{Action: "start_run", IssueRef: "#26", Detail: "this item's dependencies are satisfied"},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.AcceptanceSlot != nil {
+		t.Errorf("acceptance_slot should be omitted when no item is at the acceptance gate, got %+v", out.AcceptanceSlot)
+	}
+	// Pre-existing assertions still hold.
+	if len(out.Rollup.Eligible) != 1 || out.Rollup.Eligible[0] != "#26" {
+		t.Errorf("Rollup.Eligible = %+v", out.Rollup.Eligible)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatalf("NextActions should be a non-empty classification, got %+v", out.NextActions)
 	}
 }
 

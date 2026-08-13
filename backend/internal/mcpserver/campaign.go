@@ -58,6 +58,12 @@ type GetCampaignStatusOutput struct {
 	Rollup      CampaignRollup     `json:"rollup"`
 	NextAction  CampaignNextAction `json:"next_action" jsonschema:"the server-computed next step distilled from the rollup: action is one of attention, resume, start_run, wait, complete"`
 	NextActions *NextActions       `json:"next_actions,omitempty" jsonschema:"the MCP classifier's mapping of next_action onto a legal operator action (the tool to call, its precondition, what it consumes, and a one-line reason). Non-empty for every non-complete campaign; nil-actions on a complete campaign. Display-only"`
+	// AcceptanceSlot is the additive, best-effort acceptance-slot visibility block
+	// (E48.71 / #2503): acceptance validates against ONE shared preview slot, so a
+	// campaign serializes on it. Present only when at least one item is at or near
+	// the acceptance gate (a campaign nowhere near acceptance issues no probe and
+	// omits the block).
+	AcceptanceSlot *AcceptanceSlot `json:"acceptance_slot,omitempty" jsonschema:"present only when at least one campaign item is at or near the acceptance gate: names the shared preview slot's resolved host, its live state (free/held/unverifiable), the item holding it, and the items serialized behind it. Observability only — no host mutation"`
 }
 
 // ResumeCampaignInput is the fishhawk_resume_campaign tool's input.
@@ -362,6 +368,11 @@ server-computed next_action, and a next_actions block mapping that next_action
 onto a legal operator move (start the next eligible run, resume a paused
 campaign, attend a failed item, or wait). The campaign analogue of
 fishhawk_get_run_status. Read-only.
+
+Acceptance validates against a SINGLE shared preview slot, so a campaign's items
+serialize on it. When any item is at or near the acceptance gate the response
+carries an acceptance_slot block naming which head holds that slot and which
+items are serialized behind it, so the contention is visible before you hit it.
 `),
 	}, resolver.getCampaignStatus)
 }
@@ -389,6 +400,11 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		Rollup:      st.Rollup,
 		NextAction:  st.NextAction,
 		NextActions: campaignNextActionsFor(st.Rollup, st.NextAction),
+		// Best-effort acceptance-slot visibility (E48.71 / #2503), computed from
+		// the items AFTER the successful backend read so a campaign_not_found
+		// still surfaces unchanged. Nil (block omitted) when no item is at or near
+		// the acceptance gate.
+		AcceptanceSlot: r.acceptanceSlotFor(ctx, st.Items),
 	}, nil
 }
 

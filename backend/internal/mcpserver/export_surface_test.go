@@ -28,6 +28,8 @@ import (
 var exportBaseline = []string{
 	"AcceptanceAdmissionResult",
 	"AcceptanceNeedsTarget",
+	"AcceptanceSlot",
+	"AcceptanceSlotClaim",
 	"AnswerClarificationInput",
 	"AnswerClarificationOutput",
 	"ApproveDeployInput",

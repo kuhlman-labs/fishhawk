@@ -243,6 +243,32 @@ Outcomes:
 
 All response fields are additive: a mixed old/new backend that omits them decodes to zero values and the verb spawns exactly as today.
 
+### Campaign acceptance-slot visibility (`acceptance_slot`, [E48.71 / #2503](https://github.com/kuhlman-labs/fishhawk/issues/2503))
+
+Acceptance validates against **ONE** fixed, shared preview slot, so a campaign driving N items **serializes** on it. Before this, the only signal of the contention was the per-dispatch `needs_target` refusal — which says nothing about the sibling item holding the slot, so an operator driving N items discovered the contention by hitting it. `fishhawk_get_campaign_status` now carries an additive, best-effort **`acceptance_slot`** block (`omitempty`) that makes the contention visible. It is **observability only**: no host mutation (ADR-038 keeps that off the MCP surface) and no per-run preview allocation.
+
+**Host resolution ladder.** `target_host` is `FISHHAWK_PREVIEW_ADDR` when non-empty after `TrimSpace` (`target_host_source:"env"`), else the literal `localhost:8090` (`source:"default"`) — byte-matching `scripts/dev`'s `_preview_addr` default so the probe and the dev tooling agree. **Known limit** (like the target-identity gate above): the probe is issued **from the process serving the tool** — the operator host on the stdio transport, the fishhawkd host on the `/mcp` route (#2390). On the HTTP transport a default `localhost:8090` probes fishhawkd's own loopback, not the operator's preview; the `FISHHAWK_PREVIEW_ADDR` override is the escape hatch, and `detail` always names the URL actually probed so a misdirected probe is self-diagnosing.
+
+**The probe** (`probeAcceptanceSlotHealth`) is a **single-shot, no-retry** `GET <scheme>://<host>/healthz` reusing `acceptanceProbeSchemeOrder` + the shared `acceptanceProbeHTTPClient` (direct-dial `Proxy:nil`, redirects refused), wrapped in a short `context.WithTimeout` (`acceptanceSlotProbeTimeout`, a package var tests shrink). It differs from the dispatch gate's probe **deliberately**: there is no expected head SHA on a campaign read, so it **reports** the served `git_sha` rather than classifying it, and it has **no** unreachable-retry loop — a status poll must not inherit the dispatch gate's multi-attempt boot budget, so a black-holed target adds **at most** that one timeout to the read.
+
+**Three states, trustworthy by construction** (the operator conditions on #2503 — an observability signal that can be *confidently wrong* is worse than one that admits uncertainty):
+
+| state | when |
+|---|---|
+| `held` | a 200 with a non-empty, non-`"unknown"` `git_sha` — a build is serving the slot; `serving_git_sha` is reported |
+| `free` | **only** a connection **refused** from a reachable host (the one positive "nothing is bound" signal) **and** no stage-named holder |
+| `unverifiable` | everything else: any **non-refused** dial failure (timeout, black-hole, no route, wrong host — a dial failure is **never** `free`); a reachable-but-unidentified answer (non-200, non-JSON, missing/`"unknown"` `git_sha`); **or** a probe/stage disagreement (probe says free while stage state names a live holder — resolved to `unverifiable`, never trusting either half, with `note` saying which signals disagreed) |
+
+**Participant classification** (per-item, best-effort). Pass 1 (no network) selects candidate items — non-terminal item state carrying a parseable `run_id`. Pass 2 reads each candidate's stages and finds the `acceptance` stage: `dispatched`/`running` → **holds** the slot (`held_by`, first in item order wins); `pending`/`awaiting_host_dispatch` → **waits** behind it; a terminal stage or no acceptance stage → not a participant. Attribution is by **live acceptance stage**, not by matching the served `git_sha` back to an item (no read-only surface in this layer exposes a run's merge-candidate head SHA), so a settled or never-dispatched sibling that still binds the slot reports `state:held` + `serving_git_sha` with an **empty `held_by`** (the #2488 case); `note` covers that explicitly.
+
+**Three bounding controls** (each pinned by a deletion counterfactual in `acceptance_slot_test.go`):
+
+- **No-probe short-circuit** — when pass 2 yields no holder and no waiter, return `nil` (block omitted) **without probing**: a campaign nowhere near acceptance issues **zero** network calls.
+- **Per-item read cap** (`acceptanceSlotMaxItemReads` = 12) — more candidates than the cap sets `truncated:true` + `items_inspected`/`inspection_limit` rather than capping silently.
+- **Best-effort degrade** — a per-item `ListRunStages` failure degrades that item (recorded in `read_failures` so the block is honestly partial) and never fails the campaign-status snapshot (the `children_status.go` contract).
+
+`note` names the remediation (`scripts/dev preview <head>`) and that the slot is shared. The whole block is `omitempty`, so a campaign with no acceptance participant is byte-identical to the prior response.
+
 ## Local auto-driver (`fishhawk_drive_run`, [#1700](https://github.com/kuhlman-labs/fishhawk/issues/1700))
 
 `fishhawk_drive_run` executes **every mechanical operator step between human gates** on a `runner_kind:local` run under ADR-040 delegation, and stops at the first genuine decision. It is the local sibling of the GHA campaign auto-driver (E25.6/E25.7's `AutoDriveRunGate`): a bounded, resumable loop that reuses this host's session, token, and detached-spawn machinery rather than a separate daemon (ADR-024 — the local runner can only be spawned by this MCP host).

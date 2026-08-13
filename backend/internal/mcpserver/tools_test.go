@@ -85,7 +85,14 @@ type fakeBackend struct {
 	// uses stagesStatus. Used by the dispatch post-dispatch-fetch-failure
 	// test to fail the SECOND stages read (the wait-status classify) while
 	// the FIRST (stage-id resolution) succeeds. Defaults to 0 (disabled).
-	stagesFailOnCall  int
+	stagesFailOnCall int
+	// stagesStatusByRun overrides the GET /v0/runs/{run_id}/stages status for a
+	// SINGLE run id (E48.71 / #2503), so an acceptance-slot degrade test can fail
+	// ONE candidate item's stage read (500) while its siblings resolve. Distinct
+	// from stagesFailOnCall (which fails the Nth call per run regardless of run):
+	// the slot fan-out issues exactly one read per candidate run, so the
+	// per-run-id override is the natural way to degrade one specific item.
+	stagesStatusByRun map[uuid.UUID]int
 	artifactsStatus   int
 	stagesCalledByID  map[uuid.UUID]int
 	artifactsCalledID map[uuid.UUID]int
@@ -488,6 +495,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		getRunExtraByID:               map[uuid.UUID]map[string]any{},
 		getStatusByID:                 map[uuid.UUID]int{},
 		stagesByRun:                   map[uuid.UUID][]Stage{},
+		stagesStatusByRun:             map[uuid.UUID]int{},
 		artifactsByStage:              map[uuid.UUID][]Artifact{},
 		stagesCalledByID:              map[uuid.UUID]int{},
 		artifactsCalledID:             map[uuid.UUID]int{},
@@ -1305,6 +1313,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.stagesStatus
 		if fb.stagesFailOnCall > 0 && callNum == fb.stagesFailOnCall {
 			status = http.StatusInternalServerError
+		}
+		// Per-run-id status override (#2503): fail exactly this run's stage read.
+		if s, ok := fb.stagesStatusByRun[id]; ok {
+			status = s
 		}
 		fb.mu.Unlock()
 		w.WriteHeader(status)
