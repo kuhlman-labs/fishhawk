@@ -551,6 +551,85 @@ precedent on a different surface.
 
 Tests: `decomposition_dispatch_guard_test.go` (one case per branch, plus the three window directions — `TestGuard_Window_DependencyReachesSucceeded_StillRefuses`, `TestGuard_Window_DependencySiblingMintedLate_StillRefuses`, `TestGuard_Window_DependencyLeavesSucceeded_AdmitsOnSnapshot` — driven through a deterministic `onListRuns` hook rather than sleep-based racing), `host_dispatch_test.go` (the handler refusal/admit + committed-state, `TestHostDispatch_ConcurrentDecomposedDispatch_AdmitsExactlyOne`, and the pgtest-backed cross-layer round trip whose step (c) asserts a satisfied dependency cannot be falsified after the fact), `runs_get_test.go` / `runs_list_test.go` (the run-row surface + the no-N+1 pin). The absorbing-succeeded premise itself is pinned in the run package by `TestRunSucceededIsAbsorbing` and `TestPostgres_SucceededRunNeverLeavesSucceeded`.
 
+## Per-wave integration guard + `base_branch` derivation (`decomposition_dispatch_guard.go`, E50.13 / #2363)
+
+The wave-ORDER guard above proves a dependent child's dependency slices have
+SUCCEEDED. That is deliberately NOT sufficient to spawn it. Run state flips to
+`succeeded` BEFORE the between-wave integration merges the slice branches onto
+the parent's consolidated branch, so a child admitted on state alone would build
+on a base missing its predecessors' symbols (#1302). `resolveDependentChildBase`
+closes that gap and, in the same step, makes the marker the AUTHORITY on the
+per-wave re-base: the 200 body gains `base_branch`, and the client derives
+nothing.
+
+- **The admission rule**: for a fan-out child with a non-empty resolved
+  `depends_on`, read the parent's NEWEST `slices_integrated` audit entry and
+  ADMIT with `base_branch = consolidated_branch` only when (a) that branch is
+  non-empty AND (b) `wavecoverage.Covered(depends_on, sliceRunID, child_run_ids)`
+  holds. **A non-empty consolidated branch is NOT on its own sufficient** — that
+  is precisely the STALE case (wave 1 integrated; this wave-2 child's
+  newly-succeeded dependency not yet merged), which `consolidatedBranchFromAudit`
+  cannot distinguish because it reads only the branch name. Anything else
+  refuses `409 wave_not_integrated` with `details` `{slice_index, depends_on,
+  missing_dependency_slices, consolidated_branch_present}`.
+- **One predicate, three callers**: the coverage question is answered by the
+  shared leaf package `backend/internal/wavecoverage`, the SAME function the
+  child-completion sweeper's steady-state short-circuit and the MCP await verb's
+  `children_dispatchable` release use. A reconstruction here — or a caller keying
+  on predecessor run STATE — would announce dispatchability this endpoint then
+  refuses; that drift is the class the repo already names load-bearing (the
+  `SliceBranch`/`childSliceBranch` "MUST stay byte-identical" note).
+- **One entry, both fields**: `latestSlicesIntegrated` decodes
+  `consolidated_branch` AND `child_run_ids` from THE SAME newest entry. Reading
+  them through separate walks would let a child be admitted onto a branch whose
+  coverage was proved by a different integration (pinned by
+  `TestResolveDependentChildBase_DoesNotSpliceAcrossEntries`).
+- **Ordering relative to the CAS**: derived AFTER `guardDecompositionWaveOrder`
+  and BEFORE the state switch/CAS, so a refusal commits NO state and the child
+  stays cleanly re-dispatchable once the sweeper integrates — and the wave-ORDER
+  refusal still decides first when a dependency has not succeeded (a
+  wave-order violation must never be reported as an integration wait, since
+  waiting would never clear it). `base_branch` also rides the idempotent
+  already-`dispatched` arm, because that caller re-spawns.
+- **Absent vs errored**, the same partition the wave-order guard uses: a
+  non-fan-out run, an empty `depends_on`, or an unresolvable parent plan are
+  ABSENT — admit with no `base_branch`, i.e. byte-identical to pre-#2363
+  behaviour. A DEPENDENT child (non-empty `depends_on`) with an UNCONFIGURED
+  `AuditRepo` is NOT absent — it REFUSES (fail-closed): with no audit repository
+  there is no integration record to prove its predecessors merged, and admitting
+  would spawn it onto an unproven base (the #1302 stale-base class the guard
+  exists to close). A wave-0 child with no dependencies still admits, so an
+  unconfigured deployment's INDEPENDENT dispatches are never wedged — only a
+  genuinely dependent child is refused, and in practice `AuditRepo` is always
+  configured (`serve.go`), so this is a test-posture fail-closed. An undecodable
+  newest payload is ABSENT for the coverage question and therefore REFUSES
+  (it must not admit on bytes the server could not read). An ERRORED read
+  (plan load, audit list, sibling list) is `500 dependency_check_failed`,
+  retryable, never a silent admit.
+- **Wire fixture (#2660 lesson)**: `testdata/host_dispatch_dependent_child.json`
+  is proven byte-identical to the handler's own 200 body by
+  `TestHostDispatch_DependentChild_ResponseMatchesWireFixture`, and the MCP
+  client test serves THOSE bytes to a real `apiClient` — so the client cannot
+  share a wrong json tag with a fake that re-marshals its own struct. The
+  sibling decode (`child_run_ids`) is tied to the emitter the same way by
+  `TestLatestSlicesIntegrated_DecodesRealEmitterPayload`, which drives the REAL
+  fan-in and decodes its genuine entry: drifting the decoder tag and the
+  hand-seeded fixture key TOGETHER leaves every coverage test green and reddens
+  only that test.
+
+Tests: `decomposition_dispatch_guard_test.go` (`TestResolveDependentChildBase_*`
+— one case per admit/refuse/degrade branch, including the unconfigured-audit
+refusal for a dependent child, the undecodable payload, the
+covered-but-empty-branch refusal and the cross-entry splice pin),
+`host_dispatch_test.go`
+(`TestHostDispatch_DependentChild_EndToEnd`, the two counterfactual controls
+`TestHostDispatch_RefusesDependentChildWhenWaveNotIntegrated` /
+`…WhenIntegrationIsStale` — each asserting error IDENTITY *and* reading the
+stage row back, since the control's effect is committed state — the wave-order
+precedence pin, the wire-fixture equality and the emitter-fidelity decode), and
+`mcpserver/client_test.go` (`TestHostDispatchStage_WireShape`: the fixture-bytes
+decode and the `wave_not_integrated` annotation).
+
 ## Run-branch operator-vouch remediation (ADR-035 / #1044)
 
 `vouch.go::handleVouchCommit` — route

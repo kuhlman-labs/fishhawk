@@ -2891,6 +2891,27 @@ func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunI
 	}, nil
 }
 
+// IntegrateCompletedWave satisfies childcompletion.WaveIntegrator by
+// delegating to the orchestrator's between-wave fan-in (#2363) and converting
+// the orchestrator's *SliceConflict to childcompletion's identical type —
+// the same bridge IntegrateSlices uses to keep childcompletion's import graph
+// free of orchestrator. Returns (false, nil, nil) when the orchestrator is
+// unconfigured, matching the other adapter methods' nil-safe posture.
+func (a childCompletionAdvancer) IntegrateCompletedWave(ctx context.Context, parentRunID uuid.UUID) (bool, *childcompletion.SliceConflict, error) {
+	if a.o == nil {
+		return false, nil, nil
+	}
+	integrated, conflict, err := a.o.IntegrateCompletedWave(ctx, parentRunID)
+	if err != nil || conflict == nil {
+		return integrated, nil, err
+	}
+	return integrated, &childcompletion.SliceConflict{
+		SliceIndex: conflict.SliceIndex,
+		ChildRunID: conflict.ChildRunID,
+		Detail:     conflict.Detail,
+	}, nil
+}
+
 // DispatchChildren satisfies childcompletion.ChildDispatcher by
 // delegating to the orchestrator's concurrent decomposed-child dispatch
 // (E24.3 / #1143) — the sweeper's fail-closed backstop. Returns (0, nil)
@@ -2928,18 +2949,22 @@ func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.
 
 // newChildCompletionSweeper builds the child-completion sweeper from cfg.
 // Extracted from runServe so the wiring is unit-testable: the Dispatch
-// backstop (childCompletionAdvancer, E24.3 / #1143) must be wired non-nil
-// so the fail-closed concurrent-dispatch top-up can't be silently omitted.
+// backstop (childCompletionAdvancer, E24.3 / #1143) and the WaveIntegrate
+// between-wave fan-in (#2363) must both be wired non-nil, so neither the
+// fail-closed concurrent-dispatch top-up nor the wave-boundary integration can
+// be silently omitted — a miswiring is invisible to the behavioral tests, which
+// inject those fields directly.
 func newChildCompletionSweeper(cfg server.Config, logger *slog.Logger, interval time.Duration) *childcompletion.Sweeper {
 	adapter := childCompletionAdvancer{cfg.Orchestrator}
 	return &childcompletion.Sweeper{
-		Runs:      cfg.RunRepo,
-		Audit:     cfg.AuditRepo,
-		Advance:   adapter,
-		Integrate: adapter,
-		Dispatch:  adapter,
-		Logger:    logger,
-		Interval:  interval,
+		Runs:          cfg.RunRepo,
+		Audit:         cfg.AuditRepo,
+		Advance:       adapter,
+		Integrate:     adapter,
+		WaveIntegrate: adapter,
+		Dispatch:      adapter,
+		Logger:        logger,
+		Interval:      interval,
 	}
 }
 

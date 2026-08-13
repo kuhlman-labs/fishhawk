@@ -1079,9 +1079,18 @@ func (c *apiClient) AcceptanceDispatchAdmission(ctx context.Context, stageID uui
 // common case (a parked stage marked as a spawn attempt); Transitioned:false is
 // the idempotent no-op — the stage was already 'dispatched', a legal manual
 // re-dispatch of a stage whose spawned runner died, which the caller proceeds on.
+//
+// BaseBranch (#2363) is the branch a DECOMPOSED FAN-OUT CHILD must spawn
+// against — the parent's consolidated branch, returned only once every
+// dependency slice that child declares is provably merged onto it. It is empty
+// for every other caller (a non-decomposed run, the parent's own re-dispatch, a
+// wave-0 child with no dependencies), and an empty value means "keep the base
+// you already had". The server is the authority on the per-wave re-base; a
+// caller must NOT derive one of its own.
 type HostDispatchResult struct {
 	Transitioned bool   `json:"transitioned"`
 	StageState   string `json:"stage_state"`
+	BaseBranch   string `json:"base_branch,omitempty"`
 }
 
 // HostDispatchStage marks a host spawn against a runner_kind-locked-local stage
@@ -1106,8 +1115,15 @@ type HostDispatchResult struct {
 //     as a deliberate ordering refusal, so every host-spawn verb
 //     (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run,
 //     fishhawk_run_children) inherits it with no per-call-site edit.
-//   - 500 dependency_check_failed — the guard's parent-plan / sibling read
-//     errored (retryable), never a silent admit.
+//   - 409 wave_not_integrated — the per-wave integration guard (E50.13 /
+//     #2363): this fan-out child's dependency slices have all SUCCEEDED (so the
+//     wave-order guard admitted) but are not yet merged onto the parent's
+//     consolidated branch, either because no integration has happened or
+//     because the newest one is STALE. Annotated here ONCE (below) so every
+//     host-spawn verb inherits an actionable message with no per-call-site
+//     edit. It clears on its own: the server integrates between waves.
+//   - 500 dependency_check_failed — the guard's parent-plan / sibling / audit
+//     read errored (retryable), never a silent admit.
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
 	var res HostDispatchResult
@@ -1123,6 +1139,15 @@ func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.U
 		if errors.As(err, &ae) && ae.Code == "dependency_not_satisfied" {
 			return nil, fmt.Errorf(
 				"dispatch refused by the decomposition wave-order guard: this fan-out child depends on a sibling slice that has not succeeded yet — dispatch the blocking sibling first (see fishhawk_get_run_status children[] depends_on/blocked/blocked_by): %w",
+				err)
+		}
+		// The per-wave integration refusal (#2363) is annotated the same way and
+		// for the same reason, but says something different: nothing is wrong
+		// and nothing must be dispatched first — the predecessors are done and
+		// the server merges them between waves, so the action is to WAIT.
+		if errors.As(err, &ae) && ae.Code == "wave_not_integrated" {
+			return nil, fmt.Errorf(
+				"dispatch refused by the per-wave integration guard: this fan-out child's predecessors have succeeded but are not yet integrated onto the parent's consolidated branch; the server integrates between waves — retry the dispatch shortly (fishhawk_await_children releases when the child becomes dispatchable): %w",
 				err)
 		}
 		return nil, err

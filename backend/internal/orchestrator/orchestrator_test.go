@@ -62,6 +62,9 @@ type stubRuns struct {
 	listStagesErrIDs map[uuid.UUID]error // per-run ListStagesForRun failure (reconcile skip path)
 	transitionRunErr error
 	transitionErr    error
+	// listRunsErr fails every ListRuns call, so a test can drive the
+	// retryable child-listing failure path (#2363).
+	listRunsErr error
 
 	stageTransitions []stageTransition
 	runTransitions   []runTransition
@@ -247,6 +250,9 @@ func (s *stubRuns) CreateRun(context.Context, run.CreateRunParams) (*run.Run, er
 func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.listRunsErr != nil {
+		return nil, s.listRunsErr
+	}
 	// State filter (ReconcileStuckRuns). Returns every matching run in
 	// one page; the seeded fixtures stay well under the sweep page size
 	// so the caller breaks after the first page (Offset never advances).
