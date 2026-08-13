@@ -7121,10 +7121,8 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 		// The DECISION branch (step 4) is unchanged and still present.
 		"4. On `denied` (read the `decision_reason`)",
 		// The EXPIRY branch (step 5) is textually distinct and names the cap.
-		// Its heading also folds in the #2540 undecidable entry point.
-		"5. On EXPIRY OR an UNDECIDABLE request",
-		"an EXPIRY: still `pending` at the ~15-minute cap",
-		"it is NOT a denial",
+		"5. On EXPIRY (still `pending` at the ~15-minute cap",
+		"this is NOT a denial",
 		// Path (i): adapt in-scope only if done-means is fully satisfied, and
 		// DISCLOSE the undecided request.
 		"FULLY satisfies the issue's done-means",
@@ -7180,38 +7178,41 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 	}
 }
 
-// TestBuildImplement_ScopeAmendmentUndecidableBranch is the done-means
-// behavioural pin for the #2540 prose change: the rendered implement prompt must
-// carry the undecidable branch (step 1 reacting to `undecidable_before_deadline`),
-// the explicit do-not-enter-the-wait-poll instruction, the requirement to name
-// the amendment id + paths + remaining seconds, and the never-call-it-a-denial
-// clause — so a comment-only or partial edit of writeScopeAmendments fails where
-// a scope-completeness presence check would pass. A companion assertion mirrors
-// mcpserver's staleAmendmentWordingFindings intent: the new text carries neither
-// the retired "as if denied" phrasing nor a bare five-minute figure.
-func TestBuildImplement_ScopeAmendmentUndecidableBranch(t *testing.T) {
+// TestBuildImplement_ScopeAmendmentDeadlineObservability pins the #2540 prose
+// after approval condition 1 narrowed the control to observability-only: step 1
+// reports the remaining wall clock against the poll window as INFORMATIONAL
+// numbers and NEVER as a refusal, so the prompt must name both fields and state
+// they are informational, and must NOT carry any of the retired
+// undecidable-refusal wording that told the agent to skip its wait-poll (that
+// wording could kill a winnable amendment). A companion assertion mirrors
+// mcpserver's staleAmendmentWordingFindings intent: the text carries neither the
+// retired "as if denied" phrasing nor a bare five-minute figure.
+func TestBuildImplement_ScopeAmendmentDeadlineObservability(t *testing.T) {
 	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
 	if err != nil {
 		t.Fatalf("Build(implement): %v", err)
 	}
 	for _, want := range []string{
-		// Step 1 reacts to the server's undecidability flag.
-		"undecidable_before_deadline: true",
+		// Step 1 surfaces the two observability numbers...
 		"stage_deadline_seconds_remaining",
 		"amendment_poll_window_seconds",
-		// Do NOT enter the wait-poll it cannot finish; route to step 5.
-		"do NOT enter the step-2 wait-poll",
-		"go straight to the step-5 branch",
-		// Name the amendment id, paths, and remaining seconds.
-		"naming the amendment id, the requested paths, and the remaining seconds",
-		// Not a denial; a late decision plus a retry still folds the paths.
-		"This is NOT a denial",
-		"fishhawk_retry_stage still folds the paths later",
-		// Step 5's heading folds the undecidable entry point in alongside expiry.
-		"5. On EXPIRY OR an UNDECIDABLE request",
+		// ...explicitly as informational, never a refusal.
+		"informational only and never a refusal",
 	} {
 		if !strings.Contains(impl, want) {
-			t.Errorf("implement prompt missing undecidable-branch anchor %q", want)
+			t.Errorf("implement prompt missing deadline-observability anchor %q", want)
+		}
+	}
+	// The retired undecidable-REFUSAL wording must be gone: no flag the agent
+	// keys off, and no instruction to skip the wait-poll. Its survival would
+	// reintroduce the condition-1 regression (refusing a winnable amendment).
+	for _, banned := range []string{
+		"undecidable_before_deadline",
+		"do NOT enter the step-2 wait-poll",
+		"5. On EXPIRY OR an UNDECIDABLE request",
+	} {
+		if strings.Contains(impl, banned) {
+			t.Errorf("implement prompt still carries retired undecidable-refusal wording %q (#2540 condition 1)", banned)
 		}
 	}
 

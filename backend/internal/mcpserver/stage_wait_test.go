@@ -1,6 +1,8 @@
 package mcpserver
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,6 +289,25 @@ func TestStageDeadlineRemaining_LiveStage(t *testing.T) {
 	}
 }
 
+// requireWaitDeadlineKeysAbsent marshals a StageWaitStatus and asserts the three
+// #2540 deadline keys are absent from the WIRE bytes — not just zero-valued in
+// the decoded struct. elapsed_seconds / agent_timeout_seconds are non-pointer
+// omitempty ints, so a struct-field check cannot tell an omitted key from a
+// present 0; only a raw-body check pins the byte-level omission (test-vacuity
+// guard). Fails on any of the three keys appearing.
+func requireWaitDeadlineKeysAbsent(t *testing.T, st *StageWaitStatus, label string) {
+	t.Helper()
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("%s: marshal: %v", label, err)
+	}
+	for _, key := range []string{"elapsed_seconds", "agent_timeout_seconds", "deadline_seconds_remaining"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("%s: wire carries %q key, want omitted:\n%s", label, key, b)
+		}
+	}
+}
+
 // TestStageWaitStatusFor_DeadlineFields asserts the resolver folds the #2540
 // deadline observability onto a NON-terminal status (elapsed + budget +
 // remaining) and OMITS all three on a terminal stage and when the budget is
@@ -325,6 +346,8 @@ func TestStageWaitStatusFor_DeadlineFields(t *testing.T) {
 	if plan.DeadlineSecondsRemaining != nil || plan.AgentTimeoutSeconds != 0 || plan.ElapsedSeconds != 0 {
 		t.Errorf("terminal stage carries deadline fields: %+v", plan)
 	}
+	// Byte-level: the terminal wire must omit all three keys, not merely carry 0s.
+	requireWaitDeadlineKeysAbsent(t, plan, "terminal stage")
 
 	// Non-terminal but UNKNOWN budget: omitted (fail-open to byte-identical wire).
 	acc := stageWaitStatusFor(stages, "acceptance", "running", 0, waitBase)
@@ -334,16 +357,19 @@ func TestStageWaitStatusFor_DeadlineFields(t *testing.T) {
 	if acc.DeadlineSecondsRemaining != nil || acc.AgentTimeoutSeconds != 0 || acc.ElapsedSeconds != 0 {
 		t.Errorf("unknown-budget stage carries deadline fields: %+v", acc)
 	}
+	// Byte-level: the unknown-budget wire must omit all three keys too.
+	requireWaitDeadlineKeysAbsent(t, acc, "unknown-budget stage")
 }
 
 // TestAmendmentPollWindowConstantsInSync is the cross-package drift guard
-// (#2540 approval condition 4): the server's undecidability threshold
+// (#2540 approval condition 4): the server's surfaced poll window
 // (server.AmendmentPollWindowSeconds, 900) and this package's operator-facing
 // figure (amendmentPollWindowMinutes, 15) state the SAME poll window on
-// different surfaces. A future edit to one but not the other would silently
-// desync the server's undecidable_before_deadline threshold from the window the
-// agent actually waits — flipping the control from conservative to wrong — so
-// this asserts they stay equal, reddening on any drift.
+// different surfaces. Both are OBSERVABILITY figures now (the server displays it
+// on a request response as amendment_poll_window_seconds; this package renders it
+// in tool docs), so a future edit to one but not the other would show an operator
+// two different windows for the same thing — this asserts they stay equal,
+// reddening on any drift.
 func TestAmendmentPollWindowConstantsInSync(t *testing.T) {
 	if server.AmendmentPollWindowSeconds != amendmentPollWindowMinutes*60 {
 		t.Errorf("poll-window drift: server.AmendmentPollWindowSeconds = %d, but amendmentPollWindowMinutes*60 = %d (%d min); keep the copies in sync",

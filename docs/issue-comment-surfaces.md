@@ -1151,9 +1151,10 @@ Notes:
   `{amendment_id, paths, reason, remaining_budget}`, plus the optional #983
   headroom pair `effective_scope_files_after_approval` + `max_files_changed` when
   a cap resolves, plus — when the #2540 deadline derivation does NOT fail open —
-  the deadline triple `stage_deadline_seconds_remaining` +
-  `amendment_poll_window_seconds` + `undecidable_before_deadline`; a fail-open
-  derivation carries none of the triple, keeping the base key set byte-identical)
+  the deadline observability pair `stage_deadline_seconds_remaining` +
+  `amendment_poll_window_seconds` (display numbers only, never a refusal — #2540
+  approval condition 1); a fail-open derivation carries neither, keeping the base
+  key set byte-identical)
   when the implement agent files a mid-stage scope amendment request, and the
   decided entry (user actor, payload `{amendment_id, decision, reason,
   decided_by}`) when the operator approves or denies it. The requested entry doubles as the operator's `fishhawk_await_audit`

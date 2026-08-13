@@ -377,38 +377,60 @@ func TestStageAgentTimeoutSeconds_FromSpec(t *testing.T) {
 }
 
 // TestStageAgentTimeoutSeconds_ZeroOnUnresolvableSpec is the fail-open negative:
-// an unparseable workflow_spec (and, separately, a run-fetch error) degrades
-// agent_timeout_seconds to 0 rather than erroring the read (#2540).
+// BOTH an unparseable workflow_spec AND a run-fetch error degrade
+// agent_timeout_seconds to 0 rather than erroring the read (#2540). The two legs
+// are asserted SEPARATELY — the run-fetch-error leg (GetRun returns an error, so
+// the handler's `if gerr == nil` guard is false and the budget stays 0) was
+// previously only exercised incidentally by other reads tests that never
+// asserted the zero, so it gets its own explicit assertion here.
 func TestStageAgentTimeoutSeconds_ZeroOnUnresolvableSpec(t *testing.T) {
-	repo := newStagesRunRepo()
-	runID, stageID := uuid.New(), uuid.New()
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	repo.stages[runID] = []*run.Stage{{
-		ID: stageID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement,
-		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
-		State: run.StageStateRunning, CreatedAt: now, UpdatedAt: now,
-	}}
-	// Unparseable spec → resolveAgentTimeout returns 0.
-	repo.runForGet = &run.Run{ID: runID, WorkflowID: "feature_change", WorkflowSpec: []byte("not: [valid")}
+	newRepoWithStage := func() (*stagesRunRepo, uuid.UUID, uuid.UUID) {
+		repo := newStagesRunRepo()
+		runID, stageID := uuid.New(), uuid.New()
+		repo.stages[runID] = []*run.Stage{{
+			ID: stageID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStateRunning, CreatedAt: now, UpdatedAt: now,
+		}}
+		return repo, runID, stageID
+	}
+	assertZero := func(t *testing.T, repo *stagesRunRepo, stageID uuid.UUID) {
+		t.Helper()
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", stageID), nil)
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		var single stageResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &single); err != nil {
+			t.Fatal(err)
+		}
+		if single.AgentTimeoutSeconds != 0 {
+			t.Errorf("agent_timeout_seconds = %d, want 0 (fail open)", single.AgentTimeoutSeconds)
+		}
+		// The key is still present (not omitempty), carrying 0.
+		if !strings.Contains(w.Body.String(), `"agent_timeout_seconds":0`) {
+			t.Errorf("body should carry agent_timeout_seconds:0, got:\n%s", w.Body.String())
+		}
+	}
 
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", stageID), nil)
-	s.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
-	}
-	var single stageResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &single); err != nil {
-		t.Fatal(err)
-	}
-	if single.AgentTimeoutSeconds != 0 {
-		t.Errorf("agent_timeout_seconds = %d, want 0 (unparseable spec fails open)", single.AgentTimeoutSeconds)
-	}
-	// The key is still present (not omitempty), carrying 0.
-	if !strings.Contains(w.Body.String(), `"agent_timeout_seconds":0`) {
-		t.Errorf("body should carry agent_timeout_seconds:0, got:\n%s", w.Body.String())
-	}
+	t.Run("unparseable spec", func(t *testing.T) {
+		repo, runID, stageID := newRepoWithStage()
+		// runForGet set with an unparseable spec → GetRun succeeds, resolveAgentTimeout returns 0.
+		repo.runForGet = &run.Run{ID: runID, WorkflowID: "feature_change", WorkflowSpec: []byte("not: [valid")}
+		assertZero(t, repo, stageID)
+	})
+
+	t.Run("run-fetch error", func(t *testing.T) {
+		repo, _, stageID := newRepoWithStage()
+		// runForGet left nil → GetRun returns an error → the `if gerr == nil` guard
+		// is false, so the handler never calls resolveAgentTimeout and the budget
+		// stays 0. This is the run-fetch-error leg, now asserted explicitly.
+		assertZero(t, repo, stageID)
+	})
 }
 
 // TestStageResolvedModel_EmptyWhenNoAudit asserts the fail-open negative case:

@@ -674,40 +674,33 @@ components:
             The implement stage's resolved `max_files_changed` cap
             (#983). Absent when no cap is configured or the
             computation failed open.
-        undecidable_before_deadline:
-          type: boolean
-          description: |
-            Deadline-race control (#2540), on the REQUEST response only.
-            `true` when the executing implement stage's remaining agent
-            wall clock (`stage_deadline_seconds_remaining`) is PROVABLY
-            shorter than the amendment poll window
-            (`amendment_poll_window_seconds`) — a decision cannot land
-            before the runner kills the stage, so the agent is told up
-            front not to enter a wait it cannot finish. The row is still
-            created and still `pending` (a late decision plus
-            `fishhawk_retry_stage` still folds the paths). Absent
-            (defaulting to `false`) whenever the derivation is uncertain
-            for ANY reason — unresolvable spec budget, a never-started
-            stage, a non-positive remainder, or a self-retried stage
-            whose cumulative `started_at` understates the remainder — so
-            an uncertain estimate never refuses a winnable amendment.
         stage_deadline_seconds_remaining:
           type: integer
           description: |
             The executing implement stage's remaining agent wall clock
             (seconds) at request time (#2540): the spec-resolved
             `agent_timeout_seconds` budget minus the stage's elapsed
-            time. Present on the REQUEST response only, and only when the
-            deadline derivation did not fail open (see
-            `undecidable_before_deadline`); absent otherwise.
+            time. OBSERVABILITY-ONLY — surfaced beside
+            `amendment_poll_window_seconds` so an operator can see whether
+            a race against the deadline is already lost; it is never a
+            refusal (a computed "too short" can be a false positive
+            because the remainder is understated, so refusing on it could
+            kill a winnable amendment — #2540 approval condition 1).
+            Present on the REQUEST response only, and only when the
+            deadline derivation did not fail open (unresolvable spec
+            budget, a never-started stage, a non-positive remainder, or a
+            self-retried stage whose cumulative `started_at` understates
+            the remainder); absent otherwise.
         amendment_poll_window_seconds:
           type: integer
           description: |
-            The agent's amendment poll window (seconds) the server
-            compares `stage_deadline_seconds_remaining` against (#2540) —
-            the length of time the agent keeps polling before the request
-            EXPIRES UNDECIDED. Present on the REQUEST response only, and
-            only when the deadline derivation did not fail open.
+            The agent's amendment poll window (seconds) — the length of
+            time the agent keeps polling before the request EXPIRES
+            UNDECIDED (#2540). Surfaced OBSERVABILITY-ONLY beside
+            `stage_deadline_seconds_remaining` so an operator can gauge how
+            tight the race is; never a refusal. Present on the REQUEST
+            response only, and only when the deadline derivation did not
+            fail open.
           example: 900
 
     Run:
