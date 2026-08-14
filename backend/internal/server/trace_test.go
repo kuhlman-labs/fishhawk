@@ -2000,6 +2000,99 @@ func TestShipTrace_FixupPush_EmptyDiffAdvances(t *testing.T) {
 	}
 }
 
+// TestShipTrace_NoPRImplementManifests_StrandTheStage REPRODUCES the strand
+// #2691 reports, at the layer that owns the state. It is the backend half of a
+// cross-boundary pair: the runner half
+// (TestRun_ImplementStage_NoPR_RefusesSharedBranchPushPaths in
+// runner/cmd/fishhawk-runner/main_test.go) asserts that under --no-pr the
+// runner never PRODUCES these two manifests, and its counterfactual observation
+// names the very flags this test consumes — the two layers join on the manifest
+// field names push_to_shared_branch / push_fixup.
+//
+// It is a REPRODUCTION, not a control: the #771/#794 forward gates it exercises
+// are CORRECT and deliberately unmodified (settling these manifests without
+// their push would trade a loud strand for the silent wrong merges those gates
+// exist to prevent), so no deletion counterfactual applies here.
+//
+// It is also NOT a duplicate of TestShipTrace_{Child,Fixup}Push_
+// ImplementStaysRunning: those seed RequiresApproval=true and therefore assert
+// only that the stage does not reach awaiting_approval. A decomposition child's
+// implement stage is GATELESS, so its terminal transition is `succeeded` and
+// its orchestrator advance — a different branch of the same handler, and the
+// shape of the run actually observed. This asserts that gateless stage is left
+// unsettled in `running` with no /pull-request report ever sent, which is the
+// state the #2630 reaper later sweeps category C.
+func TestShipTrace_NoPRImplementManifests_StrandTheStage(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Minute)
+	cases := []struct {
+		name   string
+		bundle func(t *testing.T) []byte
+	}{
+		{
+			// The --no-pr decomposition child: willPushChild stamps this
+			// regardless of --no-pr (#771).
+			name:   "push_to_shared_branch",
+			bundle: func(t *testing.T) []byte { return makeChildPushBundle(t, true, 2, t0, t1) },
+		},
+		{
+			// The --no-pr fix-up pass: willPushFixup stamps this regardless of
+			// --no-pr (#794).
+			name:   "push_fixup",
+			bundle: func(t *testing.T) []byte { return makeFixupPushBundle(t, true, 2, t0, t1) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			art := newFakeArtifactRepo()
+			sf := newSigningFake()
+			ts := newTraceStoreFake()
+			au := newAuditFake()
+
+			runRow := rr.seedRun()
+			planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+			seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+			implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+			implStage.Type = run.StageTypeImplement
+			// Gateless, as a decomposition child's implement stage is: absent the
+			// forward gate this stage would transition to SUCCEEDED here.
+			implStage.RequiresApproval = false
+
+			priv, _ := sf.issue(t, runRow.ID)
+
+			s := New(Config{
+				Addr:         "127.0.0.1:0",
+				SigningRepo:  sf,
+				TraceStore:   ts,
+				AuditRepo:    au,
+				RunRepo:      rr,
+				ArtifactRepo: art,
+			})
+
+			// The trace ships and is ACCEPTED — and no /pull-request report ever
+			// follows, because --no-pr suppresses the push that would send one.
+			w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, tc.bundle(t), "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+			}
+
+			got, err := rr.GetStage(t.Context(), implStage.ID)
+			if err != nil {
+				t.Fatalf("GetStage: %v", err)
+			}
+			// Left in `running`: not succeeded (the gateless terminal it would
+			// otherwise take), not failed, not awaiting anything — unsettled,
+			// with nothing left to settle it.
+			if got.State != run.StageStateRunning {
+				t.Fatalf("stage.State = %q, want %q — the strand this issue reports (a gateless implement stage would otherwise settle %q here)",
+					got.State, run.StageStateRunning, run.StageStateSucceeded)
+			}
+		})
+	}
+}
+
 // packManifestBundle builds a minimal gzipped JSONL trace bundle whose
 // only line is a manifest carrying the given model + token split — the
 // signed wire form the cost rollup reads. Used by the cost seam test.

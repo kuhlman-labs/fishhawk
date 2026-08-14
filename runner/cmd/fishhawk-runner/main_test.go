@@ -5609,6 +5609,203 @@ func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
 	}
 }
 
+// TestRun_ImplementStage_NoPR_RefusesSharedBranchPushPaths is the runner half
+// (L1) of the two-layer push_and_open_pr=false refusal (#2691), covering the
+// two combinations the matrix above is MISSING — its `no_pr` case carries an
+// EMPTY decomposedFrom and fixup:false, which is exactly why this shipped.
+//
+// The strand: willPushChild (#771) and willPushFixup (#794) deliberately do NOT
+// test cfg.noPR, so a --no-pr decomposition child still stamps
+// push_to_shared_branch and a --no-pr fix-up still stamps push_fixup. The
+// backend then forward-gates the stage's terminal transition onto a
+// /pull-request report that --no-pr never sends, leaving the stage in `running`
+// (pinned from the backend side by TestShipTrace_NoPRImplementManifests_
+// StrandTheStage in backend/internal/server/trace_test.go — the two layers join
+// on these manifest field names). The runner therefore refuses BEFORE invoking
+// the agent, so no agent pass is burned.
+//
+// Both the REFUSE and the PROCEED branches are asserted, because the value of
+// this guard is entirely in its scoping: the standalone E22.8/#406
+// commit-yourself flow must keep working, including leaving the tree dirty.
+func TestRun_ImplementStage_NoPR_RefusesSharedBranchPushPaths(t *testing.T) {
+	const parentRunID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	const stageID = "22222222-3333-4444-5555-666666666666"
+	cases := []struct {
+		name           string
+		stageType      string
+		decomposedFrom string
+		fixup          bool
+		fixupBranch    string
+		noPR           bool
+		wantRefused    bool
+		wantDetail     string // substring the refusal's remedy must name
+		wantOpenPR     bool
+		wantPushChild  bool
+		wantPushFixup  bool
+	}{
+		{
+			// (1) A --no-pr decomposition child: refused, remedy is run_children.
+			name: "no_pr_decomposed_child_refused", stageType: "implement",
+			decomposedFrom: parentRunID, noPR: true,
+			wantRefused: true, wantDetail: "fishhawk_run_children",
+		},
+		{
+			// (2) A --no-pr fix-up pass: refused, remedy is re-dispatch.
+			name: "no_pr_fixup_refused", stageType: "implement",
+			fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222", noPR: true,
+			wantRefused: true, wantDetail: "without push_and_open_pr=false",
+		},
+		{
+			// (3) The E22.8/#406 regression pin: a STANDALONE --no-pr implement
+			// stage proceeds, stamps none of the three forward-gate flags (so its
+			// trace upload settles the stage), and leaves the tree dirty.
+			name: "no_pr_standalone_proceeds", stageType: "implement", noPR: true,
+		},
+		{
+			// (4) A decomposed child WITHOUT --no-pr proceeds and stamps the
+			// shared-branch flag: the guard is scoped to noPR, not to parentage.
+			name: "child_without_no_pr_proceeds", stageType: "implement",
+			decomposedFrom: parentRunID, wantPushChild: true,
+		},
+		{
+			// (5) A fix-up WITHOUT --no-pr proceeds and stamps the fix-up flag.
+			name: "fixup_without_no_pr_proceeds", stageType: "implement",
+			fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222", wantPushFixup: true,
+		},
+		{
+			// (6) A non-implement stage is never refused, even under --no-pr with
+			// a decomposition parent: only implement stages stamp forward gates.
+			name: "plan_stage_with_no_pr_proceeds", stageType: "plan",
+			decomposedFrom: parentRunID, noPR: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			implementEnv(t, "kuhlman-labs/fishhawk", "main")
+			fi := &fakeInvoker{canned: agent.Result{OK: true}}
+			// The agent's edit, written into the worktree run() relocated into.
+			// Case (3) reads it back to prove the tree is LEFT dirty.
+			fi.onInvoke = func(_ int, inv agent.Invocation) {
+				if inv.WorkingDir == "" {
+					return
+				}
+				if err := os.WriteFile(filepath.Join(inv.WorkingDir, "agent-edit.txt"), []byte("agent work\n"), 0o600); err != nil {
+					t.Errorf("seed the agent's working-tree edit: %v", err)
+				}
+			}
+			withFakeInvoker(t, fi)
+			withFakeRemoteBranchExists(t, false)
+			fu := newFakeUploader(t)
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:             stageID,
+				StageType:           tc.stageType,
+				Prompt:              "do the thing",
+				PromptHash:          "h",
+				DecomposedFromRunID: tc.decomposedFrom,
+				Fixup:               tc.fixup,
+				FixupBranch:         tc.fixupBranch,
+			}
+			withFakeUploader(t, fu)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+			args := []string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", tc.stageType,
+				"--stage-id", stageID,
+				"--fetch-prompt", "--upload-trace",
+			}
+			if tc.noPR {
+				args = append(args, "--no-pr")
+			}
+			var stderr strings.Builder
+			got := run(args, &stderr)
+
+			if tc.wantRefused {
+				if got != exitFailure {
+					t.Errorf("run = %d, want exitFailure (the refusal)", got)
+				}
+				// ZERO agent invocations: the whole point is that no agent pass
+				// is burned.
+				if fi.callIdx != 0 {
+					t.Errorf("agent invoked %d times, want 0 — the refusal must fire before the agent", fi.callIdx)
+				}
+				// ZERO trace ships. On a RED (guard deleted) report the manifest
+				// the runner produced instead, so the observed failure names the
+				// strand-producing flag the backend forward-gates on rather than
+				// just a changed exit code.
+				if len(fu.gotShipCalls) != 0 {
+					manifest, _, _, err := openBundleForTest(fu.gotShipCalls[0].Bundle)
+					if err != nil {
+						t.Fatalf("shipped %d traces, want 0; and the bundle would not open: %v", len(fu.gotShipCalls), err)
+					}
+					t.Fatalf("shipped %d traces, want 0 — the stage produced the strand-producing manifest push_and_open_pr=%v push_to_shared_branch=%v push_fixup=%v with no /pull-request report, which leaves the stage in `running`",
+						len(fu.gotShipCalls), manifest.PushAndOpenPR, manifest.PushToSharedBranch, manifest.PushFixup)
+				}
+				if !strings.Contains(stderr.String(), `"reason":"no_pr_unsupported_push_path"`) {
+					t.Errorf("missing the named refusal reason:\n%s", stderr.String())
+				}
+				if !strings.Contains(stderr.String(), tc.wantDetail) {
+					t.Errorf("refusal detail must name the remedy %q:\n%s", tc.wantDetail, stderr.String())
+				}
+				return
+			}
+
+			if got != exitOK {
+				t.Fatalf("run = %d, want exitOK (this path must NOT be refused):\n%s", got, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "no_pr_unsupported_push_path") {
+				t.Errorf("an admitted path must not emit the refusal:\n%s", stderr.String())
+			}
+			if fi.callIdx == 0 {
+				t.Error("agent was never invoked on an admitted path")
+			}
+			if len(fu.gotShipCalls) == 0 {
+				t.Fatal("no trace uploaded on an admitted path")
+			}
+			manifest, _, _, err := openBundleForTest(fu.gotShipCalls[0].Bundle)
+			if err != nil {
+				t.Fatalf("open bundle: %v", err)
+			}
+			if manifest.PushAndOpenPR != tc.wantOpenPR {
+				t.Errorf("manifest.PushAndOpenPR = %v, want %v", manifest.PushAndOpenPR, tc.wantOpenPR)
+			}
+			if manifest.PushToSharedBranch != tc.wantPushChild {
+				t.Errorf("manifest.PushToSharedBranch = %v, want %v", manifest.PushToSharedBranch, tc.wantPushChild)
+			}
+			if manifest.PushFixup != tc.wantPushFixup {
+				t.Errorf("manifest.PushFixup = %v, want %v", manifest.PushFixup, tc.wantPushFixup)
+			}
+
+			// Case (3), the E22.8/#406 clause the criterion turns on: the
+			// SUCCESS path must LEAVE THE AGENT'S WORK IN THE WORKING TREE. The
+			// existing --no-pr restore pin covers the agent-FAILURE path only, so
+			// a regression that started restoring on success would otherwise keep
+			// every assertion above green while re-creating this issue's bug one
+			// path over.
+			if tc.name == "no_pr_standalone_proceeds" {
+				wd := ""
+				if fi.gotInv != nil {
+					wd = fi.gotInv.WorkingDir
+				}
+				if wd == "" {
+					t.Fatal("no agent working dir captured — cannot assert the tree was left dirty")
+				}
+				if _, err := os.Stat(filepath.Join(wd, "agent-edit.txt")); err != nil {
+					t.Errorf("the agent's edit is gone from %s (%v) — --no-pr must leave the work in the tree", wd, err)
+				}
+				out, err := exec.Command("git", "-C", wd, "status", "--porcelain").CombinedOutput()
+				if err != nil {
+					t.Fatalf("git status in %s: %v\n%s", wd, err, out)
+				}
+				if strings.TrimSpace(string(out)) == "" {
+					t.Errorf("working tree at %s is CLEAN after a --no-pr implement stage — the dirty tree IS the deliverable", wd)
+				}
+			}
+		})
+	}
+}
+
 // TestRun_StampsRunnerKindOnManifestsAndStartup asserts the load-bearing
 // runner-side wiring (#1346 / ADR-045, binding condition #2): PackInputs
 // .RunnerKind is set from detectRunnerKind(os.Getenv) onto BOTH the raw and

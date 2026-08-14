@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -3289,4 +3290,79 @@ func TestSpawnRunnerStageDetached_RefusesAfterCancel(t *testing.T) {
 		}
 		t.Errorf("refused spawns left %d orphan log file(s) in TempDir: %v", len(orphans), orphans)
 	}
+}
+
+// TestRunStage_RefusesNoPROnDecomposedChild is the run_stage mirror of the
+// #2691 dispatch-verb pin: this verb exposes the identical push_and_open_pr
+// field and reaches the identical runner path, so it must refuse identically.
+// "No runner spawned" is proven through the runStageCommand seam — the fake
+// runner touches a marker file, and its absence is the assertion — and "no
+// state committed" through the wire POST counter.
+func TestRunStage_RefusesNoPROnDecomposedChild(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	parent := uuid.New().String()
+	srv, posts := noPRGuardBackend(t, runID, stageID, &parent)
+
+	marker := filepath.Join(t.TempDir(), "spawned")
+	withFakeRunner(t, "touch "+marker)
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+	})
+	// t.Error, NOT t.Fatal — see the dispatch_stage mirror: the spawn-marker and
+	// no-state-committed assertions below must survive into the counterfactual
+	// RED rather than being short-circuited by the error-identity check.
+	if err == nil {
+		t.Error("expected a refusal for a decomposition child run with push_and_open_pr=false")
+	} else if !strings.Contains(err.Error(), "fishhawk_run_children") {
+		t.Errorf("refusal must name the remedy verb: %v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("the runner was spawned — the refusal must spawn no runner at all")
+	}
+	if *posts != 0 {
+		t.Errorf("mutating POSTs = %d, want 0 — the refusal must commit no state (no auto-drive act, no host-dispatch marker)", *posts)
+	}
+}
+
+// TestRunStage_AdmitsNoPROnStandaloneRun is the E22.8/#406 pin at the run_stage
+// call site: a STANDALONE run with push_and_open_pr=false still spawns.
+func TestRunStage_AdmitsNoPROnStandaloneRun(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	srv, _ := noPRGuardBackend(t, runID, stageID, nil)
+
+	marker := filepath.Join(t.TempDir(), "spawned")
+	withFakeRunner(t, "touch "+marker)
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("a standalone --no-pr run must be admitted: %v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Errorf("the runner was NOT spawned (%v) — the commit-yourself flow must keep working", statErr)
+	}
+}
+
+// TestRunStage_PushAndOpenPRDescription_DescribesPerCaseBehavior mirrors the
+// dispatch_stage description pin onto RunStageInput: both verbs advertise the
+// same flag, so both must make the same per-case claims.
+func TestRunStage_PushAndOpenPRDescription_DescribesPerCaseBehavior(t *testing.T) {
+	schema, err := jsonschema.For[RunStageInput](nil)
+	if err != nil {
+		t.Fatalf("infer RunStageInput schema: %v", err)
+	}
+	assertPushAndOpenPRDescription(t, "fishhawk_run_stage", schema)
 }

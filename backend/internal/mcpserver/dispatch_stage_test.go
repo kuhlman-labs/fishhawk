@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -1986,5 +1987,247 @@ func TestDispatchStage_PollIntervalStaysAtFloor(t *testing.T) {
 	if out.StageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
 		t.Errorf("PollIntervalSeconds = %d, want %d (the spawn path derives from a zero prediction by design)",
 			out.StageWaitStatus.PollIntervalSeconds, suggestedStageWaitPollIntervalSeconds)
+	}
+}
+
+// noPRGuardBackend is the wire-level fixture for the #2691 call-site tests. It
+// serves a run (decomposed or standalone, per decomposedFrom) plus one pending
+// implement stage, and COUNTS every mutating POST it receives — the
+// auto-drive-attribution row and the host-dispatch marker are the two state
+// commits the guard must precede, so counting POSTs at the wire proves "no
+// state committed" directly rather than by inspecting a fake's fields.
+func noPRGuardBackend(t *testing.T, runID, stageID uuid.UUID, decomposedFrom *string) (*httptest.Server, *int) {
+	t.Helper()
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			posts++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "pending"}},
+			})
+		default:
+			// GET /v0/runs/{id}: read by guardHostDispatch, the working_dir
+			// resolver and guardNoPRImplement.
+			_ = json.NewEncoder(w).Encode(Run{
+				ID: runID.String(), Repo: "x/y", State: "running", DecomposedFrom: decomposedFrom,
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &posts
+}
+
+// countingSpawnSeam swaps dispatchSpawnDetached for a counting stub (and stubs
+// the binary lookup that precedes it), so a test can assert the refusal spawned
+// NOTHING through the seam itself rather than by observing processes.
+func countingSpawnSeam(t *testing.T) *int {
+	t.Helper()
+	var spawns int
+	savedSpawn := dispatchSpawnDetached
+	dispatchSpawnDetached = func(_ string, _, _ []string, _, _ string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+		spawns++
+		return "/dev/null", nil
+	}
+	savedLook := runStageLookPath
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		dispatchSpawnDetached = savedSpawn
+		runStageLookPath = savedLook
+	})
+	return &spawns
+}
+
+// TestDispatchStage_RefusesNoPROnDecomposedChild is the #2691 done-means at the
+// dispatch verb: a decomposition child dispatched with push_and_open_pr=false
+// is refused, NO runner is spawned (proven through the dispatchSpawnDetached
+// seam, not by observing processes), and the refusal commits NO state — neither
+// the auto-drive attribution row nor the host-dispatch marker POSTs.
+func TestDispatchStage_RefusesNoPROnDecomposedChild(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	parent := uuid.New().String()
+	srv, posts := noPRGuardBackend(t, runID, stageID, &parent)
+	spawns := countingSpawnSeam(t)
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+	})
+	// t.Error, NOT t.Fatal: the load-bearing assertions here are the STATE ones
+	// below (no spawn, no committed state), and a Fatal would short-circuit them
+	// out of the counterfactual RED — leaving the deletion evidenced only by the
+	// error identity, the trap the counterfactual discipline warns about.
+	if err == nil {
+		t.Error("expected a refusal for a decomposition child dispatched with push_and_open_pr=false")
+	} else if !strings.Contains(err.Error(), "fishhawk_run_children") {
+		t.Errorf("refusal must name the remedy verb: %v", err)
+	}
+	if *spawns != 0 {
+		t.Errorf("detached spawns = %d, want 0 — the refusal must spawn no runner at all", *spawns)
+	}
+	if *posts != 0 {
+		t.Errorf("mutating POSTs = %d, want 0 — the refusal must commit no state (no auto-drive act, no host-dispatch marker)", *posts)
+	}
+}
+
+// TestDispatchStage_AdmitsNoPROnStandaloneRun is the E22.8/#406 pin at the same
+// call site: the guard is scoped to decomposition children, so a STANDALONE run
+// dispatched with push_and_open_pr=false still spawns.
+func TestDispatchStage_AdmitsNoPROnStandaloneRun(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	srv, _ := noPRGuardBackend(t, runID, stageID, nil)
+	spawns := countingSpawnSeam(t)
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("a standalone --no-pr dispatch must be admitted: %v", err)
+	}
+	if *spawns != 1 {
+		t.Errorf("detached spawns = %d, want 1 — the commit-yourself flow must keep working", *spawns)
+	}
+}
+
+// TestDispatchStage_NoPRRunnerRefusal_SettlesCategoryC is the #2691 approval
+// condition 4 evidence: the runner's L1 refusal SETTLES the stage rather than
+// stranding it.
+//
+// The two halves of that claim are proven by two tests joined on the reason
+// string. The runner half
+// (TestRun_ImplementStage_NoPR_RefusesSharedBranchPushPaths) proves the real
+// runner emits exactly {"event":"runner_failed","reason":
+// "no_pr_unsupported_push_path",...} and exits non-zero before invoking the
+// agent. THIS test proves that exact line, produced by a real detached child
+// through the real spawn path, drives the #1747 reaper to a TERMINAL category-C
+// failure report — so the refusal lands the stage `failed`, not `running`.
+//
+// The fix-up case is the one modelled here deliberately: the MCP guard cannot
+// see fix-up status, so a fix-up --no-pr dispatch is ADMITTED at L2 and refused
+// at L1 — the exact path this settle claim has to cover.
+func TestDispatchStage_NoPRRunnerRefusal_SettlesCategoryC(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+
+	gotCh := make(chan reapFailureRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reap-failure"):
+			var b reapFailureRequest
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			gotCh <- b
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "pending"}},
+			})
+		default:
+			// A STANDALONE run: the L2 guard admits, exactly as it does for the
+			// fix-up dispatch this models (fix-up status is invisible pre-spawn).
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+		}
+	}))
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// The runner's L1 refusal, byte-for-byte as main.go emits it.
+	withFakeRunner(t, `echo '{"event":"runner_failed","reason":"no_pr_unsupported_push_path","detail":"stage is a fix-up pass"}'; exit 1`)
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+
+	select {
+	case b := <-gotCh:
+		if b.Category != "C" {
+			t.Errorf("category = %q, want C (a terminal, named failure — not a strand)", b.Category)
+		}
+		if b.Reason != "no_pr_unsupported_push_path" {
+			t.Errorf("reason = %q, want the runner's named refusal reason", b.Reason)
+		}
+		if b.ExitCode != 1 {
+			t.Errorf("exit_code = %d, want 1", b.ExitCode)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reaper never reported the L1 refusal — the stage would be STRANDED, not settled")
+	}
+}
+
+// TestDispatchStage_PushAndOpenPRDescription_DescribesPerCaseBehavior is the
+// done-means behavioral test for the user-facing text: the advertised
+// push_and_open_pr description — the SAME jsonschema.For inference AddTool uses
+// — must describe the REAL per-case behavior. The weight is on the POSITIVE
+// assertions (each per-case claim the field now makes); the negative check is a
+// backstop only, since byte-level phrasing checks are brittle to benign
+// rewording. Also pins the base_branch correction: the flag applies regardless
+// of push_and_open_pr.
+func TestDispatchStage_PushAndOpenPRDescription_DescribesPerCaseBehavior(t *testing.T) {
+	schema, err := jsonschema.For[DispatchStageInput](nil)
+	if err != nil {
+		t.Fatalf("infer DispatchStageInput schema: %v", err)
+	}
+	assertPushAndOpenPRDescription(t, "fishhawk_dispatch_stage", schema)
+}
+
+// assertPushAndOpenPRDescription is shared by the dispatch_stage and run_stage
+// description pins: both verbs expose the identical flag and reach the identical
+// runner path, so both descriptions must make the same per-case claims.
+func assertPushAndOpenPRDescription(t *testing.T, tool string, schema *jsonschema.Schema) {
+	t.Helper()
+	prop, ok := schema.Properties["push_and_open_pr"]
+	if !ok {
+		t.Fatalf("%s schema has no push_and_open_pr property", tool)
+	}
+	desc := prop.Description
+	// POSITIVE assertions — one per per-case claim the field guards.
+	for _, want := range []struct{ claim, substr string }{
+		{"the standalone flow is still supported", "STANDALONE"},
+		{"the standalone flow is still supported", "supported"},
+		{"the standalone flow leaves the work in the tree", "working tree"},
+		{"a decomposition child is refused", "DECOMPOSITION CHILD"},
+		{"a fix-up is refused", "FIX-UP"},
+		{"the refusal is named as such", "REFUSED"},
+		{"the child remedy verb is named", "fishhawk_run_children"},
+		{"the fix-up remedy is named", "re-dispatch without push_and_open_pr=false"},
+	} {
+		if !strings.Contains(desc, want.substr) {
+			t.Errorf("%s push_and_open_pr description must state %s (missing %q):\n%s", tool, want.claim, want.substr, desc)
+		}
+	}
+	// NEGATIVE backstop: the description must never claim the flag discards an
+	// implement result — it does not, on any path.
+	for _, forbidden := range []string{"discard", "throw away"} {
+		if strings.Contains(strings.ToLower(desc), forbidden) {
+			t.Errorf("%s push_and_open_pr description must not claim the flag %qs an implement result:\n%s", tool, forbidden, desc)
+		}
+	}
+	// base_branch correction: it is NOT a no-op under push_and_open_pr=false.
+	base, ok := schema.Properties["base_branch"]
+	if !ok {
+		t.Fatalf("%s schema has no base_branch property", tool)
+	}
+	if strings.Contains(base.Description, "no effect when push_and_open_pr is false") {
+		t.Errorf("%s base_branch description still claims no effect under push_and_open_pr=false, which is wrong (--base-branch and --check-base-ref are passed unconditionally):\n%s", tool, base.Description)
 	}
 }

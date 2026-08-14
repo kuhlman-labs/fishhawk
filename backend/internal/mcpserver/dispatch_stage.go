@@ -28,8 +28,8 @@ type DispatchStageInput struct {
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. dispatch is the DEFAULT verb for a local acceptance stage (E31.9) — it validates against a running preview/target instance and runs long, so non-blocking dispatch keeps the session free; no new argv (composeRunnerArgv passes --stage through, and acceptance takes neither --plan-out nor --check-base-ref)"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
-	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
-	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true"`
+	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
+	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
 }
 
@@ -218,6 +218,19 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, DispatchStageOutput{}, siblingErr
 	}
 
+	// (2b) push_and_open_pr=false decomposition-child guard (#2691). A child's
+	// implement stage settles on its shared-branch push, which this flag
+	// suppresses, so the stage would strand in `running`. The ORDERING is
+	// load-bearing: this sits before RecordAutoDriveAct, before
+	// HostDispatchStage and before dispatchSpawnDetached, so a refusal commits
+	// NO state and spawns NOTHING and the stage stays parked for a clean
+	// re-dispatch. Fails OPEN on a GetRun error (the runner-side pre-agent
+	// refusal is the backstop). Its warnings merge into warnings below.
+	noPRWarnings, noPRErr := r.guardNoPRImplement(ctx, runUUID, in.Stage, pushAndOpenPR)
+	if noPRErr != nil {
+		return nil, DispatchStageOutput{}, noPRErr
+	}
+
 	// (3) Resolve the runner binary (input > env > sibling > PATH > error).
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
 	if err != nil {
@@ -227,7 +240,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
 	// Seeded with any guard fail-open warning from step (1a) and (2a).
-	warnings := append(guardWarnings, siblingWarnings...)
+	warnings := append(append(guardWarnings, siblingWarnings...), noPRWarnings...)
 	repo := in.GitHubRepo
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)

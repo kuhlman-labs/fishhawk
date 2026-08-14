@@ -2,6 +2,36 @@
 
 The runner binary entrypoint: flag parsing in `flags.go`, stage dispatch in `main.go`. Operator-facing inputs and the action contract are in `runner/README.md`; this file covers `main.go`-level mechanics.
 
+## `--no-pr` contract (E22.8 / #406, scoped by [#2691](https://github.com/kuhlman-labs/fishhawk/issues/2691))
+
+`--no-pr` is **per-case**, not global:
+
+- **Standalone implement stage — supported, unchanged.** The runner skips the commit/push/PR-open sequence
+  (`implement_pr_skipped`, `reason:"no_pr_flag"`) and **leaves the agent's work in the working tree** for the operator
+  to commit. The bundle manifest stamps none of `push_and_open_pr` / `push_to_shared_branch` / `push_fixup`, so the
+  trace upload settles the stage. Both the success path (the tree is left dirty) and the agent-failure path (no
+  `working_tree_restored`, #953) are pinned by test.
+- **Decomposition child or fix-up pass — REFUSED before the agent runs.** `run()` emits
+  `{"event":"runner_failed","reason":"no_pr_unsupported_push_path","detail":…}` and returns `exitFailure` from inside
+  the `--fetch-prompt` block, immediately after the prompt response resolves `noPR` / `fixup` /
+  `decomposedFromRunID` / `stageType` and strictly BEFORE the lineage-worktree block — so no admin lock, no
+  sweep/provision, no lineage lock, no base checkout and **no agent invocation** has happened. The `detail` names the
+  remedy: `fishhawk_run_children` for a decomposition child (it spawns the identical child without `--no-pr`), or
+  re-dispatch without `push_and_open_pr=false` for a fix-up.
+
+**Mechanism.** `willPushChild` ([#771](https://github.com/kuhlman-labs/fishhawk/issues/771)) and `willPushFixup`
+([#794](https://github.com/kuhlman-labs/fishhawk/issues/794)) deliberately do NOT test `cfg.noPR` — those forward gates
+exist to stop a succeeded-but-unlanded implement stage — so under `--no-pr` a child still stamps
+`push_to_shared_branch` and a fix-up still stamps `push_fixup`. The backend then defers the stage's terminal transition
+onto a `/pull-request` report `--no-pr` never sends, and the stage sits in `running` until the reaper sweeps it. The
+refusal converts that silent strand into a NAMED category-C failure through the existing
+[#1747](https://github.com/kuhlman-labs/fishhawk/issues/1747) detached-reaper report path, the same path every other
+pre-agent refusal (`fixup_base_mismatch`, `worktree_admin_lock`) uses.
+
+This is also the layer that owns the **fix-up** arm: `cfg.fixup` is served only on the prompt response, so the
+prompt fetch is the first point at which it is authoritative — and it is still strictly before the agent invoke. The
+MCP-side `guardNoPRImplement` covers the decomposed-child case pre-spawn.
+
 ## Per-run working-tree isolation (E22.X / #1137)
 
 `worktree.go` provisions a per-lineage git worktree so concurrent runs on one local host never share a working tree:

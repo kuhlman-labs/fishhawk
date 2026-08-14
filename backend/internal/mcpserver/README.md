@@ -796,6 +796,40 @@ child never can, and no verb un-cancels a run. So `cancelRun` reads the run row 
 costs at most a retry. `orphan_parent_ok:true` is the single documented override for both refusals and surfaces a
 warning naming the orphaned parent.
 
+## `push_and_open_pr=false` is per-case, not global (`guardNoPRImplement`)
+
+`push_and_open_pr=false` (the runner's `--no-pr`) is supported on a **standalone** implement stage and refused on the
+two paths where it cannot settle ([#2691](https://github.com/kuhlman-labs/fishhawk/issues/2691)):
+
+| Stage kind | `push_and_open_pr=false` | Why |
+|---|---|---|
+| standalone implement | **supported** (E22.8 / [#406](https://github.com/kuhlman-labs/fishhawk/issues/406)) | stamps none of the three forward-gate manifest flags, so the trace upload settles the stage; the agent's work is left in the working tree for the operator to commit |
+| decomposition child | **refused** at dispatch (L2) | the runner stamps `push_to_shared_branch` regardless of `--no-pr` ([#771](https://github.com/kuhlman-labs/fishhawk/issues/771)), so the backend defers the terminal transition onto a `/pull-request` report `--no-pr` never sends |
+| fix-up pass | **refused** in the runner (L1) | same shape via `push_fixup` ([#794](https://github.com/kuhlman-labs/fishhawk/issues/794)) |
+
+Those two forward gates deliberately do NOT test `--no-pr`: they exist to stop a succeeded-but-unlanded implement stage
+(a child consolidated into a parent PR missing its slice; a fix-up re-review approving an unlanded diff). Making them
+settle under `--no-pr` would trade a loud strand for a silent wrong merge, so the refusal is the fix and `trace.go` is
+untouched.
+
+`guardNoPRImplement` is the **pre-spawn** half, wired into BOTH `fishhawk_dispatch_stage` and `fishhawk_run_stage`
+before every state-committing step (the auto-drive attribution row, the host-dispatch marker, the spawn), so a refusal
+commits no state, spawns nothing, and leaves the stage parked for a clean re-dispatch. It returns immediately —
+**no round-trip** — unless the stage is `implement` AND the flag is explicitly false; on that path it costs **one
+additional `GetRun`** beyond the reads the callers already make. It **fails OPEN** on a `GetRun` error, matching
+`guardHostDispatch`'s posture: on an unreadable run row this layer cannot know the stage is a child, and refusing would
+break legitimate dispatches during a backend hiccup. That fail-open branch is the ONE case where a runner process may
+start — the runner-side refusal then fires immediately after the prompt fetch, before any worktree or agent work, so
+**no agent pass is ever burned**.
+
+Its scope is deliberately the **decomposed-child signal only**. Fix-up status is not authoritatively knowable pre-spawn:
+`fixup` is derived server-side inside the `/prompt` handler from `resolveFixupConcerns(runID, stageID)` and served only
+on the prompt response — neither the run nor the stage response carries it, and the fix-up / retry / plan-approved stage
+parks are indistinguishable by state. The gate view's pending fix-up rows are a PREDICTION, not authority: the backend
+re-derives `fixup` at prompt-fetch time, so a concern waived, deferred or resolved in between flips the answer and an
+L2 refusal built on it would reject a legitimate dispatch. `base_branch` is likewise not a refusal criterion — on a
+standalone stage a base branch triggers neither a working-tree restore nor a forward-gate flag.
+
 ## Paged-acceptance discharge (`fishhawk_arbitrate_acceptance`)
 
 `fishhawk_arbitrate_acceptance` ([E66.37 / #2474](https://github.com/kuhlman-labs/fishhawk/issues/2474)) is the **operator-only discharge** for a run parked at `acceptance_triage_paged` — a FAILED acceptance verdict whose deterministic triage paged the human. Before it, `fishhawk_merge_run` refused such a run with `409 acceptance_gate_not_passed` and `fishhawk_retry_stage`'s acceptance-reopen arm refused it too (it requires NO recorded verdict), so the only way out was to leave the loop and hand-merge — losing the `merge_verdict_recorded` audit entry the merge verb exists to write. It wraps `POST /v0/runs/{run_id}/acceptance-arbitration`.
