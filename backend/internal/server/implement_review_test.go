@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -4021,11 +4022,16 @@ func TestPersistReviewConcerns_NonBlankNoteUnchanged(t *testing.T) {
 
 // TestPersistReviewConcerns_LongFreeFormTruncated: the recovered prose is
 // bounded (the note is rendered whole by the gate view and quoted into filed
-// follow-ups) and the cut is marked.
+// follow-ups) and the cut is marked. The BOUND is the load-bearing assertion —
+// a marker and a truncated=true flag on an implementation that still copied the
+// whole free_form would leave the swamped-surface defect intact — so the
+// recovered body is measured against concernNoteFreeFormMaxBytes and against
+// the oversized input, not merely inspected for the marker.
 func TestPersistReviewConcerns_LongFreeFormTruncated(t *testing.T) {
 	s, cr, au := guardServer(t)
 	runID, stageID := uuid.New(), uuid.New()
 	// Multi-byte runes so a naive byte cut would land mid-rune and emit U+FFFD.
+	// 2 bytes per rune, so the input is twice the bound — comfortably oversized.
 	freeForm := strings.Repeat("é", concernNoteFreeFormMaxBytes)
 
 	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
@@ -4041,6 +4047,36 @@ func TestPersistReviewConcerns_LongFreeFormTruncated(t *testing.T) {
 	}
 	if strings.ContainsRune(got, '�') {
 		t.Error("persisted note contains U+FFFD — the byte cut landed mid-rune")
+	}
+	// The recovered body is everything after the synthesized preamble, which
+	// backfillConcernNote separates with a blank line.
+	parts := strings.SplitN(got, "\n\n", 2)
+	if len(parts) != 2 {
+		t.Fatalf("persisted note has no recovered body separated by a blank line: %q", got)
+	}
+	body := parts[1]
+	if len(body) > concernNoteFreeFormMaxBytes {
+		t.Errorf("recovered body = %d bytes, want <= concernNoteFreeFormMaxBytes (%d) — the bound did not hold",
+			len(body), concernNoteFreeFormMaxBytes)
+	}
+	if len(body) >= len(freeForm) {
+		t.Errorf("recovered body = %d bytes, want strictly fewer than the %d-byte input — nothing was cut",
+			len(body), len(freeForm))
+	}
+	// The retained prose must be a genuine head of the input (not a stub, not a
+	// rewrite) — otherwise "bounded" could be satisfied by discarding it all.
+	retained := strings.TrimSuffix(body, concernNoteTruncationMarker)
+	if retained == body {
+		t.Errorf("recovered body does not END with the truncation marker: %q", body[max(0, len(body)-120):])
+	}
+	if !strings.HasPrefix(freeForm, retained) {
+		t.Error("retained prose is not a prefix of the input free_form")
+	}
+	// A cut backtracks at most one rune (utf8.UTFMax-1 bytes) off the boundary,
+	// so anything materially shorter means the recovery threw prose away.
+	if wantMin := concernNoteFreeFormMaxBytes - len(concernNoteTruncationMarker) - (utf8.UTFMax - 1); len(retained) < wantMin {
+		t.Errorf("retained prose = %d bytes, want >= %d — the recovery discarded prose it had room for",
+			len(retained), wantMin)
 	}
 	entries := findBackfillAudits(au)
 	if len(entries) != 1 {
