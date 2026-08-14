@@ -2135,9 +2135,12 @@ func makeApproveEntry(runID uuid.UUID) *audit.Entry {
 
 func TestLoadPriorRejectionFeedback_NoPriorRuns_ReturnsNil(t *testing.T) {
 	s := newFeedbackServer(t, nil, nil)
-	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", uuid.New())
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", uuid.New())
 	if got != nil {
 		t.Errorf("got %q, want nil (no prior runs)", *got)
+	}
+	if gotID != uuid.Nil {
+		t.Errorf("gotID = %s, want uuid.Nil (no prior runs)", gotID)
 	}
 }
 
@@ -2148,9 +2151,12 @@ func TestLoadPriorRejectionFeedback_PriorRunNoRejection_ReturnsNil(t *testing.T)
 		[]*run.Run{{ID: priorID}},
 		map[uuid.UUID][]*audit.Entry{priorID: {makeApproveEntry(priorID)}},
 	)
-	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
 	if got != nil {
 		t.Errorf("got %q, want nil (no rejection in prior run)", *got)
+	}
+	if gotID != uuid.Nil {
+		t.Errorf("gotID = %s, want uuid.Nil (no rejection in prior run)", gotID)
 	}
 }
 
@@ -2163,9 +2169,12 @@ func TestLoadPriorRejectionFeedback_PriorRunRejectionEmptyComment_ReturnsNil(t *
 		[]*run.Run{{ID: priorID}},
 		map[uuid.UUID][]*audit.Entry{priorID: {{ID: uuid.New(), RunID: &rid, Payload: payload}}},
 	)
-	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
 	if got != nil {
 		t.Errorf("got %q, want nil (rejection with empty comment)", *got)
+	}
+	if gotID != uuid.Nil {
+		t.Errorf("gotID = %s, want uuid.Nil (empty comment)", gotID)
 	}
 }
 
@@ -2176,12 +2185,17 @@ func TestLoadPriorRejectionFeedback_PriorRunRejectionNonEmptyComment_ReturnsComm
 		[]*run.Run{{ID: priorID}},
 		map[uuid.UUID][]*audit.Entry{priorID: {makeRejectionEntry(priorID, "plan is too vague")}},
 	)
-	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
 	if got == nil {
 		t.Fatal("got nil, want comment")
 	}
 	if *got != "plan is too vague" {
 		t.Errorf("got %q, want 'plan is too vague'", *got)
+	}
+	// #2680: the loader also reports WHICH prior run supplied the comment so
+	// the render layer can build a concrete retrieval pointer.
+	if gotID != priorID {
+		t.Errorf("gotID = %s, want the rejecting run %s", gotID, priorID)
 	}
 }
 
@@ -2192,9 +2206,121 @@ func TestLoadPriorRejectionFeedback_CurrentRunIDExcluded(t *testing.T) {
 		[]*run.Run{{ID: currentID}},
 		map[uuid.UUID][]*audit.Entry{currentID: {makeRejectionEntry(currentID, "do not return this")}},
 	)
-	got := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", currentID)
 	if got != nil {
 		t.Errorf("got %q, want nil (current run should be excluded)", *got)
+	}
+	if gotID != uuid.Nil {
+		t.Errorf("gotID = %s, want uuid.Nil (current run excluded)", gotID)
+	}
+}
+
+func TestLoadPriorRejectionFeedback_ListRunsError_ReturnsNil(t *testing.T) {
+	// The ListRuns error path (best-effort) must yield (nil, uuid.Nil).
+	rr := &feedbackRunRepo{
+		promptRunRepo: newPromptRunRepo(),
+		listErr:       errors.New("boom"),
+	}
+	ar := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar})
+	got, gotID := s.loadPriorRejectionFeedback(context.Background(), "x/y", "issue:42", uuid.New())
+	if got != nil {
+		t.Errorf("got %q, want nil (ListRuns error)", *got)
+	}
+	if gotID != uuid.Nil {
+		t.Errorf("gotID = %s, want uuid.Nil (ListRuns error)", gotID)
+	}
+}
+
+// TestPromptHandler_PriorRejectionFeedback_OverCap_MarkerNamesPriorRun is the
+// cross-boundary integration proof (#2680): an over-cap decision=reject
+// approval_submitted entry on a PRIOR run sharing the current run's trigger_ref
+// must, after crossing loader -> Trigger.PriorRejectionFeedbackRunID ->
+// buildPlan, render into the plan prompt as an explicit ADR-077 elision marker
+// that NAMES that prior run's id and the rejection_comment retrieval key — and
+// the over-cap tail must NOT appear verbatim. Per-layer units cannot catch a
+// loader that forgets to set the new Trigger field; deleting the run-id
+// threading in loadPriorRejectionFeedback reddens this. The same assertion runs
+// against the /prompt-render preview handler so the two prompt paths stay
+// byte-identical.
+func TestPromptHandler_PriorRejectionFeedback_OverCap_MarkerNamesPriorRun(t *testing.T) {
+	priorID := uuid.New()
+	currentID := uuid.New()
+	stageID := uuid.New()
+	triggerRef := "issue:2680"
+
+	// Over-cap reason with a recognizable tail past the cap, seeded BY
+	// CONSTRUCTION so a RED lands on the behavioral assertion, not fixture setup.
+	const tail = "TAIL_MUST_BE_ELIDED"
+	overCap := strings.Repeat("x", prompt.MaxRejectionFeedbackBytes+200) + tail
+
+	rr := &feedbackRunRepo{
+		promptRunRepo: newPromptRunRepo(),
+		listResult:    []*run.Run{{ID: priorID, Repo: "kuhlman-labs/example", TriggerRef: &triggerRef}},
+	}
+	tr := triggerRef
+	rr.runRow = &run.Run{
+		ID:            currentID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		TriggerRef:    &tr,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: currentID, Type: run.StageTypePlan}
+
+	ar := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		priorID: {makeRejectionEntry(priorID, overCap)},
+	}}
+	sf := newSigningFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, SigningRepo: sf})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	priv, _ := sf.issue(t, currentID)
+
+	assertMarker := func(t *testing.T, label, body string) {
+		t.Helper()
+		wants := []string{
+			"### Prior plan-stage rejection feedback",
+			"ELIDED",         // the elision marker fired
+			"INCOMPLETE",     // it declares the text incomplete
+			priorID.String(), // the retrieval pointer names the rejecting run
+			"rejection_comment",
+			"risks_and_assumptions", // planner instructed to declare the drop
+		}
+		for _, w := range wants {
+			if !strings.Contains(body, w) {
+				t.Errorf("%s prompt missing %q:\n%s", label, w, body)
+			}
+		}
+		if strings.Contains(body, tail) {
+			t.Errorf("%s prompt leaked the over-cap tail %q — it must be elided", label, tail)
+		}
+	}
+
+	// Signed /prompt dispatch path.
+	w := promptRequest(t, s, currentID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("/prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var signed promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &signed); err != nil {
+		t.Fatalf("decode /prompt: %v", err)
+	}
+	assertMarker(t, "/prompt", signed.Prompt)
+
+	// /prompt-render preview path — must stay byte-identical to the signed path.
+	rw := promptRenderRequest(t, s, stageID)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("/prompt-render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	var rendered promptResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &rendered); err != nil {
+		t.Fatalf("decode /prompt-render: %v", err)
+	}
+	assertMarker(t, "/prompt-render", rendered.Prompt)
+
+	if signed.Prompt != rendered.Prompt {
+		t.Errorf("signed and render-preview plan prompts diverged; the two paths must stay byte-identical")
 	}
 }
 

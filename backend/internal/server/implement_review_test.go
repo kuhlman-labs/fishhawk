@@ -3822,7 +3822,7 @@ func TestImplementReview_OperatorConcern_NoResolution_StaysOpen(t *testing.T) {
 // TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions proves the
 // operator concern participates in the resolution payload on the same footing as
 // an id-routed one: a `reopened` verdict drives it to StateReopened, a `confirmed`
-// verdict to StateAddressed, through applyConcernResolutions.
+// verdict to StateAddressed, through the round-level resolution pass.
 func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *testing.T) {
 	ctx := context.Background()
 
@@ -3833,9 +3833,14 @@ func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *test
 			t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
 		}
 		id := operatorConcernRows(cr)[0].ID
-		s.applyConcernResolutions(ctx, stage.RunID, stage.ID, []planreview.ConcernResolution{
-			{ID: id.String(), Resolution: "reopened", Note: "still not fixed"},
-		})
+		s.applyRoundConcernResolutions(ctx, stage.RunID, stage.ID, []roundReviewVerdict{{
+			model:   "claude-opus-4-8",
+			verdict: planreview.VerdictReject,
+			resolutions: []planreview.ConcernResolution{
+				{ID: id.String(), Resolution: "reopened", Note: "still not fixed"},
+			},
+			reviewSequence: 7,
+		}})
 		if got := operatorConcernRows(cr)[0].State; got != concern.StateReopened {
 			t.Errorf("state = %q, want reopened", got)
 		}
@@ -3848,9 +3853,14 @@ func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *test
 			t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
 		}
 		id := operatorConcernRows(cr)[0].ID
-		s.applyConcernResolutions(ctx, stage.RunID, stage.ID, []planreview.ConcernResolution{
-			{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
-		})
+		s.applyRoundConcernResolutions(ctx, stage.RunID, stage.ID, []roundReviewVerdict{{
+			model:   "claude-opus-4-8",
+			verdict: planreview.VerdictApprove,
+			resolutions: []planreview.ConcernResolution{
+				{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
+			},
+			reviewSequence: 7,
+		}})
 		if got := operatorConcernRows(cr)[0].State; got != concern.StateAddressed {
 			t.Errorf("state = %q, want addressed", got)
 		}
@@ -3876,14 +3886,409 @@ func TestImplementReview_OperatorConcernOnlyFixup_CountsAsRoutedRound(t *testing
 	}
 }
 
-// --- Blank-note backfill (#2555) ---------------------------------------------
+// --- Round-level resolution veto (E48.103 / #2551) ---------------------------
 //
-// A reviewer concern with an empty or whitespace-only note was persisted
-// verbatim and then held the merge gate open carrying nothing an operator, a
-// fix-up agent, or a later re-review could act on. Every fixture below seeds its
-// blank note BY CONSTRUCTION (a literal "" / "   \n\t"), never by calling the
-// control, so deleting backfillConcernNote's blank branch reddens the persisted-
-// note assertion rather than the setup.
+// These pin the four deterministic veto arms that stop a routed concern from
+// auto-resolving on ONE reviewer's `confirmed` while the round's evidence
+// contradicts it, plus the two non-veto CONTROLS that prove the ordinary
+// resolve path is untouched. Every veto case READS THE CONCERN ROW BACK from
+// the store after the round returns — the veto's effect is COMMITTED STATE, so
+// asserting on a log line or an error would not discriminate.
+
+// vetoRoundServer wires the audit + concern stores the veto pass reads, with
+// no RunRepo (runImplementReviewInvocations needs none).
+func vetoRoundServer() (*Server, *auditFake, *fakeConcernRepo, uuid.UUID, uuid.UUID) {
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	return s, au, cr, uuid.New(), uuid.New()
+}
+
+// seedRoutedConcern mints one implement concern raised by `model` and routes it
+// back (addressed_pending) with `reason` as its state_reason — the state a
+// `confirmed` resolution transitions from, seeded BY CONSTRUCTION so a veto
+// deletion reddens on the behavioural assertion rather than on setup.
+func seedRoutedConcern(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, model, note, reason string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        model,
+		OriginReviewSequence: 100,
+		Concerns:             []concern.RaisedConcern{{Severity: "high", Category: "authz", Note: note}},
+	})
+	if err != nil {
+		t.Fatalf("seed concern: %v", err)
+	}
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{rows[0].ID}, reason); err != nil {
+		t.Fatalf("route concern: %v", err)
+	}
+	return rows[0]
+}
+
+// seedAuditEntry appends a pre-existing audit entry with an explicit sequence
+// (auditFake stamps appended entries with sequence 0, which the no-change
+// ordering derivation needs to distinguish).
+func seedStageAuditEntry(t *testing.T, au *auditFake, runID, stageID uuid.UUID, seq int64, category string, fields map[string]any) {
+	t.Helper()
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	rid, sid := runID, stageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &rid,
+		StageID:  &sid,
+		Sequence: seq,
+		Category: category,
+		Payload:  payload,
+	})
+}
+
+// vetoEntries decodes every concern_resolution_vetoed entry appended in a test.
+func vetoEntries(t *testing.T, au *auditFake) []concernResolutionVetoedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []concernResolutionVetoedPayload
+	for _, ap := range au.appended {
+		if ap.Category != concernResolutionVetoedCategory {
+			continue
+		}
+		var p concernResolutionVetoedPayload
+		if err := json.Unmarshal(ap.Payload, &p); err != nil {
+			t.Fatalf("decode %s payload: %v", concernResolutionVetoedCategory, err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// concernRowAfterRound re-reads one concern row from the store.
+func concernRowAfterRound(t *testing.T, cr *fakeConcernRepo, id uuid.UUID) *concern.Concern {
+	t.Helper()
+	rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	return rows[0]
+}
+
+// confirmingReviewer is a reviewer whose verdict resolves `id` as confirmed.
+func confirmingReviewer(model, id, note string, verdict planreview.Verdict) *fakePlanReviewer {
+	return &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:            verdict,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: id, Resolution: "confirmed", Note: note}},
+		},
+		model: model,
+	}
+}
+
+// TestImplementReviewRound_V1_PeerConfirmVetoedWhileRaiserRejects is the
+// observed run (9bba554d / concern 3b012c1f): the reviewer that RAISED the high
+// authz concern rejects the pass, and a DIFFERENT reviewer confirms it in the
+// same round. The confirm must be refused and the concern left open.
+func TestImplementReviewRound_V1_PeerConfirmVetoedWhileRaiserRejects(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the handler still trusts the caller-supplied subject", "routing reason: fix the authz check")
+
+	raiser := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.6-sol",
+	}
+	peer := confirmingReviewer("fable-5", row.ID.String(), "diff looks right to me", planreview.VerdictApprove)
+
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending (a peer confirm cannot retire a concern its raiser is still rejecting)", got.State)
+	}
+	if got.StateReason != "routing reason: fix the authz check" {
+		t.Errorf("state_reason = %q, want the routing reason intact", got.StateReason)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 {
+		t.Fatalf("%s entries = %d, want 1", concernResolutionVetoedCategory, len(vetoes))
+	}
+	v := vetoes[0]
+	if v.VetoReason != vetoRaiserRejectedSameRound {
+		t.Errorf("veto_reason = %q, want %q", v.VetoReason, vetoRaiserRejectedSameRound)
+	}
+	if v.ConfirmingReviewerModel != "fable-5" || v.RaisingReviewerModel != "gpt-5.6-sol" {
+		t.Errorf("models = {confirming %q, raising %q}, want {fable-5, gpt-5.6-sol}", v.ConfirmingReviewerModel, v.RaisingReviewerModel)
+	}
+	if v.ConcernID != row.ID.String() || v.Resolution != "confirmed" || v.ConcernSeverity != "high" {
+		t.Errorf("payload = %+v, want the concern's id/resolution/severity", v)
+	}
+}
+
+// TestImplementReviewRound_V2_ConfirmVetoedOnOperatorEvidence: a pass routed
+// with operator_evidence makes the operator — who executed a reproduction —
+// the authority a reviewer confirmation alone cannot override. No reviewer
+// rejects here, so V1 provably cannot be what fires.
+func TestImplementReviewRound_V2_ConfirmVetoedOnOperatorEvidence(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "path traversal reproduces", "routed with a repro")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids":       []string{row.ID.String()},
+		"operator_evidence": "curl -X GET '/v0/files?p=../../etc/passwd' returns 200 on the fix-up head",
+	})
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "the guard reads correct", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending (operator-executed evidence outranks a reviewer confirmation)", got.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoOperatorEvidenceRouted {
+		t.Fatalf("vetoes = %+v, want exactly one %s", vetoes, vetoOperatorEvidenceRouted)
+	}
+}
+
+// TestImplementReviewRound_V3_ConfirmVetoedOnNoChangePass: the fix-up pass that
+// routed the concern landed NOTHING, so nothing can have been fixed.
+func TestImplementReviewRound_V3_ConfirmVetoedOnNoChangePass(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	seedStageAuditEntry(t, au, runID, stageID, 11, "fixup_no_changes", map[string]any{})
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "resolved", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending (a no-change pass cannot have fixed anything)", got.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoFixupPassNoChanges {
+		t.Fatalf("vetoes = %+v, want exactly one %s", vetoes, vetoFixupPassNoChanges)
+	}
+}
+
+// TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies pins the boundary of
+// the no-change arm: the concern's newest routing trigger has NO following
+// fixup_pushed/fixup_no_changes entry at all. The arm fires on positive
+// evidence of a no-change pass, so an ABSENT outcome does not veto — a
+// deliberate reading, since the only way to reach it in a real round is a
+// best-effort outcome append that failed (a re-review runs after the pass
+// terminalizes), and vetoing there would refuse confirms for a pass that DID
+// push with no later entry to clear the veto. Deleting the `found &&` guard in
+// buildResolutionVetoContext reddens this on the state assertion.
+func TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	// No fixup_pushed / fixup_no_changes entry follows sequence 10.
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "the bound landed", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed (an absent outcome entry is not evidence of a no-change pass)", got.State)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+	}
+}
+
+// TestImplementReviewRound_V4_ConfirmVetoedWhenEvidenceLookupFails is the
+// FAIL-CLOSED arm: with the trigger read erroring, the veto pass cannot know
+// whether the concern carried operator evidence or rode a no-change pass, so
+// the confirm is refused rather than applied on unknown evidence.
+func TestImplementReviewRound_V4_ConfirmVetoedWhenEvidenceLookupFails(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+	s.cfg.AuditRepo = &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryStageFixupTriggered,
+		err:         errors.New("audit store unavailable"),
+	}
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "resolved", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending (an unreadable evidence lookup must fail closed)", got.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoEvidenceLookupFailed {
+		t.Fatalf("vetoes = %+v, want exactly one %s", vetoes, vetoEvidenceLookupFailed)
+	}
+}
+
+// TestImplementReviewRound_Control_LoneConfirmResolves is the criterion-4
+// regression guard: ONE reviewer confirming with no dissent, after a pass that
+// PUSHED, resolves exactly as before this change.
+func TestImplementReviewRound_Control_LoneConfirmResolves(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "missing nil check", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	seedStageAuditEntry(t, au, runID, stageID, 11, "fixup_pushed", map[string]any{"head_sha": "abc123"})
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "the nil check landed", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed (an undisputed confirm must still resolve)", got.State)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+	}
+}
+
+// TestImplementReviewRound_Control_RaiserConfirmsOwnConcernResolves: the
+// raising reviewer IS the authority the veto exists to respect, so its own
+// confirm resolves even while it rejects the pass overall.
+func TestImplementReviewRound_Control_RaiserConfirmsOwnConcernResolves(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "missing nil check", "routed")
+
+	raiser := confirmingReviewer("gpt-5.6-sol", row.ID.String(), "this one is fixed; I reject on a NEW finding", planreview.VerdictReject)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: raiser}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed (a reviewer may always confirm its OWN concern)", got.State)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+	}
+}
+
+// TestImplementReviewRound_ReopenedAndSupersededNeverVetoed: the veto sits in
+// front of the confirm edge ONLY. A rejecting peer's reopened/superseded
+// resolutions still apply.
+func TestImplementReviewRound_ReopenedAndSupersededNeverVetoed(t *testing.T) {
+	for _, tc := range []struct {
+		resolution string
+		want       concern.State
+	}{
+		{"reopened", concern.StateReopened},
+		{"superseded", concern.StateSuperseded},
+	} {
+		t.Run(tc.resolution, func(t *testing.T) {
+			s, au, cr, runID, stageID := vetoRoundServer()
+			row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still broken", "routed")
+			// Operator evidence AND a same-round raiser rejection: every veto
+			// input is present, so a resolution that still applies proves the
+			// veto is confirm-only.
+			seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+				"concern_ids":       []string{row.ID.String()},
+				"operator_evidence": "reproduced",
+			})
+			raiser := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}, model: "gpt-5.6-sol"}
+			peer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{
+					Verdict:            planreview.VerdictApprove,
+					ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: tc.resolution, Note: "n"}},
+				},
+				model: "fable-5",
+			}
+			s.runImplementReviewInvocations(context.Background(), runID, stageID,
+				[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+			if got := concernRowAfterRound(t, cr, row.ID); got.State != tc.want {
+				t.Errorf("state = %q, want %q (%s is never vetoed)", got.State, tc.want, tc.resolution)
+			}
+			if v := vetoEntries(t, au); len(v) != 0 {
+				t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+			}
+		})
+	}
+}
+
+// TestImplementReviewRound_ReopenWinsUnderBuffering pins that moving the
+// resolution application from inside the invocation loop to a single post-loop
+// pass is behaviour-preserving for the REOPEN-WINS ordering: BOTH orders end
+// reopened, the confirm-after-reopen surfacing as the warn-logged
+// InvalidTransitionError exactly as before.
+func TestImplementReviewRound_ReopenWinsUnderBuffering(t *testing.T) {
+	for _, tc := range []struct{ name, first, second string }{
+		{"confirm_then_reopen", "confirmed", "reopened"},
+		{"reopen_then_confirm", "reopened", "confirmed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, cr, runID, stageID := vetoRoundServer()
+			// Both reviewers use the SAME model as the raiser so V1 cannot fire
+			// and the ordering — not the veto — is what the assertion reads.
+			row := seedRoutedConcern(t, cr, runID, stageID, "claude-opus-4-8", "ordering", "routed")
+			mk := func(resolution string) *fakePlanReviewer {
+				return &fakePlanReviewer{
+					verdict: &planreview.ReviewVerdict{
+						Verdict:            planreview.VerdictApprove,
+						ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: resolution, Note: resolution}},
+					},
+					model: "claude-opus-4-8",
+				}
+			}
+			s.runImplementReviewInvocations(context.Background(), runID, stageID,
+				[]reviewerInvocation{{reviewer: mk(tc.first)}, {reviewer: mk(tc.second)}},
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+			if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateReopened {
+				t.Errorf("state = %q, want reopened (REOPEN WINS in either order)", got.State)
+			}
+		})
+	}
+}
+
+// TestImplementReviewRound_OperatorEvidenceEndToEnd drives a REAL fix-up HTTP
+// request carrying operator_evidence, through audit persistence, and out the
+// other side into the veto decision (operator binding condition 2): a
+// json-tag or field-name mismatch anywhere on that path leaves the concern
+// resolvable and reddens this test.
+func TestImplementReviewRound_OperatorEvidenceEndToEnd(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "the traversal still reproduces")
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:       []string{row.ID.String()},
+		Reason:           "fix the traversal",
+		OperatorEvidence: "I ran the repro against the fix-up head: still 200",
+	}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// A DIFFERENT reviewer than the raiser ("claude-opus-4-8"), approving, so
+	// only the operator-evidence arm can fire.
+	peer := confirmingReviewer("fable-5", row.ID.String(), "reads fixed to me", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), stage.RunID, stage.ID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending (the real fix-up's operator_evidence must reach the veto)", got.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoOperatorEvidenceRouted {
+		t.Fatalf("vetoes = %+v, want exactly one %s", vetoes, vetoOperatorEvidenceRouted)
+	}
+}
 
 // findBackfillAudits returns every concern_note_backfilled entry appended to au.
 func findBackfillAudits(au *auditFake) []audit.ChainAppendParams {
@@ -3899,6 +4304,8 @@ func findBackfillAudits(au *auditFake) []audit.ChainAppendParams {
 }
 
 // decodeBackfillPayload decodes one concern_note_backfilled payload.
+
+// decodeBackfillPayload decodes one concern_note_backfilled payload.
 func decodeBackfillPayload(t *testing.T, ap audit.ChainAppendParams) concernNoteBackfilledPayload {
 	t.Helper()
 	var p concernNoteBackfilledPayload
@@ -3907,6 +4314,10 @@ func decodeBackfillPayload(t *testing.T, ap audit.ChainAppendParams) concernNote
 	}
 	return p
 }
+
+// TestPersistReviewConcerns_BlankNoteBackfilledFromFreeForm: a blank note with
+// substantive free_form is persisted carrying the recovery marker AND the
+// free_form substance, so the gate view shows something actionable.
 
 // TestPersistReviewConcerns_BlankNoteBackfilledFromFreeForm: a blank note with
 // substantive free_form is persisted carrying the recovery marker AND the
@@ -3950,6 +4361,10 @@ func TestPersistReviewConcerns_BlankNoteBackfilledFromFreeForm(t *testing.T) {
 // TestPersistReviewConcerns_BlankNoteNoFreeFormPointer: with no free_form to
 // recover from, the persisted note is the audit-entry pointer naming the origin
 // sequence, stage kind, and reviewer model.
+
+// TestPersistReviewConcerns_BlankNoteNoFreeFormPointer: with no free_form to
+// recover from, the persisted note is the audit-entry pointer naming the origin
+// sequence, stage kind, and reviewer model.
 func TestPersistReviewConcerns_BlankNoteNoFreeFormPointer(t *testing.T) {
 	s, cr, _ := guardServer(t)
 	runID, stageID := uuid.New(), uuid.New()
@@ -3977,6 +4392,9 @@ func TestPersistReviewConcerns_BlankNoteNoFreeFormPointer(t *testing.T) {
 
 // TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank: a note of only
 // whitespace passes a naive `note != ""` check but is equally unactionable.
+
+// TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank: a note of only
+// whitespace passes a naive `note != ""` check but is equally unactionable.
 func TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank(t *testing.T) {
 	s, cr, au := guardServer(t)
 	runID, stageID := uuid.New(), uuid.New()
@@ -3995,6 +4413,11 @@ func TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank(t *testing.T) {
 		t.Errorf("concern_note_backfilled entries = %d, want 1", n)
 	}
 }
+
+// TestPersistReviewConcerns_NonBlankNoteUnchanged is the counterfactual the
+// issue demands: a well-formed concern is persisted BYTE-IDENTICAL and emits NO
+// backfill audit entry. A backfill that rewrote every note would pass the
+// blank-note tests above and fail here.
 
 // TestPersistReviewConcerns_NonBlankNoteUnchanged is the counterfactual the
 // issue demands: a well-formed concern is persisted BYTE-IDENTICAL and emits NO
@@ -4019,6 +4442,14 @@ func TestPersistReviewConcerns_NonBlankNoteUnchanged(t *testing.T) {
 		t.Errorf("concern_note_backfilled entries = %d for an authored note, want 0", n)
 	}
 }
+
+// TestPersistReviewConcerns_LongFreeFormTruncated: the recovered prose is
+// bounded (the note is rendered whole by the gate view and quoted into filed
+// follow-ups) and the cut is marked. The BOUND is the load-bearing assertion —
+// a marker and a truncated=true flag on an implementation that still copied the
+// whole free_form would leave the swamped-surface defect intact — so the
+// recovered body is measured against concernNoteFreeFormMaxBytes and against
+// the oversized input, not merely inspected for the marker.
 
 // TestPersistReviewConcerns_LongFreeFormTruncated: the recovered prose is
 // bounded (the note is rendered whole by the gate view and quoted into filed
@@ -4090,6 +4521,10 @@ func TestPersistReviewConcerns_LongFreeFormTruncated(t *testing.T) {
 // TestPersistReviewConcerns_BackfillAuditEntryEmitted: exactly one advisory
 // entry per backfilled concern, carrying the right source marker — and none for
 // the authored concern in the same batch.
+
+// TestPersistReviewConcerns_BackfillAuditEntryEmitted: exactly one advisory
+// entry per backfilled concern, carrying the right source marker — and none for
+// the authored concern in the same batch.
 func TestPersistReviewConcerns_BackfillAuditEntryEmitted(t *testing.T) {
 	s, _, au := guardServer(t)
 	runID, stageID := uuid.New(), uuid.New()
@@ -4137,6 +4572,13 @@ func TestPersistReviewConcerns_BackfillAuditEntryEmitted(t *testing.T) {
 // bookkeeping failed would re-persist the blank row this control exists to
 // prevent. The synthesized note on the row IS the durable record; the audit
 // entry only adds traceability.
+
+// TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills pins the
+// INVERSE fail direction against suppressRelitigation: an audit-append failure
+// warn-logs and the backfill STILL applies. Refusing to backfill because
+// bookkeeping failed would re-persist the blank row this control exists to
+// prevent. The synthesized note on the row IS the durable record; the audit
+// entry only adds traceability.
 func TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills(t *testing.T) {
 	s, cr, au := guardServer(t)
 	au.appendErrCategory = concernNoteBackfilledCategory
@@ -4160,6 +4602,19 @@ func TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills(t *testi
 		t.Fatalf("concern_note_backfilled entries = %d, want 0 (the append was injected to fail)", n)
 	}
 }
+
+// TestPersistReviewConcerns_InsertFailureEmitsNoBackfillEntry is the
+// partial-failure ordering control: the advisory concern_note_backfilled entry
+// is appended only AFTER InsertRaised persists the batch, so a store failure
+// leaves NO audit entry describing a substitution onto a row that was never
+// minted. Appending inside the per-concern loop (the pre-fix-up ordering) makes
+// the audit chain disagree with derived state — the same slip
+// TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed guards on the
+// suppression path, here on the insert-failure path.
+//
+// The blank note is seeded BY CONSTRUCTION (a literal ""), and the insert is
+// failed by injection, so the RED lands on the audit-entry assertion rather
+// than on fixture setup.
 
 // TestPersistReviewConcerns_InsertFailureEmitsNoBackfillEntry is the
 // partial-failure ordering control: the advisory concern_note_backfilled entry
@@ -4201,6 +4656,9 @@ func TestPersistReviewConcerns_InsertFailureEmitsNoBackfillEntry(t *testing.T) {
 
 // TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills: the other
 // append-unavailable branch — no AuditRepo wired at all.
+
+// TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills: the other
+// append-unavailable branch — no AuditRepo wired at all.
 func TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills(t *testing.T) {
 	cr := newFakeConcernRepo()
 	s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: cr})
@@ -4215,6 +4673,12 @@ func TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills(t *testing.T) 
 		t.Error("persisted note is blank with no AuditRepo wired — the backfill must not depend on the audit append")
 	}
 }
+
+// TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed: the #1913
+// re-litigation guard runs FIRST and still wins — a suppressed blank-note
+// re-raise mints no row and emits no backfill entry (an ordering slip that
+// backfilled before suppressing would emit a stray advisory entry for a concern
+// that was never persisted).
 
 // TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed: the #1913
 // re-litigation guard runs FIRST and still wins — a suppressed blank-note
@@ -4242,6 +4706,8 @@ func TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed(t *testing.T) 
 }
 
 // countRaised counts all rows in state raised.
+
+// countRaised counts all rows in state raised.
 func countRaised(cr *fakeConcernRepo) int {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
@@ -4253,6 +4719,13 @@ func countRaised(cr *fakeConcernRepo) int {
 	}
 	return n
 }
+
+// TestPriorConcernsForReview_BlankNoteThreadsPointer is the re-review criterion
+// (#2555, binding approval condition 1): a LEGACY blank-note row — one minted
+// before the write-side backfill landed, seeded here by construction — must
+// reach the next review round's prompt carrying substance, not an empty field.
+// This is the wall the issue reports: a later review could not delta-verify two
+// concerns because their notes were empty.
 
 // TestPriorConcernsForReview_BlankNoteThreadsPointer is the re-review criterion
 // (#2555, binding approval condition 1): a LEGACY blank-note row — one minted

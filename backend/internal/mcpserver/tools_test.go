@@ -7763,6 +7763,211 @@ func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	}
 }
 
+// rejectResultText concatenates every TextContent item on a tool result so a
+// test can assert warnings that ride the result content regardless of ordering.
+func rejectResultText(t *testing.T, res *mcp.CallToolResult) string {
+	t.Helper()
+	if res == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			b.WriteString(tc.Text)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// TestRejectPlan_OverBudgetReason_WarnsOnResult pins the #2680 advisory warning:
+// an over-cap rejection reason yields a tool-result warning naming the reason's
+// byte count and the budget, AND the reject is STILL submitted (the advisory
+// channel must never become a refusal — unlike the approve-only over-cap 400).
+// Deleting the warning composition in rejectPlan reddens this.
+func TestRejectPlan_OverBudgetReason_WarnsOnResult(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs") // clean login isolates the truncation warning
+
+	reason := strings.Repeat("x", prompt.MaxRejectionFeedbackBytes+321)
+	res, out, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: reason,
+	})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	// The reject STILL submitted (advisory channel never refuses).
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject (over-cap reject must still submit)", fb.approvalsBody.Decision)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("StageID = %q, want %s", out.StageID, stageID.String())
+	}
+	text := rejectResultText(t, res)
+	for _, w := range []string{
+		strconv.Itoa(len(reason)),                      // reason byte count
+		strconv.Itoa(prompt.MaxRejectionFeedbackBytes), // the budget
+		"truncation marker",                            // not a silent cut
+		"still submitted",                              // the reject landed
+	} {
+		if !strings.Contains(text, w) {
+			t.Errorf("over-budget warning missing %q; got:\n%s", w, text)
+		}
+	}
+}
+
+// TestRejectPlan_UnderBudgetReason_NoWarning is the counterfactual for the
+// threshold comparison (#2680): a reason exactly AT the cap warrants NO
+// truncation warning (the > not >= boundary). Deleting the threshold comparison
+// (warning unconditionally) reddens this.
+func TestRejectPlan_UnderBudgetReason_NoWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	res, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: strings.Repeat("x", prompt.MaxRejectionFeedbackBytes), // exactly at cap
+	})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if txt := rejectResultText(t, res); strings.Contains(txt, "prior-rejection-feedback budget") {
+		t.Errorf("at-cap reason must NOT warn; got:\n%s", txt)
+	}
+	// And it still submitted.
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+}
+
+// TestRejectPlan_WarningThreshold_IsRejectionFeedbackCap is the drift pin
+// (#2680): the warning boundary is keyed to prompt.MaxRejectionFeedbackBytes,
+// not a re-typed literal — exactly-at-cap does not warn, one byte over does.
+func TestRejectPlan_WarningThreshold_IsRejectionFeedbackCap(t *testing.T) {
+	cases := []struct {
+		name     string
+		size     int
+		wantWarn bool
+	}{
+		{"at-cap", prompt.MaxRejectionFeedbackBytes, false},
+		{"one-over", prompt.MaxRejectionFeedbackBytes + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			runID := uuid.New()
+			seedPlanStage(fb, runID)
+			withFakeGh(t, "kuhlman-labs")
+
+			res, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+				RunID:  runID.String(),
+				Reason: strings.Repeat("x", tc.size),
+			})
+			if err != nil {
+				t.Fatalf("rejectPlan: %v", err)
+			}
+			warned := strings.Contains(rejectResultText(t, res), "prior-rejection-feedback budget")
+			if warned != tc.wantWarn {
+				t.Errorf("size %d (cap %d): warned=%v, want %v", tc.size, prompt.MaxRejectionFeedbackBytes, warned, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// TestRejectPlan_OverBudgetAndLoginWarnings_Coexist pins that the truncation
+// warning and the approver-login warning both ride ONE result rather than one
+// clobbering the other (#2680): an over-cap reason with an absent gh binary must
+// surface BOTH, and the reject still submits.
+func TestRejectPlan_OverBudgetAndLoginWarnings_Coexist(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGhMissing(t) // login warning fires
+
+	reason := strings.Repeat("x", prompt.MaxRejectionFeedbackBytes+10)
+	res, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: reason,
+	})
+	if err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	text := rejectResultText(t, res)
+	if !strings.Contains(text, "gh CLI not on PATH") {
+		t.Errorf("login warning clobbered by the truncation warning; got:\n%s", text)
+	}
+	if !strings.Contains(text, "prior-rejection-feedback budget") {
+		t.Errorf("truncation warning clobbered by the login warning; got:\n%s", text)
+	}
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+}
+
+// TestRejectPlanReasonDescription_NamesBudget mirrors the approve-side drift pin
+// (#2680): the reject tool's reason description must name the concrete
+// 12000-byte budget so a calling agent knows it before writing a long reason.
+func TestRejectPlanReasonDescription_NamesBudget(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var schema any
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_reject_plan" {
+			schema = tool.InputSchema
+			break
+		}
+	}
+	if schema == nil {
+		t.Fatal("fishhawk_reject_plan not registered/visible over ListTools")
+	}
+	schemaMap, ok := schema.(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_reject_plan InputSchema is %T, want a JSON object map", schema)
+	}
+	props, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_reject_plan schema has no properties object; got %v", schemaMap["properties"])
+	}
+	reasonProp, ok := props["reason"].(map[string]any)
+	if !ok {
+		t.Fatal("fishhawk_reject_plan schema has no 'reason' property")
+	}
+	desc, _ := reasonProp["description"].(string)
+	if want := strconv.Itoa(prompt.MaxRejectionFeedbackBytes); !strings.Contains(desc, want) {
+		t.Errorf("reject_plan 'reason' description must name the concrete budget %q; got:\n%s", want, desc)
+	}
+}
+
 func TestApprovePlan_DuplicateSubmission_LabeledOutputAndLeadText(t *testing.T) {
 	// #986: a duplicate-labeled 200 must reach the tool output as
 	// duplicate_submission/prior_decision AND lead the result text with

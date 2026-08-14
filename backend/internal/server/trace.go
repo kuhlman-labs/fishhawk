@@ -3855,6 +3855,12 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// implement review resolves the operator's claimed plan-stage concerns, so the
 	// hook fires at most once per loop even with heterogeneous reviewers.
 	conditionClaimsResolved := false
+	// round buffers this loop's reviewer verdicts so the delta-verification
+	// resolutions are applied ONCE after every reviewer has spoken (E48.103 /
+	// #2551). Applying them inline gave each reviewer no knowledge of what its
+	// peers said in the SAME round, so a diff-only peer's `confirmed` retired a
+	// concern whose RAISING reviewer was still returning `reject`.
+	var round []roundReviewVerdict
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
@@ -3958,9 +3964,18 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// chain stays the sole sequence authority, so a failed append
 			// (no sequence) skips persistence for this verdict.
 			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
-			// Apply the delta-verification resolutions to the concern
-			// store (#984) — same append-gated, best-effort posture.
-			s.applyConcernResolutions(ctx, runID, stageID, verdict.ConcernResolutions)
+			// Buffer the delta-verification resolutions (#984) instead of
+			// applying them here (E48.103 / #2551): they are applied once
+			// after the loop, through the veto pass that can see what the
+			// OTHER reviewers in this same round said. The append-gated
+			// posture is unchanged — a failed append (no sequence) buffers
+			// nothing, exactly as it previously applied nothing.
+			round = append(round, roundReviewVerdict{
+				model:          model,
+				verdict:        verdict.Verdict,
+				resolutions:    verdict.ConcernResolutions,
+				reviewSequence: entry.Sequence,
+			})
 			// Condition-claim resolution (E48.9 / #1956): ONE confirming
 			// (non-reject) implement review resolves the operator's claimed
 			// plan-stage concerns to addressed_by_condition — the operator's
@@ -3999,6 +4014,13 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			pagedRejectAppended = true
 		}
 	}
+
+	// Apply the round's buffered delta-verification resolutions ONCE, through
+	// the veto pass (E48.103 / #2551). Placed after the invocation loop and
+	// BEFORE recomputeAndPublishAuditComplete so the republished check still
+	// reflects post-resolution concern state, exactly as it did when the
+	// resolutions were applied inline.
+	s.applyRoundConcernResolutions(ctx, runID, stageID, round)
 
 	// The implement review has now written its terminal entries
 	// (implement_reviewed / implement_review_failed). Re-derive and
@@ -4523,6 +4545,266 @@ func (s *Server) resolveSecondNewestReportedHeadSHA(ctx context.Context, runID, 
 	return ""
 }
 
+// concernResolutionVetoedCategory is the audit-log category for a `confirmed`
+// delta-verification resolution REFUSED by the round-level veto pass (E48.103 /
+// #2551). Like concern_relitigation_suppressed it is an internal advisory audit
+// kind — it posts no issue comment and adds no Notifier method, so it is NOT an
+// issue-comment surface. It is ENRICHMENT, not the authority: the gate view
+// derives `disputed` from the durable concern row plus the authoritative
+// implement_reviewed payload, so a failed append here degrades the dispute's
+// DETAIL, never its visibility.
+const concernResolutionVetoedCategory = "concern_resolution_vetoed"
+
+// The four deterministic veto reasons, evaluated in this fixed order against a
+// `confirmed` resolution only (E48.103 / #2551).
+const (
+	// vetoRaiserRejectedSameRound: a DIFFERENT reviewer confirmed a concern
+	// whose RAISING reviewer returned `reject` in this same round. The raiser
+	// is the authority on its own finding; a peer cannot retire it over that
+	// dissent (the observed run 9bba554d / concern 3b012c1f).
+	vetoRaiserRejectedSameRound = "raiser_rejected_same_round"
+	// vetoOperatorEvidenceRouted: the concern was routed back by a fix-up pass
+	// carrying operator_evidence — the operator executed a reproduction, which
+	// a reviewer reading a diff cannot override.
+	vetoOperatorEvidenceRouted = "operator_evidence_routed"
+	// vetoFixupPassNoChanges: the fix-up pass that routed the concern recorded
+	// fixup_no_changes. Nothing landed, so nothing can have been fixed.
+	vetoFixupPassNoChanges = "fixup_pass_no_changes"
+	// vetoEvidenceLookupFailed: the audit reads backing the two evidence arms
+	// failed, so the confirm would be applied on UNKNOWN evidence. Fail closed:
+	// a wrongly-vetoed concern stays open and costs one operator waive, while a
+	// wrongly-applied confirm is the silent false-GREEN this issue reports.
+	vetoEvidenceLookupFailed = "evidence_lookup_failed"
+)
+
+// roundReviewVerdict is one buffered reviewer verdict from a single implement-
+// review round (E48.103 / #2551), captured under the SAME append-gated posture
+// the inline application had: it is buffered only when the implement_reviewed
+// append returned a sequence.
+type roundReviewVerdict struct {
+	model          string
+	verdict        planreview.Verdict
+	resolutions    []planreview.ConcernResolution
+	reviewSequence int64
+}
+
+// resolutionVetoContext is the round-level evidence a `confirmed` resolution is
+// checked against. Built ONCE per round, before any resolution is applied.
+type resolutionVetoContext struct {
+	// rejectedBy is the set of reviewer models that returned `reject` in this
+	// round, keyed by the same model string persistReviewConcerns stamps on a
+	// concern row's ReviewerModel.
+	rejectedBy map[string]bool
+	// operatorEvidenced is the set of concern ids (string form) routed by ANY
+	// same-stage stage_fixup_triggered entry carrying operator_evidence.
+	operatorEvidenced map[string]bool
+	// noChangePass is the set of concern ids whose NEWEST same-stage routing
+	// trigger was followed by fixup_no_changes with no intervening fixup_pushed.
+	noChangePass map[string]bool
+	// lookupFailed records that the audit reads behind operatorEvidenced /
+	// noChangePass could not be completed, so every `confirmed` in this round
+	// is vetoed rather than applied on unknown evidence.
+	lookupFailed bool
+}
+
+// concernResolutionVetoedPayload is the audit payload for one vetoed
+// resolution. Decoded back by the gate view to enrich the dispute it derives
+// from the durable rows.
+type concernResolutionVetoedPayload struct {
+	ConcernID               string `json:"concern_id"`
+	Resolution              string `json:"resolution"`
+	VetoReason              string `json:"veto_reason"`
+	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
+	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
+	ConcernSeverity         string `json:"concern_severity,omitempty"`
+	ConcernCategory         string `json:"concern_category,omitempty"`
+	Note                    string `json:"note,omitempty"`
+	ReviewSequence          int64  `json:"review_sequence"`
+	OriginReviewSequence    int64  `json:"origin_review_sequence"`
+}
+
+// applyRoundConcernResolutions applies ONE implement-review round's buffered
+// delta-verification resolutions (E48.103 / #2551), after every reviewer in the
+// round has spoken. It builds the round's veto context once, then replays the
+// buffered verdicts IN LOOP ORDER through applyConcernResolutions — so the
+// REOPEN-WINS ordering semantics the state machine encodes are unchanged and
+// the only behavioural difference from the previous inline application is that
+// a `confirmed` can now be refused by the veto.
+func (s *Server) applyRoundConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict) {
+	if s.cfg.ConcernRepo == nil || len(round) == 0 {
+		return
+	}
+	vc := s.buildResolutionVetoContext(ctx, runID, stageID, round)
+	for _, rv := range round {
+		s.applyConcernResolutions(ctx, runID, stageID, rv, vc)
+	}
+}
+
+// buildResolutionVetoContext assembles the round's veto evidence: the set of
+// models that rejected (in-memory, from the buffered verdicts) plus the two
+// audit-derived concern sets. The audit reads FAIL CLOSED — a nil repo, a list
+// error, or a malformed payload sets lookupFailed, which vetoes every
+// `confirmed` in the round rather than applying it on unknown evidence.
+func (s *Server) buildResolutionVetoContext(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict) resolutionVetoContext {
+	vc := resolutionVetoContext{
+		rejectedBy:        make(map[string]bool, len(round)),
+		operatorEvidenced: map[string]bool{},
+		noChangePass:      map[string]bool{},
+	}
+	for _, rv := range round {
+		if rv.model != "" && rv.verdict == planreview.VerdictReject {
+			vc.rejectedBy[rv.model] = true
+		}
+	}
+	if s.cfg.AuditRepo == nil {
+		vc.lookupFailed = true
+		return vc
+	}
+	failClosed := func(category string, err error) resolutionVetoContext {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern resolutions: veto evidence lookup failed — confirms will be vetoed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("category", category),
+			slog.String("error", err.Error()),
+		)
+		vc.lookupFailed = true
+		return vc
+	}
+
+	triggers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		return failClosed(CategoryStageFixupTriggered, err)
+	}
+	// newestTrigger holds each concern's LATEST same-stage routing sequence —
+	// the pass whose outcome decides the no-change arm.
+	newestTrigger := map[string]int64{}
+	for _, e := range triggers {
+		if !sameStage(e.StageID, &stageID) {
+			continue
+		}
+		var p struct {
+			ConcernIDs       []string `json:"concern_ids"`
+			OperatorEvidence string   `json:"operator_evidence"`
+		}
+		if uerr := json.Unmarshal(e.Payload, &p); uerr != nil {
+			return failClosed(CategoryStageFixupTriggered, uerr)
+		}
+		for _, cid := range p.ConcernIDs {
+			if strings.TrimSpace(p.OperatorEvidence) != "" {
+				vc.operatorEvidenced[cid] = true
+			}
+			if seq, ok := newestTrigger[cid]; !ok || e.Sequence > seq {
+				newestTrigger[cid] = e.Sequence
+			}
+		}
+	}
+
+	// Outcome entries for this stage, so each concern's newest routing pass can
+	// be resolved to the EARLIEST following outcome (pushed beats no_changes
+	// only by being earlier — an intervening push means something landed).
+	type outcome struct {
+		sequence int64
+		pushed   bool
+	}
+	var outcomes []outcome
+	for _, cat := range []string{"fixup_pushed", "fixup_no_changes"} {
+		entries, oerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if oerr != nil {
+			return failClosed(cat, oerr)
+		}
+		for _, e := range entries {
+			if !sameStage(e.StageID, &stageID) {
+				continue
+			}
+			outcomes = append(outcomes, outcome{sequence: e.Sequence, pushed: cat == "fixup_pushed"})
+		}
+	}
+	// found==false — the newest routing trigger has NO following outcome entry —
+	// leaves the concern un-vetoed by THIS arm. The assumption that makes that
+	// safe is ordering: a re-review round only runs after the fix-up pass
+	// terminalizes, so by the time this derivation reads the audit the pass's
+	// fixup_pushed / fixup_no_changes has landed. The one way to observe
+	// found==false in a real round is a best-effort outcome append that failed,
+	// which is an audit-durability defect, not a fix-up that landed nothing —
+	// and vetoing on it would refuse confirms for a pass that DID push, with no
+	// later entry to clear the veto and only an operator waive to close the
+	// concern. So the un-vetoed reading is deliberate; the arm fires on positive
+	// evidence of a no-change pass, never on the absence of evidence.
+	// Pinned by TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies.
+	for cid, seq := range newestTrigger {
+		var best outcome
+		found := false
+		for _, o := range outcomes {
+			if o.sequence <= seq {
+				continue
+			}
+			if !found || o.sequence < best.sequence {
+				best = o
+				found = true
+			}
+		}
+		if found && !best.pushed {
+			vc.noChangePass[cid] = true
+		}
+	}
+	return vc
+}
+
+// vetoReason returns the veto that refuses a `confirmed` resolution on this
+// concern row, or "" when the confirm may be applied. The arms are evaluated in
+// a fixed order so a concern matching several reports the most specific one.
+//
+// V1 never fires when the CONFIRMING reviewer is the one that RAISED the
+// concern: that reviewer IS the authority the veto exists to respect, so it may
+// confirm its own finding even while rejecting the pass overall.
+func (vc resolutionVetoContext) vetoReason(row *concern.Concern, confirmingModel string) string {
+	raiser := derefStr(row.ReviewerModel)
+	if raiser != "" && raiser != confirmingModel && vc.rejectedBy[raiser] {
+		return vetoRaiserRejectedSameRound
+	}
+	id := row.ID.String()
+	if vc.operatorEvidenced[id] {
+		return vetoOperatorEvidenceRouted
+	}
+	if vc.noChangePass[id] {
+		return vetoFixupPassNoChanges
+	}
+	if vc.lookupFailed {
+		return vetoEvidenceLookupFailed
+	}
+	return ""
+}
+
+// appendConcernResolutionVetoed records one refused resolution. BEST-EFFORT by
+// design: the veto stands whether or not the append lands, and the gate view
+// derives the dispute from the durable concern row rather than from this entry,
+// so a failed append costs the operator the veto's DETAIL, never the dispute
+// itself (the alternative — refusing the veto because bookkeeping failed —
+// would retire a disputed concern, which is strictly worse).
+func (s *Server) appendConcernResolutionVetoed(ctx context.Context, runID, stageID uuid.UUID, p concernResolutionVetoedPayload) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(p)
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  concernResolutionVetoedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern resolutions: veto audit append failed — the veto still stands",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("concern_id", p.ConcernID),
+			slog.String("veto_reason", p.VetoReason),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
 // applyConcernResolutions applies one reviewer's delta-verification
 // resolutions (#984) to the durable concern store: confirmed →
 // addressed, reopened → reopened, superseded → superseded, via
@@ -4537,7 +4819,14 @@ func (s *Server) resolveSecondNewestReportedHeadSHA(ctx context.Context, runID, 
 // pass here: the state machine encodes it order-independently
 // (addressed → reopened is a valid edge; reopened → addressed is
 // absent and surfaces as the warn-logged InvalidTransitionError).
-func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, resolutions []planreview.ConcernResolution) {
+//
+// A `confirmed` resolution is additionally checked against the ROUND's veto
+// context (E48.103 / #2551) before it is applied: a confirm the evidence
+// contradicts leaves the concern in its current OPEN state with its
+// state_reason intact and records a concern_resolution_vetoed entry instead.
+// `reopened` and `superseded` are never vetoed.
+func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, rv roundReviewVerdict, vc resolutionVetoContext) {
+	resolutions := rv.resolutions
 	if s.cfg.ConcernRepo == nil || len(resolutions) == 0 {
 		return
 	}
@@ -4579,6 +4868,27 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 			// or a plan-stage concern through this path.
 			warn(res, "concern belongs to a different run/stage or is not an implement-stage concern")
 			continue
+		}
+		// Round-level veto (E48.103 / #2551), for `confirmed` ONLY: a confirm
+		// the round's evidence contradicts is REFUSED — the concern keeps its
+		// current open state and state_reason, and the refusal is recorded.
+		if to == concern.StateAddressed {
+			if reason := vc.vetoReason(row, rv.model); reason != "" {
+				warn(res, "confirmed resolution vetoed: "+reason)
+				s.appendConcernResolutionVetoed(ctx, runID, stageID, concernResolutionVetoedPayload{
+					ConcernID:               cid.String(),
+					Resolution:              res.Resolution,
+					VetoReason:              reason,
+					ConfirmingReviewerModel: rv.model,
+					RaisingReviewerModel:    derefStr(row.ReviewerModel),
+					ConcernSeverity:         row.Severity,
+					ConcernCategory:         row.Category,
+					Note:                    res.Note,
+					ReviewSequence:          rv.reviewSequence,
+					OriginReviewSequence:    row.OriginReviewSequence,
+				})
+				continue
+			}
 		}
 		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, res.Note); aerr != nil {
 			// InvalidTransitionError lands here — including the

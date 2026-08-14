@@ -1201,7 +1201,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// signed prompt and the render preview stay byte-identical.
 		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
 		if runRow.TriggerRef != nil {
-			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
+			// #2680: thread BOTH the feedback text and the rejecting run's id
+			// so buildPlan's truncation marker can name a concrete retrieval
+			// pointer. Set on BOTH prompt handlers so the signed prompt and the
+			// render preview stay byte-identical.
+			feedback, priorRunID := s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
+			trigger.PriorRejectionFeedback = feedback
+			if priorRunID != uuid.Nil {
+				trigger.PriorRejectionFeedbackRunID = priorRunID.String()
+			}
 		}
 		trigger.PriorSchemaValidationError = s.loadPriorSchemaValidationError(r.Context(), runRow.ID)
 		// Clarification answers (#1088): on resume after an awaiting_input
@@ -1714,7 +1722,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// signed prompt and the render preview stay byte-identical.
 		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
 		if runRow.TriggerRef != nil {
-			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
+			// #2680: thread BOTH the feedback text and the rejecting run's id
+			// so buildPlan's truncation marker can name a concrete retrieval
+			// pointer. Set on BOTH prompt handlers so the signed prompt and the
+			// render preview stay byte-identical.
+			feedback, priorRunID := s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
+			trigger.PriorRejectionFeedback = feedback
+			if priorRunID != uuid.Nil {
+				trigger.PriorRejectionFeedbackRunID = priorRunID.String()
+			}
 		}
 		trigger.PriorSchemaValidationError = s.loadPriorSchemaValidationError(r.Context(), runRow.ID)
 		// Clarification answers (#1088): on resume after an awaiting_input
@@ -2680,14 +2696,16 @@ func (s *Server) resolveAgentSelfRetryForStage(ctx context.Context, runRow *run.
 // loadPriorRejectionFeedback searches the most-recent prior runs for
 // the same trigger_ref and returns the rejection_comment from the newest
 // approval_submitted audit entry where decision=reject and
-// rejection_comment is non-empty. Returns nil when there is no matching
-// prior rejection, when RunRepo or AuditRepo is unconfigured, or on any
-// error (best-effort, same posture as CalibrationHint). At most 3 prior
-// runs are inspected to bound audit fan-out; at most 10 runs are fetched
-// from the repo in total (Limit=10).
-func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRef string, currentRunID uuid.UUID) *string {
+// rejection_comment is non-empty, ALONG WITH the id of the run that
+// supplied it (#2680) — the render layer uses that id to build the
+// truncation marker's retrieval pointer. Returns (nil, uuid.Nil) when there
+// is no matching prior rejection, when RunRepo or AuditRepo is unconfigured,
+// or on any error (best-effort, same posture as CalibrationHint). At most 3
+// prior runs are inspected to bound audit fan-out; at most 10 runs are
+// fetched from the repo in total (Limit=10).
+func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRef string, currentRunID uuid.UUID) (*string, uuid.UUID) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
-		return nil
+		return nil, uuid.Nil
 	}
 	ref := triggerRef
 	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
@@ -2700,7 +2718,7 @@ func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRe
 			slog.String("trigger_ref", triggerRef),
 			slog.String("error", err.Error()),
 		)
-		return nil
+		return nil, uuid.Nil
 	}
 
 	checked := 0
@@ -2737,12 +2755,17 @@ func (s *Server) loadPriorRejectionFeedback(ctx context.Context, repo, triggerRe
 					"prompt: loaded prior rejection feedback into plan prompt",
 					slog.String("prior_run_id", r.ID.String()),
 					slog.Int("comment_bytes", len(c)),
+					// #2680: greppable server-side signal that the reason will be
+					// delivered with an elision marker rather than whole, so a
+					// residual drop is visible even when the operator missed the
+					// reject-time warning.
+					slog.Bool("exceeds_rejection_feedback_cap", len(c) > prompt.MaxRejectionFeedbackBytes),
 				)
-				return &c
+				return &c, r.ID
 			}
 		}
 	}
-	return nil
+	return nil, uuid.Nil
 }
 
 // loadPriorSchemaValidationError scans the run's plan_schema_retry audit

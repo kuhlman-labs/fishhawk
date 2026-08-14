@@ -33,6 +33,9 @@ type FixupStageInput struct {
 	// OperatorConcern is the free-text operator instruction routed back with NO
 	// pre-existing review concern (#1311).
 	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern AND minted as a durable concern tracked to closure (#2623): if the agent does not address it, it stays open and surfaces as an OPEN concern at the gate — no longer silently dropped. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
+	// OperatorEvidence declares the operator executed a reproduction of the
+	// routed concerns (E48.103 / #2551): an authority marker, not prose.
+	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in reason/operator_concern; this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you waive or defer it, or a fix-up genuinely resolves it. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -63,6 +66,13 @@ type FixupStageOutput struct {
 // enforced server-side by counting prior stage_fixup_triggered audit
 // entries; a second attempt returns a fixup_budget_exhausted tool error.
 // A run-bound MCP token may fix up only stages within its own run.
+//
+// operator_evidence (E48.103 / #2551) declares the operator EXECUTED a
+// reproduction of the routed concerns. It is an authority marker: those
+// concerns can no longer be retired by a reviewer's `confirmed`
+// delta-verification verdict — only by an operator waive/defer or a genuine
+// fix. Use it when a reviewer has already retired a defect you can still
+// reproduce; the reproduction prose itself still travels in reason.
 //
 // Auth: write tool. Operator-side fhk_* tokens with `write:stages` (or
 // the dedicated `write:fixups`) scope succeed; a token without either
@@ -200,7 +210,7 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 && strings.TrimSpace(in.OperatorConcern) == "" {
 		return nil, FixupStageOutput{}, fmt.Errorf("select at least one of: concern_ids (stable concern UUIDs from fishhawk_get_run_status's run.concerns block), the deprecated positional concerns indices, or a free-text operator_concern")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel, in.OperatorConcern)
+	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel, in.OperatorConcern, in.OperatorEvidence)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}

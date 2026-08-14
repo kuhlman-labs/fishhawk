@@ -1523,6 +1523,58 @@ components:
         resolutions:
           type: array
           items: { $ref: '#/components/schemas/GateViewResolution' }
+        disputed:
+          type: boolean
+          description: |
+            A `confirmed` resolution was recorded on this concern and the
+            concern is STILL OPEN (#2551) — the split resolve/reject the merge
+            gate must not settle silently. Derived from the DURABLE evidence
+            (this row's open state plus the authoritative
+            `implement_reviewed` / `plan_reviewed` payload carrying the
+            confirmation), deliberately independent of the best-effort
+            `concern_resolution_vetoed` audit entry: a failed veto append
+            degrades `disputes[]` to empty but never hides the dispute itself.
+        disputes:
+          type: array
+          description: |
+            The recorded veto detail behind `disputed` — enrichment, not the
+            source of truth. Can be EMPTY on a disputed concern when the
+            best-effort veto record did not land.
+          items: { $ref: '#/components/schemas/GateViewDispute' }
+
+    GateViewDispute:
+      type: object
+      description: |
+        One `confirmed` resolution REFUSED by the implement re-review's
+        round-level veto pass (#2551), reconstructed from a
+        `concern_resolution_vetoed` audit entry.
+      required: [sequence, veto_reason]
+      properties:
+        sequence: { type: integer, format: int64 }
+        round:
+          type: integer
+          description: Derived as for `GateViewResolution.round`.
+        veto_reason:
+          type: string
+          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed]
+          description: |
+            `raiser_rejected_same_round` — a DIFFERENT reviewer confirmed a
+            concern whose RAISING reviewer returned `reject` in the same round;
+            `operator_evidence_routed` — the concern was routed by a fix-up pass
+            carrying `operator_evidence`; `fixup_pass_no_changes` — that pass
+            recorded `fixup_no_changes`, so nothing landed;
+            `evidence_lookup_failed` — the audit reads behind the two evidence
+            arms failed, so the confirm was refused rather than applied on
+            unknown evidence (fail-closed).
+        resolution:
+          type: string
+          description: The refused resolution (always `confirmed`).
+        confirming_reviewer_model:
+          type: string
+        raising_reviewer_model:
+          type: string
+        note:
+          type: string
 
     GateViewFixup:
       type: object
@@ -11744,6 +11796,29 @@ paths:
                     degrades to the prior untracked delivery (the
                     `operator_concern_id` key is omitted) and never fails the
                     fix-up.
+                operator_evidence:
+                  type: string
+                  description: |
+                    Optional operator declaration that the OPERATOR EXECUTED a
+                    reproduction of the concern(s) this pass routes back
+                    (#2551). Its meaning is AUTHORITY, not prose delivery: the
+                    reproduction text still reaches the agent via `reason` (or
+                    `operator_concern`); this field records that the finding was
+                    verified by execution, which a reviewer reading a diff
+                    cannot override. Every concern routed by a pass carrying it
+                    is therefore EXEMPT from reviewer-confirmation auto-resolve:
+                    a later `confirmed` delta-verification verdict is VETOED
+                    (`operator_evidence_routed`, surfaced on the gate view as
+                    `disputed` + `disputes[]`) and the concern stays open until
+                    the operator waives or defers it, or a fix-up genuinely
+                    resolves it — a PERMANENT exemption for those concerns. It
+                    is NOT a selection input: supplying it alone does not
+                    satisfy the at-least-one-of rule. A whitespace-only value,
+                    or one whose byte length exceeds 4000, is rejected (400
+                    `validation_failed`, `field: operator_evidence`). The raw
+                    text is recorded on the `stage_fixup_triggered` audit entry
+                    as `operator_evidence` ONLY when non-empty, so a fix-up that
+                    omits it leaves the payload byte-identical.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
@@ -11756,8 +11831,8 @@ paths:
             `concerns` / `operator_concern`), both `concern_ids` and
             `concerns` supplied, an out-of-range / duplicate concern index,
             an unknown / foreign / plan-stage / non-open `concern_id`, or a
-            whitespace-only or over-length (>4000 bytes) `operator_concern`.
-            Body's `error` is `validation_failed`.
+            whitespace-only or over-length (>4000 bytes) `operator_concern`
+            or `operator_evidence`. Body's `error` is `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -900,6 +901,172 @@ func TestGateView_NoLiveValidation_OmitsBlock(t *testing.T) {
 	resp := decodeGateView(t, getGateView(t, s, runID, ""))
 	if resp.LiveValidation != nil {
 		t.Errorf("live_validation = %+v, want nil when no marker landed", resp.LiveValidation)
+	}
+}
+
+// --- disputes (E48.103 / #2551) ---------------------------------------------
+
+// openConcernByID finds one open concern in a gate-view response.
+func openConcernByID(t *testing.T, resp gateViewResponse, id uuid.UUID) gateViewConcern {
+	t.Helper()
+	for _, c := range resp.Open {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("concern %s is not in the open set (%d open, %d settled)", id, len(resp.Open), len(resp.Settled))
+	return gateViewConcern{}
+}
+
+// runSplitRound drives the REAL implement-review loop for the observed
+// split: the reviewer that RAISED the concern rejects, a DIFFERENT reviewer
+// confirms it in the same round.
+func runSplitRound(s *Server, runID, stageID uuid.UUID, concernID string) {
+	raiser := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}, model: "gpt-5.6-sol"}
+	peer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictApprove,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: concernID, Resolution: "confirmed", Note: "reads fixed to me"}},
+		},
+		model: "fable-5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+}
+
+// TestGateView_SplitRound_RendersDispute is THE cross-layer test (E48.103 /
+// #2551, operator condition 3): the same-round raiser-reject / peer-confirm
+// split from run 9bba554d, driven through the REAL review loop into the REAL
+// concern store and read back over the gate-view HTTP surface. The merge gate
+// must show the concern OPEN and DISPUTED, naming both reviewers.
+func TestGateView_SplitRound_RendersDispute(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed: fix the authz check")
+
+	runSplitRound(s, runID, stageID, row.ID.String())
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	got := openConcernByID(t, resp, row.ID)
+	if got.State != string(concern.StateAddressedPending) {
+		t.Fatalf("state = %q, want addressed_pending (the peer confirm must not have settled it)", got.State)
+	}
+	if !got.Disputed {
+		t.Error("disputed = false, want true (a split resolve/reject must be visible at the merge gate)")
+	}
+	if len(got.Disputes) != 1 {
+		t.Fatalf("disputes = %+v, want exactly one", got.Disputes)
+	}
+	d := got.Disputes[0]
+	if d.VetoReason != vetoRaiserRejectedSameRound {
+		t.Errorf("veto_reason = %q, want %q", d.VetoReason, vetoRaiserRejectedSameRound)
+	}
+	if d.ConfirmingReviewerModel != "fable-5" || d.RaisingReviewerModel != "gpt-5.6-sol" {
+		t.Errorf("dispute models = {confirming %q, raising %q}, want {fable-5, gpt-5.6-sol}", d.ConfirmingReviewerModel, d.RaisingReviewerModel)
+	}
+	if d.Resolution != "confirmed" {
+		t.Errorf("resolution = %q, want confirmed", d.Resolution)
+	}
+}
+
+// TestGateView_VetoAppendFailed_StillDisputed is operator condition 1: the
+// concern_resolution_vetoed append is best-effort, so the dispute must NOT be
+// visible only when that append happens to succeed. With the append FAILING,
+// the gate view must still refuse to render a clean no-dispute view — the
+// disputed flag is derived from the durable concern row (still open) plus the
+// authoritative implement_reviewed payload that carries the confirmation.
+func TestGateView_VetoAppendFailed_StillDisputed(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed: fix the authz check")
+
+	// Fail ONLY the veto append; implement_reviewed still lands.
+	au.appendErrCategory = concernResolutionVetoedCategory
+	runSplitRound(s, runID, stageID, row.ID.String())
+
+	au.mu.Lock()
+	for _, ap := range au.appended {
+		if ap.Category == concernResolutionVetoedCategory {
+			au.mu.Unlock()
+			t.Fatal("a concern_resolution_vetoed entry landed; the injected append failure did not take effect")
+		}
+	}
+	au.mu.Unlock()
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	got := openConcernByID(t, resp, row.ID)
+	if got.State != string(concern.StateAddressedPending) {
+		t.Fatalf("state = %q, want addressed_pending (the veto stands even when its bookkeeping fails)", got.State)
+	}
+	if !got.Disputed {
+		t.Error("disputed = false with the veto append failed, want true (the gate must not report a confident absence of dispute)")
+	}
+	if len(got.Disputes) != 0 {
+		t.Errorf("disputes = %+v, want none (the enrichment entry never landed)", got.Disputes)
+	}
+}
+
+// TestGateView_VetoCategoryReadError_DegradesVisibly: an unreadable
+// concern_resolution_vetoed category names itself in history_gaps with
+// history_incomplete=true, and the derived dispute survives the gap.
+func TestGateView_VetoCategoryReadError_DegradesVisibly(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed")
+
+	runSplitRound(s, runID, stageID, row.ID.String())
+	s.cfg.AuditRepo = &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: concernResolutionVetoedCategory,
+		err:         errors.New("audit store unavailable"),
+	}
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if !resp.HistoryIncomplete {
+		t.Error("history_incomplete = false, want true (an unreadable dispute category is a visible gap)")
+	}
+	var named bool
+	for _, g := range resp.HistoryGaps {
+		if g == concernResolutionVetoedCategory {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("history_gaps = %v, want it to name %s", resp.HistoryGaps, concernResolutionVetoedCategory)
+	}
+	if got := openConcernByID(t, resp, row.ID); !got.Disputed {
+		t.Error("disputed = false, want true (the derived dispute survives an unreadable enrichment category)")
+	}
+}
+
+// TestGateView_UndisputedConcern_NotDisputed is the negative control: an open
+// concern with no recorded confirmation renders disputed=false with no
+// disputes, so the flag discriminates.
+func TestGateView_UndisputedConcern_NotDisputed(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed")
+
+	// Same round shape, but the peer reopens instead of confirming.
+	peer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened", Note: "still broken"}},
+		},
+		model: "fable-5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
+	if got.Disputed || len(got.Disputes) != 0 {
+		t.Errorf("disputed = %v disputes = %+v, want a clean undisputed render", got.Disputed, got.Disputes)
 	}
 }
 

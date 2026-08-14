@@ -426,6 +426,14 @@ type Trigger struct {
 	// section so the agent knows why the previous attempt was rejected.
 	// Nil when no prior rejection exists or the comment was empty.
 	PriorRejectionFeedback *string
+	// PriorRejectionFeedbackRunID is the id of the run whose plan rejection
+	// produced PriorRejectionFeedback (#2680). Used ONLY to build the
+	// truncation marker's retrieval pointer when PriorRejectionFeedback
+	// overflows MaxRejectionFeedbackBytes; empty when the rejecting run is
+	// unknown (the marker then degrades to a source-agnostic retrieval
+	// phrasing). Nothing else reads it, so an empty value is byte-identical to
+	// today for every non-truncating build.
+	PriorRejectionFeedbackRunID string
 	// PriorSchemaValidationError is the standard_v1 validation error from
 	// the most recent in-run plan attempt that failed schema validation
 	// after coercion (#646). When non-nil and non-empty, buildPlan injects
@@ -1402,6 +1410,24 @@ const MaxApprovalConditionBytes = 12000
 // their cap is unchanged.
 const MaxConditionBytes = 4000
 
+// MaxRejectionFeedbackBytes caps the PriorRejectionFeedback channel — the
+// operator's plan-rejection rationale replayed to the replanning agent (#2680).
+// Raised from the historical inline 4000 (the observed live case was ~6000
+// bytes enumerating five distinct defects, which the old cap cut mid-sentence,
+// silently dropping the operator's later steering points) so a realistic
+// multi-defect rejection is delivered WHOLE. Unlike the BINDING
+// approve-with-conditions channel — an over-cap comment there is REFUSED at the
+// approval gate (server/approvals.go validateApprovalComment) so a dropped tail
+// can never corrupt the implement stage's binding instructions — this channel
+// is ADVISORY: a reject is cheap to re-issue and refusing it would leave the
+// operator unable to record a gate verdict at all, so an over-cap reject stays
+// SUBMITTABLE and is instead delivered with an explicit ADR-077-shaped elision
+// marker (CapTextWithRetrieval) plus an operator warning at rejection time
+// (fishhawk_reject_plan). That warn-on-reject / refuse-on-approve asymmetry is
+// deliberate, not an inconsistency. This is the value fishhawk_reject_plan's
+// operator warning names.
+const MaxRejectionFeedbackBytes = 12000
+
 // CapText returns s truncated to at most max bytes with the byte-identical
 // "...[truncated]" marker appended, and whether it truncated. The cut is
 // rune-safe: strings.ToValidUTF8 drops a trailing partial rune left by slicing
@@ -1413,6 +1439,52 @@ func CapText(s string, max int) (string, bool) {
 		return s, false
 	}
 	return strings.ToValidUTF8(s[:max], "") + "...[truncated]", true
+}
+
+// CapTextWithRetrieval is CapText's elision-marker variant (ADR-077 shape). It
+// performs the identical rune-safe cut to at most max bytes (strings.ToValidUTF8
+// drops the trailing partial rune left by slicing at a fixed byte offset, so the
+// result is always valid UTF-8), and returns (s, false) unchanged when s is at
+// or under max — the > not >= boundary, so an exactly-at-cap text renders
+// verbatim. But instead of the bare "...[truncated]" marker it appends a
+// self-describing elision block naming: the number of bytes shown, the original
+// byte count, the dropped-byte count, the cap, an explicit statement that the
+// visible text is INCOMPLETE and must NOT be read as the whole instruction, and
+// the caller-supplied retrieval pointer to where the full value can be
+// recovered. CapText is deliberately left untouched — its byte-identical
+// "...[truncated]" marker is pinned by the approval-conditions and
+// clarification-answer tests — because this marker is for a channel (prior
+// rejection feedback) where the reader must be told its steering was cut and
+// how to recover the dropped tail, not merely that a cut happened.
+func CapTextWithRetrieval(s string, max int, retrieval string) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	kept := strings.ToValidUTF8(s[:max], "")
+	dropped := len(s) - len(kept)
+	marker := fmt.Sprintf(
+		"\n\n...[ELIDED — this text is INCOMPLETE: %d of %d bytes shown, %d bytes dropped at the %d-byte cap. Do NOT read the visible text as the whole instruction. %s]",
+		len(kept), len(s), dropped, max, retrieval)
+	return kept + marker, true
+}
+
+// priorRejectionRetrievalPointer builds the elision marker's retrieval pointer
+// for the truncated prior-rejection-feedback channel (#2680). When the
+// rejecting run id is known it names the concrete recovery path — the
+// approval_submitted audit entry's rejection_comment payload key on that run,
+// reachable via fishhawk_list_audit — degrading to a source-agnostic phrasing
+// when the id is empty (the server could not identify the rejecting run). The
+// marker does NOT depend on retrieval succeeding: whether fishhawk_list_audit is
+// wired into a given plan agent's tool set is best-effort (ADR-021), so the
+// truncated-feedback path ALSO instructs the planner to declare the
+// incompleteness in risks_and_assumptions regardless.
+func priorRejectionRetrievalPointer(runID string) string {
+	if runID != "" {
+		return fmt.Sprintf(
+			"To recover the dropped tail: read the approval_submitted audit entry's rejection_comment payload key on the rejecting run %s (via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion.",
+			runID)
+	}
+	return "To recover the dropped tail: read the rejecting run's approval_submitted audit entry (rejection_comment payload key, via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion."
 }
 
 // writeApprovalConditions renders the binding "### Approval conditions" block
@@ -2271,13 +2343,22 @@ func buildPlan(t Trigger) string {
 	}
 
 	if t.PriorRejectionFeedback != nil && *t.PriorRejectionFeedback != "" {
-		feedback := *t.PriorRejectionFeedback
-		const maxFeedbackBytes = 4000
-		if len(feedback) > maxFeedbackBytes {
-			feedback = feedback[:maxFeedbackBytes] + "...[truncated]"
-		}
+		// #2680: raised from the historical inline 4000-byte bare slice to
+		// MaxRejectionFeedbackBytes so a realistic multi-defect rejection is
+		// delivered WHOLE, and — when the reason still overflows — rendered with
+		// an ADR-077-shaped elision marker (dropped-byte count + retrieval
+		// pointer) instead of a bare mid-sentence cut, so the replanning agent
+		// knows its steering is incomplete and where the tail lives.
+		feedback, truncated := CapTextWithRetrieval(*t.PriorRejectionFeedback,
+			MaxRejectionFeedbackBytes, priorRejectionRetrievalPointer(t.PriorRejectionFeedbackRunID))
 		b.WriteString("### Prior plan-stage rejection feedback\n\n")
 		b.WriteString("The operator rejected the most recent plan for this issue with the following rationale. You MUST address this feedback in your new plan:\n\n")
+		if truncated {
+			// Codify the mitigation the live agent improvised: a recipient of
+			// truncated steering must DECLARE the incompleteness in the plan so
+			// the operator sees that a rejection point may not have landed.
+			b.WriteString("IMPORTANT: the rejection feedback below was TRUNCATED — the visible text is INCOMPLETE, so some of the operator's steering may not be shown. You MUST record in the plan's risks_and_assumptions that the rejection feedback was truncated and that you could not see all of it (naming what you could not see if you recover the dropped tail via the pointer in the elision marker below).\n\n")
+		}
 		b.WriteString(feedback)
 		b.WriteString("\n\n")
 	}
