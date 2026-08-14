@@ -2249,8 +2249,10 @@ type CampaignRollup struct {
 // CampaignNextAction mirrors the backend's `campaignNextActionPayload`: the
 // single server-computed next step for the operator-agent, distilled from the
 // rollup partition. Action is drawn from the closed set
-// attention|resume|start_run|attend_human_led|wait|complete
-// (computeCampaignNextAction).
+// attention|resume|start_run|attend_human_led|wait|complete|closed
+// (computeCampaignNextAction). `closed` (#2681) means the CAMPAIGN itself went
+// terminal with an issue still unfinished: no campaign verb applies, and
+// IssueRef carries the stranded ref when one exists.
 type CampaignNextAction struct {
 	Action   string `json:"action"`
 	IssueRef string `json:"issue_ref,omitempty"`
@@ -2423,7 +2425,8 @@ type StartCampaignItemRunResult struct {
 //     bad runner_kind, unknown fields)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 404 campaign_not_found / campaign_item_not_found
-//   - 409 campaign_not_startable (the campaign is paused or terminal)
+//   - 409 campaign_not_startable (the campaign is paused, cancelled or
+//     succeeded — a terminal-FAILED campaign is REOPENED by this verb, #2681)
 //   - 409 item_not_eligible (the item is blocked on a dependency, already
 //     running, or terminal — the detail names the blocker)
 //   - 400 validation_failed (a non-absolute working_dir; E48.69 / #2498 — the

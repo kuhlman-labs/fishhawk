@@ -2138,37 +2138,58 @@ components:
       type: object
       description: |
         The single next step for the operator-agent, distilled from the
-        rollup partition. PRECEDENCE is FAILED-wins and strict: a failed item
-        yields `attention` REGARDLESS of whether eligible items also exist;
-        only with zero failed items does an eligible item yield `start_run`.
+        rollup partition AND the campaign's own state.
+
+        PRECEDENCE is FORWARD-PROGRESS-first and strict (this supersedes the
+        earlier FAILED-wins ordering, which #1838 replaced): paused > eligible
+        > restartable > human-led > stuck-failed > running/blocked > complete.
+        A failed item no longer suppresses dispatch of its still-actionable
+        siblings.
+
+        TERMINAL-CAMPAIGN RULE (#2681): when the CAMPAIGN itself is terminal
+        (`succeeded` / `failed` / `cancelled`) the action above is rewritten so
+        it never names a verb the campaign gate would refuse. A terminal-FAILED
+        campaign with a restartable item KEEPS `start_run` (that verb reopens
+        the campaign); an all-done campaign keeps `complete`; everything else
+        becomes `closed`. A PAUSED campaign is NOT terminal and still reports
+        `resume`, which is correct — resume is legal on a paused campaign.
       required: [action]
       properties:
         action:
           type: string
-          enum: [attention, resume, start_run, attend_human_led, wait, complete]
+          enum: [attention, resume, start_run, attend_human_led, wait, complete, closed]
           description: |
-            `attention` — a failed item needs operator intervention
-            (retry/abandon); takes precedence over everything else.
+            `attention` — a failed item is genuinely stuck (deps-unsatisfied or
+            human-led) and cannot be auto-restarted; resolve its run manually.
             `resume` — a paused item was handed off to a human at a run gate
             (E25.7); handle the gate then `POST /resume`. Ranked above
             `start_run` so a hand-off is surfaced before new dispatch.
             `start_run` — the next eligible (autonomous) item is ready to
-            dispatch. Wins over `attend_human_led`: whenever ANY autonomous item
+            dispatch, OR a deps-satisfied cancelled/failed item is restartable.
+            Wins over `attend_human_led`: whenever ANY autonomous item
             is eligible it is surfaced first, so human-led items never stall
-            DAG-independent autonomous work.
+            DAG-independent autonomous work. Under a terminal-FAILED campaign
+            this action is still reported for a restartable item, because
+            `POST /v0/campaigns/{campaign_id}/runs` REOPENS such a campaign.
             `attend_human_led` — the only deps-satisfied item(s) remaining are
             `autonomy:low` (human-led). Fires ONLY when `eligible` is empty and
             `human_led` is non-empty; a human must lead the item — do NOT
             dispatch an agent run.
             `wait` — items are running or blocked; nothing to do yet.
             `complete` — every item reached a terminal state.
+            `closed` (#2681) — the CAMPAIGN is terminal with work still
+            unfinished, and no campaign verb applies: it can start no further
+            item runs. Drive any remaining issue standalone with
+            `POST /v0/runs`; the campaign will not track its outcome.
         issue_ref:
           type: string
           description: |
             The item the action refers to — the first failed item for
             `attention`, the first paused item for `resume`, the first eligible
-            item for `start_run`, the first human-led item for
-            `attend_human_led`. Omitted for `wait` / `complete`.
+            or restartable item for `start_run`, the first human-led item for
+            `attend_human_led`. On `closed` it carries the stranded ref the
+            underlying partition named, when there is one. Omitted for `wait` /
+            `complete`.
         detail:
           type: string
           description: Human-readable explanation of the action.
@@ -8811,8 +8832,17 @@ paths:
       description: |
         The campaign, its items, the engine's readiness rollup, and the
         distilled `next_action`. This is the surface the operator-agent polls
-        to drive a campaign. `next_action` precedence is FAILED-wins: a failed
-        item yields `attention` regardless of whether eligible items exist.
+        to drive a campaign. `next_action` precedence is forward-progress-first
+        (paused > eligible > restartable > human-led > stuck-failed >
+        running/blocked > complete); see the `CampaignNextAction` schema.
+
+        When the CAMPAIGN itself is terminal (#2681) the action is rewritten so
+        it never names a verb the campaign gate refuses: a terminal-FAILED
+        campaign with a restartable item keeps `start_run` (that verb REOPENS
+        the campaign), an all-done campaign keeps `complete`, and everything
+        else reports `closed` — drive any remaining issue standalone via
+        `POST /v0/runs`. A paused campaign is not terminal and still reports
+        `resume`.
 
         Reconcile-on-read (E26.2 / #1481): this GET also settles any running
         item whose linked run reached a terminal state and re-derives the
@@ -8853,12 +8883,23 @@ paths:
         merge — without the backend auto-driver and without GitHub Actions.
 
         For the `issue_ref` it refuses unless the item is **eligible** per the
-        campaign engine (every dependency has succeeded), naming the blocking
-        dependency on refusal. On an eligible item it mints the run via the
-        same seam the auto-driver uses (carrying `runner_kind` so the local
+        campaign engine (every dependency has succeeded) or **restartable** (a
+        deps-satisfied, non-human-led cancelled/failed item), naming the
+        blocking dependency on refusal. On an admitted item it mints the run via
+        the same seam the auto-driver uses (carrying `runner_kind` so the local
         loop gets `local`), links it to the item, transitions the item
         `pending`/`blocked` → `running`, and advances a `pending` campaign to
         `running`.
+
+        REOPEN (#2681): a campaign that went terminal-**failed** because its
+        LAST unsettled item failed is REOPENED by this endpoint. The campaign
+        flips `failed` → `running` AND the item is reset to `pending` with its
+        run link cleared, in ONE transaction holding row locks on both rows, so
+        no concurrent reconcile-on-read can observe a running campaign whose
+        every item is still terminal. The reopen happens strictly AFTER the DAG
+        gate: a failed campaign whose named item is NOT restartable is refused
+        with the campaign left `failed` and nothing written. `cancelled` and
+        `succeeded` campaigns are never reopened — those verdicts stand.
 
         Pair this with `GET /v0/campaigns/{campaign_id}/status`, which is
         reconcile-on-read: it settles any running item whose linked run reached
@@ -8893,7 +8934,9 @@ paths:
         '409':
           description: |
             `campaign_not_startable` — the campaign is paused (resume it first)
-            or terminal; `item_not_eligible` — the item is blocked on a
+            or cancelled/succeeded (closed; drive the issue standalone). A
+            terminal-FAILED campaign is NOT refused — it is reopened (#2681);
+            `item_not_eligible` — the item is blocked on a
             dependency (the detail names it), already running, or terminal;
             `item_human_led` — the item is deps-satisfied but `autonomy:low`
             (human-led); a human must lead it out of band (do not start an agent

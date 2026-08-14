@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -248,7 +249,64 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     stuck failure never suppresses still-actionable sibling work.
 //  6. else any running or blocked item -> "wait".
 //  7. else (every item terminal done/cancelled) -> "complete".
-func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
+//
+// TERMINAL POST-FILTER (#2681). The seven arms above read ONLY the item
+// partition, so a campaign that has itself gone TERMINAL could still advertise
+// a verb the campaign-state gate refuses — the wedge this filter closes. When
+// state.IsTerminal() the base action is rewritten:
+//
+//   - start_run on a Restartable item under a FAILED campaign is KEPT (with a
+//     reopen-flavoured detail): handleStartCampaignItemRun now admits a
+//     terminal-failed campaign and reopens it atomically, so this verb is
+//     genuinely legal;
+//   - complete is KEPT: a terminal campaign whose every item is done advertises
+//     no verb at all, so it is already truthful;
+//   - everything else becomes the `closed` action, which advertises no campaign
+//     verb and points the operator at driving the leftover issue standalone.
+//
+// A NON-terminal campaign is byte-identical to the pre-#2681 behavior. In
+// particular a PAUSED campaign is not terminal, so it still advertises `resume`
+// — and that is correct, not an omission: resume is legal on a paused campaign
+// (POST /resume accepts it), so the "never advertise a refused verb" invariant
+// already holds there. Reporting `closed` for a paused campaign would be the
+// actual defect: it would tell the operator to abandon a campaign that is one
+// verb away from continuing.
+func computeCampaignNextAction(state campaign.State, e campaign.Eligibility) campaignNextActionPayload {
+	base := baseCampaignNextAction(e)
+	if !state.IsTerminal() {
+		return base
+	}
+	switch {
+	case base.Action == "start_run" && state == campaign.StateFailed && containsRef(e.Restartable, base.IssueRef):
+		// The one verb that IS legal against a terminal campaign: the operator
+		// restart, which reopens the failed campaign and resets the item in one
+		// atomic repository call (campaign.Repository.ReopenCampaignForItemRestart).
+		base.Detail = "this item failed but its dependencies are satisfied; fishhawk_start_campaign_item_run REOPENS the terminal-failed campaign (flipping it back to running) and resets the item in one atomic step, then mints a fresh run"
+		return base
+	case base.Action == "complete":
+		// Every item terminal-and-done: no verb is advertised, so nothing to fix.
+		return base
+	default:
+		// Counts mirror the WIRE rollup the operator reads: toCampaignRollupPayload
+		// folds Restartable back into the cancelled slice, so this fold matches.
+		cancelled := len(e.Cancelled) + len(e.Restartable)
+		return campaignNextActionPayload{
+			Action: "closed",
+			// Carry the ref the base arm named (when it named one) so the operator
+			// still has the stranded issue to drive standalone.
+			IssueRef: base.IssueRef,
+			Detail: fmt.Sprintf(
+				"the campaign is %s and can start no further item runs (%d succeeded, %d failed, %d cancelled); drive any remaining issue standalone with fishhawk_start_run — the campaign will not track its outcome",
+				state, len(e.Done), len(e.Failed), cancelled),
+		}
+	}
+}
+
+// baseCampaignNextAction is the item-partition-only computation: the seven-arm
+// precedence documented on computeCampaignNextAction, unchanged since #1838. It
+// is split out so the terminal post-filter reads as a filter over a stable base
+// rather than as seven more interleaved conditions.
+func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
 	case len(e.Paused) > 0:
 		return campaignNextActionPayload{
@@ -966,10 +1024,12 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 		out = append(out, toCampaignItemResponse(it))
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
-		"campaign":    toCampaignResponse(c),
-		"items":       out,
-		"rollup":      toCampaignRollupPayload(elig),
-		"next_action": computeCampaignNextAction(elig),
+		"campaign": toCampaignResponse(c),
+		"items":    out,
+		"rollup":   toCampaignRollupPayload(elig),
+		// The POST-reconcile campaign state feeds the terminal post-filter (#2681)
+		// so a campaign that just derived terminal never advertises a refused verb.
+		"next_action": computeCampaignNextAction(c.State, elig),
 	})
 }
 
@@ -1342,11 +1402,24 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 			"get campaign failed", map[string]any{"error": err.Error()})
 		return
 	}
-	// Only a pending or running campaign can dispatch a new item run. A paused
-	// campaign (resume it first), or a terminal one, refuses 409.
-	if c.State != campaign.StatePending && c.State != campaign.StateRunning {
+	// A pending or running campaign can dispatch a new item run — and so, as of
+	// #2681, can a terminal-FAILED one: a campaign whose LAST unsettled item
+	// failed derives terminal (DeriveState: anyFailed && allTerminal) while that
+	// item is still deps-satisfied and restartable, and refusing here made it
+	// unrecoverable inside the campaign. The reopen happens strictly AFTER the
+	// DAG gate below, so a failed campaign whose named item is NOT restartable is
+	// still refused with the campaign left failed and nothing written.
+	//
+	// The remaining refusals are paused and cancelled/succeeded, and the detail
+	// distinguishes them: a paused campaign has a forward verb (resume); a
+	// cancelled or succeeded one is genuinely closed.
+	if c.State != campaign.StatePending && c.State != campaign.StateRunning && c.State != campaign.StateFailed {
+		detail := "campaign is cancelled or succeeded — it is closed and can start no further item runs; drive the issue standalone with fishhawk_start_run (the campaign will not track it)"
+		if c.State == campaign.StatePaused {
+			detail = "campaign is paused — resume it (fishhawk_resume_campaign) before starting an item run"
+		}
 		s.writeError(w, r, http.StatusConflict, "campaign_not_startable",
-			"campaign is not in a state that can start an item run",
+			detail,
 			map[string]any{"campaign_id": id.String(), "state": string(c.State)})
 		return
 	}
@@ -1442,21 +1515,61 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Defensive: a terminal-FAILED campaign is admitted ONLY to reopen a
+	// restartable item. Under such a campaign every item is terminal by
+	// construction (DeriveState's allTerminal conjunct), so Eligible is empty and
+	// reaching here with !isRestartable is unreachable — but if it ever were
+	// reachable, minting a run inside a still-failed campaign is the wrong
+	// outcome, so refuse rather than fall through.
+	if c.State == campaign.StateFailed && !isRestartable {
+		s.writeError(w, r, http.StatusConflict, "campaign_not_startable",
+			"campaign is failed and this item is not restartable, so there is nothing to reopen; drive the issue standalone with fishhawk_start_run (the campaign will not track it)",
+			map[string]any{"campaign_id": id.String(), "state": string(c.State), "issue_ref": req.IssueRef})
+		return
+	}
+
 	// Restart path (#1729 cancelled / #1838 failed): reset the restartable item
 	// back to pending, clearing its stale run link, BEFORE the mint/link/transition flow — which
 	// then runs unchanged over the now-pending item. The reset is atomic under
 	// the repo's FOR UPDATE lock; capture the prior run/state for the restart
 	// audit before RestartCampaignItem clears them.
+	//
+	// Under a TERMINAL-FAILED campaign (#2681) the item reset alone is not
+	// enough — the campaign must be reopened too, or the very next status read
+	// re-derives it terminal. Both writes go through
+	// ReopenCampaignForItemRestart, ONE transaction holding row locks on the
+	// campaign and the item, so no concurrent reconcile-on-read can observe a
+	// running campaign whose every item is still terminal.
 	if isRestartable {
 		priorState := string(item.State)
 		priorRunID := ""
 		if item.RunID != nil {
 			priorRunID = item.RunID.String()
 		}
-		resetItem, rerr := s.cfg.CampaignRepo.RestartCampaignItem(r.Context(), item.ID)
+		reopened := c.State == campaign.StateFailed
+		var (
+			resetItem     *campaign.Item
+			reopenedCmp   *campaign.Campaign
+			rerr          error
+			restartFailed = "restart campaign item failed"
+		)
+		if reopened {
+			restartFailed = "reopen campaign for item restart failed"
+			reopenedCmp, resetItem, rerr = s.cfg.CampaignRepo.ReopenCampaignForItemRestart(r.Context(), id, item.ID)
+		} else {
+			resetItem, rerr = s.cfg.CampaignRepo.RestartCampaignItem(r.Context(), item.ID)
+		}
 		if rerr != nil {
 			var inv campaign.InvalidTransitionError
 			switch {
+			case errors.As(rerr, &inv) && inv.Kind == "campaign":
+				// Reopen only: the campaign left `failed` underneath us (a concurrent
+				// reconcile re-derived it, or an operator cancelled it), so the
+				// reopen no longer applies. NOTHING was written — the primitive's
+				// single transaction rolled back.
+				s.writeError(w, r, http.StatusConflict, "campaign_not_startable",
+					"campaign is no longer in the terminal-failed state this restart would reopen; re-poll fishhawk_get_campaign_status and follow its next_action",
+					map[string]any{"campaign_id": id.String(), "state": string(c.State), "issue_ref": req.IssueRef})
 			case errors.As(rerr, &inv):
 				// A concurrent restart/dispatch already moved the item off its
 				// terminal state — it is no longer restartable.
@@ -1466,18 +1579,38 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 						"issue_ref":   req.IssueRef,
 						"item_state":  string(item.State),
 					})
+			case errors.Is(rerr, campaign.ErrCampaignNotFound):
+				// The CAMPAIGN row vanished (concurrently deleted) — reported under
+				// the campaign-shaped code, never the item-shaped one, so the
+				// operator is not sent hunting for a missing item (#2681 condition 3).
+				s.writeError(w, r, http.StatusNotFound, "campaign_not_found",
+					"no campaign with that id", map[string]any{"campaign_id": id.String()})
 			case errors.Is(rerr, campaign.ErrNotFound):
+				// The ITEM is missing — either genuinely gone or (from the reopen
+				// primitive) owned by another campaign, which from this campaign's
+				// perspective is the same thing. RestartCampaignItem's plain
+				// ErrNotFound lands here unchanged.
 				s.writeError(w, r, http.StatusNotFound, "campaign_item_not_found",
 					"no campaign item with that issue_ref",
 					map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef})
 			default:
 				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-					"restart campaign item failed",
+					restartFailed,
 					map[string]any{"error": rerr.Error(), "item_id": item.ID.String()})
 			}
 			return
 		}
 		item = resetItem
+		if reopened {
+			// Adopt the reopened campaign so the pending -> running derivation below
+			// sees the fresh `running` state and does not re-derive it.
+			c = reopenedCmp
+			s.emitCampaignAudit(r.Context(), categoryCampaignAdvanced, map[string]any{
+				"campaign_id": id.String(),
+				"from":        string(campaign.StateFailed),
+				"to":          string(campaign.StateRunning),
+			})
+		}
 		s.emitCampaignAudit(r.Context(), categoryCampaignIssueRestarted, map[string]any{
 			"campaign_id":  id.String(),
 			"issue_ref":    item.IssueRef,

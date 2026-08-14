@@ -1564,11 +1564,57 @@ func TestCampaignNextActionsFor_Complete_TerminalNoActions(t *testing.T) {
 	}
 }
 
+// TestCampaignNextActionsFor_Closed pins the #2681 arm: a CAMPAIGN that went
+// terminal with an issue still unfinished classifies as campaign_closed with
+// exactly ONE action — a STANDALONE fishhawk_start_run on the stranded ref,
+// never fishhawk_start_campaign_item_run (which the campaign gate would refuse).
+func TestCampaignNextActionsFor_Closed(t *testing.T) {
+	na := campaignNextActionsFor(
+		CampaignRollup{Done: []string{"#26"}, Cancelled: []string{"#29"}},
+		caNextAction("closed", "issue:29"))
+	if na.State != "campaign_closed" {
+		t.Fatalf("State = %q, want campaign_closed", na.State)
+	}
+	if len(na.Actions) != 1 {
+		t.Fatalf("actions = %+v, want exactly 1", na.Actions)
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_start_run" {
+		t.Errorf("action = %q, want fishhawk_start_run (a campaign verb would be refused)", got.Action)
+	}
+	if got.Params["trigger_ref"] != "issue:29" {
+		t.Errorf("params = %v, want trigger_ref issue:29", got.Params)
+	}
+	if got.Consumes != consumesNewRun {
+		t.Errorf("consumes = %q, want %q", got.Consumes, consumesNewRun)
+	}
+	if !strings.Contains(got.Precondition, "terminal") {
+		t.Errorf("precondition = %q, want it to name the terminal campaign", got.Precondition)
+	}
+	if !strings.Contains(got.Reason, "standalone") {
+		t.Errorf("reason = %q, want it to say the issue must be driven standalone", got.Reason)
+	}
+
+	// A closed campaign with no stranded ref still carries the action (the
+	// "never unclassified" structural invariant) with empty params.
+	bare := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", ""))
+	if bare.State != "campaign_closed" || len(bare.Actions) != 1 {
+		t.Fatalf("refless closed = %+v, want campaign_closed with 1 action", bare)
+	}
+	if _, ok := bare.Actions[0].Params["trigger_ref"]; ok {
+		t.Errorf("refless closed params = %v, want no trigger_ref", bare.Actions[0].Params)
+	}
+}
+
 // TestCampaignNextActionsFor_UnknownAction_Unclassified pins the "never
 // unclassified" invariant: a future backend-added action value lands in the
 // labeled fallback with a NON-empty actions list — proving the classifier
-// never returns an empty/unrouted result for a non-complete campaign.
+// never returns an empty/unrouted result for a non-complete campaign. `closed`
+// is asserted NOT to land here (it has its own arm as of #2681).
 func TestCampaignNextActionsFor_UnknownAction_Unclassified(t *testing.T) {
+	if got := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", "#99")); got.State == "campaign_unclassified" {
+		t.Errorf("closed classified as %q, want its own campaign_closed arm", got.State)
+	}
 	na := campaignNextActionsFor(CampaignRollup{}, caNextAction("teleport", "#99"))
 	if na.State != "campaign_unclassified" {
 		t.Errorf("State = %q, want campaign_unclassified", na.State)

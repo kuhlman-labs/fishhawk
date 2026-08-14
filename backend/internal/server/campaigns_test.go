@@ -57,6 +57,7 @@ type fakeCampaignRepo struct {
 	transItemErr error
 	setRunErr    error
 	restartErr   error
+	reopenErr    error
 
 	// itemsErrOnCall, when non-zero, fails ListCampaignItemsForCampaign on
 	// exactly that 1-based call number (others succeed), so a test can exercise
@@ -87,7 +88,17 @@ type fakeCampaignRepo struct {
 	transCmpCalls  int
 	setRunCalls    int
 	restartCalls   int
+	reopenCalls    int
 	settleOOBCalls int
+
+	// afterReopen, when set, is invoked AFTER ReopenCampaignForItemRestart
+	// releases the fake's mutex and commits both mutations — the seam the
+	// interleaving test uses to drive a REAL reconciling GET /status into the
+	// post-commit window. Note the fake's "atomicity" is a MUTEX, not a
+	// transaction: this seam proves the SHAPE of the interleaving, never Postgres
+	// visibility (that is proven at the repository layer, in
+	// campaign/postgres_test.go).
+	afterReopen func()
 
 	// setAutonomyErr injects a SetCampaignItemAutonomy failure so the
 	// best-effort refresh's fail-open branch is reachable (#2355);
@@ -244,6 +255,59 @@ func (f *fakeCampaignRepo) RestartCampaignItem(_ context.Context, id uuid.UUID) 
 		}
 	}
 	return nil, campaign.ErrNotFound
+}
+
+// ReopenCampaignForItemRestart mirrors the Postgres primitive's guard contract
+// (#2681): campaign must be FAILED, item must exist, belong to that campaign,
+// and be in {cancelled, failed}; on any guard failure NOTHING is mutated. Both
+// mutations are applied under the fake's single mutex — an in-memory stand-in
+// for the real single transaction, sufficient for handler-flow coverage but NOT
+// evidence of Postgres transactional visibility (see afterReopen's note).
+// reopenErr injects a failure so the handler's error arms are reachable;
+// reopenCalls counts invocations for the ordering/no-op assertions.
+func (f *fakeCampaignRepo) ReopenCampaignForItemRestart(_ context.Context, campaignID, itemID uuid.UUID) (*campaign.Campaign, *campaign.Item, error) {
+	cmp, item, err := func() (*campaign.Campaign, *campaign.Item, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.reopenCalls++
+		if f.reopenErr != nil {
+			return nil, nil, f.reopenErr
+		}
+		c, ok := f.campaigns[campaignID]
+		if !ok {
+			return nil, nil, campaign.ErrCampaignNotFound
+		}
+		if c.State != campaign.StateFailed {
+			return nil, nil, campaign.InvalidTransitionError{Kind: "campaign", From: string(c.State), To: string(campaign.StateRunning)}
+		}
+		for _, items := range f.itemsByCmp {
+			for _, it := range items {
+				if it.ID != itemID {
+					continue
+				}
+				if it.CampaignID != campaignID {
+					return nil, nil, campaign.ErrCampaignItemNotFound
+				}
+				if it.State != campaign.ItemStateCancelled && it.State != campaign.ItemStateFailed {
+					return nil, nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStatePending)}
+				}
+				now := time.Now().UTC()
+				it.State = campaign.ItemStatePending
+				it.RunID = nil
+				it.UpdatedAt = now
+				c.State = campaign.StateRunning
+				c.UpdatedAt = now
+				return c, it, nil
+			}
+		}
+		return nil, nil, campaign.ErrCampaignItemNotFound
+	}()
+	if err == nil && f.afterReopen != nil {
+		// Fired with the mutex RELEASED so the hook can re-enter the repo — the
+		// post-commit window a concurrent reconciling read would land in.
+		f.afterReopen()
+	}
+	return cmp, item, err
 }
 
 // SettleCampaignItemOutOfBand settles a terminal-non-succeeded item (cancelled
@@ -1969,7 +2033,9 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := computeCampaignNextAction(tc.elig)
+			// The seven-arm precedence is the NON-terminal computation; the
+			// terminal post-filter (#2681) has its own table below.
+			got := computeCampaignNextAction(campaign.StateRunning, tc.elig)
 			if got.Action != tc.want {
 				t.Errorf("action = %q, want %q", got.Action, tc.want)
 			}
@@ -6375,5 +6441,694 @@ func TestCancelCampaign_PartialFailureConvergence(t *testing.T) {
 		if it.State != campaign.ItemStateCancelled {
 			t.Errorf("item %s = %q, want cancelled (converged)", it.IssueRef, it.State)
 		}
+	}
+}
+
+// --- terminal-failed campaign reopen + `closed` next_action (#2681) ---
+
+// seedTerminalFailedCampaign seeds a campaign in the #2681 wedge shape: N-1
+// succeeded items plus one FAILED, deps-satisfied, non-human-led item, with the
+// campaign itself terminal-FAILED (exactly what campaign.DeriveState returns for
+// anyFailed && allTerminal). NextEligible classifies the failed item as
+// Restartable, so the handler's restart branch is reachable — but only if the
+// campaign-state gate admits a failed campaign.
+func seedTerminalFailedCampaign(f *fakeCampaignRepo, staleRun *uuid.UUID) (*campaign.Campaign, *campaign.Item) {
+	items := make([]*campaign.Item, 0, 12)
+	for i := 0; i < 11; i++ {
+		items = append(items, cItem(fmt.Sprintf("issue:%d", 100+i), nil, campaign.ItemStateSucceeded))
+	}
+	failed := cItem("issue:111", nil, campaign.ItemStateFailed)
+	failed.RunID = staleRun
+	items = append(items, failed)
+	c := f.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", items)
+	c.State = campaign.StateFailed
+	return c, failed
+}
+
+// TestStartCampaignItemRun_TerminalFailedCampaign_ReopensAndRestarts is the
+// recovery half's headline done-means: the campaign whose LAST unsettled item
+// failed (so it went terminal-failed) admits the restart verb, which reopens the
+// campaign AND resets the item, mints a fresh run, links it, and emits BOTH the
+// campaign_advanced (failed -> running) and campaign_issue_restarted audits.
+func TestStartCampaignItemRun_TerminalFailedCampaign_ReopensAndRestarts(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, aud := newCampaignStartServer(t, crepo)
+	staleRun := uuid.New()
+	c, item := seedTerminalFailedCampaign(crepo, &staleRun)
+
+	// Pre-condition: the status surface advertises start_run on the failed item
+	// even though the campaign is terminal — the verb this test proves is legal.
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:111" {
+		t.Fatalf("next_action = %+v, want start_run issue:111 (the restartable arm survives the terminal filter)", st.NextAction)
+	}
+	if !strings.Contains(st.NextAction.Detail, "REOPENS") {
+		t.Errorf("detail = %q, want it to name the reopen semantics", st.NextAction.Detail)
+	}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:111","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Item.State != string(campaign.ItemStateRunning) {
+		t.Errorf("item state = %q, want running", body.Item.State)
+	}
+	if body.Item.RunID == nil || *body.Item.RunID != body.Run.ID {
+		t.Errorf("item run_id = %v, want linked to the fresh run %s", body.Item.RunID, body.Run.ID)
+	}
+	if body.Run.ID == staleRun {
+		t.Errorf("run id = %s, want a NEW run distinct from the stale one", body.Run.ID)
+	}
+	// COMMITTED STATE, not just the response body.
+	if c.State != campaign.StateRunning {
+		t.Errorf("campaign state = %q, want running (reopened)", c.State)
+	}
+	if item.State != campaign.ItemStateRunning {
+		t.Errorf("item state = %q, want running", item.State)
+	}
+	if crepo.reopenCalls != 1 {
+		t.Errorf("reopenCalls = %d, want 1", crepo.reopenCalls)
+	}
+	if crepo.restartCalls != 0 {
+		t.Errorf("restartCalls = %d, want 0 (the reopen primitive replaces the plain restart under a failed campaign)", crepo.restartCalls)
+	}
+	if n := aud.count("campaign_advanced"); n != 1 {
+		t.Errorf("campaign_advanced count = %d, want 1", n)
+	}
+	if n := aud.count("campaign_issue_restarted"); n != 1 {
+		t.Errorf("campaign_issue_restarted count = %d, want 1", n)
+	}
+	// The campaign_advanced entry names the real edge.
+	var found bool
+	for _, e := range aud.entries {
+		if e.Category != "campaign_advanced" {
+			continue
+		}
+		found = true
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("decode campaign_advanced payload: %v", err)
+		}
+		if payload["from"] != "failed" || payload["to"] != "running" {
+			t.Errorf("campaign_advanced payload = %v, want from=failed to=running", payload)
+		}
+	}
+	if !found {
+		t.Errorf("no campaign_advanced entry recorded")
+	}
+}
+
+// TestStartCampaignItemRun_ReopenIsAtomicUnderReconcilingRead drives a REAL
+// reconciling GET /v0/campaigns/{id}/status through the handler from inside the
+// start flow's post-commit window and asserts that read never observes the
+// incoherent intermediate (a running campaign whose every item is still
+// terminal) and never derives the campaign back to failed.
+//
+// SCOPE, stated honestly: fakeCampaignRepo's atomicity is a MUTEX, not a
+// transaction, so this test proves the SHAPE of the interleaving — that the
+// handler exposes no window in which the pair is half-applied to a reconciling
+// reader, and that reconcile-on-read does not undo the reopen. The TRANSACTIONAL
+// guarantee is proven separately, under a real Postgres, by
+// TestReopenCampaignForItemRestart_RejectsNonRestartableItem's still-failed
+// assertion in backend/internal/campaign/postgres_test.go.
+func TestStartCampaignItemRun_ReopenIsAtomicUnderReconcilingRead(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	staleRun := uuid.New()
+	c, _ := seedTerminalFailedCampaign(crepo, &staleRun)
+
+	var observed campaignStatusBody
+	var observedOnce bool
+	crepo.afterReopen = func() {
+		if observedOnce {
+			return
+		}
+		observedOnce = true
+		observed = getCampaignStatusBody(t, s, c.ID)
+	}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:111","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !observedOnce {
+		t.Fatal("the reconciling read never fired — the interleaving was not exercised")
+	}
+
+	// (i) the read never saw a running campaign whose every item is terminal.
+	allTerminal := true
+	for _, it := range observed.Items {
+		switch campaign.ItemState(it.State) {
+		case campaign.ItemStateSucceeded, campaign.ItemStateFailed, campaign.ItemStateCancelled:
+		default:
+			allTerminal = false
+		}
+	}
+	if observed.Campaign.State == string(campaign.StateRunning) && allTerminal {
+		t.Errorf("reconciling read observed campaign=running with EVERY item terminal — the incoherent intermediate the single transaction exists to prevent (items=%+v)", observed.Items)
+	}
+	// The read saw the coherent post-commit pair: campaign running, item pending.
+	if observed.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("reconciling read campaign state = %q, want running", observed.Campaign.State)
+	}
+	var sawPending bool
+	for _, it := range observed.Items {
+		if it.IssueRef == "issue:111" {
+			sawPending = it.State == string(campaign.ItemStatePending) && it.RunID == nil
+		}
+	}
+	if !sawPending {
+		t.Errorf("reconciling read did not see issue:111 as pending+unlinked; items = %+v", observed.Items)
+	}
+	// (ii) the reconciling read did NOT derive the campaign back to failed.
+	if c.State == campaign.StateFailed {
+		t.Errorf("campaign state after the reconciling read = failed, want it to stay reopened")
+	}
+	// (iii) the outer start still completed coherently.
+	if c.State != campaign.StateRunning {
+		t.Errorf("end-state campaign = %q, want running", c.State)
+	}
+	items, _ := crepo.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	for _, it := range items {
+		if it.IssueRef == "issue:111" && it.State != campaign.ItemStateRunning {
+			t.Errorf("end-state item = %q, want running", it.State)
+		}
+	}
+}
+
+// TestStartCampaignItemRun_TerminalFailedCampaign_NonRestartableItemRefusedWithoutReopen
+// is the reopen-AFTER-the-DAG-gate ORDERING counterfactual vehicle: a failed
+// campaign whose named failed item is NOT restartable is refused at the DAG gate
+// with the campaign LEFT FAILED and the reopen primitive never called. Moving
+// the reopen ahead of the gate turns the reopenCalls==0 / still-failed
+// assertions RED.
+//
+// Two sub-cases cover both ways NextEligible leaves a failed item OUT of
+// Restartable: deps-unsatisfied, and autonomy:low (human-led).
+func TestStartCampaignItemRun_TerminalFailedCampaign_NonRestartableItemRefusedWithoutReopen(t *testing.T) {
+	cases := []struct {
+		name  string
+		items func() []*campaign.Item
+	}{
+		{
+			name: "deps unsatisfied",
+			items: func() []*campaign.Item {
+				// The dependency itself failed, so issue:201's deps are NOT satisfied
+				// and it stays in Failed rather than diverting to Restartable.
+				return []*campaign.Item{
+					cItem("issue:200", nil, campaign.ItemStateFailed),
+					cItem("issue:201", []string{"issue:200"}, campaign.ItemStateFailed),
+				}
+			},
+		},
+		{
+			name: "autonomy low (human-led)",
+			items: func() []*campaign.Item {
+				humanLed := cItem("issue:201", nil, campaign.ItemStateFailed)
+				humanLed.Autonomy = "low"
+				return []*campaign.Item{
+					cItem("issue:200", nil, campaign.ItemStateSucceeded),
+					humanLed,
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			s, _, aud := newCampaignStartServer(t, crepo)
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", tc.items())
+			c.State = campaign.StateFailed
+
+			w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:201","workflow_id":"feature_change","runner_kind":"local"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+			}
+			if code := decodeCampaignError(t, w); code != "item_not_eligible" {
+				t.Errorf("error code = %q, want item_not_eligible", code)
+			}
+			// THE ORDERING ASSERTIONS: the gate refused BEFORE any reopen.
+			if crepo.reopenCalls != 0 {
+				t.Errorf("reopenCalls = %d, want 0 — the DAG gate must refuse BEFORE the reopen", crepo.reopenCalls)
+			}
+			if c.State != campaign.StateFailed {
+				t.Errorf("campaign state = %q, want failed (left untouched by a refused start)", c.State)
+			}
+			if n := aud.count("campaign_advanced"); n != 0 {
+				t.Errorf("campaign_advanced count = %d, want 0", n)
+			}
+			if n := aud.count("campaign_issue_restarted"); n != 0 {
+				t.Errorf("campaign_issue_restarted count = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestStartCampaignItemRun_ClosedCampaignsStillRefuse pins the NARROWED
+// campaign-state gate: paused, cancelled and succeeded campaigns still refuse
+// 409 campaign_not_startable with no run minted, no state change and no audits —
+// only FAILED was admitted. The paused detail points at resume; the
+// cancelled/succeeded detail says the campaign is closed.
+func TestStartCampaignItemRun_ClosedCampaignsStillRefuse(t *testing.T) {
+	cases := []struct {
+		state          campaign.State
+		detailContains string
+	}{
+		{campaign.StatePaused, "fishhawk_resume_campaign"},
+		{campaign.StateCancelled, "closed"},
+		{campaign.StateSucceeded, "closed"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.state), func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			s, rrepo, aud := newCampaignStartServer(t, crepo)
+			item := cItem("issue:100", nil, campaign.ItemStateFailed)
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+			c.State = tc.state
+
+			w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+			}
+			code, details := decodeCampaignErrorDetails(t, w)
+			if code != "campaign_not_startable" {
+				t.Errorf("error code = %q, want campaign_not_startable", code)
+			}
+			if details["state"] != string(tc.state) {
+				t.Errorf("details.state = %v, want %q", details["state"], tc.state)
+			}
+			var env errorEnvelope
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode envelope: %v", err)
+			}
+			if !strings.Contains(env.Error.Message, tc.detailContains) {
+				t.Errorf("message = %q, want it to contain %q", env.Error.Message, tc.detailContains)
+			}
+			// Nothing happened.
+			if c.State != tc.state {
+				t.Errorf("campaign state = %q, want %q (unchanged)", c.State, tc.state)
+			}
+			if item.State != campaign.ItemStateFailed {
+				t.Errorf("item state = %q, want failed (unchanged)", item.State)
+			}
+			if crepo.reopenCalls != 0 || crepo.restartCalls != 0 {
+				t.Errorf("reopenCalls=%d restartCalls=%d, want 0/0", crepo.reopenCalls, crepo.restartCalls)
+			}
+			if n := len(rrepo.runs); n != 0 {
+				t.Errorf("runs minted = %d, want 0", n)
+			}
+			if n := aud.count("campaign_advanced") + aud.count("campaign_issue_restarted") + aud.count("campaign_issue_started"); n != 0 {
+				t.Errorf("audits emitted = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestStartCampaignItemRun_ReopenFailure_NoAuditNoStateChange pins the reopen
+// error arms. Each injected failure maps to its own status/code, and on EVERY
+// one of them BOTH audits are ABSENT, no run is minted, and both rows are
+// unchanged.
+func TestStartCampaignItemRun_ReopenFailure_NoAuditNoStateChange(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantErr  string
+	}{
+		{
+			name: "campaign left the failed state underneath us",
+			err: campaign.InvalidTransitionError{
+				Kind: "campaign", From: string(campaign.StateCancelled), To: string(campaign.StateRunning),
+			},
+			wantCode: http.StatusConflict,
+			wantErr:  "campaign_not_startable",
+		},
+		{
+			name: "item raced off its terminal state",
+			err: campaign.InvalidTransitionError{
+				Kind: "campaign_item", From: string(campaign.ItemStateRunning), To: string(campaign.ItemStatePending),
+			},
+			wantCode: http.StatusConflict,
+			wantErr:  "item_not_eligible",
+		},
+		{
+			// The campaign-shaped miss must NOT be reported under the item-shaped
+			// code (#2681 binding condition 3).
+			name:     "campaign row vanished",
+			err:      campaign.ErrCampaignNotFound,
+			wantCode: http.StatusNotFound,
+			wantErr:  "campaign_not_found",
+		},
+		{
+			name:     "item row vanished or belongs to another campaign",
+			err:      campaign.ErrCampaignItemNotFound,
+			wantCode: http.StatusNotFound,
+			wantErr:  "campaign_item_not_found",
+		},
+		{
+			name:     "unexpected repository failure",
+			err:      errInjected,
+			wantCode: http.StatusInternalServerError,
+			wantErr:  "internal_error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			s, rrepo, aud := newCampaignStartServer(t, crepo)
+			staleRun := uuid.New()
+			c, item := seedTerminalFailedCampaign(crepo, &staleRun)
+			crepo.reopenErr = tc.err
+
+			w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:111","workflow_id":"feature_change","runner_kind":"local"}`)
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantCode, w.Body.String())
+			}
+			if code := decodeCampaignError(t, w); code != tc.wantErr {
+				t.Errorf("error code = %q, want %q", code, tc.wantErr)
+			}
+			if crepo.reopenCalls != 1 {
+				t.Errorf("reopenCalls = %d, want 1 (the reopen branch was reached)", crepo.reopenCalls)
+			}
+			// ABSENCE assertions: no audit, no run, no state change.
+			if n := aud.count("campaign_advanced"); n != 0 {
+				t.Errorf("campaign_advanced count = %d, want 0", n)
+			}
+			if n := aud.count("campaign_issue_restarted"); n != 0 {
+				t.Errorf("campaign_issue_restarted count = %d, want 0", n)
+			}
+			if n := aud.count("campaign_issue_started"); n != 0 {
+				t.Errorf("campaign_issue_started count = %d, want 0", n)
+			}
+			if n := len(rrepo.runs); n != 0 {
+				t.Errorf("runs minted = %d, want 0", n)
+			}
+			if c.State != campaign.StateFailed {
+				t.Errorf("campaign state = %q, want failed (unchanged)", c.State)
+			}
+			if item.State != campaign.ItemStateFailed {
+				t.Errorf("item state = %q, want failed (unchanged)", item.State)
+			}
+		})
+	}
+}
+
+// TestStartCampaignItemRun_FailedCampaignNonRestartableAtGate_Refused pins the
+// DEFENSIVE guard between the DAG gate and the restart branch: a FAILED campaign
+// whose named item passes the gate as ELIGIBLE (not restartable) is refused
+// campaign_not_startable rather than minting a run inside a still-failed
+// campaign. Under DeriveState that pairing is unreachable (a failed campaign has
+// no non-terminal item), so the state is seeded BY CONSTRUCTION.
+func TestStartCampaignItemRun_FailedCampaignNonRestartableAtGate_Refused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	// Deliberately inconsistent with DeriveState: a FAILED campaign carrying a
+	// deps-satisfied PENDING item, which NextEligible classifies as Eligible.
+	item := cItem("issue:100", nil, campaign.ItemStatePending)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	c.State = campaign.StateFailed
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_not_startable" {
+		t.Errorf("error code = %q, want campaign_not_startable", code)
+	}
+	if crepo.reopenCalls != 0 || crepo.restartCalls != 0 {
+		t.Errorf("reopenCalls=%d restartCalls=%d, want 0/0", crepo.reopenCalls, crepo.restartCalls)
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0 (never mint inside a still-failed campaign)", n)
+	}
+	if c.State != campaign.StateFailed {
+		t.Errorf("campaign state = %q, want failed (unchanged)", c.State)
+	}
+	if n := aud.count("campaign_advanced"); n != 0 {
+		t.Errorf("campaign_advanced count = %d, want 0", n)
+	}
+}
+
+// TestStartCampaignItemRun_RunningCampaignUsesUnchangedRestartPath is the
+// no-regression pin for #1729/#1838: a RUNNING campaign with a restartable item
+// still takes RestartCampaignItem and never the new reopen primitive.
+func TestStartCampaignItemRun_RunningCampaignUsesUnchangedRestartPath(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, aud := newCampaignStartServer(t, crepo)
+	c, _ := seedRestartableCampaign(crepo) // seeded running by seedCampaignWithItems
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (the unchanged #1729/#1838 path)", crepo.restartCalls)
+	}
+	if crepo.reopenCalls != 0 {
+		t.Errorf("reopenCalls = %d, want 0 (a non-failed campaign never reopens)", crepo.reopenCalls)
+	}
+	if n := aud.count("campaign_advanced"); n != 0 {
+		t.Errorf("campaign_advanced count = %d, want 0 (no reopen edge on a running campaign)", n)
+	}
+	if n := aud.count("campaign_issue_restarted"); n != 1 {
+		t.Errorf("campaign_issue_restarted count = %d, want 1", n)
+	}
+}
+
+// TestComputeCampaignNextAction_TerminalCampaignReportsClosed pins the terminal
+// post-filter's observable mapping: for each terminal state, a partition that
+// would otherwise yield an actionable verb reports `closed` instead — EXCEPT the
+// two arms that are already truthful (failed + restartable keeps start_run;
+// all-done keeps complete). Non-terminal states are byte-identical to the base
+// computation, including PAUSED, which keeps advertising resume.
+func TestComputeCampaignNextAction_TerminalCampaignReportsClosed(t *testing.T) {
+	terminal := []campaign.State{campaign.StateFailed, campaign.StateCancelled, campaign.StateSucceeded}
+	partitions := []struct {
+		name string
+		elig campaign.Eligibility
+		ref  string
+	}{
+		{"would be start_run (eligible)", campaign.Eligibility{Eligible: []string{"issue:6"}}, "issue:6"},
+		{"would be attention", campaign.Eligibility{Failed: []string{"issue:10"}}, "issue:10"},
+		{"would be wait", campaign.Eligibility{Running: []string{"issue:7"}}, ""},
+		{"would be resume", campaign.Eligibility{Paused: []string{"issue:9"}}, "issue:9"},
+		{"would be attend_human_led", campaign.Eligibility{HumanLed: []string{"issue:12"}}, "issue:12"},
+	}
+	for _, state := range terminal {
+		for _, p := range partitions {
+			t.Run(string(state)+"/"+p.name, func(t *testing.T) {
+				got := computeCampaignNextAction(state, p.elig)
+				if got.Action != "closed" {
+					t.Fatalf("action = %q, want closed (a terminal campaign must not advertise a refused verb)", got.Action)
+				}
+				if got.IssueRef != p.ref {
+					t.Errorf("issue_ref = %q, want %q (the stranded ref is carried through)", got.IssueRef, p.ref)
+				}
+				if !strings.Contains(got.Detail, string(state)) {
+					t.Errorf("detail = %q, want it to name the terminal state %q", got.Detail, state)
+				}
+				if !strings.Contains(got.Detail, "fishhawk_start_run") {
+					t.Errorf("detail = %q, want it to point at driving the issue standalone", got.Detail)
+				}
+			})
+		}
+	}
+
+	// EXCEPTION 1: failed + restartable KEEPS start_run — the reopen makes it legal.
+	got := computeCampaignNextAction(campaign.StateFailed, campaign.Eligibility{
+		Done: []string{"issue:100"}, Restartable: []string{"issue:111"},
+	})
+	if got.Action != "start_run" || got.IssueRef != "issue:111" {
+		t.Errorf("failed+restartable = %+v, want start_run issue:111", got)
+	}
+	if !strings.Contains(got.Detail, "REOPENS") {
+		t.Errorf("failed+restartable detail = %q, want it to name the reopen", got.Detail)
+	}
+	// A restartable item under a CANCELLED or SUCCEEDED campaign has no legal
+	// verb (those verdicts are never undone), so it closes.
+	for _, state := range []campaign.State{campaign.StateCancelled, campaign.StateSucceeded} {
+		got := computeCampaignNextAction(state, campaign.Eligibility{Restartable: []string{"issue:111"}})
+		if got.Action != "closed" {
+			t.Errorf("%s+restartable action = %q, want closed", state, got.Action)
+		}
+	}
+
+	// EXCEPTION 2: all-done KEEPS complete (it advertises no verb at all).
+	got = computeCampaignNextAction(campaign.StateSucceeded, campaign.Eligibility{Done: []string{"issue:9"}})
+	if got.Action != "complete" {
+		t.Errorf("succeeded+all-done action = %q, want complete", got.Action)
+	}
+
+	// NON-terminal states are unfiltered. PAUSED in particular still advertises
+	// resume — correct, because resume is legal on a paused campaign (binding
+	// condition 1); reporting closed there would tell the operator to abandon a
+	// campaign that is one verb away from continuing.
+	for _, state := range []campaign.State{campaign.StatePending, campaign.StateRunning, campaign.StatePaused} {
+		got := computeCampaignNextAction(state, campaign.Eligibility{Paused: []string{"issue:9"}, Eligible: []string{"issue:6"}})
+		if got.Action != "resume" || got.IssueRef != "issue:9" {
+			t.Errorf("%s = %+v, want resume issue:9 (non-terminal is unfiltered)", state, got)
+		}
+	}
+}
+
+// TestCampaignStatus_AdvertisedActionIsLegal is the issue's general property:
+// for a matrix of (campaign state x item configuration) fixtures, compute the
+// status response and then ACTUALLY INVOKE the verb the advertised action names
+// against the same fixture, asserting the state machine does not refuse it.
+//
+// The `default:` arm FAILS on any action value the test has no arm for, so a
+// future added next_action cannot silently skip the invariant.
+//
+// Note the PAUSED row (binding condition 1): a paused campaign with leftover
+// work advertises `resume`, and this test proves that satisfies the invariant by
+// invoking POST /resume and asserting it is not refused campaign_not_paused —
+// rather than forcing `closed`, which would be the actual defect.
+func TestCampaignStatus_AdvertisedActionIsLegal(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      campaign.State
+		items      []*campaign.Item
+		startRef   string // the ref a start_run arm should POST
+		wantAction string // documents the expected advertisement; "" = don't pin
+	}{
+		{
+			name:       "running with an eligible item -> start_run",
+			state:      campaign.StateRunning,
+			items:      []*campaign.Item{cItem("issue:100", nil, campaign.ItemStatePending)},
+			startRef:   "issue:100",
+			wantAction: "start_run",
+		},
+		{
+			name:  "TERMINAL-FAILED with a restartable item -> start_run (the #2681 recovery)",
+			state: campaign.StateFailed,
+			items: []*campaign.Item{
+				cItem("issue:100", nil, campaign.ItemStateSucceeded),
+				cItem("issue:111", nil, campaign.ItemStateFailed),
+			},
+			startRef:   "issue:111",
+			wantAction: "start_run",
+		},
+		{
+			name:  "PAUSED with leftover work -> resume (legal: resume works on a paused campaign)",
+			state: campaign.StatePaused,
+			items: []*campaign.Item{
+				func() *campaign.Item {
+					it := cItem("issue:200", nil, campaign.ItemStatePaused)
+					it.PauseReason = &campaign.PauseReason{PageEvent: "campaign_gate_paged"}
+					return it
+				}(),
+				cItem("issue:201", nil, campaign.ItemStatePending),
+			},
+			wantAction: "resume",
+		},
+		{
+			name:  "CANCELLED with leftover work -> closed",
+			state: campaign.StateCancelled,
+			items: []*campaign.Item{
+				cItem("issue:300", nil, campaign.ItemStateSucceeded),
+				cItem("issue:301", nil, campaign.ItemStateFailed),
+			},
+			wantAction: "closed",
+		},
+		{
+			name:  "SUCCEEDED with every item done -> complete",
+			state: campaign.StateSucceeded,
+			items: []*campaign.Item{cItem("issue:400", nil, campaign.ItemStateSucceeded)},
+			// complete is the terminal no-verb advertisement.
+			wantAction: "complete",
+		},
+		{
+			name:  "running with only human-led work -> attend_human_led",
+			state: campaign.StateRunning,
+			items: []*campaign.Item{func() *campaign.Item {
+				it := cItem("issue:500", nil, campaign.ItemStatePending)
+				it.Autonomy = "low"
+				return it
+			}()},
+			wantAction: "attend_human_led",
+		},
+		{
+			name:       "running with work in flight -> wait",
+			state:      campaign.StateRunning,
+			items:      []*campaign.Item{cItem("issue:600", nil, campaign.ItemStateRunning)},
+			wantAction: "wait",
+		},
+		{
+			name:  "running with a stuck failed item -> attention",
+			state: campaign.StateRunning,
+			items: []*campaign.Item{
+				// 700 is in flight, so 701's dependency is UNSATISFIED — the failed
+				// item stays in Failed rather than diverting to Restartable.
+				func() *campaign.Item {
+					it := cItem("issue:700", nil, campaign.ItemStateRunning)
+					id := uuid.New()
+					it.RunID = &id
+					return it
+				}(),
+				cItem("issue:701", []string{"issue:700"}, campaign.ItemStateFailed),
+			},
+			wantAction: "attention",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			s, _, _ := newCampaignStartServer(t, crepo)
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", tc.items)
+			c.State = tc.state
+
+			st := getCampaignStatusBody(t, s, c.ID)
+			if tc.wantAction != "" && st.NextAction.Action != tc.wantAction {
+				t.Fatalf("next_action = %+v, want action %q", st.NextAction, tc.wantAction)
+			}
+
+			switch st.NextAction.Action {
+			case "start_run":
+				// INVOKE it: the state machine must not refuse the advertised verb.
+				w := postStartItemRun(t, s, c.ID,
+					fmt.Sprintf(`{"issue_ref":%q,"workflow_id":"feature_change","runner_kind":"local"}`, tc.startRef))
+				if w.Code == http.StatusConflict {
+					if code := decodeCampaignError(t, w); code == "campaign_not_startable" {
+						t.Fatalf("status advertised start_run on %s but the verb was refused campaign_not_startable (body=%s)", tc.startRef, w.Body.String())
+					}
+				}
+				if w.Code != http.StatusCreated {
+					t.Fatalf("advertised start_run was refused: status = %d (body=%s)", w.Code, w.Body.String())
+				}
+			case "resume":
+				// INVOKE it: a paused campaign's advertised resume must be accepted.
+				w := postResume(t, s, c.ID.String())
+				if w.Code == http.StatusConflict {
+					if code := decodeCampaignError(t, w); code == "campaign_not_paused" {
+						t.Fatalf("status advertised resume but the verb was refused campaign_not_paused (body=%s)", w.Body.String())
+					}
+				}
+				if w.Code != http.StatusOK {
+					t.Fatalf("advertised resume was refused: status = %d (body=%s)", w.Code, w.Body.String())
+				}
+			case "closed", "complete", "wait", "attention", "attend_human_led":
+				// These advertise only read-only polls or STANDALONE verbs outside the
+				// campaign state machine (fishhawk_get_campaign_status,
+				// fishhawk_get_run_status, fishhawk_start_run) — nothing the campaign
+				// gate can refuse. What must hold is the converse: the campaign-item
+				// verb they DON'T advertise is indeed refused, which is what makes the
+				// non-advertisement truthful rather than merely silent.
+				if st.NextAction.IssueRef != "" {
+					w := postStartItemRun(t, s, c.ID,
+						fmt.Sprintf(`{"issue_ref":%q,"workflow_id":"feature_change","runner_kind":"local"}`, st.NextAction.IssueRef))
+					if w.Code == http.StatusCreated {
+						t.Errorf("action %q named issue_ref %s but the campaign-item verb SUCCEEDED on it — it should have been advertised as start_run",
+							st.NextAction.Action, st.NextAction.IssueRef)
+					}
+				}
+			default:
+				t.Fatalf("next_action %q has no arm in this invariant test — add one (a new action must not silently skip the advertised-verb-is-legal check)", st.NextAction.Action)
+			}
+		})
 	}
 }
