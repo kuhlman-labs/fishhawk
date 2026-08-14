@@ -230,6 +230,44 @@ acceptance may short-circuit straight to one). Before dispatching it,
 settled-outcome-unknown recovery relies on). Confirm no verdict exists, then
 dispatch.
 
+### Stage stranded in `dispatched`/`running` (`fishhawk_reap_stage`)
+
+A stage can end up in `dispatched` or `running` with **no live runner**: the
+runner exited without settling and the reaper's own `/reap-failure` POST
+exhausted its bounded retry, or `run_children`'s spawn-error compensation failed
+to reach that endpoint. The tell is a stage that never advances while
+`fishhawk_get_run_status` keeps reporting it in-flight, and **four verbs refusing
+it**:
+
+- `fishhawk_retry_stage` — admits only a `failed` stage.
+- `fishhawk_revive_run` — admits only a terminal-`failed` run.
+- `fishhawk_fixup_stage` — the stage is not in a fix-up-able state.
+- `fishhawk_dispatch_stage` / `fishhawk_run_stage` — the sibling-in-flight guard
+  refuses a `running` target.
+
+**Recovery: `fishhawk_reap_stage(run_id, stage_id, category:"C")` →
+`fishhawk_retry_stage` → re-dispatch** (`fishhawk_dispatch_stage` /
+`fishhawk_run_stage`, or `fishhawk_run_children` for a decomposition child). The
+reap reports the stage `failed`/category-C — the retryable infrastructure class —
+which is exactly the state `fishhawk_retry_stage` admits. The server refuses the
+five protected PARK states (`awaiting_children`, `awaiting_approval`,
+`awaiting_input`, `awaiting_scope_decision`, `awaiting_host_dispatch`), so this
+can never destroy a live park; if you get that refusal, the stage is parked and
+needs the park's own verb, not a reap.
+
+For a `runner_kind:local` run the verb probes this host and **refuses** if a
+runner is still alive — wait for it to settle instead. For a
+`github_actions` / `gitlab_ci` run it reports `runner_liveness:"unknown"` with a
+warning: a host-local process probe says nothing about a remote runner, so
+confirm on the CI side before reaping.
+
+**Do NOT reach for `fishhawk_cancel_run` here — on a decomposition child it
+wedges the parent permanently.** `fishhawk_consolidate_slices` requires every
+child to have SUCCEEDED, and a cancelled child never can; nothing un-cancels a
+run. The verb now refuses a decomposition child (and refuses when it cannot read
+the run row to tell), with `orphan_parent_ok:true` as the deliberate,
+disclosed-in-the-output override.
+
 ### Decomposed-parent native path (`fishhawk_run_children` / `fishhawk_consolidate_slices`)
 
 When a plan is **decomposed** into child slices, the parent's implement stage

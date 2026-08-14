@@ -201,16 +201,21 @@ func TestGuardSiblingInFlight_SiblingDispatched_Blocks(t *testing.T) {
 }
 
 // The TARGET stage itself in "running" blocks (a live runner already owns it;
-// a second spawn would double-drive).
+// a second spawn would double-drive). Since #2689 the WORDING branches on the
+// host-liveness verdict, so this case pins the LIVE arm explicitly: a
+// runner_kind=local run whose probe finds a live process keeps the pre-#2689
+// double-drive text verbatim.
 func TestGuardSiblingInFlight_TargetRunning_Blocks(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
 	runID := uuid.New()
 	targetID := uuid.NewString()
+	fb.getRunByID[runID] = Run{ID: runID.String(), RunnerKind: driveRunnerKindLocal}
 	fb.stagesByRun[runID] = []Stage{
 		{ID: targetID, RunID: runID.String(), Type: "implement", State: "running"},
 	}
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerLive }
 
 	_, err := r.guardSiblingStageInFlight(context.Background(), runID, targetID)
 	if err == nil {
@@ -365,5 +370,79 @@ func TestGuardSiblingInFlight_ListError_FailsOpen(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(warnings, " "), "guard skipped") {
 		t.Errorf("warning should explain the guard was skipped, got %v", warnings)
+	}
+}
+
+// TestGuardSiblingStageInFlight_TargetRunningRefusesAcrossAllVerdicts is the
+// counterfactual vehicle for the #2689 message branch AND the pin on the single
+// most important safety property in that change: the target-'running' refusal is
+// UNCONDITIONAL across live / dead / unknown. Only the WORDING moves, so a
+// misclassified probe can change prose and never a permission — the guard can
+// never ADMIT a dispatch it would otherwise block.
+func TestGuardSiblingStageInFlight_TargetRunningRefusesAcrossAllVerdicts(t *testing.T) {
+	cases := []struct {
+		name        string
+		runnerKind  string
+		verdict     runnerLivenessVerdict
+		wantProbed  bool
+		wantsReap   bool
+		wantPhrases []string
+	}{
+		{
+			name: "live", runnerKind: driveRunnerKindLocal, verdict: runnerLive, wantProbed: true,
+			wantsReap: false, wantPhrases: []string{"double-drive", "Wait for it to settle"},
+		},
+		{
+			name: "dead", runnerKind: driveRunnerKindLocal, verdict: runnerDead, wantProbed: true,
+			wantsReap: true, wantPhrases: []string{"STRANDED", "fishhawk_reap_stage", "fishhawk_retry_stage"},
+		},
+		{
+			// A non-local runner_kind: classifyReapLiveness never probes and never
+			// says dead, so the guard takes the UNKNOWN wording.
+			name: "unknown", runnerKind: "github_actions", verdict: runnerDead, wantProbed: false,
+			wantsReap: true, wantPhrases: []string{"could not be verified", "fishhawk_reap_stage", "fishhawk_retry_stage"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			runID := uuid.New()
+			targetID := uuid.NewString()
+			fb.mu.Lock()
+			fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", RunnerKind: tc.runnerKind}
+			fb.stagesByRun[runID] = []Stage{
+				{ID: targetID, RunID: runID.String(), Type: "implement", State: "running"},
+			}
+			fb.mu.Unlock()
+			probed := 0
+			r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict {
+				probed++
+				return tc.verdict
+			}
+
+			warnings, err := r.guardSiblingStageInFlight(context.Background(), runID, targetID)
+			// THE INVARIANT: refused in ALL three verdicts.
+			if err == nil {
+				t.Fatalf("verdict %s ADMITTED a dispatch against a 'running' target — the refusal must be unconditional", tc.name)
+			}
+			if len(warnings) != 0 {
+				t.Errorf("a refusal carries no warnings; got %v", warnings)
+			}
+			if (probed > 0) != tc.wantProbed {
+				t.Errorf("probe invoked %d times, wantProbed=%v", probed, tc.wantProbed)
+			}
+			for _, want := range tc.wantPhrases {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("verdict %s message must contain %q: %v", tc.name, want, err)
+				}
+			}
+			// Only the dead/unknown wordings name the recovery; the live wording
+			// must NOT, because re-dispatching or reaping a live runner is exactly
+			// what the guard exists to prevent.
+			if got := strings.Contains(err.Error(), "fishhawk_reap_stage"); got != tc.wantsReap {
+				t.Errorf("verdict %s names fishhawk_reap_stage = %v, want %v: %v", tc.name, got, tc.wantsReap, err)
+			}
+		})
 	}
 }

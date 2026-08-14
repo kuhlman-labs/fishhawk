@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -79,8 +80,25 @@ func (r *runResolver) guardHostDispatch(ctx context.Context, runUUID uuid.UUID) 
 //     sibling runner is (or is about to be) live. Its whole ship phase is spent
 //     in "running"; the incident dispatched acceptance while implement was still
 //     shipping.
-//   - The TARGET stage itself in "running": BLOCK — a live runner already owns
-//     it; a second spawn would double-drive the stage.
+//   - The TARGET stage itself in "running": BLOCK — a second spawn would
+//     double-drive the stage. The refusal is UNCONDITIONAL; only its MESSAGE
+//     branches on the host runner-liveness verdict (#2689). Before #2689 this
+//     arm asserted "a live runner owns it" as a pure DB-state claim — precisely
+//     wrong in the strand case, where no runner exists at all and the operator
+//     was told to wait for a settle that can never come. Now classifyReapLiveness
+//     decides the wording: LIVE keeps the wait-for-it text; DEAD and UNKNOWN name
+//     fishhawk_reap_stage -> fishhawk_retry_stage -> re-dispatch as the recovery.
+//     Keeping the REFUSAL unconditional is the safety property: a probe
+//     misclassification can only change prose, never ADMIT a dispatch this guard
+//     would otherwise block. (Why the host-local probe is sound at THIS call site
+//     without the explicit runner_kind gate the reap verb needs: both callers
+//     run guardHostDispatch FIRST, which blocks a run locked to a known
+//     non-host-dispatched kind, and a stage reaches "running" only via a runner's
+//     signed prompt fetch — which is what LOCKS runner_kind. So a "running"
+//     target on a remote run is already refused upstream and this arm sees only
+//     local/unlocked runs. classifyReapLiveness gates on runner_kind anyway, so
+//     even that reasoning failing degrades to the UNKNOWN wording, never a false
+//     DEAD claim.)
 //   - The TARGET stage itself in "awaiting_children" (#1891): BLOCK — it is a
 //     decomposed parent's implement stage parked on its child slices. Spawning
 //     a runner here 409s (stage_not_runnable) and the reaper report would
@@ -132,9 +150,7 @@ func (r *runResolver) guardSiblingStageInFlight(ctx context.Context, runUUID uui
 			// (transitional dead-runner re-dispatch) — are allowed. Only a live
 			// "running" target blocks.
 			if s.State == "running" {
-				return nil, fmt.Errorf(
-					"stage %s (%s) is already running for run %s — a live runner owns it; dispatching again would double-drive the stage. Wait for it to settle before re-dispatching",
-					s.ID, s.Type, runUUID)
+				return nil, r.targetRunningRefusal(ctx, runUUID, s)
 			}
 			continue
 		}
@@ -145,4 +161,28 @@ func (r *runResolver) guardSiblingStageInFlight(ctx context.Context, runUUID uui
 		}
 	}
 	return nil, nil
+}
+
+// targetRunningRefusal renders the target-'running' refusal (#2689). The
+// refusal itself is UNCONDITIONAL — this function ALWAYS returns a non-nil
+// error, for every liveness verdict — and only the wording branches, so a
+// misclassified probe can never turn a block into an admission. LIVE keeps the
+// pre-#2689 wait-for-it-to-settle text; DEAD and UNKNOWN name the recovery
+// sequence the operator previously had to know by hand.
+func (r *runResolver) targetRunningRefusal(ctx context.Context, runUUID uuid.UUID, s Stage) error {
+	verdict, warnings := r.classifyReapLiveness(ctx, runUUID, s.ID)
+	switch verdict {
+	case runnerLive:
+		return fmt.Errorf(
+			"stage %s (%s) is already running for run %s — a live runner owns it; dispatching again would double-drive the stage. Wait for it to settle before re-dispatching",
+			s.ID, s.Type, runUUID)
+	case runnerDead:
+		return fmt.Errorf(
+			"stage %s (%s) is 'running' for run %s but NO process on this host carries stage id %s: the runner is GONE and the stage is STRANDED. Re-dispatching would not clear it. Recover with fishhawk_reap_stage (category C), then fishhawk_retry_stage, then re-dispatch",
+			s.ID, s.Type, runUUID, s.ID)
+	default: // runnerUnknown
+		return fmt.Errorf(
+			"stage %s (%s) is 'running' for run %s but runner liveness could not be verified from this host (%s). If no runner is alive the stage is STRANDED — recover with fishhawk_reap_stage (category C) then fishhawk_retry_stage; otherwise wait for it to settle before re-dispatching",
+			s.ID, s.Type, runUUID, strings.Join(warnings, "; "))
+	}
 }

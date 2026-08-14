@@ -582,11 +582,13 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		// endpoint this compensation just failed to reach — POST
 		// /v0/runs/{run_id}/stages/{stage_id}/reap-failure with category C —
 		// whose authority IS {dispatched, running}; once that lands the stage is
-		// 'failed' and fishhawk_retry_stage becomes applicable. There is no MCP
-		// verb for the reap, which is why the endpoint is named literally here.
+		// 'failed' and fishhawk_retry_stage becomes applicable. Since #2689 that
+		// endpoint HAS an MCP verb — fishhawk_reap_stage — so the warning
+		// prescribes the verb and keeps the literal endpoint only as the fallback
+		// for a client that has not picked it up yet.
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
-			"the category-C failure report ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Clear it by hand: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}, then fishhawk_retry_stage, then re-invoke fishhawk_run_children.",
-			rerr, r.api.baseURL, d.runID, d.stageID))
+			"the category-C failure report ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Recover with fishhawk_reap_stage(run_id:%q, stage_id:%q, category:\"C\"), then fishhawk_retry_stage, then re-invoke fishhawk_run_children. (Fallback for a client without that verb: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}.)",
+			rerr, d.runID, d.stageID, r.api.baseURL, d.runID, d.stageID))
 	}
 	return res
 }

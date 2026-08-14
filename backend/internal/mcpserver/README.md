@@ -190,7 +190,7 @@ Detached-spawn properties (differ deliberately from the synchronous `spawnRunner
 - **Output → a per-invocation log file** under `os.TempDir()` (`fishhawk-runner-<run>-<stage>-<unixnano>.log`), **never a pipe**: an unread pipe fills its kernel buffer and blocks the writer once full (#446). The runner ships its trace via `--upload-trace` and its state to the backend, so the local log is a diagnostic only. `log_path` is returned for that diagnostic.
 - **A reaper goroutine** (`reapDetachedRunner`) collects the child's exit so it never zombies while the tool returns, and converts two exit shapes into a backend report so the stage never sits stuck:
   - **Non-zero exit** (`*exec.ExitError`, #1747/#1763): parse the runner's `runner_failed` line from the log, report category C via the bounded-backoff `/reap-failure` POST (`reportDetachedFailureWithRetry`), and fall back to the stderr diagnostic + dispatch watchdog on exhaustion.
-  - **Zero-exit STRAND** (#2630): a clean exit is NOT proof the stage settled — the #2630 runner exited 0 having re-entered its completed PR-open short-circuit, opened no PR, and left its implement stage `running` forever with no verb short of `cancel_run`. `reapZeroExitStrand` probes the stage state (`detachedStageStateProbe`, reading `ListRunStages`) and reports a category-C strand ONLY when the state is STILL in the POSITIVE allow-list `reapStrandAllowList` = {`dispatched`, `running`} after a bounded settle window (`reapProbeBackoff`, which absorbs the exit race — a healthy runner exits within ms of the backend committing its terminal transition). The allow-list, NOT `!stageStateIsTerminal`, is load-bearing: `awaiting_scope_decision` / `awaiting_input` / `awaiting_children` / `awaiting_approval` / `awaiting_host_dispatch` are all non-terminal states a runner legitimately exits 0 into (a scope-completeness park, a clarification park, a decomposed parent, a gate, a child awaiting host dispatch), and reaping any would destroy a live park — the exact class `reap_failure.go` refuses server-side for `awaiting_children`. Fail OPEN on every uncertainty (a nil probe — the pre-#2630 no-op, any probe error, or a state outside the allow-list): report nothing and leave the dispatch watchdog as the backstop. A confirmed strand lands the stage `failed`, so `retry_stage` can recover it — converting a permanent strand into an ordinary failed stage.
+  - **Zero-exit STRAND** (#2630): a clean exit is NOT proof the stage settled — the #2630 runner exited 0 having re-entered its completed PR-open short-circuit, opened no PR, and left its implement stage `running` forever — which, before [#2689](https://github.com/kuhlman-labs/fishhawk/issues/2689), no verb short of `cancel_run` could clear (`fishhawk_reap_stage` is now that verb; see below). `reapZeroExitStrand` probes the stage state (`detachedStageStateProbe`, reading `ListRunStages`) and reports a category-C strand ONLY when the state is STILL in the POSITIVE allow-list `reapStrandAllowList` = {`dispatched`, `running`} after a bounded settle window (`reapProbeBackoff`, which absorbs the exit race — a healthy runner exits within ms of the backend committing its terminal transition). The allow-list, NOT `!stageStateIsTerminal`, is load-bearing: `awaiting_scope_decision` / `awaiting_input` / `awaiting_children` / `awaiting_approval` / `awaiting_host_dispatch` are all non-terminal states a runner legitimately exits 0 into (a scope-completeness park, a clarification park, a decomposed parent, a gate, a child awaiting host dispatch), and reaping any would destroy a live park — the exact class `reap_failure.go` refuses server-side for `awaiting_children`. Fail OPEN on every uncertainty (a nil probe — the pre-#2630 no-op, any probe error, or a state outside the allow-list): report nothing and leave the dispatch watchdog as the backstop. A confirmed strand lands the stage `failed`, so `retry_stage` can recover it — converting a permanent strand into an ordinary failed stage.
 
 **Testing note — the reaper is a concurrent reader ([#2687](https://github.com/kuhlman-labs/fishhawk/issues/2687)).** A test that real-spawns a detached runner also fires `reapZeroExitStrand`, whose attempt-0 probe reads `ListRunStages` immediately (no pre-sleep) — concurrently with whatever the handler reads. So ORDINAL fault injection against `GET /v0/runs/{id}/stages` (the shared fake's `stagesFailOnCall`) is INVALID under a real spawn: the two readers race for the injected 500 and which call consumes it is nondeterministic (the `TestDispatchStage_PostFetchFailureWarnsNoError` flake). Keep such a test single-reader — stub the spawn seam (`withStubbedDispatchSpawn`), or use a no-spawn path. Recorded but NOT fixed here: when the probe finds an allow-list state (`dispatched` — which the fake's host-dispatch marker sets), the reaper goroutine OUTLIVES its test — it sleeps `reapProbeBackoff` and re-probes (up to ~3.5s) — while reading the package vars `reapProbeBackoff`/`reapReportBackoff` that `run_stage_test.go`'s `zeroReapProbeBackoff`/`zeroReapBackoff` helpers WRITE under `t.Cleanup`; a full-package `-race` run whose ordering places a reaper-leaking dispatch test just before one of those helpers is a latent cross-test race, diagnosable from here rather than mystifying.
 
@@ -377,9 +377,13 @@ the permanent-strand class [#2630](https://github.com/kuhlman-labs/fishhawk/issu
   reaper. `fishhawk_retry_stage` does **not** clear it — `run.RetryStage` admits only a stage already in state
   `failed`, and refuses anything else `ErrRetryNotApplicable`. The verb that actually clears it is the reap-failure
   REST endpoint the compensation just failed to reach: `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` with
-  `{"category":"C","reason":"runner_spawn_failed"}`, after which `fishhawk_retry_stage` becomes applicable. There is no
-  MCP verb for the reap, which is why the second warning names the endpoint literally. This is a disclosed residual,
-  not a claimed recovery; `TestRunChildren_FailedCompensationDisclosesStrand` pins the honest behaviour.
+  `{"category":"C","reason":"runner_spawn_failed"}`, after which `fishhawk_retry_stage` becomes applicable. Since
+  [#2689](https://github.com/kuhlman-labs/fishhawk/issues/2689) that endpoint HAS an MCP verb —
+  **`fishhawk_reap_stage`** — so the second warning now prescribes
+  `fishhawk_reap_stage` → `fishhawk_retry_stage` → re-invoke `fishhawk_run_children`, keeping the literal endpoint only
+  as the fallback for a client that has not picked the verb up. This is still a disclosed residual, not a claimed
+  recovery; `TestRunChildren_FailedCompensationDisclosesStrand` pins the honest behaviour and the recovery the warning
+  names.
 
 **Pre-existing, unfixed, and stated plainly:** `fishhawk_dispatch_stage` has the SAME uncompensated shape today — it
 marks the host dispatch, spawns, and returns a spawn error bare, leaving the single stage `dispatched` with no runner.
@@ -710,6 +714,53 @@ Idempotence (**endpoint-side, #1954**):
 Statuses: `merged` (a `pr_merged` / `post_merge_observed` entry landed past the anchor; `next_action` carries the operator post-merge dev-host step, **surfaced not invoked** — ADR-038), `timeout` (resumable — re-invoke; the endpoint's idempotence makes the re-POST safe), `run_terminal` (the run reached failed/cancelled while waiting — the merge will most likely never settle; check `fishhawk_get_run_status`).
 
 A **write** tool needing `write:approvals`; a run-bound agent token is rejected (`run_token_forbidden`, 403). `next_actions`' merge-ritual states (`succeeded_pr_open`, the acceptance-skipped/passed states, and the drive-folded `awaiting_merge`) now emit `approve_pr` then `fishhawk_merge_run`, replacing the bare `merge_pr` + `post_merge` steps. For the drive-folded `awaiting_merge` action, `driveAction` passes the backend's `next_action.detail` through verbatim as the folded merge action's `reason`, so the operator sees the backend's advisory qualification (any outstanding reviewer rejects / open concerns — [#2487](https://github.com/kuhlman-labs/fishhawk/issues/2487)); the action's precondition no longer makes an unconditional "every gate resolved and required checks green" all-clear claim and instead points the reader at that reason/detail.
+
+## Stranded-stage reap (`fishhawk_reap_stage`, [E67.47 / #2689](https://github.com/kuhlman-labs/fishhawk/issues/2689))
+
+`fishhawk_reap_stage` is a **thin MCP verb over the EXISTING** `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure`
+endpoint, through the existing `apiClient.ReportStageFailure`. No new REST route, no schema change, no server-side
+change: the **server keeps sole authority** over what may be reaped (`reapProtectedParkStates` is a closed allow-list of
+five PARK states; the reaper's authority is exactly `{dispatched, running}`), and a protected-park refusal, a `404
+stage_not_found` and a `403 insufficient_scope` all surface verbatim.
+
+It exists because a stage stranded in `dispatched`/`running` with no live runner was recoverable **only** by
+hand-POSTing that endpoint: `fishhawk_retry_stage` admits only a `failed` stage, `fishhawk_revive_run` only a
+terminal-FAILED run, and `fishhawk_fixup_stage` / `fishhawk_dispatch_stage` both refuse. `fishhawk_cancel_run` was a
+**trap** on a decomposition child (see below). Two residual strand paths produce that state even after
+[#2363](https://github.com/kuhlman-labs/fishhawk/issues/2363)'s option 4(a): `run_children`'s spawn-error compensation
+when the category-C report ITSELF fails, and the reaper's `reportDetachedFailureWithRetry` exhausting its bounded
+backoff. Recovery sequence: **`fishhawk_reap_stage` → `fishhawk_retry_stage` → re-dispatch**.
+
+Inputs: `run_id` + `stage_id` (required), `category` (B or C, default C — enforced LOCALLY with the verb's own message,
+never a copy of the server's 400 text), `reason` (default `operator_reap_stranded_stage`), `detail`, `exit_code`.
+Output: `transitioned`, `stage_state`, `runner_liveness`, `next_step`, `warnings`.
+
+**The liveness probe is GATED on `runner_kind`, and its invariant is narrow — stated as such rather than overclaimed.**
+`classifyReapLiveness` never returns `dead` outside the local arm:
+
+| `runner_kind` | probe runs? | verdict | note |
+|---|---|---|---|
+| `local` | yes (`probeRunnerLiveness`, the shared `driveProbeRunnerLiveness` seam) | the probe's verbatim `live`/`dead`/`unknown` | `live` **REFUSES** the reap outright, before any HTTP hop |
+| `github_actions`, `gitlab_ci`, any other non-empty kind | **no** | `unknown` | a host-local `pgrep` is INAPPLICABLE; warning says liveness is unverifiable from this host |
+| absent (`""`, an older backend's `omitempty`) | **no** | `unknown` | an absent kind cannot be confirmed local; "never DEAD" is the safe direction |
+| unreadable (GetRun error) | **no** | `unknown` | warning names the run and the read error |
+
+So the guarantee is: **it prevents reaping a live stage THIS HOST SPAWNED**. For a remote runner it rests on the
+operator's explicit invocation plus the server-side protected-park allow-list, and says so in `warnings`.
+
+`guardSiblingStageInFlight`'s target-`running` arm reuses the same classification, **message-only**: the refusal stays
+UNCONDITIONAL across `live`/`dead`/`unknown` and only the wording changes (`dead`/`unknown` now name
+`fishhawk_reap_stage` → `fishhawk_retry_stage` → re-dispatch instead of asserting "a live runner owns it" in exactly the
+case where none does). Keeping the refusal unconditional is what makes a probe misclassification able to change prose
+and never a permission — `TestGuardSiblingStageInFlight_TargetRunningRefusesAcrossAllVerdicts` pins it.
+
+**`fishhawk_cancel_run` gained a FAIL-CLOSED decomposition-child guard in the same change.** Cancelling a child
+permanently wedges its parent — `fishhawk_consolidate_slices` requires every child to have SUCCEEDED, which a cancelled
+child never can, and no verb un-cancels a run. So `cancelRun` reads the run row first and REFUSES a child; an
+**unreadable** row also refuses, deliberately the opposite posture from `guardHostDispatch` /
+`guardSiblingStageInFlight`, which fail OPEN because they guard a non-destructive dispatch decision where failing open
+costs at most a retry. `orphan_parent_ok:true` is the single documented override for both refusals and surfaces a
+warning naming the orphaned parent.
 
 ## Paged-acceptance discharge (`fishhawk_arbitrate_acceptance`)
 
