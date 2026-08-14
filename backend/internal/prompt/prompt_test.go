@@ -1693,10 +1693,15 @@ func TestBuild_Plan_PriorRejectionFeedback_OverCap_ExplicitElisionMarker(t *test
 		"ELIDED",
 		"INCOMPLETE",
 		strconv.Itoa(original), // original byte count
-		strconv.Itoa(original - MaxRejectionFeedbackBytes), // dropped byte count
-		strconv.Itoa(MaxRejectionFeedbackBytes),            // the cap
-		runID,                                              // concrete retrieval pointer
-		"rejection_comment",                                // the payload key to read
+		// The dropped-byte count is anchored to the marker's "%d bytes dropped"
+		// phrase, NOT a bare strconv.Itoa(300): "300" is a substring of the
+		// original count "12300", so a bare want would still pass if the
+		// composition dropped the count element entirely. The phrase keeps the
+		// counterfactual for this element attainable.
+		strconv.Itoa(original-MaxRejectionFeedbackBytes) + " bytes dropped", // dropped byte count
+		strconv.Itoa(MaxRejectionFeedbackBytes),                             // the cap
+		runID,                                                               // concrete retrieval pointer
+		"rejection_comment",                                                 // the payload key to read
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -7950,7 +7955,10 @@ func TestCapTextWithRetrieval_BoundaryAndMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("CapTextWithRetrieval(over-cap) ok=false, want true")
 	}
-	for _, w := range []string{"ELIDED", "INCOMPLETE", pointer, strconv.Itoa(len(over)), strconv.Itoa(max)} {
+	// The dropped-byte count is anchored to the marker's "%d bytes dropped"
+	// phrase: a bare "40" want would be a substring of the original count "140"
+	// and pass even if the composition dropped the count element.
+	for _, w := range []string{"ELIDED", "INCOMPLETE", pointer, strconv.Itoa(len(over)), strconv.Itoa(max), strconv.Itoa(len(over)-max) + " bytes dropped"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("marker missing %q: %q", w, got)
 		}
