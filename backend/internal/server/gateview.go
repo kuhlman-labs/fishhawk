@@ -85,6 +85,39 @@ type gateViewConcern struct {
 	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
 	Fixups            []gateViewFixup      `json:"fixups,omitempty"`
 	Resolutions       []gateViewResolution `json:"resolutions,omitempty"`
+	// Disputed reports that a reviewer recorded a `confirmed` resolution on
+	// this concern and the concern is STILL OPEN (E48.103 / #2551) — the
+	// split resolve/reject the merge gate must not settle silently.
+	//
+	// It is derived from the DURABLE evidence: this row's own open state plus
+	// the authoritative implement_reviewed / plan_reviewed payload that carries
+	// the confirmation. That derivation is deliberately independent of the
+	// best-effort concern_resolution_vetoed audit entry, so a failed veto
+	// append degrades the dispute's DETAIL (an empty Disputes) and never its
+	// visibility. A concern confirmed and then reopened by a later round also
+	// reads as disputed, which is the same operator-visible fact: a
+	// confirmation is on record that did not settle it.
+	Disputed bool `json:"disputed"`
+	// Disputes carries the recorded veto detail — why the confirmation was
+	// refused, and by/against which reviewer. Enrichment over Disputed: it can
+	// be empty on a disputed concern when the (best-effort) veto append failed.
+	Disputes []gateViewDispute `json:"disputes,omitempty"`
+}
+
+// gateViewDispute is one refused `confirmed` resolution, reconstructed from a
+// concern_resolution_vetoed audit entry (E48.103 / #2551).
+type gateViewDispute struct {
+	Sequence int64 `json:"sequence"`
+	// Round is derived as for gateViewResolution.Round (the veto is recorded on
+	// the implement stage, so the fix-up-round convention applies).
+	Round int `json:"round,omitempty"`
+	// VetoReason is one of raiser_rejected_same_round | operator_evidence_routed
+	// | fixup_pass_no_changes | evidence_lookup_failed.
+	VetoReason              string `json:"veto_reason"`
+	Resolution              string `json:"resolution,omitempty"`
+	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
+	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
+	Note                    string `json:"note,omitempty"`
 }
 
 // gateViewFixup is one fix-up routing claim reconstructed from the
@@ -181,6 +214,7 @@ var gateViewHistoryCategories = []string{
 	"implement_reviewed",
 	"plan_reviewed",
 	concernRelitigationSuppressedCategory,
+	concernResolutionVetoedCategory,
 }
 
 // scopeGateViewRead is the read scope a non-mcp caller must hold to read the
@@ -333,6 +367,13 @@ type gateViewHistory struct {
 	outcomes    []gateViewOutcome
 	resolutions []gateViewReviewResolution
 	suppressed  []gateViewSuppressedRelitig
+	vetoes      []gateViewVeto
+}
+
+type gateViewVeto struct {
+	sequence  int64
+	concernID string
+	payload   concernResolutionVetoedPayload
 }
 
 type gateViewTrigger struct {
@@ -446,6 +487,18 @@ func (s *Server) loadGateViewHistory(ctx context.Context, runID uuid.UUID, resp 
 		}
 		h.suppressed = append(h.suppressed, gateViewSuppressedRelitig(p))
 	}
+	for _, e := range byCategory[concernResolutionVetoedCategory] {
+		var p concernResolutionVetoedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			s.warnGateViewPayload(runID, concernResolutionVetoedCategory, e.Sequence, err)
+			continue
+		}
+		h.vetoes = append(h.vetoes, gateViewVeto{
+			sequence:  e.Sequence,
+			concernID: p.ConcernID,
+			payload:   p,
+		})
+	}
 	return h
 }
 
@@ -506,6 +559,30 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 			gr.Round = gateViewRound(h.triggers, c.StageID, res.sequence)
 		}
 		out.Resolutions = append(out.Resolutions, gr)
+		// A recorded confirmation on a concern that is STILL OPEN is the
+		// dispute (E48.103 / #2551) — derived here from the durable row plus
+		// the authoritative review payload, NOT from the best-effort veto
+		// entry, so the merge gate can never render a confident no-dispute
+		// view because a bookkeeping append failed.
+		if res.resolution == "confirmed" {
+			out.Disputed = true
+		}
+	}
+
+	for _, v := range h.vetoes {
+		if v.concernID != idStr {
+			continue
+		}
+		out.Disputed = true
+		out.Disputes = append(out.Disputes, gateViewDispute{
+			Sequence:                v.sequence,
+			Round:                   gateViewRound(h.triggers, c.StageID, v.sequence),
+			VetoReason:              v.payload.VetoReason,
+			Resolution:              v.payload.Resolution,
+			ConfirmingReviewerModel: v.payload.ConfirmingReviewerModel,
+			RaisingReviewerModel:    v.payload.RaisingReviewerModel,
+			Note:                    v.payload.Note,
+		})
 	}
 	return out
 }

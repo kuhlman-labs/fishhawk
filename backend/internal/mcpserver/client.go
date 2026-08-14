@@ -396,6 +396,30 @@ type GateViewConcern struct {
 	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
 	Fixups            []GateViewFixup      `json:"fixups,omitempty"`
 	Resolutions       []GateViewResolution `json:"resolutions,omitempty"`
+	// Disputed / Disputes mirror the server's gateViewConcern (E48.103 /
+	// #2551): a `confirmed` resolution was recorded on this concern and it is
+	// STILL OPEN. Disputed is derived server-side from the durable concern row
+	// plus the authoritative review payload, so it can be true with an EMPTY
+	// Disputes when the (best-effort) veto record did not land. Same json-tag
+	// byte-match rule as the fields above.
+	Disputed bool              `json:"disputed"`
+	Disputes []gateViewDispute `json:"disputes,omitempty"`
+}
+
+// gateViewDispute is one refused `confirmed` resolution: why the confirmation
+// was vetoed, and by/against which reviewer (E48.103 / #2551). Deliberately
+// UNEXPORTED — the MCP jsonschema reflection walks it through the exported
+// Disputes field either way, and this package's exported surface is pinned by
+// exportBaseline (export_surface_test.go), which no new type should widen for
+// a nested payload shape.
+type gateViewDispute struct {
+	Sequence                int64  `json:"sequence"`
+	Round                   int    `json:"round,omitempty"`
+	VetoReason              string `json:"veto_reason"`
+	Resolution              string `json:"resolution,omitempty"`
+	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
+	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
+	Note                    string `json:"note,omitempty"`
 }
 
 // GateViewFixup is one fix-up routing claim joined to its outcome.
@@ -1302,6 +1326,11 @@ type fixupRequest struct {
 	// back to the agent with NO pre-existing review concern (#1311). omitempty:
 	// the common fix-up omits it and addresses recorded concerns instead.
 	OperatorConcern string `json:"operator_concern,omitempty"`
+	// OperatorEvidence declares that the OPERATOR executed a reproduction of
+	// the concerns this pass routes back (E48.103 / #2551), making the operator
+	// the authority a reviewer confirmation alone cannot override. omitempty:
+	// an unset value leaves the request body byte-identical.
+	OperatorEvidence string `json:"operator_evidence,omitempty"`
 }
 
 // FixupStage routes one or more advisory implement-review concerns back
@@ -1343,8 +1372,14 @@ type fixupRequest struct {
 // operatorConcern is the optional free-text operator instruction routed back
 // to the agent with NO pre-existing review concern (#1311); empty addresses
 // recorded concerns instead.
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool, implementModel, operatorConcern string) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass, ImplementModel: implementModel, OperatorConcern: operatorConcern})
+// operatorEvidence declares the operator executed a reproduction of the routed
+// concerns (E48.103 / #2551): those concerns can then no longer be retired by a
+// reviewer's `confirmed` delta-verification verdict — only by a waive, a defer,
+// or a genuine fix. 400 validation_failed on a whitespace-only or over-length
+// (>4000 byte) value; it is NOT a selection input, so it does not by itself
+// satisfy the at-least-one-of concern selection rule.
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool, implementModel, operatorConcern, operatorEvidence string) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass, ImplementModel: implementModel, OperatorConcern: operatorConcern, OperatorEvidence: operatorEvidence})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}

@@ -366,3 +366,109 @@ func TestGetGateView_ConcernEvidenceWireDecode(t *testing.T) {
 		t.Errorf("settled concern settled_ref = %q, want %q", got, settledRef)
 	}
 }
+
+// TestGetGateView_DisputesDecodeFromBackendShape is the json-tag byte-match
+// guard for the dispute fields (E48.103 / #2551): the payload is authored as
+// RAW backend-shaped JSON (the server's key names, not this package's Go
+// struct), so a tag typo on GateViewConcern.Disputed / .Disputes or on any
+// gateViewDispute field decodes to a zero value and reddens this test.
+func TestGetGateView_DisputesDecodeFromBackendShape(t *testing.T) {
+	runID := uuid.New()
+	concernID := uuid.New().String()
+	raw := json.RawMessage(`{
+      "run_id": "` + runID.String() + `",
+      "open": [{
+        "id": "` + concernID + `",
+        "stage_kind": "implement",
+        "origin_review_sequence": 30,
+        "reviewer_model": "gpt-5.6-sol",
+        "severity": "high",
+        "category": "authz",
+        "state": "addressed_pending",
+        "note": "` + gateViewNote96Plus + `",
+        "has_suggested_patch": false,
+        "disputed": true,
+        "disputes": [{
+          "sequence": 41,
+          "round": 2,
+          "veto_reason": "raiser_rejected_same_round",
+          "resolution": "confirmed",
+          "confirming_reviewer_model": "fable-5",
+          "raising_reviewer_model": "gpt-5.6-sol",
+          "note": "reads fixed to me"
+        }]
+      }],
+      "settled": [],
+      "suppressed_relitigations": [],
+      "history_incomplete": false
+    }`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal StructuredContent: %v", err)
+	}
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	if decoded.GateView == nil || len(decoded.GateView.Open) != 1 {
+		t.Fatalf("open did not round-trip: %+v", decoded.GateView)
+	}
+	got := decoded.GateView.Open[0]
+	if !got.Disputed {
+		t.Error("disputed = false, want true (a json-tag mismatch silently zeroes it)")
+	}
+	if len(got.Disputes) != 1 {
+		t.Fatalf("disputes = %+v, want exactly one", got.Disputes)
+	}
+	d := got.Disputes[0]
+	if d.VetoReason != "raiser_rejected_same_round" || d.ConfirmingReviewerModel != "fable-5" ||
+		d.RaisingReviewerModel != "gpt-5.6-sol" || d.Resolution != "confirmed" ||
+		d.Sequence != 41 || d.Round != 2 || d.Note != "reads fixed to me" {
+		t.Errorf("dispute = %+v, want every field decoded from the backend-shaped payload", d)
+	}
+}
+
+// TestGetGateView_NoDisputes_RendersFalse is the negative control: a
+// backend-shaped payload with no dispute keys decodes to disputed=false with
+// no disputes, so the assertion above discriminates.
+func TestGetGateView_NoDisputes_RendersFalse(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{
+      "run_id": "` + runID.String() + `",
+      "open": [{
+        "id": "` + uuid.New().String() + `",
+        "stage_kind": "implement",
+        "origin_review_sequence": 30,
+        "severity": "high",
+        "category": "authz",
+        "state": "raised",
+        "note": "plain open concern",
+        "has_suggested_patch": false,
+        "disputed": false
+      }],
+      "settled": [],
+      "suppressed_relitigations": [],
+      "history_incomplete": false
+    }`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	got := decoded.GateView.Open[0]
+	if got.Disputed || len(got.Disputes) != 0 {
+		t.Errorf("disputed = %v disputes = %+v, want a clean undisputed render", got.Disputed, got.Disputes)
+	}
+}

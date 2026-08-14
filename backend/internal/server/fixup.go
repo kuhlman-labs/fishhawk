@@ -124,6 +124,19 @@ type fixupRequest struct {
 	// the agent does not address it. The mint is best-effort — a nil store or an
 	// insert failure degrades to the pre-#2623 untracked delivery.
 	OperatorConcern string `json:"operator_concern"`
+	// OperatorEvidence declares that the OPERATOR executed a reproduction of
+	// the concern(s) this pass routes back (E48.103 / #2551). Its meaning is
+	// AUTHORITY, not prose delivery: the reproduction text still reaches the
+	// agent via `reason` (or `operator_concern`); this field records that the
+	// operator — who can execute the code, which a reviewer reading a diff
+	// cannot — stands behind the finding. Every concern routed by a pass
+	// carrying it is therefore exempt from reviewer-confirmation auto-resolve:
+	// a later `confirmed` delta-verification verdict is VETOED
+	// (operator_evidence_routed) and the concern stays open until the operator
+	// waives, defers, or a fix-up genuinely resolves it. It is NOT a selection
+	// input — supplying it alone does not satisfy the at-least-one-of rule
+	// above. Empty (the default) leaves every path byte-identical.
+	OperatorEvidence string `json:"operator_evidence"`
 	// ForceAdditionalPass is the bounded operator override (#860): when
 	// true it grants ONE fix-up pass beyond the normal budget
 	// (defaultMaxFixupPasses), hard-capped at defaultFixupCeiling total
@@ -263,6 +276,27 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				fmt.Sprintf("operator_concern is %d bytes; the maximum is %d (it must not be silently truncated as a binding instruction)", len(operatorConcern), maxOperatorConcernBytes),
 				map[string]any{"field": "operator_concern"})
+			return
+		}
+	}
+	// Validate the optional operator-evidence declaration (E48.103 / #2551) the
+	// same way and for the same reason: it changes whether a reviewer
+	// confirmation can retire the routed concerns, so a whitespace-only or
+	// over-length value fails LOUD rather than being silently dropped or
+	// truncated. It is NOT a selection input, so it is validated BEFORE — and
+	// deliberately not counted by — the at-least-one guard below.
+	operatorEvidence := strings.TrimSpace(reqBody.OperatorEvidence)
+	if reqBody.OperatorEvidence != "" {
+		if operatorEvidence == "" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"operator_evidence must not be whitespace-only",
+				map[string]any{"field": "operator_evidence"})
+			return
+		}
+		if len(operatorEvidence) > maxOperatorConcernBytes {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				fmt.Sprintf("operator_evidence is %d bytes; the maximum is %d (it must not be silently truncated as a binding authority declaration)", len(operatorEvidence), maxOperatorConcernBytes),
+				map[string]any{"field": "operator_evidence"})
 			return
 		}
 	}
@@ -546,16 +580,17 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			ForceAdditionalPass: reqBody.ForceAdditionalPass,
 			HardCeiling:         defaultFixupCeiling,
 		},
-		Selected:        selected,
-		ConcernIDs:      concernIDs,
-		Indices:         reqBody.Concerns,
-		Reason:          reqBody.Reason,
-		AllowCreate:     allowCreate,
-		PriorPasses:     priorPasses,
-		RefundedPasses:  refundedPasses,
-		DelegatedRule:   delegatedRule,
-		PinModel:        pinModel,
-		OperatorConcern: operatorConcern,
+		Selected:         selected,
+		ConcernIDs:       concernIDs,
+		Indices:          reqBody.Concerns,
+		Reason:           reqBody.Reason,
+		AllowCreate:      allowCreate,
+		PriorPasses:      priorPasses,
+		RefundedPasses:   refundedPasses,
+		DelegatedRule:    delegatedRule,
+		PinModel:         pinModel,
+		OperatorConcern:  operatorConcern,
+		OperatorEvidence: operatorEvidence,
 	})
 	if err != nil {
 		switch {
@@ -618,6 +653,12 @@ type fixupActionParams struct {
 	DelegatedRule   string
 	PinModel        *ResolvedModel
 	OperatorConcern string
+	// OperatorEvidence is the operator's reproduction-executed declaration for
+	// THIS pass (E48.103 / #2551), recorded on the stage_fixup_triggered
+	// payload so the later re-review's veto pass can read it back. Empty for
+	// every non-HTTP caller (acceptance triage, campaign auto-drive), keeping
+	// their payloads byte-identical.
+	OperatorEvidence string
 }
 
 // fixupStageAs performs the gate-action core of POST /v0/stages/{id}/fixup
@@ -666,7 +707,7 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// (now including any minted operator-concern id) rides `concern_ids`; the
 	// minted id is ALSO recorded on its own `operator_concern_id` key so the
 	// gate-view fixups[] join attributes the pass to the operator concern.
-	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID)
+	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's fix-up reason as state_reason. AFTER the
@@ -1097,7 +1138,7 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // `concerns` field. The mint is best-effort, so operatorConcernID is uuid.Nil
 // (and the key omitted) when the mint degraded. Best-effort: the transition is
 // already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID) {
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -1181,6 +1222,13 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 	// byte-identical on the nil-store / insert-failure path.
 	if operatorConcernID != uuid.Nil {
 		fields["operator_concern_id"] = operatorConcernID.String()
+	}
+	// E48.103 / #2551: the operator's reproduction-executed declaration for this
+	// pass. Recorded ONLY when non-empty so every pre-#2551 payload stays
+	// byte-identical; the implement re-review's veto pass reads this key back to
+	// refuse a reviewer `confirmed` on the concerns this pass routed.
+	if operatorEvidence != "" {
+		fields["operator_evidence"] = operatorEvidence
 	}
 
 	payload, _ := json.Marshal(fields)
