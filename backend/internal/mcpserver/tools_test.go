@@ -279,6 +279,21 @@ type fakeBackend struct {
 	hostDispatchWaveNotIntegrated map[string]bool
 	reapFailureByStage            map[uuid.UUID][]reapFailureRequest
 	reapFailureStatus             int
+	// reapFailureErrBody, when set, is written verbatim on a non-200 instead of
+	// the generic internal_error body, so a test can drive the endpoint's real
+	// refusal CODES (404 stage_not_found, the protected-park refusal) and assert
+	// they reach the operator unchanged (#2689).
+	reapFailureErrBody string
+	// reapFailureRespBody, when set, is written verbatim on the 200 instead of
+	// the default {transitioned:true,stage_state:"failed"} — the seam for the
+	// endpoint's IDEMPOTENT no-op shape against an already-terminal stage.
+	reapFailureRespBody string
+	// reapFailureAttempts counts EVERY reap-failure POST the fake received,
+	// including the ones it answered non-200 (#2689). reapFailureByStage records
+	// only the accepted bodies, so it cannot express "the detached reaper's
+	// bounded-backoff retry loop exhausted" — the residual-strand path the
+	// operator verb exists to recover. This counter can.
+	reapFailureAttempts int
 	// decideFlipsListStatus makes the amendment decision POST also update the
 	// matching row in amendmentsByRun, so a modelled child polling
 	// ListScopeAmendments observes the decision land. Opt-in: the existing
@@ -817,7 +832,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		var body reapFailureRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		fb.mu.Lock()
+		fb.reapFailureAttempts++
 		status := fb.reapFailureStatus
+		errBody := fb.reapFailureErrBody
+		respBody := fb.reapFailureRespBody
 		if status == 0 || status == http.StatusOK {
 			fb.reapFailureByStage[id] = append(fb.reapFailureByStage[id], body)
 			// Model the reaper's authority over {dispatched, running}: the stage
@@ -834,7 +852,15 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		if status != 0 && status != http.StatusOK {
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"reap-failure boom"}}`))
+			if errBody != "" {
+				_, _ = w.Write([]byte(errBody))
+			} else {
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"reap-failure boom"}}`))
+			}
+			return
+		}
+		if respBody != "" {
+			_, _ = w.Write([]byte(respBody))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
@@ -986,7 +1012,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		status := fb.amendmentsStatus
 		errBody := fb.amendmentsErrBody
-		items := fb.amendmentsByRun[id]
+		// Copy the elements, not just the slice header: the decision handler
+		// mutates items[i].Status in place under the same lock, so encoding the
+		// shared backing array after Unlock races with a concurrent decision.
+		items := append([]ScopeAmendmentItem(nil), fb.amendmentsByRun[id]...)
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
@@ -2884,7 +2913,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E25.20 (#2355) adds exactly ONE tool — fishhawk_cancel_campaign, the
 	// operator clean-shutdown of an abandoned/rebuilt campaign that marks it and
 	// its unfinished items cancelled — taking the total 47 -> 48.
-	const wantToolCount = 49
+	//
+	// E67.47 (#2689) adds exactly ONE tool — fishhawk_reap_stage, the
+	// operator-reachable reap of a stage stranded in dispatched/running that
+	// retry_stage / revive_run / fixup_stage / dispatch_stage all refuse —
+	// taking the total 49 -> 50.
+	const wantToolCount = 50
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -2937,6 +2971,27 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	for _, want := range []string{"AUTO-ROUTED", "NOT a re-run", "NOT a pass", "acceptance_arbitrated"} {
 		if !strings.Contains(arbitrateDesc, want) {
 			t.Errorf("fishhawk_arbitrate_acceptance description must mention %q; got:\n%s", want, arbitrateDesc)
+		}
+	}
+
+	// fishhawk_reap_stage (#2689) must be wire-visible AND its description must
+	// carry the load-bearing contract: the endpoint it wraps, the verb that
+	// becomes applicable afterwards, and the server-side protected-park refusal
+	// that makes it safe. A description regression would ship the wrong contract
+	// to the one operator who reaches for this verb — the one holding a strand.
+	var reapDesc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_reap_stage" {
+			reapDesc = tool.Description
+			break
+		}
+	}
+	if reapDesc == "" {
+		t.Fatal("fishhawk_reap_stage is not registered/visible over ListTools")
+	}
+	for _, want := range []string{"fishhawk_retry_stage", "reap-failure", "protected PARK states", "fishhawk_cancel_run", "runner_kind"} {
+		if !strings.Contains(reapDesc, want) {
+			t.Errorf("fishhawk_reap_stage description must mention %q (#2689):\n%s", want, reapDesc)
 		}
 	}
 
@@ -11721,6 +11776,275 @@ func TestCancelRun_ReapWarningDoesNotFailTheVerb(t *testing.T) {
 	if !strings.Contains(out.ReapWarnings[0], strconv.Itoa(h.pid)) {
 		t.Errorf("warning %q does not name the surviving pid %d", out.ReapWarnings[0], h.pid)
 	}
+}
+
+// --- #2689: the FAIL-CLOSED decomposition-child cancel guard ---
+//
+// Every arm asserts COMMITTED STATE (the fake's recorded cancel count), not
+// error identity alone: a guard that fired and was then rolled back would
+// return a byte-identical error, so the cancel count is what proves the
+// refusal short-circuited the mutation.
+
+func cancelCalls(fb *fakeBackend, runID uuid.UUID) int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return fb.cancelCalledByID[runID]
+}
+
+// seedChildRunRow seeds a run row whose decomposed_from names a parent — the
+// shape that permanently wedges that parent when cancelled.
+func seedChildRunRow(fb *fakeBackend, runID, parentID uuid.UUID) {
+	parent := parentID.String()
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y", DecomposedFrom: &parent}
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y", DecomposedFrom: &parent}
+}
+
+// TestCancelRun_DecomposedChildRefusedWithoutOverride is the counterfactual
+// vehicle for the child refusal.
+func TestCancelRun_DecomposedChildRefusedWithoutOverride(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	child, parent := uuid.New(), uuid.New()
+	seedChildRunRow(fb, child, parent)
+
+	_, _, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: child.String()})
+	if err == nil {
+		t.Fatal("cancelling a decomposition child must be refused without the override")
+	}
+	if !strings.Contains(err.Error(), parent.String()) {
+		t.Errorf("refusal must name the parent run id: %v", err)
+	}
+	if !strings.Contains(err.Error(), "orphan_parent_ok") {
+		t.Errorf("refusal must name the override: %v", err)
+	}
+	if got := cancelCalls(fb, child); got != 0 {
+		t.Errorf("backend cancel called %d times, want 0 — the refusal must short-circuit the mutation", got)
+	}
+}
+
+// TestCancelRun_DecomposedChildProceedsWithOverride pins the escape hatch:
+// exactly ONE cancel, plus a warning naming the orphaned parent.
+func TestCancelRun_DecomposedChildProceedsWithOverride(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	child, parent := uuid.New(), uuid.New()
+	seedChildRunRow(fb, child, parent)
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{
+		RunID: child.String(), OrphanParentOK: true,
+	})
+	if err != nil {
+		t.Fatalf("the override must let the cancel proceed: %v", err)
+	}
+	if got := cancelCalls(fb, child); got != 1 {
+		t.Errorf("backend cancel called %d times, want exactly 1", got)
+	}
+	if len(out.Warnings) == 0 {
+		t.Fatal("an overridden guard must disclose the orphaned parent")
+	}
+	if !strings.Contains(out.Warnings[0], parent.String()) {
+		t.Errorf("warning must name the parent run id: %q", out.Warnings[0])
+	}
+}
+
+// TestCancelRun_GetRunErrorFailsClosed is the counterfactual vehicle for the
+// FAIL-CLOSED read-error branch — the deliberate inversion of the fail-open
+// posture the dispatch guards take, because this mutation is irreversible.
+func TestCancelRun_GetRunErrorFailsClosed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled"}
+	fb.mu.Unlock()
+
+	_, _, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("an unreadable run row must REFUSE the cancel, not proceed")
+	}
+	if !strings.Contains(err.Error(), "could not be read") {
+		t.Errorf("refusal must name the unreadable state: %v", err)
+	}
+	if !strings.Contains(err.Error(), "orphan_parent_ok") {
+		t.Errorf("refusal must name the override: %v", err)
+	}
+	if got := cancelCalls(fb, runID); got != 0 {
+		t.Errorf("backend cancel called %d times, want 0", got)
+	}
+}
+
+// TestCancelRun_GetRunErrorProceedsWithOverride pins that the escape hatch
+// clears the read-error refusal too — the availability cost of the fail-closed
+// posture is one flag, not a wedged operator.
+func TestCancelRun_GetRunErrorProceedsWithOverride(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled"}
+	fb.mu.Unlock()
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{
+		RunID: runID.String(), OrphanParentOK: true,
+	})
+	if err != nil {
+		t.Fatalf("the override must let the cancel proceed: %v", err)
+	}
+	if got := cancelCalls(fb, runID); got != 1 {
+		t.Errorf("backend cancel called %d times, want exactly 1", got)
+	}
+	if len(out.Warnings) == 0 || !strings.Contains(out.Warnings[0], runID.String()) {
+		t.Errorf("warnings %v must name the run whose parentage could not be read", out.Warnings)
+	}
+}
+
+// TestCancelRun_NonChildUnaffected is the control that stops the guard passing
+// by refusing everything: an ordinary non-child run cancels unchanged, with no
+// warning.
+func TestCancelRun_NonChildUnaffected(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y"}
+	fb.mu.Unlock()
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("an ordinary non-child cancel must be unaffected: %v", err)
+	}
+	if got := cancelCalls(fb, runID); got != 1 {
+		t.Errorf("backend cancel called %d times, want exactly 1", got)
+	}
+	if len(out.Warnings) != 0 {
+		t.Errorf("the non-child path carries no warnings; got %v", out.Warnings)
+	}
+	if out.Run.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", out.Run.State)
+	}
+}
+
+// --- #2689: both new operator-facing fields proven across the MCP WIRE ---
+
+// TestReapStage_WireContract invokes fishhawk_reap_stage BY NAME over a real
+// in-memory MCP session and unmarshals the raw structured result, so
+// runner_liveness and warnings are proven to survive the wire — not just the
+// handler's return value.
+func TestReapStage_WireContract(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", RunnerKind: "github_actions"}
+	fb.mu.Unlock()
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerReapStage, "fishhawk_reap_stage",
+		map[string]any{"run_id": runID.String(), "stage_id": stageID.String()})
+
+	var out ReapStageOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.RunnerLiveness != "unknown" {
+		t.Errorf("runner_liveness did not survive the wire: %q", out.RunnerLiveness)
+	}
+	if len(out.Warnings) == 0 {
+		t.Fatalf("warnings did not survive the wire: %s", raw)
+	}
+	if !strings.Contains(out.Warnings[0], "github_actions") {
+		t.Errorf("warning %q must name the runner kind", out.Warnings[0])
+	}
+	if !out.Transitioned || out.StageState != "failed" {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
+	}
+	if !strings.Contains(out.NextStep, "fishhawk_retry_stage") {
+		t.Errorf("next_step must name fishhawk_retry_stage: %q", out.NextStep)
+	}
+}
+
+// TestCancelRun_OrphanParentOKCrossesTheWire proves the new INPUT field is
+// advertised on the tool's schema and is honoured when sent over the wire, and
+// that the resulting warning comes back on the wire too.
+func TestCancelRun_OrphanParentOKCrossesTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	child, parent := uuid.New(), uuid.New()
+	seedChildRunRow(fb, child, parent)
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerCancelRun, "fishhawk_cancel_run",
+		map[string]any{"run_id": child.String(), "orphan_parent_ok": true})
+
+	var out CancelRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Run.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", out.Run.State)
+	}
+	if len(out.Warnings) == 0 {
+		t.Fatalf("warnings did not survive the wire: %s", raw)
+	}
+	if !strings.Contains(out.Warnings[0], parent.String()) {
+		t.Errorf("warning %q must name the orphaned parent", out.Warnings[0])
+	}
+
+	// The input field must be ADVERTISED, else no client can send it.
+	descs := toolInputSchemaProperties(t, "fishhawk_cancel_run")
+	if _, ok := descs["orphan_parent_ok"]; !ok {
+		t.Errorf("fishhawk_cancel_run's input schema does not advertise orphan_parent_ok; properties: %v", descs)
+	}
+}
+
+// toolInputSchemaProperties returns the named registered tool's input-schema
+// property set over a real ListTools round-trip.
+func toolInputSchemaProperties(t *testing.T, name string) map[string]bool {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	server := buildServer(cfg)
+	registerTools(server, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	props := map[string]bool{}
+	for _, tool := range res.Tools {
+		if tool.Name != name {
+			continue
+		}
+		// Over the wire the SDK decodes Tool.InputSchema into a JSON object map.
+		schemaMap, ok := any(tool.InputSchema).(map[string]any)
+		if !ok {
+			t.Fatalf("%s InputSchema is %T, want a JSON object map", name, tool.InputSchema)
+		}
+		raw, ok := schemaMap["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s schema has no properties object; got %v", name, schemaMap["properties"])
+		}
+		for prop := range raw {
+			props[prop] = true
+		}
+		return props
+	}
+	t.Fatalf("tool %s is not registered/visible over ListTools", name)
+	return nil
 }
 
 // TestRunStateProbe_ReadsLiveState covers the probe cancelRun hands to the

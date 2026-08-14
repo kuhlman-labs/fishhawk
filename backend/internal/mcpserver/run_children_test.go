@@ -1196,10 +1196,218 @@ func TestRunChildren_FailedCompensationDisclosesStrand(t *testing.T) {
 		t.Fatalf("warnings = %v, want an explicit strand disclosure", c.Warnings)
 	}
 	if !strings.Contains(strand, "reap-failure") {
-		t.Errorf("strand warning does not name the reap-failure endpoint (the verb that ACTUALLY clears it): %s", strand)
+		t.Errorf("strand warning does not name the reap-failure endpoint (the fallback for a client without the verb): %s", strand)
 	}
 	if !strings.Contains(strand, "will NOT clear it") {
 		t.Errorf("strand warning does not retract the retry_stage claim: %s", strand)
+	}
+	// #2689: the warning must now prescribe a recovery that ACTUALLY WORKS as an
+	// MCP verb, not only a hand-rolled POST. This is the behavioral done-means
+	// test for the prose change — a comment-only touch of run_children.go fails
+	// here.
+	for _, want := range []string{"fishhawk_reap_stage", "fishhawk_retry_stage"} {
+		if !strings.Contains(strand, want) {
+			t.Errorf("strand warning does not name %s as the recovery: %s", want, strand)
+		}
+	}
+	// The prescribed call must be actionable: it carries THIS stage's ids.
+	if !strings.Contains(strand, stageIDOf(fb, child)) {
+		t.Errorf("strand warning does not name the stranded stage id: %s", strand)
+	}
+}
+
+// TestRunChildren_ChildExitsNonZeroWithoutSettling_ReapStageRecovers is the
+// issue's done-means test (#2689) with BOTH halves composed in ONE test:
+// strand PRODUCTION and strand RECOVERY.
+//
+// PRODUCTION. A REAL child is spawned detached through the REAL
+// spawnRunnerStageDetached (no seam fake) with a stub runner that emits a
+// runner_failed line and exits NON-ZERO without settling its stage. The reaper
+// goroutine fires exactly as in production — and its reap-failure POST is
+// answered 500 for the whole of its bounded-backoff retry loop, which is the
+// SECOND residual strand path this change serves (reportDetachedFailureWithRetry
+// exhausting to a stderr diagnostic). The test waits for that loop to exhaust
+// (an exhaustion the accepted-bodies map cannot express, hence the fake's
+// attempt counter) and then asserts the honest committed state: the stage is
+// STILL 'running', with no runner and no reaper left.
+//
+// ORDERING (#2689 review). The stub runner cannot itself perform the runner's
+// signed prompt fetch — the one transition that flips a stage dispatched ->
+// running — so the test applies that flip on its behalf. For the observed strand
+// to be PRODUCED by the child's exit rather than MANUFACTURED after it, the flip
+// must provably precede the exit, so the stub and the test handshake through two
+// files: the stub touches `ready` as its FIRST act and then BLOCKS until the test
+// creates `gate`, and only then emits its runner_failed line and exits 7. The
+// test waits for `ready`, applies the flip, asserts the fake has recorded ZERO
+// reap-failure attempts at that instant (a positive check that the child had not
+// yet exited and no reaper had yet run), and only then opens the gate. The
+// 'running' state the reaper leaves behind is therefore the state the child's
+// non-zero exit found and failed to settle.
+//
+// RECOVERY. With the backend healthy again the operator invokes
+// fishhawk_reap_stage against that SAME fake backend, and the test asserts
+// transitioned:true / stage_state failed / a fishhawk_retry_stage next_step, and
+// that the fake's COMMITTED stage state is now 'failed'. The accepted body's
+// reason is asserted to be the OPERATOR's default, not the runner's parsed
+// reason, so a late reaper attempt could not be mistaken for the recovery.
+func TestRunChildren_ChildExitsNonZeroWithoutSettling_ReapStageRecovers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub runner uses /bin/sh")
+	}
+	// Shrink the reaper's retry backoff so the exhaustion path is fast. Every
+	// wall-clock bound below derives from timescale.D so one factor scales them
+	// together on a loaded runner (AGENTS.md / #1984).
+	origBackoff := reapReportBackoff
+	reapReportBackoff = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { reapReportBackoff = origBackoff })
+
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, child := uuid.New(), uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	// The reaper's OWN report fails throughout: this is what leaves the residual
+	// strand instead of the reaper clearing it itself.
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	// The stub's handshake files. `ready` proves the child is alive and has NOT
+	// yet emitted its failure line; `gate` releases it to exit.
+	handshakeDir := t.TempDir()
+	readyPath := filepath.Join(handshakeDir, "ready")
+	gatePath := filepath.Join(handshakeDir, "gate")
+
+	// The stub's own wedge is bounded so a test that fails before opening the
+	// gate leaks no lingering process; the bound derives from timescale.D like
+	// every other duration here (AGENTS.md / #1984), polled at an unscaled 50ms.
+	stubWedgeTicks := int(timescale.D(30*time.Second) / (50 * time.Millisecond))
+	stub := filepath.Join(t.TempDir(), "stub-runner")
+	script := "#!/bin/sh\n" +
+		": > '" + readyPath + "'\n" +
+		"i=0\n" +
+		"while [ ! -f '" + gatePath + "' ]; do\n" +
+		"  i=$((i+1))\n" +
+		"  [ \"$i\" -gt " + fmt.Sprintf("%d", stubWedgeTicks) + " ] && break\n" +
+		"  sleep 0.05 2>/dev/null || sleep 1\n" +
+		"done\n" +
+		`echo '{"event":"runner_failed","reason":"agent_invocation_failed","detail":"boom"}'` + "\n" +
+		"exit 7\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	in := runChildrenIn(parent)
+	in.RunnerBinary = stub
+	_, out, err := r.runChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 1 {
+		t.Fatalf("dispatched_count = %d, want 1", out.DispatchedCount)
+	}
+	t.Cleanup(func() { _, _ = detachedRunners.terminateRunners(child.String(), nil) })
+
+	stageID := stageIDOf(fb, child)
+
+	// ORDERING STEP 1: wait for the child to announce itself. Past this point the
+	// child is alive and wedged BEFORE its runner_failed line, so it has not
+	// exited and its reaper has not run.
+	readyDeadline := time.Now().Add(timescale.D(10 * time.Second))
+	for {
+		if _, statErr := os.Stat(readyPath); statErr == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			t.Fatalf("stub runner never touched %s — the child was not spawned", readyPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// ORDERING STEP 2: model the runner's signed prompt fetch, the only
+	// transition that flips a stage dispatched -> running. The child never
+	// settles it further.
+	fb.mu.Lock()
+	for i := range fb.stagesByRun[child] {
+		fb.stagesByRun[child][i].State = "running"
+	}
+	attemptsAtFlip := fb.reapFailureAttempts
+	fb.mu.Unlock()
+
+	// ORDERING STEP 3: the positive proof that the flip PRECEDED the exit. A
+	// reaper attempt can only exist once the child has exited, so zero attempts
+	// at the instant of the flip means the 'running' state was in place before
+	// the child could produce the strand — it is not manufactured afterwards.
+	if attemptsAtFlip != 0 {
+		t.Fatalf("reap-failure attempts at the dispatched->running flip = %d, want 0 — the child exited before the transition, so the strand below would be manufactured, not produced", attemptsAtFlip)
+	}
+
+	// ORDERING STEP 4: release the child to emit runner_failed and exit 7.
+	if err := os.WriteFile(gatePath, nil, 0o600); err != nil {
+		t.Fatalf("open the stub runner's gate: %v", err)
+	}
+
+	// Wait for the reaper's retry loop to EXHAUST: one initial attempt plus one
+	// per backoff step. Only then is the strand residual rather than in-flight.
+	wantAttempts := 1 + len(reapReportBackoff)
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
+	for {
+		fb.mu.Lock()
+		attempts := fb.reapFailureAttempts
+		fb.mu.Unlock()
+		if attempts >= wantAttempts {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the reaper made %d reap-failure attempts, want %d — its retry loop never exhausted", attempts, wantAttempts)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// THE STRAND, produced by a real non-zero child exit: no runner, no reaper,
+	// and every other recovery verb refuses a stage in this state.
+	if got := stageStateOf(fb, child); got != "running" {
+		t.Fatalf("stage = %q, want the produced 'running' strand", got)
+	}
+
+	// RECOVERY: the backend is healthy again and the operator reaps.
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusOK
+	fb.mu.Unlock()
+
+	_, reaped, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: child.String(), StageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("fishhawk_reap_stage on the stranded stage: %v", err)
+	}
+	if !reaped.Transitioned {
+		t.Error("transitioned = false, want true — the verb did not clear the strand")
+	}
+	if reaped.StageState != "failed" {
+		t.Errorf("stage_state = %q, want failed", reaped.StageState)
+	}
+	if !strings.Contains(reaped.NextStep, "fishhawk_retry_stage") {
+		t.Errorf("next_step must name fishhawk_retry_stage: %q", reaped.NextStep)
+	}
+	if got := stageStateOf(fb, child); got != "failed" {
+		t.Errorf("committed stage state = %q, want failed (the state fishhawk_retry_stage admits)", got)
+	}
+	// Identity: the ACCEPTED body is the operator's, not a late reaper attempt's.
+	stageUUID, perr := uuid.Parse(stageID)
+	if perr != nil {
+		t.Fatalf("stage id %q: %v", stageID, perr)
+	}
+	fb.mu.Lock()
+	accepted := append([]reapFailureRequest(nil), fb.reapFailureByStage[stageUUID]...)
+	fb.mu.Unlock()
+	if len(accepted) != 1 {
+		t.Fatalf("accepted reap-failure bodies = %d, want exactly 1 (the operator's)", len(accepted))
+	}
+	if accepted[0].Reason != reapStageDefaultReason {
+		t.Errorf("accepted reason = %q, want the operator default %q — the recovery was not this verb's",
+			accepted[0].Reason, reapStageDefaultReason)
 	}
 }
 

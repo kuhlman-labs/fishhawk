@@ -188,6 +188,8 @@ var exportBaseline = []string{
 	"PlanVerification",
 	"ProductReport",
 	"ReapFailureResult",
+	"ReapStageInput",
+	"ReapStageOutput",
 	"RecordAutoDriveAct",
 	"RecordAutoDriveActResult",
 	"RecoverExemptPath",

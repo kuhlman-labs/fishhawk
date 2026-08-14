@@ -72,6 +72,12 @@ type runResolver struct {
 	// fishhawk_drive_run (#1955). Nil falls back to the production
 	// probeRunnerLiveness (which execs pgrep); tests inject a canned verdict so
 	// the loop runs the dead/live/unknown branches without a real process table.
+	//
+	// SHARED since #2689: fishhawk_reap_stage's classifyReapLiveness (and, via
+	// it, guardSiblingStageInFlight's target-'running' refusal wording) reads
+	// the same seam, so one injected verdict drives every liveness-dependent
+	// branch in the package. The name keeps its drive_ prefix deliberately — a
+	// rename would churn drive_run.go and its tests for no behavioural gain.
 	driveProbeRunnerLiveness func(ctx context.Context, stageID string) runnerLivenessVerdict
 }
 
@@ -267,6 +273,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerConsolidateSlices(srv, resolver)
 	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
+	registerReapStage(srv, resolver)
 	registerReviveRun(srv, resolver)
 	registerFileIssue(srv, resolver)
 	registerDraftEpic(srv, resolver)
@@ -2852,6 +2859,11 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 // (E22.2 / #391). Mirrors `POST /v0/runs/{run_id}/cancel`.
 type CancelRunInput struct {
 	RunID string `json:"run_id" jsonschema:"the Fishhawk run UUID to cancel"`
+	// OrphanParentOK is the single documented override for the #2689
+	// decomposition-child guard, covering BOTH refusals it can raise: the run IS
+	// a decomposition child, and the run row could not be read to tell. Default
+	// false, so the guard fails CLOSED.
+	OrphanParentOK bool `json:"orphan_parent_ok,omitempty" jsonschema:"override the decomposition-child guard and cancel anyway, accepting that the parent run becomes permanently unconsolidatable; also overrides the fail-closed refusal raised when the run row cannot be read to determine parentage"`
 }
 
 // CancelRunOutput surfaces the post-cancel Run row. State should be
@@ -2874,6 +2886,10 @@ type CancelRunOutput struct {
 	// ReapWarnings names any detached runner that survived TERM and KILL. A
 	// warning NEVER fails the verb — the cancel already landed.
 	ReapWarnings []string `json:"reap_warnings,omitempty" jsonschema:"detached runners that did not exit after TERM and KILL, naming the stage id and pid to kill by hand; the cancel itself still succeeded"`
+	// Warnings carries the #2689 decomposition-child guard's disclosure when
+	// orphan_parent_ok overrode a refusal: the parent run id whose fan-in can no
+	// longer complete, or the unreadable run row the override waved past.
+	Warnings []string `json:"warnings,omitempty" jsonschema:"present only when orphan_parent_ok overrode the decomposition-child guard: names the parent run left permanently unconsolidatable, or the run-row read failure the override waved past"`
 	// Elisions is the ADR-077 byte-bound block: present ONLY when the shared
 	// run-row ladder had to reduce the row, absent otherwise.
 	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
@@ -2914,6 +2930,18 @@ dispatch (#2545). A reap warning never fails the verb — the cancel
 already landed. The registry is per-MCP-process: a cancel issued
 from a different process than the one that dispatched reaps
 nothing, and the runner-side lineage-lock reclaim is the net.
+
+NOT A RECOVERY VERB FOR A STRANDED STAGE (#2689). Cancelling a
+DECOMPOSITION CHILD permanently wedges its parent:
+fishhawk_consolidate_slices requires every child to have
+SUCCEEDED, and a cancelled child never can. So this verb REFUSES a
+decomposition child, and FAILS CLOSED — refusing too — when the
+run row cannot be read to determine parentage, because the
+mutation it guards is irreversible. orphan_parent_ok:true is the
+single override for both refusals and surfaces a warning naming
+the orphaned parent. To clear a stage stranded in
+dispatched/running, use fishhawk_reap_stage then
+fishhawk_retry_stage instead of cancelling.
 `),
 	}, resolver.cancelRun)
 }
@@ -2924,6 +2952,10 @@ func (r *runResolver) cancelRun(ctx context.Context, req *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
 	}
+	warnings, err := r.guardDecompositionChildCancel(ctx, runID, in.OrphanParentOK)
+	if err != nil {
+		return nil, CancelRunOutput{}, err
+	}
 	cancelled, err := r.api.CancelRun(ctx, runID)
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
@@ -2933,7 +2965,7 @@ func (r *runResolver) cancelRun(ctx context.Context, req *mcp.CallToolRequest, i
 	// revived/retried run clear that tombstone immediately instead of waiting
 	// out its TTL. Warnings ride the output; they never fail the verb.
 	reaped, reapWarnings := detachedRunners.terminateRunners(runID.String(), r.runStateProbe)
-	out := CancelRunOutput{Run: *cancelled, ReapedRunners: reaped, ReapWarnings: reapWarnings}
+	out := CancelRunOutput{Run: *cancelled, ReapedRunners: reaped, ReapWarnings: reapWarnings, Warnings: warnings}
 	bounded, berr := boundRunRowOutput(out, cancelled.ID, r.responseBudget(req),
 		func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
@@ -2941,6 +2973,54 @@ func (r *runResolver) cancelRun(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, CancelRunOutput{}, fmt.Errorf("bound cancel_run response: %w", berr)
 	}
 	return nil, bounded, nil
+}
+
+// guardDecompositionChildCancel is the FAIL-CLOSED decomposition-child cancel
+// guard (#2689). Cancelling a decomposition child permanently wedges its
+// parent: fishhawk_consolidate_slices requires every child to have SUCCEEDED,
+// so a cancelled child makes the fan-in unreachable forever — and there is no
+// verb that un-cancels a run. Decision table:
+//
+//   - GetRun error + no override  -> REFUSE naming the read error and the
+//     override. This is deliberately the OPPOSITE posture from guardHostDispatch
+//     / guardSiblingStageInFlight, which fail OPEN: those guard a NON-destructive
+//     dispatch decision where failing open costs at most a retry, while this
+//     guards an irreversible mutation. The cost of a backend hiccup is now one
+//     flag, not an unrecoverable parent.
+//   - GetRun error + override     -> proceed with a warning naming the run and
+//     the read error.
+//   - DecomposedFrom == nil       -> proceed unchanged, no warning. The common
+//     non-child path; the cost is one extra read.
+//   - a child + no override       -> REFUSE naming the parent run id and the
+//     override.
+//   - a child + override          -> proceed with a warning naming the parent
+//     run id and stating it is now unconsolidatable.
+//
+// Returns (warnings, err): a non-nil err is the pre-cancel refusal (the caller
+// must NOT cancel); warnings ride the output of a cancel that proceeded.
+func (r *runResolver) guardDecompositionChildCancel(ctx context.Context, runID uuid.UUID, orphanParentOK bool) ([]string, error) {
+	got, err := r.api.GetRun(ctx, runID)
+	if err != nil {
+		if !orphanParentOK {
+			return nil, fmt.Errorf(
+				"refusing to cancel run %s: its decomposition parentage could not be read (%v), and cancelling a decomposition CHILD permanently wedges its parent — fishhawk_consolidate_slices requires every child to have SUCCEEDED, which a cancelled child never can. Retry once the backend read recovers, or pass orphan_parent_ok:true to cancel anyway. To clear a stage stranded in dispatched/running, use fishhawk_reap_stage then fishhawk_retry_stage instead",
+				runID, err)
+		}
+		return []string{fmt.Sprintf(
+			"orphan_parent_ok overrode the fail-closed decomposition-child guard: run %s's parentage could not be read (%v), so if this run IS a decomposition child its parent is now permanently unconsolidatable",
+			runID, err)}, nil
+	}
+	if got.DecomposedFrom == nil {
+		return nil, nil
+	}
+	if !orphanParentOK {
+		return nil, fmt.Errorf(
+			"refusing to cancel run %s: it is a decomposition CHILD of parent run %s, and cancelling it permanently wedges that parent — fishhawk_consolidate_slices requires every child to have SUCCEEDED, which a cancelled child never can, and no verb un-cancels a run. To clear a stage stranded in dispatched/running use fishhawk_reap_stage then fishhawk_retry_stage; to abandon the whole decomposition cancel the PARENT run. Pass orphan_parent_ok:true to cancel this child anyway",
+			runID, *got.DecomposedFrom)
+	}
+	return []string{fmt.Sprintf(
+		"orphan_parent_ok overrode the decomposition-child guard: run %s is a child of parent run %s, which is now permanently unconsolidatable — fishhawk_consolidate_slices can never complete for it because a cancelled child can never be SUCCEEDED",
+		runID, *got.DecomposedFrom)}, nil
 }
 
 // runStateProbe reads a run's live state for the detached registry's cancel
