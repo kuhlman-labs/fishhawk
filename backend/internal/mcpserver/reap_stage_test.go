@@ -162,6 +162,69 @@ func TestReapStage_DefaultsCategoryAndReason(t *testing.T) {
 	}
 }
 
+// (A) TestReapStage_CategoryBAcceptedWithItsOwnNextStep pins the OTHER side of
+// the allow-list boundary — the one TestReapStage_RejectsCategoryOutsideBC and
+// TestReapStage_DefaultsCategoryAndReason leave untested. Two things are
+// proven, and the second is the fix-up concern:
+//
+//	(1) B is genuinely ACCEPTED: it reaches the backend and lands on the wire
+//	    verbatim, rather than being defaulted away or refused locally.
+//	(2) It gets its OWN next_step. run.RetryableFailure classifies B
+//	    (constraint/policy) as NOT retryable, so fishhawk_retry_stage refuses a
+//	    B-reaped stage with 422 retry_not_applicable — the C guidance ("call
+//	    fishhawk_retry_stage next") would send the operator at a verb that
+//	    cannot admit the stage this call just produced.
+//
+// This is the counterfactual vehicle for reapStageNextStep's branch: the B and
+// C hints are driven through the SAME handler and required to DIFFER, so
+// collapsing the selector back to one constant reddens it whatever the wording.
+func TestReapStage_CategoryBAcceptedWithItsOwnNextStep(t *testing.T) {
+	reap := func(t *testing.T, category string) (ReapStageOutput, reapFailureRequest) {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		r, _ := reapResolver(t, srv, runnerDead)
+		runID, stageID := uuid.New(), uuid.New()
+
+		_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+			RunID: runID.String(), StageID: stageID.String(), Category: category,
+		})
+		if err != nil {
+			t.Fatalf("category %q must be accepted: %v", category, err)
+		}
+		fb.mu.Lock()
+		bodies := fb.reapFailureByStage[stageID]
+		fb.mu.Unlock()
+		if len(bodies) != 1 {
+			t.Fatalf("recorded bodies = %d, want 1", len(bodies))
+		}
+		return out, bodies[0]
+	}
+
+	outB, bodyB := reap(t, "B")
+	if bodyB.Category != "B" {
+		t.Errorf("wire category = %q, want B (an accepted category must reach the backend verbatim)", bodyB.Category)
+	}
+	if outB.StageState != "failed" {
+		t.Errorf("stage_state = %q, want failed", outB.StageState)
+	}
+
+	outC, _ := reap(t, "C")
+	if outB.NextStep == outC.NextStep {
+		t.Errorf("category B and C returned the SAME next_step (%q); B is not retryable, so its recovery path differs", outB.NextStep)
+	}
+	// The B guidance must not tell the operator to call the verb that refuses a
+	// category-B stage; it must name the refusal and the override that admits it.
+	if !strings.Contains(outB.NextStep, "retry_not_applicable") {
+		t.Errorf("category-B next_step must name the refusal fishhawk_retry_stage answers with: %q", outB.NextStep)
+	}
+	if !strings.Contains(outB.NextStep, "override") {
+		t.Errorf("category-B next_step must name the operator-only override that re-opens a B failure: %q", outB.NextStep)
+	}
+	if !strings.Contains(outC.NextStep, "fishhawk_retry_stage admits it") {
+		t.Errorf("category-C next_step must still say fishhawk_retry_stage admits the stage: %q", outC.NextStep)
+	}
+}
+
 // (A) TestReapStage_LiveRunnerRefused is the counterfactual vehicle for the
 // LIVE refusal: a runner_kind=local run whose probe finds a live process is
 // refused outright, with zero HTTP hops.

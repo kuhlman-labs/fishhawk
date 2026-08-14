@@ -42,13 +42,37 @@ const (
 	// reports. The endpoint accepts only B or C; C is what makes
 	// fishhawk_retry_stage applicable afterwards.
 	reapStageDefaultCategory = "C"
+	// reapStageCategoryB is the other category the endpoint accepts: the
+	// constraint/policy class. Named so the allow-list and the next-step
+	// selector share one literal.
+	reapStageCategoryB = "B"
 	// reapStageDefaultReason is the recorded classification when the operator
 	// supplies none.
 	reapStageDefaultReason = "operator_reap_stranded_stage"
-	// reapStageNextStepHint is the constant post-reap guidance: the reap only
-	// lands the stage in 'failed'; re-opening it is a separate operator verb.
-	reapStageNextStepHint = "the stage is now 'failed' (category C, the retryable infrastructure class), so fishhawk_retry_stage admits it: call fishhawk_retry_stage next, then re-dispatch (fishhawk_dispatch_stage / fishhawk_run_stage, or fishhawk_run_children for a decomposition child)."
+	// reapStageNextStepHintC is the post-reap guidance for the DEFAULT category:
+	// the reap only lands the stage in 'failed'; re-opening it is a separate
+	// operator verb, and at category C that verb is fishhawk_retry_stage.
+	reapStageNextStepHintC = "the stage is now 'failed' (category C, the retryable infrastructure class), so fishhawk_retry_stage admits it: call fishhawk_retry_stage next, then re-dispatch (fishhawk_dispatch_stage / fishhawk_run_stage, or fishhawk_run_children for a decomposition child)."
+	// reapStageNextStepHintB is the guidance for the OTHER accepted category.
+	// It is a DIFFERENT next step, not a wording variant: run.RetryableFailure
+	// classifies B (constraint/policy) as NOT retryable, so fishhawk_retry_stage
+	// refuses a B-reaped stage with 422 retry_not_applicable and the recovery
+	// sequence needs the operator-only override escape hatch (#698) instead.
+	reapStageNextStepHintB = "the stage is now 'failed' (category B, the constraint/policy class), which fishhawk_retry_stage does NOT admit — it refuses with 422 retry_not_applicable, because category B means a spec/workflow change rather than a re-run. Re-opening it needs the operator-only category-B override: POST /v0/stages/{stage_id}/retry with {\"override\":true,\"reason\":\"...\"} (an operator token; agent tokens are refused), then re-dispatch. To recover an ordinary strand, reap at the default category C instead — B is for recording a genuine constraint/policy failure."
 )
+
+// reapStageNextStep selects the post-reap guidance for the category actually
+// reported. The two accepted categories have DIFFERENT recovery paths, so a
+// single constant would tell a category-B caller to invoke a verb that refuses
+// the stage it just produced. The argument is the DEFAULTED category, so the
+// only inputs are the two the allow-list admits; anything else is treated as C
+// (unreachable — reapStage refuses it before this is called).
+func reapStageNextStep(category string) string {
+	if category == reapStageCategoryB {
+		return reapStageNextStepHintB
+	}
+	return reapStageNextStepHintC
+}
 
 // runnerLivenessLabel renders a runnerLivenessVerdict as the operator-facing
 // string carried on ReapStageOutput.runner_liveness. Kept separate from the
@@ -86,7 +110,7 @@ type ReapStageOutput struct {
 	// RunnerLiveness is deliberately NARROW: see classifyReapLiveness. It is
 	// "dead" ONLY for a runner_kind=local run this host could probe.
 	RunnerLiveness string   `json:"runner_liveness" jsonschema:"the host runner-liveness verdict classified before the reap: live (refused), dead (a local run this host probed and found no runner for), or unknown (a non-local runner_kind, an unreadable run row, or an inconclusive probe)"`
-	NextStep       string   `json:"next_step" jsonschema:"the post-reap guidance: the stage is failed/category-C, so fishhawk_retry_stage admits it, then re-dispatch"`
+	NextStep       string   `json:"next_step" jsonschema:"the post-reap guidance, which DIFFERS by the category reported: at C the stage is failed/category-C so fishhawk_retry_stage admits it, then re-dispatch; at B fishhawk_retry_stage refuses (422 retry_not_applicable) and re-opening needs the operator-only category-B override on POST /v0/stages/{stage_id}/retry"`
 	Warnings       []string `json:"warnings,omitempty" jsonschema:"non-fatal notes raised while classifying runner liveness, including the unverifiable-from-this-host note for a non-local runner_kind"`
 }
 
@@ -144,6 +168,12 @@ verb can take", not "never".
 Input:
   - run_id, stage_id : the stranded stage (both required).
   - category         : B or C; defaults to C. Anything else is refused locally.
+                       Prefer the default: only C is retryable, so a category-B
+                       reap lands a stage fishhawk_retry_stage REFUSES (422
+                       retry_not_applicable) and re-opening it then needs the
+                       operator-only category-B override on
+                       POST /v0/stages/{stage_id}/retry. next_step says which
+                       of the two you got.
   - reason           : defaults to operator_reap_stranded_stage.
   - detail, exit_code: optional diagnostics recorded with the failure.
 
@@ -176,7 +206,7 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if category == "" {
 		category = reapStageDefaultCategory
 	}
-	if category != "B" && category != reapStageDefaultCategory {
+	if category != reapStageCategoryB && category != reapStageDefaultCategory {
 		return nil, ReapStageOutput{}, fmt.Errorf(
 			"category must be \"B\" or \"C\" (C is the retryable infrastructure class a reap reports); got %q", in.Category)
 	}
@@ -216,7 +246,7 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 		Transitioned:   res.Transitioned,
 		StageState:     res.StageState,
 		RunnerLiveness: runnerLivenessLabel(verdict),
-		NextStep:       reapStageNextStepHint,
+		NextStep:       reapStageNextStep(category),
 		Warnings:       warnings,
 	}, nil
 }

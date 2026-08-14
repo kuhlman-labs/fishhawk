@@ -249,7 +249,12 @@ it**:
 `fishhawk_retry_stage` → re-dispatch** (`fishhawk_dispatch_stage` /
 `fishhawk_run_stage`, or `fishhawk_run_children` for a decomposition child). The
 reap reports the stage `failed`/category-C — the retryable infrastructure class —
-which is exactly the state `fishhawk_retry_stage` admits. The server refuses the
+which is exactly the state `fishhawk_retry_stage` admits. Keep the default: the
+endpoint also accepts `category:"B"`, but B (constraint/policy) is NOT retryable,
+so a B reap lands a stage `fishhawk_retry_stage` refuses with `422
+retry_not_applicable` and re-opening then needs the operator-only category-B
+override (`POST /v0/stages/{stage_id}/retry` with `{"override":true,"reason":"…"}`).
+The verb's `next_step` tells you which of the two you got. The server refuses the
 five protected PARK states (`awaiting_children`, `awaiting_approval`,
 `awaiting_input`, `awaiting_scope_decision`, `awaiting_host_dispatch`), so this
 can never destroy a live park; if you get that refusal, the stage is parked and

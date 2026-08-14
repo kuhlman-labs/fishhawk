@@ -735,6 +735,20 @@ Inputs: `run_id` + `stage_id` (required), `category` (B or C, default C — enfo
 never a copy of the server's 400 text), `reason` (default `operator_reap_stranded_stage`), `detail`, `exit_code`.
 Output: `transitioned`, `stage_state`, `runner_liveness`, `next_step`, `warnings`.
 
+**`next_step` is per-CATEGORY, because the two accepted categories have different recovery paths.** `run.RetryableFailure`
+classifies **C** (infrastructure) as retryable and **B** (constraint/policy) as NOT, so one constant hint would send a
+category-B caller at a verb that refuses the stage the call just produced:
+
+| reported `category` | `next_step` says |
+|---|---|
+| `C` (default) | the stage is `failed`/category-C, `fishhawk_retry_stage` admits it — retry, then re-dispatch |
+| `B` | `fishhawk_retry_stage` does **NOT** admit it (`422 retry_not_applicable`); re-opening needs the operator-only category-B override ([#698](https://github.com/kuhlman-labs/fishhawk/issues/698)), `POST /v0/stages/{stage_id}/retry` with `{"override":true,"reason":"…"}` — agent tokens are refused there |
+
+Prefer the default: `B` is for recording a genuine constraint/policy failure, not for clearing an ordinary strand.
+`TestReapStage_CategoryBAcceptedWithItsOwnNextStep` pins both halves — that `B` reaches the wire verbatim, and that its
+`next_step` DIFFERS from the `C` one (the two are driven through the same handler and compared, so collapsing the
+selector back to one constant reddens it whatever the wording).
+
 **The liveness probe is GATED on `runner_kind`, and its invariant is narrow — stated as such rather than overclaimed.**
 `classifyReapLiveness` never returns `dead` outside the local arm:
 
