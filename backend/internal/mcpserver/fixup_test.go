@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"reflect"
 	"strings"
@@ -415,5 +416,58 @@ func TestFixupStage_NeitherAddressingForm_MessagePointsAtConcernIDs(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "deprecated") {
 		t.Errorf("err = %v, want the positional fallback marked deprecated", err)
+	}
+}
+
+func TestFixupStage_OperatorEvidence_ThreadsIntoBody(t *testing.T) {
+	// operator_evidence (E48.103 / #2551) must reach the backend request body
+	// verbatim — it is what exempts the routed concerns from
+	// reviewer-confirmation auto-resolve.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), Type: "implement", State: "pending"}
+
+	const evidence = "ran the repro at head abc123: the traversal still returns 200"
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:          stageID.String(),
+		ConcernIDs:       []string{uuid.New().String()},
+		Reason:           "fix the traversal",
+		OperatorEvidence: evidence,
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if fb.fixupBody.OperatorEvidence != evidence {
+		t.Errorf("body operator_evidence = %q, want the threaded declaration", fb.fixupBody.OperatorEvidence)
+	}
+}
+
+func TestFixupStage_NoOperatorEvidence_OmittedFromBody(t *testing.T) {
+	// Unset leaves the request body byte-identical to the pre-#2551 shape: the
+	// key is omitted (omitempty), not sent empty. Asserted on the marshalled
+	// request the client builds, since the fake backend hands tests the DECODED
+	// struct (in which an absent and an empty key are indistinguishable).
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	concernID := uuid.New().String()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), Type: "implement", State: "pending"}
+
+	if _, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:    stageID.String(),
+		ConcernIDs: []string{concernID},
+	}); err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if fb.fixupBody.OperatorEvidence != "" {
+		t.Errorf("body operator_evidence = %q, want empty when the input omits it", fb.fixupBody.OperatorEvidence)
+	}
+	wire, err := json.Marshal(fixupRequest{ConcernIDs: []string{concernID}})
+	if err != nil {
+		t.Fatalf("marshal fixupRequest: %v", err)
+	}
+	if strings.Contains(string(wire), "operator_evidence") {
+		t.Errorf("marshalled request carries operator_evidence with the field unset, want it omitted: %s", wire)
 	}
 }

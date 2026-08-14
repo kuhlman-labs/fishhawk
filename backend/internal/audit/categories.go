@@ -60,7 +60,12 @@ import "sort"
 // approve refused because the scope carries a non-.go testable-source path the
 // comment-only exemption provably cannot cover), and
 // plan_comment_only_override_acknowledged (the honored override, recording that
-// the implement stage re-derives the verdict from the REAL diff). When a new
+// the implement stage re-derives the verdict from the REAL diff). E48.103 /
+// #2551 added concern_resolution_vetoed, the implement re-review's marker for a
+// `confirmed` delta-verification resolution REFUSED because the evidence
+// contradicts it (the raising reviewer rejected in the same round, the operator
+// routed the concern with executed reproduction evidence, the fix-up pass landed
+// no changes, or the evidence lookup itself failed). When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -107,6 +112,7 @@ var KnownCategories = map[string]struct{}{
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
 	"concern_relitigation_suppressed":         {},
+	"concern_resolution_vetoed":               {},
 	"concern_waive_failed":                    {},
 	"concern_waived":                          {},
 	"consolidated_pr_opened":                  {},

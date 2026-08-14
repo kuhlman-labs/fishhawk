@@ -508,6 +508,21 @@ The `next_actions` `deploy_gate_parked` arm points at `fishhawk_approve_deploy` 
 
 Both fields are `omitempty` on every surface — the common no-evidence concern leaves the payload byte-identical.
 
+**Fix-up arguments (`FixupStageInput`).**
+
+| Argument | Meaning |
+|---|---|
+| `concern_ids` | PRIMARY addressing: stable concern UUIDs from `fishhawk_get_run_status`'s `run.concerns.items[].id`. |
+| `concerns` | DEPRECATED positional indices; valid only when `concern_ids` is absent. |
+| `reason` | Operator rationale, recorded on `stage_fixup_triggered` and as the routed concerns' `state_reason`. |
+| `allow_create` | Net-new paths this pass may CREATE ([#823](https://github.com/kuhlman-labs/fishhawk/issues/823)). |
+| `force_additional_pass` | Bounded override: ONE pass past the budget, hard-capped at 3 total. |
+| `implement_model` | Per-pass model override; empty inherits the run's resolved implement model. |
+| `operator_concern` | Free-text binding instruction with NO pre-existing review concern ([#1311](https://github.com/kuhlman-labs/fishhawk/issues/1311)), minted as a durable tracked concern (#2623). |
+| `operator_evidence` | Declares YOU executed a reproduction of the routed concern(s) ([#2551](https://github.com/kuhlman-labs/fishhawk/issues/2551)). **Authority, not prose** — the reproduction text still travels in `reason`/`operator_concern`. Every concern routed by the pass becomes EXEMPT from reviewer-confirmation auto-resolve: a later `confirmed` delta-verification verdict is vetoed (`operator_evidence_routed`) and the concern stays open until an operator waive/defer or a genuine fix. **PERMANENT** for those concerns, so it raises the waive burden — use it when a reviewer has already retired a defect you can still reproduce. NOT a selection input; whitespace-only or >4000 bytes → 400 `validation_failed`. |
+
+**Gate-view disputes ([#2551](https://github.com/kuhlman-labs/fishhawk/issues/2551)).** `GateViewConcern` mirrors the backend's `disputed` (bool) and `disputes[]` (`gateViewDispute`: `{sequence, round, veto_reason, resolution, confirming_reviewer_model, raising_reviewer_model, note}`, `veto_reason` one of `raiser_rejected_same_round` | `operator_evidence_routed` | `fixup_pass_no_changes` | `evidence_lookup_failed`). `disputed` means a `confirmed` resolution was recorded on a concern that is STILL OPEN — the same-round raiser-reject / peer-confirm split. The backend derives it from the durable concern row, so `disputed` can be true with an EMPTY `disputes[]` when the best-effort veto record did not land; treat `disputes[]` as detail, never as the presence test. Same json-tag byte-match rule as above — the wire test drives raw server-shaped JSON. `gateViewDispute` is deliberately unexported (the exported surface is pinned by `exportBaseline`); the MCP schema reflection walks it through the exported `Disputes` field.
+
 **Run-status concerns block `short_summary` ([#2488](https://github.com/kuhlman-labs/fishhawk/issues/2488)).** Each item in `fishhawk_get_run_status`'s `run.concerns.items[]` (mirror `RunConcernItem`) now carries a `short_summary` — a **bounded** note-derived recognition label (at most 100 bytes, whitespace-collapsed to one line, `...`-marked when the note is cut, equal to the whole collapsed note when it already fits, **absent** when the note is blank after collapsing). It lets ONE default `fishhawk_get_run_status` call map each concern `id` to a recognisable defect without a second `fishhawk_list_audit` and correlation by array ordering. It is present **regardless of `include_review_prose`** (like verdicts/severities/concern keys). It is **not a unique key** — two concerns whose notes share a long prefix may share a label — so route fix-ups by `id`; the full untruncated note stays on `fishhawk_get_gate_view` and the originating `*_reviewed` audit entry.
 
 Inputs:

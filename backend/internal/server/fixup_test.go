@@ -2973,3 +2973,102 @@ func TestFixupStage_OperatorConcern_RefusedMintsNoOrphan(t *testing.T) {
 		}
 	}
 }
+
+// --- operator_evidence (E48.103 / #2551) ------------------------------------
+
+// TestFixupStage_OperatorEvidenceWhitespaceOnly_Rejected: a provided-but-
+// whitespace-only operator_evidence fails LOUD (400 field=operator_evidence).
+// It changes whether a reviewer confirmation can retire the routed concerns, so
+// it must never be silently dropped.
+func TestFixupStage_OperatorEvidenceWhitespaceOnly_Rejected(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", OperatorEvidence: "   \t\n  "})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "operator_evidence") {
+		t.Errorf("body should name operator_evidence as the offending field: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (rejected before any transition)", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorEvidenceOverLength_Rejected: an operator_evidence
+// exceeding maxOperatorConcernBytes fails LOUD rather than being truncated.
+func TestFixupStage_OperatorEvidenceOverLength_Rejected(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	oversized := strings.Repeat("a", maxOperatorConcernBytes+1)
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", OperatorEvidence: oversized})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "operator_evidence") {
+		t.Errorf("body should name operator_evidence as the offending field: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (rejected before any transition)", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorEvidenceOnly_DoesNotSatisfyAtLeastOne: operator_evidence
+// is an AUTHORITY declaration, not a selection input — supplying it alone still
+// fails the at-least-one-of rule naming concern_ids.
+func TestFixupStage_OperatorEvidenceOnly_DoesNotSatisfyAtLeastOne(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorEvidence: "I reproduced it"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "concern_ids") {
+		t.Errorf("body should name concern_ids (the at-least-one-of rule): %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorEvidence_RecordedOnTriggerPayload: a valid value lands
+// verbatim on the stage_fixup_triggered payload — the durable input the
+// re-review's veto pass reads back.
+func TestFixupStage_OperatorEvidence_RecordedOnTriggerPayload(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "reviewer's concern")
+
+	const evidence = "ran the repro at head abc123: still returns 200"
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:       []string{row.ID.String()},
+		Reason:           "fix it",
+		OperatorEvidence: evidence,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := latestFixupTriggeredPayload(t, au)["operator_evidence"]; got != evidence {
+		t.Errorf("payload.operator_evidence = %v, want the verbatim text", got)
+	}
+}
+
+// TestFixupStage_NoOperatorEvidence_KeyAbsent: the legacy payload stays
+// byte-identical when the field is unset — the key is omitted, not written
+// empty (a written empty string would trip nothing today but would make every
+// pre-#2551 entry decode differently).
+func TestFixupStage_NoOperatorEvidence_KeyAbsent(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "reviewer's concern")
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{row.ID.String()}, Reason: "fix it"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if _, present := latestFixupTriggeredPayload(t, au)["operator_evidence"]; present {
+		t.Error("payload carries an operator_evidence key with the field unset, want it omitted")
+	}
+}
