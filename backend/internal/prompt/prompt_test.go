@@ -6660,6 +6660,83 @@ func TestBuild_ImplementReview_ScopeProvenance_CoexistsWithOperatorUndelivered(t
 	}
 }
 
+func TestBuild_ImplementReview_ScopeProvenance_RenameSourceTouchedLine(t *testing.T) {
+	// #2398: a declared path realized as a rename SOURCE renders a positive
+	// TOUCHED line that states BOTH facts without contradiction (binding
+	// condition 1): the old path has no standalone changed-file row of its own,
+	// AND it is visible as the source side of the "R <old> -> <new>" row in the
+	// changed-file list. The two claims must not read as a contradiction, and the
+	// path must NOT appear as an untouched declared path.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- R cli/internal/credstore/credstore.go -> internal/credstore/credstore.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles: 2,
+				Renames: []GateScopeRename{
+					{OldPath: "cli/internal/credstore/credstore.go", NewPath: "internal/credstore/credstore.go"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	want := "cli/internal/credstore/credstore.go (plan scope, TOUCHED as the SOURCE side of a rename -> " +
+		"internal/credstore/credstore.go; git recorded a single R row for the move, so " +
+		"cli/internal/credstore/credstore.go has no standalone changed-file row of its own but IS shown as " +
+		"the source side of the \"R cli/internal/credstore/credstore.go -> internal/credstore/credstore.go\" " +
+		"row in the changed-file list above — this is NOT an untouched declared path)"
+	if !strings.Contains(got, want) {
+		t.Errorf("rename TOUCHED line missing or reworded:\n want: %q\n got:\n%s", want, got)
+	}
+	// The self-contradictory pre-fix phrasing ("absent from the changed-file
+	// list by construction") must NOT survive anywhere in the rendered prompt.
+	if strings.Contains(got, "absent from the changed-file list by construction") {
+		t.Errorf("the contradictory old wording survives in the rendered prompt:\n%s", got)
+	}
+	if strings.Contains(got, "(plan scope, UNTOUCHED") {
+		t.Errorf("a rename source must not render as an untouched declared path:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_Indeterminate_HedgesUntouched(t *testing.T) {
+	// #2398 binding condition 1/2: when the diff mode is indeterminate (rename
+	// rows with no source path), every UNTOUCHED label is HEDGED as NOT
+	// DETERMINABLE rather than asserted as fact — for plan paths AND folds.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- R  -> pkg/moved.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:                     1,
+				PlanUntouched:                 []string{"pkg/declared.go"},
+				Folds:                         []GateScopeFold{{Path: "pkg/folded.go", Source: "scope-amendment", Touched: false}},
+				RenameProvenanceIndeterminate: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Plan-path untouched label is hedged, not asserted.
+	if !strings.Contains(got, "pkg/declared.go (plan scope — UNTOUCHED label NOT DETERMINABLE under this diff mode") {
+		t.Errorf("indeterminate mode must hedge the plan untouched label:\n%s", got)
+	}
+	if strings.Contains(got, "pkg/declared.go (plan scope, UNTOUCHED — reviewer judgment") {
+		t.Errorf("indeterminate mode must NOT assert the plan path UNTOUCHED as fact:\n%s", got)
+	}
+	// Fold untouched label is likewise hedged.
+	if !strings.Contains(got, "pkg/folded.go (folded: scope-amendment) — UNTOUCHED label NOT DETERMINABLE under this diff mode") {
+		t.Errorf("indeterminate mode must hedge the fold untouched label:\n%s", got)
+	}
+	if strings.Contains(got, "pkg/folded.go (folded: scope-amendment) — folded, UNTOUCHED — a permission") {
+		t.Errorf("indeterminate mode must NOT assert the fold UNTOUCHED as fact:\n%s", got)
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"

@@ -80,9 +80,20 @@ const (
 
 // DiffEntry is the per-file shape that lands in the payload. Mirrors
 // ChangedFile but with json tags pinned for the audit on-wire format.
+//
+// It mirrors ChangedFile field-for-field so both directions of the plain
+// struct conversion compile — DiffEntry(f) here (EmitEvaluation) and
+// policy.ChangedFile(e) in the post-CI re-eval's reconstructPolicyDiff
+// (backend/internal/server/policy_reeval.go). OldPath (#2398) is carried
+// to keep that mirror intact; it is additive and `omitempty`, so a
+// non-rename diff's payload is byte-identical to before the field existed
+// and older audit rows decode to an empty OldPath. It is informational to
+// the policy engine (no check reads it), so re-eval verdicts are
+// unchanged whether or not it round-trips.
 type DiffEntry struct {
-	Path   string `json:"path"`
-	Status Status `json:"status"`
+	Path    string `json:"path"`
+	Status  Status `json:"status"`
+	OldPath string `json:"old_path,omitempty"`
 }
 
 // EmitEvaluation runs Evaluate against the diff + constraints and

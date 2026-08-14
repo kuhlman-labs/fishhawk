@@ -5686,6 +5686,214 @@ func TestScopeProvenanceForReview_ReconstructionParity(t *testing.T) {
 	}
 }
 
+// credstoreMovePlan builds the run 933cd6ee approved-plan shape (#2398): the
+// two credstore files declared as `delete` at their old cli/ location and as
+// `create` at their new location — the exact two-delete/two-create move shape
+// that manufactured the spurious evidence_conflict.
+func credstoreMovePlan() *plan.Plan {
+	return &plan.Plan{Scope: plan.Scope{Files: []plan.ScopeFile{
+		{Path: "cli/internal/credstore/credstore.go", Operation: plan.FileOpDelete},
+		{Path: "cli/internal/credstore/credstore_test.go", Operation: plan.FileOpDelete},
+		{Path: "internal/credstore/credstore.go", Operation: plan.FileOpCreate},
+		{Path: "internal/credstore/credstore_test.go", Operation: plan.FileOpCreate},
+	}}}
+}
+
+// renameRow builds a policy.ChangedFile R row carrying a rename source.
+func renameRow(oldPath, newPath string) policy.ChangedFile {
+	return policy.ChangedFile{Path: newPath, OldPath: oldPath, Status: policy.StatusRenamed}
+}
+
+// TestScopeProvenance_RenameSourceIsTouched_2398 is the done-means regression
+// fixture: it reproduces run 933cd6ee exactly — the plan declares the credstore
+// move as two `delete` + two `create` entries, and the committed diff carries
+// the two R100 rows git actually recorded with old_path populated. It asserts
+// the evidence that manufactured the spurious high-severity evidence_conflict is
+// gone: no declared path is reported UNTOUCHED, both rename pairs are named, the
+// #1407 operator-scope-undelivered signal does not fire, and the RENDERED prompt
+// carries no untouched-declared-path claim for either moved file. It fails on
+// today's pre-fix code (the rename SOURCE is absent from the changed-file set).
+func TestScopeProvenance_RenameSourceIsTouched_2398(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	runID, stageID := uuid.New(), uuid.New()
+
+	// The two R100 rows: each declared-deleted cli/ path is the rename SOURCE
+	// of its new-location destination.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		renameRow("cli/internal/credstore/credstore.go", "internal/credstore/credstore.go"),
+		renameRow("cli/internal/credstore/credstore_test.go", "internal/credstore/credstore_test.go"),
+	}}
+
+	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
+		credstoreMovePlan(), prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("prov = nil; want a provenance naming the renames")
+	}
+	// (i) No declared path appears in PlanUntouched — each is TOUCHED as a
+	// rename source.
+	if len(prov.PlanUntouched) != 0 {
+		t.Errorf("PlanUntouched = %v, want empty (each declared-deleted path is a rename source)", prov.PlanUntouched)
+	}
+	// (ii) Renames names BOTH (old,new) pairs.
+	wantPairs := map[string]string{
+		"cli/internal/credstore/credstore.go":      "internal/credstore/credstore.go",
+		"cli/internal/credstore/credstore_test.go": "internal/credstore/credstore_test.go",
+	}
+	if len(prov.Renames) != len(wantPairs) {
+		t.Fatalf("Renames = %+v, want %d pairs", prov.Renames, len(wantPairs))
+	}
+	for _, r := range prov.Renames {
+		if wantPairs[r.OldPath] != r.NewPath {
+			t.Errorf("Renames pair %q -> %q not in the expected move set", r.OldPath, r.NewPath)
+		}
+	}
+	if prov.RenameProvenanceIndeterminate {
+		t.Error("RenameProvenanceIndeterminate = true, want false (both R rows carry a source)")
+	}
+
+	// (iii) operatorScopeUndelivered does NOT fire for the same declared-deleted
+	// paths — they are touched as rename sources, so no operator_scope_path_
+	// undelivered audit entry is appended (the caller gates the append on a
+	// non-empty return).
+	undelivered := operatorScopeUndelivered(
+		[]string{"cli/internal/credstore/credstore.go", "cli/internal/credstore/credstore_test.go"}, diff)
+	if undelivered != nil {
+		t.Errorf("operatorScopeUndelivered = %v, want nil (rename sources are delivered)", undelivered)
+	}
+
+	// (iv) The rendered prompt contains no untouched-declared-path claim, and
+	// DOES positively explain each rename source.
+	rendered, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: credstoreMovePlan(),
+		Diff:         renderDiffForReview(diff),
+		GateEvidence: &prompt.GateEvidence{ScopeProvenance: prov},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(rendered, "(plan scope, UNTOUCHED") {
+		t.Errorf("rendered prompt asserts an UNTOUCHED declared path; the #2398 contradiction is back:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "operator_scope_path_undelivered") {
+		t.Errorf("rendered prompt raised operator_scope_path_undelivered on a rename source:\n%s", rendered)
+	}
+	for _, want := range []string{
+		"cli/internal/credstore/credstore.go (plan scope, TOUCHED as the SOURCE side of a rename -> internal/credstore/credstore.go",
+		"cli/internal/credstore/credstore_test.go (plan scope, TOUCHED as the SOURCE side of a rename -> internal/credstore/credstore_test.go",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered prompt missing positive rename line %q:\n%s", want, rendered)
+		}
+	}
+}
+
+// TestScopeProvenance_CopySourceStaysUntouched pins the false-positive direction
+// the Status == StatusRenamed guard prevents (#2398 binding condition 2): a COPY
+// row leaves its source byte-unchanged, so a declared-deleted path that is only a
+// copy SOURCE stays UNTOUCHED — folding copy sources into the touched set would
+// replace a false negative with a false positive.
+func TestScopeProvenance_CopySourceStaysUntouched(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	// Plan declares old.go (as a file the commit should have changed); the diff
+	// only COPIES old.go to new.go, leaving old.go itself untouched.
+	pl := &plan.Plan{Scope: plan.Scope{Files: []plan.ScopeFile{
+		{Path: "pkg/old.go", Operation: plan.FileOpModify},
+	}}}
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "pkg/copy.go", OldPath: "pkg/old.go", Status: policy.StatusCopied},
+	}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("prov = nil; want an untouched plan path")
+	}
+	if !containsString(prov.PlanUntouched, "pkg/old.go") {
+		t.Errorf("PlanUntouched = %v, want to contain pkg/old.go (a copy source is NOT touched)", prov.PlanUntouched)
+	}
+	if len(prov.Renames) != 0 {
+		t.Errorf("Renames = %+v, want empty (a copy is not a rename)", prov.Renames)
+	}
+	// A copy source with a source present must NOT make the diff indeterminate.
+	if prov.RenameProvenanceIndeterminate {
+		t.Error("RenameProvenanceIndeterminate = true, want false (a copy row never sets it)")
+	}
+	// operatorScopeUndelivered still fires for a copy source (it was not delivered).
+	if got := operatorScopeUndelivered([]string{"pkg/old.go"}, diff); len(got) != 1 || got[0] != "pkg/old.go" {
+		t.Errorf("operatorScopeUndelivered = %v, want [pkg/old.go] (copy source stays undelivered)", got)
+	}
+}
+
+// TestScopeProvenance_RenameOldPathAbsent_Indeterminate pins the legacy /
+// forge-compare consolidated-diff case (#2398): an R row with an EMPTY OldPath
+// (a pre-field bundle, or GitHub's consolidated review diff that carries R
+// statuses with no source) sets RenameProvenanceIndeterminate, and the declared
+// path is still listed but HEDGED as not-determinable rather than asserted
+// UNTOUCHED as fact.
+func TestScopeProvenance_RenameOldPathAbsent_Indeterminate(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	pl := &plan.Plan{Scope: plan.Scope{Files: []plan.ScopeFile{
+		{Path: "pkg/declared.go", Operation: plan.FileOpDelete},
+	}}}
+	// R row with no source path, plus an unrelated destination — declared.go is
+	// absent from the committed set and its touch state is undecidable.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "pkg/moved.go", Status: policy.StatusRenamed}, // empty OldPath
+	}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("prov = nil; want an indeterminate provenance")
+	}
+	if !prov.RenameProvenanceIndeterminate {
+		t.Error("RenameProvenanceIndeterminate = false, want true (an R row carries no source)")
+	}
+	if !containsString(prov.PlanUntouched, "pkg/declared.go") {
+		t.Errorf("PlanUntouched = %v, want to still list pkg/declared.go", prov.PlanUntouched)
+	}
+	// Rendered: hedged, not asserted UNTOUCHED as fact.
+	rendered, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: pl,
+		Diff:         renderDiffForReview(diff),
+		GateEvidence: &prompt.GateEvidence{ScopeProvenance: prov},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(rendered, "pkg/declared.go (plan scope — UNTOUCHED label NOT DETERMINABLE under this diff mode") {
+		t.Errorf("rendered prompt must hedge the untouched label as NOT DETERMINABLE:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "pkg/declared.go (plan scope, UNTOUCHED — reviewer judgment") {
+		t.Errorf("rendered prompt must NOT assert the path UNTOUCHED as fact under indeterminate mode:\n%s", rendered)
+	}
+}
+
+// TestRenderDiffForReview_RenameArrow pins the changed-file rendering (#2398): an
+// R/C row with a source renders `- R <old> -> <new>`, while a diff with NO
+// renames renders byte-identically to before the field existed — the property
+// prompt-hash replay depends on.
+func TestRenderDiffForReview_RenameArrow(t *testing.T) {
+	withRename := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "a.go", Status: policy.StatusModified},
+		renameRow("old/b.go", "new/b.go"),
+	}}
+	got := renderDiffForReview(withRename)
+	want := "- M a.go\n- R old/b.go -> new/b.go\n"
+	if got != want {
+		t.Errorf("renderDiffForReview with rename = %q, want %q", got, want)
+	}
+
+	// No-rename byte-stability: an ordinary diff renders exactly as before, so a
+	// hash-replayed prompt over a rename-free diff is unaffected.
+	noRename := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "a.go", Status: policy.StatusModified},
+		{Path: "b.go", Status: policy.StatusAdded},
+		{Path: "c.go", Status: policy.StatusDeleted},
+	}}
+	if got, want := renderDiffForReview(noRename), "- M a.go\n- A b.go\n- D c.go\n"; got != want {
+		t.Errorf("no-rename render = %q, want byte-identical %q", got, want)
+	}
+}
+
 // TestRunImplementReviews_ScopeProvenance_FoldOnly_RendersDecomposition is the
 // #1914 cross-boundary dispatch test: an approved add_scope_files path the
 // commit left untouched drives runImplementReviews, and the RENDERED

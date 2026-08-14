@@ -744,6 +744,10 @@ MCP surface: `fishhawk_get_plan` adds `test_sweep` (`TestSweep{findings[], scann
 - The complementary BLOCKING gate for a FULLY-untouched concrete DECLARED scope path is the runner's #1151/#1231/#2501 scope-completeness park (`gitops.MissingScopeFiles`; the scope-completeness invariant in `docs/ARCHITECTURE.md`); this is the advisory pre-review surface for the partial / operator-added case.
 - Audit-kind note in `docs/issue-comment-surfaces.md`.
 
+### Rename-aware touched set (#2398)
+
+Both this `#1407` signal and the `#1914` `scopeProvenanceForReview` decompose "was this declared path touched?" against a shared `committedPathSet(diff)` helper. It inserts every row's destination `Path` AND, for `Status == StatusRenamed` rows carrying a non-empty `OldPath`, the rename **SOURCE** — because porcelain rename detection collapses a declared delete+create into a single `R` row that records only the destination, so the source path never appears as its own row and would otherwise read as untouched (manufacturing a spurious high-severity `evidence_conflict` on any file move — run 933cd6ee / #2397). A **COPY** (`StatusCopied`) source is deliberately NOT inserted: a copy leaves its source byte-unchanged, so treating it as touched would replace a false negative with a false positive. When the diff carries any RENAME row with an EMPTY `OldPath` (a pre-field bundle, or the forge-compare consolidated-review diff), the helper reports `indeterminate` — an absent declared path cannot be distinguished from a rename source, so the provenance marks itself indeterminate and the prompt hedges the untouched label rather than asserting it. Copy rows with an empty source do NOT set indeterminate (a copy source is never counted as touched, so its absence cannot flip an untouched verdict).
+
 ## Re-review convergence: settled ledger + re-litigation guard (#1913)
 
 `trace.go` makes implement re-review rounds converge by threading settled history forward and turning operator arbitrations into a machine-binding suppression guard (issue #1913; measured churn on runs a04d5cbf / 98704b0c).

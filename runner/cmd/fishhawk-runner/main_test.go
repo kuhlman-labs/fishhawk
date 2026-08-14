@@ -1883,6 +1883,72 @@ func TestMakeGitDiffEvent_CarriesPatch(t *testing.T) {
 	}
 }
 
+// wireGoldenGitDiffRenamePath anchors the SHARED cross-module wire fixture
+// (#2398 binding condition 3) to this test source via runtime.Caller, the
+// same anchor wireGoldenHeldCommitPath uses. The backend's
+// TestExtractDiff_RenameOldPath decodes the IDENTICAL file, so a runner-side
+// serialization change the backend cannot decode fails a test rather than
+// silently passing two hand-maintained literals.
+func wireGoldenGitDiffRenamePath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
+}
+
+// TestMakeGitDiffEvent_RenameCarriesOldPath is the RUNNER half of the #2398
+// cross-module wire seam. It builds a diff with a rename (R, carrying a
+// source OldPath) and a plain modify (M, no source), runs the real
+// makeGitDiffEventStats, and asserts the emitted git_diff payload is
+// byte-identical to the shared testdata/wire fixture — so the runner emits
+// exactly the bytes the backend's TestExtractDiff_RenameOldPath decodes.
+// It also asserts the plain M row emits NO `old_path` key (omitempty), so an
+// ordinary diff's wire shape is unchanged.
+func TestMakeGitDiffEvent_RenameCarriesOldPath(t *testing.T) {
+	d := constraint.Diff{ChangedFiles: []constraint.ChangedFile{
+		{Path: "internal/credstore/credstore.go", OldPath: "cli/internal/credstore/credstore.go", Status: constraint.StatusRenamed},
+		{Path: "backend/internal/server/trace.go", Status: constraint.StatusModified},
+	}}
+	// patch empty, truncated false, ins/dels 0 → every omitempty field absent,
+	// so the payload reduces to kind/base_ref/files/num_files.
+	ev := makeGitDiffEventStats("main", d, "", false, 0, 0)
+
+	fixture, err := os.ReadFile(wireGoldenGitDiffRenamePath(t))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	var want bytes.Buffer
+	if err := json.Compact(&want, fixture); err != nil {
+		t.Fatalf("compact fixture: %v", err)
+	}
+	if !bytes.Equal([]byte(ev.Payload), want.Bytes()) {
+		t.Fatalf("emitted git_diff payload diverged from the shared wire fixture.\n emitted: %s\n fixture: %s",
+			ev.Payload, want.Bytes())
+	}
+
+	// Explicit omitempty check: the plain M row's serialized object must not
+	// carry an old_path key.
+	var payload gitDiffPayload
+	if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Files[0].OldPath != "cli/internal/credstore/credstore.go" {
+		t.Errorf("rename row OldPath = %q, want the source path", payload.Files[0].OldPath)
+	}
+	if payload.Files[1].OldPath != "" {
+		t.Errorf("plain M row OldPath = %q, want empty", payload.Files[1].OldPath)
+	}
+	mRow, err := json.Marshal(payload.Files[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(mRow), "old_path") {
+		t.Errorf("plain M row emitted an old_path key (omitempty broken): %s", mRow)
+	}
+}
+
 // TestRun_GitDiffPatch_RedactedInBundle drives the full runner with a
 // real git repo whose staged change adds a line containing a secret.
 // The patch lands inside the git_diff event payload, so it must be

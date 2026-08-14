@@ -3447,9 +3447,17 @@ func enforceConstraints(cfg config, d constraint.Diff) ([]agent.Event, error) {
 // gitDiffFile mirrors constraint.ChangedFile but with json tags
 // pinned for the bundle's wire format. The backend's reader
 // decodes into the same shape.
+//
+// OldPath carries the rename/copy SOURCE path for R/C rows (#2398).
+// Additive and `omitempty`: an ordinary row emits byte-identical JSON
+// to before this field existed (no `old_path` key), so only bundles
+// carrying a rename/copy change shape. The `old_path` json tag MUST
+// stay identical to backend/internal/bundle/bundle.go's gitDiffEntry
+// mirror — the runner↔backend wire contract.
 type gitDiffFile struct {
-	Path   string `json:"path"`
-	Status string `json:"status"`
+	Path    string `json:"path"`
+	Status  string `json:"status"`
+	OldPath string `json:"old_path,omitempty"`
 }
 
 // gitDiffPayload is the body of a git_diff event in the bundle.
@@ -3463,9 +3471,10 @@ type gitDiffFile struct {
 // bundles (and patch-compute failures) omit it, and the backend
 // reader decodes the absence to an empty Patch. PatchTruncated marks
 // a patch that hit the maxPatchBytes cap. The `patch` / `patch_truncated`
-// json tags MUST stay identical to backend/internal/bundle/bundle.go's
-// gitDiffPayload mirror — this is the runner↔backend wire contract,
-// not a JSON Schema, so the two sides agree field-by-field in lockstep.
+// json tags — and the per-file `old_path` tag on gitDiffFile — MUST stay
+// identical to backend/internal/bundle/bundle.go's gitDiffPayload /
+// gitDiffEntry mirror. This is the runner↔backend wire contract, not a
+// JSON Schema, so the two sides agree field-by-field in lockstep.
 //
 // Insertions/Deletions carry the `git diff --cached --numstat <base>`
 // totals (E22.X / #1137). They moved onto the wire because per-run
@@ -3504,7 +3513,7 @@ func makeGitDiffEvent(baseRef string, d constraint.Diff, patch string, truncated
 func makeGitDiffEventStats(baseRef string, d constraint.Diff, patch string, truncated bool, insertions, deletions int) agent.Event {
 	files := make([]gitDiffFile, 0, len(d.ChangedFiles))
 	for _, f := range d.ChangedFiles {
-		files = append(files, gitDiffFile{Path: f.Path, Status: string(f.Status)})
+		files = append(files, gitDiffFile{Path: f.Path, Status: string(f.Status), OldPath: f.OldPath})
 	}
 	return agent.Event{
 		Kind: "git_diff",

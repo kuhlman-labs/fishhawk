@@ -817,6 +817,31 @@ type GateScopeProvenance struct {
 	// reconstructed effective-set size (clamped at 0). A positive value is a
 	// real divergence the provenance does NOT explain — the still-flag signal.
 	UnexplainedCount int
+	// Renames are the (old,new) pairs whose OLD side is a declared plan/fold
+	// path realized as the SOURCE side of a rename (#2398). Each names a
+	// declared path that is TOUCHED as a rename source — porcelain rename
+	// detection collapses the declared delete+create into one R row keyed on
+	// the destination, so the source never appears as its own changed-file row
+	// and would otherwise read as untouched. writeGateEvidence renders each as
+	// a positive TOUCHED line so the evidence is self-explanatory. Empty for a
+	// diff with no declared-path renames, keeping the prompt byte-identical.
+	Renames []GateScopeRename
+	// RenameProvenanceIndeterminate is true when the diff carries rename rows
+	// with NO source path (a legacy pre-field bundle or the forge-compare
+	// consolidated-review diff), so an absent declared path cannot be
+	// distinguished from a rename source. writeGateEvidence then hedges every
+	// UNTOUCHED label as NOT DETERMINABLE rather than asserting it as fact.
+	// False for a determinable diff, keeping the prompt byte-identical.
+	RenameProvenanceIndeterminate bool
+}
+
+// GateScopeRename is one declared-path rename (#2398): the SOURCE side
+// (OldPath, a declared plan/fold path) and the DESTINATION it moved to
+// (NewPath). writeGateEvidence renders it as a positive TOUCHED line so a
+// renamed-away declared path is not misread as untouched.
+type GateScopeRename struct {
+	OldPath string
+	NewPath string
 }
 
 // GateScopeFold is one folded (non-plan) effective-scope entry (#1914): the
@@ -4025,19 +4050,45 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		b.WriteString("Declared-scope provenance (decomposition of the declared scope.files count — makes " +
 			"\"fully explained\" machine-derived on both sides of the divergence):\n\n")
 		fmt.Fprintf(b, "- plan scope.files: %d entries\n", p.PlanFiles)
+		// Declared paths TOUCHED as the SOURCE side of a rename (#2398). git
+		// records a single R row keyed on the destination, so the old path has
+		// no standalone changed-file row of its own — but it IS visible as the
+		// source side of the "R <old> -> <new>" row in the changed-file list
+		// above. Both facts are stated plainly so the two never read as a
+		// contradiction (binding condition 1): no keyed row of its own, yet
+		// present as the rename source — NOT an untouched declared path.
+		for _, rn := range p.Renames {
+			fmt.Fprintf(b, "  - %s (plan scope, TOUCHED as the SOURCE side of a rename -> %s; git recorded a "+
+				"single R row for the move, so %s has no standalone changed-file row of its own but IS shown as "+
+				"the source side of the \"R %s -> %s\" row in the changed-file list above — this is NOT an "+
+				"untouched declared path)\n", rn.OldPath, rn.NewPath, rn.OldPath, rn.OldPath, rn.NewPath)
+		}
 		// Untouched PLAN paths are their own distinctly-labeled reviewer-judgment
 		// category — NOT auto-classified as non-drift (unless the fix-up ceiling
-		// explains them) and NOT auto-flagged.
+		// explains them) and NOT auto-flagged. When the diff mode is indeterminate
+		// (rename rows with no source path), the untouched label is not
+		// determinable — an absent path cannot be distinguished from a rename
+		// source — so it is hedged rather than asserted (binding condition 1/2).
 		for _, pu := range p.PlanUntouched {
-			fmt.Fprintf(b, "  - %s (plan scope, UNTOUCHED — reviewer judgment: an approved-plan file the commit "+
-				"left unchanged; not machine-classified either way)\n", pu)
+			if p.RenameProvenanceIndeterminate {
+				fmt.Fprintf(b, "  - %s (plan scope — UNTOUCHED label NOT DETERMINABLE under this diff mode: the "+
+					"diff carries rename/copy rows with no source path, so an absent path cannot be distinguished "+
+					"from a rename source; do NOT assert this as an untouched declared path)\n", pu)
+			} else {
+				fmt.Fprintf(b, "  - %s (plan scope, UNTOUCHED — reviewer judgment: an approved-plan file the commit "+
+					"left unchanged; not machine-classified either way)\n", pu)
+			}
 		}
 		if len(p.Folds) > 0 {
 			b.WriteString("- folded (non-plan) effective-scope entries — permissions, not work-orders:\n")
 			for _, f := range p.Folds {
-				if f.Touched {
+				switch {
+				case f.Touched:
 					fmt.Fprintf(b, "  - %s (folded: %s)\n", f.Path, f.Source)
-				} else {
+				case p.RenameProvenanceIndeterminate:
+					fmt.Fprintf(b, "  - %s (folded: %s) — UNTOUCHED label NOT DETERMINABLE under this diff mode "+
+						"(rename/copy rows carry no source path); do NOT assert it as untouched\n", f.Path, f.Source)
+				default:
 					fmt.Fprintf(b, "  - %s (folded: %s) — folded, UNTOUCHED — a permission, not a work-order\n",
 						f.Path, f.Source)
 				}
