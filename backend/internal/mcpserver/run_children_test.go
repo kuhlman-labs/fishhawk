@@ -1229,8 +1229,20 @@ func TestRunChildren_FailedCompensationDisclosesStrand(t *testing.T) {
 // exhausting to a stderr diagnostic). The test waits for that loop to exhaust
 // (an exhaustion the accepted-bodies map cannot express, hence the fake's
 // attempt counter) and then asserts the honest committed state: the stage is
-// STILL 'running', with no runner and no reaper left. That state is produced, not
-// seeded.
+// STILL 'running', with no runner and no reaper left.
+//
+// ORDERING (#2689 review). The stub runner cannot itself perform the runner's
+// signed prompt fetch — the one transition that flips a stage dispatched ->
+// running — so the test applies that flip on its behalf. For the observed strand
+// to be PRODUCED by the child's exit rather than MANUFACTURED after it, the flip
+// must provably precede the exit, so the stub and the test handshake through two
+// files: the stub touches `ready` as its FIRST act and then BLOCKS until the test
+// creates `gate`, and only then emits its runner_failed line and exits 7. The
+// test waits for `ready`, applies the flip, asserts the fake has recorded ZERO
+// reap-failure attempts at that instant (a positive check that the child had not
+// yet exited and no reaper had yet run), and only then opens the gate. The
+// 'running' state the reaper leaves behind is therefore the state the child's
+// non-zero exit found and failed to settle.
 //
 // RECOVERY. With the backend healthy again the operator invokes
 // fishhawk_reap_stage against that SAME fake backend, and the test asserts
@@ -1261,8 +1273,25 @@ func TestRunChildren_ChildExitsNonZeroWithoutSettling_ReapStageRecovers(t *testi
 	fb.reapFailureStatus = http.StatusInternalServerError
 	fb.mu.Unlock()
 
+	// The stub's handshake files. `ready` proves the child is alive and has NOT
+	// yet emitted its failure line; `gate` releases it to exit.
+	handshakeDir := t.TempDir()
+	readyPath := filepath.Join(handshakeDir, "ready")
+	gatePath := filepath.Join(handshakeDir, "gate")
+
+	// The stub's own wedge is bounded so a test that fails before opening the
+	// gate leaks no lingering process; the bound derives from timescale.D like
+	// every other duration here (AGENTS.md / #1984), polled at an unscaled 50ms.
+	stubWedgeTicks := int(timescale.D(30*time.Second) / (50 * time.Millisecond))
 	stub := filepath.Join(t.TempDir(), "stub-runner")
 	script := "#!/bin/sh\n" +
+		": > '" + readyPath + "'\n" +
+		"i=0\n" +
+		"while [ ! -f '" + gatePath + "' ]; do\n" +
+		"  i=$((i+1))\n" +
+		"  [ \"$i\" -gt " + fmt.Sprintf("%d", stubWedgeTicks) + " ] && break\n" +
+		"  sleep 0.05 2>/dev/null || sleep 1\n" +
+		"done\n" +
 		`echo '{"event":"runner_failed","reason":"agent_invocation_failed","detail":"boom"}'` + "\n" +
 		"exit 7\n"
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
@@ -1281,13 +1310,43 @@ func TestRunChildren_ChildExitsNonZeroWithoutSettling_ReapStageRecovers(t *testi
 	t.Cleanup(func() { _, _ = detachedRunners.terminateRunners(child.String(), nil) })
 
 	stageID := stageIDOf(fb, child)
-	// Model the runner's signed prompt fetch, the only transition that flips a
-	// stage dispatched -> running. The child never settles it further.
+
+	// ORDERING STEP 1: wait for the child to announce itself. Past this point the
+	// child is alive and wedged BEFORE its runner_failed line, so it has not
+	// exited and its reaper has not run.
+	readyDeadline := time.Now().Add(timescale.D(10 * time.Second))
+	for {
+		if _, statErr := os.Stat(readyPath); statErr == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			t.Fatalf("stub runner never touched %s — the child was not spawned", readyPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// ORDERING STEP 2: model the runner's signed prompt fetch, the only
+	// transition that flips a stage dispatched -> running. The child never
+	// settles it further.
 	fb.mu.Lock()
 	for i := range fb.stagesByRun[child] {
 		fb.stagesByRun[child][i].State = "running"
 	}
+	attemptsAtFlip := fb.reapFailureAttempts
 	fb.mu.Unlock()
+
+	// ORDERING STEP 3: the positive proof that the flip PRECEDED the exit. A
+	// reaper attempt can only exist once the child has exited, so zero attempts
+	// at the instant of the flip means the 'running' state was in place before
+	// the child could produce the strand — it is not manufactured afterwards.
+	if attemptsAtFlip != 0 {
+		t.Fatalf("reap-failure attempts at the dispatched->running flip = %d, want 0 — the child exited before the transition, so the strand below would be manufactured, not produced", attemptsAtFlip)
+	}
+
+	// ORDERING STEP 4: release the child to emit runner_failed and exit 7.
+	if err := os.WriteFile(gatePath, nil, 0o600); err != nil {
+		t.Fatalf("open the stub runner's gate: %v", err)
+	}
 
 	// Wait for the reaper's retry loop to EXHAUST: one initial attempt plus one
 	// per backoff step. Only then is the strand residual rather than in-flight.
