@@ -4053,6 +4053,38 @@ func TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed(t *testing.T) 
 	}
 }
 
+// COUNTERFACTUAL EVIDENCE for the three #2549 tests below (recorded in-tree so a
+// diff-only review can confirm the exercise was RUN, not reasoned about). The
+// control — the `if child.DecomposedFrom != nil { continue }` skip in
+// newestTerminalRecoveryDescendant (campaigns.go) — was DELETED, the three tests
+// run, then the file restored byte-identically (sha256 re-verified,
+// `git diff` empty). All three went RED, and the run was repeated WITHOUT -race
+// to prove the RED is the control firing and not a fake-internal data race: the
+// failure set is identical under both, and no race report was emitted under
+// -race. Observed output (uuids elided as <...>, identical under both runs):
+//
+//	--- FAIL: ..._SucceededSliceSettlesFailed (0.00s)
+//	    campaigns_test.go: item state = "succeeded", want failed (a decomposition slice is not a recovery)
+//	    campaigns_test.go: rollup.Done = [issue:100], want empty (nothing succeeded)
+//	    campaigns_test.go: campaign state = "succeeded", want non-succeeded (parent failed)
+//	    campaigns_test.go: item run_id = <slice>, want the failed parent <parent> (never relinked to slice <slice>)
+//	    campaigns_test.go: audit outcome = succeeded, want failed
+//	    campaigns_test.go: audit run_id = <slice>, want the failed parent <parent>
+//	--- FAIL: ..._RunningSliceSettlesFailed (0.00s)
+//	    campaigns_test.go: item state = "running", want failed (a running slice must not read as an in-flight recovery)
+//	    campaigns_test.go: rollup.Running = [issue:100], want empty (item settled, not left running)
+//	    campaigns_test.go: campaign_issue_settled count = 0, want 1 (settled on this read)
+//	--- FAIL: ..._RecoveryChildWinsOverNewerSlice (0.00s)
+//	    campaigns_test.go: item state = "succeeded", want failed (settled off the recovery child, not the newer slice)
+//	    campaigns_test.go: rollup.Done = [issue:100], want empty (the succeeded run is a slice, not a recovery)
+//	    campaigns_test.go: item run_id = <slice>, want the recovery child <recovery> (not the parent <parent>, not the slice <slice>)
+//	    campaigns_test.go: audit run_id = <slice>, want the recovery child <recovery>
+//	FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/server
+//
+// Each RED lands on the behavioral assertion, not on fixture setup, and each
+// names the wrong-lineage run the deleted skip let through — so the three are
+// discriminating rather than vacuous.
+//
 // TestReconcileOnRead_FailedDecompositionParent_SucceededSliceSettlesFailed is
 // the reproduction of the live incident (#2549, campaign 96997403 / issue:2501):
 // a FAILED decomposition parent whose slices include a succeeded one settles the
