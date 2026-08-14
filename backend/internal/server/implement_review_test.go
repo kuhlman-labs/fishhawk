@@ -4161,6 +4161,44 @@ func TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills(t *testi
 	}
 }
 
+// TestPersistReviewConcerns_InsertFailureEmitsNoBackfillEntry is the
+// partial-failure ordering control: the advisory concern_note_backfilled entry
+// is appended only AFTER InsertRaised persists the batch, so a store failure
+// leaves NO audit entry describing a substitution onto a row that was never
+// minted. Appending inside the per-concern loop (the pre-fix-up ordering) makes
+// the audit chain disagree with derived state — the same slip
+// TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed guards on the
+// suppression path, here on the insert-failure path.
+//
+// The blank note is seeded BY CONSTRUCTION (a literal ""), and the insert is
+// failed by injection, so the RED lands on the audit-entry assertion rather
+// than on fixture setup.
+func TestPersistReviewConcerns_InsertFailureEmitsNoBackfillEntry(t *testing.T) {
+	s, cr, au := guardServer(t)
+	cr.insertErr = errors.New("store down")
+	runID, stageID := uuid.New(), uuid.New()
+
+	before := countRaised(cr)
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"claude-opus-4-8", "round commentary worth recovering", 77,
+		[]planreview.Concern{
+			{Severity: "high", Category: "correctness", Note: ""},
+			{Severity: "low", Category: "style", Note: "authored"},
+		})
+	if minted != nil {
+		t.Fatalf("minted = %v, want nil — InsertRaised was injected to fail", minted)
+	}
+	// Derived state: no row exists.
+	if got := countRaised(cr) - before; got != 0 {
+		t.Fatalf("minted %d rows after an injected insert failure, want 0", got)
+	}
+	// Audit evidence must agree with it: no entry claiming a substitution.
+	if n := len(findBackfillAudits(au)); n != 0 {
+		t.Errorf("concern_note_backfilled entries = %d after the insert failed, want 0 — "+
+			"the audit chain claims a substituted note was recorded onto a row that was never minted", n)
+	}
+}
+
 // TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills: the other
 // append-unavailable branch — no AuditRepo wired at all.
 func TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills(t *testing.T) {

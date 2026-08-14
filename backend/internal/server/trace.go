@@ -2738,7 +2738,9 @@ type concernRelitigationSuppressedPayload struct {
 // substitution: the synthesized note itself is that record — persisted on the
 // row, rendered at every operator surface, and self-describing about being
 // synthesized (it leads with concern.MissingNoteMarker). An append failure
-// therefore degrades traceability but never silence.
+// therefore degrades traceability but never silence. The entry is appended only
+// AFTER the batch InsertRaised succeeds, so an entry exists only where the row
+// it describes does.
 const concernNoteBackfilledCategory = "concern_note_backfilled"
 
 // concernNoteBackfilledPayload is the audit payload for a
@@ -4611,6 +4613,12 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		return nil
 	}
 	raised := make([]concern.RaisedConcern, 0, len(concerns))
+	// Advisory backfill entries accumulate here and are appended only AFTER
+	// InsertRaised persists the batch (#2555 fix-up): an entry appended inside
+	// the loop would describe a substitution onto a row that a subsequent insert
+	// failure never minted, leaving the audit chain disagreeing with derived
+	// state — the same ordering slip the suppression path guards against.
+	var pendingBackfills []pendingNoteBackfill
 	for _, c := range concerns {
 		// Re-litigation guard (#1913): a concern re-raising an operator-arbitrated
 		// (waived/deferred) settled concern with no new evidence is recorded as a
@@ -4642,15 +4650,14 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 			// substitution (it is stored on the row, rendered at every operator
 			// surface, and self-describing); the audit entry only improves
 			// traceability. An append failure degrades traceability, never silence.
-			if err := s.appendConcernNoteBackfilled(ctx, runID, stageID, reviewerModel, originSequence, c, note, source, truncated); err != nil {
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: append concern_note_backfilled failed — note still backfilled onto the row",
-					slog.String("run_id", runID.String()),
-					slog.String("stage_id", stageID.String()),
-					slog.String("stage_kind", stageKind),
-					slog.String("backfill_source", source),
-					slog.String("error", err.Error()),
-				)
-			}
+			// The append itself is DEFERRED to after the insert (see below), so
+			// the entry is never written for a row that was never minted.
+			pendingBackfills = append(pendingBackfills, pendingNoteBackfill{
+				concern:   c,
+				note:      note,
+				source:    source,
+				truncated: truncated,
+			})
 		}
 		raised = append(raised, concern.RaisedConcern{
 			Severity:       string(c.Severity),
@@ -4686,7 +4693,34 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		)
 		return nil
 	}
+	// The batch is durable — now record the advisory backfill entries. Their
+	// fail direction is unchanged: the synthesized note is already on the
+	// persisted row, so an append failure here degrades traceability, never
+	// silence, and never removes the substitution it failed to describe.
+	for _, b := range pendingBackfills {
+		if err := s.appendConcernNoteBackfilled(ctx, runID, stageID, reviewerModel, originSequence, b.concern, b.note, b.source, b.truncated); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: append concern_note_backfilled failed — note still backfilled onto the row",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("stage_kind", stageKind),
+				slog.String("backfill_source", b.source),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 	return minted
+}
+
+// pendingNoteBackfill is one blank-note substitution awaiting its advisory
+// concern_note_backfilled audit entry (#2555). persistReviewConcerns collects
+// these while building the InsertRaised batch and appends them only after that
+// insert succeeds, so a partial failure can never leave an audit entry
+// describing a substitution onto a concern row that was never minted.
+type pendingNoteBackfill struct {
+	concern   planreview.Concern
+	note      string
+	source    string
+	truncated bool
 }
 
 // suppressRelitigation reports whether the concern c is a no-evidence re-raise of
