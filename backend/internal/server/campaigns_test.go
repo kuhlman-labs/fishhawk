@@ -3840,11 +3840,41 @@ func TestStartCampaignItemRun_RestartThenDownstreamFailure_ReAdmittable(t *testi
 	}
 }
 
+// seedLineageBase is the fixed CreatedAt anchor every seeded lineage child is
+// stamped from. fakeRepo.CreateRun stamps CreatedAt from time.Now(), and
+// ListRuns orders created_at DESC with an id DESC tie-break — so "this child is
+// newest" derived from successive CreateRun calls is a WALL-CLOCK RACE, and on
+// a tie the ordering falls through to the id tie-break and a
+// newest-descendant test asserts nothing about outcome-vs-ordering. Every seed
+// helper below therefore sets CreatedAt EXPLICITLY at a caller-chosen offset
+// from this anchor, so strict ordering is established by construction rather
+// than by clock resolution or a sleep.
+var seedLineageBase = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// stampRunCreatedAt overwrites a seeded run's CreatedAt with an explicit
+// instant. fakeRepo stores (and returns) the same *run.Run pointer it keeps in
+// its map, so this reaches the row the walk will read; the fake's mutex is held
+// for parity with its own accessors.
+func stampRunCreatedAt(rrepo *fakeRepo, r *run.Run, createdAt time.Time) {
+	rrepo.mu.Lock()
+	defer rrepo.mu.Unlock()
+	r.CreatedAt = createdAt
+}
+
 // seedRecoveryChild mints a run in the fake run repo carrying parent_run_id =
 // parentID (a resume/recovery child, the #216 lineage) and drives it to state.
 // It models the run fishhawk_resume_run mints when an operator recovers a
-// failed run (#1751).
+// failed run (#1751). DecomposedFrom is left nil — that is what marks this
+// lineage a recovery rather than a decomposition slice (#2549).
 func seedRecoveryChild(t *testing.T, rrepo *fakeRepo, parentID uuid.UUID, state run.State) *run.Run {
+	t.Helper()
+	return seedRecoveryChildAt(t, rrepo, parentID, state, seedLineageBase)
+}
+
+// seedRecoveryChildAt is seedRecoveryChild with an explicit CreatedAt, for the
+// mixed-lineage tests that must order a recovery child against a slice
+// deterministically.
+func seedRecoveryChildAt(t *testing.T, rrepo *fakeRepo, parentID uuid.UUID, state run.State, createdAt time.Time) *run.Run {
 	t.Helper()
 	child, err := rrepo.CreateRun(context.Background(), run.CreateRunParams{
 		Repo:          "kuhlman-labs/fishhawk",
@@ -3856,9 +3886,45 @@ func seedRecoveryChild(t *testing.T, rrepo *fakeRepo, parentID uuid.UUID, state 
 	if err != nil {
 		t.Fatalf("seed recovery child: %v", err)
 	}
+	stampRunCreatedAt(rrepo, child, createdAt)
 	if state != run.StatePending {
 		if _, err := rrepo.TransitionRun(context.Background(), child.ID, state); err != nil {
 			t.Fatalf("transition recovery child to %s: %v", state, err)
+		}
+	}
+	return child
+}
+
+// seedDecompositionSlice mints a fan-out child modelling orchestrator
+// decomposition exactly: ParentRunID AND DecomposedFrom AND SliceIndex all set
+// (run.ChildParamsFrom sets parent_run_id for every child kind and the fan-out
+// then adds decomposed_from + slice_index on top). Contrast seedRecoveryChild,
+// which sets ParentRunID only — the pair is what discriminates the two lineages
+// inside one parent_run_id walk (#2549). CreatedAt is explicit so slice
+// ordering is deterministic.
+func seedDecompositionSlice(t *testing.T, rrepo *fakeRepo, parentID uuid.UUID, sliceIndex int, state run.State, createdAt time.Time) *run.Run {
+	t.Helper()
+	idx := sliceIndex
+	child, err := rrepo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "sha-slice",
+		TriggerSource:  run.TriggerCLI,
+		ParentRunID:    &parentID,
+		DecomposedFrom: &parentID,
+		SliceIndex:     &idx,
+	})
+	if err != nil {
+		t.Fatalf("seed decomposition slice %d: %v", sliceIndex, err)
+	}
+	if child.DecomposedFrom == nil || child.SliceIndex == nil {
+		t.Fatalf("seeded slice %d lost its decomposition marks (decomposed_from=%v slice_index=%v)",
+			sliceIndex, child.DecomposedFrom, child.SliceIndex)
+	}
+	stampRunCreatedAt(rrepo, child, createdAt)
+	if state != run.StatePending {
+		if _, err := rrepo.TransitionRun(context.Background(), child.ID, state); err != nil {
+			t.Fatalf("transition slice %d to %s: %v", sliceIndex, state, err)
 		}
 	}
 	return child
@@ -3984,6 +4050,158 @@ func TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed(t *testing.T) 
 	}
 	if n := aud.count("campaign_issue_settled"); n != 1 {
 		t.Errorf("campaign_issue_settled count = %d, want 1", n)
+	}
+}
+
+// COUNTERFACTUAL EVIDENCE for the three #2549 tests below (recorded in-tree so a
+// diff-only review can confirm the exercise was RUN, not reasoned about). The
+// control — the `if child.DecomposedFrom != nil { continue }` skip in
+// newestTerminalRecoveryDescendant (campaigns.go) — was DELETED, the three tests
+// run, then the file restored byte-identically (sha256 re-verified,
+// `git diff` empty). All three went RED, and the run was repeated WITHOUT -race
+// to prove the RED is the control firing and not a fake-internal data race: the
+// failure set is identical under both, and no race report was emitted under
+// -race. Observed output (uuids elided as <...>, identical under both runs):
+//
+//	--- FAIL: ..._SucceededSliceSettlesFailed (0.00s)
+//	    campaigns_test.go: item state = "succeeded", want failed (a decomposition slice is not a recovery)
+//	    campaigns_test.go: rollup.Done = [issue:100], want empty (nothing succeeded)
+//	    campaigns_test.go: campaign state = "succeeded", want non-succeeded (parent failed)
+//	    campaigns_test.go: item run_id = <slice>, want the failed parent <parent> (never relinked to slice <slice>)
+//	    campaigns_test.go: audit outcome = succeeded, want failed
+//	    campaigns_test.go: audit run_id = <slice>, want the failed parent <parent>
+//	--- FAIL: ..._RunningSliceSettlesFailed (0.00s)
+//	    campaigns_test.go: item state = "running", want failed (a running slice must not read as an in-flight recovery)
+//	    campaigns_test.go: rollup.Running = [issue:100], want empty (item settled, not left running)
+//	    campaigns_test.go: campaign_issue_settled count = 0, want 1 (settled on this read)
+//	--- FAIL: ..._RecoveryChildWinsOverNewerSlice (0.00s)
+//	    campaigns_test.go: item state = "succeeded", want failed (settled off the recovery child, not the newer slice)
+//	    campaigns_test.go: rollup.Done = [issue:100], want empty (the succeeded run is a slice, not a recovery)
+//	    campaigns_test.go: item run_id = <slice>, want the recovery child <recovery> (not the parent <parent>, not the slice <slice>)
+//	    campaigns_test.go: audit run_id = <slice>, want the recovery child <recovery>
+//	FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/server
+//
+// Each RED lands on the behavioral assertion, not on fixture setup, and each
+// names the wrong-lineage run the deleted skip let through — so the three are
+// discriminating rather than vacuous.
+//
+// TestReconcileOnRead_FailedDecompositionParent_SucceededSliceSettlesFailed is
+// the reproduction of the live incident (#2549, campaign 96997403 / issue:2501):
+// a FAILED decomposition parent whose slices include a succeeded one settles the
+// campaign item FAILED, not succeeded, and the item is NOT relinked to the slice.
+//
+// The slices are minted in explicit CreatedAt order so slice 2 (succeeded) is
+// STRICTLY the newest by construction — the exact ordering that made the walk
+// settle succeeded before the DecomposedFrom skip. Note the counterfactual trap
+// the issue names: a test asserting only "a failed run with a succeeded
+// descendant settles succeeded" passes both before and after the fix, so the
+// descendants here are specifically decomposition slices and the expected
+// outcome is specifically the inverse of the pre-fix behavior.
+func TestReconcileOnRead_FailedDecompositionParent_SucceededSliceSettlesFailed(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	// The fan-out shape of the live incident: three slices, the SUCCEEDED one
+	// strictly newest so it wins the newest-by-CreatedAt comparison.
+	seedDecompositionSlice(t, rrepo, failedRunID, 0, run.StateFailed, seedLineageBase.Add(1*time.Minute))
+	seedDecompositionSlice(t, rrepo, failedRunID, 1, run.StateCancelled, seedLineageBase.Add(2*time.Minute))
+	newestSlice := seedDecompositionSlice(t, rrepo, failedRunID, 2, run.StateSucceeded, seedLineageBase.Add(3*time.Minute))
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Items[0].State != string(campaign.ItemStateFailed) {
+		t.Errorf("item state = %q, want failed (a decomposition slice is not a recovery)", st.Items[0].State)
+	}
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (nothing succeeded)", st.Rollup.Done)
+	}
+	if st.Campaign.State == string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want non-succeeded (parent failed)", st.Campaign.State)
+	}
+	// Provenance half of the bug: the item still points at the FAILED PARENT.
+	// A state-only assertion would pass a fix that settled failed but relinked.
+	if st.Items[0].RunID == nil || *st.Items[0].RunID != failedRunID {
+		t.Errorf("item run_id = %v, want the failed parent %s (never relinked to slice %s)",
+			st.Items[0].RunID, failedRunID, newestSlice.ID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled count = %d, want 1", n)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["outcome"] != string(campaign.ItemStateFailed) {
+		t.Errorf("audit outcome = %v, want failed", p["outcome"])
+	}
+	if p["run_id"] != failedRunID.String() {
+		t.Errorf("audit run_id = %v, want the failed parent %s", p["run_id"], failedRunID)
+	}
+}
+
+// TestReconcileOnRead_FailedDecompositionParent_RunningSliceSettlesFailed is the
+// inverse half of #2549: a still-RUNNING slice under a failed decomposition
+// parent is not an in-flight recovery, so it must not trip the inFlight early
+// return and hang the item running. The item settles failed on this same read.
+func TestReconcileOnRead_FailedDecompositionParent_RunningSliceSettlesFailed(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	seedDecompositionSlice(t, rrepo, failedRunID, 0, run.StateRunning, seedLineageBase.Add(1*time.Minute))
+	seedDecompositionSlice(t, rrepo, failedRunID, 1, run.StateSucceeded, seedLineageBase.Add(2*time.Minute))
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Items[0].State != string(campaign.ItemStateFailed) {
+		t.Errorf("item state = %q, want failed (a running slice must not read as an in-flight recovery)", st.Items[0].State)
+	}
+	if len(st.Rollup.Running) != 0 {
+		t.Errorf("rollup.Running = %v, want empty (item settled, not left running)", st.Rollup.Running)
+	}
+	if st.Items[0].RunID == nil || *st.Items[0].RunID != failedRunID {
+		t.Errorf("item run_id = %v, want the failed parent %s", st.Items[0].RunID, failedRunID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled count = %d, want 1 (settled on this read)", n)
+	}
+}
+
+// TestReconcileOnRead_FailedRun_RecoveryChildWinsOverNewerSlice is the mixed
+// lineage that discriminates the two child kinds inside ONE walk, where an
+// outcome-only assertion cannot. A FAILED recovery child (DecomposedFrom nil) is
+// seeded STRICTLY OLDER than a SUCCEEDED decomposition slice, so:
+//   - without the DecomposedFrom skip the newer slice wins and the item settles
+//     succeeded off it (the bug), and
+//   - if the fix OVER-corrected and dropped recovery children too, the walk
+//     would find no descendant and the item would settle failed off the parent
+//     WITHOUT the relink — which the run_id assertion below catches.
+func TestReconcileOnRead_FailedRun_RecoveryChildWinsOverNewerSlice(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	recovery := seedRecoveryChildAt(t, rrepo, failedRunID, run.StateFailed, seedLineageBase.Add(1*time.Minute))
+	slice := seedDecompositionSlice(t, rrepo, failedRunID, 0, run.StateSucceeded, seedLineageBase.Add(2*time.Minute))
+	if !slice.CreatedAt.After(recovery.CreatedAt) {
+		t.Fatalf("slice CreatedAt %s must be strictly after recovery %s", slice.CreatedAt, recovery.CreatedAt)
+	}
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Items[0].State != string(campaign.ItemStateFailed) {
+		t.Errorf("item state = %q, want failed (settled off the recovery child, not the newer slice)", st.Items[0].State)
+	}
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (the succeeded run is a slice, not a recovery)", st.Rollup.Done)
+	}
+	// Relinked to the RECOVERY child — proves recovery children are still walked
+	// (the anti-over-correction assertion), and that the slice never won.
+	if st.Items[0].RunID == nil || *st.Items[0].RunID != recovery.ID {
+		t.Errorf("item run_id = %v, want the recovery child %s (not the parent %s, not the slice %s)",
+			st.Items[0].RunID, recovery.ID, failedRunID, slice.ID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled count = %d, want 1", n)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["run_id"] != recovery.ID.String() {
+		t.Errorf("audit run_id = %v, want the recovery child %s", p["run_id"], recovery.ID)
 	}
 }
 
