@@ -3332,7 +3332,27 @@ type ApprovePlanInput struct {
 	// model), and records the model_resolved audit the runner spawn routes
 	// through. Omit to leave the model to the lower rungs (spec / plan
 	// recommendation / deployment default).
-	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator override for the implement-stage model (#1013): the top rung of the resolution ladder (deployment default < spec executor.model < plan model_recommendation < this override). The backend validates the resolved model against the deployment's per-adapter allow-list and rejects an unknown one 422 plan_invalid_model. Omit to ratify the plan's model_recommendation or fall through to the spec/deployment default"`
+	// AmendAcceptanceCriteria is the OPTIONAL channel for RETIRING or RESTATING
+	// the approved plan's acceptance criteria by id at the same gate the
+	// conditions are attached (#2581). Plan-approval conditions reshape the
+	// design but never rewrite the criteria, so acceptance can validate the
+	// shipped behaviour against a superseded contract and fail a correct
+	// implementation. Retirement is the operator's explicit decision — there is
+	// deliberately NO automatic/derived retirement.
+	AmendAcceptanceCriteria []AcceptanceCriteriaAmendment `json:"amend_acceptance_criteria,omitempty" jsonschema:"optional list of amendments to the approved plan's acceptance criteria, recorded on the SAME approval row as 'reason' (#2581). Each entry has id (a criterion id from the approved plan), action ('retire' — stop validating it, so an acceptance failure naming ONLY retired criteria is neutralized; or 'restate' — replace its statement, which keeps it LIVE and still failing if it genuinely fails), a REQUIRED reason (the reconstructable why), and statement (required for restate). Refused 400 for an unknown id, a blank reason, a restate with no statement, a duplicate id, an id a prior approval already retired, or use on a reject/non-plan stage; refused 422 acceptance_criteria_all_retired when the amendment would retire EVERY criterion (re-plan instead of emptying the contract) and 422 acceptance_criteria_unavailable when the plan carries no acceptance_criteria. Use it when your approval conditions changed the design a criterion assumed; a criterion merely made contested by remove_scope_files needs no amendment — the acceptance prompt already carries the dropped paths as contested context"`
+	ImplementModel          string                        `json:"implement_model,omitempty" jsonschema:"optional operator override for the implement-stage model (#1013): the top rung of the resolution ladder (deployment default < spec executor.model < plan model_recommendation < this override). The backend validates the resolved model against the deployment's per-adapter allow-list and rejects an unknown one 422 plan_invalid_model. Omit to ratify the plan's model_recommendation or fall through to the spec/deployment default"`
+}
+
+// AcceptanceCriteriaAmendment is one operator amendment to the approved plan's
+// acceptance criteria, passed to fishhawk_approve_plan (#2581). The wire tags
+// (id/action/reason/statement) are byte-identical to the backend's
+// acceptanceCriteriaAmendment so the declaration round-trips unchanged onto the
+// approval_submitted audit payload.
+type AcceptanceCriteriaAmendment struct {
+	ID        string `json:"id" jsonschema:"the acceptance criterion id from the approved plan (verification.acceptance_criteria[].id) this amendment targets"`
+	Action    string `json:"action" jsonschema:"'retire' (the criterion is no longer validated; an acceptance failure that names ONLY retired criteria is recorded as passed) or 'restate' (replace the criterion statement — the criterion stays LIVE and still fails if it genuinely fails)"`
+	Reason    string `json:"reason" jsonschema:"REQUIRED per criterion: why this criterion is retired or restated. Recorded on the approval audit entry and rendered into the acceptance prompt, so it is the reconstructable why"`
+	Statement string `json:"statement,omitempty" jsonschema:"the replacement criterion statement; REQUIRED when action is 'restate' and ignored for 'retire'"`
 }
 
 // BindingAssertion is one operator-declared binding-assertion check passed to
@@ -3665,7 +3685,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.AmendAcceptanceCriteria, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -3728,7 +3748,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// so this NEVER refuses the submit: warn-on-reject / refuse-on-approve is a
 	// deliberate asymmetry, not an inconsistency.
 	warn = mergeRejectWarnings(warn, rejectReasonOverBudgetWarning(in.Reason))
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -3837,7 +3857,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -3868,7 +3888,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

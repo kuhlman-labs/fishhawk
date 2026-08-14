@@ -3018,6 +3018,24 @@ components:
           description: Hex sha256 of the canonical acceptance bytes shipped.
         verdict: { type: string, enum: [passed, failed] }
         failure_mode: { type: string, enum: [error, assertion_fail] }
+        effective_verdict:
+          type: string
+          enum: [passed]
+          description: |
+            Present ONLY when a `failed` verdict was NEUTRALIZED because every
+            failure it reported named an acceptance criterion the operator
+            RETIRED at the plan-approval gate (#2581, `amend_acceptance_criteria`).
+            `verdict`/`failure_mode` keep echoing what the producer shipped and the
+            stored artifact bytes are untouched; the governance
+            `acceptance_outcome_recorded` entry records this value as its
+            `verdict` alongside `verdict_reported`, `downgrade_basis` and
+            `retired_criterion_ids`. Omitted otherwise — additive either way, since
+            the runner decodes this body without `DisallowUnknownFields`.
+            On an IDEMPOTENT replay (`idempotent: true`) this field ECHOES the
+            already-recorded `acceptance_outcome_recorded` entry rather than a
+            fresh recomputation, so a retirement recorded after the original ship
+            cannot make the replay response disagree with the governance chain the
+            merge gate reads.
         idempotent: { type: boolean }
 
     PlanUploadResponse:
@@ -10573,6 +10591,61 @@ paths:
                     rejected `400 validation_failed` before any approval row
                     is recorded. Honored only on `approve`; ignored on
                     `reject`. Omitting the field is byte-identical to today.
+                amend_acceptance_criteria:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, action, reason]
+                    properties:
+                      id:
+                        type: string
+                        description: |
+                          A criterion id from the approved plan's
+                          `verification.acceptance_criteria`.
+                      action:
+                        type: string
+                        enum: [retire, restate]
+                      reason:
+                        type: string
+                        description: |
+                          REQUIRED per criterion — the reconstructable why,
+                          recorded on the approval audit entry and rendered into
+                          the acceptance prompt.
+                      statement:
+                        type: string
+                        description: |
+                          The replacement criterion statement; REQUIRED for
+                          `restate`, ignored for `retire`.
+                  description: |
+                    Optional list of amendments to the approved plan's acceptance
+                    criteria (#2581). Plan-approval conditions reshape the design
+                    but never rewrite the criteria, so the acceptance stage can
+                    validate shipped behaviour against a superseded contract and
+                    fail a correct implementation; this is the explicit channel
+                    that fixes the contract at the same gate that reshaped it.
+                    `retire` stops validating the criterion — a later acceptance
+                    verdict whose failures name ONLY retired criteria is recorded
+                    `passed` (with `verdict_reported`, `downgrade_basis` and
+                    `retired_criterion_ids` on the `acceptance_outcome_recorded`
+                    payload). `restate` replaces the statement and keeps the
+                    criterion LIVE, so it still fails if it genuinely fails.
+                    Recorded on the SAME `approval_submitted` payload as
+                    `comment` / `add_scope_files` / `remove_scope_files`, so each
+                    retirement's id, reason and source are reconstructable from
+                    the chain alone. There is deliberately NO automatic/derived
+                    retirement: only this explicit operator decision retires a
+                    criterion. Validated BEFORE any approval row is recorded —
+                    `400 validation_failed` (field `amend_acceptance_criteria`,
+                    `details.rule` one of `unknown_criterion_id`,
+                    `unknown_action`, `reason_required`, `statement_required`,
+                    `duplicate_id`, `already_retired`,
+                    `amendment_not_approve_plan_stage`), `422
+                    acceptance_criteria_all_retired`, or `422
+                    acceptance_criteria_unavailable`. Honored only on `approve`
+                    AND only on a PLAN stage — unlike the scope channels this one
+                    REFUSES rather than ignores elsewhere, so a dropped amendment
+                    can never diverge from what the chain records. Omitting the
+                    field is byte-identical to today.
                 claims_concern_ids:
                   type: array
                   items:

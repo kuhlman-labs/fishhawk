@@ -633,6 +633,42 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// fails closed to today's 422 for that entry.
 	validatedHead, _ := s.acceptanceValidatedHeadSHA(r.Context(), runID, stageID)
 
+	// Retired-criterion neutralization (#2581): a FAILED verdict whose every
+	// failure names a criterion the operator retired at the approval gate is
+	// recorded as passed, under the four conjunctive preconditions in
+	// acceptanceDowngrade. The shipped ARTIFACT BYTES are never rewritten — only
+	// the governance acceptance_outcome_recorded payload carries the effective
+	// verdict — and the raw tallies stay the agent's evidence. Both degrade
+	// branches (plan unreadable, effective-set unreadable) take NO downgrade: the
+	// fail direction is always toward recording the agent's verdict as-is.
+	effectiveVerdict, downgradeRetiredIDs, downgradeBasis := "", []string(nil), ""
+	if acc.Verdict == acceptanceVerdictFailed {
+		approvedPlan, perr := s.loadApprovedPlanForRun(r.Context(), runID)
+		switch {
+		case perr != nil:
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"acceptance: approved plan unreadable; recording the reported verdict unchanged",
+				slog.String("run_id", runID.String()), slog.String("error", perr.Error()))
+		case approvedPlan == nil:
+			// No plan to anchor a retirement to — nothing can be retired.
+		default:
+			eff, eerr := s.resolveEffectiveAcceptanceCriteria(r.Context(), runID, approvedPlan, nil)
+			if eerr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"acceptance: effective criteria unreadable; recording the reported verdict unchanged",
+					slog.String("run_id", runID.String()), slog.String("error", eerr.Error()))
+			} else if down, ids, basis := acceptanceDowngrade(acc, eff); down {
+				effectiveVerdict = acceptanceVerdictPassed
+				downgradeRetiredIDs = ids
+				downgradeBasis = basis
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+					"acceptance: failed verdict neutralized — every failure named a retired criterion",
+					slog.String("run_id", runID.String()),
+					slog.String("retired_criterion_ids", strings.Join(ids, ",")))
+			}
+		}
+	}
+
 	// buildOutcomePayload renders the acceptance_outcome_recorded payload. The
 	// `outcome`/`criteria_passed`/`criteria_total` tags are the issue-comment
 	// render contract (issuecomment/status_template.go); verdict/failure_mode +
@@ -640,14 +676,23 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// #1682 additive field (internal chained-audit map — no docs/spec schema
 	// change); older entries simply lack it and Option C fails closed on absence.
 	buildOutcomePayload := func(artifactID string) []byte {
-		p, _ := json.Marshal(map[string]any{
-			"run_id":           runID.String(),
-			"stage_id":         stageID.String(),
-			"artifact_id":      artifactID,
-			"content_hash":     contentHash,
-			"verdict":          acc.Verdict,
-			"failure_mode":     acc.FailureMode,
-			"outcome":          acceptanceOutcomeLabel(acc.Verdict),
+		recordedVerdict := acc.Verdict
+		if effectiveVerdict != "" {
+			recordedVerdict = effectiveVerdict
+		}
+		fields := map[string]any{
+			"run_id":       runID.String(),
+			"stage_id":     stageID.String(),
+			"artifact_id":  artifactID,
+			"content_hash": contentHash,
+			"verdict":      recordedVerdict,
+			// failure_mode stays what the AGENT reported: like the raw tallies
+			// below it is evidence, not a verdict. On a downgrade it is read
+			// alongside verdict_reported.
+			"failure_mode": acc.FailureMode,
+			"outcome":      acceptanceOutcomeLabel(recordedVerdict),
+			// The raw per-result tallies are recorded UNCHANGED on a downgrade —
+			// they are the agent's evidence and must not be rewritten.
 			"criteria_passed":  passed,
 			"criteria_failed":  failed,
 			"criteria_skipped": skipped,
@@ -656,7 +701,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			"evidence_hashes":  acc.normalizedEvidenceHashes,
 			"auth_method":      authMethod,
 			"head_sha":         validatedHead,
-		})
+		}
+		// #2581: all three keys are OMITTED when no downgrade occurred, so an
+		// unused feature marshals byte-identically to today.
+		if effectiveVerdict != "" {
+			fields["verdict_reported"] = acc.Verdict
+			fields["downgrade_basis"] = downgradeBasis
+			fields["retired_criterion_ids"] = downgradeRetiredIDs
+		}
+		p, _ := json.Marshal(fields)
 		return p
 	}
 
@@ -688,13 +741,26 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
 			return
 		}
+		// #2581 replay fidelity: the effective verdict above was recomputed from
+		// the CURRENT approval chain, which may carry a retirement recorded AFTER
+		// the original ship (a later plan-gate approve on a re-planned run). The
+		// replay response must not diverge from the acceptance_outcome_recorded
+		// entry the merge gate reads, so it ECHOES the chain: the recorded entry
+		// for this artifact wins whenever it can be read, and the freshly computed
+		// value stands only when there is no readable entry (in which case the
+		// heal above just appended exactly that value).
+		replayEffectiveVerdict := effectiveVerdict
+		if recorded, ok := s.recordedAcceptanceEffectiveVerdict(r.Context(), runID, existing.ID.String()); ok {
+			replayEffectiveVerdict = recorded
+		}
 		s.writeJSON(w, r, http.StatusOK, acceptanceResponse{
-			ID:          existing.ID,
-			StageID:     existing.StageID,
-			ContentHash: existing.ContentHash,
-			Verdict:     acc.Verdict,
-			FailureMode: acc.FailureMode,
-			Idempotent:  true,
+			ID:               existing.ID,
+			StageID:          existing.StageID,
+			ContentHash:      existing.ContentHash,
+			Verdict:          acc.Verdict,
+			FailureMode:      acc.FailureMode,
+			EffectiveVerdict: replayEffectiveVerdict,
+			Idempotent:       true,
 		})
 		return
 	} else if !errors.Is(err, artifact.ErrNotFound) {
@@ -742,8 +808,12 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// verdict cannot double-route. Best-effort relative to the ship: any
 	// internal error WARN-logs inside and never unwinds the 201 / artifact /
 	// outcome audit already committed.
+	//
+	// A NEUTRALIZED verdict (#2581) skips triage entirely: there is no failure
+	// left to route once every reported failure named a criterion the operator
+	// retired at the approval gate.
 	paged := false
-	if acc.Verdict == acceptanceVerdictFailed {
+	if acc.Verdict == acceptanceVerdictFailed && effectiveVerdict == "" {
 		disposition := s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
 		paged = acceptanceDispositionPages(disposition)
 	}
@@ -763,12 +833,13 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, acceptanceResponse{
-		ID:          created.ID,
-		StageID:     created.StageID,
-		ContentHash: created.ContentHash,
-		Verdict:     acc.Verdict,
-		FailureMode: acc.FailureMode,
-		Idempotent:  false,
+		ID:               created.ID,
+		StageID:          created.StageID,
+		ContentHash:      created.ContentHash,
+		Verdict:          acc.Verdict,
+		FailureMode:      acc.FailureMode,
+		EffectiveVerdict: effectiveVerdict,
+		Idempotent:       false,
 	})
 }
 
@@ -1985,5 +2056,13 @@ type acceptanceResponse struct {
 	ContentHash string    `json:"content_hash"`
 	Verdict     string    `json:"verdict"`
 	FailureMode string    `json:"failure_mode,omitempty"`
-	Idempotent  bool      `json:"idempotent"`
+	// EffectiveVerdict is populated ONLY when a failed verdict was neutralized
+	// because every failure it reported named a criterion the operator retired at
+	// the approval gate (#2581). Verdict/FailureMode keep echoing what the
+	// producer shipped; this field names what the governance record settled on.
+	// Omitted otherwise, so a deployed runner sees a byte-identical body. Additive
+	// for that runner either way: runner/internal/upload decodes the 200/201 body
+	// with a plain json.Decoder and does NOT call DisallowUnknownFields.
+	EffectiveVerdict string `json:"effective_verdict,omitempty"`
+	Idempotent       bool   `json:"idempotent"`
 }

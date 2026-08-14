@@ -2525,3 +2525,35 @@ func TestShipPullRequest_BuildRequiredScopeParkGoldenBytes(t *testing.T) {
 		t.Errorf("a build-required-only park must omit the other two shortfall keys: %s", buildRequired)
 	}
 }
+
+// TestShipAcceptance_UnknownEffectiveVerdictFieldIgnored pins the deployed-
+// consumer compatibility claim for the backend's additive
+// acceptanceResponse.effective_verdict (#2581): ShipAcceptance decodes the
+// 201 body with a plain json.Decoder and does NOT call DisallowUnknownFields, so
+// an unknown field is IGNORED and the known fields still decode. Without that
+// property a deployed runner would fail category-B the moment the backend began
+// recording a neutralized verdict. This is the test that fails if the decoder
+// ever tightens.
+func TestShipAcceptance_UnknownEffectiveVerdictFieldIgnored(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.body = `{"id":"00000000-0000-0000-0000-000000000ccc","stage_id":"stage-xyz",` +
+		`"content_hash":"abc","verdict":"failed","failure_mode":"assertion_fail",` +
+		`"effective_verdict":"passed","idempotent":false}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"failed","failure_mode":"assertion_fail"}`),
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptance rejected a body carrying the additive effective_verdict field: %v", err)
+	}
+	if res.Verdict != "failed" || res.FailureMode != "assertion_fail" {
+		t.Errorf("decoded verdict/failure_mode = %q/%q, want failed/assertion_fail", res.Verdict, res.FailureMode)
+	}
+	if res.Idempotent {
+		t.Error("Idempotent = true, want false")
+	}
+}

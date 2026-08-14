@@ -1454,3 +1454,42 @@ imported** from `backend/internal/server/acceptance.go` (the #875 compile trap),
 (verdict-vs-stage-state, the deterministic triage table, the LOCAL-runner explicit-re-dispatch rule, paged arbitration)
 lives in the `fishhawk://runbook` resource + the server `instructions`.
 
+
+## Amending acceptance criteria at approval (`fishhawk_approve_plan` → `amend_acceptance_criteria`)
+
+Plan-approval conditions reshape the design but never rewrite the approved plan's
+acceptance criteria, so the acceptance stage can validate the shipped behaviour
+against a superseded contract and fail a correct implementation (#2581).
+`fishhawk_approve_plan` therefore accepts `amend_acceptance_criteria` alongside
+`reason`: a list of `{id, action, reason, statement?}` recorded on the SAME
+approval row as the conditions that motivated it.
+
+- `action: "retire"` — the criterion is no longer validated. An acceptance
+  verdict whose failures name ONLY retired criteria is recorded `passed`
+  (`verdict_reported` / `downgrade_basis` / `retired_criterion_ids` ride the
+  `acceptance_outcome_recorded` payload).
+- `action: "restate"` — replaces the statement and keeps the criterion LIVE. A
+  restated criterion still fails if it genuinely fails; restatement is not a
+  silencing channel.
+- `reason` is REQUIRED per criterion — it is the reconstructable why, and it is
+  rendered into the acceptance prompt's retired block.
+
+**Anti-silencing refusals** (all PRE-insert, so a corrected retry flows
+normally): `400 validation_failed` with `details.field=amend_acceptance_criteria`
+and `details.rule` naming the specific refusal (`unknown_criterion_id`,
+`unknown_action`, `reason_required`, `statement_required`, `duplicate_id`,
+`already_retired`, `amendment_not_approve_plan_stage`); `422
+acceptance_criteria_all_retired` when the amendment would retire EVERY criterion
+— evaluated on the union of prior recorded retirements and this request's, so it
+fires cumulatively too, and there is no override (re-plan instead of emptying the
+contract); `422 acceptance_criteria_unavailable` when the plan carries no
+acceptance criteria or its prior amendments cannot be read (fail-closed).
+
+**Derived retirement is deliberately NOT provided.** Retiring a criterion because
+its subject is a file dropped by `remove_scope_files` is a natural-language
+judgement no token rule decides, and a silent retirement converts a loud
+acceptance failure into silence. Instead the dropped paths are rendered into the
+acceptance prompt as contested context with a skip-not-fail instruction, so the
+validator judges subjecthood where it can read both the criterion and the
+observed behaviour. Use this channel for the unambiguous cases; you do not need
+it merely because a path was dropped.

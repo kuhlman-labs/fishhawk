@@ -7732,6 +7732,109 @@ func TestApprovePlan_NoClaimsConcernIDs_OmitsFieldOnTheWire(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_AmendAcceptanceCriteria_PlumbedToSubmitApproval pins the
+// #2581 MCP half: the tool's amend_acceptance_criteria input reaches the
+// approvals request body with every field intact, so the operator's retirement
+// lands on the same approval row as the reason that motivated it.
+func TestApprovePlan_AmendAcceptanceCriteria_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	amendments := []AcceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: "retire", Reason: "condition 1 dropped the surface this criterion asserts"},
+	}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:                   runID.String(),
+		Reason:                  "narrow the design to the resolver seam",
+		AmendAcceptanceCriteria: amendments,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.AmendAcceptanceCriteria, amendments) {
+		t.Errorf("amend_acceptance_criteria = %+v, want %+v",
+			fb.approvalsBody.AmendAcceptanceCriteria, amendments)
+	}
+}
+
+// TestApprovePlan_NoAmendAcceptanceCriteria_OmitsFieldOnTheWire confirms the
+// byte-identical unused path: an approve without amendments leaves the field
+// nil on the request body the backend decodes (#2581).
+func TestApprovePlan_NoAmendAcceptanceCriteria_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.AmendAcceptanceCriteria != nil {
+		t.Errorf("amend_acceptance_criteria = %+v, want nil when none declared",
+			fb.approvalsBody.AmendAcceptanceCriteria)
+	}
+}
+
+// TestApprovePlan_AmendAcceptanceCriteria_Advertised pins the wire-visible half:
+// over a real in-memory MCP session, ListTools carries fishhawk_approve_plan
+// with an amend_acceptance_criteria input property (#2581). No new tool is
+// registered, so the tool-count assertion elsewhere is unchanged — this is the
+// assertion that a no-op touch of the input struct would fail.
+func TestApprovePlan_AmendAcceptanceCriteria_Advertised(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_approve_plan" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_approve_plan is not registered/visible over ListTools")
+	}
+	schemaMap, ok := any(tool.InputSchema).(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_approve_plan InputSchema is %T, want a JSON object map", tool.InputSchema)
+	}
+	props, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_approve_plan schema has no properties object; got %v", schemaMap["properties"])
+	}
+	if _, ok := props["amend_acceptance_criteria"]; !ok {
+		t.Errorf("fishhawk_approve_plan input schema missing property amend_acceptance_criteria; got %v", props)
+	}
+}
+
 func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

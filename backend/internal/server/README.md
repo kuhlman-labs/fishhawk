@@ -2319,3 +2319,159 @@ A scope-completeness park carries exactly ONE of three shortfall classes. The fi
 - **Fail-closed** on: a nil stage, a non-implement stage, a FIXUP dispatch (a fix-up exists to re-invoke the agent with the reviewer's concerns — resuming would open a PR from the UNFIXED commit and report the fix-up as done), a nil `AuditRepo`, any `ListForRunByCategory` error, no entry for the stage, a newest entry that is not a checkpoint-bearing `pull_request_failed`, an undecodable payload, and an incomplete checkpoint. The cost of a wrong emission is a PR opened from an unintended head; the cost of a wrong omission is today's agent re-run. Those are not symmetric.
 - **Runner-side guards** (`runner/cmd/fishhawk-runner/README.md`): the `pr_open` kind additionally makes the runner re-verify the run branch's REMOTE TIP still equals `held_commit_sha` before touching the forge (a checkpointed commit passed no operator gate the way a park did), and re-report the checkpoint on its own failure so a multi-retry outage stays resumable.
 
+
+## Acceptance-criteria amendment at the plan gate (`acceptance_amendments.go`, E67.11 / #2581)
+
+Plan-approval conditions reshape the design but never touch the plan's
+acceptance criteria, so the acceptance stage validates the shipped behaviour
+against the PRE-approval contract and fails a correct implementation (#2581, the
+observed `healthz-reports-server-budget` failure in run 66c938d1). Two halves fix
+that, and a deliberately-rejected third is documented below.
+
+**1. The explicit channel.** `POST /v0/stages/{id}/approvals` accepts
+`amend_acceptance_criteria`: a list of `{id, action: retire|restate, reason,
+statement?}`. `retire` drops a criterion out of the live contract; `restate`
+replaces its statement and leaves it LIVE (restatement is NOT a silencing
+channel — a restated criterion still fails if it genuinely fails). The reason is
+REQUIRED per criterion; the amendment is recorded on the SAME
+`approval_submitted` payload as the `comment` / `add_scope_files` /
+`remove_scope_files` that motivated it, so each retirement's id, reason and
+source are reconstructable from the chain alone.
+
+**2. Contested context in the acceptance prompt.** The acceptance prompt renders
+the binding approval conditions AND the paths the operator dropped via
+`remove_scope_files` as CONTESTED CONTEXT, with a skip-not-fail instruction:
+where an observed behaviour conflicts with a criterion because a condition
+changed the design or dropped its surface, the validator reports that criterion
+`result`=`skipped` with the conflict in its `expectation_basis`, never
+`result`=`failed`. This half is a PROMPT INSTRUCTION to an LLM validator — the
+tests prove the instruction RENDERS, not that a validator obeys it. The failure
+direction is safe: a non-compliant validator yields at worst today's spurious
+failure, never a silent pass.
+
+**Automatic DERIVED retirement is deliberately NOT provided.** Retiring a
+criterion because its "subject" is a file dropped by `remove_scope_files` is a
+natural-language judgement no token rule decides, and a rule that silently
+retires a live criterion converts a loud acceptance failure into silence — the
+exact inversion of the defect this fixes. So the ONLY retirement source is the
+operator (`acceptanceRetirementSourceOperator`), and the dropped paths reach the
+validator as context to judge in situ rather than as an inference.
+
+### The single seam and its call sites
+
+`resolveEffectiveAcceptanceCriteria` is the ONE place the effective set is
+computed. No caller may union, filter, or recompute any part of it; a consumer
+needing a different projection changes that signature. It returns `Live` (plan
+order, restatements applied), `Retired` (plan order, with reason + source +
+recording audit sequence), `Restated` (the ids a restatement replaced, plan
+order), and `AllIDs` — ALWAYS the full plan id list.
+
+`Restated` exists because `Live` alone cannot signal that an amendment applied:
+a restate-only history leaves `Live` the same LENGTH as the plan set with only a
+statement differing. `amended()` (`len(Retired) > 0 || len(Restated) > 0`) is the
+single predicate a consumer uses to choose the effective set over the plan set —
+`resolveAcceptancePromptCriteria` keying that decision off `Retired` alone
+silently dropped a restate-only amendment on BOTH prompt paths, so the validator
+judged the change against the very statement the operator replaced at the gate.
+On a restate-only history the live set renders and the retired block does not
+(nothing was retired). Pinned by
+`TestGetStagePrompt_Acceptance_RestateOnly_RendersReplacement` and its
+`TestRenderStagePrompt_…` twin.
+
+It is consumed at exactly FOUR call sites:
+
+1. `checkAmendAcceptanceCriteria` (the approve gate) — **validation-only**: it
+   resolves the PRIOR effective set to evaluate the refusals below and records
+   nothing derived from the result.
+2. `handleGetPrompt`'s acceptance branch (the signed dispatch prompt).
+3. `handleRenderPrompt`'s acceptance branch (the render/preview prompt).
+4. `handleShipAcceptance` (verdict ingest), where the recorded retired-id set is
+   the strict key for the downgrade.
+
+### Anti-silencing gate — nine named refusals, all PRE-Submit
+
+Every refusal inserts NO approval row, so a corrected retry flows normally
+(the ADR-036 placement its sibling gates use). `details.rule` names each one:
+
+| # | Refusal | Status |
+|---|---|---|
+| R1 | `unknown_criterion_id` — not in the approved plan | 400 `validation_failed` |
+| R2 | `reason_required` — blank/whitespace reason | 400 |
+| R3 | `statement_required` — `restate` with no statement | 400 |
+| R4 | `duplicate_id` — the same id twice in one request | 400 |
+| R5 | `amendment_not_approve_plan_stage` — a reject, or a non-plan stage | 400 |
+| R6 | every criterion retired in ONE call | 422 `acceptance_criteria_all_retired` |
+| R7 | every criterion retired CUMULATIVELY (prior approvals retired the rest) | 422 `acceptance_criteria_all_retired` |
+| R8 | `already_retired` — an id a PRIOR approval retired | 400 |
+| R9 | plan unloadable / zero criteria / prior amendments unreadable | 422 `acceptance_criteria_unavailable` |
+
+R6 and R7 are ONE control evaluated on the deduplicated union of prior and
+in-flight retirements: the channel cannot empty a plan's acceptance contract, in
+one call or across many. An action outside `{retire, restate}` is refused under
+`unknown_action`; an oversized reason/statement is CAPPED (`prompt.CapText`),
+not refused. Unlike the scope channels — which IGNORE a non-plan-stage value
+(#2598) — this channel REFUSES it, because a silently dropped amendment diverges
+what the operator believes they retired from what the chain records.
+
+### Downgrade at verdict ingest — four CONJUNCTIVE preconditions
+
+`acceptanceDowngrade` neutralizes a FAILED verdict to `passed` only when ALL
+hold:
+
+- **D1** `verdict=failed` AND `failure_mode=assertion_fail`. An `error` mode (a
+  crash / 500) is never downgraded — a crashing target is not a superseded
+  expectation.
+- **D2** EVERY failed criterion result's id is in the RECORDED retired-id set.
+  Strict keying on the chain, never a prompt-text or heuristic match.
+- **D3** the surviving partition is non-empty (at least one reported result whose
+  id is NOT retired) — a verdict reporting only retired criteria evidences
+  nothing about the live contract.
+- **D4** no surviving BLOCKING skip: no non-retired criterion REPORTED `skipped`
+  whose plan `blocking` value (nil → true) is true. D4 keys on what the verdict
+  REPORTS, not on the live set: a blocking live criterion the verdict OMITS
+  entirely does not block the downgrade (the same trust model that already lets a
+  validator omit criteria from a `passed` verdict). Pinned in both directions by
+  `TestDowngrade_SurvivingBlockingSkip_NotDowngraded` and
+  `TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades`.
+
+On a downgrade the `acceptance_outcome_recorded` payload records
+`verdict=passed` plus `verdict_reported`, `downgrade_basis`, and
+`retired_criterion_ids`; `failure_mode` and the raw criteria tallies stay what
+the agent reported (evidence, not verdict), the STORED ARTIFACT BYTES are never
+rewritten, and triage is skipped (no failure left to route). The merge gate reads
+the audit payload, so `acceptanceGateState` returns the merge-eligible
+`acceptance_passed` with no gate change.
+
+### Invariants
+
+- **`acceptance_criteria_ids` stays a SUPERSET.** The ids served on the
+  acceptance prompt response are every PLAN criterion id, retired ones included,
+  so a verdict reporting a retired id can never fail the stage closed on the
+  runner's join-key validation.
+- **Stored artifact bytes are never rewritten.** Only the governance payload
+  carries the effective verdict.
+- **Byte-identical when unused.** With no amendment recorded, the
+  `approval_submitted` payload, the `acceptance_outcome_recorded` payload, the
+  acceptance prompt, and the ship response are byte-for-byte what they were
+  before this change (every new key is `omitempty`/conditional). Asserted against
+  FROZEN PRE-CHANGE goldens, not against heading/key absence: the
+  `approval_submitted` payload against `wantPreChangeAmendlessApprovalPayload`
+  (`approvals_test.go`) and the acceptance prompt's criteria span against
+  `wantPreChangeAcceptanceCriteriaSpan` (`prompt_test.go`, captured by rendering
+  the package at the pre-#2581 commit) — so a same-keys-different-bytes
+  regression fails.
+- **A replay echoes the CHAIN, not a recomputation.** `handleShipAcceptance`
+  computes the downgrade from the CURRENT approval chain, so a retirement
+  recorded AFTER the original ship would make a replay of the same verdict bytes
+  answer differently from the governance entry the merge gate reads. The
+  idempotent branch therefore reads the recorded outcome entry
+  (`recordedAcceptanceEffectiveVerdict`) and echoes ITS effective verdict, falling
+  back to the fresh computation only when no entry is readable (in which case the
+  #1396 heal just appended exactly that value). Pinned by
+  `TestShipAcceptance_IdempotentReplay_EchoesRecordedEffectiveVerdict`.
+- **Every degrade fails toward MORE validation.** An unreadable chain at prompt
+  build renders the FULL plan criteria set; an unreadable chain, an unreadable
+  plan, or NO approved plan at all at ingest performs NO downgrade; an unreadable
+  chain at the approve gate REFUSES the amendment; an absent `AuditRepo` or an
+  undecodable `approval_submitted` payload leaves the criterion LIVE. None of them
+  can silence a criterion.
