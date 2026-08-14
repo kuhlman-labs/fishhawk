@@ -142,6 +142,14 @@ func (f *driveFakeBackend) stateOf(typ string) string {
 	return ""
 }
 
+// setState deliberately takes NO lock: every call site is inside a hook body
+// (onGate/onSpawn/onAudit/onStages), and the handler already holds f.mu across
+// the hook invocation (handler(): the /auto-drive, /stages, /audit arms Lock
+// then call the hook; driveSpawn Locks then calls onSpawn). sync.Mutex is not
+// reentrant, so locking here would self-deadlock. The hook mutators that write
+// f.stages/f.runState directly are unlocked for the same reason. Contrast the
+// setOnX setters (drive_fake_hooks_test.go), which run on the TEST goroutine
+// with no lock held and so MUST lock — that is the #2694 fix.
 func (f *driveFakeBackend) setState(typ, state string) {
 	for i := range f.stages {
 		if f.stages[i].Type == typ {
@@ -414,7 +422,7 @@ func TestDriveRun_CleanPath_FullAuditTrail(t *testing.T) {
 		stg(driveImplID, "implement", "blocked", 1),
 		stg(driveAccID, "acceptance", "blocked", 2),
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		switch typ {
 		case "plan":
 			f.setState("plan", "awaiting_approval")
@@ -424,8 +432,8 @@ func TestDriveRun_CleanPath_FullAuditTrail(t *testing.T) {
 		case "acceptance":
 			f.setState("acceptance", "succeeded")
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		switch {
 		case f.stateOf("plan") == "awaiting_approval":
 			f.setState("plan", "succeeded")
@@ -437,7 +445,7 @@ func TestDriveRun_CleanPath_FullAuditTrail(t *testing.T) {
 		default:
 			return AutoDriveOutcome{Note: "observe-only"}
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -501,7 +509,7 @@ func TestDriveRun_NonLocalRunnerKind_Rejected(t *testing.T) {
 				stg(driveImplID, "implement", "blocked", 1),
 			})
 			f.runnerKind = kind
-			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 			rec := &spawnRecorder{}
 			r, srv := newDriveResolver(t, f, rec)
 			defer srv.Close()
@@ -535,7 +543,7 @@ func TestDriveRun_NonLocalRunnerKind_Rejected(t *testing.T) {
 func TestDriveRun_RecordActFailure_NoSpawn(t *testing.T) {
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "pending", 0)})
 	f.recordActErr = true
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -565,13 +573,13 @@ func TestDriveRun_ResumeRecordedNotSpawned_RetryNote(t *testing.T) {
 	// Pre-seed a run_auto_driven dispatch row for implement (a prior crashed
 	// attempt): the resume must re-record with a retry note, dispatch once.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -607,12 +615,12 @@ func TestDriveRun_ObserveOnlyPlanGate_DecisionRequired(t *testing.T) {
 		stg(drivePlanID, "plan", "pending", 0),
 		stg(driveImplID, "implement", "blocked", 1),
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "plan" {
 			f.setState("plan", "awaiting_approval")
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "no delegated knob"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "no delegated knob"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -639,9 +647,9 @@ func TestDriveRun_Paged_HaltsUnacted(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Paged: true, PageEvent: "reviewer_reject", Note: "must_page_human"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -667,7 +675,7 @@ func TestDriveRun_ScopeAmendmentPending_Decision(t *testing.T) {
 	})
 	f.seq++
 	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: "scope_amendment_requested", Payload: map[string]any{}})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -696,7 +704,7 @@ func TestDriveRun_ScopeAmendmentCheckError_FailsClosed(t *testing.T) {
 		stg(driveImplID, "implement", "blocked", 1),
 	})
 	f.auditErr = true
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -720,7 +728,7 @@ func TestDriveRun_ScopeAmendmentCheckError_FailsClosed(t *testing.T) {
 
 func TestDriveRun_Timeout(t *testing.T) {
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "blocked", 0)})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -744,7 +752,7 @@ func TestDriveRun_StallGuard(t *testing.T) {
 	// A stage in a non-dispatchable, non-in-flight, non-gate state with an
 	// endpoint that always observes-only: the loop must not spin forever.
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -762,7 +770,7 @@ func TestDriveRun_StallGuard(t *testing.T) {
 
 func TestDriveRun_SpawnFailure_StageFailed(t *testing.T) {
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "pending", 0)})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{fail: true}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -794,9 +802,9 @@ func TestDriveRun_MergeQueuedNotLanded(t *testing.T) {
 	// must NOT report merged off the acted:merge alone, and it must queue the
 	// merge in memory: NO re-call of the gate on later polls (which would
 	// duplicate the gate:merge row and re-enable auto-merge every interval).
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge; not landed"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -844,7 +852,7 @@ func TestDriveRun_GateError_HaltsActing(t *testing.T) {
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
 	f.gateErr = true
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{} } // unreached
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{} }) // unreached
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -883,14 +891,14 @@ func TestDriveRun_DecisionRequired_FixupBudgetExhausted(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{
 			DecisionRequired: true,
 			DecisionState:    "fixup_budget_exhausted",
 			Action:           "route_fixup",
 			Note:             "fixup budget exhausted",
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -947,14 +955,14 @@ func TestDriveRun_HumanQuorumRequired_StopsWithApproveAction(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{
 			DecisionRequired: true,
 			DecisionState:    operatorrole.DecisionStateHumanQuorumRequired,
 			Action:           "approve",
 			Note:             "human quorum required",
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1073,9 +1081,9 @@ func TestDriveRun_RepeatedActedGate_BoundedByNoProgress(t *testing.T) {
 	})
 	// acted:true for the SAME action while the fixture never changes -> identical
 	// signature across gate calls -> no progress.
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "no-op act"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1104,13 +1112,13 @@ func TestDriveRun_ActedGateThatChangesState_KeepsDriving(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "real progress"}
-	}
+	})
 	// Each poll flips the plan stage's recorded state (implement stays
 	// awaiting_approval so the gate is still reached), so consecutive acted-gate
 	// signatures DIFFER; after several acts the run settles terminal.
-	f.onStages = func(f *driveFakeBackend) {
+	f.setOnStages(func(f *driveFakeBackend) {
 		// ALWAYS flip the plan stage's state by parity so consecutive acted-gate
 		// signatures differ (the no-progress guard must reset each time); settle
 		// the run terminal after several acts (seen at the next iteration's top).
@@ -1122,7 +1130,7 @@ func TestDriveRun_ActedGateThatChangesState_KeepsDriving(t *testing.T) {
 		} else {
 			f.stages[0].State = "succeeded"
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1174,14 +1182,14 @@ func TestDriveRun_DecisionRequired_FixupCeilingReached(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_approval", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{
 			DecisionRequired: true,
 			DecisionState:    "fixup_ceiling_reached",
 			Action:           "route_fixup",
 			Note:             "fixup ceiling reached",
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1237,7 +1245,7 @@ func TestDriveRun_ResumeDispatchedInFlight_NoDoubleSpawn(t *testing.T) {
 	})
 	// The prior invocation's dispatch row — the cross-invocation resume signal.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1282,7 +1290,7 @@ func TestDriveRun_ManualDispatchInFlight_NoDoubleSpawn(t *testing.T) {
 	// provenance; post-#1912 it no longer anchors staleness (the stage's updated_at
 	// does), so it must NOT trigger a re-record or double-spawn.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_dispatch_stage", "note": "manual host dispatch"})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1326,7 +1334,7 @@ func TestDriveRun_PriorDispatchRowCheckError_FailsClosed(t *testing.T) {
 		stg(driveImplID, "implement", "blocked", 1),
 	})
 	f.auditErrCategory = CategoryRunAutoDriven
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1360,7 +1368,7 @@ func TestDriveRun_FixupRedispatch(t *testing.T) {
 		stg(driveImplID, "implement", "pending", 1),
 	})
 	fixedUp := false
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ != "implement" {
 			return
 		}
@@ -1370,15 +1378,15 @@ func TestDriveRun_FixupRedispatch(t *testing.T) {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		if f.stateOf("implement") == "awaiting_approval" && !fixedUp {
 			fixedUp = true
 			f.setState("implement", "pending") // route_fixup re-opens
 			return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "auto-routed fix-up"}
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1424,12 +1432,12 @@ func TestDriveRun_FreshRunAllPending_DispatchesOnlyPlan(t *testing.T) {
 	})
 	// The plan spawn leaves plan NON-terminal (running) so it stays the earliest
 	// non-terminal stage — implement/acceptance must never become dispatchable.
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "plan" {
 			f.setState("plan", "running")
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1477,7 +1485,7 @@ func TestDriveRun_AcceptanceHeldOnReview(t *testing.T) {
 			stg(driveAccID, "acceptance", "pending", 2),
 			stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "running", 3),
 		})
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -1504,13 +1512,13 @@ func TestDriveRun_AcceptanceHeldOnReview(t *testing.T) {
 			stg(driveAccID, "acceptance", "pending", 2),
 			stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "succeeded", 3),
 		})
-		f.onSpawn = func(f *driveFakeBackend, typ string) {
+		f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 			if typ == "acceptance" {
 				f.setState("acceptance", "succeeded")
 				f.runState = "succeeded"
 			}
-		}
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		})
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -1550,13 +1558,13 @@ func driveAcceptancePendingStages() []Stage {
 func TestDriveRun_DerivedAcceptancePending_DispatchesAcceptance(t *testing.T) {
 	f := newDriveFake("running", driveAcceptancePendingStages())
 	f.derivedStatus = "acceptance_pending"
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "acceptance" {
 			f.setState("acceptance", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1597,13 +1605,13 @@ func TestDriveRun_DerivedAcceptancePending_ShortCircuit_NoSpawn(t *testing.T) {
 	f := newDriveFake("running", driveAcceptancePendingStages())
 	f.derivedStatus = "acceptance_pending"
 	f.admissionShortCircuit = true
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		if f.stateOf("acceptance") == "succeeded" {
 			f.runState = "succeeded"
 			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1645,7 +1653,7 @@ func TestDriveRun_DerivedAcceptancePending_ShortCircuit_NoSpawn(t *testing.T) {
 func TestDriveRun_ReviewParked_NoDerivedStatus_StopsDecisionRequired(t *testing.T) {
 	f := newDriveFake("running", driveAcceptancePendingStages())
 	// derivedStatus intentionally left empty — the legacy no-signal path.
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1675,7 +1683,7 @@ func TestDriveRun_DerivedAcceptancePending_ReviewInFlight_StillHeld(t *testing.T
 		stg(driveReviewID, "review", "running", 3),
 	})
 	f.derivedStatus = "acceptance_pending" // present, but a review is genuinely in flight
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1715,7 +1723,7 @@ func TestDriveRun_DerivedAcceptancePending_ObserveOnlyFallThrough_PollsToStalled
 		stg(driveReviewID, "review", "awaiting_approval", 3),
 	})
 	f.derivedStatus = "acceptance_pending" // still stamped; no checks_green stamp yet
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1921,13 +1929,13 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 			if tc.seedAudit != nil {
 				tc.seedAudit(f)
 			}
-			f.onSpawn = func(f *driveFakeBackend, typ string) {
+			f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 				if typ == "acceptance" {
 					f.setState("acceptance", "succeeded")
 					f.runState = "succeeded"
 				}
-			}
-			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+			})
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 			rec := &spawnRecorder{}
 			r, srv := newDriveResolver(t, f, rec)
 			defer srv.Close()
@@ -1993,7 +2001,7 @@ func TestDriveRun_ResumeDispatchedStale_StopsDistinct(t *testing.T) {
 	})
 	// An OLD dispatch-evidence row (past the threshold): the anchor is genuinely stale.
 	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2070,12 +2078,12 @@ func TestDriveRun_ThreadsNonNilProbeToSpawn(t *testing.T) {
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "pending", 0),
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "plan" {
 			f.setState("plan", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2128,13 +2136,13 @@ func TestDriveRun_DispatchedStale_DeadProbe_AutoRedispatches(t *testing.T) {
 	// to fixup_redispatch, so recordName stays 'implement' and the stale note wins.
 	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
 	// The re-dispatched runner reaches its prompt fetch and settles the run.
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2213,13 +2221,13 @@ func TestDriveRun_DispatchedStale_DeadProbe_FixupRedispatchAttribution(t *testin
 	f.seq++
 	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: categoryStageFixupTriggered, Payload: map[string]any{}})
 	// The re-dispatched runner reaches its prompt fetch and settles the run.
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2269,7 +2277,7 @@ func TestDriveRun_DispatchedStale_LiveProbe_StopsWithoutSpawn(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		impl,
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2402,13 +2410,13 @@ func TestDriveRun_CrossInvocationFixupRedispatch(t *testing.T) {
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
 	f.seq++
 	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: categoryStageFixupTriggered, Payload: map[string]any{}})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2461,7 +2469,7 @@ func TestDriveRun_FixupAttributionCheckError_FailsClosed(t *testing.T) {
 	// priorRow==true so the fixup-attribution branch is entered.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
 	f.auditErrCategory = categoryStageFixupTriggered // only the fix-up trigger read errors
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2518,7 +2526,7 @@ func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T
 	// the anchor is live on the first check and only crosses the threshold as the
 	// loop polls, so branch (b) trips MID-invocation rather than immediately.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2560,7 +2568,7 @@ func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T
 
 func TestDriveRun_ContextCancelled(t *testing.T) {
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "blocked", 0)})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2592,10 +2600,10 @@ func TestDriveRun_MergeQueuedPersistsAcrossResume(t *testing.T) {
 	})
 	// The prior invocation's queued-merge row.
 	f.appendAuto(map[string]any{"act": "gate", "action": "merge", "source": "run_auto_drive_endpoint", "note": "enabled auto-merge"})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		// Would re-queue the merge if reached — the test asserts it is NOT reached.
 		return AutoDriveOutcome{Acted: true, Action: "merge", Note: "should not be called"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2640,11 +2648,11 @@ func TestDriveRun_MergeRowReadError_FailsOpen(t *testing.T) {
 		stg(driveAccID, "acceptance", "succeeded", 2),
 	})
 	f.auditErrCategory = CategoryRunAutoDriven // the seed's read (and any prior-dispatch read) errors
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		// The loop must REACH the gate (proving it did not halt on the read error);
 		// acting merge here then engages the in-memory queued-merge guard.
 		return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2743,7 +2751,7 @@ func TestDriveRun_PlanGateParked_SettledReviews_DecisionRequired(t *testing.T) {
 	f.seedPlanReviewStarted(2)
 	f.seedPlanReviewed("approve")
 	f.seedPlanReviewed("approve_with_concerns")
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "no delegated knob"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "no delegated knob"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2781,7 +2789,7 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 	// Land the SECOND verdict on the 2nd plan_reviewed read (the 2nd loop
 	// iteration), so the first iteration observes 'pending' and must NOT gate.
 	reads := 0
-	f.onAudit = func(f *driveFakeBackend, category string) {
+	f.setOnAudit(func(f *driveFakeBackend, category string) {
 		if category != "plan_reviewed" {
 			return
 		}
@@ -2793,7 +2801,7 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 				Category: "plan_reviewed", Payload: map[string]any{"verdict": "approve"},
 			})
 		}
-	}
+	})
 	// LOAD-BEARING ordering check (concern: the fake's observe-only outcome would
 	// otherwise mask a premature gate call — a regression gate-calling on the
 	// first still-pending iteration returns the same decision_required with
@@ -2801,7 +2809,7 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 	// already be settled; record a violation if the driver gate-called while the
 	// round was still pending.
 	var gatedWhilePending bool
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		configured, verdicts := 0, 0
 		for _, e := range f.audit {
 			switch e.Category {
@@ -2819,7 +2827,7 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 			gatedWhilePending = true
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -2870,7 +2878,7 @@ func TestDriveRun_ReviewGateParked_ImplementReviewsPending_PollsThenGates(t *tes
 	// Land the SECOND verdict on the 2nd implement_reviewed read (the 2nd loop
 	// iteration), so the first iteration observes 'pending' and must NOT gate.
 	reads := 0
-	f.onAudit = func(f *driveFakeBackend, category string) {
+	f.setOnAudit(func(f *driveFakeBackend, category string) {
 		if category != "implement_reviewed" {
 			return
 		}
@@ -2882,14 +2890,14 @@ func TestDriveRun_ReviewGateParked_ImplementReviewsPending_PollsThenGates(t *tes
 				Category: "implement_reviewed", Payload: map[string]any{"verdict": "approve"},
 			})
 		}
-	}
+	})
 	// LOAD-BEARING ordering check (same as T2, adapted to the implement round): at
 	// the instant the gate is called, the implement advisory round MUST already be
 	// settled. A regression that gate-calls on the first still-pending iteration
 	// returns the same decision_required with gateCalls==1, so without this probe
 	// the assertion would pass vacuously.
 	var gatedWhilePending bool
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		configured, verdicts := 0, 0
 		for _, e := range f.audit {
 			switch e.Category {
@@ -2907,7 +2915,7 @@ func TestDriveRun_ReviewGateParked_ImplementReviewsPending_PollsThenGates(t *tes
 			gatedWhilePending = true
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3023,7 +3031,7 @@ func TestDriveRun_PlanGateParked_ReviewReadError_DecisionWithWarning(t *testing.
 	// (scope_amendment_*) and the run_auto_driven reads still succeed, so the
 	// stop is the review-read fall-through, not amendment_check_failed.
 	f.auditErrCategory = "plan_reviewed"
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3063,7 +3071,7 @@ func TestDriveRun_ReviewReachability(t *testing.T) {
 			stg(drivePlanID, "plan", "awaiting_approval", 0),
 			stg(driveReviewID, "review", "pending", 1),
 		})
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3087,7 +3095,7 @@ func TestDriveRun_ReviewReachability(t *testing.T) {
 			stg(driveImplID, "implement", "succeeded", 1),
 			stg(driveReviewID, "review", "pending", 2),
 		})
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Acted: true, Action: "approve"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Acted: true, Action: "approve"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3123,7 +3131,7 @@ func TestDriveRun_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "running", 0), // in-flight: the loop polls, emitting a heartbeat per iteration
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	// Deterministic iteration count (concern: a >=1 assertion accepts a single
 	// notification for an otherwise multi-iteration drive, leaving the cadence
 	// unpinned). The plan stage is polled as in-flight, so exactly one heartbeat
@@ -3132,12 +3140,12 @@ func TestDriveRun_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 	// next GetRun observes terminal and exits before its heartbeat.
 	const wantHeartbeats = 3
 	stageReads := 0
-	f.onStages = func(f *driveFakeBackend) {
+	f.setOnStages(func(f *driveFakeBackend) {
 		stageReads++
 		if stageReads == wantHeartbeats {
 			f.runState = "succeeded"
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3224,7 +3232,7 @@ func TestDriveRun_ProgressHeartbeat_NoToken_NoEmission(t *testing.T) {
 	// driver emitted nothing.
 	ctx := context.Background()
 	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "running", 0)})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3333,7 +3341,7 @@ func TestDriveRun_DispatchedInferenceArmDeleted_AnchorsOnStageTimestamp(t *testi
 		})
 		// Deliberately NO dispatch row and nil StartedAt — the exact shape the
 		// deleted inference arm treated as an immediate handoff.
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3359,7 +3367,7 @@ func TestDriveRun_DispatchedInferenceArmDeleted_AnchorsOnStageTimestamp(t *testi
 			stg(drivePlanID, "plan", "succeeded", 0),
 			impl,
 		})
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3430,7 +3438,7 @@ func TestDriveRun_DispatchRowNoLongerAnchorsStaleness(t *testing.T) {
 			// A FRESH dispatch-evidence row — under the OLD model this reset the
 			// anchor and made it poll; post-#1912 it no longer does.
 			f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": source, "note": ""})
-			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+			f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 			rec := &spawnRecorder{}
 			r, srv := newDriveResolver(t, f, rec)
 			defer srv.Close()
@@ -3468,20 +3476,20 @@ func TestDriveRun_AwaitingHostDispatch_AutoDispatched(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		impl,
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "running") // the spawned runner reached its prompt fetch
 		}
-	}
+	})
 	converge := 0
-	f.onStages = func(f *driveFakeBackend) {
+	f.setOnStages(func(f *driveFakeBackend) {
 		converge++
 		if converge >= 2 && f.stateOf("implement") == "running" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3523,7 +3531,7 @@ func TestDriveRun_HostDispatchMarkerFails_NoSpawn(t *testing.T) {
 		impl,
 	})
 	f.hostDispatchStatus = http.StatusConflict // the marker 4xx -> fail closed
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3567,7 +3575,7 @@ func TestDriveRun_DispatchedZeroAnchor_DegradesToPolling(t *testing.T) {
 	// A dispatch-evidence row (attribution only, post-#1912) with a ZERO Timestamp:
 	// it no longer feeds the anchor, so the anchor stays zero.
 	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Time{})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3613,7 +3621,7 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 	// Old driver-sourced spawn evidence (past the threshold): the first drive is
 	// genuinely stale.
 	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3667,7 +3675,7 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 	// updated_at). It then advances running -> succeeded (with the run settling) —
 	// the convergence tail.
 	converge := 0
-	f.onStages = func(f *driveFakeBackend) {
+	f.setOnStages(func(f *driveFakeBackend) {
 		converge++
 		switch converge {
 		case 1:
@@ -3677,7 +3685,7 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
+	})
 
 	// (3) Re-invoked drive: must NOT re-report stale — the fresh manual row reset
 	// the anchor. It polls the now-live stage and settles.
@@ -3719,7 +3727,7 @@ func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
 			impl,
 		})
 		// Deliberately NO dispatch row: StartedAt is the only spawn evidence.
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3757,7 +3765,7 @@ func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
 		})
 		// An OLD dispatch-evidence row (older than StartedAt): StartedAt must still win.
 		f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
-		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 		rec := &spawnRecorder{}
 		r, srv := newDriveResolver(t, f, rec)
 		defer srv.Close()
@@ -3790,13 +3798,13 @@ func TestDriveRun_AcceptanceShortCircuit_NoSpawn_ContinuesToMerge(t *testing.T) 
 		stg(driveAccID, "acceptance", "pending", 2),
 	})
 	f.admissionShortCircuit = true
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		if f.allSucceeded("plan", "implement", "acceptance") {
 			f.runState = "succeeded" // webhook-settled on the next poll
 			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3872,9 +3880,9 @@ func TestDriveRun_AcceptanceNeedsTarget_StopsResumable(t *testing.T) {
 	f.admissionNeedsTarget = true
 	f.admissionTargetHosts = []string{targetHost}
 	f.admissionExpectedHeadSHA = probeExpectedSHA
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3931,20 +3939,20 @@ func TestDriveRun_AcceptanceNeedsTargetVerified_Dispatches(t *testing.T) {
 	f.admissionNeedsTarget = true
 	f.admissionTargetHosts = []string{hostOf(target.URL)}
 	f.admissionExpectedHeadSHA = probeExpectedSHA
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		if f.allSucceeded("plan", "implement", "acceptance") {
 			f.runState = "succeeded"
 			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	// Advance the acceptance stage to succeeded once its runner spawns, so the
 	// loop can proceed to merge.
-	f.onSpawn = func(f *driveFakeBackend, stageType string) {
+	f.setOnSpawn(func(f *driveFakeBackend, stageType string) {
 		if stageType == "acceptance" {
 			f.setState("acceptance", "succeeded")
 		}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -3977,18 +3985,18 @@ func TestDriveRun_AcceptanceAdmissionError_FailsOpen(t *testing.T) {
 		stg(driveAccID, "acceptance", "pending", 2),
 	})
 	f.admissionStatus = http.StatusInternalServerError
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "acceptance" {
 			f.setState("acceptance", "succeeded")
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		if f.allSucceeded("plan", "implement", "acceptance") {
 			f.runState = "succeeded"
 			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
 		}
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -4029,9 +4037,9 @@ func TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed(t *testing.T) {
 		stg(driveAccID, "acceptance", "pending", 2),
 	})
 	f.admissionStatus = http.StatusForbidden
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
 		return AutoDriveOutcome{Note: "observe-only"}
-	}
+	})
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -4231,7 +4239,7 @@ func TestDriveRun_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
 	})
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -4272,13 +4280,13 @@ func TestDriveRun_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "pending", 1),
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -4325,13 +4333,13 @@ func TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		stg(driveImplID, "implement", "pending", 1),
 	})
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -4378,13 +4386,13 @@ func TestDriveRun_InheritsBoundWorkingDir(t *testing.T) {
 		stg(driveImplID, "implement", "pending", 1),
 	})
 	f.workingDir = bound // the run's start_run binding
-	f.onSpawn = func(f *driveFakeBackend, typ string) {
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
-	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
