@@ -2642,3 +2642,353 @@ func TestAcceptanceGateAdmitsMerge(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2581: retired-criterion neutralization at verdict ingest.
+// ---------------------------------------------------------------------------
+
+// amendIngestCriteria is the ingest fixture's plan contract: crit-1 blocking
+// (schema default), crit-2 the criterion the operator retires, crit-3
+// non-blocking.
+func amendIngestCriteria() []plan.AcceptanceCriterion {
+	no := false
+	return []plan.AcceptanceCriterion{
+		{ID: "crit-1", Statement: "the run settles", Source: plan.CriterionSourceExplicit},
+		{ID: "crit-2", Statement: "healthz reports the server budget", Source: plan.CriterionSourceExplicit},
+		{ID: "crit-3", Statement: "the advisory renders", Source: plan.CriterionSourceExplicit, Blocking: &no},
+	}
+}
+
+// seedRetirementFixture gives the acceptance-ingest server everything the #2581
+// downgrade reads: a plan stage carrying the approved plan's acceptance
+// criteria, and an approve-decision approval_submitted row recording the
+// retirements. Every piece is written BY CONSTRUCTION — no test calls the gate
+// or the downgrade helper in its own setup — so a counterfactual RED lands on
+// the behavioral assertion.
+func seedRetirementFixture(t *testing.T, ar *fakeArtifactRepo, au *auditFake, rr *promptRunRepo, runID uuid.UUID, amendments []acceptanceCriteriaAmendment) {
+	t.Helper()
+	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan}
+	rr.getStages[planStage.ID] = planStage
+	if rr.stagesByRunID == nil {
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{}
+	}
+	rr.stagesByRunID[runID] = append(rr.stagesByRunID[runID], planStage)
+	seedBudgetPlanArtifact(t, ar, planStage.ID, &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Verification: plan.Verification{AcceptanceCriteria: amendIngestCriteria()},
+	})
+	if len(amendments) == 0 {
+		return
+	}
+	seedHeadEntry(au, runID, &planStage.ID, "approval_submitted", 3, map[string]any{
+		"stage_id":                  planStage.ID.String(),
+		"decision":                  "approve",
+		"amend_acceptance_criteria": amendments,
+	})
+}
+
+// retireCrit2 is the standard single retirement the ingest tests seed.
+func retireCrit2() []acceptanceCriteriaAmendment {
+	return []acceptanceCriteriaAmendment{{
+		ID: "crit-2", Action: "retire",
+		Reason: "approval condition 1 replaced the server-budget surface",
+	}}
+}
+
+// acceptanceVerdictBytes marshals a verdict body with the given mode + results.
+func acceptanceVerdictBytes(t *testing.T, verdict, failureMode string, results ...acceptanceCriterionResult) []byte {
+	t.Helper()
+	body, err := json.Marshal(acceptanceBody{
+		Verdict:     verdict,
+		FailureMode: failureMode,
+		Criteria:    critRaw(results...),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestShipAcceptance_RetiredOnlyFailure_RecordedPassed is the #2581 done-means:
+// a failed verdict whose ONLY failure names a retired criterion is recorded as
+// passed, with the reported verdict, the basis, and the retired ids preserved;
+// the stored artifact bytes are untouched; triage writes nothing; and the merge
+// gate reads a merge-eligible acceptance_passed.
+func TestShipAcceptance_RetiredOnlyFailure_RecordedPassed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "no budget line"},
+	)
+
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Verdict != "failed" || resp.EffectiveVerdict != "passed" {
+		t.Errorf("response verdict/effective_verdict = %q/%q, want failed/passed", resp.Verdict, resp.EffectiveVerdict)
+	}
+
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "passed" {
+		t.Errorf("recorded verdict = %v, want passed", payload["verdict"])
+	}
+	if payload["verdict_reported"] != "failed" {
+		t.Errorf("verdict_reported = %v, want failed", payload["verdict_reported"])
+	}
+	if payload["downgrade_basis"] != acceptanceDowngradeBasisRetiredOnly {
+		t.Errorf("downgrade_basis = %v, want %q", payload["downgrade_basis"], acceptanceDowngradeBasisRetiredOnly)
+	}
+	if got := toStringSlice(payload["retired_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-2"}) {
+		t.Errorf("retired_criterion_ids = %v, want [crit-2]", got)
+	}
+	if payload["outcome"] != "accepted" {
+		t.Errorf("outcome = %v, want accepted", payload["outcome"])
+	}
+	// The agent's evidence is preserved verbatim: raw tallies unchanged.
+	if payload["criteria_failed"] != float64(1) || payload["criteria_passed"] != float64(1) {
+		t.Errorf("tallies rewritten: passed=%v failed=%v, want 1/1", payload["criteria_passed"], payload["criteria_failed"])
+	}
+	// The STORED ARTIFACT BYTES are never rewritten.
+	stored, err := ar.Get(context.Background(), resp.ID)
+	if err != nil {
+		t.Fatalf("read back artifact: %v", err)
+	}
+	if !bytes.Equal(stored.Content, body) {
+		t.Errorf("stored artifact bytes were rewritten:\n got %s\nwant %s", stored.Content, body)
+	}
+	// No failure left to route.
+	if n := countByCategory(au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0 on a neutralized verdict", n)
+	}
+	// The merge gate reads the effective verdict.
+	state, gerr := s.acceptanceGateState(context.Background(),
+		acceptanceGateRun(runID, specWithAcceptanceStage),
+		[]*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)})
+	if gerr != nil {
+		t.Fatalf("acceptanceGateState: %v", gerr)
+	}
+	if state != acceptanceGatePassed {
+		t.Errorf("gate state = %q, want %q", state, acceptanceGatePassed)
+	}
+}
+
+// TestShipAcceptance_NoAmendments_OutcomePayloadUnchanged is the inert-when-
+// unused control: with no retirement recorded, the acceptance_outcome_recorded
+// payload carries NONE of the downgrade keys and the response omits
+// effective_verdict — byte-identical to the pre-#2581 shape.
+func TestShipAcceptance_NoAmendments_OutcomePayloadUnchanged(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, nil)
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "effective_verdict") {
+		t.Errorf("response carries effective_verdict with the feature unused: %s", w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want the reported failed", payload["verdict"])
+	}
+	for _, key := range []string{"verdict_reported", "downgrade_basis", "retired_criterion_ids"} {
+		if _, present := payload[key]; present {
+			t.Errorf("payload carries %s with the feature unused: %v", key, payload)
+		}
+	}
+}
+
+// TestShipAcceptance_BlockingSkipSupersededByConditions_RecordedPassed is the
+// PROPOSAL-3-ONLY path (operator binding condition 3): the validator obeyed the
+// prompt's skip-not-fail instruction — it shipped verdict=passed with a BLOCKING
+// criterion reported skipped and a conditions-superseded expectation_basis, with
+// NO amendment recorded anywhere. The outcome must be a plain acceptance_passed
+// with no downgrade keys: this path needs no retirement at all.
+func TestShipAcceptance_BlockingSkipSupersededByConditions_RecordedPassed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, nil)
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "skipped",
+			ExpectationBasis: "approval condition 1 superseded this criterion's design"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+	)
+
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "passed" || payload["outcome"] != "accepted" {
+		t.Errorf("verdict/outcome = %v/%v, want passed/accepted", payload["verdict"], payload["outcome"])
+	}
+	for _, key := range []string{"verdict_reported", "downgrade_basis", "retired_criterion_ids"} {
+		if _, present := payload[key]; present {
+			t.Errorf("payload carries %s on the proposal-3-only path: %v", key, payload)
+		}
+	}
+	state, gerr := s.acceptanceGateState(context.Background(),
+		acceptanceGateRun(runID, specWithAcceptanceStage),
+		[]*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)})
+	if gerr != nil {
+		t.Fatalf("acceptanceGateState: %v", gerr)
+	}
+	if state != acceptanceGatePassed {
+		t.Errorf("gate state = %q, want %q", state, acceptanceGatePassed)
+	}
+}
+
+// assertNoDowngrade ships the given verdict against the crit-2 retirement
+// fixture and asserts the recorded outcome is the REPORTED failure — the
+// downgrade did not fire.
+func assertNoDowngrade(t *testing.T, body []byte) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "effective_verdict") {
+		t.Errorf("response carries effective_verdict on a non-downgraded verdict: %s", w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (no downgrade)", payload["verdict"])
+	}
+	if _, present := payload["verdict_reported"]; present {
+		t.Errorf("downgrade keys present on a non-downgraded verdict: %v", payload)
+	}
+}
+
+// D1: an `error` failure mode — a crash / 500 — is NEVER downgraded, even when
+// every failed criterion is retired.
+func TestDowngrade_ErrorFailureMode_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "error",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// D2 is the issue's own counterfactual: a criterion the operator did NOT retire
+// still fails acceptance, even alongside a retired failure.
+func TestDowngrade_LiveFailureAlongsideRetired_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "failed", Observed: "still broken"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// D3: a verdict that reports ONLY retired criteria evidences nothing about the
+// live contract, so the surviving partition is empty and no downgrade fires.
+func TestDowngrade_EmptySurvivingPartition_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// D4: a surviving BLOCKING criterion reported skipped was never exercised, so it
+// must not ride out on someone else's downgrade.
+func TestDowngrade_SurvivingBlockingSkip_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "skipped", ExpectationBasis: "target unavailable"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// TestDowngrade_SurvivingNonBlockingSkip_StillDowngrades is D4's paired
+// positive: a NON-blocking surviving skip does not block the downgrade, so the
+// precondition is keyed on the criterion's blocking value rather than on the
+// presence of any skip at all.
+func TestDowngrade_SurvivingNonBlockingSkip_StillDowngrades(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "skipped", ExpectationBasis: "advisory only"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "passed" {
+		t.Errorf("recorded verdict = %v, want passed (a non-blocking skip does not block the downgrade)", got)
+	}
+}
+
+// TestDowngrade_AuditReadError_NoDowngrade pins the INGEST caller's documented
+// fail direction: an unreadable approval chain records the agent's verdict
+// as-is. The degrade can never silence a criterion.
+func TestDowngrade_AuditReadError_NoDowngrade(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	au.listByCategoryErr = errors.New("audit store outage")
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	au.listByCategoryErr = nil
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (an unreadable chain takes no downgrade)", got)
+	}
+}
+
+// TestDowngrade_PlanUnreadable_NoDowngrade pins the second ingest degrade: an
+// unreadable plan artifact also records the reported verdict unchanged.
+func TestDowngrade_PlanUnreadable_NoDowngrade(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	ar.listErr = errors.New("artifact store outage")
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (an unreadable plan takes no downgrade)", got)
+	}
+}
+
+// TestAcceptanceCriteriaIDs_SupersetIncludesRetired pins the SUPERSET invariant
+// as its own criterion-level assertion (operator binding condition 5): the ids
+// served to the runner still carry a RETIRED criterion, so a verdict reporting
+// it can never fail the stage closed on the runner's join-key validation.
+func TestAcceptanceCriteriaIDs_SupersetIncludesRetired(t *testing.T) {
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendIngestCriteria()}}
+	ids := acceptanceCriteriaIDsFromPlan(p)
+	if want := []string{"crit-1", "crit-2", "crit-3"}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("acceptance_criteria_ids = %v, want %v (every plan id, retired ones included)", ids, want)
+	}
+}

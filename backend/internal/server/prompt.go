@@ -1178,6 +1178,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		trigger.ApprovedPlan = approvedPlan
 		trigger.TargetInstanceURL = s.resolveAcceptanceTargetURL(r.Context(), runRow)
+		// Contested context + effective criteria (#2581). The binding approval
+		// conditions ride the SAME resolver the implement path uses (nil when the
+		// operator approved with no reason, leaving the prompt byte-identical),
+		// alongside the paths the operator dropped from scope at that gate. The
+		// criteria set comes from the single resolveEffectiveAcceptanceCriteria
+		// seam; it FAILS OPEN (both fields nil -> the FULL plan criteria set
+		// renders), so a degraded audit read can never silence a criterion.
+		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		trigger.AcceptanceDroppedScopePaths = s.loadApprovalRemoveScopeFiles(r.Context(), runRow.ID)
+		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired =
+			s.resolveAcceptancePromptCriteria(r.Context(), runRow.ID, approvedPlan)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was
@@ -1699,6 +1710,17 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		trigger.ApprovedPlan = approvedPlan
 		trigger.TargetInstanceURL = s.resolveAcceptanceTargetURL(r.Context(), runRow)
+		// Contested context + effective criteria (#2581). The binding approval
+		// conditions ride the SAME resolver the implement path uses (nil when the
+		// operator approved with no reason, leaving the prompt byte-identical),
+		// alongside the paths the operator dropped from scope at that gate. The
+		// criteria set comes from the single resolveEffectiveAcceptanceCriteria
+		// seam; it FAILS OPEN (both fields nil -> the FULL plan criteria set
+		// renders), so a degraded audit read can never silence a criterion.
+		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		trigger.AcceptanceDroppedScopePaths = s.loadApprovalRemoveScopeFiles(r.Context(), runRow.ID)
+		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired =
+			s.resolveAcceptancePromptCriteria(r.Context(), runRow.ID, approvedPlan)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was

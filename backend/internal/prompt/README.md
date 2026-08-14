@@ -239,3 +239,38 @@ loop is grounding-capable and the `reviewsandbox.ExportTree` export succeeded; t
 SHA is the one `ExportTree` resolved and archived (C4). The supplemental
 base-rebase re-invoke prompt renders no diff and is always ungrounded. Pinned by
 `TestBuild_ReviewGrounding_*` in `prompt_test.go`.
+
+## Acceptance-prompt contested context + retired criteria (#2581)
+
+`buildAcceptance` renders two additional blocks, both BEFORE the
+`### Output contract` section (so their backtick tokens fall outside the region
+the closed-field-set guard counts) and both introducing NO new verdict field —
+they reuse only the already-enumerated `skipped` / `expectation_basis` / `notes`
+fields:
+
+- **`writeAcceptanceApprovalConditions`** — the CONTESTED CONTEXT block. It
+  renders the operator's binding plan-approval conditions (`ApprovalConditions`,
+  capped at `MaxApprovalConditionBytes`) and the paths dropped from scope at the
+  same gate (`AcceptanceDroppedScopePaths`, from `remove_scope_files`), then the
+  skip-not-fail instruction: where an observed behaviour conflicts with a
+  criterion BECAUSE a condition changed the design or dropped its surface, report
+  that criterion `result`=`skipped` with the conflict in its
+  `expectation_basis` — never `result`=`failed`, and never a top-level
+  `verdict`=`failed` on a superseded criterion alone. A criterion the conditions
+  did not touch is validated normally. This hands the SUBJECTHOOD judgement to
+  the validator, which can read the criterion and the observed behaviour, instead
+  of inferring it from a token rule (#2581).
+- **`writeAcceptanceRetiredCriteria`** — the criteria the operator explicitly
+  RETIRED at the approval gate (`AcceptanceCriteriaRetired`), each with its
+  recorded reason and an instruction not to validate them.
+
+`writeAcceptanceCriteriaForAcceptance` renders `AcceptanceCriteriaEffective`
+when it is non-nil (the live set after amendments) and falls back to
+`ApprovedPlan.Verification.AcceptanceCriteria` otherwise, so every legacy and
+unamended run renders byte-identically to before the channel existed. Both new
+blocks render nothing when their fields are empty.
+
+Caveat worth stating plainly: this half is a prompt INSTRUCTION to an LLM
+validator. The tests prove the instruction renders, not that a validator obeys
+it. The failure direction is safe — a non-compliant validator produces at worst
+today's spurious failure, never a silent pass.

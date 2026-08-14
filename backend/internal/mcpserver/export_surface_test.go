@@ -27,6 +27,11 @@ import (
 // a NEW export added later is caught while the pre-existing surface is pinned.
 var exportBaseline = []string{
 	"AcceptanceAdmissionResult",
+	// #2581: the per-entry shape of fishhawk_approve_plan's
+	// amend_acceptance_criteria input. Exported for the same reason as
+	// BindingAssertion below — the MCP SDK's jsonschema reflection needs the
+	// nested type (and its fields) exported to advertise the entry shape.
+	"AcceptanceCriteriaAmendment",
 	"AcceptanceNeedsTarget",
 	"AcceptanceSlot",
 	"AcceptanceSlotClaim",

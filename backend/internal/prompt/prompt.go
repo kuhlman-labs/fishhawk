@@ -379,6 +379,28 @@ type Trigger struct {
 	// to the issue-only prompt and a `plan_missing_for_implement`
 	// audit entry surfaces the gap (#223).
 	ApprovedPlan *plan.Plan
+	// AcceptanceCriteriaEffective is the acceptance-stage LIVE criteria set
+	// after the operator's approve-time amendments (#2581): the plan's criteria
+	// minus every retired one, with restatements applied. Nil (the default, and
+	// every legacy run) makes buildAcceptance render
+	// ApprovedPlan.Verification.AcceptanceCriteria verbatim, so the prompt stays
+	// byte-identical to today. Populated ONLY on the acceptance-stage prompt,
+	// from the server's single resolveEffectiveAcceptanceCriteria seam.
+	AcceptanceCriteriaEffective []plan.AcceptanceCriterion
+	// AcceptanceCriteriaRetired is the set the operator retired at the plan
+	// gate, each with its recorded reason (#2581). Rendered as an explicit
+	// "retired at approval" block so the validator does not validate them and,
+	// if it reports them at all, reports result=skipped citing the reason. Nil
+	// for every run that used no amendment.
+	AcceptanceCriteriaRetired []RetiredAcceptanceCriterion
+	// AcceptanceDroppedScopePaths carries the repo-relative paths the operator
+	// dropped from the implement scope at the approval gate via
+	// remove_scope_files (#2581, operator binding condition 1). They ride the
+	// SAME contested-context block as ApprovalConditions with the same
+	// skip-not-fail instruction: a criterion whose surface was dropped is
+	// SURFACED AS CONTESTED for the validator to judge in context, never retired
+	// by an inference rule. Empty for every approve that removed no path.
+	AcceptanceDroppedScopePaths []string
 	// PlanStageTimeout is the max runtime budget for the plan stage.
 	// Zero resolves to defaultStageTimeoutMinutes in buildPlan.
 	PlanStageTimeout time.Duration
@@ -2161,9 +2183,17 @@ func buildAcceptance(t Trigger) string {
 		b.WriteString("\n\n")
 	}
 
-	// Acceptance criteria from the approved plan. This is the binding
-	// checklist the validator judges the running instance against.
-	writeAcceptanceCriteriaForAcceptance(&b, t.ApprovedPlan)
+	// Contested context (#2581): the binding approval conditions and the paths
+	// dropped from scope at the approval gate, with the skip-not-fail
+	// instruction. Rendered BEFORE the criteria so the validator reads the
+	// superseding context before the checklist it qualifies.
+	writeAcceptanceApprovalConditions(&b, t)
+
+	// Acceptance criteria from the approved plan, minus anything the operator
+	// retired at the approval gate. This is the binding checklist the validator
+	// judges the running instance against.
+	writeAcceptanceCriteriaForAcceptance(&b, t)
+	writeAcceptanceRetiredCriteria(&b, t)
 
 	// Target instance section. The value is the acceptance stage's first
 	// spec-declared egress target host (the E31.4/#1532 egress-allowance
@@ -2258,16 +2288,110 @@ func buildAcceptance(t Trigger) string {
 	return b.String()
 }
 
-// writeAcceptanceCriteriaForAcceptance renders the approved plan's typed
-// verification.acceptance_criteria as the acceptance validator's binding
-// checklist — one block per criterion carrying id, statement, source
+// RetiredAcceptanceCriterion is one acceptance criterion the operator retired
+// at the plan-approval gate (#2581), carried into the acceptance prompt so the
+// retirement and its recorded reason are visible to the validator. The server's
+// resolveEffectiveAcceptanceCriteria seam is the only producer.
+type RetiredAcceptanceCriterion struct {
+	ID     string
+	Reason string
+}
+
+// writeAcceptanceApprovalConditions renders the acceptance-stage contested
+// context (#2581): the operator's binding plan-approval conditions and the paths
+// they dropped from scope at the same gate, plus the skip-not-fail instruction.
+//
+// Why it exists: plan-approval conditions reshape the design but never rewrite
+// the plan's acceptance criteria, so a correct implementation can be judged
+// against a superseded expectation and fail acceptance (#2581). Rather than
+// inferring which criterion a condition (or a dropped path) invalidated — a
+// natural-language judgement no token rule decides — the conditions and the
+// dropped paths are handed to the validator as CONTEXT, and the validator judges
+// subjecthood where it can actually read the criterion and the observed
+// behavior.
+//
+// It renders nothing when the run carries neither conditions nor dropped paths,
+// so an unamended run's prompt is byte-identical to today. Capped by the same
+// CapText/MaxApprovalConditionBytes discipline as the implement-side block.
+//
+// Both this block and the retired-criteria block render BEFORE the "### Output
+// contract" section, so their backtick tokens fall outside the region the
+// closed-field-set guard counts, and they introduce NO new verdict field: they
+// reuse only the already-enumerated result=skipped / expectation_basis / notes
+// fields.
+func writeAcceptanceApprovalConditions(b *strings.Builder, t Trigger) {
+	if t.ApprovalConditions == nil && len(t.AcceptanceDroppedScopePaths) == 0 {
+		return
+	}
+	b.WriteString("### Binding approval conditions (they SUPERSEDE the criteria below)\n\n")
+	b.WriteString("The operator approved this plan with the conditions and scope decisions recorded " +
+		"here. They were BINDING on the implementation, so the change you are validating was built " +
+		"to THEM, not to any criterion below that contradicts them.\n\n")
+	if t.ApprovalConditions != nil {
+		ac, _ := CapText(*t.ApprovalConditions, MaxApprovalConditionBytes)
+		b.WriteString("Approval conditions:\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
+	}
+	if len(t.AcceptanceDroppedScopePaths) > 0 {
+		b.WriteString("Paths DROPPED from scope at the approval gate (the implementation was " +
+			"forbidden to touch them, so any criterion whose only surface is one of these was " +
+			"superseded by that decision):\n")
+		for _, p := range t.AcceptanceDroppedScopePaths {
+			b.WriteString("- ")
+			b.WriteString(p)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Where an observed behavior conflicts with a criterion BECAUSE an approval " +
+		"condition changed the design or dropped its surface, report that criterion " +
+		"`result`=`skipped` and name the conflict in its `expectation_basis` — never " +
+		"`result`=`failed`. Do NOT emit a top-level `verdict`=`failed` on the strength of a " +
+		"superseded criterion alone. A criterion the conditions did NOT touch is unaffected: " +
+		"validate it normally and fail it if it genuinely fails.\n\n")
+}
+
+// writeAcceptanceRetiredCriteria renders the criteria the operator explicitly
+// RETIRED at the approval gate (#2581), each with its recorded reason. Unlike
+// the contested-context block above (which hands the validator judgement),
+// retirement is the operator's explicit, audited decision: these criteria are
+// not validated at all. Renders nothing when nothing was retired.
+func writeAcceptanceRetiredCriteria(b *strings.Builder, t Trigger) {
+	if len(t.AcceptanceCriteriaRetired) == 0 {
+		return
+	}
+	b.WriteString("### Retired at approval — do NOT validate these\n\n")
+	b.WriteString("The operator retired these acceptance criteria at the plan-approval gate, with " +
+		"the reason recorded on the approval audit entry. They are no longer part of the contract: " +
+		"do not validate them and do not fail the change for them. If you report them at all, " +
+		"report `result`=`skipped` citing the retirement reason in `expectation_basis`.\n\n")
+	for _, rc := range t.AcceptanceCriteriaRetired {
+		fmt.Fprintf(b, "- [%s] retired: %s\n", rc.ID, rc.Reason)
+	}
+	b.WriteString("\n")
+}
+
+// writeAcceptanceCriteriaForAcceptance renders the acceptance validator's
+// binding checklist — one block per criterion carrying id, statement, source
 // (+source_ref/rationale), the effective blocking value (nil->true schema
 // default), verify_hint, and preconditions. verification.out_of_scope renders
 // as the explicit not-covered list. A nil plan or an empty criteria set is a
 // loud warning line (the plan_acceptance_precheck gate normally prevents it).
-func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, p *plan.Plan) {
+//
+// The rendered set is t.AcceptanceCriteriaEffective when it is non-nil (the
+// operator amended the criteria at the approval gate, #2581) and the approved
+// plan's verification.acceptance_criteria otherwise — so every legacy run and
+// every unamended run renders byte-identically to before the amendment channel
+// existed.
+func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, t Trigger) {
+	p := t.ApprovedPlan
+	criteria := t.AcceptanceCriteriaEffective
+	if criteria == nil && p != nil {
+		criteria = p.Verification.AcceptanceCriteria
+	}
 	b.WriteString("### Acceptance criteria\n\n")
-	if p == nil || len(p.Verification.AcceptanceCriteria) == 0 {
+	if p == nil || len(criteria) == 0 {
 		// Two distinct empty-criteria situations. A plan that declares
 		// verification.out_of_scope but authors NO acceptance_criteria is the
 		// SANCTIONED 0-criteria case (#1543/#1612): nothing is runtime-observable,
@@ -2293,7 +2417,7 @@ func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, p *plan.Plan) {
 		return
 	}
 	v := p.Verification
-	for _, c := range v.AcceptanceCriteria {
+	for _, c := range criteria {
 		blocking := c.Blocking == nil || *c.Blocking
 		fmt.Fprintf(b, "- [%s] %s\n", c.ID, c.Statement)
 		fmt.Fprintf(b, "  source: %s", c.Source)

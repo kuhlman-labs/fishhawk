@@ -1647,7 +1647,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -8975,5 +8975,66 @@ func TestSubmitApproval_OverCapReject_NotRefused(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
 	if got.State != string(run.StageStateFailed) {
 		t.Errorf("State = %q, want failed (reject)", got.State)
+	}
+}
+
+// TestApprovalAudit_AmendAcceptanceCriteria_RecordedOnSameRow pins the #2581
+// persistence seam: the amendment lands on the SAME approval_submitted entry as
+// the reason that motivated it, and each retirement's id, reason and SOURCE are
+// reconstructable from the chain alone — read back through the seam that every
+// consumer uses.
+func TestApprovalAudit_AmendAcceptanceCriteria_RecordedOnSameRow(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve",`+
+		`"comment":"narrow the design to the resolver seam",`+
+		`"amend_acceptance_criteria":[{"id":"crit-2","action":"retire","reason":"condition 1 dropped its surface"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if payload["comment"] != "narrow the design to the resolver seam" {
+		t.Errorf("comment = %v, want the approval reason on the SAME row", payload["comment"])
+	}
+	entries, _ := payload["amend_acceptance_criteria"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("amend_acceptance_criteria = %v, want one entry", payload["amend_acceptance_criteria"])
+	}
+	first, _ := entries[0].(map[string]any)
+	if first["id"] != "crit-2" || first["action"] != "retire" ||
+		first["reason"] != "condition 1 dropped its surface" {
+		t.Errorf("recorded amendment = %v, want the id/action/reason verbatim", first)
+	}
+
+	// Reconstructable from the chain alone: feed the recorded row back through
+	// the seam and assert the retirement's provenance.
+	au.seedApprovalEntry(runRow.ID, stage.ID, 1, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: "retire", Reason: "condition 1 dropped its surface"},
+	})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(eff.Retired) != 1 || eff.Retired[0].Source != acceptanceRetirementSourceOperator {
+		t.Errorf("retired provenance = %+v, want one operator_approval retirement", eff.Retired)
+	}
+}
+
+// TestApprovalAudit_NoAmendments_PayloadByteIdentical is the inert-when-unused
+// control (#2581): an approve that does not use the channel records an
+// approval_submitted payload with NO amend_acceptance_criteria key at all, so
+// the payload is byte-identical to the pre-change shape.
+func TestApprovalAudit_NoAmendments_PayloadByteIdentical(t *testing.T) {
+	s, _, au, _, _, stage := newAmendServer(t, amendCriteria())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"looks good"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, present := payload["amend_acceptance_criteria"]; present {
+		t.Errorf("amend_acceptance_criteria present on an amendment-less approve: %v", payload)
 	}
 }

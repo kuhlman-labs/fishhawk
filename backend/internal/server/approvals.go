@@ -121,6 +121,21 @@ type approvalRequest struct {
 	// here so the DisallowUnknownFields decode accepts it; callers omit it
 	// (omitempty) and stay byte-identical to today.
 	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
+	// AmendAcceptanceCriteria is the OPTIONAL operator channel for RETIRING or
+	// RESTATING an approved plan's acceptance criteria by id at the plan gate
+	// (#2581). Plan-approval conditions reshape the design but never rewrite the
+	// criteria, so the acceptance stage can validate the shipped behaviour
+	// against a superseded contract and fail a correct implementation; this is
+	// the explicit channel that fixes the contract at the same gate that
+	// reshaped it. Each entry requires a reason (the reconstructable why), and a
+	// restate additionally requires the replacement statement. Validated
+	// pre-Submit by checkAmendAcceptanceCriteria — nine named refusals including
+	// the anti-silencing all-retired gate — so a malformed or contract-emptying
+	// amendment inserts no approval row. Recorded on the SAME approval_submitted
+	// payload as the reason/add_scope_files/remove_scope_files that motivated it.
+	// Declared here so the DisallowUnknownFields decode accepts it; callers omit
+	// it (omitempty) and stay byte-identical to today.
+	AmendAcceptanceCriteria []acceptanceCriteriaAmendment `json:"amend_acceptance_criteria,omitempty"`
 	// ImplementModel is the OPTIONAL operator override for the implement
 	// stage's model (#1013) — the highest rung of the implement-model
 	// resolution ladder (deployment default < spec executor.model < plan
@@ -512,6 +527,22 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// recording is unreachable by construction rather than by a second check.
 	var addScopeFiles []string
 	var removeScopeFiles []string
+	// Acceptance-criteria amendment channel (#2581). Validated PRE-Submit like
+	// every sibling gate — a refusal inserts no approval row, so a corrected
+	// retry flows normally. Deliberately called OUTSIDE the approve+plan block:
+	// the gate must REFUSE an amendment supplied on a reject or a non-plan stage
+	// (R5) rather than silently dropping it, and a silent drop is exactly the
+	// divergence between what the operator believes they retired and what the
+	// chain records that this channel exists to prevent. Because the gate refuses
+	// every non-plan/non-approve call, the returned slice can only be non-empty
+	// for a plan-stage approve — so recording it is safe by construction, the
+	// same property the #2598 plan-block locals give the scope channels. The
+	// slash-command approval channel (issue_approval.go) passes no amendments and
+	// is deliberately unchanged.
+	amendAcceptanceCriteria, ok := s.checkAmendAcceptanceCriteria(w, r, stage, decision, req.AmendAcceptanceCriteria)
+	if !ok {
+		return
+	}
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
@@ -696,21 +727,22 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// the prior inline core did (duplicate 200, InvalidTransition 409, and
 	// the two distinct submit/advance 500 messages).
 	result, err := s.approveStageAs(r.Context(), ident, approveActionParams{
-		Stage:               stage,
-		Decision:            decision,
-		Comment:             req.Comment,
-		CommentPtr:          commentPtr,
-		ApproverGithubLogin: req.ApproverGithubLogin,
-		AddScopeFiles:       addScopeFiles,
-		RemoveScopeFiles:    removeScopeFiles,
-		SliceAddScopeFiles:  sliceAddScopeFiles,
-		BindingAssertions:   req.BindingAssertions,
-		ClaimsConcernIDs:    req.ClaimsConcernIDs,
-		DelegatedRule:       delegatedRule,
-		ResolvedModel:       resolvedModel,
-		PlanModel:           req.PlanModel,
-		ReviewModel:         req.ReviewModel,
-		PredicateResolution: predicateRes,
+		Stage:                   stage,
+		Decision:                decision,
+		Comment:                 req.Comment,
+		CommentPtr:              commentPtr,
+		ApproverGithubLogin:     req.ApproverGithubLogin,
+		AddScopeFiles:           addScopeFiles,
+		RemoveScopeFiles:        removeScopeFiles,
+		SliceAddScopeFiles:      sliceAddScopeFiles,
+		BindingAssertions:       req.BindingAssertions,
+		ClaimsConcernIDs:        req.ClaimsConcernIDs,
+		AmendAcceptanceCriteria: amendAcceptanceCriteria,
+		DelegatedRule:           delegatedRule,
+		ResolvedModel:           resolvedModel,
+		PlanModel:               req.PlanModel,
+		ReviewModel:             req.ReviewModel,
+		PredicateResolution:     predicateRes,
 	})
 	if err != nil {
 		var aerr *approveActionError
@@ -836,10 +868,16 @@ type approveActionParams struct {
 	SliceAddScopeFiles map[string][]string
 	BindingAssertions  []bindingAssertion
 	ClaimsConcernIDs   []string
-	DelegatedRule      string
-	ResolvedModel      *ResolvedModel
-	PlanModel          string
-	ReviewModel        string
+	// AmendAcceptanceCriteria is the canonical amendment slice
+	// checkAmendAcceptanceCriteria produced, or nil when the approve carried
+	// none (#2581). Recorded on the approval_submitted payload; the in-process
+	// campaign auto-driver leaves it nil. Only a PLAN-stage approve can carry a
+	// non-empty value — the gate refuses the channel everywhere else.
+	AmendAcceptanceCriteria []acceptanceCriteriaAmendment
+	DelegatedRule           string
+	ResolvedModel           *ResolvedModel
+	PlanModel               string
+	ReviewModel             string
 	// PredicateResolution, when non-nil, carries the forge-resolved
 	// min_permission / member_of values a satisfied approval-gate predicate
 	// resolution produced (E39.5 / #1710). The HTTP handler stashes it from
@@ -982,7 +1020,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -992,7 +1030,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -1122,7 +1160,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1839,7 +1877,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []acceptanceCriteriaAmendment, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1930,6 +1968,15 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// implement-review hook reads them back via loadApprovalConcernClaims. Only
 	// on approve with a non-empty slice; the key is omitted otherwise so a
 	// no-claim approve is byte-identical to today.
+	// Acceptance-criteria amendment (#2581): record the operator's retirements /
+	// restatements on the SAME row as the reason and the scope channels that
+	// motivated them, so each retirement's id, reason and source are
+	// reconstructable from the chain alone. Only on approve with a non-empty
+	// slice — the key is omitted otherwise, so an approve that does not use the
+	// channel marshals byte-identically to today.
+	if app.Decision == approval.DecisionApprove && len(amendAcceptanceCriteria) > 0 {
+		auditPayload["amend_acceptance_criteria"] = amendAcceptanceCriteria
+	}
 	if app.Decision == approval.DecisionApprove && len(claimsConcernIDs) > 0 {
 		auditPayload["claims_concern_ids"] = claimsConcernIDs
 	}

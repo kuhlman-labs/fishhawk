@@ -10722,3 +10722,138 @@ func TestLoadApprovalConditions_RealPostgres_RepeatedLoads_Deduplicated(t *testi
 		t.Fatalf("persisted approval_conditions_truncated rows after 3 real-Postgres loads = %d, want exactly 1 — the emitter payload key and the 0068 index key must agree (a NULL-distinct degradation would leave 3)", len(rows))
 	}
 }
+
+// seedAcceptanceRetirement records an approve-decision approval_submitted row on
+// the acceptance-prompt fixture's PLAN stage retiring ac-list, BY CONSTRUCTION
+// (never through the approve gate), so the prompt-side assertion is independent
+// of the gate.
+func seedAcceptanceRetirement(t *testing.T, s *Server, runID uuid.UUID, conditions string) {
+	t.Helper()
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	var planStageID uuid.UUID
+	for _, st := range rr.stagesByRunID[runID] {
+		if st.Type == run.StageTypePlan {
+			planStageID = st.ID
+		}
+	}
+	if planStageID == uuid.Nil {
+		t.Fatal("fixture has no plan stage")
+	}
+	payload := map[string]any{
+		"stage_id": planStageID.String(),
+		"decision": "approve",
+		"amend_acceptance_criteria": []acceptanceCriteriaAmendment{{
+			ID: "ac-list", Action: "retire", Reason: "the listing endpoint was dropped at the approval gate",
+		}},
+		"remove_scope_files": []string{"backend/internal/server/widgets_list.go"},
+	}
+	if conditions != "" {
+		payload["comment"] = conditions
+	}
+	raw, _ := json.Marshal(payload)
+	rid := runID
+	sid := planStageID
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: 4,
+		Category: "approval_submitted", Payload: raw,
+	})
+}
+
+// TestGetStagePrompt_Acceptance_ContestedContextAndRetiredCriterion pins the
+// #2581 wiring on the SIGNED dispatch prompt path: the binding approval
+// conditions render with the skip-not-fail instruction, the paths dropped at the
+// gate render as contested, the retired criterion is ABSENT from the live
+// checklist and PRESENT in the retired block — and acceptance_criteria_ids still
+// serves the retired id (the superset invariant, so the runner's join-key
+// validation can never fail the stage closed).
+func TestGetStagePrompt_Acceptance_ContestedContextAndRetiredCriterion(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	seedAcceptanceRetirement(t, s, runID, "1. Drop the listing endpoint; the widget list is out of scope.")
+
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, want := range []string{
+		"Binding approval conditions",
+		"Drop the listing endpoint",
+		"Paths DROPPED from scope at the approval gate",
+		"backend/internal/server/widgets_list.go",
+		"never `result`=`failed`",
+		"Retired at approval",
+		"[ac-list] retired: the listing endpoint was dropped at the approval gate",
+		"POST /widgets returns 201",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+	if strings.Contains(resp.Prompt, "GET /widgets lists created widgets") {
+		t.Errorf("retired criterion still renders in the live checklist\n---\n%s", resp.Prompt)
+	}
+	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want %v (a SUPERSET including the retired id)",
+			resp.AcceptanceCriteriaIDs, want)
+	}
+}
+
+// TestRenderStagePrompt_Acceptance_ContestedContextAndRetiredCriterion pins the
+// SAME wiring on the unsigned render/preview path: both acceptance prompt
+// surfaces must change together or the preview diverges from what the runner
+// receives.
+func TestRenderStagePrompt_Acceptance_ContestedContextAndRetiredCriterion(t *testing.T) {
+	s, runID, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	seedAcceptanceRetirement(t, s, runID, "1. Drop the listing endpoint; the widget list is out of scope.")
+
+	w := promptRenderRequest(t, s, acceptanceStageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, want := range []string{
+		"Binding approval conditions",
+		"Paths DROPPED from scope at the approval gate",
+		"Retired at approval",
+		"[ac-list] retired: the listing endpoint was dropped at the approval gate",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("rendered acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+	if strings.Contains(resp.Prompt, "GET /widgets lists created widgets") {
+		t.Errorf("retired criterion still renders in the rendered live checklist\n---\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks is the inert-when-unused
+// control on the server path: with no approval row at all, neither #2581 block
+// renders and the full plan criteria set is served.
+func TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, unwanted := range []string{"Binding approval conditions", "Retired at approval", "Paths DROPPED from scope"} {
+		if strings.Contains(resp.Prompt, unwanted) {
+			t.Errorf("acceptance prompt renders %q with the feature unused\n---\n%s", unwanted, resp.Prompt)
+		}
+	}
+	for _, want := range []string{"ac-create", "ac-list"} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("acceptance prompt missing plan criterion %q", want)
+		}
+	}
+}

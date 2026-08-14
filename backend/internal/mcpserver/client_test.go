@@ -1571,7 +1571,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "restore the dropped file",
-		"kuhlman-labs", nil, nil, perSlice, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -1588,10 +1588,57 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no slice map): %v", err)
 	}
 	if _, present := gotRaw["add_scope_files_to_slice"]; present {
 		t.Errorf("add_scope_files_to_slice present on a no-targeting approve body: %#v", gotRaw)
+	}
+}
+
+// TestSubmitApproval_SendsAmendAcceptanceCriteriaBody pins the apiClient half of
+// the #2581 wire contract against a real HTTP server: SubmitApproval must POST
+// amend_acceptance_criteria with the id/action/reason/statement tags byte-
+// identical to what the caller passed (the backend's DisallowUnknownFields
+// decoder rejects any drift in a field name), and must OMIT the key entirely
+// when the caller passes nil so an amendment-less approve body is unchanged.
+func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
+	stageID := uuid.New()
+	amendments := []AcceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: "retire", Reason: "condition 1 dropped the surface it asserts"},
+		{ID: "crit-3", Action: "restate", Reason: "narrowed at the gate", Statement: "the gate refuses instead of warning"},
+	}
+
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+uuid.NewString()+`","state":"succeeded"}`)
+	})
+
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "narrowed the design",
+		"kuhlman-labs", nil, nil, nil, nil, nil, amendments, ""); err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	raw, err := json.Marshal(gotRaw["amend_acceptance_criteria"])
+	if err != nil {
+		t.Fatalf("marshal decoded field: %v", err)
+	}
+	// The handler decodes into map[string]any, so re-marshalling sorts keys —
+	// the assertion is on the field NAMES and values, not their emitted order.
+	want := `[{"action":"retire","id":"crit-2","reason":"condition 1 dropped the surface it asserts"},` +
+		`{"action":"restate","id":"crit-3","reason":"narrowed at the gate","statement":"the gate refuses instead of warning"}]`
+	if string(raw) != want {
+		t.Errorf("amend_acceptance_criteria on the wire = %s, want %s", raw, want)
+	}
+
+	// nil → the key must be absent, not present-and-null.
+	gotRaw = nil
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval (no amendments): %v", err)
+	}
+	if _, present := gotRaw["amend_acceptance_criteria"]; present {
+		t.Errorf("amend_acceptance_criteria present on an amendment-less approve body: %#v", gotRaw)
 	}
 }

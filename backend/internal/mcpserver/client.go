@@ -853,6 +853,13 @@ type approvalRequest struct {
 	// DisallowUnknownFields decoder requires the field be declared here too;
 	// reject and claim-less approve callers pass nil (omitempty).
 	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
+	// AmendAcceptanceCriteria is the operator's approve-time amendment of the
+	// approved plan's acceptance criteria (#2581): retire or restate a criterion
+	// by id, each with a required reason. The backend validates it pre-Submit and
+	// records it on the approval audit payload. The DisallowUnknownFields decoder
+	// requires the field be declared here too; reject and amendment-less approve
+	// callers pass nil (omitempty).
+	AmendAcceptanceCriteria []AcceptanceCriteriaAmendment `json:"amend_acceptance_criteria,omitempty"`
 	// ImplementModel is the optional operator override for the implement-stage
 	// model (#1013) — the highest rung of the resolution ladder. The backend
 	// resolves the full ladder at the plan gate, validates the resolved value
@@ -963,23 +970,41 @@ type approvalResult struct {
 //     declared scope.files — this channel ADDS and does not MOVE, so re-plan
 //     the decomposition — an invalid path, or an empty path list. details
 //     carry the offending key/path plus the ordered {index,title} slice list)
+//   - 400 validation_failed with details.field = amend_acceptance_criteria
+//     (#2581: the acceptance-criteria amendment refusals, each naming the
+//     offending entry under details.id and the specific refusal under
+//     details.rule — unknown_criterion_id, unknown_action, reason_required,
+//     statement_required, duplicate_id, already_retired, or
+//     amendment_not_approve_plan_stage. Pre-insert: fix the entry and re-approve)
+//   - 422 acceptance_criteria_all_retired (#2581: the amendment would retire
+//     EVERY acceptance criterion in the approved plan — the anti-silencing gate,
+//     evaluated on the union of prior recorded retirements and this request's, so
+//     it fires cumulatively too. There is NO override; re-plan rather than
+//     emptying the acceptance contract. details carry retired_count and
+//     criteria_count)
+//   - 422 acceptance_criteria_unavailable (#2581: amend_acceptance_criteria was
+//     supplied but the approved plan could not be loaded, carries zero
+//     acceptance_criteria, or its prior amendments could not be read — fail
+//     closed, since an amendment must anchor to a criterion that exists.
+//     Remediation: re-plan so the criteria exist, or approve without the channel)
 //   - 422 plan_invalid_model (#1013: the RESOLVED implement model — the
 //     ladder of deployment default < spec executor.model < plan
 //     model_recommendation < implement_model override — is not in the
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
-		Decision:             decision,
-		Comment:              comment,
-		ApproverGithubLogin:  approverGithubLogin,
-		AddScopeFiles:        addScopeFiles,
-		RemoveScopeFiles:     removeScopeFiles,
-		AddScopeFilesToSlice: addScopeFilesToSlice,
-		BindingAssertions:    bindingAssertions,
-		ClaimsConcernIDs:     claimsConcernIDs,
-		ImplementModel:       implementModel,
+		Decision:                decision,
+		Comment:                 comment,
+		ApproverGithubLogin:     approverGithubLogin,
+		AddScopeFiles:           addScopeFiles,
+		RemoveScopeFiles:        removeScopeFiles,
+		AddScopeFilesToSlice:    addScopeFilesToSlice,
+		BindingAssertions:       bindingAssertions,
+		ClaimsConcernIDs:        claimsConcernIDs,
+		AmendAcceptanceCriteria: amendAcceptanceCriteria,
+		ImplementModel:          implementModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

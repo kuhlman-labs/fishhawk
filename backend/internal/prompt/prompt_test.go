@@ -8105,3 +8105,143 @@ func TestBuildSupplementalReview_RequiresNonEmptyNote(t *testing.T) {
 		t.Error("supplemental verdict JSON shape block changed; it must stay byte-identical")
 	}
 }
+
+// TestBuild_Acceptance_BindingConditions_SkipNotFail pins the #2581 contested-
+// context block: an acceptance prompt for a run whose plan approval carried
+// conditions renders them as BINDING and SUPERSEDING, with the skip-not-fail
+// instruction naming result=skipped + expectation_basis and forbidding a
+// verdict=failed on a superseded criterion alone.
+func TestBuild_Acceptance_BindingConditions_SkipNotFail(t *testing.T) {
+	conditions := "1. Drop the /healthz budget line; report the budget on the run row instead."
+	got, err := Build("acceptance", Trigger{
+		Repo:               "kuhlman-labs/fishhawk",
+		ApprovedPlan:       acceptanceFixturePlan(),
+		ApprovalConditions: &conditions,
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"Binding approval conditions",
+		conditions,
+		"SUPERSEDE",
+		"`result`=`skipped`",
+		"`expectation_basis`",
+		"never `result`=`failed`",
+		"Do NOT emit a top-level `verdict`=`failed` on the strength of a superseded criterion alone",
+		// A criterion the conditions did not touch stays fully validated.
+		"validate it normally and fail it if it genuinely fails",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_DroppedScopePaths_RenderedAsContested pins operator
+// binding condition 1: the paths dropped from scope at the approval gate ride
+// the SAME contested-context block, so a criterion whose only surface was
+// dropped is surfaced as contested rather than silently retired by inference.
+func TestBuild_Acceptance_DroppedScopePaths_RenderedAsContested(t *testing.T) {
+	got, err := Build("acceptance", Trigger{
+		Repo:                        "kuhlman-labs/fishhawk",
+		ApprovedPlan:                acceptanceFixturePlan(),
+		AcceptanceDroppedScopePaths: []string{"backend/internal/server/healthz.go"},
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"Paths DROPPED from scope at the approval gate",
+		"backend/internal/server/healthz.go",
+		"`result`=`skipped`",
+		"never `result`=`failed`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_NoConditionsNoAmendments_ByteIdentical is the inert-when-
+// unused control: a run with neither conditions, dropped paths, nor amendments
+// renders NEITHER new block, and the prompt is byte-identical to the same build
+// before the fields existed (asserted by the absence of every new heading).
+func TestBuild_Acceptance_NoConditionsNoAmendments_ByteIdentical(t *testing.T) {
+	got, err := Build("acceptance", Trigger{
+		Repo:         "kuhlman-labs/fishhawk",
+		ApprovedPlan: acceptanceFixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, unwanted := range []string{
+		"Binding approval conditions",
+		"Paths DROPPED from scope",
+		"Retired at approval",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("acceptance prompt renders %q with the feature unused\n---\n%s", unwanted, got)
+		}
+	}
+	// The full plan criteria set still renders when no effective set is supplied.
+	for _, want := range []string{"ac-create", "ac-list"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing plan criterion %q", want)
+		}
+	}
+}
+
+// TestBuild_Acceptance_RetiredCriterion_NotInLiveChecklist pins the retired
+// block: a retired criterion is ABSENT from the live checklist and PRESENT in
+// the retired block with its reason and a skip instruction.
+func TestBuild_Acceptance_RetiredCriterion_NotInLiveChecklist(t *testing.T) {
+	p := acceptanceFixturePlan()
+	got, err := Build("acceptance", Trigger{
+		Repo:                        "kuhlman-labs/fishhawk",
+		ApprovedPlan:                p,
+		AcceptanceCriteriaEffective: p.Verification.AcceptanceCriteria[:1],
+		AcceptanceCriteriaRetired: []RetiredAcceptanceCriterion{
+			{ID: "ac-list", Reason: "the listing endpoint was dropped at the approval gate"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if strings.Contains(got, "GET /widgets lists created widgets") {
+		t.Errorf("retired criterion statement still renders in the live checklist\n---\n%s", got)
+	}
+	for _, want := range []string{
+		"POST /widgets returns 201 with the created widget",
+		"Retired at approval — do NOT validate these",
+		"[ac-list] retired: the listing endpoint was dropped at the approval gate",
+		"`result`=`skipped`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_RestatedCriterion_RendersReplacementStatement pins that a
+// restated criterion stays in the LIVE checklist under its replacement text —
+// restatement is not a silencing channel.
+func TestBuild_Acceptance_RestatedCriterion_RendersReplacementStatement(t *testing.T) {
+	p := acceptanceFixturePlan()
+	live := append([]plan.AcceptanceCriterion(nil), p.Verification.AcceptanceCriteria...)
+	live[1].Statement = "GET /widgets lists created widgets, newest first"
+	got, err := Build("acceptance", Trigger{
+		Repo:                        "kuhlman-labs/fishhawk",
+		ApprovedPlan:                p,
+		AcceptanceCriteriaEffective: live,
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if !strings.Contains(got, "GET /widgets lists created widgets, newest first") {
+		t.Errorf("restated statement missing from the live checklist\n---\n%s", got)
+	}
+	if strings.Contains(got, "Retired at approval") {
+		t.Errorf("a restate rendered a retirement block\n---\n%s", got)
+	}
+}
