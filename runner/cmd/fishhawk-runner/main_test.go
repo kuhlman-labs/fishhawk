@@ -10217,6 +10217,32 @@ func TestPushFailureCategory(t *testing.T) {
 	}
 }
 
+// TestPushFailureCategory_PullRequestInvalidStaysB is the issue's third
+// acceptance criterion as an explicit named counterfactual (#2566): the fix
+// must NOT make every failure retryable. On the ORDINARY push/ship path
+// upload.ErrPullRequestInvalid still classifies B, and the genuine constraint
+// sentinels still classify B — so a later change that widened the held-commit C
+// classification onto this path would redden this test. The table row in
+// TestPushFailureCategory keeps the same "B" as the second guard.
+func TestPushFailureCategory_PullRequestInvalidStaysB(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"ErrPullRequestInvalid", fmt.Errorf("ship: %w", upload.ErrPullRequestInvalid)},
+		{"ErrCommitOutOfScope", fmt.Errorf("x: %w", gitops.ErrCommitOutOfScope)},
+		{"ErrScopeFilesMissing", fmt.Errorf("x: %w", gitops.ErrScopeFilesMissing)},
+		{"ErrBindingAssertionUnsatisfied", fmt.Errorf("x: %w", gitops.ErrBindingAssertionUnsatisfied)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pushFailureCategory(tc.err); got != "B" {
+				t.Errorf("pushFailureCategory(%s) = %q, want B (the ordinary push path must stay non-retryable)", tc.name, got)
+			}
+		})
+	}
+}
+
 // flakeEchoLine is the signature line the scripted verify commands below emit
 // to simulate a testcontainers start-timeout failure. It carries the same
 // marker set as the verbatim #972 outputs.
@@ -19522,6 +19548,79 @@ func TestOpenHeldCommitPR_LegacyExemptFailureReportCarriesNoCheckpoint(t *testin
 	}
 }
 
+// TestOpenHeldCommitPR_ShipRejectedAsInvalid_ReportsCategoryC (#2566) is the
+// primary counterfactual for this change: on the held-commit resume path a
+// backend rejection of the runner-assembled artifact body
+// (upload.ErrPullRequestInvalid) reports category C — RETRYABLE — not the
+// category B the ordinary push path uses. The body carries no gate verdict and
+// the agent is structurally unreachable, so a 400 here is a runner/backend WIRE
+// defect and the run must stay retryable once it is fixed.
+//
+// prErrSeq rejects ONLY the success ship (call 0) with a wrapped sentinel and
+// lets the failure report (call 1) through — that sequenced seam is what makes
+// the reported category observable. Restoring the deleted `category = "B"`
+// mapping in openHeldCommitPR reddens the Category assertion (step 9).
+func TestOpenHeldCommitPR_ShipRejectedAsInvalid_ReportsCategoryC(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	fu.prErrSeq = []error{fmt.Errorf("ship: %w", upload.ErrPullRequestInvalid), nil}
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
+	}
+	rep := lastFailureReport(fu)
+	if rep == nil {
+		t.Fatal("no failure report shipped")
+	}
+	if rep.Category != "C" {
+		t.Errorf("a rejected held-commit ship must report category C (retryable), got %q", rep.Category)
+	}
+	// The report must still re-carry the checkpoint so the next retry resumes
+	// off the held commit rather than degrading to a full agent re-run.
+	if rep.Branch != branch || rep.HeadSHA != headSHA || rep.BaseSHA != "base-sha-2169" {
+		t.Errorf("the failure report must re-carry the checkpoint, got branch=%q head=%q base=%q",
+			rep.Branch, rep.HeadSHA, rep.BaseSHA)
+	}
+}
+
+// TestOpenHeldCommitPR_LegacyExemptShipRejectedReportsCategoryC is the sibling
+// legacy-exempt case (empty resume kind): the #1231 exempt path ships the SAME
+// runner-assembled body, so a backend rejection is category C there too. Its
+// failure report still carries NO checkpoint — that audit shape is unchanged.
+func TestOpenHeldCommitPR_LegacyExemptShipRejectedReportsCategoryC(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	fu.prErrSeq = []error{fmt.Errorf("ship: %w", upload.ErrPullRequestInvalid), nil}
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	// Empty resume kind = the legacy #1231 exempt resolution.
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", "", &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
+	}
+	rep := lastFailureReport(fu)
+	if rep == nil {
+		t.Fatal("no failure report shipped")
+	}
+	if rep.Category != "C" {
+		t.Errorf("a rejected legacy-exempt ship must report category C, got %q", rep.Category)
+	}
+	if rep.Branch != "" || rep.HeadSHA != "" || rep.BaseSHA != "" {
+		t.Errorf("the legacy exempt failure report must carry NO checkpoint, got branch=%q head=%q base=%q",
+			rep.Branch, rep.HeadSHA, rep.BaseSHA)
+	}
+}
+
 // checkpointBackend is an httptest backend that speaks the REAL /pull-request
 // and /prompt wire shapes and models the two backend rules this change adds:
 // failPullRequestStage's push_checkpoint recording and
@@ -19542,6 +19641,47 @@ type checkpointBackend struct {
 	prOpened   bool
 	priv       ed25519.PrivateKey
 	pub        ed25519.PublicKey
+
+	// lastFailedCategory records the category of the newest pull_request_failed
+	// report. It stands in for the FailureCategory the backend persists on the
+	// stage row; the /retry endpoint below reads it to model handleRetryStage's
+	// RetryableFailure admission gate — a C is admitted, a B is refused 422.
+	// (The production admission rule is pinned per-side by
+	// backend/internal/server's retry_test.go, NOT by this fake.)
+	lastFailedCategory string
+
+	// rejectFirstShip, when set, models a runner-side wire defect (the #2563
+	// base_sha-omission shape): the backend rejects the FIRST success-ship with
+	// 400 pull_request_invalid and accepts a later one — i.e. the defect is
+	// "fixed" between the failing attempt and the retry. Off by default so the
+	// sibling TestImplementPROpenOutage_* test, which shares this fake, is
+	// unaffected.
+	rejectFirstShip   bool
+	firstShipRejected bool
+}
+
+// retryAdmitted models handleRetryStage's RetryableFailure gate over the
+// recorded category: a category-C stage is admitted (fishhawk_retry_stage
+// returns 200 and the runner is re-dispatched), a category-B stage is refused
+// (422, no second dispatch). This is the retry-admissibility rule binding
+// condition 1 requires the fake to model — the category-B arm REFUSES THE RETRY
+// DISPATCH, exactly as production does, rather than admitting a dispatch and
+// then withholding resume fields (a rule production never exhibits).
+func (b *checkpointBackend) retryAdmitted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastFailedCategory == "C"
+}
+
+// resumeRun models fishhawk_resume_run: the recovery available when a retry is
+// refused (category B). It re-dispatches the implement stage as a FRESH agent
+// run, so the held-commit checkpoint no longer applies — clearing it makes the
+// next /prompt serve an ordinary implement prompt and the runner re-invoke the
+// agent.
+func (b *checkpointBackend) resumeRun() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.checkpoint = nil
 }
 
 func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
@@ -19603,6 +19743,7 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 		raw, _ := io.ReadAll(r.Body)
 		var body struct {
 			Outcome         string `json:"outcome"`
+			Category        string `json:"category"`
 			Branch          string `json:"branch"`
 			HeadSHA         string `json:"head_sha"`
 			BaseSHA         string `json:"base_sha"`
@@ -19619,9 +19760,24 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 				Branch: body.Branch, HeadSHA: body.HeadSHA,
 				BaseSHA: body.BaseSHA, TreeSHA: body.VerifiedTreeSHA,
 			}
+			b.lastFailedCategory = body.Category
 		case body.Outcome == "failed":
 			b.checkpoint = nil
+			b.lastFailedCategory = body.Category
 		case body.Outcome == "":
+			// Model the runner wire defect (#2563 shape): reject the FIRST
+			// success-ship, accept the retry. The runner maps this 400 to
+			// upload.ErrPullRequestInvalid.
+			if b.rejectFirstShip && !b.firstShipRejected {
+				b.firstShipRejected = true
+				b.mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": "pull_request_invalid", "detail": "base_sha is required",
+				})
+				return
+			}
 			b.prOpened = true
 		}
 		b.mu.Unlock()
@@ -19631,6 +19787,20 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 			"id": "00000000-0000-0000-0000-000000000bbb", "stage_id": r.URL.Query().Get("stage_id"),
 			"content_hash": "cafebabe", "pr_number": 42,
 		})
+	})
+	// POST /retry: the retry-admissibility gate (binding condition 1). It reads
+	// the recorded failed category and returns 200 (admit → the runner is
+	// re-dispatched) for a retryable C or 422 retry_not_applicable for a
+	// non-retryable B — a category-B stage is REFUSED here, and no second
+	// dispatch occurs, exactly as production's handleRetryStage does.
+	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", func(w http.ResponseWriter, _ *http.Request) {
+		if b.retryAdmitted() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "retry_not_applicable"})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -19736,6 +19906,143 @@ func TestImplementPROpenOutage_ResumesWithoutAgentReinvocation(t *testing.T) {
 	// The pusher ran exactly once — passes 2 and 3 never re-committed.
 	if fp.calls != 1 {
 		t.Errorf("CommitAndPush called %d time(s), want 1 (the resumes must not re-commit)", fp.calls)
+	}
+}
+
+// TestImplementPROpenResume_ShipRejected_RetriesWithoutAgentReinvocation is the
+// #2566 cross-boundary end-to-end: a held-commit resume whose ship is rejected
+// on a RUNNER wire defect must stay RETRYABLE (category C), so the operator
+// recovers with fishhawk_retry_stage — re-attempting the idempotent PR-open with
+// NO agent — instead of fishhawk_resume_run, the ~$20 re-run the resume exists
+// to avoid.
+//
+// The seam spans the runner module and the backend module, which may not import
+// each other, so it is exercised over real HTTP against checkpointBackend with
+// the real upload.Client: runner failure-report bytes → backend recording →
+// backend retry admission → backend prompt response → runner short-circuit. The
+// fake MODELS three backend rules (checkpoint recording, resume emission, and —
+// per binding condition 1 — retry admissibility, whose category-B arm REFUSES
+// the retry dispatch); each production rule is pinned SEPARATELY by
+// backend/internal/server (TestPullRequestFailed_*, TestResolvePushCheckpointResume_*,
+// and the new TestRetryStage_CategoryCPROpenResumeAdmitted pair).
+//
+// Three passes: (1) ordinary implement, PR-open outage → category C, checkpoint
+// armed, agent runs ONCE; (2) the pr_open resume, PR opens but the ship is
+// rejected 400 pull_request_invalid (the #2563 wire-defect shape) → the fix
+// classifies category C, the reverted classification category B; (3) the defect
+// is fixed and a second resume ships. invoker.callIdx == 1 across all three is
+// the done-means. Reverting step 2 (openHeldCommitPR's classification) makes
+// pass 2 report B, the retry is REFUSED, resume_run re-invokes the agent, and
+// callIdx becomes 2 — observed empirically in the PR Notes, not asserted here.
+func TestImplementPROpenResume_ShipRejected_RetriesWithoutAgentReinvocation(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	implementEnv(t, "test-owner/test-repo", "main")
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	backend, srv := newCheckpointBackend(t)
+	// The runner wire defect: the backend rejects the FIRST success-ship and
+	// accepts the retry (the defect is "fixed" between pass 2 and pass 3).
+	backend.rejectFirstShip = true
+	origClient := newUploadClient
+	newUploadClient = func(baseURL string) uploadClient { return upload.New(baseURL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+
+	// Pass 1's forge is DOWN so the ordinary implement fails category C at
+	// PR-open and arms a retryable checkpoint; passes 2 and 3 (the resumes) run
+	// with the forge UP.
+	fpr := &fakePROpener{err: errors.New("503 Service Unavailable from the forge")}
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{
+		HeadSHA: headSHA, BaseSHA: "base-sha-2169", TreeSHA: "tree-sha-2169",
+	}}
+	withFakeGitOps(t, fp, fpr)
+
+	args := []string{
+		"--run-id", verifiedTreeRunID,
+		"--backend-url", srv.URL,
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifiedTreeStageID,
+		"--working-dir", repo,
+		"--github-repo", "test-owner/test-repo",
+		"--base-branch", "main",
+		"--fetch-prompt", "--upload-trace",
+	}
+
+	// recoverStage models the operator's post-failure recovery, driven by the
+	// backend's retry admission over the wire: a 200 admits the retry (the
+	// runner is re-dispatched → pr_open resume, no agent), a 422 refuses it
+	// (category B → the only recovery is fishhawk_resume_run, which re-invokes
+	// the agent). This is the honest counterfactual vehicle binding condition 1
+	// requires — the category-B arm refuses the dispatch, it does not admit one
+	// and then withhold resume fields.
+	recoverStage := func(t *testing.T) {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/v0/stages/"+verifiedTreeStageID+"/retry", "application/json", http.NoBody)
+		if err != nil {
+			t.Fatalf("retry POST: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			backend.resumeRun()
+		}
+	}
+
+	// PASS 1 — ordinary implement: agent runs, commit+push land, PR-open fails
+	// (forge down) → category C, checkpoint armed.
+	var log1 strings.Builder
+	if code := run(args, &log1); code != exitFailure {
+		t.Fatalf("pass 1: run = %d, want exitFailure\n%s", code, log1.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("pass 1: agent invoked %d time(s), want 1", invoker.callIdx)
+	}
+	if !strings.Contains(log1.String(), `"event":"pr_open_checkpoint_armed"`) {
+		t.Fatalf("pass 1 must arm the checkpoint:\n%s", log1.String())
+	}
+	recoverStage(t) // category C → retry admitted, runner re-dispatched
+
+	// PASS 2 — the pr_open resume: the forge is up, the PR opens, but the
+	// artifact SHIP is rejected 400 pull_request_invalid (the wire defect). The
+	// fix classifies this category C (retryable).
+	fpr.err = nil
+	var log2 strings.Builder
+	if code := run(args, &log2); code != exitFailure {
+		t.Fatalf("pass 2: run = %d, want exitFailure\n%s", code, log2.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("pass 2 re-invoked the agent (%d calls): the resume did not fire\n%s", invoker.callIdx, log2.String())
+	}
+	if !strings.Contains(log2.String(), `"event":"pr_open_resume_tip_verified"`) {
+		t.Fatalf("pass 2 must take the pr_open resume path:\n%s", log2.String())
+	}
+	recoverStage(t) // fix: category C → admitted; revert: category B → resume_run
+
+	// PASS 3 — the defect is fixed (the backend now accepts the body). Under the
+	// fix this is a SECOND pr_open resume with NO agent; under the reverted
+	// classification it is a full agent re-run (callIdx → 2), which is what makes
+	// callIdx the counterfactual discriminator.
+	var log3 strings.Builder
+	if code := run(args, &log3); code != exitOK {
+		t.Fatalf("pass 3: run = %d, want exitOK\n%s", code, log3.String())
+	}
+
+	// THE done-means assertion: exactly one agent invocation across the whole
+	// outage-plus-wire-defect recovery.
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invoked %d time(s) across three passes, want EXACTLY 1 (revert makes this 2)", invoker.callIdx)
+	}
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush called %d time(s), want 1 (the resumes must not re-commit)", fp.calls)
+	}
+	if fpr.gotArgs == nil || fpr.gotArgs.Head != branch {
+		t.Errorf("pass 3 must open the PR from the checkpointed branch, got %+v", fpr.gotArgs)
+	}
+	if !strings.Contains(log3.String(), `"event":"pr_open_resume_pr_opened"`) {
+		t.Errorf("pass 3 must open via the resume path:\n%s", log3.String())
+	}
+	if !strings.Contains(log3.String(), `"event":"pull_request_uploaded"`) {
+		t.Errorf("pass 3 must ship the pull_request artifact:\n%s", log3.String())
 	}
 }
 

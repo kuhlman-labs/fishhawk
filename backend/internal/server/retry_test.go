@@ -172,6 +172,56 @@ func TestRetryStage_CHappyPathWithoutOrchestrator(t *testing.T) {
 	}
 }
 
+// prOpenResumeReason is the runner's failure reason on a held-commit pr_open
+// resume whose ship was rejected on a wire defect (openHeldCommitPR). #2566
+// reclassifies this on the runner side from category B to C; these two tests
+// are the backend half — the admission gate is category-driven, so a C is
+// admitted and a B is refused REGARDLESS of this reason.
+const prOpenResumeReason = "pr_open_resume: ship pull-request from held commit: upload: pull-request rejected as invalid"
+
+// TestRetryStage_CategoryCPROpenResumeAdmitted (#2566) is the backend half of
+// the held-commit-resume classification: a stage failed at category C with the
+// runner's pr_open-resume reason is ADMITTED by fishhawk_retry_stage — 200,
+// category cleared — so the resume that failed on a runner wire defect stays
+// recoverable WITHOUT a full agent re-run. This closes, for this path, the
+// cross-layer gap the runner README recorded as asserted only from code reading.
+func TestRetryStage_CategoryCPROpenResumeAdmitted(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureC, prOpenResumeReason)
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.FailureCategory != nil {
+		t.Errorf("body.FailureCategory = %v, want nil after retry", body.FailureCategory)
+	}
+}
+
+// TestRetryStage_CategoryBPROpenResumeRefused is the paired counterfactual: the
+// SAME pr_open-resume reason at category B still returns 422
+// retry_not_applicable, proving admission is CATEGORY-driven and not
+// reason-driven — which is why the runner-side C-vs-B classification is the
+// load-bearing fix, not the reason string.
+func TestRetryStage_CategoryBPROpenResumeRefused(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := seedFailedStage(repo, run.FailureB, prOpenResumeReason)
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body missing retry_not_applicable code: %s", w.Body.String())
+	}
+}
+
 // E8.6: with an Orchestrator wired, an A/C retry transitions
 // failed → pending → dispatched (the orchestrator advances the
 // pending stage). The fake orchestrator has no GitHub client, so

@@ -6174,6 +6174,38 @@ func mintBaseAuthToken(ctx context.Context, cfg config, client uploadClient, iss
 	return token
 }
 
+// heldCommitShipCategory classifies a ship failure on the held-commit resume
+// path (openHeldCommitPR). EVERY failure here — including a backend rejection of
+// the artifact body (upload.ErrPullRequestInvalid) — is category C, i.e.
+// RETRYABLE. Three facts make that correct, and they are the reasoning this
+// change exists to record at the site (#2566):
+//
+//   - The artifact body this path ships is RUNNER-ASSEMBLED from
+//     backend-advertised held-commit coordinates (head_sha/base_sha/branch) plus
+//     the PR title/body — no committed-tree gate verdict, no operator constraint,
+//     is involved. So a 400 pull_request_invalid here (the #2563 base_sha
+//     omission being the observed instance) is a runner/backend WIRE defect, not
+//     an operator constraint violation. Once that defect is fixed, the run is
+//     recoverable, and category B would leave it permanently unretryable.
+//   - A retry on this path is cheap and safe BY CONSTRUCTION: the held-commit
+//     short-circuit sits BEFORE the prompt read and the agent wiring, so the
+//     agent invoker is structurally unreachable; the pr_open resume re-proves the
+//     remote tip before touching the forge; and OpenPR is idempotent
+//     adopt-then-create (#2167). An unbounded retry costs only idempotent
+//     PR-open attempts, never a ~$20 agent pass.
+//   - This DIVERGES from pushFailureCategory DELIBERATELY. That classifier keeps
+//     ErrPullRequestInvalid at category B for two reasons that do not hold here:
+//     the ordinary push path's artifact body carries AGENT-authored PR text, and
+//     its retry costs a full agent pass. The divergence is a decision, not drift;
+//     TestPushFailureCategory_PullRequestInvalidStaysB guards it.
+//
+// Kept as a named function rather than an inline branch so the reasoning travels
+// with the code and a future reader cannot re-derive the old B mapping from the
+// (now corrected) upload.ErrPullRequestInvalid doc comment.
+func heldCommitShipCategory(_ error) string {
+	return "C"
+}
+
 // openHeldCommitPR resolves an operator EXEMPT decision on a scope-completeness
 // park (#1231) with ZERO agent re-invocation. The implement stage previously
 // parked because the missing-declared-scope-file gate was its sole failure, and
@@ -6346,11 +6378,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		PrivateKey: issued.PrivateKey,
 	})
 	if err != nil {
-		category := "C"
-		if errors.Is(err, upload.ErrPullRequestInvalid) {
-			category = "B"
-		}
-		return fail(category, fmt.Sprintf("ship pull-request from held commit: %v", err))
+		return fail(heldCommitShipCategory(err), fmt.Sprintf("ship pull-request from held commit: %v", err))
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"pull_request_uploaded","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
