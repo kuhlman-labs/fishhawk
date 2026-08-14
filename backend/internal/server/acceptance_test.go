@@ -2981,6 +2981,133 @@ func TestDowngrade_PlanUnreadable_NoDowngrade(t *testing.T) {
 	}
 }
 
+// TestShipAcceptance_IdempotentReplay_EchoesRecordedEffectiveVerdict pins the
+// replay-fidelity control: the downgrade decision is recomputed from the CURRENT
+// approval chain, so a retirement recorded AFTER the original ship (a later
+// plan-gate approve on a re-planned run) would make a replay of the SAME verdict
+// bytes answer effective_verdict=passed while the recorded
+// acceptance_outcome_recorded entry the merge gate reads still says failed. The
+// replay response must echo the CHAIN, not the recomputation.
+//
+// The post-ship retirement is seeded BY CONSTRUCTION (a synthetic
+// approval_submitted row), so the RED lands on the response assertion.
+func TestShipAcceptance_IdempotentReplay_EchoesRecordedEffectiveVerdict(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	// Ship #1 lands with NOTHING retired: the chain records the failure as-is.
+	seedRetirementFixture(t, ar, au, rr, runID, nil)
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "no budget line"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "failed" {
+		t.Fatalf("recorded verdict = %v, want failed on the original ship", got)
+	}
+
+	// A LATER plan-gate approve retires crit-2 — recorded AFTER the ship above.
+	planStageID := rr.stagesByRunID[runID][0].ID
+	seedHeadEntry(au, runID, &planStageID, "approval_submitted", 9, map[string]any{
+		"stage_id":                  planStageID.String(),
+		"decision":                  "approve",
+		"amend_acceptance_criteria": retireCrit2(),
+	})
+
+	// The replay of the SAME bytes.
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Idempotent {
+		t.Fatalf("replay was not idempotent: %+v", resp)
+	}
+	if resp.EffectiveVerdict != "" {
+		t.Errorf("replay effective_verdict = %q, want empty — the chain records the un-downgraded verdict", resp.EffectiveVerdict)
+	}
+	// And the governance chain itself is untouched by the replay.
+	if n := countByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Errorf("acceptance_outcome_recorded entries = %d, want 1 (the replay must not append)", n)
+	}
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (the replay must not rewrite the chain)", got)
+	}
+}
+
+// TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades documents D4's
+// REPORTED-skip-only semantics: the precondition keys on a criterion the verdict
+// reports `skipped`, so a blocking LIVE criterion the verdict OMITS entirely does
+// not block the downgrade. This is the approved D4 wording ("no non-retired
+// criterion reported skipped") and matches the trust model that already lets a
+// validator omit criteria from a passed verdict; it is pinned here so the
+// behavior is a recorded decision rather than an unexercised path.
+func TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+	// crit-1 is blocking and LIVE, and is not reported at all. crit-3 is the
+	// surviving reported result that satisfies D3.
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["verdict"]; got != "passed" {
+		t.Errorf("recorded verdict = %v, want passed (D4 keys on REPORTED skips, not on omissions)", got)
+	}
+}
+
+// TestDowngrade_NoApprovedPlan_NoDowngrade pins the third ingest degrade: a run
+// with NO approved plan (loadApprovedPlanForRun returns nil with no error) has
+// nothing to anchor a retirement to, so a failed verdict is recorded as-is even
+// with a retirement sitting on the approval chain.
+func TestDowngrade_NoApprovedPlan_NoDowngrade(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newAcceptanceServer(t, runID, stageID)
+	// A plan STAGE with no plan artifact, and a parentless run: the plan lookup
+	// walks to the parent, finds none, and returns (nil, nil).
+	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan}
+	rr.getStages[planStage.ID] = planStage
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	rr.getRuns[runID] = &run.Run{ID: runID}
+	seedHeadEntry(au, runID, &planStage.ID, "approval_submitted", 3, map[string]any{
+		"stage_id":                  planStage.ID.String(),
+		"decision":                  "approve",
+		"amend_acceptance_criteria": retireCrit2(),
+	})
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	)
+
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "effective_verdict") {
+		t.Errorf("response carries effective_verdict with no approved plan: %s", w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (no plan to anchor a retirement to)", payload["verdict"])
+	}
+	for _, key := range []string{"verdict_reported", "downgrade_basis", "retired_criterion_ids"} {
+		if _, present := payload[key]; present {
+			t.Errorf("payload carries %s with no approved plan: %v", key, payload)
+		}
+	}
+}
+
 // TestAcceptanceCriteriaIDs_SupersetIncludesRetired pins the SUPERSET invariant
 // as its own criterion-level assertion (operator binding condition 5): the ids
 // served to the runner still carry a RETIRED criterion, so a verdict reporting

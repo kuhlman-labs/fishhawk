@@ -262,6 +262,107 @@ func TestResolveEffectiveCriteria_IgnoredEntries(t *testing.T) {
 	}
 }
 
+// TestResolveEffectiveCriteria_NoAuditRepo_PlanSetVerbatim: with no AuditRepo
+// configured there is no chain to read, so the seam returns the plan's criteria
+// verbatim with nothing retired — the same direction as every other degrade
+// (toward MORE validation, never toward silence).
+func TestResolveEffectiveCriteria_NoAuditRepo_PlanSetVerbatim(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), uuid.New(), p, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(eff.Live) != 3 || len(eff.Retired) != 0 {
+		t.Errorf("Live/Retired = %d/%d, want 3/0 with no AuditRepo", len(eff.Live), len(eff.Retired))
+	}
+}
+
+// TestResolveEffectiveCriteria_UndecodablePayload_Skipped: an approval_submitted
+// row whose payload does not decode is SKIPPED rather than failing the read, and
+// a decodable retirement on the same chain still applies. Skipping toward more
+// validation is the documented direction; the row is seeded BY CONSTRUCTION.
+func TestResolveEffectiveCriteria_UndecodablePayload_Skipped(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	key := runRow.ID.String() + ":approval_submitted"
+	rid, sid := runRow.ID, stage.ID
+	au.byRunCategory[key] = append(au.byRunCategory[key], &audit.Entry{
+		ID: uuid.New(), Sequence: 2, RunID: &rid, StageID: &sid,
+		Category: "approval_submitted", Payload: []byte(`{"decision":`),
+	})
+	au.seedApprovalEntry(runRow.ID, stage.ID, 3, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: "retire", Reason: "superseded at the gate"},
+	})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(eff.Retired) != 1 || eff.Retired[0].ID != "crit-2" {
+		t.Errorf("Retired = %+v, want only crit-2 (the undecodable row is skipped)", eff.Retired)
+	}
+	if len(eff.Live) != 2 {
+		t.Errorf("Live = %d, want 2", len(eff.Live))
+	}
+}
+
+// TestRecordedAcceptanceEffectiveVerdict covers the replay-echo reader the
+// idempotent ship branch consults: a recorded DOWNGRADE reports its effective
+// verdict, a recorded plain outcome reports none, and every unreadable case
+// (unknown artifact, audit read error, no AuditRepo) reports "not found" so the
+// caller falls back to its freshly computed value instead of silently claiming
+// the verdict was not downgraded.
+func TestRecordedAcceptanceEffectiveVerdict(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	key := runRow.ID.String() + ":" + CategoryAcceptanceOutcomeRecorded
+	rid, sid := runRow.ID, stage.ID
+	seedOutcome := func(payload map[string]any) {
+		raw, _ := json.Marshal(payload)
+		au.byRunCategory[key] = append(au.byRunCategory[key], &audit.Entry{
+			ID: uuid.New(), RunID: &rid, StageID: &sid,
+			Category: CategoryAcceptanceOutcomeRecorded, Payload: raw,
+		})
+	}
+	seedOutcome(map[string]any{"artifact_id": "art-plain", "verdict": "failed"})
+	seedOutcome(map[string]any{
+		"artifact_id": "art-downgraded", "verdict": "passed", "verdict_reported": "failed",
+	})
+	au.byRunCategory[key] = append(au.byRunCategory[key], &audit.Entry{
+		ID: uuid.New(), RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded,
+		Payload: []byte(`{"artifact_id":`),
+	})
+
+	for _, tc := range []struct {
+		name       string
+		artifactID string
+		wantVerd   string
+		wantFound  bool
+	}{
+		{"downgrade recorded", "art-downgraded", acceptanceVerdictPassed, true},
+		{"no downgrade recorded", "art-plain", "", true},
+		{"no entry for this artifact", "art-missing", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, found := s.recordedAcceptanceEffectiveVerdict(context.Background(), runRow.ID, tc.artifactID)
+			if got != tc.wantVerd || found != tc.wantFound {
+				t.Errorf("= (%q, %v), want (%q, %v)", got, found, tc.wantVerd, tc.wantFound)
+			}
+		})
+	}
+
+	au.listErr = errors.New("audit store outage")
+	if got, found := s.recordedAcceptanceEffectiveVerdict(context.Background(), runRow.ID, "art-downgraded"); got != "" || found {
+		t.Errorf("on a read error = (%q, %v), want (\"\", false)", got, found)
+	}
+
+	noAudit := New(Config{Addr: "127.0.0.1:0"})
+	if got, found := noAudit.recordedAcceptanceEffectiveVerdict(context.Background(), runRow.ID, "art-downgraded"); got != "" || found {
+		t.Errorf("with no AuditRepo = (%q, %v), want (\"\", false)", got, found)
+	}
+}
+
 // TestResolveEffectiveCriteria_AuditError_NoPartialSet: an audit read failure
 // returns an error and NO partial set, so each caller picks its own fail
 // direction explicitly.

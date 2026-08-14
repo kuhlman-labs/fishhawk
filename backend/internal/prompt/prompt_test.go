@@ -8163,31 +8163,83 @@ func TestBuild_Acceptance_DroppedScopePaths_RenderedAsContested(t *testing.T) {
 	}
 }
 
+// wantPreChangeAcceptanceCriteriaSpan is the acceptance prompt's issue-context →
+// acceptance-criteria span for a Trigger carrying only Repo + acceptanceFixture
+// Plan(), frozen from the PRE-#2581 renderer. Every block the amendment channel
+// can introduce (the contested-context block before the criteria, the retired
+// block after them) lands inside this span, so an unused-feature render that is
+// byte-equal to it cannot have grown a line anywhere the change touches.
+//
+// PROVENANCE: captured by running Build("acceptance", that exact Trigger)
+// against the prompt package as it stood at commit b7d906a6 — the commit BEFORE
+// the #2581 fields existed — checked out into a scratch tree outside the repo.
+// That is what makes the byte claim checkable: the assertion compares today's
+// output against the PRE-CHANGE bytes, not against a second render by the same
+// code (equal by construction whatever the renderer does), and not against a
+// heading-absence check (which would miss any other line the change introduced).
+// When the criteria-section wording is deliberately changed, regenerate this
+// constant and say so.
+const wantPreChangeAcceptanceCriteriaSpan = "### Originating issue\n" +
+	"\n" +
+	"(no issue context provided)\n" +
+	"\n" +
+	"### Acceptance criteria\n" +
+	"\n" +
+	"- [ac-create] POST /widgets returns 201 with the created widget\n" +
+	"  source: explicit, source_ref: #1534, blocking: true\n" +
+	"  verify_hint: curl the running instance\n" +
+	"  precondition: an authenticated session exists\n" +
+	"- [ac-list] GET /widgets lists created widgets\n" +
+	"  source: inferred, blocking: true\n" +
+	"  rationale: listing is implied by creation\n" +
+	"\n" +
+	"Explicitly NOT covered (out of scope — do not fail the change for these):\n" +
+	"- widget deletion is not covered\n" +
+	"\n"
+
 // TestBuild_Acceptance_NoConditionsNoAmendments_ByteIdentical is the inert-when-
 // unused control: a run with neither conditions, dropped paths, nor amendments
-// renders NEITHER new block, and the prompt is byte-identical to the same build
-// before the fields existed (asserted by the absence of every new heading).
+// renders a span BYTE-IDENTICAL to the pre-change render above — the contractual
+// claim, asserted as bytes rather than as the absence of the new headings.
 func TestBuild_Acceptance_NoConditionsNoAmendments_ByteIdentical(t *testing.T) {
-	got, err := Build("acceptance", Trigger{
+	base := Trigger{
 		Repo:         "kuhlman-labs/fishhawk",
 		ApprovedPlan: acceptanceFixturePlan(),
-	})
-	if err != nil {
-		t.Fatalf("Build(acceptance): %v", err)
 	}
-	for _, unwanted := range []string{
+	spanOf := func(t *testing.T, tr Trigger) string {
+		t.Helper()
+		got, err := Build("acceptance", tr)
+		if err != nil {
+			t.Fatalf("Build(acceptance): %v", err)
+		}
+		start := strings.Index(got, "### Originating issue")
+		end := strings.Index(got, "### Target instance")
+		if start < 0 || end < start {
+			t.Fatalf("criteria span anchors not found (start=%d end=%d):\n%s", start, end, got)
+		}
+		return got[start:end]
+	}
+
+	if span := spanOf(t, base); span != wantPreChangeAcceptanceCriteriaSpan {
+		t.Errorf("the unused-feature acceptance prompt is not byte-identical to the PRE-CHANGE render.\n--- got ---\n%q\n--- want ---\n%q", span, wantPreChangeAcceptanceCriteriaSpan)
+	}
+	// Explicitly nil/empty channels are the same case, stated for the reader.
+	withEmpty := base
+	withEmpty.AcceptanceCriteriaEffective = nil
+	withEmpty.AcceptanceCriteriaRetired = nil
+	withEmpty.AcceptanceDroppedScopePaths = []string{}
+	if span := spanOf(t, withEmpty); span != wantPreChangeAcceptanceCriteriaSpan {
+		t.Errorf("explicitly-empty amendment channels changed the criteria span:\n%q", span)
+	}
+	// And the frozen golden must not contain any new block — a golden
+	// regenerated from post-change code would otherwise pass silently.
+	for _, marker := range []string{
 		"Binding approval conditions",
 		"Paths DROPPED from scope",
 		"Retired at approval",
 	} {
-		if strings.Contains(got, unwanted) {
-			t.Errorf("acceptance prompt renders %q with the feature unused\n---\n%s", unwanted, got)
-		}
-	}
-	// The full plan criteria set still renders when no effective set is supplied.
-	for _, want := range []string{"ac-create", "ac-list"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("acceptance prompt missing plan criterion %q", want)
+		if strings.Contains(wantPreChangeAcceptanceCriteriaSpan, marker) {
+			t.Errorf("the frozen pre-change golden contains %q; it was regenerated from post-change code", marker)
 		}
 	}
 }

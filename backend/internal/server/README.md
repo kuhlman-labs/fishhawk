@@ -2413,8 +2413,13 @@ hold:
 - **D3** the surviving partition is non-empty (at least one reported result whose
   id is NOT retired) — a verdict reporting only retired criteria evidences
   nothing about the live contract.
-- **D4** no surviving BLOCKING skip: no non-retired criterion reported `skipped`
-  whose plan `blocking` value (nil → true) is true.
+- **D4** no surviving BLOCKING skip: no non-retired criterion REPORTED `skipped`
+  whose plan `blocking` value (nil → true) is true. D4 keys on what the verdict
+  REPORTS, not on the live set: a blocking live criterion the verdict OMITS
+  entirely does not block the downgrade (the same trust model that already lets a
+  validator omit criteria from a `passed` verdict). Pinned in both directions by
+  `TestDowngrade_SurvivingBlockingSkip_NotDowngraded` and
+  `TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades`.
 
 On a downgrade the `acceptance_outcome_recorded` payload records
 `verdict=passed` plus `verdict_reported`, `downgrade_basis`, and
@@ -2435,8 +2440,25 @@ the audit payload, so `acceptanceGateState` returns the merge-eligible
 - **Byte-identical when unused.** With no amendment recorded, the
   `approval_submitted` payload, the `acceptance_outcome_recorded` payload, the
   acceptance prompt, and the ship response are byte-for-byte what they were
-  before this change (every new key is `omitempty`/conditional).
+  before this change (every new key is `omitempty`/conditional). Asserted against
+  FROZEN PRE-CHANGE goldens, not against heading/key absence: the
+  `approval_submitted` payload against `wantPreChangeAmendlessApprovalPayload`
+  (`approvals_test.go`) and the acceptance prompt's criteria span against
+  `wantPreChangeAcceptanceCriteriaSpan` (`prompt_test.go`, captured by rendering
+  the package at the pre-#2581 commit) — so a same-keys-different-bytes
+  regression fails.
+- **A replay echoes the CHAIN, not a recomputation.** `handleShipAcceptance`
+  computes the downgrade from the CURRENT approval chain, so a retirement
+  recorded AFTER the original ship would make a replay of the same verdict bytes
+  answer differently from the governance entry the merge gate reads. The
+  idempotent branch therefore reads the recorded outcome entry
+  (`recordedAcceptanceEffectiveVerdict`) and echoes ITS effective verdict, falling
+  back to the fresh computation only when no entry is readable (in which case the
+  #1396 heal just appended exactly that value). Pinned by
+  `TestShipAcceptance_IdempotentReplay_EchoesRecordedEffectiveVerdict`.
 - **Every degrade fails toward MORE validation.** An unreadable chain at prompt
-  build renders the FULL plan criteria set; an unreadable chain or plan at ingest
-  performs NO downgrade; an unreadable chain at the approve gate REFUSES the
-  amendment. None of them can silence a criterion.
+  build renders the FULL plan criteria set; an unreadable chain, an unreadable
+  plan, or NO approved plan at all at ingest performs NO downgrade; an unreadable
+  chain at the approve gate REFUSES the amendment; an absent `AuditRepo` or an
+  undecodable `approval_submitted` payload leaves the criterion LIVE. None of them
+  can silence a criterion.

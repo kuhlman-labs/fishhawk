@@ -741,13 +741,25 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
 			return
 		}
+		// #2581 replay fidelity: the effective verdict above was recomputed from
+		// the CURRENT approval chain, which may carry a retirement recorded AFTER
+		// the original ship (a later plan-gate approve on a re-planned run). The
+		// replay response must not diverge from the acceptance_outcome_recorded
+		// entry the merge gate reads, so it ECHOES the chain: the recorded entry
+		// for this artifact wins whenever it can be read, and the freshly computed
+		// value stands only when there is no readable entry (in which case the
+		// heal above just appended exactly that value).
+		replayEffectiveVerdict := effectiveVerdict
+		if recorded, ok := s.recordedAcceptanceEffectiveVerdict(r.Context(), runID, existing.ID.String()); ok {
+			replayEffectiveVerdict = recorded
+		}
 		s.writeJSON(w, r, http.StatusOK, acceptanceResponse{
 			ID:               existing.ID,
 			StageID:          existing.StageID,
 			ContentHash:      existing.ContentHash,
 			Verdict:          acc.Verdict,
 			FailureMode:      acc.FailureMode,
-			EffectiveVerdict: effectiveVerdict,
+			EffectiveVerdict: replayEffectiveVerdict,
 			Idempotent:       true,
 		})
 		return

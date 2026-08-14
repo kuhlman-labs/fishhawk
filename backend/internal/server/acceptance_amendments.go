@@ -421,9 +421,13 @@ const acceptanceDowngradeBasisRetiredOnly = "retired_criteria_only"
 //	D3 the surviving partition is non-empty: at least one reported criterion
 //	   result whose id is NOT retired. A verdict that reports only retired
 //	   criteria evidences nothing about the live contract.
-//	D4 no surviving blocking skip: no non-retired criterion reported `skipped`
+//	D4 no surviving blocking skip: no non-retired criterion REPORTED `skipped`
 //	   whose plan `blocking` value (nil defaults to true) is true. A blocking
-//	   criterion that was never exercised must not ride out on a downgrade.
+//	   criterion the validator reported as un-exercised must not ride out on a
+//	   downgrade. D4 keys on what the verdict REPORTS: a blocking live criterion
+//	   the verdict OMITS entirely does not block the downgrade — the same trust
+//	   model that already lets a validator omit criteria from a passed verdict
+//	   (pinned by TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades).
 //
 // Returns the retired ids that were reported failed (plan order, via the
 // effective set's ordering) and the downgrade basis.
@@ -482,6 +486,44 @@ func acceptanceDowngrade(acc acceptanceBody, eff effectiveAcceptanceCriteria) (b
 		}
 	}
 	return true, ids, acceptanceDowngradeBasisRetiredOnly
+}
+
+// recordedAcceptanceEffectiveVerdict reads the acceptance_outcome_recorded entry
+// paired with artifactID and reports the EFFECTIVE verdict the chain already
+// records for it: the recorded `verdict` when that entry carries a downgrade
+// (`verdict_reported` present), and "" when it does not. The second return
+// distinguishes "read a recorded entry" from "no readable entry", so the caller
+// can fall back to its freshly computed value rather than silently reporting an
+// un-downgraded verdict.
+//
+// It exists for the idempotent replay branch of handleShipAcceptance only: the
+// downgrade decision is recomputed from the CURRENT approval chain, so a
+// retirement recorded after the original ship would otherwise make a replay
+// answer differently from the governance entry the merge gate reads.
+func (s *Server) recordedAcceptanceEffectiveVerdict(ctx context.Context, runID uuid.UUID, artifactID string) (string, bool) {
+	if s.cfg.AuditRepo == nil {
+		return "", false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		var p struct {
+			ArtifactID      string `json:"artifact_id"`
+			Verdict         string `json:"verdict"`
+			VerdictReported string `json:"verdict_reported"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil || p.ArtifactID != artifactID {
+			continue
+		}
+		if p.VerdictReported == "" {
+			// The recorded entry carries no downgrade.
+			return "", true
+		}
+		return p.Verdict, true
+	}
+	return "", false
 }
 
 // resolveAcceptancePromptCriteria resolves the effective criteria set for an

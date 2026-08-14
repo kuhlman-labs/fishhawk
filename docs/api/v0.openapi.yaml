@@ -3031,6 +3031,11 @@ components:
             `verdict` alongside `verdict_reported`, `downgrade_basis` and
             `retired_criterion_ids`. Omitted otherwise — additive either way, since
             the runner decodes this body without `DisallowUnknownFields`.
+            On an IDEMPOTENT replay (`idempotent: true`) this field ECHOES the
+            already-recorded `acceptance_outcome_recorded` entry rather than a
+            fresh recomputation, so a retirement recorded after the original ship
+            cannot make the replay response disagree with the governance chain the
+            merge gate reads.
         idempotent: { type: boolean }
 
     PlanUploadResponse:
