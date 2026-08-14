@@ -3,6 +3,7 @@ package campaign
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 )
@@ -11,6 +12,22 @@ import (
 // adapter translates pgx.ErrNoRows into this; callers can errors.Is against
 // it without depending on the database driver. Mirrors run.ErrNotFound.
 var ErrNotFound = errors.New("not found")
+
+// ErrCampaignNotFound and ErrCampaignItemNotFound REFINE ErrNotFound for the
+// multi-row methods (today: ReopenCampaignForItemRestart), which can miss on
+// EITHER the campaign row or the item row. Both WRAP ErrNotFound, so every
+// existing `errors.Is(err, ErrNotFound)` caller is unaffected; a caller that
+// needs to report WHICH row was missing — so a campaign-shaped miss is never
+// reported under an item-shaped error code — errors.Is against the specific
+// sentinel first and falls back to the umbrella.
+//
+// An item that exists but belongs to a DIFFERENT campaign is reported as
+// ErrCampaignItemNotFound: from the named campaign's perspective that item
+// does not exist, which is exactly what the item-shaped code says.
+var (
+	ErrCampaignNotFound     = fmt.Errorf("campaign: %w", ErrNotFound)
+	ErrCampaignItemNotFound = fmt.Errorf("campaign item: %w", ErrNotFound)
+)
 
 // CreateCampaignParams are the inputs needed to insert a new campaign.
 //
@@ -168,18 +185,61 @@ type Repository interface {
 	// pending with run_id NULL, ready to fall through the mint/link/transition
 	// path for a fresh run.
 	//
-	// NOTE ON THE cancelled-vs-failed ASYMMETRY: this repository reset admits
-	// BOTH cancelled and failed as the forward-compatible seam for the
-	// failed-item recovery family. The OPERATOR VERB
-	// (handleStartCampaignItemRun), however, currently admits ONLY cancelled
-	// items: a failed item drives DeriveState to campaign `failed` (engine.go),
-	// which the handler's campaign-state gate refuses (campaign_not_startable)
-	// BEFORE item admission — so a failed item never reaches this reset through
-	// the verb today. The broader repo contract is intentional; the layering
-	// asymmetry is documented here at the definition site (operator arbitration,
-	// #1729). See also SettleCampaignItemOutOfBand — the sibling guard-bypassing
-	// terminal transition that settles (rather than restarts) a delivered item.
+	// NOTE ON THE cancelled-vs-failed ASYMMETRY (RESOLVED by #2681): this
+	// repository reset admits BOTH cancelled and failed, and the OPERATOR VERB
+	// (handleStartCampaignItemRun) now reaches BOTH from-states. A failed item
+	// whose siblings are all terminal drives DeriveState to campaign `failed`
+	// (engine.go), which this method cannot recover on its own — it resets the
+	// item but leaves the campaign terminal. That campaign-plus-item reset is
+	// ReopenCampaignForItemRestart's job (below); RestartCampaignItem stays the
+	// path for a still-pending/running campaign, where only the item needs
+	// resetting. See also SettleCampaignItemOutOfBand — the sibling
+	// guard-bypassing terminal transition that settles (rather than restarts) a
+	// delivered item.
 	RestartCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error)
+
+	// ReopenCampaignForItemRestart reopens a TERMINAL-FAILED campaign and resets
+	// one of its restartable-terminal items in ONE transaction: the campaign
+	// moves failed -> running AND the item moves {cancelled|failed} -> pending
+	// with its run link cleared. It is the recovery primitive behind
+	// fishhawk_start_campaign_item_run for the #2681 wedge — a campaign whose
+	// LAST unsettled item failed goes terminal (DeriveState: anyFailed &&
+	// allTerminal), and a terminal campaign refuses every recovery verb, so the
+	// item was unrecoverable inside the campaign.
+	//
+	// SINGLE TRANSACTION, BOTH ROWS LOCKED. The two mutations are applied inside
+	// one transaction holding SELECT … FOR UPDATE row locks on the campaign and
+	// then the item (that fixed order — campaign row, then item row — is the
+	// package-wide lock order; no other method locks an item before a campaign
+	// inside one transaction, so this introduces no lock cycle). That is not
+	// cosmetic: reconcileCampaignItemsOnRead runs on EVERY status read
+	// (server/campaigns.go), and a running campaign whose every item is still
+	// terminal derives straight back to failed. Splitting the pair into two
+	// writes would expose exactly that window; one transaction means no
+	// concurrent read can ever observe it.
+	//
+	// It lives OUTSIDE campaignTransitions/campaignItemTransitions
+	// (transition.go refuses EVERY transition out of a terminal `from`, for the
+	// campaign AND the item) because a reopen-for-restart is an operator
+	// recovery, not a lifecycle transition — so, like RestartCampaignItem, it
+	// enforces its OWN guards:
+	//
+	//   - campaign missing                 -> ErrCampaignNotFound
+	//   - campaign state != failed         -> InvalidTransitionError{Kind:"campaign"}
+	//     (a paused, cancelled, succeeded, running or pending campaign is NEVER
+	//     reopened: cancellation and success are verdicts this verb must not
+	//     undo, and a non-terminal campaign needs no reopen — RestartCampaignItem
+	//     is its path)
+	//   - item missing                     -> ErrCampaignItemNotFound
+	//   - item owned by another campaign   -> ErrCampaignItemNotFound
+	//   - item state not in {cancelled, failed}
+	//     -> InvalidTransitionError{Kind:"campaign_item"}
+	//
+	// On ANY guard failure NOTHING is written — the whole point of the single
+	// transaction. A caller may re-read both rows and find them byte-unchanged,
+	// including in the case where the campaign guard PASSED and the item guard
+	// then rejected (the campaign is still failed).
+	ReopenCampaignForItemRestart(ctx context.Context, campaignID, itemID uuid.UUID) (*Campaign, *Item, error)
 
 	// SettleCampaignItemOutOfBand settles a TERMINAL item (cancelled or failed)
 	// to succeeded WITHOUT clearing the run link, atomically under the same

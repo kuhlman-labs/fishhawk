@@ -1364,3 +1364,108 @@ func TestStartCampaignItemRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
 		t.Errorf("the linked item was lost to the bound: %+v", out.Item)
 	}
 }
+
+// TestGetCampaignStatus_Closed_E2E_ThroughRealServer is the cross-boundary
+// done-means for the #2681 `closed` next_action: it drives a REAL
+// Postgres-backed campaign through the REAL server.Handler() over httptest, the
+// REAL MCP apiClient JSON decode, and campaignNextActionsFor rendering in ONE
+// test — so a json-tag rename or an enum-name drift between the server's
+// campaignNextActionPayload and this package's CampaignNextAction turns it RED
+// rather than passing per-layer.
+//
+// It asserts BOTH terminal arms across the boundary:
+//   - a CANCELLED campaign with an unfinished item decodes as `closed` +
+//     NextActions.State campaign_closed carrying the single standalone
+//     fishhawk_start_run;
+//   - a terminal-FAILED campaign WITH a restartable item still decodes as
+//     `start_run` with the reopen-flavoured detail.
+func TestGetCampaignStatus_Closed_E2E_ThroughRealServer(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	const bearer = "fhk_closed_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns", "read:runs"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{CampaignRepo: repo, APITokenRepo: tokRepo})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+	// seed builds a campaign in cState whose items are driven to the given
+	// states, and returns its id.
+	seed := func(t *testing.T, cState campaign.State, items map[string]campaign.ItemState) uuid.UUID {
+		t.Helper()
+		c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+		if err != nil {
+			t.Fatalf("create campaign: %v", err)
+		}
+		for ref, st := range items {
+			it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: ref})
+			if err != nil {
+				t.Fatalf("create item %s: %v", ref, err)
+			}
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, st); err != nil {
+				t.Fatalf("item %s →%s: %v", ref, st, err)
+			}
+		}
+		if _, err := repo.TransitionCampaign(ctx, c.ID, cState); err != nil {
+			t.Fatalf("campaign →%s: %v", cState, err)
+		}
+		return c.ID
+	}
+
+	// --- arm 1: a CANCELLED campaign with an unfinished item -> closed ---
+	closedID := seed(t, campaign.StateCancelled, map[string]campaign.ItemState{
+		"issue:100": campaign.ItemStateSucceeded,
+		"issue:101": campaign.ItemStateFailed,
+	})
+	_, out, err := r.getCampaignStatus(ctx, nil, GetCampaignStatusInput{CampaignID: closedID.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (closed): %v", err)
+	}
+	if out.NextAction.Action != "closed" {
+		t.Fatalf("decoded next_action = %+v, want action \"closed\" (the server's terminal filter must survive the wire)", out.NextAction)
+	}
+	if out.NextAction.IssueRef != "issue:101" {
+		t.Errorf("decoded issue_ref = %q, want issue:101 (the stranded ref is carried)", out.NextAction.IssueRef)
+	}
+	// The DETAIL arrived intact — not merely a non-empty string.
+	if !strings.Contains(out.NextAction.Detail, "cancelled") || !strings.Contains(out.NextAction.Detail, "fishhawk_start_run") {
+		t.Errorf("decoded detail = %q, want it to name the terminal state and the standalone verb", out.NextAction.Detail)
+	}
+	if out.NextActions == nil || out.NextActions.State != "campaign_closed" {
+		t.Fatalf("next_actions = %+v, want State campaign_closed", out.NextActions)
+	}
+	if len(out.NextActions.Actions) != 1 || out.NextActions.Actions[0].Action != "fishhawk_start_run" {
+		t.Errorf("next_actions actions = %+v, want exactly one fishhawk_start_run", out.NextActions.Actions)
+	}
+	if out.NextActions.Actions[0].Params["trigger_ref"] != "issue:101" {
+		t.Errorf("next_actions params = %v, want trigger_ref issue:101", out.NextActions.Actions[0].Params)
+	}
+
+	// --- arm 2: a terminal-FAILED campaign WITH a restartable item -> start_run ---
+	failedID := seed(t, campaign.StateFailed, map[string]campaign.ItemState{
+		"issue:200": campaign.ItemStateSucceeded,
+		"issue:201": campaign.ItemStateFailed,
+	})
+	_, out2, err := r.getCampaignStatus(ctx, nil, GetCampaignStatusInput{CampaignID: failedID.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (failed+restartable): %v", err)
+	}
+	if out2.NextAction.Action != "start_run" || out2.NextAction.IssueRef != "issue:201" {
+		t.Fatalf("decoded next_action = %+v, want start_run issue:201 (the reopen keeps this arm legal)", out2.NextAction)
+	}
+	if !strings.Contains(out2.NextAction.Detail, "REOPENS") {
+		t.Errorf("decoded detail = %q, want the reopen-flavoured detail", out2.NextAction.Detail)
+	}
+	// The restartable item is folded into the wire cancelled slice, so the
+	// classifier routes it to the campaign-item restart verb.
+	if out2.NextActions == nil || out2.NextActions.State != "campaign_start_run" {
+		t.Fatalf("next_actions = %+v, want State campaign_start_run", out2.NextActions)
+	}
+	if len(out2.NextActions.Actions) != 1 || out2.NextActions.Actions[0].Action != "fishhawk_start_campaign_item_run" {
+		t.Errorf("next_actions actions = %+v, want exactly one fishhawk_start_campaign_item_run", out2.NextActions.Actions)
+	}
+}

@@ -1396,12 +1396,22 @@ per-tool contract). Internals not covered there:
   `run_children` / `drive_run` all inherit it. The tool refuses a `local` item with no `working_dir` and a
   non-absolute `working_dir` for any kind on BOTH transports — a strictly stronger rule than `start_run`'s HTTP-only
   guard) maps `item_not_eligible` / `item_human_led`
-  (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`.
+  (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`. As of E67.43 / #2681
+  the `campaign_not_startable` message names the two REMAINING causes truthfully — a PAUSED campaign must be resumed
+  (`fishhawk_resume_campaign`); a CANCELLED or SUCCEEDED campaign is closed, so drive the issue standalone with
+  `fishhawk_start_run` — because a terminal-FAILED campaign is no longer refused: this verb REOPENS it (the campaign
+  flips back to `running` and the item is reset in ONE atomic backend step), which is what makes the last-failed-item
+  recovery reachable inside the campaign at all.
 - **`next_actions` mapping.** `fishhawk_get_campaign_status` maps `next_action` onto a legal operator move via
   `campaignNextActionsFor`, so the agent never reads an unclassified state. `fishhawk_resume_campaign` is legal only
   when `next_action` is `resume`. The `attend_human_led` classification names the relabel-and-re-poll remedy: the
   `human_led` verdict is re-read from the issue's `autonomy:*` label on every `fishhawk_get_campaign_status` poll
   (E25.20 / #2355), so relabelling a child (`autonomy:low` → `autonomy:medium`) and re-polling moves it into `eligible`.
+  The `closed` action (E67.43 / #2681) classifies as `campaign_closed` with exactly ONE suggested action — a STANDALONE
+  `fishhawk_start_run` on the stranded `issue_ref`, never `fishhawk_start_campaign_item_run`, which the campaign gate
+  would refuse — and its reason states the campaign will NOT track that run's outcome. Unlike `complete` (terminal, nil
+  actions) this arm carries an action: there IS work left, just not campaign-tracked work. `closed` is in the
+  classifier's enumerated closed set, so it no longer falls through to the `campaign_unclassified` fallback.
 - **`fishhawk_cancel_campaign` (E25.20 / #2355).** `campaign_id` only. Marks the campaign AND every unfinished
   (non-terminal) item `cancelled` so an abandoned/rebuilt campaign stops showing as live work in the campaign list;
   it does NOT cancel the linked RUNS (`fishhawk_cancel_run` owns that). Idempotent + convergent — re-invoking after a

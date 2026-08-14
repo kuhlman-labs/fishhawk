@@ -382,6 +382,89 @@ func (r *postgresRepo) RestartCampaignItem(ctx context.Context, id uuid.UUID) (*
 	return result, nil
 }
 
+// ReopenCampaignForItemRestart reopens a terminal-FAILED campaign and resets one
+// of its restartable-terminal items in ONE transaction (see the Repository doc
+// for the full contract). Lock order is campaign row THEN item row — the
+// package-wide order, so no lock cycle — and every guard runs under both locks
+// before the first write, so a rejection commits nothing.
+//
+// Like RestartCampaignItem it deliberately bypasses the transition tables (which
+// refuse every terminal `from`, for the campaign as well as the item) and
+// enforces its own guards: a missing campaign is ErrCampaignNotFound, a
+// non-failed campaign is InvalidTransitionError{Kind:"campaign"}, a missing or
+// foreign-owned item is ErrCampaignItemNotFound, and an item outside
+// {cancelled, failed} is InvalidTransitionError{Kind:"campaign_item"}.
+func (r *postgresRepo) ReopenCampaignForItemRestart(ctx context.Context, campaignID, itemID uuid.UUID) (*Campaign, *Item, error) {
+	var (
+		outCampaign *Campaign
+		outItem     *Item
+	)
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+
+		// 1. Lock and guard the CAMPAIGN row first (the package-wide lock order).
+		currentCampaign, err := q.LockCampaignForUpdate(ctx, campaignID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCampaignNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign: %w", err)
+		}
+		if from := State(currentCampaign.State); from != StateFailed {
+			// Only a terminal-FAILED campaign is reopened. A cancelled or
+			// succeeded campaign carries an operator/derived VERDICT this verb must
+			// not undo; a pending/running/paused one needs no reopen at all.
+			return InvalidTransitionError{Kind: "campaign", From: string(from), To: string(StateRunning)}
+		}
+
+		// 2. Lock and guard the ITEM row, still inside the same transaction.
+		currentItem, err := q.LockCampaignItemForUpdate(ctx, itemID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCampaignItemNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		if currentItem.CampaignID != campaignID {
+			// The item exists but belongs to another campaign: from THIS campaign's
+			// perspective it does not exist. Reported as an item miss (never as a
+			// cross-campaign leak of the other campaign's state).
+			return ErrCampaignItemNotFound
+		}
+		if from := ItemState(currentItem.State); from != ItemStateCancelled && from != ItemStateFailed {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStatePending)}
+		}
+
+		// 3. Both guards passed: apply BOTH mutations. Clearing the run link and
+		// resetting the item mirrors RestartCampaignItem; flipping the campaign
+		// back to running is what makes the item reachable by the verb again.
+		if _, err := q.SetCampaignItemRun(ctx, campaigndb.SetCampaignItemRunParams{ID: itemID, RunID: nil}); err != nil {
+			return fmt.Errorf("clear campaign item run: %w", err)
+		}
+		updatedItem, err := q.UpdateCampaignItemState(ctx, campaigndb.UpdateCampaignItemStateParams{
+			ID:    itemID,
+			State: string(ItemStatePending),
+		})
+		if err != nil {
+			return fmt.Errorf("reset campaign item state: %w", err)
+		}
+		updatedCampaign, err := q.UpdateCampaignState(ctx, campaigndb.UpdateCampaignStateParams{
+			ID:    campaignID,
+			State: string(StateRunning),
+		})
+		if err != nil {
+			return fmt.Errorf("reopen campaign state: %w", err)
+		}
+		outCampaign = rowToCampaign(updatedCampaign)
+		outItem = rowToCampaignItem(updatedItem)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return outCampaign, outItem, nil
+}
+
 // SettleCampaignItemOutOfBand settles a restartable-terminal item (cancelled or
 // failed) to succeeded WITHOUT clearing its run link, atomically under
 // SELECT … FOR UPDATE. It mirrors RestartCampaignItem's lock posture and its

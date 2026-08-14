@@ -1811,8 +1811,8 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 // server-computed next_action (computeCampaignNextAction, server/campaigns.go)
 // onto a legal MCP operator action. It mirrors EXACTLY the backend's closed
 // action set — attention | resume | start_run | attend_human_led | wait |
-// complete — so a future backend-added action value lands in the labeled
-// campaign_unclassified fallback rather than crashing.
+// complete | closed — so a future backend-added action value lands in the
+// labeled campaign_unclassified fallback rather than crashing.
 // fishhawk_get_campaign_status embeds the result
 // in its output so the operator-agent never reads an unclassified campaign
 // state.
@@ -1928,6 +1928,32 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 		// Every item reached a terminal state: the campaign is done. Terminal —
 		// no actions (the block still names the state), mirroring a terminal run.
 		return &NextActions{State: "campaign_complete"}
+	case "closed":
+		// The CAMPAIGN itself went terminal (cancelled/succeeded, or failed with
+		// no restartable item) while at least one issue is still unfinished
+		// (#2681). No campaign verb applies — a cancelled or succeeded campaign is
+		// a verdict, and a failed one with nothing restartable has no forward path
+		// inside the campaign — so point the operator at driving the stranded
+		// issue STANDALONE. Unlike "complete" this arm carries an action: there IS
+		// work left, just not campaign-tracked work.
+		params := map[string]string{}
+		if na.IssueRef != "" {
+			params["trigger_ref"] = na.IssueRef
+		}
+		reason := "the campaign is closed (terminal) and can start no further item runs"
+		if na.IssueRef != "" {
+			reason = "campaign item " + na.IssueRef + " is unfinished but the campaign is closed (terminal) and can start no further item runs — drive the issue standalone with fishhawk_start_run; the campaign will NOT track its outcome"
+		}
+		return &NextActions{
+			State: "campaign_closed",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_start_run",
+				Params:       params,
+				Precondition: "the campaign is terminal and can start no further item runs, so fishhawk_start_campaign_item_run would be refused campaign_not_startable; a standalone run on the issue ref is the remaining path",
+				Consumes:     consumesNewRun,
+				Reason:       reason,
+			}},
+		}
 	default:
 		return campaignUnclassifiedNextActions(na)
 	}

@@ -56,7 +56,7 @@ type GetCampaignStatusOutput struct {
 	Campaign    Campaign           `json:"campaign"`
 	Items       []CampaignItem     `json:"items"`
 	Rollup      CampaignRollup     `json:"rollup"`
-	NextAction  CampaignNextAction `json:"next_action" jsonschema:"the server-computed next step distilled from the rollup: action is one of attention, resume, start_run, wait, complete"`
+	NextAction  CampaignNextAction `json:"next_action" jsonschema:"the server-computed next step distilled from the rollup: action is one of attention, resume, start_run, attend_human_led, wait, complete, closed. 'closed' means the CAMPAIGN itself went terminal with an issue still unfinished — no campaign verb applies, so drive that issue standalone with fishhawk_start_run"`
 	NextActions *NextActions       `json:"next_actions,omitempty" jsonschema:"the MCP classifier's mapping of next_action onto a legal operator action (the tool to call, its precondition, what it consumes, and a one-line reason). Non-empty for every non-complete campaign; nil-actions on a complete campaign. Display-only"`
 	// AcceptanceSlot is the additive, best-effort acceptance-slot visibility block
 	// (E48.71 / #2503): acceptance validates against ONE shared preview slot, so a
@@ -253,9 +253,15 @@ this when fishhawk_get_campaign_status reports next_action "start_run" — to dr
 a campaign locally yourself, instead of the backend auto-driver, so the campaign
 tracks + DAG-gates each run as you push it to merge. It admits an item that is
 either eligible (its dependencies have all succeeded) OR a deps-satisfied
-cancelled item, which it RESTARTS: the cancelled item is reset to pending and a
+cancelled/failed item, which it RESTARTS: the item is reset to pending and a
 fresh run is minted, re-linked, and audited (campaign_issue_restarted) so its
-dependents no longer stay blocked forever. On refusal it names the blocking
+dependents no longer stay blocked forever. A campaign that went TERMINAL-FAILED
+because its LAST unsettled item failed is REOPENED by this verb: the campaign
+flips back to running and the item is reset in ONE atomic step, so the item is
+recoverable inside the campaign rather than stranded. A PAUSED campaign is not
+reopened — resume it first (fishhawk_resume_campaign) — and a cancelled or
+succeeded campaign is closed: drive the issue standalone with fishhawk_start_run.
+On refusal it names the blocking
 dependency; then it mints the run, links it, and moves the item to running. Poll
 fishhawk_get_campaign_status again after starting — the status read settles each
 run as it reaches terminal and advances the campaign in DAG order.
@@ -272,8 +278,9 @@ write:campaigns scope (a runner-bound token is rejected 403). A running or
 still-blocked item fails item_not_eligible (the detail names the unmet
 dependency); a deps-satisfied autonomy:low (human-led) item fails item_human_led
 instead — a human must lead it out of band, do not start an agent run; an
-unknown issue_ref fails campaign_item_not_found; a paused or terminal campaign
-fails campaign_not_startable.
+unknown issue_ref fails campaign_item_not_found; a PAUSED, CANCELLED or
+SUCCEEDED campaign fails campaign_not_startable (a terminal-FAILED one does
+NOT — this verb reopens it).
 `),
 	}, resolver.startCampaignItemRun)
 }
@@ -333,8 +340,10 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
 					"item_human_led: %s — this item is deps-satisfied but autonomy:low (human-led); a human must lead it out of band (do not start an agent run), then re-poll fishhawk_get_campaign_status", ae.Message)
 			case "campaign_not_startable":
+				// The two remaining causes, named truthfully (#2681): a terminal-FAILED
+				// campaign is NOT one of them — this verb reopens it.
 				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
-					"campaign_not_startable: %s — a paused campaign must be resumed (fishhawk_resume_campaign) and a terminal one cannot start new runs", ae.Message)
+					"campaign_not_startable: %s — a PAUSED campaign must be resumed first (fishhawk_resume_campaign); a CANCELLED or SUCCEEDED campaign is closed, so drive the issue standalone with fishhawk_start_run (the campaign will not track it)", ae.Message)
 			case "campaign_run_start_failed":
 				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
 					"campaign_run_start_failed: %s — could not resolve the installation or workflow spec; ensure the GitHub App is installed and the workflow_id exists at workflow_ref", ae.Message)

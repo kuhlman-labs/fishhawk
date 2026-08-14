@@ -1480,3 +1480,331 @@ func TestPostgres_CampaignDelete_CascadesItems(t *testing.T) {
 		t.Errorf("item after campaign delete err = %v, want ErrNotFound (ON DELETE CASCADE)", err)
 	}
 }
+
+// --- ReopenCampaignForItemRestart (#2681) ---
+
+// reopenFixture builds a campaign driven to the requested state plus a set of
+// items, each driven to its requested state through the valid transition path,
+// returned by issue ref. It is the shared seed for the
+// ReopenCampaignForItemRestart tests: every guard those tests exercise must be
+// reached with the rows already IN the target state, seeded by construction,
+// so a RED lands on the behavioral assertion rather than on fixture setup.
+func reopenFixture(t *testing.T, repo campaign.Repository, cState campaign.State, items map[string]campaign.ItemState) (*campaign.Campaign, map[string]*campaign.Item) {
+	t.Helper()
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	out := make(map[string]*campaign.Item, len(items))
+	for ref, st := range items {
+		it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: ref})
+		if err != nil {
+			t.Fatalf("create item %s: %v", ref, err)
+		}
+		// running/paused/succeeded-from-running are reached through running; the
+		// rest transition straight out of pending.
+		switch st {
+		case campaign.ItemStatePending:
+			// initial state
+		case campaign.ItemStatePaused:
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+				t.Fatalf("item %s →running: %v", ref, err)
+			}
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStatePaused); err != nil {
+				t.Fatalf("item %s →paused: %v", ref, err)
+			}
+		default:
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, st); err != nil {
+				t.Fatalf("item %s →%s: %v", ref, st, err)
+			}
+		}
+		fresh, err := repo.GetCampaignItem(ctx, it.ID)
+		if err != nil {
+			t.Fatalf("re-read item %s: %v", ref, err)
+		}
+		out[ref] = fresh
+	}
+
+	switch cState {
+	case campaign.StatePending:
+		// initial state
+	case campaign.StatePaused:
+		if _, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+			t.Fatalf("campaign →running: %v", err)
+		}
+		if _, err := repo.TransitionCampaign(ctx, c.ID, campaign.StatePaused); err != nil {
+			t.Fatalf("campaign →paused: %v", err)
+		}
+	default:
+		if _, err := repo.TransitionCampaign(ctx, c.ID, cState); err != nil {
+			t.Fatalf("campaign →%s: %v", cState, err)
+		}
+	}
+	fresh, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign: %v", err)
+	}
+	return fresh, out
+}
+
+// TestReopenCampaignForItemRestart_ReopensAndResetsAtomically is the happy-path
+// round trip: a terminal-FAILED campaign whose items are {succeeded, failed
+// (run-linked)} is reopened and its failed item reset in one call. It asserts
+// BOTH the returned values AND a fresh read of each row, so a method that
+// returned the right structs without committing them fails.
+func TestReopenCampaignForItemRestart_ReopensAndResetsAtomically(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, items := reopenFixture(t, repo, campaign.StateFailed, map[string]campaign.ItemState{
+		"issue:100": campaign.ItemStateSucceeded,
+		"issue:101": campaign.ItemStateFailed,
+	})
+	// Link a REAL run to the failed item so the link-clearing is observable.
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := repo.SetCampaignItemRun(ctx, items["issue:101"].ID, &r.ID); err != nil {
+		t.Fatalf("link run: %v", err)
+	}
+
+	gotC, gotItem, err := repo.ReopenCampaignForItemRestart(ctx, c.ID, items["issue:101"].ID)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if gotC.State != campaign.StateRunning {
+		t.Errorf("returned campaign state = %q, want running", gotC.State)
+	}
+	if gotItem.State != campaign.ItemStatePending {
+		t.Errorf("returned item state = %q, want pending", gotItem.State)
+	}
+	if gotItem.RunID != nil {
+		t.Errorf("returned item run_id = %v, want nil (link cleared)", gotItem.RunID)
+	}
+
+	// Persisted, not just returned.
+	freshC, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign: %v", err)
+	}
+	if freshC.State != campaign.StateRunning {
+		t.Errorf("persisted campaign state = %q, want running", freshC.State)
+	}
+	freshItem, err := repo.GetCampaignItem(ctx, items["issue:101"].ID)
+	if err != nil {
+		t.Fatalf("re-read item: %v", err)
+	}
+	if freshItem.State != campaign.ItemStatePending || freshItem.RunID != nil {
+		t.Errorf("persisted item = state %q run_id %v, want pending/nil", freshItem.State, freshItem.RunID)
+	}
+	// The untouched sibling is unchanged.
+	if sib, _ := repo.GetCampaignItem(ctx, items["issue:100"].ID); sib.State != campaign.ItemStateSucceeded {
+		t.Errorf("sibling state = %q, want succeeded (untouched)", sib.State)
+	}
+}
+
+// TestReopenCampaignForItemRestart_RejectsNonFailedCampaign is the
+// campaign-state guard's counterfactual vehicle. Every non-failed campaign state
+// is refused InvalidTransitionError{Kind:"campaign"} — and, because a control
+// whose real effect is COMMITTED STATE cannot be pinned by error identity alone,
+// it re-reads BOTH rows and asserts the item is STILL terminal and the campaign
+// state unchanged.
+func TestReopenCampaignForItemRestart_RejectsNonFailedCampaign(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	for _, cState := range []campaign.State{
+		campaign.StatePending,
+		campaign.StateRunning,
+		campaign.StatePaused,
+		campaign.StateCancelled,
+		campaign.StateSucceeded,
+	} {
+		t.Run(string(cState), func(t *testing.T) {
+			c, items := reopenFixture(t, repo, cState, map[string]campaign.ItemState{
+				"issue:200": campaign.ItemStateFailed,
+			})
+			item := items["issue:200"]
+
+			gotC, gotItem, err := repo.ReopenCampaignForItemRestart(ctx, c.ID, item.ID)
+			var ite campaign.InvalidTransitionError
+			if !errors.As(err, &ite) {
+				t.Fatalf("err = %v, want InvalidTransitionError", err)
+			}
+			if ite.Kind != "campaign" || ite.From != string(cState) {
+				t.Errorf("err = %+v, want kind campaign from %s", ite, cState)
+			}
+			if gotC != nil || gotItem != nil {
+				t.Errorf("returned (%v, %v), want (nil, nil) on refusal", gotC, gotItem)
+			}
+			// COMMITTED STATE: nothing was written.
+			freshC, err := repo.GetCampaign(ctx, c.ID)
+			if err != nil {
+				t.Fatalf("re-read campaign: %v", err)
+			}
+			if freshC.State != cState {
+				t.Errorf("campaign state = %q, want %q (unchanged)", freshC.State, cState)
+			}
+			freshItem, err := repo.GetCampaignItem(ctx, item.ID)
+			if err != nil {
+				t.Fatalf("re-read item: %v", err)
+			}
+			if freshItem.State != campaign.ItemStateFailed {
+				t.Errorf("item state = %q, want failed (unchanged)", freshItem.State)
+			}
+		})
+	}
+}
+
+// TestReopenCampaignForItemRestart_RejectsNonRestartableItem is BOTH the
+// item-state guard's counterfactual vehicle AND the ATOMICITY proof. The
+// campaign guard has ALREADY PASSED when the item guard rejects, so a
+// non-transactional implementation (two sequential writes) would have committed
+// the campaign flip to running before the item guard ran. The assertion that
+// carries the atomicity claim is therefore "the campaign is STILL failed" after
+// the call — not the error identity, which is byte-identical either way.
+func TestReopenCampaignForItemRestart_RejectsNonRestartableItem(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	for _, itemState := range []campaign.ItemState{
+		campaign.ItemStateSucceeded,
+		campaign.ItemStateRunning,
+		campaign.ItemStatePending,
+		campaign.ItemStateBlocked,
+		campaign.ItemStatePaused,
+	} {
+		t.Run(string(itemState), func(t *testing.T) {
+			c, items := reopenFixture(t, repo, campaign.StateFailed, map[string]campaign.ItemState{
+				"issue:300": itemState,
+			})
+			item := items["issue:300"]
+
+			gotC, gotItem, err := repo.ReopenCampaignForItemRestart(ctx, c.ID, item.ID)
+			var ite campaign.InvalidTransitionError
+			if !errors.As(err, &ite) {
+				t.Fatalf("err = %v, want InvalidTransitionError", err)
+			}
+			if ite.Kind != "campaign_item" || ite.From != string(itemState) {
+				t.Errorf("err = %+v, want kind campaign_item from %s", ite, itemState)
+			}
+			if gotC != nil || gotItem != nil {
+				t.Errorf("returned (%v, %v), want (nil, nil) on refusal", gotC, gotItem)
+			}
+			// THE ATOMICITY ASSERTION: the campaign guard passed, so a
+			// two-writes-no-transaction implementation would already have flipped
+			// the campaign to running. One transaction means the rollback erased it.
+			freshC, err := repo.GetCampaign(ctx, c.ID)
+			if err != nil {
+				t.Fatalf("re-read campaign: %v", err)
+			}
+			if freshC.State != campaign.StateFailed {
+				t.Errorf("campaign state = %q, want failed — the item guard rejected, so the campaign flip must have rolled back (atomicity)", freshC.State)
+			}
+			freshItem, err := repo.GetCampaignItem(ctx, item.ID)
+			if err != nil {
+				t.Fatalf("re-read item: %v", err)
+			}
+			if freshItem.State != itemState {
+				t.Errorf("item state = %q, want %q (unchanged)", freshItem.State, itemState)
+			}
+		})
+	}
+}
+
+// TestReopenCampaignForItemRestart_RejectsItemFromAnotherCampaign pins the
+// ownership guard: a real, genuinely-restartable item of campaign B passed with
+// campaign A's id is refused ErrCampaignItemNotFound — and NOTHING in either
+// campaign is written. Both campaigns are FAILED and both items restartable, so
+// the refusal can only come from the ownership check (pairing the foreign item
+// with a fixture that would otherwise succeed is what makes the guard's deletion
+// observable).
+func TestReopenCampaignForItemRestart_RejectsItemFromAnotherCampaign(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	a, aItems := reopenFixture(t, repo, campaign.StateFailed, map[string]campaign.ItemState{
+		"issue:400": campaign.ItemStateFailed,
+	})
+	b, bItems := reopenFixture(t, repo, campaign.StateFailed, map[string]campaign.ItemState{
+		"issue:401": campaign.ItemStateFailed,
+	})
+
+	gotC, gotItem, err := repo.ReopenCampaignForItemRestart(ctx, a.ID, bItems["issue:401"].ID)
+	if !errors.Is(err, campaign.ErrCampaignItemNotFound) {
+		t.Fatalf("err = %v, want ErrCampaignItemNotFound", err)
+	}
+	if !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("err = %v, want it to also satisfy errors.Is(err, ErrNotFound) (the umbrella sentinel)", err)
+	}
+	if gotC != nil || gotItem != nil {
+		t.Errorf("returned (%v, %v), want (nil, nil) on refusal", gotC, gotItem)
+	}
+	// Neither campaign nor B's item moved.
+	if fresh, _ := repo.GetCampaign(ctx, a.ID); fresh.State != campaign.StateFailed {
+		t.Errorf("campaign A state = %q, want failed (unchanged)", fresh.State)
+	}
+	if fresh, _ := repo.GetCampaign(ctx, b.ID); fresh.State != campaign.StateFailed {
+		t.Errorf("campaign B state = %q, want failed (unchanged)", fresh.State)
+	}
+	if fresh, _ := repo.GetCampaignItem(ctx, bItems["issue:401"].ID); fresh.State != campaign.ItemStateFailed {
+		t.Errorf("campaign B item state = %q, want failed (unchanged)", fresh.State)
+	}
+	if fresh, _ := repo.GetCampaignItem(ctx, aItems["issue:400"].ID); fresh.State != campaign.ItemStateFailed {
+		t.Errorf("campaign A item state = %q, want failed (unchanged)", fresh.State)
+	}
+}
+
+// TestReopenCampaignForItemRestart_NotFound pins the two missing-row guards and
+// the sentinel DISTINCTION between them: a missing campaign is
+// ErrCampaignNotFound, a missing item under a real failed campaign is
+// ErrCampaignItemNotFound, and both satisfy errors.Is(err, ErrNotFound) so no
+// existing umbrella caller changes behavior.
+func TestReopenCampaignForItemRestart_NotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, items := reopenFixture(t, repo, campaign.StateFailed, map[string]campaign.ItemState{
+		"issue:500": campaign.ItemStateFailed,
+	})
+
+	// Unknown campaign id -> the CAMPAIGN sentinel (never the item-shaped one).
+	_, _, err := repo.ReopenCampaignForItemRestart(ctx, uuid.New(), items["issue:500"].ID)
+	if !errors.Is(err, campaign.ErrCampaignNotFound) {
+		t.Errorf("missing-campaign err = %v, want ErrCampaignNotFound", err)
+	}
+	if errors.Is(err, campaign.ErrCampaignItemNotFound) {
+		t.Errorf("missing-campaign err = %v, must NOT be reported as an item miss", err)
+	}
+	if !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("missing-campaign err = %v, want it to satisfy the ErrNotFound umbrella", err)
+	}
+
+	// Unknown item id under a real failed campaign -> the ITEM sentinel.
+	_, _, err = repo.ReopenCampaignForItemRestart(ctx, c.ID, uuid.New())
+	if !errors.Is(err, campaign.ErrCampaignItemNotFound) {
+		t.Errorf("missing-item err = %v, want ErrCampaignItemNotFound", err)
+	}
+	if errors.Is(err, campaign.ErrCampaignNotFound) {
+		t.Errorf("missing-item err = %v, must NOT be reported as a campaign miss", err)
+	}
+	if !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("missing-item err = %v, want it to satisfy the ErrNotFound umbrella", err)
+	}
+
+	// Nothing was written on either miss.
+	if fresh, _ := repo.GetCampaign(ctx, c.ID); fresh.State != campaign.StateFailed {
+		t.Errorf("campaign state = %q, want failed (unchanged)", fresh.State)
+	}
+	if fresh, _ := repo.GetCampaignItem(ctx, items["issue:500"].ID); fresh.State != campaign.ItemStateFailed {
+		t.Errorf("item state = %q, want failed (unchanged)", fresh.State)
+	}
+}

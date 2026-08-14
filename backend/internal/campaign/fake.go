@@ -98,6 +98,11 @@ func (BaseFake) RestartCampaignItem(_ context.Context, _ uuid.UUID) (*Item, erro
 	return nil, ErrNotFound
 }
 
+// ReopenCampaignForItemRestart returns nil, nil, ErrNotFound.
+func (BaseFake) ReopenCampaignForItemRestart(_ context.Context, _, _ uuid.UUID) (*Campaign, *Item, error) {
+	return nil, nil, ErrNotFound
+}
+
 // SettleCampaignItemOutOfBand returns nil, ErrNotFound.
 func (BaseFake) SettleCampaignItemOutOfBand(_ context.Context, _ uuid.UUID) (*Item, error) {
 	return nil, ErrNotFound
