@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1627,25 +1628,160 @@ func TestBuild_Plan_PriorRejectionFeedback_Nil_SectionAbsent(t *testing.T) {
 	}
 }
 
-func TestBuild_Plan_PriorRejectionFeedback_Truncated(t *testing.T) {
-	// Input of 5000 bytes should be capped at 4000 bytes with the truncation suffix.
-	// Cap is 4000 (not 2000) because real rejection rationales run 2-4KB —
-	// substantive operator feedback shouldn't lose its actionable tail.
-	longFeedback := strings.Repeat("x", 5000)
+// TestBuild_Plan_PriorRejectionFeedback_SixThousandBytes_DeliveredWhole is the
+// #2680 done-means behavioral test: a 6000-byte reason (the observed live case
+// size, five defects) appears VERBATIM in the built plan prompt with NO
+// truncation marker. It fails if MaxRejectionFeedbackBytes is reverted to 4000.
+func TestBuild_Plan_PriorRejectionFeedback_SixThousandBytes_DeliveredWhole(t *testing.T) {
+	feedback := strings.Repeat("y", 6000)
 	got, err := Build("plan", Trigger{
 		IssueNumber:            7,
 		Repo:                   "x/y",
-		PriorRejectionFeedback: &longFeedback,
+		PriorRejectionFeedback: &feedback,
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "...[truncated]") {
-		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	if !strings.Contains(got, feedback) {
+		t.Errorf("6000-byte reason must be delivered WHOLE, but it was not present verbatim")
 	}
-	// The full 5000-char string must not appear verbatim.
-	if strings.Contains(got, longFeedback) {
-		t.Errorf("untruncated long feedback appeared in prompt")
+	if strings.Contains(got, "ELIDED") || strings.Contains(got, "...[truncated]") {
+		t.Errorf("6000-byte reason (under the 12000-byte cap) must carry no truncation marker:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_PriorRejectionFeedback_ExactlyAtCap_Verbatim pins the > not >=
+// boundary: an exactly-MaxRejectionFeedbackBytes reason renders verbatim.
+func TestBuild_Plan_PriorRejectionFeedback_ExactlyAtCap_Verbatim(t *testing.T) {
+	feedback := strings.Repeat("z", MaxRejectionFeedbackBytes)
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", PriorRejectionFeedback: &feedback})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, feedback) {
+		t.Errorf("exactly-at-cap reason must render verbatim")
+	}
+	if strings.Contains(got, "ELIDED") {
+		t.Errorf("exactly-at-cap reason must not be truncated (> not >= boundary):\n%s", got)
+	}
+}
+
+// TestBuild_Plan_PriorRejectionFeedback_OverCap_ExplicitElisionMarker asserts
+// the ADR-077 elision shape (#2680): an over-cap reason renders a marker naming
+// the dropped-byte count, the original byte count, the cap, the INCOMPLETE
+// statement, the rejecting run id, and the rejection_comment retrieval key — and
+// the raw over-cap tail is absent (not a bare mid-sentence cut). Deleting the
+// marker composition in CapTextWithRetrieval reddens this.
+func TestBuild_Plan_PriorRejectionFeedback_OverCap_ExplicitElisionMarker(t *testing.T) {
+	const tail = "TAIL_MUST_BE_ELIDED"
+	original := MaxRejectionFeedbackBytes + 300
+	feedback := strings.Repeat("x", original-len(tail)) + tail
+	if len(feedback) != original {
+		t.Fatalf("fixture is %d bytes, want %d", len(feedback), original)
+	}
+	runID := "11111111-2222-3333-4444-555555555555"
+	got, err := Build("plan", Trigger{
+		IssueNumber:                 7,
+		Repo:                        "x/y",
+		PriorRejectionFeedback:      &feedback,
+		PriorRejectionFeedbackRunID: runID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"ELIDED",
+		"INCOMPLETE",
+		strconv.Itoa(original), // original byte count
+		// The dropped-byte count is anchored to the marker's "%d bytes dropped"
+		// phrase, NOT a bare strconv.Itoa(300): "300" is a substring of the
+		// original count "12300", so a bare want would still pass if the
+		// composition dropped the count element entirely. The phrase keeps the
+		// counterfactual for this element attainable.
+		strconv.Itoa(original-MaxRejectionFeedbackBytes) + " bytes dropped", // dropped byte count
+		strconv.Itoa(MaxRejectionFeedbackBytes),                             // the cap
+		runID,                                                               // concrete retrieval pointer
+		"rejection_comment",                                                 // the payload key to read
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("over-cap plan prompt missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, tail) {
+		t.Errorf("over-cap tail %q leaked — it must be elided, not delivered as a bare cut", tail)
+	}
+}
+
+// TestBuild_Plan_PriorRejectionFeedback_TruncationInstruction pins step 4's
+// asymmetry (#2680): a TRUNCATED rendering carries the risks_and_assumptions
+// declaration instruction; an UNtruncated one does not.
+func TestBuild_Plan_PriorRejectionFeedback_TruncationInstruction(t *testing.T) {
+	const instr = "record in the plan's risks_and_assumptions"
+
+	over := strings.Repeat("x", MaxRejectionFeedbackBytes+50)
+	gotOver, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", PriorRejectionFeedback: &over})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(gotOver, instr) {
+		t.Errorf("truncated rendering must instruct the planner to declare the drop in risks_and_assumptions:\n%s", gotOver)
+	}
+
+	under := strings.Repeat("x", 100)
+	gotUnder, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", PriorRejectionFeedback: &under})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(gotUnder, instr) {
+		t.Errorf("untruncated rendering must NOT carry the truncation-declaration instruction:\n%s", gotUnder)
+	}
+}
+
+// TestBuild_Plan_PriorRejectionFeedback_OverCap_EmptyRunID_GenericPointer pins
+// the empty-id degrade (#2680): with no PriorRejectionFeedbackRunID, an over-cap
+// reason still gets an explicit marker with a source-agnostic retrieval phrasing
+// and no dangling empty-id artifact (no "run ]" / "run ." fragment).
+func TestBuild_Plan_PriorRejectionFeedback_OverCap_EmptyRunID_GenericPointer(t *testing.T) {
+	feedback := strings.Repeat("x", MaxRejectionFeedbackBytes+50)
+	got, err := Build("plan", Trigger{
+		IssueNumber:            7,
+		Repo:                   "x/y",
+		PriorRejectionFeedback: &feedback,
+		// PriorRejectionFeedbackRunID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "ELIDED") || !strings.Contains(got, "rejection_comment") {
+		t.Errorf("empty-id over-cap must still carry an explicit marker with the generic retrieval phrasing:\n%s", got)
+	}
+	// The id-branch phrasing ("on the rejecting run <id>") must NOT appear — the
+	// empty-id case degrades to the source-agnostic phrasing with no dangling
+	// empty id folded in.
+	if strings.Contains(got, "on the rejecting run ") {
+		t.Errorf("empty-id marker used the id-branch phrasing (dangling empty id):\n%s", got)
+	}
+	if !strings.Contains(got, "read the rejecting run's approval_submitted audit entry") {
+		t.Errorf("empty-id marker missing the generic source-agnostic retrieval phrasing:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_PriorRejectionFeedback_MidRuneCut_ValidUTF8 pins the rune-safe
+// cut (#2680): a cap boundary landing inside a multi-byte rune yields valid
+// UTF-8 in the built prompt.
+func TestBuild_Plan_PriorRejectionFeedback_MidRuneCut_ValidUTF8(t *testing.T) {
+	// Fill up to one byte before the cap, then a 3-byte euro straddling it.
+	feedback := strings.Repeat("a", MaxRejectionFeedbackBytes-1) + "€" + strings.Repeat("b", 100)
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", PriorRejectionFeedback: &feedback})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("plan prompt is not valid UTF-8 after a mid-rune cut")
+	}
+	if !strings.Contains(got, "ELIDED") {
+		t.Errorf("mid-rune over-cap reason must still be marked:\n%s", got)
 	}
 }
 
@@ -7797,6 +7933,52 @@ func TestCapText_RuneSafe(t *testing.T) {
 	body := strings.TrimSuffix(got, "...[truncated]")
 	if body != strings.Repeat("a", max-1) {
 		t.Errorf("rune-safe cut body = %q (len %d), want %d 'a's with the partial rune dropped", body, len(body), max-1)
+	}
+}
+
+// TestCapTextWithRetrieval_BoundaryAndMarker pins the elision-marker variant
+// (#2680): at/under cap returns verbatim with ok=false (the > not >= boundary),
+// over cap returns the visible prefix plus a marker naming the byte accounting,
+// the INCOMPLETE statement, and the caller's retrieval pointer, and the cut is
+// rune-safe. Flipping the `<= max` guard to `< max` reddens the at-cap sub-test.
+func TestCapTextWithRetrieval_BoundaryAndMarker(t *testing.T) {
+	const max = 100
+	const pointer = "SEE_RUN_abc123"
+
+	atCap := strings.Repeat("a", max)
+	if got, ok := CapTextWithRetrieval(atCap, max, pointer); got != atCap || ok {
+		t.Errorf("CapTextWithRetrieval(at-cap) = (%d bytes, ok=%v), want the input unchanged and ok=false", len(got), ok)
+	}
+
+	over := strings.Repeat("a", max+40)
+	got, ok := CapTextWithRetrieval(over, max, pointer)
+	if !ok {
+		t.Fatalf("CapTextWithRetrieval(over-cap) ok=false, want true")
+	}
+	// The dropped-byte count is anchored to the marker's "%d bytes dropped"
+	// phrase: a bare "40" want would be a substring of the original count "140"
+	// and pass even if the composition dropped the count element.
+	for _, w := range []string{"ELIDED", "INCOMPLETE", pointer, strconv.Itoa(len(over)), strconv.Itoa(max), strconv.Itoa(len(over)-max) + " bytes dropped"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("marker missing %q: %q", w, got)
+		}
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", max)) {
+		t.Errorf("marker must keep the first %d visible bytes as the prefix", max)
+	}
+}
+
+// TestCapTextWithRetrieval_RuneSafe covers the rune-safe cut for the elision
+// variant: a boundary inside a multi-byte rune must not emit invalid UTF-8.
+func TestCapTextWithRetrieval_RuneSafe(t *testing.T) {
+	const max = 100
+	blob := strings.Repeat("a", max-1) + "€" + strings.Repeat("b", 50)
+	got, ok := CapTextWithRetrieval(blob, max, "ptr")
+	if !ok {
+		t.Fatalf("CapTextWithRetrieval did not truncate an over-cap blob")
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("CapTextWithRetrieval left invalid UTF-8 after a mid-rune cut: %q", got)
 	}
 }
 

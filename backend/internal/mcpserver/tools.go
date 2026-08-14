@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
@@ -3362,7 +3363,7 @@ type ApprovePlanOutput struct {
 // because reject without a rationale is poor practice.
 type RejectPlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being rejected"`
-	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing). Propagates to a fresh run's plan as prior-rejection feedback"`
+	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing). Propagates to a fresh run's plan as prior-rejection feedback. Budget: 12000 bytes (measured in bytes, not characters) — a longer reason is NOT refused (unlike an over-cap approve condition), but its tail is elided from the replanning agent's prompt behind an explicit truncation marker, and this tool returns a warning naming the overflow. To keep long steering intact, split it or move it into the next approve's binding conditions"`
 }
 
 // RejectPlanOutput mirrors ApprovePlanOutput.
@@ -3551,6 +3552,14 @@ in the audit log + the plan-on-issue comment's status footer
 (#377). Reason is optional but recommended — the CLI warns when
 missing.
 
+The reason also becomes the replanning agent's prior-rejection
+feedback. It is capped at 12000 bytes there: a longer reason is
+still accepted (a reject is advisory and must stay submittable),
+but its tail is elided behind an explicit truncation marker and
+this tool returns a warning naming the overflow — keep steering
+that must survive under the budget, or route it into the next
+approve's binding conditions.
+
 Same resolver + error shapes as fishhawk_approve_plan.
 `),
 	}, resolver.rejectPlan)
@@ -3706,6 +3715,19 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
+	// Over-budget rejection warning (#2680). A reason longer than the advisory
+	// PriorRejectionFeedback cap will reach the replanning agent with an
+	// explicit ADR-077 elision marker (NOT a silent cut), but its tail is
+	// dropped from the delivered steering — so warn the operator at rejection
+	// time, before the replan cycle is spent, that the reason will not arrive
+	// intact. Threshold keyed to prompt.MaxRejectionFeedbackBytes so it cannot
+	// drift from the render-side cap. Unlike the BINDING approve-with-conditions
+	// channel — where an over-cap comment is REFUSED at the gate
+	// (server/approvals.go) so a dropped tail can never corrupt the implement
+	// stage's binding instructions — a reject is advisory and cheap to re-issue,
+	// so this NEVER refuses the submit: warn-on-reject / refuse-on-approve is a
+	// deliberate asymmetry, not an inconsistency.
+	warn = mergeRejectWarnings(warn, rejectReasonOverBudgetWarning(in.Reason))
 	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
@@ -3716,6 +3738,37 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 		DuplicateSubmission: updated.DuplicateSubmission,
 		PriorDecision:       updated.PriorDecision,
 	}, nil
+}
+
+// rejectReasonOverBudgetWarning returns an operator-facing warning when a plan
+// rejection reason exceeds the advisory PriorRejectionFeedback cap
+// (prompt.MaxRejectionFeedbackBytes), or "" when it fits (#2680). The threshold
+// comparison is the control: a reason at or under the cap warrants no warning,
+// so the caller must not warn unconditionally. The warning names the reason's
+// byte count, the effective budget, the overflow, that the delivered prompt
+// carries an explicit truncation marker (not a silent cut), and the remedy.
+func rejectReasonOverBudgetWarning(reason string) string {
+	if len(reason) <= prompt.MaxRejectionFeedbackBytes {
+		return ""
+	}
+	return fmt.Sprintf(
+		"rejection reason is %d bytes, over the %d-byte prior-rejection-feedback budget by %d bytes: the replanning agent will receive it with an explicit truncation marker (not a silent cut), but the dropped tail will not reach it. Shorten the reason, or move the steering that must survive into the next approve's binding conditions / binding_assertions. The reject was still submitted.",
+		len(reason), prompt.MaxRejectionFeedbackBytes, len(reason)-prompt.MaxRejectionFeedbackBytes)
+}
+
+// mergeRejectWarnings joins the approver-login warning and the over-budget
+// warning into one result-warning string so BOTH coexist on the tool result
+// rather than one clobbering the other (#2680). Either may be empty; two
+// present warnings are separated by a blank line.
+func mergeRejectWarnings(login, overBudget string) string {
+	switch {
+	case login == "":
+		return overBudget
+	case overBudget == "":
+		return login
+	default:
+		return login + "\n\n" + overBudget
+	}
 }
 
 // commentHasStandaloneToken reports whether tok appears as a
