@@ -58,8 +58,16 @@ var (
 	ErrPlanInvalid = errors.New("upload: plan rejected as schema-invalid")
 	// ErrPullRequestInvalid surfaces when the backend rejects the
 	// pull-request body for missing required fields or wrong shape.
-	// Permanent at the protocol layer — the runner shipped the
-	// wrong fields; retrying won't help.
+	// Re-shipping the SAME bytes won't help, but the defect is
+	// RUNNER-side (a wrong/missing wire field) and the run is
+	// recoverable once it is fixed — so a call site must NOT infer a
+	// non-retryable failure category from this sentinel alone. The
+	// correct category depends on the path: on the held-commit resume
+	// path (openHeldCommitPR) the body is runner-assembled and a retry
+	// invokes no agent, so it is category C (retryable); on the
+	// ordinary push path pushFailureCategory keeps it category B
+	// because that body carries agent-authored text and a retry costs
+	// a full agent pass (#2566).
 	ErrPullRequestInvalid = errors.New("upload: pull-request rejected as invalid")
 	// ErrAcceptanceInvalid surfaces when the backend rejects the
 	// acceptance verdict body (400 acceptance_invalid) — missing or
