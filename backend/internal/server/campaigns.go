@@ -2288,10 +2288,20 @@ const recoveryDescendantListLimit = 100
 // caller then preserves today's direct failed settle.
 //
 // It is a BFS over the parent_run_id tree, cycle-guarded with a visited set so
-// a corrupt parent_run_id cycle can't loop forever. This lineage is DISTINCT
-// from DecomposedFrom (decomposition children, #455): the ParentRunID filter
-// selects only resume/recovery children, so a decomposition child is never
-// mistaken for a recovery of the failed run (#1751).
+// a corrupt parent_run_id cycle can't loop forever.
+//
+// The ParentRunID filter alone is NOT a discriminator (#2549):
+// run.ChildParamsFrom sets ParentRunID for EVERY child kind, so a decomposition
+// slice carries BOTH parent_run_id AND decomposed_from and is indistinguishable
+// from a recovery under that filter. What makes this lineage recovery-only is
+// the explicit DecomposedFrom == nil skip below — handleRecoverRun
+// (server/recover.go, operator resume) and the CI-failure retry mint
+// (webhook/dispatcher.go) both leave DecomposedFrom zero, while orchestrator
+// fan-out sets it (#455). The skip buys two outcomes: a failed decomposition
+// parent settles failed off ITSELF regardless of whichever slice sorts newest
+// by CreatedAt, and a still-running slice is not read as an in-flight recovery
+// so it cannot hang the campaign item running. The #1751 settle-off-the-
+// recovery behavior is unchanged for the lineage that owns it.
 //
 // BEST-EFFORT: a ListRuns error logs and returns (nil, false) so reconcile
 // never fails the read — the item then keeps today's failed settle.
@@ -2319,6 +2329,16 @@ func (s *Server) newestTerminalRecoveryDescendant(ctx context.Context, failedRun
 				continue
 			}
 			visited[child.ID] = true
+			// The discriminator (#2549): a decomposition slice carries
+			// parent_run_id like every other child, so the filter above
+			// returns it — but it is neither a settle candidate nor an
+			// in-flight signal, and its own subtree (e.g. a resume OF a
+			// slice) is not this run's recovery lineage either, so it is
+			// not enqueued. Marking it visited first keeps the cycle
+			// guard total over the parent_run_id graph.
+			if child.DecomposedFrom != nil {
+				continue
+			}
 			// Any non-terminal descendant means a recovery is still in flight;
 			// leave the item running for a later read rather than settling it.
 			if !child.State.IsTerminal() {

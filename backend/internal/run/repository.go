@@ -169,12 +169,16 @@ type ListRunsFilter struct {
 	// (untenanted rows stay visible) — the account-scoped list contract
 	// the /v0/runs handler enforces against the caller's Identity.AccountID.
 	AccountID string
-	// ParentRunID filters to recovery children minted with this
-	// parent_run_id — the resume/retry lineage loadApprovedPlanForRun
-	// walks upward (#216). Nil = no constraint. DISTINCT from
-	// DecomposedFrom: decomposition children carry decomposed_from,
-	// recovery children carry parent_run_id; the two lineages must not
-	// be conflated (#1751).
+	// ParentRunID filters to children minted with this parent_run_id —
+	// the lineage loadApprovedPlanForRun walks upward (#216). Nil = no
+	// constraint. parent_run_id is the SHARED provenance thread of EVERY
+	// child kind: ChildParamsFrom sets it for operator recoveries, CI
+	// retries AND decomposition slices alike, so a slice carries BOTH
+	// parent_run_id and decomposed_from and this filter alone does NOT
+	// select recovery children (#2549). A caller that wants the
+	// recovery lineage ONLY must additionally require
+	// DecomposedFrom == nil — see server.newestTerminalRecoveryDescendant,
+	// which does exactly that.
 	ParentRunID *uuid.UUID
 	Limit       int
 	Offset      int

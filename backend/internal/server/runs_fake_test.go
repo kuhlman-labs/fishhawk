@@ -89,6 +89,7 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		IdempotencyKey:     p.IdempotencyKey,
 		ParentRunID:        p.ParentRunID,
 		DecomposedFrom:     p.DecomposedFrom,
+		SliceIndex:         p.SliceIndex,
 		RunnerKind:         runnerKind,
 		WorkflowSpec:       p.WorkflowSpec,
 		MaxRetriesSnapshot: p.MaxRetriesSnapshot,
