@@ -82,9 +82,22 @@ type fakeBackend struct {
 	stagesStatus     int
 	// stagesFailOnCall, when > 0, makes the Nth (1-based, per run_id)
 	// GET /v0/runs/{run_id}/stages call return 500 while every other call
-	// uses stagesStatus. Used by the dispatch post-dispatch-fetch-failure
-	// test to fail the SECOND stages read (the wait-status classify) while
-	// the FIRST (stage-id resolution) succeeds. Defaults to 0 (disabled).
+	// uses stagesStatus. Used by the dispatch post-dispatch-fetch-failure and
+	// acceptance-short-circuit post-fetch tests to fail the THIRD stages read
+	// (the classify) while the first two — stage-id resolution and the #1872
+	// sibling guard — succeed. Defaults to 0 (disabled).
+	//
+	// PRECONDITION (#2687): ordinal-indexed injection is only valid when the test
+	// has exactly ONE reader of this endpoint for the run. A real detached spawn
+	// adds a SECOND, concurrent reader — the reaper's zero-exit strand probe
+	// (reapZeroExitStrand, #2630) reads ListRunStages on attempt 0 with no
+	// pre-sleep — racing the handler's own read for the injected 500 and making
+	// which call it lands on nondeterministic. A test using this knob must keep the
+	// endpoint single-reader: stub the detached-spawn seam via
+	// withStubbedDispatchSpawn (dispatch_stage_test.go) instead of real-spawning,
+	// or exercise a no-spawn path (the acceptance short-circuit). Both users assert
+	// the total per-run read count equals postDispatchStagesCall so a future extra
+	// reader fails by name rather than silently re-targeting the injection.
 	stagesFailOnCall int
 	// stagesStatusByRun overrides the GET /v0/runs/{run_id}/stages status for a
 	// SINGLE run id (E48.71 / #2503), so an acceptance-slot degrade test can fail

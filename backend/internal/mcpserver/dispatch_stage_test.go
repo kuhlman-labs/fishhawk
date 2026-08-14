@@ -284,24 +284,70 @@ func TestDispatchStage_ArgvParity_ImplementStage(t *testing.T) {
 
 // --- fail-soft: post-dispatch stage fetch failure ---
 
+// postDispatchStagesCall is the ordinal (1-based, per run id) of the
+// post-dispatch classify read of GET /v0/runs/{id}/stages: (1) resolveStageID,
+// (2) the sibling-in-flight guard (#1872), (3) the post-dispatch classify. It is
+// BOTH the value both ordinal-injection tests assign to fb.stagesFailOnCall and
+// the expected total stages-read count they assert afterwards, so a future extra
+// or shifted stages read fails with a NAMED count mismatch instead of silently
+// re-targeting the injected 500 onto a different call. Shared by the dispatch and
+// acceptance-short-circuit users of the knob (both take the same three reads).
+const postDispatchStagesCall = 3
+
+// withStubbedDispatchSpawn replaces the injectable detached-spawn seam
+// (dispatchSpawnDetached) with a stub returning a fixed fake log path and a nil
+// error WITHOUT forking a child and WITHOUT starting a reaper goroutine,
+// restoring the original via t.Cleanup. Modeled on the inline override in
+// TestDispatchStage_ThreadsNonNilProbeToSpawn.
+//
+// #2687: a REAL detached spawn's reaper calls reapZeroExitStrand, whose
+// attempt-0 probe issues its OWN GET /v0/runs/{id}/stages concurrently with the
+// handler's post-dispatch classify read. Any test doing ORDINAL fault injection
+// on that endpoint (fb.stagesFailOnCall) must therefore NOT real-spawn — the
+// concurrent reader makes which request consumes the injected 500 nondeterministic
+// (the flake #2687 fixed). Stubbing the seam removes the reaper, so the endpoint
+// stays single-reader and the ordinal lands deterministically.
+func withStubbedDispatchSpawn(t *testing.T) {
+	t.Helper()
+	savedSpawn := dispatchSpawnDetached
+	dispatchSpawnDetached = func(_ string, _, _ []string, _, _ string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+		return "/dev/null", nil
+	}
+	// The dispatch path resolves the runner binary (runStageLookPath) BEFORE it
+	// reaches the spawn seam, so stub that too — mirroring withFakeRunner minus the
+	// real command and reaper.
+	savedLook := runStageLookPath
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		dispatchSpawnDetached = savedSpawn
+		runStageLookPath = savedLook
+	})
+}
+
 // TestDispatchStage_PostFetchFailureWarnsNoError asserts the fail-soft branch:
-// when the post-dispatch stage fetch fails (the SECOND /stages call), the
+// when the post-dispatch stage fetch fails (the THIRD /stages call), the
 // handler returns the handle with a nil StageWaitStatus + a warning, never a
 // tool error — the spawn already happened and the handle is durable.
 func TestDispatchStage_PostFetchFailureWarnsNoError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	withFakeRunner(t, "exit 0")
+	// Stub the detached-spawn seam rather than real-spawn (withFakeRunner): a real
+	// spawn starts a reaper whose attempt-0 zero-exit probe reads GET
+	// /v0/runs/{id}/stages concurrently with the handler's post-dispatch classify,
+	// racing for the ordinal-injected 500 (#2687). With the stub there is no reaper,
+	// so the three /stages reads below are the ONLY reads and the count is
+	// deterministic. See withStubbedDispatchSpawn.
+	withStubbedDispatchSpawn(t)
 
 	runID := uuid.New()
 	stageID := uuid.New()
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
-	// Three /stages calls now fire: (1) resolveStageID, (2) the sibling-in-flight
-	// guard (#1872), (3) the post-dispatch classify. Fail the THIRD so the
-	// post-dispatch classify errors (the guard's call-2 succeeds — target pending,
-	// no in-flight sibling — and allows the spawn).
+	// Three /stages calls fire: (1) resolveStageID, (2) the sibling-in-flight guard
+	// (#1872), (3) the post-dispatch classify. Fail the THIRD so the post-dispatch
+	// classify errors (the guard's call-2 succeeds — target pending, no in-flight
+	// sibling — and allows the spawn).
 	fb.mu.Lock()
-	fb.stagesFailOnCall = 3
+	fb.stagesFailOnCall = postDispatchStagesCall
 	fb.mu.Unlock()
 
 	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
@@ -328,6 +374,16 @@ func TestDispatchStage_PostFetchFailureWarnsNoError(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a post-dispatch-fetch-failure warning, got %v", out.Warnings)
+	}
+	// Ordinal precondition: exactly postDispatchStagesCall reads fired, so the
+	// injected 500 landed on the post-dispatch classify. A shifted or extra read
+	// (e.g. a re-introduced concurrent reaper probe, #2687) fails here by name
+	// rather than silently moving the injection onto a different call.
+	fb.mu.Lock()
+	gotCalls := fb.stagesCalledByID[runID]
+	fb.mu.Unlock()
+	if gotCalls != postDispatchStagesCall {
+		t.Errorf("GET /stages read %d times for the run, want %d — a shifted or extra stages read means the injected 500 no longer lands on the post-dispatch classify", gotCalls, postDispatchStagesCall)
 	}
 }
 

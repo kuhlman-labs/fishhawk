@@ -2832,7 +2832,13 @@ func TestRunStage_AcceptanceAdmissionError_StageLeftRunning_FailsClosed(t *testi
 func TestRunStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.admissionShortCircuit = true
-	fb.stagesFailOnCall = 3 // resolveStageID(1), sibling guard(2), post-short-circuit fetch(3)
+	// resolveStageID(1), sibling guard(2), post-short-circuit fetch(3). Unlike the
+	// dispatch post-fetch test this path is NOT exposed to the #2687 reaper hazard:
+	// the acceptance short-circuit spawns NO runner (spawned stays 0 below), so
+	// there is no detached reaper issuing a concurrent GET /stages probe and the
+	// ordinal is single-reader by construction — hence this test needs no spawn
+	// stub, only the shared count pin.
+	fb.stagesFailOnCall = postDispatchStagesCall
 	r := newResolver(srv, nil)
 
 	spawned := 0
@@ -2884,6 +2890,16 @@ func TestRunStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 	}
 	if !scNote {
 		t.Errorf("missing the short-circuit note naming %q; warnings: %v", plan.AcceptanceVerdictNotValidated, out.Warnings)
+	}
+	// Ordinal precondition (shared with TestDispatchStage_PostFetchFailureWarnsNoError):
+	// exactly postDispatchStagesCall reads fired, so the injected 500 landed on the
+	// post-short-circuit fetch. A shifted or extra read fails here by name rather
+	// than silently moving the injection onto a different call.
+	fb.mu.Lock()
+	gotCalls := fb.stagesCalledByID[runID]
+	fb.mu.Unlock()
+	if gotCalls != postDispatchStagesCall {
+		t.Errorf("GET /stages read %d times for the run, want %d — a shifted or extra stages read means the injected 500 no longer lands on the post-short-circuit fetch", gotCalls, postDispatchStagesCall)
 	}
 }
 
