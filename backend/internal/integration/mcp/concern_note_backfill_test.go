@@ -202,6 +202,15 @@ func TestConcernNoteBackfill_EndToEnd(t *testing.T) {
 
 	// Read leg B: the run-status surface, which renders the bounded label. The
 	// key was OMITTED entirely for a blank note before this change.
+	//
+	// The label is bounded at 100 bytes, so it structurally CANNOT carry the
+	// recovered free_form prose — leg A above is the substance surface. What is
+	// load-bearing here is therefore the DERIVATION, not mere non-blankness: the
+	// label must carry the self-describing synthesized marker and must be a byte
+	// prefix of THIS row's whitespace-collapsed persisted note (the same note leg
+	// A pinned to the review's free_form). Both assertions go RED if the
+	// cross-boundary note is replaced with arbitrary non-empty text, or if the
+	// label is derived from anything other than the recovered note.
 	runBody := getJSON(t, ctx, httpSrv.URL+"/v0/runs/"+r.ID.String(), fx.operatorTok)
 	var status struct {
 		Concerns struct {
@@ -218,8 +227,23 @@ func TestConcernNoteBackfill_EndToEnd(t *testing.T) {
 	if !present {
 		t.Fatalf("run-status short_summary key ABSENT for the backfilled concern:\n%s", runBody)
 	}
-	if s, _ := label.(string); strings.TrimSpace(s) == "" {
-		t.Errorf("run-status short_summary = %q, want a non-blank label\nbody: %s", s, runBody)
+	s, _ := label.(string)
+	if strings.TrimSpace(s) == "" {
+		t.Fatalf("run-status short_summary = %q, want a non-blank label\nbody: %s", s, runBody)
+	}
+	if !strings.Contains(s, concern.MissingNoteMarker) {
+		t.Errorf("run-status short_summary = %q, want the self-describing synthesized-note marker %q — "+
+			"the operator must be able to tell this label was not authored by the reviewer\nbody: %s",
+			s, concern.MissingNoteMarker, runBody)
+	}
+	// The label is the collapsed note cut to the byte bound with a trailing
+	// truncation marker (or the whole collapsed note when it already fits), so
+	// stripping that marker must leave a byte prefix of the persisted note.
+	collapsedNote := strings.Join(strings.Fields(rows[0].Note), " ")
+	if head := strings.TrimSuffix(s, "..."); head == "" || !strings.HasPrefix(collapsedNote, head) {
+		t.Errorf("run-status short_summary = %q, want a leading slice of the recovered note %q — "+
+			"the label must be derived from THIS concern's backfilled note, not from arbitrary text\nbody: %s",
+			s, collapsedNote, runBody)
 	}
 }
 
