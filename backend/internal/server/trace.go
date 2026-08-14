@@ -2726,6 +2726,58 @@ type concernRelitigationSuppressedPayload struct {
 	OriginReviewSequence int64  `json:"origin_review_sequence"`
 }
 
+// concernNoteBackfilledCategory is the audit-log category for the blank-note
+// backfill (#2555): a reviewer concern whose note is empty (or whitespace-only)
+// has a non-blank note synthesized before InsertRaised, so the durable row can
+// never hold the merge gate open carrying nothing. Like
+// concern_relitigation_suppressed it is an internal advisory audit kind written
+// by persistReviewConcerns; it posts no issue comment and adds no Notifier
+// method, so it is NOT an issue-comment surface.
+//
+// The audit entry is a TRACEABILITY addition, not the durable record of the
+// substitution: the synthesized note itself is that record — persisted on the
+// row, rendered at every operator surface, and self-describing about being
+// synthesized (it leads with concern.MissingNoteMarker). An append failure
+// therefore degrades traceability but never silence. The entry is appended only
+// AFTER the batch InsertRaised succeeds, so an entry exists only where the row
+// it describes does.
+const concernNoteBackfilledCategory = "concern_note_backfilled"
+
+// concernNoteBackfilledPayload is the audit payload for a
+// concern_note_backfilled entry (#2555). Source names where the substituted
+// text came from (backfillSourceFreeForm | backfillSourceNone), so an operator
+// can tell a free_form recovery from a bare audit pointer without re-reading
+// the row.
+type concernNoteBackfilledPayload struct {
+	Source               string `json:"source"`
+	Severity             string `json:"severity"`
+	Category             string `json:"category"`
+	Note                 string `json:"note"`
+	FreeFormTruncated    bool   `json:"free_form_truncated"`
+	ReviewerModel        string `json:"reviewer_model,omitempty"`
+	OriginReviewSequence int64  `json:"origin_review_sequence"`
+}
+
+// Backfill sources recorded on a concern_note_backfilled entry (#2555).
+const (
+	// backfillSourceFreeForm: the substituted note carries prose recovered
+	// from the review's free_form commentary.
+	backfillSourceFreeForm = "free_form"
+	// backfillSourceNone: the review carried no free_form either, so the
+	// substituted note is the bare audit-entry pointer.
+	backfillSourceNone = "none"
+)
+
+// concernNoteFreeFormMaxBytes bounds how much of a review's free_form prose is
+// copied into a backfilled note. The note is rendered whole by the gate view
+// and quoted into auto-drafted follow-ups, so an unbounded copy of a long
+// commentary would swamp both surfaces; the marker below records the cut.
+const concernNoteFreeFormMaxBytes = 2000
+
+// concernNoteTruncationMarker terminates a free_form recovery cut at
+// concernNoteFreeFormMaxBytes.
+const concernNoteTruncationMarker = " […truncated; read the review's full free_form in the audit entry]"
+
 // DispatchConsolidatedReview dispatches the gating agent implement review
 // for a decomposed parent run against its consolidated PR diff (#1060),
 // satisfying orchestrator.ConsolidatedReviewDispatcher. The orchestrator
@@ -3911,7 +3963,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// stamped with the sequence the append returned — the audit
 			// chain stays the sole sequence authority, so a failed append
 			// (no sequence) skips persistence for this verdict.
-			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, entry.Sequence, verdict.Concerns)
+			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
 			// Buffer the delta-verification resolutions (#984) instead of
 			// applying them here (E48.103 / #2551): they are applied once
 			// after the loop, through the veto pass that can see what the
@@ -4226,11 +4278,16 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 			continue
 		}
 		out = append(out, prompt.PriorConcern{
-			ID:          c.ID.String(),
-			State:       string(c.State),
+			ID:    c.ID.String(),
+			State: string(c.State),
+			// DisplayNote, not the raw field (#2555): a re-review asked to
+			// delta-verify a LEGACY blank-note row (one minted before the
+			// write-side backfill landed) otherwise receives an empty note and
+			// cannot judge it at all — the exact wall the issue reports. The
+			// stand-in names the *_reviewed audit entry to read instead.
 			Severity:    c.Severity,
 			Category:    c.Category,
-			Note:        c.Note,
+			Note:        c.DisplayNote(),
 			StateReason: c.StateReason,
 		})
 	}
@@ -4274,11 +4331,14 @@ func (s *Server) settledConcernsForReview(ctx context.Context, runID, stageID uu
 			continue
 		}
 		out = append(out, prompt.PriorConcern{
-			ID:          c.ID.String(),
-			State:       string(c.State),
+			ID:    c.ID.String(),
+			State: string(c.State),
+			// Same DisplayNote read as priorConcernsForReview (#2555): the
+			// settled ledger's purpose is to stop a reviewer re-raising a
+			// settled finding, which a blank ledger row cannot do.
 			Severity:    c.Severity,
 			Category:    c.Category,
-			Note:        c.Note,
+			Note:        c.DisplayNote(),
 			StateReason: c.StateReason,
 		})
 	}
@@ -4856,11 +4916,19 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 // this can be a strict subset of `concerns`, which is exactly why it (not
 // the raw verdict.Concerns) is the correct fresh-concern source. Every
 // early-return / error path returns nil.
-func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel string, originSequence int64, concerns []planreview.Concern) []*concern.Concern {
+// The freeForm argument is the emitting verdict's free_form commentary, the
+// recovery source for the blank-note backfill below (#2555).
+func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel, freeForm string, originSequence int64, concerns []planreview.Concern) []*concern.Concern {
 	if s.cfg.ConcernRepo == nil || len(concerns) == 0 {
 		return nil
 	}
 	raised := make([]concern.RaisedConcern, 0, len(concerns))
+	// Advisory backfill entries accumulate here and are appended only AFTER
+	// InsertRaised persists the batch (#2555 fix-up): an entry appended inside
+	// the loop would describe a substitution onto a row that a subsequent insert
+	// failure never minted, leaving the audit chain disagreeing with derived
+	// state — the same ordering slip the suppression path guards against.
+	var pendingBackfills []pendingNoteBackfill
 	for _, c := range concerns {
 		// Re-litigation guard (#1913): a concern re-raising an operator-arbitrated
 		// (waived/deferred) settled concern with no new evidence is recorded as a
@@ -4875,10 +4943,36 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		if s.suppressRelitigation(ctx, runID, stageID, stageKind, reviewerModel, originSequence, c) {
 			continue
 		}
+		// Blank-note backfill (#2555), applied AFTER the suppression check so a
+		// suppressed concern is still suppressed and never backfilled: a concern
+		// whose note is empty or whitespace-only holds the merge gate open
+		// carrying nothing an operator, a fix-up agent, or a later re-review can
+		// act on, and its only disposition is a waive of unknown content. A
+		// concern that already carries a note passes through byte-identical.
+		note, source, truncated := backfillConcernNote(c.Note, freeForm, stageKind, reviewerModel, originSequence)
+		if source != "" {
+			// Fail direction is deliberately the INVERSE of suppressRelitigation:
+			// that guard requires its audit entry to land before it acts, because
+			// falling open there merely inserts a concern. Here, refusing to
+			// backfill because an append failed would re-persist the blank row
+			// this control exists to prevent, so the backfill applies regardless.
+			// The synthesized note IS the durable, operator-visible record of the
+			// substitution (it is stored on the row, rendered at every operator
+			// surface, and self-describing); the audit entry only improves
+			// traceability. An append failure degrades traceability, never silence.
+			// The append itself is DEFERRED to after the insert (see below), so
+			// the entry is never written for a row that was never minted.
+			pendingBackfills = append(pendingBackfills, pendingNoteBackfill{
+				concern:   c,
+				note:      note,
+				source:    source,
+				truncated: truncated,
+			})
+		}
 		raised = append(raised, concern.RaisedConcern{
 			Severity:       string(c.Severity),
 			Category:       c.Category,
-			Note:           c.Note,
+			Note:           note,
 			SuggestedPatch: c.SuggestedPatch,
 			// Carry the reviewer's supporting evidence and re-raise lineage
 			// into the durable row (E60.8 / #2353). This is the single point
@@ -4909,7 +5003,34 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		)
 		return nil
 	}
+	// The batch is durable — now record the advisory backfill entries. Their
+	// fail direction is unchanged: the synthesized note is already on the
+	// persisted row, so an append failure here degrades traceability, never
+	// silence, and never removes the substitution it failed to describe.
+	for _, b := range pendingBackfills {
+		if err := s.appendConcernNoteBackfilled(ctx, runID, stageID, reviewerModel, originSequence, b.concern, b.note, b.source, b.truncated); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: append concern_note_backfilled failed — note still backfilled onto the row",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("stage_kind", stageKind),
+				slog.String("backfill_source", b.source),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 	return minted
+}
+
+// pendingNoteBackfill is one blank-note substitution awaiting its advisory
+// concern_note_backfilled audit entry (#2555). persistReviewConcerns collects
+// these while building the InsertRaised batch and appends them only after that
+// insert succeeds, so a partial failure can never leave an audit entry
+// describing a substitution onto a concern row that was never minted.
+type pendingNoteBackfill struct {
+	concern   planreview.Concern
+	note      string
+	source    string
+	truncated bool
 }
 
 // suppressRelitigation reports whether the concern c is a no-evidence re-raise of
@@ -4994,6 +5115,90 @@ func (s *Server) appendRelitigationSuppressed(ctx context.Context, runID, stageI
 		StageID:   &stageID,
 		Timestamp: time.Now().UTC(),
 		Category:  concernRelitigationSuppressedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	})
+	return err
+}
+
+// backfillConcernNote returns the note to persist for one decoded concern, the
+// backfill source marker, and whether a free_form recovery was truncated
+// (#2555). It is pure — no ctx, no I/O — so every branch is unit-testable.
+//
+// Three branches:
+//
+//   - a note carrying anything but whitespace is returned UNCHANGED with an
+//     empty source marker (the no-op path: a well-formed concern is never
+//     rewritten, and no audit entry is emitted for it);
+//   - a blank note WITH free_form prose returns a marked recovery: a leading
+//     concern.MissingNoteMarker line stating the note was empty and that the
+//     text below is recovered from the review's free_form — explicitly warning
+//     that the free_form may cover other findings from the same round, so an
+//     operator never mistakes it for this concern's authored note — followed by
+//     the free_form, bounded at concernNoteFreeFormMaxBytes;
+//   - a blank note with NO free_form returns concern.MissingNotePointer, the
+//     same text DisplayNote() synthesizes for a legacy blank row, so the write
+//     and read paths render one vocabulary.
+//
+// The backfill NEVER drops a concern: the observed blank one (run 9bba554d) was
+// a genuine medium-severity finding whose note the reviewer simply omitted.
+func backfillConcernNote(note, freeForm, stageKind, reviewerModel string, originSequence int64) (string, string, bool) {
+	if strings.TrimSpace(note) != "" {
+		return note, "", false
+	}
+	prose := strings.TrimSpace(freeForm)
+	if prose == "" {
+		return concern.MissingNotePointer(stageKind, reviewerModel, originSequence), backfillSourceNone, false
+	}
+	body, truncated := truncateFreeFormForNote(prose)
+	return fmt.Sprintf("%s The reviewer emitted this concern with an empty note. The text below is recovered from "+
+			"the review's free_form commentary, which may cover other findings from the same round — treat it as a "+
+			"pointer to substance, not as this concern's authored note. Source: the %s-stage review recorded at audit "+
+			"sequence %d.\n\n%s", concern.MissingNoteMarker, strings.TrimSpace(stageKind), originSequence, body),
+		backfillSourceFreeForm, truncated
+}
+
+// truncateFreeFormForNote bounds recovered free_form prose at
+// concernNoteFreeFormMaxBytes, cutting on a rune boundary (backtracking off any
+// UTF-8 continuation byte, so the cut never emits U+FFFD) and appending
+// concernNoteTruncationMarker. Reports whether it cut.
+func truncateFreeFormForNote(s string) (string, bool) {
+	if len(s) <= concernNoteFreeFormMaxBytes {
+		return s, false
+	}
+	cut := concernNoteFreeFormMaxBytes - len(concernNoteTruncationMarker)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut] + concernNoteTruncationMarker, true
+}
+
+// appendConcernNoteBackfilled writes the concern_note_backfilled advisory audit
+// entry for one backfilled concern (#2555). It returns an error when the
+// AuditRepo is unconfigured or the chained append fails; the caller WARN-logs
+// and applies the backfill anyway (see the fail-direction comment there).
+func (s *Server) appendConcernNoteBackfilled(ctx context.Context, runID, stageID uuid.UUID, reviewerModel string, originSequence int64, c planreview.Concern, note, source string, truncated bool) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("audit repo not configured")
+	}
+	payload, _ := json.Marshal(concernNoteBackfilledPayload{
+		Source:               source,
+		Severity:             string(c.Severity),
+		Category:             c.Category,
+		Note:                 note,
+		FreeFormTruncated:    truncated,
+		ReviewerModel:        reviewerModel,
+		OriginReviewSequence: originSequence,
+	})
+	systemKind := audit.ActorKind("system")
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  concernNoteBackfilledCategory,
 		ActorKind: &systemKind,
 		Payload:   payload,
 	})

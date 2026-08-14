@@ -198,6 +198,12 @@ The ledger is **two-tier**, matching the server-side re-litigation guard (`persi
 
 The inline verdict-schema block renders the optional `settled_ref`/`new_evidence` concern members conditionally, keyed on `len(SettledConcerns) > 0` — mirroring the existing `concern_resolutions` conditional keyed on `PriorConcerns`. An empty `SettledConcerns` (which includes the common no-waived-concern case) leaves the prompt byte-identical to the pre-#1913 output, protecting the caching prefix. The two-tier discard/insertable-regression language is pinned by `TestBuild_ImplementReview_SettledConcernsTwoTierLanguage`.
 
+## Required non-empty concern note (#2555, E48.104)
+
+All THREE reviewer verdict-schema blocks — plan review, implement review, and the base-rebase supplemental exemption review — render one shared instruction (`requiredNoteInstruction`) immediately AFTER their JSON shape block: `note` is REQUIRED on every concern and must be self-contained, and a concern whose substance lives only in `free_form` is unactionable downstream (free_form is round-level commentary and cannot be attributed back to one finding). The JSON shape blocks themselves are byte-identical to their pre-#2555 text, so the existing shape assertions still hold; the instruction is additive prose after them. Paired with `planreview.VerdictSchema()` promoting `note` into the concern object's `required` array, and with the server-side backfill (`persistReviewConcerns`) that is the actual enforcing control — the prompt reduces how often a blank note is emitted, it does not guarantee it. Pinned by `TestBuildPlanReview_RequiresNonEmptyNote`, `TestBuildImplementReview_RequiresNonEmptyNote`, and `TestBuildSupplementalReview_RequiresNonEmptyNote`.
+
+Both prompt-facing concern threads — `priorConcernsForReview` (the open delta list) and `settledConcernsForReview` (the settled ledger) — render `concern.Concern.DisplayNote()` rather than the raw field, so a LEGACY blank-note row reaches a later review round carrying a pointer to its originating `*_reviewed` audit entry instead of an empty string a reviewer cannot delta-verify.
+
 ## Counterfactual attainability (#2444)
 
 The dominant defect class in agent-written control tests: a test that passes whether or not the control it guards exists — the counterfactual is never checked, so the test proves nothing. #2444 closes it at design time with a matched pair of prompt rules.

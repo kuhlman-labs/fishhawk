@@ -4380,7 +4380,12 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// the ungrounded diff-only wording, since this fixture is ungrounded): the
 	// block is in the current (trimmed) prompt AND would be in the untrimmed
 	// version, so the baseline moves with it (4837 + 192).
-	const preTrimBaselineLen = 5029
+	//
+	// #2555 raised it by the 333 bytes the required-`note` instruction adds
+	// after the verdict-schema block: like the blocks above, it is in the
+	// current (trimmed) prompt AND would be in the untrimmed version, so the
+	// baseline moves with it (5029 + 333).
+	const preTrimBaselineLen = 5362
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -8032,5 +8037,71 @@ func TestBuild_Implement_ApprovalConditions_OverCapTruncates(t *testing.T) {
 	}
 	if strings.Contains(got, cond) {
 		t.Errorf("untruncated over-cap conditions appeared in the implement prompt")
+	}
+}
+
+// requiredNoteAnchor is a load-bearing fragment of requiredNoteInstruction
+// (#2555). Asserting a substring rather than the whole constant lets the wording
+// be edited without breaking the tests, while still failing if the instruction
+// is dropped from a verdict-schema block.
+const requiredNoteAnchor = "`note` is REQUIRED on every concern and must be self-contained"
+
+// TestBuildPlanReview_RequiresNonEmptyNote: the plan-review verdict-schema block
+// must instruct that `note` is required and self-contained (#2555). A concern
+// whose substance lives only in free_form is unactionable downstream — free_form
+// is round-level, so it cannot be attributed back to one finding.
+func TestBuildPlanReview_RequiresNonEmptyNote(t *testing.T) {
+	got := buildPlanReview(Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if !strings.Contains(got, requiredNoteAnchor) {
+		t.Errorf("plan-review prompt is missing the required-note instruction:\n%s", got)
+	}
+	if !strings.Contains(got, "put the substance in `free_form`") {
+		t.Errorf("plan-review prompt does not warn against deferring the note to free_form:\n%s", got)
+	}
+	// The JSON shape block itself is unchanged — the instruction sits AFTER it.
+	if !strings.Contains(got, "      \"note\": \"<free-form explanation of the concern>\"\n") {
+		t.Error("plan-review verdict JSON shape block changed; it must stay byte-identical")
+	}
+}
+
+// TestBuildImplementReview_RequiresNonEmptyNote is the implement-review twin.
+func TestBuildImplementReview_RequiresNonEmptyNote(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo: "x/y", IssueNumber: 42, ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, requiredNoteAnchor) {
+		t.Errorf("implement-review prompt is missing the required-note instruction:\n%s", got)
+	}
+	if !strings.Contains(got, "      \"note\": \"<free-form explanation of the concern>\",\n") {
+		t.Error("implement-review verdict JSON shape block changed; it must stay byte-identical")
+	}
+}
+
+// TestBuildSupplementalReview_RequiresNonEmptyNote is the supplemental
+// exemption-review twin — the third verdict-schema block, which renders on its
+// own branch and would otherwise be missed.
+func TestBuildSupplementalReview_RequiresNonEmptyNote(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:                 "x/y",
+		IssueNumber:          42,
+		ApprovedPlan:         fixturePlan(),
+		SupplementalReinvoke: true,
+		GateEvidence: &GateEvidence{
+			ScopeExemptions: []GateScopeExemption{
+				{Path: "pkg/foo/foo.go", Reason: "already correct after the rebase"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, requiredNoteAnchor) {
+		t.Errorf("supplemental review prompt is missing the required-note instruction:\n%s", got)
+	}
+	if !strings.Contains(got, "      \"note\": \"<free-form explanation of the concern>\"\n") {
+		t.Error("supplemental verdict JSON shape block changed; it must stay byte-identical")
 	}
 }

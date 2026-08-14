@@ -1069,3 +1069,39 @@ func TestGateView_UndisputedConcern_NotDisputed(t *testing.T) {
 		t.Errorf("disputed = %v disputes = %+v, want a clean undisputed render", got.Disputed, got.Disputes)
 	}
 }
+
+// TestGateView_BlankNoteConcernRendersPointer: the gate view is the surface an
+// operator decides from, and it renders each open concern's FULL note. A LEGACY
+// blank-note row — seeded by construction, as such rows already sit in the
+// store — must render a non-blank stand-in naming its originating review, not
+// an empty string whose only available disposition is a waive of unknown
+// content (#2555).
+func TestGateView_BlankNoteConcernRendersPointer(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	blank := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "gpt-5-codex", 88,
+		"medium", "coverage", "", "")
+	authored := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "gpt-5-codex", 89,
+		"low", "style", "the helper shadows the package-level logger", "")
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	byID := map[uuid.UUID]string{}
+	for _, c := range resp.Open {
+		byID[c.ID] = c.Note
+	}
+	got := byID[blank.ID]
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("gate view rendered an EMPTY note for a blank-note open concern")
+	}
+	for _, want := range []string{concern.MissingNoteMarker, "88", "gpt-5-codex"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gate-view note = %q, want it to name %q", got, want)
+		}
+	}
+	// The counterfactual half: an authored note is rendered verbatim, so the
+	// chokepoint cannot be satisfied by decorating every note.
+	if byID[authored.ID] != "the helper shadows the package-level logger" {
+		t.Errorf("authored note = %q, want it rendered verbatim", byID[authored.ID])
+	}
+}

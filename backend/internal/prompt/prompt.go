@@ -2855,6 +2855,18 @@ func reviewTreeShortCommit(sha string) string {
 	return sha
 }
 
+// requiredNoteInstruction is appended immediately after each reviewer verdict
+// schema block (#2555). A concern's `note` is where its substance lives: the
+// durable concern row, the gate view an operator decides from, the fix-up
+// prompt, and every later delta re-review all read that field and nothing else.
+// A concern whose substance lives only in `free_form` is unactionable
+// downstream — free_form is round-level commentary, not per-concern text, so it
+// cannot be attributed back to one finding.
+const requiredNoteInstruction = "`note` is REQUIRED on every concern and must be self-contained: state the claim, " +
+	"where it applies, and what would resolve it, in the note itself. Do NOT leave a note empty and put the " +
+	"substance in `free_form` — the note is the only field that travels with the concern to the operator, the " +
+	"fix-up agent, and the next review round.\n\n"
+
 // buildPlanReview constructs the constrained prompt for a plan-review agent.
 // The review agent's sole task is to emit a structured verdict JSON — it is
 // explicitly forbidden from re-planning, proposing edits, or producing any
@@ -2922,6 +2934,7 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("  ],\n")
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
+	b.WriteString(requiredNoteInstruction)
 
 	// Review criteria — what the agent should assess. Record a concern per gap.
 	b.WriteString("### Review criteria\n\n")
@@ -3264,6 +3277,7 @@ func buildImplementReview(t Trigger) string {
 	}
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
+	b.WriteString(requiredNoteInstruction)
 	b.WriteString("Populate `suggested_patch` ONLY for a mechanical concern whose fix is a small, self-contained " +
 		"unified diff that applies cleanly to the PR branch (a missing nil-check, a typo, a one-line guard); " +
 		"leave it absent for any concern whose resolution needs judgement or touches multiple call sites.\n\n")
@@ -3684,6 +3698,7 @@ func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
 	b.WriteString("  ],\n")
 	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
 	b.WriteString("}\n\n")
+	b.WriteString(requiredNoteInstruction)
 
 	b.WriteString("### Verdict decision rule\n\n")
 	b.WriteString("- `approve`: every additional exemption is sound — each exempted path genuinely needed no edit " +

@@ -2,6 +2,7 @@ package concern
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -101,5 +102,93 @@ func TestStateIsOpen(t *testing.T) {
 		if s.IsOpen() {
 			t.Errorf("%s.IsOpen() = true, want false", s)
 		}
+	}
+}
+
+// ptr returns a pointer to s, for the *string ReviewerModel field.
+func ptr(s string) *string { return &s }
+
+// TestDisplayNote_NonBlankPassthrough pins the no-op path: an authored note is
+// returned BYTE-IDENTICAL, never rewritten or decorated.
+func TestDisplayNote_NonBlankPassthrough(t *testing.T) {
+	const note = "the fixup never ran gofmt; backend/internal/server/trace.go is unformatted at HEAD"
+	c := Concern{
+		Note:                 note,
+		StageKind:            StageKindImplement,
+		ReviewerModel:        ptr("claude-opus-4-8"),
+		OriginReviewSequence: 41,
+	}
+	if got := c.DisplayNote(); got != note {
+		t.Errorf("DisplayNote() = %q, want the stored note byte-identical (%q)", got, note)
+	}
+}
+
+// TestDisplayNote_BlankReturnsPointer is the read-side control: a LEGACY row
+// minted before the write-side backfill landed carries an empty note, and every
+// surface reading it rendered an empty field. The blank fixture is seeded BY
+// CONSTRUCTION (a literal ""), so deleting the blank branch reddens this
+// assertion and not the setup.
+func TestDisplayNote_BlankReturnsPointer(t *testing.T) {
+	c := Concern{
+		Note:                 "",
+		StageKind:            StageKindImplement,
+		ReviewerModel:        ptr("gpt-5-codex"),
+		OriginReviewSequence: 77,
+	}
+	got := c.DisplayNote()
+	if got == "" {
+		t.Fatal("DisplayNote() = \"\" for a blank-note row — the surface renders nothing actionable")
+	}
+	for _, want := range []string{MissingNoteMarker, "gpt-5-codex", StageKindImplement, "77"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DisplayNote() = %q, want it to name %q so the operator can find the originating review", got, want)
+		}
+	}
+}
+
+// TestDisplayNote_WhitespaceOnlyReturnsPointer: a note of only whitespace is as
+// unactionable as an empty one and takes the same branch.
+func TestDisplayNote_WhitespaceOnlyReturnsPointer(t *testing.T) {
+	c := Concern{
+		Note:                 "   \n\t  ",
+		StageKind:            StageKindPlan,
+		ReviewerModel:        ptr("claude-opus-4-8"),
+		OriginReviewSequence: 12,
+	}
+	got := c.DisplayNote()
+	if !strings.Contains(got, MissingNoteMarker) {
+		t.Errorf("DisplayNote() = %q for a whitespace-only note, want the %q stand-in", got, MissingNoteMarker)
+	}
+	if !strings.Contains(got, StageKindPlan) {
+		t.Errorf("DisplayNote() = %q, want it to name the plan stage kind", got)
+	}
+}
+
+// TestDisplayNote_NilReviewerModelRendersUnknown pins the nil-pointer branch:
+// ReviewerModel is a *string stored NULL for a row minted with no model, so a
+// naive deref would panic and a naive format would print "%!s(*string=<nil>)".
+func TestDisplayNote_NilReviewerModelRendersUnknown(t *testing.T) {
+	for name, c := range map[string]Concern{
+		"nil_model":   {StageKind: StageKindImplement, OriginReviewSequence: 5},
+		"blank_model": {StageKind: StageKindImplement, ReviewerModel: ptr("  "), OriginReviewSequence: 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := c.DisplayNote()
+			if !strings.Contains(got, missingNoteUnknownReviewer) {
+				t.Errorf("DisplayNote() = %q, want the %q rendering", got, missingNoteUnknownReviewer)
+			}
+			if strings.Contains(got, "%!") {
+				t.Errorf("DisplayNote() = %q, want no format-verb error artifact", got)
+			}
+		})
+	}
+}
+
+// TestMissingNotePointer_BlankStageKind covers the last defensive branch: a row
+// whose stage kind is somehow empty still renders a legible pointer.
+func TestMissingNotePointer_BlankStageKind(t *testing.T) {
+	got := MissingNotePointer("", "m", 9)
+	if !strings.Contains(got, "unknown-stage") {
+		t.Errorf("MissingNotePointer(\"\", …) = %q, want it to render an unknown stage kind", got)
 	}
 }

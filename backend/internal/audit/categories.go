@@ -111,6 +111,7 @@ var KnownCategories = map[string]struct{}{
 	"concern_addressed_by_condition":          {},
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
+	"concern_note_backfilled":                 {},
 	"concern_relitigation_suppressed":         {},
 	"concern_resolution_vetoed":               {},
 	"concern_waive_failed":                    {},

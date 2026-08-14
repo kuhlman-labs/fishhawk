@@ -38,7 +38,16 @@ func VerdictSchema() map[string]any {
 	concernSchema := map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
-		"required":             []any{"severity"},
+		// `note` is REQUIRED (#2555): a concern with no note is persisted into
+		// the durable store and holds the merge gate open carrying nothing an
+		// operator, a fix-up agent, or a later re-review can act on. Deliberately
+		// NOT paired with `minLength`: codex 0.140's strict `--output-schema`
+		// mode rejects unsupported string keywords with HTTP 400
+		// invalid_json_schema (the #1330 class, which is why StrictVerdictSchema
+		// exists), and the enforcing control is the server-side backfill in
+		// persistReviewConcerns anyway — this only stops a schema-conforming
+		// reviewer from LEGALLY omitting the field.
+		"required": []any{"severity", "note"},
 		"properties": map[string]any{
 			"severity": map[string]any{
 				"type": "string",
