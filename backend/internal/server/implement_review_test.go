@@ -4076,6 +4076,36 @@ func TestImplementReviewRound_V3_ConfirmVetoedOnNoChangePass(t *testing.T) {
 	}
 }
 
+// TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies pins the boundary of
+// the no-change arm: the concern's newest routing trigger has NO following
+// fixup_pushed/fixup_no_changes entry at all. The arm fires on positive
+// evidence of a no-change pass, so an ABSENT outcome does not veto — a
+// deliberate reading, since the only way to reach it in a real round is a
+// best-effort outcome append that failed (a re-review runs after the pass
+// terminalizes), and vetoing there would refuse confirms for a pass that DID
+// push with no later entry to clear the veto. Deleting the `found &&` guard in
+// buildResolutionVetoContext reddens this on the state assertion.
+func TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies(t *testing.T) {
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	// No fixup_pushed / fixup_no_changes entry follows sequence 10.
+
+	peer := confirmingReviewer("fable-5", row.ID.String(), "the bound landed", planreview.VerdictApprove)
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: peer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed (an absent outcome entry is not evidence of a no-change pass)", got.State)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+	}
+}
+
 // TestImplementReviewRound_V4_ConfirmVetoedWhenEvidenceLookupFails is the
 // FAIL-CLOSED arm: with the trigger read erroring, the veto pass cannot know
 // whether the concern carried operator evidence or rode a no-change pass, so

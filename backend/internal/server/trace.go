@@ -4659,6 +4659,18 @@ func (s *Server) buildResolutionVetoContext(ctx context.Context, runID, stageID 
 			outcomes = append(outcomes, outcome{sequence: e.Sequence, pushed: cat == "fixup_pushed"})
 		}
 	}
+	// found==false — the newest routing trigger has NO following outcome entry —
+	// leaves the concern un-vetoed by THIS arm. The assumption that makes that
+	// safe is ordering: a re-review round only runs after the fix-up pass
+	// terminalizes, so by the time this derivation reads the audit the pass's
+	// fixup_pushed / fixup_no_changes has landed. The one way to observe
+	// found==false in a real round is a best-effort outcome append that failed,
+	// which is an audit-durability defect, not a fix-up that landed nothing —
+	// and vetoing on it would refuse confirms for a pass that DID push, with no
+	// later entry to clear the veto and only an operator waive to close the
+	// concern. So the un-vetoed reading is deliberate; the arm fires on positive
+	// evidence of a no-change pass, never on the absence of evidence.
+	// Pinned by TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies.
 	for cid, seq := range newestTrigger {
 		var best outcome
 		found := false
