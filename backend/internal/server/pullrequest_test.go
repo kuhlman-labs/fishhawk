@@ -2851,3 +2851,151 @@ func TestPullRequestBody_ScopeParkAcceptsBuildRequiredShortfall(t *testing.T) {
 		t.Error("head_sha is still required for a scope_park outcome")
 	}
 }
+
+// --- Held-commit PR text on the park / checkpoint reports (#2570) ---
+//
+// CROSS-BOUNDARY, backend half. Each of these POSTs a REAL runner-shaped body
+// through the REAL handler (real DisallowUnknownFields decode, real validate())
+// and asserts what got persisted, so a wire-tag drift between the two modules
+// fails here rather than silently degrading a resume back to the placeholder.
+
+// TestShipPullRequest_ScopePark_PersistsPRText: the park row and the parked
+// audit payload both carry the agent-authored PR text.
+func TestShipPullRequest_ScopePark_PersistsPRText(t *testing.T) {
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := &parkRecordingRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au, RunRepo: rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body, err := json.Marshal(map[string]any{
+		"outcome":           "scope_park",
+		"branch":            "fishhawk/run-aaaaaaaa/slice-0",
+		"head_sha":          "1111111111111111111111111111111111111111",
+		"base_sha":          "2222222222222222222222222222222222222222",
+		"verified_tree_sha": "3333333333333333333333333333333333333333",
+		"missing_paths":     []string{"docs/foo.md"},
+		"title":             "feat(server): carry PR text across a resume",
+		"body":              "## Summary\n\n- the agent's own narrative",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 400 here would mean the runner's new keys did not survive the
+	// DisallowUnknownFields decoder — the wire-contract assumption this change
+	// rests on.
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.parkCalls) != 1 {
+		t.Fatalf("park calls = %d, want 1", len(rr.parkCalls))
+	}
+	pc := rr.parkCalls[0]
+	if pc.park.PRTitle != "feat(server): carry PR text across a resume" {
+		t.Errorf("park.PRTitle = %q, want the shipped title", pc.park.PRTitle)
+	}
+	if pc.park.PRBody != "## Summary\n\n- the agent's own narrative" {
+		t.Errorf("park.PRBody = %q, want the shipped body", pc.park.PRBody)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(pc.append.Payload, &payload); err != nil {
+		t.Fatalf("decode parked payload: %v", err)
+	}
+	for _, k := range []string{"pr_title", "pr_body"} {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("parked audit payload is missing %s (the legacy-row ladder's fallback): %v", k, payload)
+		}
+	}
+}
+
+// TestShipPullRequest_ScopePark_PRTextGatedWhenAbsent is m8's park half: with no
+// PR text shipped, the parked audit payload must be BYTE-IDENTICAL to today —
+// this payload is a raw map, so writing the keys unconditionally would stamp two
+// JSON nulls onto every existing parked entry.
+func TestShipPullRequest_ScopePark_PRTextGatedWhenAbsent(t *testing.T) {
+	sf := newSigningFake()
+	rr := &parkRecordingRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: newAuditFake(), RunRepo: rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := []byte(`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b",` +
+		`"verified_tree_sha":"t","missing_paths":["x.go"]}`)
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.parkCalls) != 1 {
+		t.Fatalf("park calls = %d, want 1", len(rr.parkCalls))
+	}
+	got := string(rr.parkCalls[0].append.Payload)
+	for _, k := range []string{`"pr_title"`, `"pr_body"`} {
+		if strings.Contains(got, k) {
+			t.Errorf("a park with no PR text must omit %s entirely, got: %s", k, got)
+		}
+	}
+	if pc := rr.parkCalls[0]; pc.park.PRTitle != "" || pc.park.PRBody != "" {
+		t.Errorf("park PR text = (%q, %q), want both empty", pc.park.PRTitle, pc.park.PRBody)
+	}
+}
+
+// TestPullRequestFailed_CheckpointCarriesPRText: the checkpoint half — a
+// checkpoint-bearing failure report's push_checkpoint carries the PR text that
+// resolvePushCheckpointResume reads back on the retry.
+func TestPullRequestFailed_CheckpointCarriesPRText(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"outcome": "failed", "category": "C", "reason": "open PR: 503 from the forge",
+		"branch": "fishhawk/run-2570/stage-abc", "head_sha": "headsha2570",
+		"base_sha": "basesha2570", "verified_tree_sha": "treesha2570",
+		"title": "feat(server): carry PR text across a resume",
+		"body":  "## Summary\n\n- the agent's own narrative",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, state := prFailedCheckpointPayload(t, body)
+	raw, ok := payload["push_checkpoint"]
+	if !ok {
+		t.Fatalf("push_checkpoint missing: %v", payload)
+	}
+	var cp map[string]string
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		t.Fatalf("decode push_checkpoint: %v", err)
+	}
+	if cp["pr_title"] != "feat(server): carry PR text across a resume" {
+		t.Errorf("push_checkpoint.pr_title = %q, want the shipped title", cp["pr_title"])
+	}
+	if cp["pr_body"] != "## Summary\n\n- the agent's own narrative" {
+		t.Errorf("push_checkpoint.pr_body = %q, want the shipped body", cp["pr_body"])
+	}
+	// Recording the text must not change the failure semantics.
+	if state != run.StageStateFailed {
+		t.Errorf("stage.State = %q, want failed", state)
+	}
+}
+
+// TestPullRequestFailed_CheckpointPRTextGatedWhenAbsent is m8's checkpoint half.
+func TestPullRequestFailed_CheckpointPRTextGatedWhenAbsent(t *testing.T) {
+	body := []byte(`{"outcome":"failed","category":"C","reason":"open PR: 503",` +
+		`"branch":"fishhawk/run-2570/stage-abc","head_sha":"headsha2570",` +
+		`"base_sha":"basesha2570","verified_tree_sha":"treesha2570"}`)
+	payload, _ := prFailedCheckpointPayload(t, body)
+	got := string(payload["push_checkpoint"])
+	for _, k := range []string{`"pr_title"`, `"pr_body"`} {
+		if strings.Contains(got, k) {
+			t.Errorf("a checkpoint with no PR text must omit %s entirely, got: %s", k, got)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package run_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -2460,5 +2461,64 @@ func TestPostgres_ParkScopeCompletenessAndAppend_BuildRequiredRoundTrip(t *testi
 	}
 	if len(gotLegacy.ScopeCompletenessPark.MissingPaths) != 1 {
 		t.Errorf("the legacy shortfall must survive unchanged: %+v", gotLegacy.ScopeCompletenessPark)
+	}
+}
+
+// TestPostgres_ParkScopeCompleteness_PRTextRoundTrip is m7: the agent-authored
+// PR text (#2570) round-trips through the park's JSONB column, and a PRE-change
+// payload — one written before the struct carried the fields — still decodes,
+// with both fields EMPTY rather than erroring. That additive-no-migration
+// property is what lets this ship without a schema change, and what makes the
+// backend's issue-context fallback the correct behavior for every existing row.
+func TestPostgres_ParkScopeCompleteness_PRTextRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	pk, ok := repo.(scopeCompletenessParker)
+	if !ok {
+		t.Fatal("postgres repo does not implement ParkScopeCompletenessAndAppend")
+	}
+	ctx := context.Background()
+
+	r, running := seedRunningImplementStage(t, repo)
+	park := run.ScopeCompletenessPark{
+		HeldCommitSHA:   "1111111111111111111111111111111111111111",
+		RunBranch:       "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		BaseSHA:         "5555555555555555555555555555555555555555",
+		MissingPaths:    []string{"docs/foo.md"},
+		PRTitle:         "feat(server): carry agent PR text across a resume",
+		PRBody:          "## Summary\n\n- capture at park time\n\nCloses #2570",
+	}
+	if _, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park,
+		parkParams(r.ID, running.ID, []byte(`{}`))); err != nil || !won {
+		t.Fatalf("park: won=%v err=%v, want won=true nil", won, err)
+	}
+	got, err := repo.GetStage(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.ScopeCompletenessPark == nil {
+		t.Fatal("persisted ScopeCompletenessPark = nil")
+	}
+	if got.ScopeCompletenessPark.PRTitle != park.PRTitle {
+		t.Errorf("PRTitle = %q, want %q", got.ScopeCompletenessPark.PRTitle, park.PRTitle)
+	}
+	if got.ScopeCompletenessPark.PRBody != park.PRBody {
+		t.Errorf("PRBody = %q, want %q", got.ScopeCompletenessPark.PRBody, park.PRBody)
+	}
+
+	// A PRE-#2570 payload decodes with both fields empty and no error, so every
+	// already-written park row stays readable with no migration and no repair.
+	var legacy run.ScopeCompletenessPark
+	legacyJSON := []byte(`{"held_commit_sha":"abc","run_branch":"b","verified_tree_sha":"t",` +
+		`"base_sha":"z","missing_paths":["x"]}`)
+	if err := json.Unmarshal(legacyJSON, &legacy); err != nil {
+		t.Fatalf("a pre-#2570 park payload must still decode: %v", err)
+	}
+	if legacy.PRTitle != "" || legacy.PRBody != "" {
+		t.Errorf("a pre-#2570 payload must decode the PR text EMPTY, got (%q, %q)", legacy.PRTitle, legacy.PRBody)
+	}
+	if legacy.HeldCommitSHA != "abc" || len(legacy.MissingPaths) != 1 {
+		t.Errorf("the pre-#2570 payload's own fields must be unaffected: %+v", legacy)
 	}
 }

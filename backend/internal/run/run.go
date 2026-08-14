@@ -759,6 +759,29 @@ type ScopeCompletenessPark struct {
 	// degraded — attribution is diagnostic and must never cost the operator the
 	// preserved commit.
 	OwningSlices []BuildRequiredOwner `json:"owning_slices,omitempty"`
+	// PRTitle and PRBody are the AGENT-AUTHORED pull-request text the parking
+	// pass resolved (#2570), carried so an EXEMPT resume opens a real pull
+	// request instead of the `chore: fishhawk implement stage <id>` placeholder
+	// — which carries no summary, no test plan, and no `Closes #N`, so the
+	// trigger issue never auto-closes on merge.
+	//
+	// They are persisted here rather than re-read at resume time because the
+	// runner's /tmp PR-description handoff is already GONE: loadAgentAuthoredPR
+	// deletes it on every read path, the parking pass consumed it before the park
+	// existed, and on an ephemeral runner /tmp does not survive the stage at all.
+	// This JSONB column is the only storage both a same-host and a fresh-host
+	// resume can reach.
+	//
+	// PRBody EXCLUDES the Fishhawk attribution footer: the runner that OPENS the
+	// pull request appends it exactly once at open time, so a persisted footer
+	// would either double up or carry the wrong branch/audit URL.
+	//
+	// Both omitempty and additive — the column is JSONB, so no migration — and a
+	// pre-#2570 park row decodes them EMPTY, where heldCommitPRTitleBody
+	// (backend/internal/server/heldcommitpr.go) synthesizes the documented
+	// issue-context fallback instead.
+	PRTitle string `json:"pr_title,omitempty"`
+	PRBody  string `json:"pr_body,omitempty"`
 }
 
 // BuildRequiredOwner attributes one build-required path to the decomposition

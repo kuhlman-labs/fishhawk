@@ -9956,6 +9956,40 @@ paths:
                       checkpointed commit passed no operator gate the way a
                       park did. An exempt resolution always WINS over a
                       checkpoint, so the two can never both be emitted.
+                  held_commit_pr_title:
+                    type: string
+                    description: |
+                      The pull-request TITLE the resumed runner opens with
+                      (#2570). Served ONLY alongside the held-commit fields
+                      above, on BOTH resume kinds. Resolved in order: the
+                      agent-authored title captured at park / checkpoint time
+                      and persisted on the park row (or the newest
+                      `scope_completeness_parked` audit payload's `pr_title`,
+                      for a legacy park), then a Conventional-Commits title
+                      synthesized from the run's cached issue context (the
+                      issue title verbatim when it already matches the header
+                      shape, else `chore: `-prefixed). ABSENT when neither
+                      resolves — the runner then keeps its
+                      `chore: fishhawk implement stage <id>` placeholder, i.e.
+                      the pre-#2570 behavior. Unrecoverable PR text NEVER
+                      withholds the resume: it is a quality input, not a
+                      safety precondition.
+                  held_commit_pr_body:
+                    type: string
+                    description: |
+                      The pull-request BODY the resumed runner opens with
+                      (#2570), resolved per-field and independently of
+                      `held_commit_pr_title` — a recovered title is never
+                      discarded because the body was empty, and vice versa.
+                      Falls back to a synthesized body naming the triggering
+                      issue and stating that the agent did not re-run. A
+                      `Closes #<number>` line is appended unless the body
+                      already carries an ACTIVE closing reference to that
+                      issue (a closing keyword immediately preceding the exact
+                      `#<number>`, outside any code span or fenced code block),
+                      so merging a resumed PR still auto-closes the trigger
+                      issue. The body EXCLUDES the Fishhawk attribution
+                      footer — the opening runner appends it exactly once.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -10164,6 +10198,14 @@ paths:
                     type: string
                     enum: [pr_open]
                     description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint.
+                  held_commit_pr_title:
+                    type: string
+                    description: |
+                      The pull-request title the resumed runner opens with (#2570), served only alongside the held-commit fields on both resume kinds. Resolved from the agent-authored title captured at park/checkpoint time (park row, else the newest `scope_completeness_parked` audit `pr_title`), else a Conventional-Commits title synthesized from the run's cached issue context. Absent when neither resolves — the runner then keeps its `chore: fishhawk implement stage <id>` placeholder. Unrecoverable PR text never withholds the resume.
+                  held_commit_pr_body:
+                    type: string
+                    description: |
+                      The pull-request body the resumed runner opens with (#2570), resolved independently of `held_commit_pr_title` so a recovered title is not discarded because the body was empty. Falls back to a body naming the triggering issue and stating the agent did not re-run. A `Closes #<number>` line is appended unless the body already carries an ACTIVE closing reference to that issue (a closing keyword immediately preceding the exact `#<number>`, outside any code span or fenced code block). Excludes the Fishhawk attribution footer, which the opening runner appends exactly once.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

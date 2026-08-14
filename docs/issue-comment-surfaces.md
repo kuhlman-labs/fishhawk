@@ -1168,7 +1168,8 @@ Notes:
   `server/pullrequest.go::parkScopeCompletenessStage` writes the parked entry
   (system actor, or operator on the bearer path; payload `{run_id, stage_id,
   branch, head_sha, base_sha, verified_tree_sha, missing_paths,
-  unsatisfied_assertions, build_required_paths, owning_slices, auth_method}`)
+  unsatisfied_assertions, build_required_paths, owning_slices, auth_method}`,
+  plus the optional `pr_title` / `pr_body` keys below)
   when the runner reports `{outcome:"scope_park"}` — the implement stage's ONLY
   committed-tree gate shortfall was the missing-declared-scope-file check (#1151),
   an unsatisfied binding assertion (#1171/#2501), or — on a DECOMPOSED CHILD only —
@@ -1181,6 +1182,20 @@ Notes:
   decomposition, so the operator is told WHICH slice boundary was cut; that class is
   exempt-INELIGIBLE (its committed tree is red by construction) and its only
   admissible decision is `fail`.
+  The **`pr_title` / `pr_body`** payload keys (#2570) are the AGENT-AUTHORED
+  pull-request text the parking pass resolved, written ONLY when the runner
+  reported them non-empty — a park with no agent PR description omits both keys
+  entirely, so every pre-#2570 parked payload is byte-identical. The park ROW
+  carries the same text (`run.ScopeCompletenessPark.PRTitle`/`PRBody`, additive
+  JSONB, no migration) and is the primary carrier; these keys are the legacy-row
+  fallback `server/prompt.go::resolveHeldCommitExemption` reads when a park row
+  predates the struct fields, the same ladder shape #2563 uses for `base_sha`.
+  They exist because an exempt resume runs NO agent and so writes no
+  PR-description handoff — without them the resumed PR opened as
+  `chore: fishhawk implement stage <id>` with no summary, no test plan and no
+  `Closes` reference, leaving the trigger issue open on merge. `pr_body` excludes
+  the Fishhawk attribution footer: the runner that OPENS the pull request appends
+  it exactly once.
   `server/scope_completeness.go::handleDecideScopeCompleteness`
   writes the exempted entry (user actor; payload `{run_id, stage_id, decision,
   reason, decided_by, held_commit_sha, run_branch, verified_tree_sha,
@@ -1277,7 +1292,14 @@ Notes:
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
   The **`push_checkpoint`** payload key (#2169) is the PR-OPEN CHECKPOINT:
-  `{branch, head_sha, base_sha, verified_tree_sha}`, present ONLY when the
+  `{branch, head_sha, base_sha, verified_tree_sha}` — plus the optional
+  `pr_title` / `pr_body` (#2570), the agent-authored pull-request text the
+  failing pass resolved, each written only when non-empty so a pre-#2570
+  checkpoint payload is byte-identical and neither is enforced in `validate()`
+  for the same stranding reason as the coordinates. `resolvePushCheckpointResume`
+  reads them back and serves them as `held_commit_pr_title` /
+  `held_commit_pr_body`, so the resumed PR is a real one rather than the
+  placeholder. Present ONLY when the
   reported failure happened AFTER `CommitAndPush` already landed the
   gate-verified commit on the run branch (a PR-open failure, or an artifact-ship
   failure once the PR was open), and only when the report carries BOTH a
