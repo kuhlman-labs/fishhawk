@@ -5347,7 +5347,10 @@ func TestOperatorScopeUndelivered_Helper(t *testing.T) {
 		"/etc/passwd",    // absolute → skipped
 		"../escape.go",   // traversal → skipped
 	}
-	got := operatorScopeUndelivered(operatorAdded, diff)
+	got, indeterminate := operatorScopeUndelivered(operatorAdded, diff)
+	if indeterminate {
+		t.Error("indeterminate = true, want false (the diff carries no source-less rename row)")
+	}
 	want := []string{"dir/missing.go", "frontend/x.tsx"}
 	if len(got) != len(want) {
 		t.Fatalf("operatorScopeUndelivered = %v, want %v", got, want)
@@ -5359,12 +5362,11 @@ func TestOperatorScopeUndelivered_Helper(t *testing.T) {
 	}
 
 	// Empty operator-added set → nil (no signal).
-	if got := operatorScopeUndelivered(nil, diff); got != nil {
+	if got, _ := operatorScopeUndelivered(nil, diff); got != nil {
 		t.Errorf("operatorScopeUndelivered(nil, ...) = %v, want nil", got)
 	}
 	// All present → nil (all delivered).
-	allPresent := operatorScopeUndelivered([]string{"a.go", "dir/touched.go"}, diff)
-	if allPresent != nil {
+	if allPresent, _ := operatorScopeUndelivered([]string{"a.go", "dir/touched.go"}, diff); allPresent != nil {
 		t.Errorf("all-delivered operatorScopeUndelivered = %v, want nil", allPresent)
 	}
 }
@@ -5755,10 +5757,13 @@ func TestScopeProvenance_RenameSourceIsTouched_2398(t *testing.T) {
 	// paths — they are touched as rename sources, so no operator_scope_path_
 	// undelivered audit entry is appended (the caller gates the append on a
 	// non-empty return).
-	undelivered := operatorScopeUndelivered(
+	undelivered, undeliveredIndeterminate := operatorScopeUndelivered(
 		[]string{"cli/internal/credstore/credstore.go", "cli/internal/credstore/credstore_test.go"}, diff)
 	if undelivered != nil {
 		t.Errorf("operatorScopeUndelivered = %v, want nil (rename sources are delivered)", undelivered)
+	}
+	if undeliveredIndeterminate {
+		t.Error("operatorScopeUndelivered indeterminate = true, want false (both R rows carry a source)")
 	}
 
 	// (iv) The rendered prompt contains no untouched-declared-path claim, and
@@ -5817,9 +5822,10 @@ func TestScopeProvenance_CopySourceStaysUntouched(t *testing.T) {
 	if prov.RenameProvenanceIndeterminate {
 		t.Error("RenameProvenanceIndeterminate = true, want false (a copy row never sets it)")
 	}
-	// operatorScopeUndelivered still fires for a copy source (it was not delivered).
-	if got := operatorScopeUndelivered([]string{"pkg/old.go"}, diff); len(got) != 1 || got[0] != "pkg/old.go" {
-		t.Errorf("operatorScopeUndelivered = %v, want [pkg/old.go] (copy source stays undelivered)", got)
+	// operatorScopeUndelivered still fires for a copy source (it was not
+	// delivered) and stays determinate (a copy row never sets indeterminate).
+	if got, indeterminate := operatorScopeUndelivered([]string{"pkg/old.go"}, diff); len(got) != 1 || got[0] != "pkg/old.go" || indeterminate {
+		t.Errorf("operatorScopeUndelivered = %v (indeterminate=%v), want [pkg/old.go] determinate (copy source stays undelivered)", got, indeterminate)
 	}
 }
 
@@ -5864,6 +5870,188 @@ func TestScopeProvenance_RenameOldPathAbsent_Indeterminate(t *testing.T) {
 	}
 	if strings.Contains(rendered, "pkg/declared.go (plan scope, UNTOUCHED — reviewer judgment") {
 		t.Errorf("rendered prompt must NOT assert the path UNTOUCHED as fact under indeterminate mode:\n%s", rendered)
+	}
+}
+
+// TestScopeProvenance_CopyOldPathAbsent_NotIndeterminate pins the source-less
+// COPY carve-out (#2398 binding condition 2 / fixup): a `C` row with an EMPTY
+// OldPath must NOT set RenameProvenanceIndeterminate — a copy source is never
+// counted as touched, so a missing copy source cannot turn an absent declared
+// path into a secretly-touched one, and the untouched label stays provably
+// accurate. The declared path renders plainly UNTOUCHED, not hedged. Without the
+// `Status == StatusRenamed` guard a future edit broadening the trigger to
+// source-less C rows would pass every other test in this diff — this is the case
+// that would catch it.
+func TestScopeProvenance_CopyOldPathAbsent_NotIndeterminate(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	pl := &plan.Plan{Scope: plan.Scope{Files: []plan.ScopeFile{
+		{Path: "pkg/declared.go", Operation: plan.FileOpModify},
+	}}}
+	// A C row with no source path — declared.go is absent from the committed set,
+	// and a source-less COPY must leave the diff mode DETERMINATE.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "x.go", Status: policy.StatusCopied}, // empty OldPath
+	}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("prov = nil; want an untouched plan path")
+	}
+	if prov.RenameProvenanceIndeterminate {
+		t.Error("RenameProvenanceIndeterminate = true, want false (a source-less COPY row never sets it)")
+	}
+	if !containsString(prov.PlanUntouched, "pkg/declared.go") {
+		t.Errorf("PlanUntouched = %v, want to contain pkg/declared.go", prov.PlanUntouched)
+	}
+	// Rendered: plainly UNTOUCHED (reviewer judgment), NOT hedged as
+	// not-determinable.
+	rendered, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: pl,
+		Diff:         renderDiffForReview(diff),
+		GateEvidence: &prompt.GateEvidence{ScopeProvenance: prov},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(rendered, "pkg/declared.go (plan scope, UNTOUCHED — reviewer judgment") {
+		t.Errorf("rendered prompt must render the declared path plainly UNTOUCHED under a source-less COPY:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "NOT DETERMINABLE") {
+		t.Errorf("rendered prompt must NOT hedge under a source-less COPY row:\n%s", rendered)
+	}
+}
+
+// TestScopeProvenance_FoldedRenameSource_PreservesProvenance pins that a rename
+// whose SOURCE is a folded (operator-added) path is rendered with its ACTUAL
+// provenance — "folded: <channel>" — not misrepresented as an approved-plan
+// entry, and is NOT double-rendered in the folds list (#2398 fixup, concern 2).
+func TestScopeProvenance_FoldedRenameSource_PreservesProvenance(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	// Plan declares one real path (touched below); the operator ADDED
+	// frontend/added.tsx via add_scope_files, and the diff RENAMES that folded
+	// path to frontend/moved.tsx — so its rename source is a FOLD, not plan scope.
+	pl := provenancePlan("backend/other.go")
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/other.go", Status: policy.StatusModified},
+		renameRow("frontend/added.tsx", "frontend/moved.tsx"),
+	}}
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"frontend/added.tsx"}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, trig, diff, nil)
+	if prov == nil {
+		t.Fatal("prov = nil; want a provenance naming the folded rename")
+	}
+	if len(prov.Renames) != 1 {
+		t.Fatalf("Renames = %+v, want exactly 1", prov.Renames)
+	}
+	rn := prov.Renames[0]
+	if rn.OldPath != "frontend/added.tsx" || rn.NewPath != "frontend/moved.tsx" {
+		t.Errorf("Renames[0] = %+v, want frontend/added.tsx -> frontend/moved.tsx", rn)
+	}
+	if rn.Provenance != "folded: approval-add-scope-files" {
+		t.Errorf("Renames[0].Provenance = %q, want %q (a folded rename source is not plan scope)",
+			rn.Provenance, "folded: approval-add-scope-files")
+	}
+	// The rename source must NOT also appear in the folds list (no double-render).
+	if _, ok := foldByPath(prov.Folds, "frontend/added.tsx"); ok {
+		t.Errorf("Folds = %+v, want frontend/added.tsx dropped (it renders once, as a rename)", prov.Folds)
+	}
+	// Rendered: labeled folded, NOT plan scope, and named only once.
+	rendered, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: pl,
+		Diff:         renderDiffForReview(diff),
+		GateEvidence: &prompt.GateEvidence{ScopeProvenance: prov},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(rendered, "frontend/added.tsx (folded: approval-add-scope-files, TOUCHED as the SOURCE side of a rename -> frontend/moved.tsx") {
+		t.Errorf("rendered prompt must label the folded rename source with its fold channel:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "frontend/added.tsx (plan scope, TOUCHED") {
+		t.Errorf("rendered prompt must NOT misrepresent a folded rename source as plan scope:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "frontend/added.tsx (folded: approval-add-scope-files)") {
+		t.Errorf("rendered prompt must NOT ALSO render the rename source in the folds list:\n%s", rendered)
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_Indeterminate is the concern-1
+// cross-boundary test (#2398 fixup): an operator-added scope path absent from a
+// committed diff that ALSO carries a source-less rename row. The undelivered
+// second evidence surface must PRESERVE the indeterminate state — the audit
+// payload marks it Indeterminate, and the rendered prompt HEDGES the warning as
+// NOT DETERMINABLE rather than asserting it as a definitive high-priority miss,
+// so it never contradicts the scope-provenance surface (which hedges the same
+// path). Deleting the call-site threading of the indeterminate flag reddens this.
+func TestRunImplementReviews_OperatorScopeUndelivered_Indeterminate(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+
+	// The committed diff touches the plan file and carries a source-less rename
+	// row (empty OldPath) — the legacy/consolidated diff mode — but NOT addPath.
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: "backend/internal/foo/moved.go", Status: policy.StatusRenamed}, // empty OldPath → indeterminate
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	// The audit entry preserves the indeterminate state.
+	au.mu.Lock()
+	var indeterminate, found bool
+	var undeliveredPaths []string
+	for i := range au.appended {
+		if au.appended[i].Category != operatorScopeUndeliveredCategory {
+			continue
+		}
+		found = true
+		var p operatorScopeUndeliveredPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			au.mu.Unlock()
+			t.Fatalf("unmarshal operator_scope_path_undelivered payload: %v", err)
+		}
+		indeterminate = p.Indeterminate
+		undeliveredPaths = p.UndeliveredPaths
+	}
+	au.mu.Unlock()
+	if !found {
+		t.Fatal("no operator_scope_path_undelivered audit entry appended")
+	}
+	if !indeterminate {
+		t.Error("audit payload Indeterminate = false, want true (a source-less rename makes it not determinable)")
+	}
+	if !containsString(undeliveredPaths, addPath) {
+		t.Errorf("undelivered paths = %v, want to contain %q", undeliveredPaths, addPath)
+	}
+
+	// The rendered prompt HEDGES rather than asserting the miss as fact.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	if !strings.Contains(got, "operator_scope_path_undelivered (INDETERMINATE") {
+		t.Errorf("prompt must render the hedged INDETERMINATE header:\n%s", got)
+	}
+	if strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):") {
+		t.Errorf("prompt must NOT assert the undelivered miss as fact under indeterminate mode:\n%s", got)
+	}
+	if strings.Contains(got, "This is a deterministic, machine-verified signal") {
+		t.Errorf("prompt must NOT render the fact-framing explanation under indeterminate mode:\n%s", got)
+	}
+	if !strings.Contains(got, "- "+addPath) {
+		t.Errorf("prompt must still list the candidate path %q:\n%s", addPath, got)
 	}
 }
 

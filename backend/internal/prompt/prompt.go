@@ -769,6 +769,15 @@ type GateEvidence struct {
 	// a high-priority operator_scope_path_undelivered warning. Nil/empty omits
 	// the block.
 	OperatorScopeUndelivered []string
+	// OperatorScopeUndeliveredIndeterminate hedges the OperatorScopeUndelivered
+	// warning when the committed diff carries rename rows with no source path
+	// (#2398 fixup): an operator-added path absent from the committed file set
+	// cannot be distinguished from a rename source, so its undelivered status is
+	// NOT determinable. writeGateEvidence then renders the block hedged rather
+	// than asserting the paths undelivered as fact — matching how ScopeProvenance
+	// hedges its untouched labels under the same diff mode, so the two surfaces
+	// never contradict. False keeps the render byte-identical.
+	OperatorScopeUndeliveredIndeterminate bool
 	// ScopeProvenance decomposes the declared scope.files count into its
 	// provenance (#1914) so the implement reviewer can machine-classify a
 	// declared-vs-staged COUNT divergence as NON-drift when it is fully
@@ -842,6 +851,12 @@ type GateScopeProvenance struct {
 type GateScopeRename struct {
 	OldPath string
 	NewPath string
+	// Provenance names the old path's ACTUAL source — "plan scope" for a plan
+	// scope.files entry, or "folded: <channel>" for an operator-added / folded
+	// path — so a folded rename source is not misrendered as an approved-plan
+	// entry (#2398 fixup). Empty renders as "plan scope" for backward
+	// compatibility with a caller that predates the field.
+	Provenance string
 }
 
 // GateScopeFold is one folded (non-plan) effective-scope entry (#1914): the
@@ -3947,9 +3962,16 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	// the signal is present (#1407), so an empty/nil OperatorScopeUndelivered
 	// keeps the prompt byte-identical to the pre-change render.
 	if len(ev.OperatorScopeUndelivered) > 0 {
-		b.WriteString("- An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left " +
-			"UNTOUCHED) is a high-priority miss — a likely dropped operator-required edit. Treat it as outranking " +
-			"stylistic findings and name it before them.\n")
+		if ev.OperatorScopeUndeliveredIndeterminate {
+			b.WriteString("- The `operator_scope_path_undelivered` block below is INDETERMINATE under this diff mode " +
+				"(the diff carries rename rows with no source path, so an absent path cannot be distinguished from a " +
+				"rename source). Do NOT treat the listed paths as definitively undelivered; verify each against the " +
+				"changed-file list before raising it.\n")
+		} else {
+			b.WriteString("- An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left " +
+				"UNTOUCHED) is a high-priority miss — a likely dropped operator-required edit. Treat it as outranking " +
+				"stylistic findings and name it before them.\n")
+		}
 	}
 	b.WriteString("- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is " +
 		"CI-green; state the unverified status in a concern or in `free_form`.\n")
@@ -4056,12 +4078,19 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		// source side of the "R <old> -> <new>" row in the changed-file list
 		// above. Both facts are stated plainly so the two never read as a
 		// contradiction (binding condition 1): no keyed row of its own, yet
-		// present as the rename source — NOT an untouched declared path.
+		// present as the rename source — NOT an untouched declared path. The
+		// old path's ACTUAL provenance (plan scope or fold channel) is named so
+		// a folded/operator-added rename source is not misrendered as an
+		// approved-plan entry (#2398 fixup).
 		for _, rn := range p.Renames {
-			fmt.Fprintf(b, "  - %s (plan scope, TOUCHED as the SOURCE side of a rename -> %s; git recorded a "+
+			prov := rn.Provenance
+			if prov == "" {
+				prov = "plan scope"
+			}
+			fmt.Fprintf(b, "  - %s (%s, TOUCHED as the SOURCE side of a rename -> %s; git recorded a "+
 				"single R row for the move, so %s has no standalone changed-file row of its own but IS shown as "+
 				"the source side of the \"R %s -> %s\" row in the changed-file list above — this is NOT an "+
-				"untouched declared path)\n", rn.OldPath, rn.NewPath, rn.OldPath, rn.OldPath, rn.NewPath)
+				"untouched declared path)\n", rn.OldPath, prov, rn.NewPath, rn.OldPath, rn.OldPath, rn.NewPath)
 		}
 		// Untouched PLAN paths are their own distinctly-labeled reviewer-judgment
 		// category — NOT auto-classified as non-drift (unless the fix-up ceiling
@@ -4133,14 +4162,25 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	}
 
 	if len(ev.OperatorScopeUndelivered) > 0 {
-		b.WriteString("operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):\n\n")
-		b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded " +
-			"at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — yet the " +
-			"committed tree did NOT touch them. This is a deterministic, machine-verified signal: each path is absent " +
-			"from the committed file set. Treat it as a HIGH-priority miss — a likely dropped operator-required edit, " +
-			"not a stylistic finding — and name it before stylistic concerns. (Scope here is untouched-only: a path " +
-			"the commit DID touch but with the wrong content is not detected deterministically and remains for you to " +
-			"judge on the diff.)\n\n")
+		if ev.OperatorScopeUndeliveredIndeterminate {
+			b.WriteString("operator_scope_path_undelivered (INDETERMINATE — operator-added scope path possibly left " +
+				"UNTOUCHED):\n\n")
+			b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path " +
+				"folded at plan approval or an approved mid-stage scope amendment (often a binding-condition test). " +
+				"They are absent from the committed file set, BUT this diff carries rename rows with NO source path, " +
+				"so an absent path cannot be distinguished from a rename source — the undelivered status is NOT " +
+				"DETERMINABLE. Do NOT assert these as definitively undelivered; verify each against the changed-file " +
+				"list (a path shown as a rename source WAS delivered) before raising it.\n\n")
+		} else {
+			b.WriteString("operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):\n\n")
+			b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded " +
+				"at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — yet the " +
+				"committed tree did NOT touch them. This is a deterministic, machine-verified signal: each path is absent " +
+				"from the committed file set. Treat it as a HIGH-priority miss — a likely dropped operator-required edit, " +
+				"not a stylistic finding — and name it before stylistic concerns. (Scope here is untouched-only: a path " +
+				"the commit DID touch but with the wrong content is not detected deterministically and remains for you to " +
+				"judge on the diff.)\n\n")
+		}
 		for _, p := range ev.OperatorScopeUndelivered {
 			fmt.Fprintf(b, "- %s\n", p)
 		}

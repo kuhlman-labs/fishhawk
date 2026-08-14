@@ -2698,6 +2698,12 @@ type operatorScopeUndeliveredPayload struct {
 	UndeliveredPaths   []string `json:"undelivered_paths"`
 	UndeliveredCount   int      `json:"undelivered_count"`
 	OperatorAddedCount int      `json:"operator_added_count"`
+	// Indeterminate is true when the committed diff carried a rename row with no
+	// source path, so an absent operator-added path cannot be distinguished from
+	// a rename source and the undelivered set is NOT determinable (#2398 fixup).
+	// omitempty keeps a determinable-diff payload byte-identical to before the
+	// field existed and older rows decode to false.
+	Indeterminate bool `json:"indeterminate,omitempty"`
 }
 
 // concernRelitigationSuppressedCategory is the audit-log category for the
@@ -3381,16 +3387,22 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// WARN-logs a nil repo / list error and contributes nothing).
 	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
 	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
-	if undelivered := operatorScopeUndelivered(operatorAdded, diff); len(undelivered) > 0 {
+	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, diff); len(undelivered) > 0 {
 		// Populate the prompt signal so the reviewer sees the miss as a
 		// high-priority gate-evidence warning. Allocate gateEvidence if the
 		// bundle carried none (mirrors the existing allocate-if-needed
-		// pattern), then thread it onto the trigger.
+		// pattern), then thread it onto the trigger. Under an indeterminate
+		// diff mode (rename rows with no source path) the undelivered status is
+		// not determinable — an absent path cannot be distinguished from a
+		// rename source — so the flag is threaded through and writeGateEvidence
+		// hedges the warning rather than asserting it as fact, matching the
+		// scope-provenance surface (#2398 fixup).
 		if gateEvidence == nil {
 			gateEvidence = &prompt.GateEvidence{}
 			trig.GateEvidence = gateEvidence
 		}
 		gateEvidence.OperatorScopeUndelivered = undelivered
+		gateEvidence.OperatorScopeUndeliveredIndeterminate = undeliveredIndeterminate
 
 		// Append the deterministic advisory audit entry so the miss is
 		// visible on the run surface BEFORE any reviewer verdict. Best-effort
@@ -3401,6 +3413,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				UndeliveredPaths:   undelivered,
 				UndeliveredCount:   len(undelivered),
 				OperatorAddedCount: len(operatorAdded),
+				Indeterminate:      undeliveredIndeterminate,
 			})
 			systemKind := audit.ActorKind("system")
 			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -3775,6 +3788,11 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 	}
 
 	var folds []prompt.GateScopeFold
+	// foldSource records each folded path's provenance channel so a rename whose
+	// SOURCE is a folded (operator-added) path is rendered with its ACTUAL
+	// provenance instead of being mislabeled "plan scope" (#2398 fixup). A path
+	// absent from this map is a plan-scope entry (inScope is plan ∪ folds).
+	foldSource := make(map[string]string)
 	addFold := func(paths []string, source string) {
 		for _, p := range paths {
 			// first-source-wins dedup (plan wins over folds; earlier fold wins
@@ -3783,6 +3801,7 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 				continue
 			}
 			inScope[p] = struct{}{}
+			foldSource[p] = source
 			accum = append(accum, scopeFile{Path: p, Operation: "modify"})
 			folds = append(folds, prompt.GateScopeFold{Path: p, Source: source, Touched: touched(p)})
 		}
@@ -3810,11 +3829,37 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 	// every rename in the diff. Each names a declared path that is TOUCHED as a
 	// rename source (so it never appears in planUntouched), which the prompt
 	// renders as a positive line so the evidence is self-explanatory (#2398).
+	// Provenance carries the old path's ACTUAL source (plan scope or the fold
+	// channel) so a folded/operator-added rename source is not misrendered as a
+	// plan-scope entry (#2398 fixup).
 	var scopeRenames []prompt.GateScopeRename
+	renameSources := make(map[string]struct{})
 	for _, rp := range renames {
-		if _, ok := inScope[rp.OldPath]; ok {
-			scopeRenames = append(scopeRenames, prompt.GateScopeRename{OldPath: rp.OldPath, NewPath: rp.NewPath})
+		if _, ok := inScope[rp.OldPath]; !ok {
+			continue
 		}
+		provenance := "plan scope"
+		if src, ok := foldSource[rp.OldPath]; ok {
+			provenance = "folded: " + src
+		}
+		scopeRenames = append(scopeRenames, prompt.GateScopeRename{
+			OldPath: rp.OldPath, NewPath: rp.NewPath, Provenance: provenance,
+		})
+		renameSources[rp.OldPath] = struct{}{}
+	}
+	// A rename source already rendered as its own positive rename line must NOT
+	// also appear in the folds list, or the reviewer sees the same path twice
+	// (#2398 fixup). Drop it from folds; its touch state (TOUCHED as a rename
+	// source) is fully conveyed by the rename line.
+	if len(renameSources) > 0 {
+		kept := folds[:0]
+		for _, f := range folds {
+			if _, ok := renameSources[f.Path]; ok {
+				continue
+			}
+			kept = append(kept, f)
+		}
+		folds = kept
 	}
 
 	unexplained := 0
@@ -5328,11 +5373,20 @@ func committedPathSet(diff policy.Diff) (set map[string]struct{}, renames []rena
 // entries and non-repo-relative tokens are skipped (mirroring MissingScopeFiles)
 // — a directory or absolute/traversal token can never name a committed diff
 // path, so it would only produce false positives.
-func operatorScopeUndelivered(operatorAdded []string, diff policy.Diff) []string {
+//
+// indeterminate mirrors committedPathSet: it is true when the diff carries a
+// rename row with no source path, so an operator-added path absent from the
+// committed set cannot be distinguished from a rename source. The caller
+// preserves this so the operator-scope-undelivered surface HEDGES the warning
+// as not-determinable rather than asserting it as fact — the same diff mode
+// under which scopeProvenanceForReview hedges its untouched labels (#2398
+// fixup). It is reported alongside a non-empty undelivered set so the reviewer
+// still sees the candidate paths, just not as a definitive miss.
+func operatorScopeUndelivered(operatorAdded []string, diff policy.Diff) (undelivered []string, indeterminate bool) {
 	if len(operatorAdded) == 0 {
-		return nil
+		return nil, false
 	}
-	committed, _, _ := committedPathSet(diff)
+	committed, _, indeterminate := committedPathSet(diff)
 	var out []string
 	seen := make(map[string]struct{}, len(operatorAdded))
 	for _, p := range operatorAdded {
@@ -5348,7 +5402,7 @@ func operatorScopeUndelivered(operatorAdded []string, diff policy.Diff) []string
 		seen[p] = struct{}{}
 		out = append(out, p)
 	}
-	return out
+	return out, indeterminate
 }
 
 // gateEvidenceForReview maps the bundle's gate_evidence wire struct into
