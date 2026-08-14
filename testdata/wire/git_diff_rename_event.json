@@ -1,0 +1,1 @@
+{"kind":"name_status","base_ref":"main","files":[{"path":"internal/credstore/credstore.go","status":"R","old_path":"cli/internal/credstore/credstore.go"},{"path":"backend/internal/server/trace.go","status":"M"}],"num_files":2}

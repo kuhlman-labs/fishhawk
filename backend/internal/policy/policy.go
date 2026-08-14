@@ -46,6 +46,19 @@ const (
 type ChangedFile struct {
 	Path   string
 	Status Status
+	// OldPath is the rename/copy SOURCE path — the pre-move name of a
+	// file reported as an R (rename) or C (copy) row. Populated only for
+	// R/C rows and empty for every ordinary row (and for older bundles
+	// that predate the wire field, which decode to empty).
+	//
+	// INFORMATIONAL to the policy engine: no check function reads it, so
+	// CountedFileCount, forbidden-paths, allowed-paths, and every other
+	// evaluator see byte-identical input whether or not it is populated —
+	// a rename stays ONE counted row on its destination Path. It exists so
+	// the backend's scope-provenance evidence can map a declared-deleted
+	// path to its rename destination rather than reporting it untouched
+	// (#2398). Mirror of the runner's constraint.ChangedFile.OldPath.
+	OldPath string
 }
 
 // Diff is the input to Evaluate: every file the stage touched, in

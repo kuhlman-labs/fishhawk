@@ -132,6 +132,69 @@ func TestEmitEvaluation_Pass(t *testing.T) {
 	}
 }
 
+// TestEmitEvaluation_OldPathWireRoundTrip pins the #2398 OldPath audit-wire
+// contract (fixup concern 4): a non-rename DiffEntry serializes WITHOUT an
+// `old_path` key (omitempty keeps a legacy payload byte-identical and older
+// audit rows decode to empty), while a rename (R) entry round-trips OldPath
+// through the audit payload — the same omitempty / legacy-decode properties the
+// bundle wire got, now pinned on the audit surface (EmitEvaluation payload).
+func TestEmitEvaluation_OldPathWireRoundTrip(t *testing.T) {
+	repo := &fakeAuditRepo{}
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	d := Diff{ChangedFiles: []ChangedFile{
+		{Path: "backend/plain.go", Status: StatusModified},
+		{Path: "internal/moved.go", OldPath: "moved.go", Status: StatusRenamed},
+	}}
+	if _, err := EmitEvaluation(
+		context.Background(), repo, runID, stageID,
+		"implement", d, Constraints{}, nil,
+	); err != nil {
+		t.Fatalf("EmitEvaluation: %v", err)
+	}
+
+	// (a) On-wire: the non-rename entry carries NO old_path key; the rename entry
+	// does. Inspect the raw JSON so the omitempty contract is checked on-wire,
+	// not merely after decode (where an absent key and an empty string collapse).
+	var raw struct {
+		Diff []map[string]json.RawMessage `json:"diff"`
+	}
+	if err := json.Unmarshal(repo.captured.Payload, &raw); err != nil {
+		t.Fatalf("payload unmarshal (raw): %v", err)
+	}
+	if len(raw.Diff) != 2 {
+		t.Fatalf("diff entries = %d, want 2", len(raw.Diff))
+	}
+	if _, ok := raw.Diff[0]["old_path"]; ok {
+		t.Errorf("non-rename entry serialized an old_path key: %s", repo.captured.Payload)
+	}
+	if _, ok := raw.Diff[1]["old_path"]; !ok {
+		t.Errorf("rename entry omitted its old_path key: %s", repo.captured.Payload)
+	}
+
+	// (b) OldPath round-trips through decode back into a DiffEntry.
+	var got EvaluationPayload
+	if err := json.Unmarshal(repo.captured.Payload, &got); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if got.Diff[0].OldPath != "" {
+		t.Errorf("non-rename OldPath = %q, want empty", got.Diff[0].OldPath)
+	}
+	if got.Diff[1].OldPath != "moved.go" {
+		t.Errorf("rename OldPath = %q, want moved.go (round-trip)", got.Diff[1].OldPath)
+	}
+
+	// (c) A legacy payload with no old_path key decodes to an empty OldPath.
+	var legacy DiffEntry
+	if err := json.Unmarshal([]byte(`{"path":"a.go","status":"M"}`), &legacy); err != nil {
+		t.Fatalf("legacy decode: %v", err)
+	}
+	if legacy.OldPath != "" {
+		t.Errorf("legacy DiffEntry.OldPath = %q, want empty", legacy.OldPath)
+	}
+}
+
 func TestEmitEvaluation_Violations(t *testing.T) {
 	repo := &fakeAuditRepo{}
 	runID := uuid.New()

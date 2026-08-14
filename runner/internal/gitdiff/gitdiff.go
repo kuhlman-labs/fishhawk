@@ -209,6 +209,17 @@ func (r *Runner) RunPatch(ctx context.Context, baseRef, repoDir string) (patch s
 // We use the -z (NUL-terminated) form to dodge filenames with
 // special characters; the same parser handles the renamed/copied
 // case by consuming three fields when status is R or C.
+//
+// The porcelain `git diff --name-status` form performs rename
+// detection by DEFAULT (git-config diff.renames defaults to true since
+// git 2.9), so a moved file is reported as a single R<score> record —
+// git does NOT emit a separate D + A pair, and the source path exists
+// NOWHERE else in the event. Parse therefore records the source in
+// ChangedFile.OldPath rather than discarding it, so a downstream
+// consumer can tell a declared-deleted path was realized as a rename
+// source rather than left untouched (#2398). OldPath rides on the same
+// row and is never read by the constraint engine, so counting is
+// unaffected.
 func Parse(raw []byte) (constraint.Diff, error) {
 	var d constraint.Diff
 	if len(raw) == 0 {
@@ -240,17 +251,22 @@ func Parse(raw []byte) (constraint.Diff, error) {
 		path := scanner.Text()
 
 		if statusLetter == "R" || statusLetter == "C" {
-			// Old path follows; we record the new path (the
-			// destination) since constraints look at the resulting
-			// tree.
+			// For R/C the first path token is the SOURCE (oldPath) and a
+			// second token is the DESTINATION. We key the row on the
+			// destination (constraints look at the resulting tree) but
+			// also record the source in OldPath so a downstream consumer
+			// can map a declared-deleted path to its rename destination
+			// (#2398). The source appears nowhere else in the -z stream.
+			oldPath := path
 			if !scanner.Scan() {
 				return constraint.Diff{},
-					fmt.Errorf("missing destination path after rename/copy from %q", path)
+					fmt.Errorf("missing destination path after rename/copy from %q", oldPath)
 			}
 			newPath := scanner.Text()
 			d.ChangedFiles = append(d.ChangedFiles, constraint.ChangedFile{
-				Path:   newPath,
-				Status: constraint.Status(statusLetter),
+				Path:    newPath,
+				OldPath: oldPath,
+				Status:  constraint.Status(statusLetter),
 			})
 			continue
 		}

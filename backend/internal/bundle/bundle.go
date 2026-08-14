@@ -194,11 +194,12 @@ type Line struct {
 
 // gitDiffPayload mirrors the runner's payload struct exactly.
 // Adding fields requires both sides to agree. The `patch` /
-// `patch_truncated` json tags MUST stay identical to the runner's
-// gitDiffPayload (runner/cmd/fishhawk-runner/main.go) — this is the
-// runner↔backend wire contract, not a JSON Schema, so the two sides
-// move in lockstep. Patch is additive: older bundles omit it and
-// decode to an empty string (#585). Insertions/Deletions are likewise
+// `patch_truncated` json tags — and the per-file `old_path` tag on
+// gitDiffEntry (#2398) — MUST stay identical to the runner's
+// gitDiffPayload / gitDiffFile (runner/cmd/fishhawk-runner/main.go) —
+// this is the runner↔backend wire contract, not a JSON Schema, so the
+// two sides move in lockstep. Patch is additive: older bundles omit it
+// and decode to an empty string (#585). Insertions/Deletions are likewise
 // additive and `omitempty` (#1137): they carry the staged-diff numstat
 // totals so the MCP server reports diff stats from the event rather than
 // re-deriving them from the operator checkout's HEAD, which per-run
@@ -214,9 +215,16 @@ type gitDiffPayload struct {
 	Deletions      int            `json:"deletions,omitempty"`
 }
 
+// gitDiffEntry mirrors the runner's gitDiffFile
+// (runner/cmd/fishhawk-runner/main.go). OldPath carries the rename/copy
+// SOURCE path for R/C rows (#2398); the `old_path` json tag MUST stay
+// identical to the runner's gitDiffFile — the runner↔backend wire
+// contract. Additive and `omitempty`: older bundles omit the key and
+// decode to an empty OldPath, no error and no fabricated default.
 type gitDiffEntry struct {
-	Path   string `json:"path"`
-	Status string `json:"status"`
+	Path    string `json:"path"`
+	Status  string `json:"status"`
+	OldPath string `json:"old_path,omitempty"`
 }
 
 // scopeDriftPayload mirrors the runner's scope_drift policy_event
@@ -563,6 +571,9 @@ func ExtractDiff(bundleBytes []byte) (policy.Diff, error) {
 			d.ChangedFiles = append(d.ChangedFiles, policy.ChangedFile{
 				Path:   f.Path,
 				Status: policy.Status(f.Status),
+				// Rename/copy SOURCE path for R/C rows (#2398). Empty for
+				// ordinary rows and for older bundles that omit the key.
+				OldPath: f.OldPath,
 			})
 		}
 		out = d

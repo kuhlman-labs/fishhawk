@@ -14,6 +14,10 @@ The runner emits the `git_diff` event whenever `--check-base-ref` is set (decoup
 
 Pre-#296 the form was `<base>...HEAD`, which only saw committed state; agents leaving edits unstaged (the common case for Claude Code) shipped empty diff events and every PR silently failed `tests_added_or_updated` / `max_files_changed`.
 
+## Rename/copy source capture (#2398)
+
+`git diff --name-status` is a **porcelain** command, so rename detection is **ON by default** (`diff.renames` defaults to true since git 2.9): a moved file is reported as a single `R<score>` record — git does NOT emit a separate `D` + `A` pair, and the source path appears nowhere else in the event. `gitdiff.Parse` therefore records the source in `ChangedFile.OldPath` (populated only for `R`/`C` rows, empty for every ordinary row) and rides it onto the wire as the per-file `old_path` field. `OldPath` is **informational to the constraint engine** — no check function reads it, so `CountedFileCount`, forbidden-paths, and every other evaluator see byte-identical input and a rename stays ONE counted row on its destination `Path`. It exists so the backend's scope-provenance evidence can tell that a declared-deleted path was realized as the source side of a move rather than left untouched (which manufactured a spurious `evidence_conflict` on run 933cd6ee / PR #2397).
+
 ## Patch payload (#585)
 
 `computeAndEmitDiff` additionally runs `git diff --cached <base>` (no `--name-status`) via `gitdiff.Runner.RunPatch` to capture the full unified-diff hunk text into the `git_diff` event's optional `patch` field (size-capped at 256 KiB with a truncation marker; `patch_truncated` flags the cap).

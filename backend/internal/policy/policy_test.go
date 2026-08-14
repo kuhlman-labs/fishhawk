@@ -170,6 +170,45 @@ func TestMaxFilesChanged_Over(t *testing.T) {
 	}
 }
 
+// TestCountedFileCount_OldPathIsInformational mirrors the runner's
+// constraint test: the #2398 OldPath field is INFORMATIONAL to the policy
+// engine. The same diff with and without OldPath populated yields the
+// identical CountedFileCount AND the identical Evaluate verdict under a
+// max_files_changed limit set exactly at the row count — a rename stays ONE
+// counted row on its destination Path.
+func TestCountedFileCount_OldPathIsInformational(t *testing.T) {
+	withOldPath := Diff{ChangedFiles: []ChangedFile{
+		{Path: "a.go", Status: StatusModified},
+		{Path: "internal/moved.go", OldPath: "moved.go", Status: StatusRenamed},
+	}}
+	withoutOldPath := Diff{ChangedFiles: []ChangedFile{
+		{Path: "a.go", Status: StatusModified},
+		{Path: "internal/moved.go", Status: StatusRenamed},
+	}}
+
+	if got, want := CountedFileCount(withOldPath), CountedFileCount(withoutOldPath); got != want {
+		t.Fatalf("CountedFileCount diverged on OldPath: with=%d without=%d", got, want)
+	}
+	if got := CountedFileCount(withOldPath); got != 2 {
+		t.Fatalf("CountedFileCount = %d, want 2 (a rename is ONE counted row)", got)
+	}
+
+	c := Constraints{MaxFilesChanged: 2}
+	if v := Evaluate(withOldPath, c); len(v) != 0 {
+		t.Errorf("with OldPath: expected no violation at limit=2, got %+v", v)
+	}
+	if v := Evaluate(withoutOldPath, c); len(v) != 0 {
+		t.Errorf("without OldPath: expected no violation at limit=2, got %+v", v)
+	}
+	tight := Constraints{MaxFilesChanged: 1}
+	if v := Evaluate(withOldPath, tight); len(v) != 1 {
+		t.Errorf("with OldPath: expected 1 violation at limit=1, got %+v", v)
+	}
+	if v := Evaluate(withoutOldPath, tight); len(v) != 1 {
+		t.Errorf("without OldPath: expected 1 violation at limit=1, got %+v", v)
+	}
+}
+
 // TestIsGeneratedPath pins the generated/vendored allowlist (#2054):
 // sqlc db packages (a .go file under a db/ directory) and vendored deps
 // (vendor/) are exempt; hand-written non-db source is not. Parity with

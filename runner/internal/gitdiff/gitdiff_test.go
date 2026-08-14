@@ -50,20 +50,36 @@ func TestParse_SimpleAddedModifiedDeleted(t *testing.T) {
 
 func TestParse_RenameAndCopy(t *testing.T) {
 	// R100 = pure rename. C75 = copy with 75% similarity. The
-	// destination path goes second; we record the destination.
+	// destination path goes second; we record the destination as Path
+	// and the SOURCE as OldPath (#2398).
 	raw := []byte("R100\x00old.go\x00new.go\x00C75\x00source.go\x00dest.go\x00")
 	d, err := Parse(raw)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if len(d.ChangedFiles) != 2 {
-		t.Fatalf("got %d files, want 2: %+v", len(d.ChangedFiles), d.ChangedFiles)
+	want := []constraint.ChangedFile{
+		{Path: "new.go", OldPath: "old.go", Status: constraint.StatusRenamed},
+		{Path: "dest.go", OldPath: "source.go", Status: constraint.StatusCopied},
 	}
-	if d.ChangedFiles[0].Path != "new.go" || d.ChangedFiles[0].Status != constraint.StatusRenamed {
-		t.Errorf("rename: got %+v", d.ChangedFiles[0])
+	if !reflect.DeepEqual(d.ChangedFiles, want) {
+		t.Errorf("got %+v, want %+v", d.ChangedFiles, want)
 	}
-	if d.ChangedFiles[1].Path != "dest.go" || d.ChangedFiles[1].Status != constraint.StatusCopied {
-		t.Errorf("copy: got %+v", d.ChangedFiles[1])
+}
+
+func TestParse_RenameSpecialCharsPreservesSourceAndDest(t *testing.T) {
+	// The -z token walk pairs source/destination even when the paths
+	// carry characters git would otherwise C-quote (tab, space). Both
+	// tokens must survive verbatim and land as OldPath/Path (#2398).
+	raw := []byte("R100\x00old dir/a\tb.go\x00new dir/a\tb.go\x00")
+	d, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := []constraint.ChangedFile{
+		{Path: "new dir/a\tb.go", OldPath: "old dir/a\tb.go", Status: constraint.StatusRenamed},
+	}
+	if !reflect.DeepEqual(d.ChangedFiles, want) {
+		t.Errorf("got %+v, want %+v", d.ChangedFiles, want)
 	}
 }
 
@@ -261,6 +277,74 @@ func TestRun_RealRepo_CapturesUncommittedEdits(t *testing.T) {
 	}
 	if !sawNew {
 		t.Errorf("expected new_test.go (Added) in diff; got %+v", d.ChangedFiles)
+	}
+}
+
+// TestRun_RealGitRecordsRenameWithSource is the EMPIRICAL proof of the
+// assumption the whole #2398 fix rests on: `git diff --cached
+// --name-status -z <base>` (a PORCELAIN command) performs rename
+// detection BY DEFAULT, so a moved file is reported as a single R<score>
+// record carrying its SOURCE path — NOT a separate D + A pair. If git
+// instead emitted D + A, Parse would record no OldPath and the fix would
+// be inert; this test fails loudly in that world.
+//
+// Hermetic: GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null on
+// the diff command's environment so it exercises git's BUILT-IN default
+// (an operator `diff.renames=false` in a global/system config cannot mask
+// it). Skipped when git is absent from PATH.
+func TestRun_RealGitRecordsRenameWithSource(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+
+	mustRunGit(t, repo, "init", "--initial-branch=main")
+	mustRunGit(t, repo, "config", "user.name", "init")
+	mustRunGit(t, repo, "config", "user.email", "init@example.com")
+	mustRunGit(t, repo, "config", "commit.gpgsign", "false")
+	mustRunGit(t, repo, "config", "tag.gpgsign", "false")
+	// Content long enough that git's rename detection scores it R100 on a
+	// pure move (a one-byte file can be ambiguous).
+	body := []byte("package credstore\n\n// credstore holds credentials.\nfunc Load() {}\n")
+	if err := os.WriteFile(filepath.Join(repo, "credstore.go"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "initial")
+	mustRunGit(t, repo, "branch", "base")
+
+	// Pure rename: git mv preserves content, so the staged index vs base
+	// is a delete+create pair that porcelain rename detection collapses.
+	mustRunGit(t, repo, "mv", "credstore.go", "moved_credstore.go")
+	mustRunGit(t, repo, "add", "-A")
+
+	// Neutralize global/system git config on the diff command so the
+	// result reflects git's built-in rename-detection default, not the
+	// operator's environment.
+	hermetic := func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, name, args...)
+		c.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		return c
+	}
+	d, err := (&Runner{Cmd: hermetic}).Run(context.Background(), "base", repo)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(d.ChangedFiles) != 1 {
+		t.Fatalf("got %d changed files, want 1 R row (git collapsed the move); files=%+v",
+			len(d.ChangedFiles), d.ChangedFiles)
+	}
+	got := d.ChangedFiles[0]
+	if got.Status != constraint.StatusRenamed {
+		t.Fatalf("status = %q, want R — git did NOT collapse the move into a rename; "+
+			"the #2398 fix rests on porcelain rename detection being on by default; got %+v",
+			got.Status, got)
+	}
+	if got.Path != "moved_credstore.go" {
+		t.Errorf("destination Path = %q, want moved_credstore.go", got.Path)
+	}
+	if got.OldPath != "credstore.go" {
+		t.Errorf("OldPath = %q, want credstore.go (the rename SOURCE); got %+v", got.OldPath, got)
 	}
 }
 

@@ -5,6 +5,9 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -367,6 +370,82 @@ func TestExtractDiff_RoundTripsPatch(t *testing.T) {
 	}
 	if len(got.ChangedFiles) != 1 || got.ChangedFiles[0].Path != "a.go" {
 		t.Errorf("ChangedFiles = %+v, want single a.go", got.ChangedFiles)
+	}
+}
+
+// sharedGitDiffRenameFixture reads the SHARED cross-module wire fixture
+// (#2398 binding condition 3), anchored to this test source via
+// runtime.Caller — the same file the runner's
+// TestMakeGitDiffEvent_RenameCarriesOldPath asserts it emits byte-for-byte.
+// Decoding the runner's exact emitted bytes here (rather than a second
+// hand-maintained literal) is what closes the wire seam: a runner
+// serialization change the backend cannot decode fails THIS test.
+func sharedGitDiffRenameFixture(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the shared wire fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared wire fixture %s: %v", path, err)
+	}
+	return b
+}
+
+// TestExtractDiff_RenameOldPath is the BACKEND half of the #2398 wire seam.
+// It decodes the SHARED fixture — the exact git_diff payload the runner
+// emits — as a bundle's git_diff event and asserts the rename SOURCE
+// (old_path) round-trips into policy.ChangedFile.OldPath, while the plain
+// M row carries an empty OldPath.
+func TestExtractDiff_RenameOldPath(t *testing.T) {
+	fixture := sharedGitDiffRenameFixture(t)
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGitDiff, Data: json.RawMessage(fixture)},
+	}
+	got, err := ExtractDiff(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractDiff: %v", err)
+	}
+	want := []policy.ChangedFile{
+		{Path: "internal/credstore/credstore.go", Status: policy.StatusRenamed, OldPath: "cli/internal/credstore/credstore.go"},
+		{Path: "backend/internal/server/trace.go", Status: policy.StatusModified, OldPath: ""},
+	}
+	if len(got.ChangedFiles) != len(want) {
+		t.Fatalf("got %d files, want %d: %+v", len(got.ChangedFiles), len(want), got.ChangedFiles)
+	}
+	for i, w := range want {
+		if got.ChangedFiles[i] != w {
+			t.Errorf("file %d = %+v, want %+v", i, got.ChangedFiles[i], w)
+		}
+	}
+}
+
+// TestExtractDiff_RenameWithoutOldPath is the legacy/consolidated case: an
+// R row with NO old_path key (a pre-field bundle, or the forge-compare
+// consolidated-review diff) decodes to an empty OldPath — no error, no
+// fabricated default (#2398).
+func TestExtractDiff_RenameWithoutOldPath(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		// R row with no old_path key at all.
+		{Seq: 2, Kind: EventKindGitDiff, Data: json.RawMessage(
+			`{"kind":"name_status","base_ref":"origin/main","files":[{"path":"moved.go","status":"R"}],"num_files":1}`)},
+	}
+	got, err := ExtractDiff(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractDiff: %v", err)
+	}
+	if len(got.ChangedFiles) != 1 {
+		t.Fatalf("got %d files, want 1: %+v", len(got.ChangedFiles), got.ChangedFiles)
+	}
+	if got.ChangedFiles[0].OldPath != "" {
+		t.Errorf("OldPath = %q, want empty (no key → no default)", got.ChangedFiles[0].OldPath)
+	}
+	if got.ChangedFiles[0].Status != policy.StatusRenamed {
+		t.Errorf("Status = %q, want R", got.ChangedFiles[0].Status)
 	}
 }
 

@@ -45,6 +45,20 @@ const (
 type ChangedFile struct {
 	Path   string
 	Status Status
+	// OldPath is the rename/copy SOURCE path — the pre-move name of a
+	// file `git diff --name-status` reports as an R (rename) or C (copy)
+	// row. Populated ONLY for R/C rows and empty for every ordinary row.
+	//
+	// It is INFORMATIONAL to the constraint engine: no check function
+	// reads it. CountedFileCount, forbidden-paths, allowed-paths, and
+	// every other evaluator see byte-identical input whether or not it is
+	// populated — a rename stays ONE counted row on its destination Path.
+	// It exists so downstream consumers (the backend's scope-provenance
+	// evidence, #2398) can tell that a declared-deleted path was realized
+	// as the source side of a move rather than left untouched, because
+	// porcelain rename detection collapses the delete+create pair into a
+	// single R row that records only the destination.
+	OldPath string
 }
 
 // Diff is the input to Evaluate: every file the agent touched in
