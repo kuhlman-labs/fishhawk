@@ -10793,7 +10793,7 @@ func TestGetStagePrompt_Acceptance_ContestedContextAndRetiredCriterion(t *testin
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
 		}
 	}
-	if strings.Contains(resp.Prompt, "GET /widgets lists created widgets") {
+	if strings.Contains(resp.Prompt, "GET /widgets lists widgets") {
 		t.Errorf("retired criterion still renders in the live checklist\n---\n%s", resp.Prompt)
 	}
 	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
@@ -10828,8 +10828,114 @@ func TestRenderStagePrompt_Acceptance_ContestedContextAndRetiredCriterion(t *tes
 			t.Errorf("rendered acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
 		}
 	}
-	if strings.Contains(resp.Prompt, "GET /widgets lists created widgets") {
+	if strings.Contains(resp.Prompt, "GET /widgets lists widgets") {
 		t.Errorf("retired criterion still renders in the rendered live checklist\n---\n%s", resp.Prompt)
+	}
+}
+
+// seedAcceptanceRestatement records an approve-decision approval_submitted row
+// on the acceptance-prompt fixture's PLAN stage RESTATING ac-list and retiring
+// nothing, BY CONSTRUCTION (never through the approve gate). It is the
+// restate-only history the prompt paths must render: a restatement leaves the
+// criterion LIVE, so the only observable is which statement the checklist
+// carries.
+func seedAcceptanceRestatement(t *testing.T, s *Server, runID uuid.UUID, statement string) {
+	t.Helper()
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	var planStageID uuid.UUID
+	for _, st := range rr.stagesByRunID[runID] {
+		if st.Type == run.StageTypePlan {
+			planStageID = st.ID
+		}
+	}
+	if planStageID == uuid.Nil {
+		t.Fatal("fixture has no plan stage")
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"stage_id": planStageID.String(),
+		"decision": "approve",
+		"amend_acceptance_criteria": []acceptanceCriteriaAmendment{{
+			ID: "ac-list", Action: "restate", Reason: "the listing shape was narrowed at the gate",
+			Statement: statement,
+		}},
+	})
+	rid := runID
+	sid := planStageID
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: 4,
+		Category: "approval_submitted", Payload: raw,
+	})
+}
+
+// restatedACListStatement is the replacement statement both restate-only server
+// tests assert on. It is deliberately absent from the plan fixture, so a prompt
+// that fell back to the plan's criteria cannot contain it.
+const restatedACListStatement = "GET /widgets returns only the CURRENT page of created widgets"
+
+// TestGetStagePrompt_Acceptance_RestateOnly_RendersReplacement is the round-four
+// regression on the SIGNED dispatch prompt path: a recorded restatement with NO
+// retirement must reach the acceptance checklist. The resolver used to key
+// "was anything amended?" off the retired set alone, so a restate-only history
+// returned (nil, nil) and the prompt fell back to the plan's ORIGINAL statement —
+// the validator then judged the change against the very text the operator
+// replaced at the gate. The retired block must still not render: nothing was
+// retired.
+func TestGetStagePrompt_Acceptance_RestateOnly_RendersReplacement(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	seedAcceptanceRestatement(t, s, runID, restatedACListStatement)
+
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, restatedACListStatement) {
+		t.Errorf("acceptance prompt missing the restated statement %q\n---\n%s", restatedACListStatement, resp.Prompt)
+	}
+	if strings.Contains(resp.Prompt, "GET /widgets lists widgets") {
+		t.Errorf("acceptance prompt still renders the SUPERSEDED statement\n---\n%s", resp.Prompt)
+	}
+	if strings.Contains(resp.Prompt, "Retired at approval") {
+		t.Errorf("retired block rendered on a restate-only history\n---\n%s", resp.Prompt)
+	}
+	// The criterion stays LIVE: it is still on the checklist, and the served ids
+	// are still the full plan set.
+	if !strings.Contains(resp.Prompt, "ac-list") {
+		t.Errorf("restated criterion dropped from the live checklist\n---\n%s", resp.Prompt)
+	}
+	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want %v", resp.AcceptanceCriteriaIDs, want)
+	}
+}
+
+// TestRenderStagePrompt_Acceptance_RestateOnly_RendersReplacement pins the SAME
+// composition on the unsigned render/preview path — both acceptance prompt
+// surfaces must change together or the preview diverges from what the runner
+// receives.
+func TestRenderStagePrompt_Acceptance_RestateOnly_RendersReplacement(t *testing.T) {
+	s, runID, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	seedAcceptanceRestatement(t, s, runID, restatedACListStatement)
+
+	w := promptRenderRequest(t, s, acceptanceStageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, restatedACListStatement) {
+		t.Errorf("rendered acceptance prompt missing the restated statement %q\n---\n%s", restatedACListStatement, resp.Prompt)
+	}
+	if strings.Contains(resp.Prompt, "GET /widgets lists widgets") {
+		t.Errorf("rendered acceptance prompt still renders the SUPERSEDED statement\n---\n%s", resp.Prompt)
+	}
+	if strings.Contains(resp.Prompt, "Retired at approval") {
+		t.Errorf("retired block rendered on a restate-only history\n---\n%s", resp.Prompt)
 	}
 }
 

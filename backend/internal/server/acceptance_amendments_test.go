@@ -205,6 +205,48 @@ func TestResolveEffectiveCriteria_Restate_StaysLive(t *testing.T) {
 	if len(eff.Retired) != 0 {
 		t.Errorf("Retired = %+v, want empty (a restate never retires)", eff.Retired)
 	}
+	if want := []string{"crit-2"}; !reflect.DeepEqual(eff.Restated, want) {
+		t.Errorf("Restated = %v, want %v — Live alone cannot signal a restate-only amendment", eff.Restated, want)
+	}
+	if !eff.amended() {
+		t.Error("amended() = false on a restate-only history; the prompt would fall back to the plan's original statements")
+	}
+}
+
+// TestResolveAcceptancePromptCriteria_RestateOnly_RendersReplacement pins the
+// PROMPT caller's composition for a restate-only history: the live set (carrying
+// the replacement statement) is returned so buildAcceptance renders it, and the
+// retired list stays nil so the retired block does not render.
+func TestResolveAcceptancePromptCriteria_RestateOnly_RendersReplacement(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	au.seedApprovalEntry(runRow.ID, stage.ID, 6, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: "restate", Reason: "narrowed at the gate", Statement: "healthz reports the STAGE budget"},
+	})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+
+	live, retired := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	if len(live) != 3 {
+		t.Fatalf("live = %+v, want the three-criterion effective set (a restate-only history must not fall back to the plan set)", live)
+	}
+	if live[1].Statement != "healthz reports the STAGE budget" {
+		t.Errorf("live[1].Statement = %q, want the replacement statement", live[1].Statement)
+	}
+	if retired != nil {
+		t.Errorf("retired = %+v, want nil (nothing was retired)", retired)
+	}
+}
+
+// TestResolveAcceptancePromptCriteria_NoAmendments_NilNil is the inert control
+// paired with the test above: with nothing recorded both trigger fields stay nil,
+// which is what keeps an unamended run's prompt byte-identical.
+func TestResolveAcceptancePromptCriteria_NoAmendments_NilNil(t *testing.T) {
+	s, _, _, _, runRow, _ := newAmendServer(t, amendCriteria())
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+
+	live, retired := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	if live != nil || retired != nil {
+		t.Errorf("unamended resolve = (%+v, %+v), want nil/nil", live, retired)
+	}
 }
 
 // TestResolveEffectiveCriteria_CumulativeAcrossEntries_AscendingSequence: two

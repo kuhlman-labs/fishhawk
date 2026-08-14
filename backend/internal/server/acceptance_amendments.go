@@ -78,14 +78,29 @@ type retiredCriterion struct {
 
 // effectiveAcceptanceCriteria is the COMPLETE effective criteria set for a run:
 // the live criteria (with restatements applied, in plan order), the retired set
-// with provenance (also in plan order), and AllIDs — ALWAYS the full plan id
-// list, never narrowed, because the acceptance_criteria_ids served to the runner
-// must stay a SUPERSET so a verdict reporting a retired id can never fail the
-// stage closed on join-key validation.
+// with provenance (also in plan order), the ids whose statement a restatement
+// replaced (plan order), and AllIDs — ALWAYS the full plan id list, never
+// narrowed, because the acceptance_criteria_ids served to the runner must stay a
+// SUPERSET so a verdict reporting a retired id can never fail the stage closed on
+// join-key validation.
+//
+// Restated exists because Live alone cannot tell a consumer whether an amendment
+// applied: a restate-only history leaves Live the same LENGTH as the plan set
+// with only a statement differing, so a consumer keying "was anything amended?"
+// off len(Retired) silently drops the restatement (the round-four defect — the
+// acceptance prompt fell back to the plan's original statements).
 type effectiveAcceptanceCriteria struct {
-	Live    []plan.AcceptanceCriterion
-	Retired []retiredCriterion
-	AllIDs  []string
+	Live     []plan.AcceptanceCriterion
+	Retired  []retiredCriterion
+	Restated []string
+	AllIDs   []string
+}
+
+// amended reports whether any recorded or pending amendment actually changed the
+// plan's criteria set — a retirement or a restatement. It is the single predicate
+// consumers use to decide between the effective set and the plan set verbatim.
+func (e effectiveAcceptanceCriteria) amended() bool {
+	return len(e.Retired) > 0 || len(e.Restated) > 0
 }
 
 // retiredIDSet returns the retired criterion ids as a set for membership tests.
@@ -146,6 +161,7 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 	}
 
 	retired := map[string]retiredCriterion{}
+	restated := map[string]struct{}{}
 	apply := func(a acceptanceCriteriaAmendment, seq int64) {
 		if _, already := retired[a.ID]; already {
 			// Retire is absorbing and a restate of a retired criterion is a
@@ -173,6 +189,7 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 			eff.Live = append(eff.Live[:idx], eff.Live[idx+1:]...)
 		case acceptanceAmendActionRestate:
 			eff.Live[idx].Statement = a.Statement
+			restated[a.ID] = struct{}{}
 		}
 	}
 	for _, rec := range recorded {
@@ -189,6 +206,12 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 	}
 	sort.Slice(eff.Retired, func(i, j int) bool {
 		return planOrder[eff.Retired[i].ID] < planOrder[eff.Retired[j].ID]
+	})
+	for id := range restated {
+		eff.Restated = append(eff.Restated, id)
+	}
+	sort.Slice(eff.Restated, func(i, j int) bool {
+		return planOrder[eff.Restated[i]] < planOrder[eff.Restated[j]]
 	})
 	return eff, nil
 }
@@ -531,6 +554,13 @@ func (s *Server) recordedAcceptanceEffectiveVerdict(ctx context.Context, runID u
 // package's render shape. It FAILS OPEN: on any resolve error it WARN-logs and
 // returns (nil, nil), which makes buildAcceptance render the FULL plan criteria
 // set — a degraded read can never silence a criterion.
+//
+// The live set is returned whenever ANY amendment applied — a retirement or a
+// RESTATEMENT. Keying this off the retired set alone dropped a restate-only
+// history on the floor: the prompt fell back to the plan's original statements
+// and the validator judged the change against the very text the operator
+// replaced at the gate. Both prompt paths call this one function, so they cannot
+// diverge on it.
 func (s *Server) resolveAcceptancePromptCriteria(ctx context.Context, runID uuid.UUID, p *plan.Plan) ([]plan.AcceptanceCriterion, []prompt.RetiredAcceptanceCriterion) {
 	if p == nil {
 		return nil, nil
@@ -544,10 +574,15 @@ func (s *Server) resolveAcceptancePromptCriteria(ctx context.Context, runID uuid
 		)
 		return nil, nil
 	}
-	if len(eff.Retired) == 0 {
+	if !eff.amended() {
 		// Nothing was amended: leave both trigger fields nil so the prompt is
 		// byte-identical to today.
 		return nil, nil
+	}
+	if len(eff.Retired) == 0 {
+		// Restate-only: the live set carries the replacement statements, and the
+		// retired block must not render (there is nothing retired to name).
+		return eff.Live, nil
 	}
 	retired := make([]prompt.RetiredAcceptanceCriterion, 0, len(eff.Retired))
 	for _, r := range eff.Retired {

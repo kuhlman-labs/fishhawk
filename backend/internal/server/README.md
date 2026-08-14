@@ -2363,7 +2363,20 @@ validator as context to judge in situ rather than as an inference.
 computed. No caller may union, filter, or recompute any part of it; a consumer
 needing a different projection changes that signature. It returns `Live` (plan
 order, restatements applied), `Retired` (plan order, with reason + source +
-recording audit sequence), and `AllIDs` — ALWAYS the full plan id list.
+recording audit sequence), `Restated` (the ids a restatement replaced, plan
+order), and `AllIDs` — ALWAYS the full plan id list.
+
+`Restated` exists because `Live` alone cannot signal that an amendment applied:
+a restate-only history leaves `Live` the same LENGTH as the plan set with only a
+statement differing. `amended()` (`len(Retired) > 0 || len(Restated) > 0`) is the
+single predicate a consumer uses to choose the effective set over the plan set —
+`resolveAcceptancePromptCriteria` keying that decision off `Retired` alone
+silently dropped a restate-only amendment on BOTH prompt paths, so the validator
+judged the change against the very statement the operator replaced at the gate.
+On a restate-only history the live set renders and the retired block does not
+(nothing was retired). Pinned by
+`TestGetStagePrompt_Acceptance_RestateOnly_RendersReplacement` and its
+`TestRenderStagePrompt_…` twin.
 
 It is consumed at exactly FOUR call sites:
 
