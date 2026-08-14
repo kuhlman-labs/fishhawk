@@ -132,6 +132,36 @@ else
   fail "cmd_post_merge should invoke cmd_reload"
 fi
 
+# 3c. _path_affects_build (#2403): the ONE doc-only carve-out shared by
+# _detect_rebuild_set and both banner matchers. A path whose basename is exactly
+# README.md cannot alter a built binary; everything else counts as
+# build-affecting (fail-safe to over-notify). The embedded-asset rows are the
+# guard that rules out a `*.md` blanket deny or a Go-source allow-list — each is
+# //go:embed'ed and DOES change the binary.
+for p in \
+  backend/cmd/fishhawk-mcp-shim/README.md \
+  backend/cmd/fishhawk-mcp/README.md \
+  README.md
+do
+  if _path_affects_build "$p"; then
+    fail "_path_affects_build should classify $p as doc-only"
+  else
+    pass "_path_affects_build: $p is doc-only"
+  fi
+done
+for p in \
+  backend/cmd/fishhawk-mcp-shim/main.go \
+  backend/internal/mcpserver/runbook.md \
+  backend/internal/spec/schemas/workflow-v2.schema.json \
+  backend/internal/spec/presets/workflow-preset-low.yaml
+do
+  if _path_affects_build "$p"; then
+    pass "_path_affects_build: $p is build-affecting"
+  else
+    fail "_path_affects_build should classify $p as build-affecting"
+  fi
+done
+
 # 4. _diff_touches_mcp: pure matcher mirrors the rebuild matrix's mcp routing.
 if _diff_touches_mcp "backend/cmd/fishhawk-mcp/main.go"; then
   pass "_diff_touches_mcp matches backend/cmd/fishhawk-mcp/"
@@ -161,6 +191,42 @@ if _diff_touches_mcp "backend/cmd/fishhawk-mcp-shim/main.go"; then
 else
   pass "_diff_touches_mcp stays quiet for a fishhawk-mcp-shim path (cross-glob non-collision)"
 fi
+# #2403: a README-only diff under an mcp trigger glob must NOT fire the banner —
+# a README is not a `go build` input, so the binary is byte-identical.
+if _diff_touches_mcp "backend/cmd/fishhawk-mcp/README.md"; then
+  fail "_diff_touches_mcp should NOT match a README-only backend/cmd/fishhawk-mcp diff (#2403)"
+else
+  pass "_diff_touches_mcp stays quiet for a README-only backend/cmd/fishhawk-mcp diff (#2403)"
+fi
+if _diff_touches_mcp "backend/internal/mcpserver/README.md"; then
+  fail "_diff_touches_mcp should NOT match a README-only backend/internal/mcpserver diff (#2403)"
+else
+  pass "_diff_touches_mcp stays quiet for a README-only backend/internal/mcpserver diff (#2403)"
+fi
+# The embedded-asset guard: these are //go:embed'ed (onboarding.go:47,
+# parse.go:20, preset.go:18) and DO change the binary, so the carve-out must be
+# a README deny-list — never a blanket `*.md` deny or a Go-source allow-list.
+if _diff_touches_mcp "backend/internal/mcpserver/runbook.md"; then
+  pass "_diff_touches_mcp still matches the //go:embed'ed runbook.md (#2403 false-negative guard)"
+else
+  fail "_diff_touches_mcp must still match backend/internal/mcpserver/runbook.md (it is //go:embed'ed)"
+fi
+if _diff_touches_mcp "backend/internal/spec/schemas/workflow-v2.schema.json"; then
+  pass "_diff_touches_mcp still matches an //go:embed'ed schema (#2403 false-negative guard)"
+else
+  fail "_diff_touches_mcp must still match backend/internal/spec/schemas/workflow-v2.schema.json"
+fi
+if _diff_touches_mcp "backend/internal/spec/presets/workflow-preset-low.yaml"; then
+  pass "_diff_touches_mcp still matches an //go:embed'ed preset (#2403 false-negative guard)"
+else
+  fail "_diff_touches_mcp must still match backend/internal/spec/presets/workflow-preset-low.yaml"
+fi
+# Non-vacuity: a doc line must never MASK a real source line in the same diff.
+if _diff_touches_mcp "$(print -l 'backend/cmd/fishhawk-mcp/README.md' 'backend/cmd/fishhawk-mcp/main.go')"; then
+  pass "_diff_touches_mcp still matches a mixed README + main.go diff (doc line masks nothing)"
+else
+  fail "_diff_touches_mcp should match a mixed README + main.go diff"
+fi
 
 # 4a. _diff_touches_shim: the shim's OWN trigger glob only — not the shared libs,
 # and (cross-glob non-collision) not a plain fishhawk-mcp path.
@@ -179,6 +245,19 @@ if _diff_touches_shim "backend/internal/plan/validate.go"; then
   fail "_diff_touches_shim should NOT match a shared-lib path"
 else
   pass "_diff_touches_shim stays quiet for a shared-lib path (shim not in the shared-lib case)"
+fi
+# #2403, the REPORTED bug: PR #2397 edited only
+# backend/cmd/fishhawk-mcp-shim/README.md and drew a spurious ACTION REQUIRED.
+if _diff_touches_shim "backend/cmd/fishhawk-mcp-shim/README.md"; then
+  fail "_diff_touches_shim should NOT match a README-only shim diff (#2403)"
+else
+  pass "_diff_touches_shim stays quiet for a README-only shim diff (#2403)"
+fi
+# Non-vacuity: a doc line must never MASK a real source line in the same diff.
+if _diff_touches_shim "$(print -l 'backend/cmd/fishhawk-mcp-shim/README.md' 'backend/cmd/fishhawk-mcp-shim/main.go')"; then
+  pass "_diff_touches_shim still matches a mixed README + main.go diff (doc line masks nothing)"
+else
+  fail "_diff_touches_shim should match a mixed README + main.go diff"
 fi
 
 # 4c. The extracted MCP tool library (E66.7 / #2408): an mcpserver-only change
@@ -455,6 +534,27 @@ else
   fail "_select_mcp_banner: shim_rebuilt should win over auto_swap"
 fi
 
+# 5g-bis. DONE-MEANS (#2403), end to end across all three layers: the predicate
+# feeds _diff_touches_shim feeds _decide_shim_signal feeds _select_mcp_banner in
+# one assertion. Args `1 1 1` = rebuilt under --all with a good reflog, exactly
+# the observed `reload`/`post-merge` shape that produced the spurious banner on
+# PR #2397. Doc-only merge diff -> the `none` banner, no ACTION REQUIRED.
+shim_signal="$(_decide_shim_signal 1 1 1 'backend/cmd/fishhawk-mcp-shim/README.md')"
+if [[ "$(_select_mcp_banner 0 "$shim_signal" 0 0)" == none ]]; then
+  pass "done-means (#2403): a README-only shim diff selects the 'none' banner"
+else
+  fail "done-means (#2403): a README-only shim diff should select 'none' (got shim_signal=$shim_signal)"
+fi
+# Non-vacuity control for the case above: the SAME call shape with a real source
+# line must still select shim_rebuilt, so `none` cannot pass by the pipeline
+# being inert.
+shim_signal="$(_decide_shim_signal 1 1 1 'backend/cmd/fishhawk-mcp-shim/main.go')"
+if [[ "$(_select_mcp_banner 0 "$shim_signal" 0 0)" == shim_rebuilt ]]; then
+  pass "done-means control (#2403): a main.go shim diff still selects 'shim_rebuilt'"
+else
+  fail "done-means control (#2403): a main.go shim diff should select 'shim_rebuilt' (got shim_signal=$shim_signal)"
+fi
+
 # 5h. _detect_rebuild_set wiring (ADR-060 / #1922): the shim carries its own
 # trigger glob, and the shared-lib case must NOT short-circuit past the shim.
 drs_body="$(typeset -f _detect_rebuild_set)"
@@ -521,6 +621,71 @@ STUB
   pass "_detect_rebuild_set: shared-lib + shim two-line diff marks BOTH (no early-return drop)"
 else
   fail "_detect_rebuild_set: shared-lib + shim diff should mark the shim (see diagnostic above)"
+fi
+
+# 5h-ter (#2403): the THIRD carve-out site — this is what fixes the plain
+# (branch-diff) `up`, where _decide_shim_signal/_decide_mcp_signal key the signal
+# off rebuilt_list membership and never consult the matchers. A README-only diff
+# must route to NO binary, while fishhawkd still rebuilds as the unconditional
+# baseline. Same subshell-exit-status contract as the fixture above.
+if (
+  set +e
+  tmp_stub="$(mktemp -d)"
+  cat > "${tmp_stub}/git" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  *rev-parse*) exit 0 ;;
+  *diff*) print "backend/cmd/fishhawk-mcp-shim/README.md"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${tmp_stub}/git"
+  PATH="${tmp_stub}:$PATH"
+  typeset -gA rebuild_set
+  rebuild_set=()
+  _detect_rebuild_set
+  ok=0
+  if [[ -n "${rebuild_set[fishhawk-mcp-shim]:-}" || "${rebuild_set[fishhawkd]:-}" != "__baseline__" ]]; then
+    print "  (shim=${rebuild_set[fishhawk-mcp-shim]:-unset} fishhawkd=${rebuild_set[fishhawkd]:-unset})"
+    ok=1
+  fi
+  rm -rf "$tmp_stub"
+  exit $ok
+); then
+  pass "_detect_rebuild_set: README-only diff marks no shim, fishhawkd stays __baseline__ (#2403)"
+else
+  fail "_detect_rebuild_set: README-only diff should leave the shim unmarked (see diagnostic above)"
+fi
+
+# Non-vacuity for the fixture above: a README + main.go two-line diff must STILL
+# mark the shim — the per-line skip must not swallow a real source line.
+if (
+  set +e
+  tmp_stub="$(mktemp -d)"
+  cat > "${tmp_stub}/git" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  *rev-parse*) exit 0 ;;
+  *diff*) print "backend/cmd/fishhawk-mcp-shim/README.md"; print "backend/cmd/fishhawk-mcp-shim/main.go"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${tmp_stub}/git"
+  PATH="${tmp_stub}:$PATH"
+  typeset -gA rebuild_set
+  rebuild_set=()
+  _detect_rebuild_set
+  ok=0
+  if [[ "${rebuild_set[fishhawk-mcp-shim]:-}" != "backend/cmd/fishhawk-mcp-shim/main.go" ]]; then
+    print "  (shim=${rebuild_set[fishhawk-mcp-shim]:-unset})"
+    ok=1
+  fi
+  rm -rf "$tmp_stub"
+  exit $ok
+); then
+  pass "_detect_rebuild_set: README + main.go diff still marks the shim (doc line masks nothing)"
+else
+  fail "_detect_rebuild_set: README + main.go diff should mark the shim (see diagnostic above)"
 fi
 
 # 5i. Build/banner wiring body-greps: _build_binary src_paths, cmd_up's forced

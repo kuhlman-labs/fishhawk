@@ -385,6 +385,17 @@ _detect_rebuild_set() {
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
 
+    # A doc-only path routes to NO binary (#2403). This is what fixes the plain
+    # (branch-diff) `up`, where _decide_mcp_signal/_decide_shim_signal key the
+    # signal off rebuilt_list membership and never consult the matchers — the
+    # matcher-side filters alone would fix only `reload`/`post-merge`. Benign
+    # side effect: a README-only branch diff no longer rebuilds
+    # mcp/shim/runner/cli, which is correct because a non-embedded README is not
+    # a `go build` input and the produced binary is byte-identical; fishhawkd
+    # rebuilds unconditionally as the baseline either way. Applied per line, so
+    # a doc line never masks a real source line in the same diff.
+    if ! _path_affects_build "$f"; then continue; fi
+
     case "$f" in
       # Shared libs trigger the four version-coupled binaries. Do NOT `return`
       # here: fishhawk-mcp-shim is deliberately NOT in this case (it rebuilds
@@ -513,17 +524,52 @@ _build_binary() {
   esac
 }
 
+# Pure: can this single path alter a built binary? Returns 0 (yes — the
+# DEFAULT) for every path, and 1 ONLY for a path whose basename is exactly
+# `README.md`. Shared by _detect_rebuild_set and both banner matchers so the
+# carve-out is defined in exactly one place (#2403).
+#
+# The direction is deliberately FAIL-SAFE TO OVER-NOTIFY: an unknown file type
+# counts as build-affecting, because a false positive is a cosmetic extra
+# banner while a false negative is a silently stale binary the operator is
+# never told to reconnect. That is why this is a README DENY-list and NOT the
+# `*.go`/`go.mod`/`go.sum` allow-list — nor a blanket `*.md` deny — that the
+# issue sketched: several non-Go, doc-shaped assets under these very globs are
+# `//go:embed`ed and DO change the built binary:
+#   - backend/internal/mcpserver/runbook.md      (//go:embed, onboarding.go:47)
+#   - backend/internal/plan/schemas/*.json       (//go:embed, validate.go:19)
+#   - backend/internal/spec/schemas/*.json       (//go:embed, parse.go:20)
+#   - backend/internal/spec/presets/*.yaml       (//go:embed, preset.go:18)
+# Conversely, no package embeds its own README.md (checked repo-wide over every
+# `//go:embed` directive in backend/, runner/ and cli/ — none names a README,
+# and every embed under these globs names explicit files, not a directory). If
+# a package ever embeds its own README.md, this carve-out must be revisited.
+_path_affects_build() {
+  local p="$1"
+  # `:t` is the zsh tail/basename modifier, so this matches a README at any
+  # depth as well as a bare top-level README.md.
+  case "${p:t}" in
+    README.md) return 1 ;;
+  esac
+  return 0
+}
+
 # Pure path matcher: returns 0 if any line of the newline-delimited changed-file
 # text in $1 matches a rebuild-matrix glob that routes to fishhawk-mcp, else 1.
 # Reuses the exact glob set _detect_rebuild_set uses for fishhawk-mcp — the
 # shared-lib case (backend/internal/plan|spec, line ~71) plus the mcp-cmd case
-# (backend/cmd/fishhawk-mcp, line ~81). If those matrix globs change, this must
-# move with them. Git-free so scripts/test-dev can drive it with crafted input.
+# (backend/cmd/fishhawk-mcp, line ~81) — MINUS the doc-only paths
+# _path_affects_build denies (#2403), the one carve-out this shares with
+# _detect_rebuild_set. If those matrix globs change, this must move with them.
+# Git-free so scripts/test-dev can drive it with crafted input.
 _diff_touches_mcp() {
   local diff_text="$1"
   local f
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
+    # A README cannot alter the binary, so it must not fire the banner. Applied
+    # per line, so a doc line never masks a real source line in the same diff.
+    if ! _path_affects_build "$f"; then continue; fi
     case "$f" in
       backend/cmd/fishhawk-mcp/*|backend/internal/mcpserver/*|backend/internal/plan/*|backend/internal/spec/*)
         return 0
@@ -540,13 +586,18 @@ _diff_touches_mcp() {
 # not join the shared-lib case, so a plan/spec edit does not fire the shim
 # banner. Cross-glob non-collision holds both directions: the literal `/` after
 # `fishhawk-mcp` keeps _diff_touches_mcp's glob off shim paths and this glob off
-# plain-mcp paths. If the matrix shim glob changes, this must move with it.
+# plain-mcp paths. Doc-only paths denied by _path_affects_build are skipped
+# (#2403) — the same carve-out _diff_touches_mcp and _detect_rebuild_set share.
+# If the matrix shim glob changes, this must move with it.
 # Git-free so scripts/test-dev can drive it with crafted input.
 _diff_touches_shim() {
   local diff_text="$1"
   local f
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
+    # A README cannot alter the binary, so it must not fire the banner. Applied
+    # per line, so a doc line never masks a real source line in the same diff.
+    if ! _path_affects_build "$f"; then continue; fi
     case "$f" in
       backend/cmd/fishhawk-mcp-shim/*)
         return 0
