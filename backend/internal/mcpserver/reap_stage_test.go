@@ -40,6 +40,27 @@ func seedLocalRun(fb *fakeBackend, runID uuid.UUID) {
 	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", RunnerKind: driveRunnerKindLocal}
 }
 
+// seedStrandedStage seeds the target stage so the pre-POST state comparison is
+// ARMED. Without a stage row the comparison is unarmed by design (fail open),
+// so the race tests below must seed one.
+func seedStrandedStage(fb *fakeBackend, runID uuid.UUID, stageID string, state string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.stagesByRun[runID] = []Stage{{
+		ID: stageID, RunID: runID.String(), Sequence: 1, Type: "implement", State: state,
+	}}
+}
+
+// setStageState models the CONCURRENT dispatcher: it advances the seeded stage
+// the way a host dispatch that spawned a runner would.
+func setStageState(fb *fakeBackend, runID uuid.UUID, state string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for i := range fb.stagesByRun[runID] {
+		fb.stagesByRun[runID][i].State = state
+	}
+}
+
 func reapHops(fb *fakeBackend) int {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -239,8 +260,10 @@ func TestReapStage_LivenessGatedOnRunnerKind(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reapStage: %v", err)
 		}
-		if *probeCalls != 1 {
-			t.Errorf("probe invoked %d times for a local run, want 1", *probeCalls)
+		// Two calls: the classification, then confirmStrandBeforeReap's pre-POST
+		// re-probe (the check/use-window narrowing).
+		if *probeCalls != 2 {
+			t.Errorf("probe invoked %d times for a local run, want 2", *probeCalls)
 		}
 		if out.RunnerLiveness != "dead" {
 			t.Errorf("runner_liveness = %q, want dead for a probed local run", out.RunnerLiveness)
@@ -303,8 +326,10 @@ func TestReapStage_ProbeUnknownWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an inconclusive probe must not fail the reap: %v", err)
 	}
-	if *probeCalls != 1 {
-		t.Errorf("probe invoked %d times, want 1", *probeCalls)
+	// The classification plus the pre-POST re-probe; an inconclusive verdict is
+	// re-checked exactly like a dead one.
+	if *probeCalls != 2 {
+		t.Errorf("probe invoked %d times, want 2", *probeCalls)
 	}
 	if out.RunnerLiveness != "unknown" {
 		t.Errorf("runner_liveness = %q, want unknown", out.RunnerLiveness)
@@ -314,6 +339,179 @@ func TestReapStage_ProbeUnknownWarns(t *testing.T) {
 	}
 	if !out.Transitioned {
 		t.Error("the reap must still proceed on an inconclusive probe")
+	}
+}
+
+// (B) TestReapStage_RaceStageAdvancedUnderProbeRefused is the counterfactual
+// vehicle for detector (1) of confirmStrandBeforeReap — the pre/post stage-state
+// comparison.
+//
+// It drives the exact interleaving the fixed-verdict tests could not: the stage
+// is 'dispatched', the probe answers DEAD (no runner exists yet), and DURING
+// that probe a concurrent dispatch spawns a runner and advances the stage to
+// 'running'. The endpoint accepts both states, so without the comparison the
+// POST would fail the newly-live runner's stage.
+//
+// Detector (2) is deliberately UNARMED here (the probe answers dead on every
+// call), so the refusal can only come from the state comparison.
+func TestReapStage_RaceStageAdvancedUnderProbeRefused(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "dispatched")
+
+	r := newResolver(srv, nil)
+	probeCalls := 0
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict {
+		probeCalls++
+		if probeCalls == 1 {
+			// The concurrent dispatch lands between the classification and the
+			// reap: a runner is spawned and the stage advances.
+			setStageState(fb, runID, "running")
+		}
+		return runnerDead
+	}
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("a stage that advanced dispatched -> running under the probe must refuse the reap")
+	}
+	if !strings.Contains(err.Error(), `"dispatched"`) || !strings.Contains(err.Error(), `"running"`) {
+		t.Errorf("the refusal must name both observed states: %v", err)
+	}
+	if got := reapHops(fb); got != 0 {
+		t.Errorf("reap-failure POSTs = %d, want 0 (a stage that moved must never reach the backend)", got)
+	}
+	// COMMITTED STATE, not just the error identity: the stage the concurrent
+	// dispatcher advanced is still 'running', never failed by this call.
+	if state, ok := r.observeStageState(context.Background(), runID, stageID.String()); !ok || state != "running" {
+		t.Errorf("stage state = %q (observed=%v), want the untouched running", state, ok)
+	}
+}
+
+// (B) TestReapStage_RaceRunnerAppearedBeforePostRefused is the counterfactual
+// vehicle for detector (2) — the re-probe.
+//
+// The stage state is 'running' for the WHOLE call (the state comparison is
+// unarmed by construction: the observed value is paired with ITSELF), so the
+// only thing that can refuse is the second probe finding the runner a
+// concurrent dispatch spawned after the first probe answered dead.
+func TestReapStage_RaceRunnerAppearedBeforePostRefused(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+
+	r := newResolver(srv, nil)
+	probeCalls := 0
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict {
+		probeCalls++
+		if probeCalls == 1 {
+			return runnerDead
+		}
+		return runnerLive
+	}
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("a runner that appeared between the classification and the reap must refuse it")
+	}
+	if !strings.Contains(err.Error(), stageID.String()) || !strings.Contains(err.Error(), "between the liveness classification and the reap") {
+		t.Errorf("the refusal must name the stage and the window it closed: %v", err)
+	}
+	if probeCalls != 2 {
+		t.Errorf("probe invoked %d times, want 2 (classification + the pre-POST re-probe)", probeCalls)
+	}
+	if got := reapHops(fb); got != 0 {
+		t.Errorf("reap-failure POSTs = %d, want 0 (a live runner must never reach the backend)", got)
+	}
+	if state, ok := r.observeStageState(context.Background(), runID, stageID.String()); !ok || state != "running" {
+		t.Errorf("stage state = %q (observed=%v), want the untouched running", state, ok)
+	}
+}
+
+// (B) TestReapStage_UnracedStrandStillReaped is the PAIRED CONTROL for both
+// detectors: a genuinely stranded stage — state unchanged across the call, both
+// probes dead — is still reaped. Without it the two refusals above could be
+// satisfied by a verb that refuses everything.
+func TestReapStage_UnracedStrandStillReaped(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+	r, probeCalls := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("an unraced strand must still be reapable: %v", err)
+	}
+	if !out.Transitioned || out.StageState != "failed" {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
+	}
+	if *probeCalls != 2 {
+		t.Errorf("probe invoked %d times, want 2 (classification + the pre-POST re-probe)", *probeCalls)
+	}
+	if got := reapHops(fb); got != 1 {
+		t.Errorf("reap-failure POSTs = %d, want 1", got)
+	}
+}
+
+// (B) TestReapStage_ReconfirmNeverProbesANonLocalRun: the pre-POST re-probe
+// inherits the runner_kind GATE. Re-probing a github_actions run would
+// fabricate exactly the host verdict classifyReapLivenessGated withholds.
+func TestReapStage_ReconfirmNeverProbesANonLocalRun(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", RunnerKind: "github_actions"}
+	fb.mu.Unlock()
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+	r, probeCalls := reapResolver(t, srv, runnerLive)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("reapStage: %v", err)
+	}
+	if *probeCalls != 0 {
+		t.Errorf("the host probe ran %d times for a github_actions run, want 0 on BOTH the classification and the re-confirmation", *probeCalls)
+	}
+	if out.RunnerLiveness != "unknown" {
+		t.Errorf("runner_liveness = %q, want unknown", out.RunnerLiveness)
+	}
+	if got := reapHops(fb); got != 1 {
+		t.Errorf("reap-failure POSTs = %d, want 1", got)
+	}
+}
+
+// (B) TestReapStage_UnobservableStageFailsOpen: an unreadable stage list leaves
+// the state comparison UNARMED and the reap proceeds — the documented fail-open
+// posture, since refusing a recovery verb on a transient read error would
+// re-strand the stage it exists to clear.
+func TestReapStage_UnobservableStageFailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	fb.mu.Lock()
+	fb.stagesStatusByRun[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("an unreadable stage list must not refuse the reap: %v", err)
+	}
+	if !out.Transitioned || out.StageState != "failed" {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
 	}
 }
 
@@ -426,6 +624,13 @@ func TestReapStage_EndToEndOverHTTP(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&got.body)
 			stageState = "failed"
 			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/stages") {
+			// The pre/post state reads confirmStrandBeforeReap takes cross HTTP
+			// here too, serving the stage's live state.
+			_, _ = w.Write([]byte(`{"items":[{"id":"` + stageID.String() +
+				`","run_id":"` + runID.String() + `","type":"implement","state":"` + stageState + `"}]}`))
 			return
 		}
 		// GET /v0/runs/{id}: a runner_kind=local run, so the gate reaches the

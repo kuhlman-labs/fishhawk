@@ -125,12 +125,21 @@ stage instead of cancelling the run.
 Before the call the verb classifies host runner liveness, GATED on the run's
 runner_kind, and the invariant it delivers is narrow by design: for a
 runner_kind=local run it probes THIS host's process table for the stage id and
-REFUSES outright when a runner is still live, so a live stage this host spawned
-is never reaped. For github_actions / gitlab_ci / an unreadable or absent
-runner_kind a host-local process probe is INAPPLICABLE — the verdict is
-'unknown', never 'dead', and the call proceeds on your explicit invocation plus
-the server-side protected-park allow-list, with a warning saying liveness is
-unverifiable from this host.
+REFUSES outright when a runner is still live. For github_actions / gitlab_ci /
+an unreadable or absent runner_kind a host-local process probe is INAPPLICABLE —
+the verdict is 'unknown', never 'dead', and the call proceeds on your explicit
+invocation plus the server-side protected-park allow-list, with a warning saying
+liveness is unverifiable from this host.
+
+That classification and the POST are two round-trips, not one atomic operation,
+and the endpoint's authority spans BOTH 'dispatched' and 'running' — so a
+concurrent dispatch could spawn a runner for a stage just classified 'dead' and
+the POST would fail a LIVE stage. The verb NARROWS that window: immediately
+before the POST it re-reads the stage state and re-probes, and refuses if the
+state moved or a runner appeared. It does not CLOSE it — only a server-side
+compare-and-set on the observed state could — so the honest guarantee is
+"reaping a live stage this host spawned is refused on every observation this
+verb can take", not "never".
 
 Input:
   - run_id, stage_id : the stranded stage (both required).
@@ -176,7 +185,12 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 		reason = reapStageDefaultReason
 	}
 
-	verdict, warnings := r.classifyReapLiveness(ctx, runUUID, in.StageID)
+	// The stage's state BEFORE the classification: half of the check/use race
+	// detector in confirmStrandBeforeReap. An unreadable or absent row leaves
+	// that comparison unarmed (fail OPEN — see there).
+	before, beforeKnown := r.observeStageState(ctx, runUUID, in.StageID)
+
+	verdict, probed, warnings := r.classifyReapLivenessGated(ctx, runUUID, in.StageID)
 	if verdict == runnerLive {
 		// The one case the probe can prove: a runner THIS host spawned still
 		// carries this stage id. Reaping it would fail a stage that is genuinely
@@ -184,6 +198,12 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, ReapStageOutput{}, fmt.Errorf(
 			"refusing to reap stage %s of run %s: a process on this host still carries this stage id, so the runner is LIVE and the stage is executing, not stranded. Wait for it to settle, or use fishhawk_cancel_run to abandon the whole run (never on a decomposition child — a cancelled child can never satisfy fishhawk_consolidate_slices)",
 			in.StageID, in.RunID)
+	}
+
+	// LAST observation before the hop: the classification above is already stale
+	// by the time the POST is written.
+	if err := r.confirmStrandBeforeReap(ctx, runUUID, in.StageID, before, beforeKnown, probed); err != nil {
+		return nil, ReapStageOutput{}, err
 	}
 
 	res, err := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, in.Detail, in.ExitCode)
@@ -222,9 +242,18 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 // The probe itself is the drive_run.go seam, unchanged and shared:
 // r.driveProbeRunnerLiveness when injected, else probeRunnerLiveness.
 func (r *runResolver) classifyReapLiveness(ctx context.Context, runUUID uuid.UUID, stageID string) (runnerLivenessVerdict, []string) {
+	verdict, _, warnings := r.classifyReapLivenessGated(ctx, runUUID, stageID)
+	return verdict, warnings
+}
+
+// classifyReapLivenessGated is classifyReapLiveness plus the gate's own
+// decision: probed reports whether the host probe was APPLICABLE (the local
+// arm), which is what lets the pre-POST re-confirmation re-probe without a
+// second GetRun and without probing a run whose runner_kind the gate excluded.
+func (r *runResolver) classifyReapLivenessGated(ctx context.Context, runUUID uuid.UUID, stageID string) (runnerLivenessVerdict, bool, []string) {
 	got, err := r.api.GetRun(ctx, runUUID)
 	if err != nil {
-		return runnerUnknown, []string{fmt.Sprintf(
+		return runnerUnknown, false, []string{fmt.Sprintf(
 			"could not verify runner liveness for run %s because its runner_kind is unreadable (%v); proceeding on your explicit invocation plus the server-side protected-park allow-list",
 			runUUID, err)}
 	}
@@ -233,19 +262,93 @@ func (r *runResolver) classifyReapLiveness(ctx context.Context, runUUID uuid.UUI
 		if kind == "" {
 			kind = "(absent)"
 		}
-		return runnerUnknown, []string{fmt.Sprintf(
+		return runnerUnknown, false, []string{fmt.Sprintf(
 			"a host-local process probe is INAPPLICABLE to a runner_kind=%s run: liveness is unverifiable from this host, so proceeding rests on your explicit invocation plus the server-side protected-park allow-list (the five protected park states the server refuses to reap)",
 			kind)}
 	}
-	probe := r.driveProbeRunnerLiveness
-	if probe == nil {
-		probe = probeRunnerLiveness
-	}
-	verdict := probe(ctx, stageID)
+	verdict := r.livenessProbe()(ctx, stageID)
 	if verdict == runnerUnknown {
-		return verdict, []string{fmt.Sprintf(
+		return verdict, true, []string{fmt.Sprintf(
 			"the host runner-liveness probe for stage %s was inconclusive (pgrep absent from PATH, a syntax/fatal exit, or a timeout); liveness could not be confirmed either way",
 			stageID)}
 	}
-	return verdict, nil
+	return verdict, true, nil
+}
+
+// livenessProbe resolves the shared drive_run.go probe seam:
+// r.driveProbeRunnerLiveness when injected, else the real probeRunnerLiveness.
+func (r *runResolver) livenessProbe() func(context.Context, string) runnerLivenessVerdict {
+	if r.driveProbeRunnerLiveness != nil {
+		return r.driveProbeRunnerLiveness
+	}
+	return probeRunnerLiveness
+}
+
+// observeStageState reads the target stage's CURRENT state. The second return
+// is false when the state could not be observed at all — the stage list read
+// failed, or the run carries no such stage — which leaves the caller's
+// comparison unarmed rather than asserting a change.
+func (r *runResolver) observeStageState(ctx context.Context, runUUID uuid.UUID, stageID string) (string, bool) {
+	stages, err := r.api.ListRunStages(ctx, runUUID)
+	if err != nil {
+		return "", false
+	}
+	for _, s := range stages {
+		if s.ID == stageID {
+			return s.State, true
+		}
+	}
+	return "", false
+}
+
+// confirmStrandBeforeReap re-observes the target IMMEDIATELY before the POST and
+// refuses on any evidence the stage moved under the liveness classification.
+//
+// WHY (the #2689 fix-up concern). classifyReapLivenessGated and
+// ReportStageFailure are two round-trips, not one atomic operation, and the
+// endpoint's reap authority spans BOTH 'dispatched' and 'running'. So this
+// interleaving fails a genuinely LIVE stage:
+//
+//	probe(stage 'dispatched') -> dead   |
+//	                                    | a concurrent dispatch spawns a runner
+//	                                    | the stage advances dispatched -> running
+//	POST /reap-failure ---------------->| the live runner's stage is failed
+//
+// Two INDEPENDENT detectors, both taken as late as possible:
+//
+//	(1) the stage's state CHANGED since the pre-classification read — something
+//	    else is driving it, and the dispatched -> running advance above is
+//	    exactly that signature;
+//	(2) the host probe, RE-RUN, now finds a LIVE runner — the spawn landed but
+//	    the state has not advanced yet, which (1) alone would miss.
+//
+// This NARROWS the window; it does not close it. Nothing on this side of the
+// wire can: a dispatch landing between this last observation and the server
+// committing the failure is still reaped. Closing it needs a server-side
+// compare-and-set (reap only from the state the caller observed) on an endpoint
+// this verb deliberately does not change. The tool description and the package
+// README state the guarantee at that narrowed strength rather than as an
+// absolute invariant.
+//
+// Both detectors fail OPEN on an unreadable or absent stage row: this is a
+// narrowing layer on top of the server's protected-park allow-list, and
+// refusing a recovery verb on a transient read error would re-strand the very
+// stage it exists to clear.
+func (r *runResolver) confirmStrandBeforeReap(ctx context.Context, runUUID uuid.UUID, stageID, before string, beforeKnown, probed bool) error {
+	if after, afterKnown := r.observeStageState(ctx, runUUID, stageID); beforeKnown && afterKnown && after != before {
+		return fmt.Errorf(
+			"refusing to reap stage %s of run %s: it moved from %q to %q while its runner liveness was being classified, so something else is driving it — a concurrent dispatch spawns a runner and advances the stage into 'running', and reaping now would fail a LIVE runner's stage. Re-read the stage (fishhawk_get_run_status) and re-invoke only if it is still stranded",
+			stageID, runUUID, before, after)
+	}
+	if !probed {
+		// A non-local runner_kind was never probed in the first place; re-probing
+		// here would fabricate the host verdict the gate exists to withhold.
+		return nil
+	}
+	if r.livenessProbe()(ctx, stageID) == runnerLive {
+		return fmt.Errorf(
+			"refusing to reap stage %s of run %s: a process on this host picked up this stage id between the liveness classification and the reap — a concurrent dispatch spawned a runner, so the stage is executing, not stranded. Wait for it to settle before reaping",
+			stageID, runUUID)
+	}
+	return nil
 }

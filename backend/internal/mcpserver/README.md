@@ -748,6 +748,26 @@ Output: `transitioned`, `stage_state`, `runner_liveness`, `next_step`, `warnings
 So the guarantee is: **it prevents reaping a live stage THIS HOST SPAWNED**. For a remote runner it rests on the
 operator's explicit invocation plus the server-side protected-park allow-list, and says so in `warnings`.
 
+**The classification and the POST are not atomic, so that guarantee is NARROWED, not absolute.** The endpoint's reap
+authority spans BOTH `dispatched` and `running`, so a stage probed `dead` while merely `dispatched` can be dispatched
+concurrently — spawning a runner and advancing to `running` — and the POST would then fail a genuinely live stage.
+`confirmStrandBeforeReap` re-observes IMMEDIATELY before the POST and refuses on either of two independent detectors:
+
+| detector | fires when | misses |
+|---|---|---|
+| (1) pre/post stage-state comparison | the stage's state CHANGED across the classification (the `dispatched` → `running` advance is exactly this signature) | a spawn whose state advance has not committed yet |
+| (2) re-probe | the host probe, re-run, now finds a LIVE runner (inherits the `runner_kind` gate — a non-local run is never probed on either pass) | a spawn whose process is not yet visible to `pgrep` |
+
+Both **fail OPEN** on an unreadable or absent stage row: this is a narrowing layer over the server's protected-park
+allow-list, and refusing a recovery verb on a transient read error would re-strand the stage it exists to clear. Neither
+detector CLOSES the window — nothing on the client side can, because the observation and the POST are two round-trips.
+Closing it needs a **server-side compare-and-set** (reap only from the state the caller observed) on an endpoint this
+verb deliberately does not change; until that exists the honest claim is "refused on every observation this verb can
+take", not "never". `TestReapStage_RaceStageAdvancedUnderProbeRefused` and
+`TestReapStage_RaceRunnerAppearedBeforePostRefused` drive one interleaving each (each with the OTHER detector unarmed,
+so the refusal can only come from the one under test), `TestReapStage_UnracedStrandStillReaped` is the paired control
+that an unraced strand is still reaped, and `TestReapStage_ReconfirmNeverProbesANonLocalRun` pins the re-probe's gate.
+
 `guardSiblingStageInFlight`'s target-`running` arm reuses the same classification, **message-only**: the refusal stays
 UNCONDITIONAL across `live`/`dead`/`unknown` and only the wording changes (`dead`/`unknown` now name
 `fishhawk_reap_stage` → `fishhawk_retry_stage` → re-dispatch instead of asserting "a live runner owns it" in exactly the

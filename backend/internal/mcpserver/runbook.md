@@ -261,6 +261,13 @@ runner is still alive — wait for it to settle instead. For a
 warning: a host-local process probe says nothing about a remote runner, so
 confirm on the CI side before reaping.
 
+It also re-reads the stage state and re-probes immediately before the POST, and
+refuses if the stage moved (`"it moved from ... to ..."`) or a runner appeared in
+between — a concurrent dispatch racing the reap. On that refusal, re-read the
+stage with `fishhawk_get_run_status` and re-invoke only if it is still stranded.
+That check narrows the race but does not eliminate it: **do not run a dispatch
+of the same stage concurrently with a reap of it.**
+
 **Do NOT reach for `fishhawk_cancel_run` here — on a decomposition child it
 wedges the parent permanently.** `fishhawk_consolidate_slices` requires every
 child to have SUCCEEDED, and a cancelled child never can; nothing un-cancels a
