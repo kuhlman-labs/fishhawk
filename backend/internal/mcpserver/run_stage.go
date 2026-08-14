@@ -85,8 +85,8 @@ type RunStageInput struct {
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. The acceptance stage (E31.9) validates the merged change against a running preview/target instance; prefer fishhawk_dispatch_stage for it (it runs long, non-blocking) and it takes neither --plan-out nor --check-base-ref"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
-	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
-	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. Pass false explicitly to keep the commit-yourself flow (the operator commits + pushes). A bare omitted value resolves to true."`
+	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
+	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
 	Verbose       bool   `json:"verbose,omitempty" jsonschema:"when true, return the full runner event list including every stage_progress heartbeat; default false returns a compact result that omits routine heartbeats"`
 }
@@ -424,6 +424,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		return nil, RunStageOutput{}, siblingErr
 	}
 	guardWarnings = append(guardWarnings, siblingWarnings...)
+
+	// push_and_open_pr=false decomposition-child guard (#2691), the parity
+	// mirror of the dispatch_stage call site — this verb exposes the identical
+	// flag and reaches the identical runner path. Placed before every
+	// state-committing step (the host-dispatch marker and the spawn) so a
+	// refusal commits no state and spawns nothing. Fails OPEN on a GetRun error.
+	noPRWarnings, noPRErr := r.guardNoPRImplement(ctx, runUUID, in.Stage, pushAndOpenPR)
+	if noPRErr != nil {
+		return nil, RunStageOutput{}, noPRErr
+	}
+	guardWarnings = append(guardWarnings, noPRWarnings...)
 
 	// (1z) Resolve working_dir transport-conditionally BEFORE the runner-binary
 	// resolution, the acceptance short-circuit admission call, the host-dispatch

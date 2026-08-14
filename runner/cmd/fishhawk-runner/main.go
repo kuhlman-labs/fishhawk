@@ -666,6 +666,44 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.maxRetriesSnapshot = maxRetriesSnapshot
 		cfg.retryAttempt = retryAttempt
 
+		// --no-pr unsupported-push-path refusal (L1, #2691). The ORDERING is
+		// load-bearing: this fires the instant the prompt response has resolved
+		// cfg.noPR, cfg.fixup, cfg.decomposedFromRunID and stageType (all
+		// assigned above) and strictly BEFORE the lineage-worktree block that
+		// follows — so no worktree admin lock, no sweep/provision, no lineage
+		// lock, no base checkout and no agent invocation has happened yet. A
+		// refusal here burns ZERO agent tokens and mutates nothing. This is also
+		// the FIRST point at which fix-up status is authoritative: cfg.fixup is
+		// derived server-side inside the /prompt handler and is served only on
+		// the prompt response, so no pre-spawn caller can know it.
+		//
+		// WHY only these two paths, and not --no-pr generally: a STANDALONE
+		// implement stage under --no-pr stamps NONE of the three forward-gate
+		// manifest flags, so its trace upload settles the stage — that is the
+		// supported E22.8/#406 commit-yourself flow and it keeps working
+		// unchanged. But willPushChild (#771) and willPushFixup (#794) below
+		// deliberately do NOT test cfg.noPR: those gates exist to stop a
+		// succeeded-but-unlanded implement stage, so a decomposition child still
+		// stamps push_to_shared_branch and a fix-up pass still stamps push_fixup
+		// under --no-pr. The backend then defers the stage's terminal transition
+		// onto a /pull-request report that --no-pr never sends, leaving the stage
+		// in `running` until the #2630 reaper sweeps it. Refusing here converts
+		// that silent strand into a NAMED category-C failure via the existing
+		// #1747 detached-reaper report path, before any agent pass is spent.
+		if stageType == "implement" && cfg.noPR && (cfg.fixup || cfg.decomposedFromRunID != "") {
+			detail := fmt.Sprintf(
+				"run %s is a decomposition CHILD of parent run %s: a child's implement stage settles on its push onto the shared parent branch (push_to_shared_branch, #771), which --no-pr / push_and_open_pr=false suppresses — the stage would sit in 'running' with no /pull-request report to settle it. Dispatch this child with fishhawk_run_children, which spawns the identical child WITHOUT --no-pr",
+				cfg.runID, cfg.decomposedFromRunID)
+			if cfg.fixup {
+				detail = fmt.Sprintf(
+					"stage %s is a fix-up pass: a fix-up settles on its push onto the existing PR branch %s (push_fixup, #794), which --no-pr / push_and_open_pr=false suppresses — the stage would sit in 'running' with no /pull-request report to settle it. Re-dispatch this stage without push_and_open_pr=false",
+					cfg.stageID, cfg.fixupBranch)
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"no_pr_unsupported_push_path","detail":%q}`+"\n", detail)
+			return exitFailure
+		}
+
 		// Per-run working-tree isolation (E22.X / #1137). This is the first
 		// point the runner knows decomposedFromRunID, so it is where the
 		// lineage worktree is provisioned. Compute the lineage root (parent

@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -444,5 +446,133 @@ func TestGuardSiblingStageInFlight_TargetRunningRefusesAcrossAllVerdicts(t *test
 				t.Errorf("verdict %s names fishhawk_reap_stage = %v, want %v: %v", tc.name, got, tc.wantsReap, err)
 			}
 		})
+	}
+}
+
+// The push_and_open_pr=false decomposition-child guard (#2691) has five
+// enumerated branches. Each gets its own assertion driving guardNoPRImplement
+// directly, so the decision table is pinned independently of either call site.
+
+// A decomposition child + implement + push_and_open_pr=false => BLOCK naming
+// the remedy verb. This is the strand path: the child stamps
+// push_to_shared_branch regardless of --no-pr, and the backend then waits
+// forever for a /pull-request report the runner never sends.
+func TestGuardNoPRImplement_DecomposedChild_Blocks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	parent := uuid.New().String()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y", DecomposedFrom: &parent}
+
+	warnings, err := r.guardNoPRImplement(context.Background(), runID, "implement", false)
+	if err == nil {
+		t.Fatal("expected a block error for a decomposition child dispatched with push_and_open_pr=false")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "fishhawk_run_children") {
+		t.Errorf("error must name the remedy verb: %v", err)
+	}
+	if !strings.Contains(msg, parent) {
+		t.Errorf("error must name the parent run: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("a hard block carries no warnings, got %v", warnings)
+	}
+}
+
+// A STANDALONE run + implement + push_and_open_pr=false => ALLOW. This is the
+// E22.8/#406 commit-yourself flow: it stamps none of the three forward-gate
+// flags, so its trace upload settles the stage. The whole value of scoping this
+// guard is that it does not break this path.
+func TestGuardNoPRImplement_Standalone_Allows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+
+	warnings, err := r.guardNoPRImplement(context.Background(), runID, "implement", false)
+	if err != nil {
+		t.Fatalf("a standalone --no-pr implement dispatch must be ALLOWED, got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("an allowed standalone dispatch carries no warnings, got %v", warnings)
+	}
+}
+
+// A decomposition child + PLAN stage + push_and_open_pr=false => ALLOW. Only an
+// implement stage stamps a forward-gate flag.
+func TestGuardNoPRImplement_NonImplementStage_Allows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	parent := uuid.New().String()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y", DecomposedFrom: &parent}
+
+	warnings, err := r.guardNoPRImplement(context.Background(), runID, "plan", false)
+	if err != nil {
+		t.Fatalf("a plan stage must never be refused by this guard, got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("got warnings %v, want none", warnings)
+	}
+}
+
+// A decomposition child + implement + push_and_open_pr=TRUE => ALLOW with NO
+// GetRun round-trip. The short-circuit is asserted through a counting backend
+// rather than by the nil error alone: the fail-open branch would ALSO return a
+// nil error, so only the request count discriminates "short-circuited" from
+// "read the run and then failed open".
+func TestGuardNoPRImplement_PushAndOpenPRTrue_ShortCircuitsWithoutRoundTrip(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	warnings, err := r.guardNoPRImplement(context.Background(), uuid.New(), "implement", true)
+	if err != nil {
+		t.Fatalf("push_and_open_pr=true must be allowed, got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("the short-circuit emits no warnings, got %v", warnings)
+	}
+	if calls != 0 {
+		t.Errorf("backend requests = %d, want 0 — the common path must cost no round-trip", calls)
+	}
+}
+
+// A GetRun error => FAIL OPEN: nil error plus exactly one warning naming the
+// skipped guard. Deliberate (approval condition 1): on an unreadable run row
+// this layer cannot know the stage is a child, and refusing would break
+// legitimate dispatches during a backend hiccup. This is the ONE branch where a
+// runner process may start — the runner-side refusal then fires before the
+// agent is invoked, so no agent pass is burned.
+func TestGuardNoPRImplement_GetRunError_FailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getStatusByID[runID] = 500
+
+	warnings, err := r.guardNoPRImplement(context.Background(), runID, "implement", false)
+	if err != nil {
+		t.Fatalf("a GetRun error must FAIL OPEN (nil error), got %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one fail-open warning", warnings)
+	}
+	if !strings.Contains(warnings[0], "guard skipped") {
+		t.Errorf("warning should explain the guard was skipped, got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "backstop") {
+		t.Errorf("warning should name the runner-side backstop, got %q", warnings[0])
 	}
 }

@@ -64,6 +64,74 @@ func (r *runResolver) guardHostDispatch(ctx context.Context, runUUID uuid.UUID) 
 	return nil, nil
 }
 
+// guardNoPRImplement is the pre-spawn half of the two-layer
+// push_and_open_pr=false refusal (#2691). An implement stage dispatched with
+// push_and_open_pr=false on a DECOMPOSITION CHILD cannot settle: the runner
+// stamps push_to_shared_branch in the bundle manifest regardless of --no-pr
+// (willPushChild deliberately does not test it — the #771 forward gate exists
+// to stop a succeeded-but-unlanded child), so the backend defers the child
+// stage's terminal transition onto a /pull-request report the --no-pr runner
+// never sends and the stage sits in `running` until the #2630 reaper sweeps it
+// category C. Refusing here means no runner process is spawned at all.
+//
+// Decision table:
+//
+//   - stage != "implement", or push_and_open_pr is true: return immediately,
+//     NO round-trip. The common path costs nothing.
+//   - GetRun error: FAIL OPEN — a warning and a nil error, matching
+//     guardHostDispatch's #1355 posture. On an unreadable run row this layer
+//     cannot know the stage is a child, and refusing would break legitimate
+//     dispatches during a backend hiccup. This is the ONE branch where a runner
+//     process may start: the runner-side L1 refusal (main.go, immediately after
+//     the prompt fetch and before any worktree or agent work) is the backstop,
+//     so no AGENT PASS is burned even here.
+//   - DecomposedFrom == nil: allow. The STANDALONE E22.8/#406 commit-yourself
+//     flow is supported and must keep working — its trace upload settles the
+//     stage because it stamps none of the three forward-gate flags.
+//   - a decomposition child: BLOCK, naming fishhawk_run_children (which spawns
+//     the identical child WITHOUT the flag).
+//
+// COST: on the implement + push_and_open_pr=false path this guard performs ONE
+// ADDITIONAL GetRun beyond the run reads the callers already do. That read is
+// deliberately not shared with guardHostDispatch: threading a run row through
+// would couple the two guards' fail-open postures, and the extra read is paid
+// only on the rare explicit-false dispatch.
+//
+// SCOPE: deliberately the decomposed-child signal ONLY. Fix-up status is NOT
+// authoritatively knowable pre-spawn — cfg.fixup is derived server-side inside
+// the /prompt handler from resolveFixupConcerns(runID, stageID) and served only
+// on the prompt response; neither the run response nor the stage response
+// carries it, and the fix-up / retry / plan-approved stage parks are
+// indistinguishable by state (see guardSiblingStageInFlight below). The gate
+// view's pending fix-up rows are a PREDICTION, not authority: the backend
+// re-derives fixup at prompt-fetch time, so a concern waived, deferred or
+// resolved between dispatch and fetch flips the answer and an L2 refusal built
+// on it would reject a legitimate dispatch. That is why the fix-up arm lives in
+// the runner, at the first point the answer is authoritative and still strictly
+// before the agent invoke. base_branch is likewise NOT a refusal criterion: a
+// base branch on a STANDALONE stage triggers neither a working-tree restore nor
+// a forward-gate flag.
+//
+// Returns (warnings, err): a non-nil err is the pre-spawn block (the caller
+// must NOT spawn); warnings merge into the caller's warnings slice.
+func (r *runResolver) guardNoPRImplement(ctx context.Context, runUUID uuid.UUID, stage string, pushAndOpenPR bool) ([]string, error) {
+	if stage != "implement" || pushAndOpenPR {
+		return nil, nil
+	}
+	got, err := r.api.GetRun(ctx, runUUID)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"push_and_open_pr=false decomposition-child guard skipped (could not read run %s: %v); proceeding — the runner-side refusal remains the backstop and fires before the agent is invoked",
+			runUUID, err)}, nil
+	}
+	if got.DecomposedFrom == nil {
+		return nil, nil
+	}
+	return nil, fmt.Errorf(
+		"refusing to dispatch the implement stage of run %s with push_and_open_pr=false: it is a decomposition CHILD of parent run %s, and a child's implement stage settles on its push onto the shared parent branch (push_to_shared_branch, #771) — push_and_open_pr=false suppresses that push, so the backend defers the stage's terminal transition onto a /pull-request report that is never sent and the stage sits in 'running' until the reaper sweeps it. Use fishhawk_run_children to dispatch this child: it spawns the identical child WITHOUT the flag",
+		runUUID, *got.DecomposedFrom)
+}
+
 // guardSiblingStageInFlight is the sibling-in-flight host-dispatch admission
 // guard (incident bdf94763 / #1872). Dispatching a stage while another stage of
 // the same run is still executing rotates the run's signing key out from under
