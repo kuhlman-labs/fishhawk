@@ -2313,7 +2313,12 @@ func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
 			Category:          c.Category,
 			State:             string(c.State),
 			HasSuggestedPatch: c.SuggestedPatch != "",
-			ShortSummary:      concernShortSummary(c.Note),
+			// DisplayNote, not the raw field (#2555): concernShortSummary
+			// collapses a blank note to "" and the key is omitted, so a legacy
+			// blank-note row appeared on the run-status surface with no label at
+			// all. Feeding it the stand-in yields a bounded pointer label
+			// instead; the collapse/bound/marker logic is unchanged.
+			ShortSummary: concernShortSummary(c.DisplayNote()),
 		})
 	}
 	return out

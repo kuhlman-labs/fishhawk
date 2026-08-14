@@ -518,3 +518,41 @@ func TestDeferConcern_ChildNumberDiscovered(t *testing.T) {
 		t.Errorf("concern state = %q, want deferred", resp.Concern.State)
 	}
 }
+
+// TestDeferConcern_BlankNoteBodyAndTitleCarryPointer: deferring a LEGACY
+// blank-note concern (seeded by construction) auto-drafts a follow-up whose
+// title is derived from the stand-in rather than collapsing to the generic
+// "Deferred review concern" fallback, and whose body quotes the stand-in rather
+// than an empty blockquote line (#2555). A filed follow-up nobody can identify
+// is the same unactionable artifact one surface over.
+func TestDeferConcern_BlankNoteBodyAndTitleCarryPointer(t *testing.T) {
+	s, repo, _, cr, fp := deferServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedDeferRun(repo, runID)
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 512, "   \n\t ")
+
+	w := postDefer(t, s, row.ID.String(), deferConcernRequest{ParentEpic: "#389", N: "9"}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp deferConcernResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if strings.Contains(resp.Issue.Title, "Deferred review concern") {
+		t.Errorf("issue title = %q, want a title derived from the stand-in, not the degenerate fallback",
+			resp.Issue.Title)
+	}
+	if !strings.Contains(resp.Issue.Title, concern.MissingNoteMarker) {
+		t.Errorf("issue title = %q, want it to carry the %q stand-in", resp.Issue.Title, concern.MissingNoteMarker)
+	}
+	body := fp.captured.Item.Body
+	if strings.Contains(body, "\n> \n") {
+		t.Errorf("filed body quotes an EMPTY line:\n%s", body)
+	}
+	for _, want := range []string{concern.MissingNoteMarker, "512"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("filed body missing %q:\n%s", want, body)
+		}
+	}
+}

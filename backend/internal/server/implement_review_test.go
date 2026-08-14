@@ -3066,7 +3066,7 @@ func TestPersistReviewConcerns_CarriesEvidenceOntoMintedRow(t *testing.T) {
 	// survive onto it.
 	ref := uuid.New().String()
 
-	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement, "m", 300,
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement, "m", "", 300,
 		[]planreview.Concern{
 			{Severity: "high", Category: "correctness", Note: "evidenced", NewEvidence: evidence, SettledRef: ref},
 			{Severity: "low", Category: "style", Note: "bare"},
@@ -3105,7 +3105,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
 			t.Errorf("waived no-evidence re-raise minted %d rows, want 0 (suppressed)", got)
@@ -3141,7 +3141,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		ref := seedSettled(t, cr, runID, stageID, concern.StateDeferred)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "low", Category: "scope", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
 			t.Errorf("deferred no-evidence re-raise minted %d rows, want 0 (suppressed)", got)
@@ -3155,7 +3155,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise",
 				SettledRef: ref, NewEvidence: "genuinely regressed in the fixup"}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
@@ -3170,7 +3170,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		seedSettled(t, cr, runID, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: "not-a-uuid"}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("unparsable settled_ref minted %d rows, want 1 (fail-open)", got)
@@ -3184,7 +3184,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		seedSettled(t, cr, runID, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: uuid.New().String()}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("unknown-UUID settled_ref minted %d rows, want 1 (fail-open)", got)
@@ -3200,7 +3200,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// Waived concern belongs to a DIFFERENT stage of the same run.
 		otherStage := uuid.New()
 		ref := seedSettled(t, cr, runID, otherStage, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("other-stage settled_ref minted %d rows, want 1 (fail-open)", got)
@@ -3218,7 +3218,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// ref to another run's concern — it falls open to the normal insert.
 		otherRun := uuid.New()
 		ref := seedSettled(t, cr, otherRun, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("other-run settled_ref minted %d rows, want 1 (fail-open)", got)
@@ -3236,7 +3236,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// disjunct of the guard's cross-scope check (row.StageKind != stageKind).
 		// It falls open to the normal insert.
 		ref := seedSettledKind(t, cr, runID, stageID, concern.StageKindPlan, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("other-stage-kind settled_ref minted %d rows, want 1 (fail-open)", got)
@@ -3252,7 +3252,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// An ADDRESSED (resolved) concern is NOT guard-eligible: a genuine
 		// regression must reach the operator, so a no-evidence re-raise still inserts.
 		ref := seedSettled(t, cr, runID, stageID, concern.StateAddressed)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("addressed settled_ref minted %d rows, want 1 (insertable regression path)", got)
@@ -3269,7 +3269,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// Swap in a wrapper that fails GetByIDs AFTER seeding — a store outage.
 		wrapper := &lookupErrConcernRepo{fakeConcernRepo: cr, getErr: errors.New("db down")}
 		s.cfg.ConcernRepo = wrapper
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("lookup-error re-raise minted %d rows, want 1 (fail-open, loop never wedged)", got)
@@ -3286,7 +3286,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		// The suppression audit append fails: the guard must fall open (insert)
 		// so the suppression is never SILENT, and sibling concerns still persist.
 		au.appendErrCategory = concernRelitigationSuppressedCategory
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{
 				{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref},
 				{Severity: "low", Category: "scope", Note: "genuinely new"},
@@ -3303,7 +3303,7 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		s, cr, au := guardServer(t)
 		runID, stageID := uuid.New(), uuid.New()
 		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
-		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", "", 200,
 			[]planreview.Concern{
 				{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref},
 				{Severity: "low", Category: "scope", Note: "genuinely new"},
@@ -3872,5 +3872,369 @@ func TestImplementReview_OperatorConcernOnlyFixup_CountsAsRoutedRound(t *testing
 	prior := s.priorConcernsForReview(ctx, stage.RunID, stage.ID)
 	if !hasFixupRoutedConcern(prior) {
 		t.Errorf("hasFixupRoutedConcern = false, want true (an operator-concern-only fix-up is a routed round)")
+	}
+}
+
+// --- Blank-note backfill (#2555) ---------------------------------------------
+//
+// A reviewer concern with an empty or whitespace-only note was persisted
+// verbatim and then held the merge gate open carrying nothing an operator, a
+// fix-up agent, or a later re-review could act on. Every fixture below seeds its
+// blank note BY CONSTRUCTION (a literal "" / "   \n\t"), never by calling the
+// control, so deleting backfillConcernNote's blank branch reddens the persisted-
+// note assertion rather than the setup.
+
+// findBackfillAudits returns every concern_note_backfilled entry appended to au.
+func findBackfillAudits(au *auditFake) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, ap := range au.appended {
+		if ap.Category == concernNoteBackfilledCategory {
+			out = append(out, ap)
+		}
+	}
+	return out
+}
+
+// decodeBackfillPayload decodes one concern_note_backfilled payload.
+func decodeBackfillPayload(t *testing.T, ap audit.ChainAppendParams) concernNoteBackfilledPayload {
+	t.Helper()
+	var p concernNoteBackfilledPayload
+	if err := json.Unmarshal(ap.Payload, &p); err != nil {
+		t.Fatalf("decode concern_note_backfilled payload: %v", err)
+	}
+	return p
+}
+
+// TestPersistReviewConcerns_BlankNoteBackfilledFromFreeForm: a blank note with
+// substantive free_form is persisted carrying the recovery marker AND the
+// free_form substance, so the gate view shows something actionable.
+func TestPersistReviewConcerns_BlankNoteBackfilledFromFreeForm(t *testing.T) {
+	s, cr, _ := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	const freeForm = "The added helper never asserts the error path; the test asserts only the happy branch."
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"claude-opus-4-8", freeForm, 42,
+		[]planreview.Concern{{Severity: "medium", Category: "coverage", Note: ""}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1 — a blank-note concern is NEVER dropped", len(minted))
+	}
+	// Read the STORED row, not just the returned struct: the gate view reads
+	// what the repository holds.
+	stored, err := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	got := stored[0].Note
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("persisted note is blank — the concern still holds the gate open carrying nothing")
+	}
+	if !strings.Contains(got, concern.MissingNoteMarker) {
+		t.Errorf("persisted note = %q, want the %q marker so the note is self-describing as synthesized",
+			got, concern.MissingNoteMarker)
+	}
+	if !strings.Contains(got, freeForm) {
+		t.Errorf("persisted note = %q, want it to carry the recovered free_form substance %q", got, freeForm)
+	}
+	// The marker must warn that free_form is round-level: a round emitting two
+	// blank concerns gets the SAME prose on both rows, so an operator must not
+	// read it as this concern's authored note.
+	if !strings.Contains(got, "may cover other findings from the same round") {
+		t.Errorf("persisted note = %q, want it to state the free_form may cover other findings from the round", got)
+	}
+}
+
+// TestPersistReviewConcerns_BlankNoteNoFreeFormPointer: with no free_form to
+// recover from, the persisted note is the audit-entry pointer naming the origin
+// sequence, stage kind, and reviewer model.
+func TestPersistReviewConcerns_BlankNoteNoFreeFormPointer(t *testing.T) {
+	s, cr, _ := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"gpt-5-codex", "   ", 108,
+		[]planreview.Concern{{Severity: "high", Category: "correctness", Note: ""}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1", len(minted))
+	}
+	stored, err := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	got := stored[0].Note
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("persisted note is blank with no free_form to recover from — want the audit-entry pointer")
+	}
+	for _, want := range []string{concern.MissingNoteMarker, "gpt-5-codex", concern.StageKindImplement, "108"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("persisted note = %q, want it to name %q", got, want)
+		}
+	}
+}
+
+// TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank: a note of only
+// whitespace passes a naive `note != ""` check but is equally unactionable.
+func TestPersistReviewConcerns_WhitespaceOnlyNoteTreatedAsBlank(t *testing.T) {
+	s, cr, au := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", "free-form substance here", 7,
+		[]planreview.Concern{{Severity: "low", Category: "style", Note: "   \n\t "}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1", len(minted))
+	}
+	stored, _ := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if !strings.Contains(stored[0].Note, concern.MissingNoteMarker) {
+		t.Errorf("persisted note = %q, want the whitespace-only note treated as blank and backfilled", stored[0].Note)
+	}
+	if n := len(findBackfillAudits(au)); n != 1 {
+		t.Errorf("concern_note_backfilled entries = %d, want 1", n)
+	}
+}
+
+// TestPersistReviewConcerns_NonBlankNoteUnchanged is the counterfactual the
+// issue demands: a well-formed concern is persisted BYTE-IDENTICAL and emits NO
+// backfill audit entry. A backfill that rewrote every note would pass the
+// blank-note tests above and fail here.
+func TestPersistReviewConcerns_NonBlankNoteUnchanged(t *testing.T) {
+	s, cr, au := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	const note = "handleGetStage drops the reviewer model when ReviewerModel is NULL; add the derefStr fallback"
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", "unrelated round commentary", 9,
+		[]planreview.Concern{{Severity: "medium", Category: "correctness", Note: note}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1", len(minted))
+	}
+	stored, _ := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if stored[0].Note != note {
+		t.Errorf("persisted note = %q, want the authored note byte-identical (%q)", stored[0].Note, note)
+	}
+	if n := len(findBackfillAudits(au)); n != 0 {
+		t.Errorf("concern_note_backfilled entries = %d for an authored note, want 0", n)
+	}
+}
+
+// TestPersistReviewConcerns_LongFreeFormTruncated: the recovered prose is
+// bounded (the note is rendered whole by the gate view and quoted into filed
+// follow-ups) and the cut is marked.
+func TestPersistReviewConcerns_LongFreeFormTruncated(t *testing.T) {
+	s, cr, au := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	// Multi-byte runes so a naive byte cut would land mid-rune and emit U+FFFD.
+	freeForm := strings.Repeat("é", concernNoteFreeFormMaxBytes)
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", freeForm, 3,
+		[]planreview.Concern{{Severity: "low", Category: "coverage", Note: ""}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1", len(minted))
+	}
+	stored, _ := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	got := stored[0].Note
+	if !strings.Contains(got, concernNoteTruncationMarker) {
+		t.Errorf("persisted note = %q…, want the truncation marker", got[:min(len(got), 200)])
+	}
+	if strings.ContainsRune(got, '�') {
+		t.Error("persisted note contains U+FFFD — the byte cut landed mid-rune")
+	}
+	entries := findBackfillAudits(au)
+	if len(entries) != 1 {
+		t.Fatalf("concern_note_backfilled entries = %d, want 1", len(entries))
+	}
+	if p := decodeBackfillPayload(t, entries[0]); !p.FreeFormTruncated {
+		t.Error("payload.free_form_truncated = false, want true")
+	}
+}
+
+// TestPersistReviewConcerns_BackfillAuditEntryEmitted: exactly one advisory
+// entry per backfilled concern, carrying the right source marker — and none for
+// the authored concern in the same batch.
+func TestPersistReviewConcerns_BackfillAuditEntryEmitted(t *testing.T) {
+	s, _, au := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+
+	s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"claude-opus-4-8", "round commentary", 55,
+		[]planreview.Concern{
+			{Severity: "high", Category: "correctness", Note: ""},
+			{Severity: "low", Category: "style", Note: "authored"},
+		})
+	entries := findBackfillAudits(au)
+	if len(entries) != 1 {
+		t.Fatalf("concern_note_backfilled entries = %d, want exactly 1 (one blank concern of two)", len(entries))
+	}
+	if entries[0].ActorKind == nil || *entries[0].ActorKind != audit.ActorSystem {
+		t.Errorf("ActorKind = %v, want system", entries[0].ActorKind)
+	}
+	p := decodeBackfillPayload(t, entries[0])
+	if p.Source != backfillSourceFreeForm {
+		t.Errorf("payload.source = %q, want %q", p.Source, backfillSourceFreeForm)
+	}
+	if p.Severity != "high" || p.Category != "correctness" || p.OriginReviewSequence != 55 {
+		t.Errorf("payload = %+v, want it keyed back to the emitting concern and review", p)
+	}
+	if strings.TrimSpace(p.Note) == "" {
+		t.Error("payload.note is blank, want the substituted text")
+	}
+
+	// The no-free_form path records the other source marker.
+	s2, _, au2 := guardServer(t)
+	s2.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement, "m", "", 56,
+		[]planreview.Concern{{Severity: "low", Category: "coverage", Note: ""}})
+	e2 := findBackfillAudits(au2)
+	if len(e2) != 1 {
+		t.Fatalf("concern_note_backfilled entries = %d, want 1", len(e2))
+	}
+	if p := decodeBackfillPayload(t, e2[0]); p.Source != backfillSourceNone {
+		t.Errorf("payload.source = %q, want %q", p.Source, backfillSourceNone)
+	}
+}
+
+// TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills pins the
+// INVERSE fail direction against suppressRelitigation: an audit-append failure
+// warn-logs and the backfill STILL applies. Refusing to backfill because
+// bookkeeping failed would re-persist the blank row this control exists to
+// prevent. The synthesized note on the row IS the durable record; the audit
+// entry only adds traceability.
+func TestPersistReviewConcerns_BackfillAuditAppendFailureStillBackfills(t *testing.T) {
+	s, cr, au := guardServer(t)
+	au.appendErrCategory = concernNoteBackfilledCategory
+	runID, stageID := uuid.New(), uuid.New()
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", "recoverable commentary", 21,
+		[]planreview.Concern{{Severity: "medium", Category: "coverage", Note: ""}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1 — an audit failure must never drop the concern", len(minted))
+	}
+	stored, _ := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if strings.TrimSpace(stored[0].Note) == "" {
+		t.Fatal("persisted note is blank after an audit-append failure — the fix fell open to the defect")
+	}
+	if !strings.Contains(stored[0].Note, concern.MissingNoteMarker) {
+		t.Errorf("persisted note = %q, want the self-describing stand-in — it IS the durable record of the substitution",
+			stored[0].Note)
+	}
+	if n := len(findBackfillAudits(au)); n != 0 {
+		t.Fatalf("concern_note_backfilled entries = %d, want 0 (the append was injected to fail)", n)
+	}
+}
+
+// TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills: the other
+// append-unavailable branch — no AuditRepo wired at all.
+func TestPersistReviewConcerns_BackfillNilAuditRepoStillBackfills(t *testing.T) {
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", "", 4, []planreview.Concern{{Severity: "low", Category: "coverage", Note: ""}})
+	if len(minted) != 1 {
+		t.Fatalf("minted %d rows, want 1", len(minted))
+	}
+	if strings.TrimSpace(minted[0].Note) == "" {
+		t.Error("persisted note is blank with no AuditRepo wired — the backfill must not depend on the audit append")
+	}
+}
+
+// TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed: the #1913
+// re-litigation guard runs FIRST and still wins — a suppressed blank-note
+// re-raise mints no row and emits no backfill entry (an ordering slip that
+// backfilled before suppressing would emit a stray advisory entry for a concern
+// that was never persisted).
+func TestPersistReviewConcerns_SuppressedBlankNoteStillSuppressed(t *testing.T) {
+	s, cr, au := guardServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+
+	before := countRaised(cr)
+	s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement,
+		"m", "round commentary", 200,
+		[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "", SettledRef: ref}})
+	if got := countRaised(cr) - before; got != 0 {
+		t.Errorf("suppressed blank-note re-raise minted %d new rows, want 0", got)
+	}
+	if n := len(findBackfillAudits(au)); n != 0 {
+		t.Errorf("concern_note_backfilled entries = %d for a suppressed concern, want 0", n)
+	}
+	if n := countSuppressionAudits(au, concernRelitigationSuppressedCategory); n != 1 {
+		t.Errorf("concern_relitigation_suppressed entries = %d, want 1", n)
+	}
+}
+
+// countRaised counts all rows in state raised.
+func countRaised(cr *fakeConcernRepo) int {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	n := 0
+	for _, r := range cr.rows {
+		if r.State == concern.StateRaised {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPriorConcernsForReview_BlankNoteThreadsPointer is the re-review criterion
+// (#2555, binding approval condition 1): a LEGACY blank-note row — one minted
+// before the write-side backfill landed, seeded here by construction — must
+// reach the next review round's prompt carrying substance, not an empty field.
+// This is the wall the issue reports: a later review could not delta-verify two
+// concerns because their notes were empty.
+func TestPriorConcernsForReview_BlankNoteThreadsPointer(t *testing.T) {
+	s, cr, _ := guardServer(t)
+	ctx := context.Background()
+	runID, stageID := uuid.New(), uuid.New()
+
+	// A legacy row: inserted with a literal blank note, bypassing the write-side
+	// control entirely (exactly how the rows already in the store were minted).
+	rows, err := cr.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: runID, StageID: stageID, StageKind: concern.StageKindImplement,
+		ReviewerModel: "gpt-5-codex", OriginReviewSequence: 64,
+		Concerns: []concern.RaisedConcern{{Severity: "medium", Category: "coverage", Note: ""}},
+	})
+	if err != nil {
+		t.Fatalf("seed legacy blank row: %v", err)
+	}
+	// A settled sibling, so the settled ledger is exercised too.
+	settled, err := cr.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: runID, StageID: stageID, StageKind: concern.StageKindImplement,
+		ReviewerModel: "gpt-5-codex", OriginReviewSequence: 65,
+		Concerns: []concern.RaisedConcern{{Severity: "low", Category: "style", Note: "  "}},
+	})
+	if err != nil {
+		t.Fatalf("seed settled blank row: %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, settled[0].ID, concern.StateWaived, "operator arbitration"); err != nil {
+		t.Fatalf("waive: %v", err)
+	}
+
+	prior := s.priorConcernsForReview(ctx, runID, stageID)
+	if len(prior) != 1 {
+		t.Fatalf("priorConcernsForReview returned %d concerns, want 1", len(prior))
+	}
+	if strings.TrimSpace(prior[0].Note) == "" {
+		t.Fatal("the re-review prompt received an EMPTY prior-concern note — the reviewer cannot delta-verify it")
+	}
+	for _, want := range []string{concern.MissingNoteMarker, "64", "gpt-5-codex"} {
+		if !strings.Contains(prior[0].Note, want) {
+			t.Errorf("prior concern note = %q, want it to name %q", prior[0].Note, want)
+		}
+	}
+	if prior[0].ID != rows[0].ID.String() {
+		t.Errorf("prior concern id = %q, want the seeded row's id", prior[0].ID)
+	}
+
+	ledger := s.settledConcernsForReview(ctx, runID, stageID)
+	if len(ledger) != 1 {
+		t.Fatalf("settledConcernsForReview returned %d concerns, want 1", len(ledger))
+	}
+	if strings.TrimSpace(ledger[0].Note) == "" {
+		t.Error("the settled ledger threaded an EMPTY note — a blank ledger row cannot stop a re-raise")
 	}
 }

@@ -5106,3 +5106,52 @@ func TestShipPlan_AppliesToPathsSatisfied_AdvancesToGate(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanReviewLoop_BlankNoteBackfilled is the plan-stage twin of the
+// implement-loop backfill tests (#2555), driving the REAL runPlanReviewLoop:
+// both review loops must pass the verdict's free_form into
+// persistReviewConcerns, so a plan reviewer that emits a blank-note concern can
+// no longer wedge the plan gate with an unactionable item. A plan.go call site
+// left on the old signature (or passing "") reddens this on the persisted note.
+func TestPlanReviewLoop_BlankNoteBackfilled(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	const freeForm = "The approach step 4 never states how the migration is rolled back."
+	rev := &probingReviewer{
+		model: "claude-opus-4-8",
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictApproveWithConcerns,
+			FreeForm: freeForm,
+			// Blank BY CONSTRUCTION — the fixture never calls the control.
+			Concerns: []planreview.Concern{{Severity: "medium", Category: "verification", Note: ""}},
+		},
+	}
+	inv := reviewerInvocation{reviewer: rev, provider: "anthropic", specModel: "claude-opus-4-8"}
+
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model",
+		planreview.DefaultReviewBudget, "")
+
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted %d plan concerns, want 1", len(rows))
+	}
+	if strings.TrimSpace(rows[0].Note) == "" {
+		t.Fatal("the plan loop persisted a BLANK note — it holds the plan gate open carrying nothing")
+	}
+	if !strings.Contains(rows[0].Note, concern.MissingNoteMarker) {
+		t.Errorf("persisted note = %q, want the synthesized-note marker", rows[0].Note)
+	}
+	if !strings.Contains(rows[0].Note, freeForm) {
+		t.Errorf("persisted note = %q, want the plan review's free_form substance recovered into it", rows[0].Note)
+	}
+	if rows[0].StageKind != concern.StageKindPlan {
+		t.Errorf("stage kind = %q, want %q", rows[0].StageKind, concern.StageKindPlan)
+	}
+}

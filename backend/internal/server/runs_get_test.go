@@ -2931,11 +2931,15 @@ func TestGetRun_ConcernShortSummaryPerItem(t *testing.T) {
 	}
 }
 
-// TestGetRun_ConcernShortSummaryOmittedWhenNoteBlank seeds a whitespace-only
-// note and asserts the short_summary KEY is absent from the decoded item
-// object (not merely empty). This is the server-side authority for the
-// omission claim (counterfactual (ii) deletes ,omitempty and runs it).
-func TestGetRun_ConcernShortSummaryOmittedWhenNoteBlank(t *testing.T) {
+// TestRunStatus_BlankNoteConcernShortSummaryPointer replaces the pre-#2555
+// contract (short_summary KEY ABSENT for a blank-note concern) with its
+// deliberate inversion: a LEGACY blank-note row — seeded here by construction
+// with a whitespace-only note, exactly as such rows sit in the store today —
+// now renders a bounded stand-in label naming the originating review, because
+// an open concern the operator cannot even identify is the defect this change
+// removes. The bound/marker/per-item-derivation assertions elsewhere in this
+// file are unchanged; only the blank-note case flipped.
+func TestRunStatus_BlankNoteConcernShortSummaryPointer(t *testing.T) {
 	repo := newFakeRepo()
 	cr := newFakeConcernRepo()
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
@@ -2963,8 +2967,22 @@ func TestGetRun_ConcernShortSummaryOmittedWhenNoteBlank(t *testing.T) {
 	if len(raw.Concerns.Items) != 1 {
 		t.Fatalf("items = %d, want 1:\n%s", len(raw.Concerns.Items), w.Body.String())
 	}
-	if _, present := raw.Concerns.Items[0]["short_summary"]; present {
-		t.Errorf("short_summary key present for a blank-note concern, want absent:\n%s", w.Body.String())
+	rawLabel, present := raw.Concerns.Items[0]["short_summary"]
+	if !present {
+		t.Fatalf("short_summary key ABSENT for a blank-note concern, want the stand-in label:\n%s", w.Body.String())
+	}
+	label, _ := rawLabel.(string)
+	if !strings.Contains(label, concern.MissingNoteMarker) {
+		t.Errorf("short_summary = %q, want the %q stand-in", label, concern.MissingNoteMarker)
+	}
+	// The bound still applies — the stand-in flows through concernShortSummary
+	// unchanged, so it is collapsed and capped like any other note.
+	if len(label) > concernShortSummaryMaxBytes {
+		t.Errorf("short_summary = %d bytes, want <= %d — the stand-in must respect the existing bound",
+			len(label), concernShortSummaryMaxBytes)
+	}
+	if strings.Contains(label, "\n") {
+		t.Errorf("short_summary = %q, want whitespace collapsed", label)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -187,6 +188,60 @@ type Concern struct {
 	SettledRef string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+// MissingNoteMarker leads every synthesized stand-in for a blank reviewer
+// note (#2555). It is deliberately a literal an operator can grep for: a
+// note carrying it was NOT authored by the reviewer.
+const MissingNoteMarker = "[no reviewer note recorded]"
+
+// missingNoteUnknownReviewer renders in place of a blank/absent reviewer model.
+const missingNoteUnknownReviewer = "an unknown reviewer"
+
+// MissingNotePointer builds the deterministic stand-in text for a concern
+// whose reviewer note is blank (#2555): the marker plus a pointer to the
+// originating *_reviewed audit entry, which IS the authoritative record of
+// what the reviewer emitted. It fabricates no substance — it only guarantees
+// the operator, a fix-up agent, and a later re-review get a non-blank field
+// naming exactly where to read next.
+//
+// It is exported because the write-side backfill (server's persistReviewConcerns)
+// synthesizes the same text when a blank-note concern arrives with no free_form
+// to recover from, so the stored row and this read-side fallback speak ONE
+// vocabulary rather than two near-identical ones.
+func MissingNotePointer(stageKind, reviewerModel string, originSequence int64) string {
+	reviewer := strings.TrimSpace(reviewerModel)
+	if reviewer == "" {
+		reviewer = missingNoteUnknownReviewer
+	}
+	kind := strings.TrimSpace(stageKind)
+	if kind == "" {
+		kind = "unknown"
+	}
+	return fmt.Sprintf("%s — raised by %s in the %s-stage review recorded at audit sequence %d. "+
+		"Read that *_reviewed audit entry for the reviewer's own output; this concern's note was empty.",
+		MissingNoteMarker, reviewer, kind, originSequence)
+}
+
+// DisplayNote returns the note every operator-facing and prompt-facing surface
+// should render for this concern (#2555). It returns c.Note verbatim whenever
+// the stored note carries anything but whitespace; when the stored note is
+// blank — the legacy rows minted BEFORE the write-side backfill landed — it
+// returns MissingNotePointer built from the row itself.
+//
+// The contract is narrow on purpose: it never fabricates substance and never
+// rewrites an authored note. It guarantees only that no surface renders an
+// empty field where a concern's substance belongs, and that the empty field is
+// replaced by a pointer to where the reviewer's actual output lives.
+func (c Concern) DisplayNote() string {
+	if strings.TrimSpace(c.Note) != "" {
+		return c.Note
+	}
+	model := ""
+	if c.ReviewerModel != nil {
+		model = *c.ReviewerModel
+	}
+	return MissingNotePointer(c.StageKind, model, c.OriginReviewSequence)
 }
 
 // RaisedConcern is one concern as decoded from a review verdict, before

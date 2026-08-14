@@ -242,16 +242,20 @@ func TestStrictVerdictSchema_SatisfiesStrictRequired(t *testing.T) {
 		assertNullable(t, topProps, k, "strict top-level")
 	}
 
-	// concerns.items: severity required & non-null enum; category/note/
-	// suggested_patch nullable.
+	// concerns.items: severity + note required & non-null (note joined the
+	// ORIGINAL required set in #2555, so the transform must leave its plain
+	// "string" type alone — a nullable note would let a reviewer emit
+	// `"note": null` and re-open the empty-note hole); category/
+	// suggested_patch/settled_ref/new_evidence stay nullable.
 	concernItems := itemsOf(t, topProps, "concerns")
 	assertRequiredEnumeratesAll(t, concernItems, "strict concerns.items")
 	concernProps := propsOf(t, concernItems, "strict concerns.items")
 	assertNonNull(t, concernProps, "severity", "strict concerns.items")
+	assertNonNull(t, concernProps, "note", "strict concerns.items")
 	if _, ok := concernProps["severity"].(map[string]any)["enum"]; !ok {
 		t.Error("strict concerns.items: severity lost its enum in the strict transform")
 	}
-	for _, k := range []string{"category", "note", "suggested_patch", "settled_ref", "new_evidence"} {
+	for _, k := range []string{"category", "suggested_patch", "settled_ref", "new_evidence"} {
 		assertNullable(t, concernProps, k, "strict concerns.items")
 	}
 
@@ -469,5 +473,89 @@ func TestVerdictSchema_RoundTripsThroughDecode(t *testing.T) {
 	}
 	if len(got.ConcernResolutions) != 1 || got.ConcernResolutions[0].ID != "c-1" {
 		t.Errorf("ConcernResolutions = %+v, want one entry id c-1", got.ConcernResolutions)
+	}
+}
+
+// concernSchemaNode digs out the concern object schema from VerdictSchema()'s
+// nested maps, failing the test on any shape surprise.
+func concernSchemaNode(t *testing.T, root map[string]any) map[string]any {
+	t.Helper()
+	props, ok := root["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema has no properties map")
+	}
+	concerns, ok := props["concerns"].(map[string]any)
+	if !ok {
+		t.Fatal("schema has no concerns property")
+	}
+	items, ok := concerns["items"].(map[string]any)
+	if !ok {
+		t.Fatal("concerns has no items object")
+	}
+	return items
+}
+
+// TestVerdictSchema_ConcernNoteRequired pins the schema half of #2555: `note`
+// must be REQUIRED on a concern. Before this, `required` was [severity] alone,
+// so a schema-conforming reviewer could LEGALLY emit a concern with no text at
+// all — and one did, twice, wedging a merge gate with an item whose only
+// disposition was a waive of unknown content.
+func TestVerdictSchema_ConcernNoteRequired(t *testing.T) {
+	req, ok := concernSchemaNode(t, VerdictSchema())["required"].([]any)
+	if !ok {
+		t.Fatal("concern schema has no required array")
+	}
+	var got []string
+	for _, r := range req {
+		s, _ := r.(string)
+		got = append(got, s)
+	}
+	for _, want := range []string{"severity", "note"} {
+		found := false
+		for _, g := range got {
+			if g == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("concern required = %v, want it to contain %q", got, want)
+		}
+	}
+	// No minLength: codex 0.140's strict --output-schema rejects unsupported
+	// string keywords with HTTP 400 invalid_json_schema (#1330). The enforcing
+	// control is the server-side backfill, not the schema.
+	props, _ := concernSchemaNode(t, VerdictSchema())["properties"].(map[string]any)
+	note, _ := props["note"].(map[string]any)
+	if _, present := note["minLength"]; present {
+		t.Error("concern note declares minLength — codex strict mode rejects it with HTTP 400 (#1330)")
+	}
+}
+
+// TestStrictVerdictSchema_NoteNotNullable pins the derived strict variant: with
+// `note` now in the ORIGINAL required set, the strict transform must emit it as
+// a plain "string" rather than widening it to ["string","null"] — a nullable
+// note would let a codex reviewer emit `"note": null` and re-open the hole the
+// required promotion closes.
+func TestStrictVerdictSchema_NoteNotNullable(t *testing.T) {
+	props, ok := concernSchemaNode(t, StrictVerdictSchema())["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("strict concern schema has no properties map")
+	}
+	note, ok := props["note"].(map[string]any)
+	if !ok {
+		t.Fatal("strict concern schema has no note property")
+	}
+	typ, ok := note["type"].(string)
+	if !ok {
+		t.Fatalf("strict note type = %#v, want the plain string \"string\" (a required field is never widened)", note["type"])
+	}
+	if typ != "string" {
+		t.Errorf("strict note type = %q, want \"string\"", typ)
+	}
+	// The still-optional siblings must keep their nullable widening, so this
+	// test cannot pass by disabling the transform outright.
+	patch, _ := props["suggested_patch"].(map[string]any)
+	if _, isArray := patch["type"].([]any); !isArray {
+		t.Errorf("strict suggested_patch type = %#v, want the nullable [\"string\",\"null\"] widening", patch["type"])
 	}
 }

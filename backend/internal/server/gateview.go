@@ -466,10 +466,12 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 		Category:             c.Category,
 		State:                string(c.State),
 		StateReason:          c.StateReason,
-		Note:                 c.Note,
-		NewEvidence:          c.NewEvidence,
-		SettledRef:           c.SettledRef,
-		HasSuggestedPatch:    c.SuggestedPatch != "",
+		// DisplayNote, not the raw field (#2555): a legacy blank-note row would
+		// otherwise render an empty note at the gate the operator decides from.
+		Note:              c.DisplayNote(),
+		NewEvidence:       c.NewEvidence,
+		SettledRef:        c.SettledRef,
+		HasSuggestedPatch: c.SuggestedPatch != "",
 	}
 	if c.StageKind == concern.StageKindImplement {
 		out.Round = gateViewRound(h.triggers, c.StageID, c.OriginReviewSequence)

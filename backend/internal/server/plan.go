@@ -2134,7 +2134,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			// Persist the verdict's concerns with stable IDs (#964) using
 			// the sequence the append returned; a failed append (no
 			// sequence) skips persistence for this verdict.
-			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindPlan, model, entry.Sequence, verdict.Concerns)
+			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindPlan, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The

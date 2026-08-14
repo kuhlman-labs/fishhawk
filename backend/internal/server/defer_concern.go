@@ -241,8 +241,11 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filing := workmgmt.FilingRequest{
-		Type:    itemType,
-		Summary: deferSummary(row.Note),
+		Type: itemType,
+		// DisplayNote, not the raw field (#2555): a blank note would otherwise
+		// title the filed follow-up from nothing (the generic fallback) and quote
+		// an empty line in its body.
+		Summary: deferSummary(row.DisplayNote()),
 		Body:    deferBody(row, rn, reqBody.Note),
 		Labels:  reqBody.Labels,
 		Relations: workmgmt.Relations{
@@ -504,7 +507,7 @@ func deferBody(row *concern.Concern, rn *run.Run, operatorNote string) string {
 
 	b.WriteString("## Observed\n\n")
 	fmt.Fprintf(&b, "A **%s** severity concern in category **%s**, raised by %s:\n\n", row.Severity, row.Category, reviewer)
-	for _, ln := range strings.Split(strings.TrimRight(row.Note, "\n"), "\n") {
+	for _, ln := range strings.Split(strings.TrimRight(row.DisplayNote(), "\n"), "\n") {
 		fmt.Fprintf(&b, "> %s\n", ln)
 	}
 	b.WriteString("\n")
