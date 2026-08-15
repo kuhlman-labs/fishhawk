@@ -265,6 +265,16 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 	start := time.Now()
 	deadline := start.Add(time.Duration(timeout) * time.Second)
 
+	// The checks-pending re-POSTs are bounded by the SHARED deadline too: a POST
+	// issued on an unbounded ctx could let a slow or hung backend push the tool
+	// past its promised timeout indefinitely instead of returning the resumable
+	// checks_pending checkpoint (E67.56 / #2717). deadlineCtx caps every POST so
+	// an in-flight one cannot outlive the deadline; a POST cancelled by it (or by
+	// the parent ctx) after a checks-pending refusal is the bounded wait expiring,
+	// not a dispatch failure, so it resolves to the checkpoint below.
+	deadlineCtx, cancelDeadline := context.WithDeadline(ctx, deadline)
+	defer cancelDeadline()
+
 	interval := r.reviewPollInterval
 	if interval <= 0 {
 		interval = defaultReviewPollInterval
@@ -279,24 +289,41 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 	// shared deadline expires (then returns the resumable checks_pending status).
 	// A 502 (merge_dispatch_failed) and every OTHER error surface here verbatim —
 	// the verdict row is durable, so a re-invoke re-queues the merge.
+	//
+	// sawChecksPending records that a checks-pending refusal was observed. It is a
+	// dedicated flag rather than checksSeq != 0 so the "return the resumable
+	// checkpoint on a bounded-wait cancellation" decision does not depend on the
+	// server having surfaced details.verdict_sequence (mergeVerdictSequenceFrom
+	// returns 0 when it is absent) — a checks-pending 409 with no sequence still
+	// resolves to the checkpoint, not a spurious tool error.
 	var res *MergeRunResult
 	var checksSeq int64
+	var sawChecksPending bool
 	for {
+		// Check expiry before every (re-)POST: the timer below is clamped to the
+		// deadline, so it can fire AT the deadline and loop back here — re-POSTing
+		// then would issue a doomed HTTP call past the tool's promised timeout. On
+		// exhaustion return the resumable checkpoint instead of POSTing again.
+		if sawChecksPending && !time.Now().Before(deadline) {
+			return nil, checksPendingOutput(checksSeq, start), nil
+		}
 		var merr error
-		res, merr = r.api.MergeRun(ctx, runID, verdict)
+		res, merr = r.api.MergeRun(deadlineCtx, runID, verdict)
 		if merr == nil {
 			break
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {
-			// A ctx cancellation mid-retry AFTER a checks-pending hit is the
-			// bounded wait expiring, not a genuine dispatch failure — return the
-			// resumable checkpoint rather than a spurious tool error.
-			if checksSeq != 0 && ctx.Err() != nil {
+			// A POST cancelled mid-retry AFTER a checks-pending hit — by the shared
+			// deadline or the parent ctx — is the bounded wait expiring, not a
+			// genuine dispatch failure. Return the resumable checkpoint rather than
+			// a spurious tool error.
+			if sawChecksPending && deadlineCtx.Err() != nil {
 				return nil, checksPendingOutput(checksSeq, start), nil
 			}
 			return nil, MergeRunOutput{}, fmt.Errorf("merge run: %w", merr)
 		}
+		sawChecksPending = true
 		if seq := mergeVerdictSequenceFrom(ae.Details); seq != 0 {
 			checksSeq = seq
 		}
@@ -311,7 +338,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		}
 		timer := time.NewTimer(wait)
 		select {
-		case <-ctx.Done():
+		case <-deadlineCtx.Done():
 			timer.Stop()
 			return nil, checksPendingOutput(checksSeq, start), nil
 		case <-timer.C:

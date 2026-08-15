@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -503,6 +504,15 @@ const mergeChecksPendingBody = `{"error":{"code":"merge_checks_pending",` +
 	`"message":"required checks have not all passed",` +
 	`"details":{"verdict_sequence":61595,"reason":"checks_pending"}}}`
 
+// mergeChecksPendingBodyNoSeq is the same 409 with NO details.verdict_sequence —
+// a shape the handler does not emit today, but the tool's seen-pending decision
+// must not depend on the sequence being present (E67.56 / #2717 concern 2). Used
+// to drive the sawChecksPending decoupling: a checks-pending refusal with no
+// sequence must still resolve to the resumable checkpoint, not a tool error.
+const mergeChecksPendingBodyNoSeq = `{"error":{"code":"merge_checks_pending",` +
+	`"message":"required checks have not all passed",` +
+	`"details":{"reason":"checks_pending"}}}`
+
 // TestMergeRun_ChecksPendingThenSuccess drives the wait-then-queue path
 // (E67.56 / #2717): the backend answers 409 merge_checks_pending for the first
 // two POSTs then 200, so the tool re-POSTs (more than once) WITHOUT erroring and
@@ -599,6 +609,122 @@ func TestMergeRun_ChecksPendingUntilDeadline(t *testing.T) {
 	fb.mu.Unlock()
 	if calls < 2 {
 		t.Errorf("merge POSTed %d times, want >= 2 (the tool re-POSTs across the wait)", calls)
+	}
+}
+
+// TestMergeRun_ChecksPendingDeadlineBranch pins the checks-pending loop's OWN
+// deadline-exhaustion branch (E67.56 / #2717): with a responsive always-409
+// backend and NO ctx deadline, the ONLY thing that can end the wait is the
+// tool's own clamped deadline (TimeoutSeconds=1 → clampAwaitTimeout → 1s). So
+// the `!time.Now().Before(deadline)` return and the timer-clamped final wait are
+// reached directly through the tool's deadline expiring, not approximated via a
+// parent-ctx cancellation. Counterfactual: deleting the loop's deadline return
+// makes the wait never end under a non-cancelling ctx → the test hangs (RED).
+func TestMergeRun_ChecksPendingDeadlineBranch(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		stateAfterMerge:   "running",
+		mergeStickyStatus: http.StatusConflict, // every POST 409 checks-pending
+		mergeErrBody:      mergeChecksPendingBody,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv) // reviewPollInterval = 1ms
+
+	// context.Background() never cancels — the shared deadline is the sole exit.
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — the clamped-deadline expiry must resolve to checks_pending, not a tool error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending (reached via the tool's own deadline, not ctx cancel)", out.Status)
+	}
+	if out.VerdictSequence != 61595 {
+		t.Errorf("verdict_sequence = %d, want 61595 (surfaced from details)", out.VerdictSequence)
+	}
+	if out.WaitedSeconds < 1 {
+		t.Errorf("waited_seconds = %f, want >= ~1 (the shared 1s deadline elapsed)", out.WaitedSeconds)
+	}
+}
+
+// TestMergeRun_ChecksPendingPOSTBoundedByDeadline pins the high-correctness fix
+// (E67.56 / #2717): a re-POST after a checks-pending refusal must not outlive the
+// shared deadline. The backend returns 409 merge_checks_pending on the first POST
+// (setting the seen-pending flag), then HANGS every subsequent POST. Because the
+// tool bounds each POST by a context derived from the shared deadline, the hung
+// re-POST is cancelled AT the deadline and the tool returns status=checks_pending
+// within its wall-clock budget rather than blocking on the hung backend
+// indefinitely.
+//
+// The first 409 deliberately OMITS details.verdict_sequence, so this test also
+// pins concern 2's sawChecksPending decoupling: the bounded-wait cancellation
+// must resolve to the checkpoint using a dedicated seen-pending flag, not
+// checksSeq != 0 (which would be 0 here and misroute to a tool error).
+//
+// It is a single counterfactual vehicle for all three changed controls:
+//   - POST on the unbounded parent ctx (drop deadlineCtx): the tool blocks on the
+//     hung backend until the 6s server fallback → elapsed blows past the ~1s
+//     budget, and status is not checks_pending → RED.
+//   - guard on ctx.Err() instead of deadlineCtx.Err(): the Background parent ctx
+//     never errs, so the deadline-cancelled POST surfaces as a tool error → RED.
+//   - seen-pending flag as checksSeq != 0: 0 here, so the cancelled POST surfaces
+//     as a tool error → RED.
+func TestMergeRun_ChecksPendingPOSTBoundedByDeadline(t *testing.T) {
+	var calls int32
+	prURL := "https://github.com/x/y/pull/7"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(Run{ID: id.String(), State: "running", PullRequestURL: &prURL})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/merge", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&calls, 1) == 1 {
+			// First POST: the checks-pending 409 that sets the seen-pending flag.
+			// No verdict_sequence — the seen-pending decision must not need it.
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(mergeChecksPendingBodyNoSeq))
+			return
+		}
+		// Every subsequent POST HANGS until the client cancels its request (the
+		// deadline-derived context) or a generous fallback fires. When the tool
+		// bounds the POST by the shared deadline the client cancellation propagates
+		// to r.Context() and the handler returns promptly.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(6 * time.Second):
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	r := &runResolver{
+		api:                newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		reviewPollInterval: time.Millisecond,
+	}
+
+	// context.Background(): only the tool's OWN shared deadline (TimeoutSeconds=1)
+	// can end the wait, so the deadline must both stop the retry loop AND cancel
+	// the in-flight hung POST.
+	begin := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 1})
+	elapsed := time.Since(begin)
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a hung re-POST past the deadline must resolve to checks_pending, not a tool error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending", out.Status)
+	}
+	if out.VerdictSequence != 0 {
+		t.Errorf("verdict_sequence = %d, want 0 (the 409 carried no sequence — provenance is not inferred)", out.VerdictSequence)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("mergeRun blocked %s, want it bounded by the ~1s shared deadline — the in-flight POST outlived the deadline", elapsed)
 	}
 }
 
