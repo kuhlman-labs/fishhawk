@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -1467,5 +1468,97 @@ func TestGetCampaignStatus_Closed_E2E_ThroughRealServer(t *testing.T) {
 	}
 	if len(out2.NextActions.Actions) != 1 || out2.NextActions.Actions[0].Action != "fishhawk_start_campaign_item_run" {
 		t.Errorf("next_actions actions = %+v, want exactly one fishhawk_start_campaign_item_run", out2.NextActions.Actions)
+	}
+}
+
+// TestStartCampaignItemRun_FloorTier_BoundedThroughHandler is the cross-boundary
+// test (#2576 step 9): it drives fishhawk_start_campaign_item_run through the
+// fakeBackend seam AND the MCP SDK in-memory transport at a floor-clamped
+// budget, with an oversized issue_context and a multi-element depends_on, so the
+// floor's per-field elisions block must pass the reflected output-schema
+// validation INSIDE the handler and carry the campaign-items pointer built from
+// the caller's campaign_id. Per-layer units would each pass while that seam
+// broke.
+func TestStartCampaignItemRun_FloorTier_BoundedThroughHandler(t *testing.T) {
+	ctx := context.Background()
+	fb, srv := newFakeBackend(t)
+	campaignID := uuid.New()
+	runID := uuid.NewString()
+
+	// Seed a run whose issue_context is oversized AND whose retained strings are
+	// inflated (floorForcingRun), so the within-row tiers cannot get it under the
+	// convergence floor and the ladder is driven INTO the floor tier — where the
+	// three-element depends_on is truncated and itemised.
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		Run: floorForcingRun(runID),
+		Item: CampaignItem{
+			ID: uuid.NewString(), IssueRef: "kuhlman-labs/fishhawk#2576",
+			DependsOn: []string{"kuhlman-labs/fishhawk#2508", "kuhlman-labs/fishhawk#2510", "kuhlman-labs/fishhawk#2546"},
+			RunID:     runID, State: "running",
+		},
+	}
+
+	cfg := config{backendURL: srv.URL, apiToken: "tok-test"}
+	srvMCP := buildServer(cfg)
+	registerTools(srvMCP, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1"})})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srvMCP.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_start_campaign_item_run",
+		Arguments: map[string]any{
+			"campaign_id": campaignID.String(),
+			"issue_ref":   "kuhlman-labs/fishhawk#2576",
+			"workflow_id": "feature_change",
+		},
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "validating tool output") {
+			t.Fatalf("the floor elisions block failed the SDK's output-schema validation: %v", err)
+		}
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+
+	structured, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out StartCampaignItemRunOutput
+	if err := json.Unmarshal(structured, &out); err != nil {
+		t.Fatalf("decode tool output %s: %v", structured, err)
+	}
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("did not reach the floor tier through the handler: %s", structured)
+	}
+	if err := validateWireElisions(out.Elisions); err != nil {
+		t.Errorf("round-tripped floor elisions violate their own classification: %v", err)
+	}
+
+	var saw bool
+	want := "GET /v0/campaigns/" + campaignID.String() + "/items"
+	for _, f := range out.Elisions.Fields {
+		if f.Field == "item.depends_on" {
+			saw = true
+			if f.Class != string(classStored) || f.Pointer != want {
+				t.Errorf("item.depends_on entry = {class %q pointer %q}, want stored + %q built from the caller's campaign_id", f.Class, f.Pointer, want)
+			}
+		}
+	}
+	if !saw {
+		t.Errorf("no item.depends_on floor entry crossed the handler boundary: %s", structured)
 	}
 }

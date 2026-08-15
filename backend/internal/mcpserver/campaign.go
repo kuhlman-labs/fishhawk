@@ -357,7 +357,13 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 	bounded, berr := boundRunRowOutput(
 		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, res.Run.ID, r.responseBudget(req),
 		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
-		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e })
+		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
+		// The campaign id is not carried on the CampaignItem, so the floor's
+		// stored pointer for a reduced `item` is threaded from here — the one call
+		// site that knows it (#2576). It names the UNBOUNDED items enumeration.
+		withFloorCarryPointer("item", func(field, reason string, omitted int) elidedField {
+			return newStoredElision(field, reason, pointerCampaignItems(id.String()).retrievalPointer, omitted)
+		}))
 	if berr != nil {
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("bound start_campaign_item_run response: %w", berr)
 	}
