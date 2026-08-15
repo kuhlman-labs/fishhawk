@@ -3086,6 +3086,14 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// before the merge verb runs. GitHub refuses to queue auto-merge on a
 	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
 	// enable error surfaces unchanged (no fallback).
+	//
+	// The exclusion is deliberate and load-bearing: this fallback covers ONLY
+	// the clean-status class. An UNSTABLE-status rejection (ErrPullRequestUnstableStatus,
+	// E67.56 / #2717 — the PR's required checks have not all passed) must NOT be
+	// widened into it: a REST squash merge on an UNSTABLE PR would SUCCEED and
+	// land the change before its pending checks report. That class travels
+	// through this seam untouched (errors.Is(err, ErrPullRequestCleanStatus) is
+	// false for it) and the server maps it to a bounded wait, not a merge.
 	if errors.Is(err, forge.ErrPullRequestCleanStatus) {
 		return m.gh.MergePullRequest(ctx, scope, repo, number, forge.MergeMethodSquash)
 	}

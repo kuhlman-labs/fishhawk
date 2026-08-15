@@ -6747,17 +6747,28 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            The run cannot be merged: no PR url or a failed/cancelled run
-            (`run_not_mergeable`), or the acceptance gate does not admit a
-            merge (`acceptance_gate_not_passed`).
+            One of three cases. (1) The run cannot be merged: no PR url or a
+            failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
+            does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
+            request's required checks have NOT all passed, so GitHub reports it
+            in unstable status and refuses to queue the squash merge
+            (`merge_checks_pending`, E67.56 / #2717). On `merge_checks_pending`
+            the verdict row is recorded and durable and `details` carry
+            `{verdict_sequence, pr_url, reason:"checks_pending"}`; an immediate
+            retry CANNOT succeed. If the checks are still pending, re-invoke once
+            they complete; but if a required check has already FAILED the merge
+            will never queue — inspect the pull request instead of waiting.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '502':
           description: |
             The verdict row is recorded and durable, but queuing the squash
-            merge failed (`merge_dispatch_failed`); the merge is retryable — a
-            re-POST re-queues without duplicating the verdict.
+            merge failed for a reason OTHER than the checks-pending precondition
+            above (`merge_dispatch_failed`); the merge is retryable — a re-POST
+            re-queues without duplicating the verdict. A checks-not-all-passed
+            refusal is reported distinctly as `409 merge_checks_pending`, not
+            here, so this 502 is never a remedy-that-cannot-work.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

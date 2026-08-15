@@ -3,17 +3,37 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
+
+// unstableChecksMerger is a server.GitHubMerger that returns the multi-%w
+// unstable-status sentinel githubclient.EnableAutoMerge produces on a
+// checks-not-all-passed refusal (E67.56 / #2717), carrying the verbatim
+// production GraphQL message from run a152a0a5.
+type unstableChecksMerger struct{}
+
+func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run) error {
+	return fmt.Errorf("%w: %w: enable auto-merge: Pull request Pull request is in unstable status",
+		forge.ErrValidation, forge.ErrPullRequestUnstableStatus)
+}
 
 // --- fishhawk_merge_run (E48.7 / #1954) ---
 
@@ -39,8 +59,15 @@ type mergeRunFakeBackend struct {
 	// 200 when exhausted); mergeErrBodies the matching error bodies. Lets a
 	// test drive a 502-then-200 sequence.
 	mergeStatuses []int
-	mergeErrBody  string
-	mergeResp     MergeRunResult
+	// mergeStickyStatus, when non-zero, is returned for EVERY POST (ignoring the
+	// queue) — a test drives an always-checks-pending backend with it.
+	mergeStickyStatus int
+	mergeErrBody      string
+	mergeResp         MergeRunResult
+	// mergeVerdicts records the verdict body of each POST so a test can assert
+	// every re-POST across the wait carries the same verdict (the tool never
+	// skips the POST — endpoint-side idempotence).
+	mergeVerdicts []string
 
 	auditEntries []AuditEntry
 	getRunCalls  int
@@ -100,7 +127,11 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 		if fb.mergeCalls < len(fb.mergeStatuses) {
 			status = fb.mergeStatuses[fb.mergeCalls]
 		}
+		if fb.mergeStickyStatus != 0 {
+			status = fb.mergeStickyStatus
+		}
 		fb.mergeCalls++
+		fb.mergeVerdicts = append(fb.mergeVerdicts, body.Verdict)
 		errBody := fb.mergeErrBody
 		resp := fb.mergeResp
 		if status == http.StatusOK {
@@ -464,6 +495,393 @@ func TestMergeRun_502ThenReinvoke_ReQueues(t *testing.T) {
 	}
 	if fb.mergeCalls != 2 {
 		t.Errorf("merge POSTed %d times, want 2 (502 then re-queue)", fb.mergeCalls)
+	}
+}
+
+// mergeChecksPendingBody is the backend's 409 merge_checks_pending envelope
+// (E67.56 / #2717), carrying the durable verdict row's sequence in details.
+const mergeChecksPendingBody = `{"error":{"code":"merge_checks_pending",` +
+	`"message":"required checks have not all passed",` +
+	`"details":{"verdict_sequence":61595,"reason":"checks_pending"}}}`
+
+// mergeChecksPendingBodyNoSeq is the same 409 with NO details.verdict_sequence —
+// a shape the handler does not emit today, but the tool's seen-pending decision
+// must not depend on the sequence being present (E67.56 / #2717 concern 2). Used
+// to drive the sawChecksPending decoupling: a checks-pending refusal with no
+// sequence must still resolve to the resumable checkpoint, not a tool error.
+const mergeChecksPendingBodyNoSeq = `{"error":{"code":"merge_checks_pending",` +
+	`"message":"required checks have not all passed",` +
+	`"details":{"reason":"checks_pending"}}}`
+
+// TestMergeRun_ChecksPendingThenSuccess drives the wait-then-queue path
+// (E67.56 / #2717): the backend answers 409 merge_checks_pending for the first
+// two POSTs then 200, so the tool re-POSTs (more than once) WITHOUT erroring and
+// falls through to the terminal await, resolving merged. Also the
+// idempotence-shape assertion (plan 10d): every re-POST carries the same verdict
+// body — the tool never skips the POST. Counterfactual: deleting isChecksPending's
+// code check makes this RED (the first 409 becomes a tool error).
+func TestMergeRun_ChecksPendingThenSuccess(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		stateAfterMerge:  "succeeded",
+		mergeStatuses:    []int{http.StatusConflict, http.StatusConflict}, // 409, 409, then default 200
+		mergeErrBody:     mergeChecksPendingBody,
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 61595, AlreadyRecorded: true, PRURL: "https://github.com/x/y/pull/7"},
+		auditEntries:     []AuditEntry{{Category: "pr_merged", Sequence: 61596}},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv) // reviewPollInterval = 1ms
+
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a checks-pending 409 must be WAITED on, not surfaced as an error", err)
+	}
+	if out.Status != "merged" {
+		t.Fatalf("status = %q, want merged (the merge queues once the checks clear)", out.Status)
+	}
+	fb.mu.Lock()
+	calls, verdicts := fb.mergeCalls, append([]string(nil), fb.mergeVerdicts...)
+	fb.mu.Unlock()
+	if calls < 3 {
+		t.Errorf("merge POSTed %d times, want >= 3 (two checks-pending waits then the queue)", calls)
+	}
+	for i, v := range verdicts {
+		if v != "ship it" {
+			t.Errorf("POST %d verdict = %q, want 'ship it' (every re-POST carries the same verdict)", i, v)
+		}
+	}
+}
+
+// TestMergeRun_ChecksPendingUntilDeadline pins the resumable checkpoint
+// (E67.56 / #2717): the backend answers 409 merge_checks_pending on every POST,
+// so the bounded wait expires and the tool returns status=checks_pending — NOT a
+// tool error. Binding conditions 1 + 4: the Message names the checks-not-all-passed
+// precondition AND the already-FAILED possibility and does NOT say "retry the
+// merge"; VerdictSequence is surfaced while VerdictRecorded / AlreadyRecorded /
+// MergeQueued are all false (provenance is not inferred). Counterfactual:
+// deleting isChecksPending's code check makes this RED (the 409 becomes a tool
+// error).
+func TestMergeRun_ChecksPendingUntilDeadline(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		stateAfterMerge:   "running",
+		mergeStickyStatus: http.StatusConflict, // every POST 409 checks-pending
+		mergeErrBody:      mergeChecksPendingBody,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv) // reviewPollInterval = 1ms
+
+	// A short ctx deadline bounds the shared wait without a real multi-second wait.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a checks-pending deadline must resolve to a status, not a tool error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending", out.Status)
+	}
+	// Binding condition 1: honest wording naming both outcomes, no failing remedy.
+	if !strings.Contains(out.Message, "have not all passed") {
+		t.Errorf("message must name the checks-not-all-passed precondition: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "FAILED") {
+		t.Errorf("message must name the already-failed-check possibility: %q", out.Message)
+	}
+	if strings.Contains(out.Message, "retry the merge") {
+		t.Errorf("message must NOT prescribe 'retry the merge': %q", out.Message)
+	}
+	// Binding condition 4: report the sequence, but infer no provenance.
+	if out.VerdictSequence != 61595 {
+		t.Errorf("verdict_sequence = %d, want 61595 (surfaced from details)", out.VerdictSequence)
+	}
+	if out.VerdictRecorded || out.AlreadyRecorded {
+		t.Errorf("provenance flags = recorded:%v already:%v, want both false on checks_pending", out.VerdictRecorded, out.AlreadyRecorded)
+	}
+	if out.MergeQueued {
+		t.Error("merge_queued = true on checks_pending, want false (nothing was queued)")
+	}
+	fb.mu.Lock()
+	calls := fb.mergeCalls
+	fb.mu.Unlock()
+	if calls < 2 {
+		t.Errorf("merge POSTed %d times, want >= 2 (the tool re-POSTs across the wait)", calls)
+	}
+}
+
+// TestMergeRun_ChecksPendingDeadlineBranch pins the checks-pending loop's OWN
+// deadline-exhaustion branch (E67.56 / #2717): with a responsive always-409
+// backend and NO ctx deadline, the ONLY thing that can end the wait is the
+// tool's own clamped deadline (TimeoutSeconds=1 → clampAwaitTimeout → 1s). So
+// the `!time.Now().Before(deadline)` return and the timer-clamped final wait are
+// reached directly through the tool's deadline expiring, not approximated via a
+// parent-ctx cancellation. Counterfactual: deleting the loop's deadline return
+// makes the wait never end under a non-cancelling ctx → the test hangs (RED).
+func TestMergeRun_ChecksPendingDeadlineBranch(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		stateAfterMerge:   "running",
+		mergeStickyStatus: http.StatusConflict, // every POST 409 checks-pending
+		mergeErrBody:      mergeChecksPendingBody,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv) // reviewPollInterval = 1ms
+
+	// context.Background() never cancels — the shared deadline is the sole exit.
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — the clamped-deadline expiry must resolve to checks_pending, not a tool error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending (reached via the tool's own deadline, not ctx cancel)", out.Status)
+	}
+	if out.VerdictSequence != 61595 {
+		t.Errorf("verdict_sequence = %d, want 61595 (surfaced from details)", out.VerdictSequence)
+	}
+	if out.WaitedSeconds < 1 {
+		t.Errorf("waited_seconds = %f, want >= ~1 (the shared 1s deadline elapsed)", out.WaitedSeconds)
+	}
+}
+
+// TestMergeRun_ChecksPendingPOSTBoundedByDeadline pins the high-correctness fix
+// (E67.56 / #2717): a re-POST after a checks-pending refusal must not outlive the
+// shared deadline. The backend returns 409 merge_checks_pending on the first POST
+// (setting the seen-pending flag), then HANGS every subsequent POST. Because the
+// tool bounds each POST by a context derived from the shared deadline, the hung
+// re-POST is cancelled AT the deadline and the tool returns status=checks_pending
+// within its wall-clock budget rather than blocking on the hung backend
+// indefinitely.
+//
+// The first 409 deliberately OMITS details.verdict_sequence, so this test also
+// pins concern 2's sawChecksPending decoupling: the bounded-wait cancellation
+// must resolve to the checkpoint using a dedicated seen-pending flag, not
+// checksSeq != 0 (which would be 0 here and misroute to a tool error).
+//
+// It is a single counterfactual vehicle for all three changed controls:
+//   - POST on the unbounded parent ctx (drop deadlineCtx): the tool blocks on the
+//     hung backend until the 6s server fallback → elapsed blows past the ~1s
+//     budget, and status is not checks_pending → RED.
+//   - guard on ctx.Err() instead of deadlineCtx.Err(): the Background parent ctx
+//     never errs, so the deadline-cancelled POST surfaces as a tool error → RED.
+//   - seen-pending flag as checksSeq != 0: 0 here, so the cancelled POST surfaces
+//     as a tool error → RED.
+func TestMergeRun_ChecksPendingPOSTBoundedByDeadline(t *testing.T) {
+	var calls int32
+	prURL := "https://github.com/x/y/pull/7"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(Run{ID: id.String(), State: "running", PullRequestURL: &prURL})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/merge", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.AddInt32(&calls, 1) == 1 {
+			// First POST: the checks-pending 409 that sets the seen-pending flag.
+			// No verdict_sequence — the seen-pending decision must not need it.
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(mergeChecksPendingBodyNoSeq))
+			return
+		}
+		// Every subsequent POST HANGS until the client cancels its request (the
+		// deadline-derived context) or a generous fallback fires. When the tool
+		// bounds the POST by the shared deadline the client cancellation propagates
+		// to r.Context() and the handler returns promptly.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(6 * time.Second):
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	r := &runResolver{
+		api:                newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		reviewPollInterval: time.Millisecond,
+	}
+
+	// context.Background(): only the tool's OWN shared deadline (TimeoutSeconds=1)
+	// can end the wait, so the deadline must both stop the retry loop AND cancel
+	// the in-flight hung POST.
+	begin := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 1})
+	elapsed := time.Since(begin)
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a hung re-POST past the deadline must resolve to checks_pending, not a tool error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending", out.Status)
+	}
+	if out.VerdictSequence != 0 {
+		t.Errorf("verdict_sequence = %d, want 0 (the 409 carried no sequence — provenance is not inferred)", out.VerdictSequence)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("mergeRun blocked %s, want it bounded by the ~1s shared deadline — the in-flight POST outlived the deadline", elapsed)
+	}
+}
+
+// TestMergeRun_GenuineError_PassthroughNoRetry is the counterfactual guard that
+// the checks-pending wait did NOT swallow every failure: a 502 merge_dispatch_failed
+// and a 409 acceptance_gate_not_passed each still surface as a TOOL ERROR after
+// exactly ONE POST (zero retries).
+func TestMergeRun_GenuineError_PassthroughNoRetry(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		errBody string
+		wantMsg string
+	}{
+		{
+			name:    "502 merge_dispatch_failed",
+			status:  http.StatusBadGateway,
+			errBody: `{"error":{"code":"merge_dispatch_failed","message":"verdict durable, queue retryable"}}`,
+			wantMsg: "merge_dispatch_failed",
+		},
+		{
+			name:    "409 acceptance_gate_not_passed",
+			status:  http.StatusConflict,
+			errBody: `{"error":{"code":"acceptance_gate_not_passed","message":"acceptance gate not passed"}}`,
+			wantMsg: "acceptance_gate_not_passed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				stateAfterMerge:   "running",
+				mergeStickyStatus: tc.status,
+				mergeErrBody:      tc.errBody,
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+
+			_, _, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+			if err == nil {
+				t.Fatalf("mergeRun: nil error, want the %s surfaced as a tool error (not swallowed by the wait)", tc.wantMsg)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("err = %v, want it to name %s", err, tc.wantMsg)
+			}
+			fb.mu.Lock()
+			calls := fb.mergeCalls
+			fb.mu.Unlock()
+			if calls != 1 {
+				t.Errorf("merge POSTed %d times, want exactly 1 (a genuine error is not retried)", calls)
+			}
+		})
+	}
+}
+
+// TestMergeRun_CrossBoundary_RealServerChecksPending is binding condition 2's
+// TRUE end-to-end test (E67.56 / #2717): it mounts the REAL server merge handler
+// (with a merger returning the unstable-wrapped sentinel — the same fmt.Errorf
+// multi-%w shape githubclient produces) on an httptest server, and drives the
+// REAL mcpserver apiClient and the REAL merge tool handler against it. Unlike the
+// hand-rolled table cases, NOTHING hand-authors the 409 envelope — the real
+// handler emits it and the real client reads it, so a mismatch between the two
+// would be caught here. The tool WAITS on the 409 (bounded by a short ctx) and
+// returns status=checks_pending, never a tool error, and the verdict row is
+// durable in the real audit repo across the wait. Counterfactual: deleting the
+// server's 409 branch turns this RED (the tool sees the generic 502 and returns
+// a tool error).
+func TestMergeRun_CrossBoundary_RealServerChecksPending(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition running: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, row.ID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+
+	const bearer = "fhk_merge_checks_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:approvals"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo:      runRepo,
+		AuditRepo:    auditRepo,
+		APITokenRepo: tokRepo,
+		GateMerger:   unstableChecksMerger{},
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	r := &runResolver{
+		api:                newAPIClient(config{backendURL: ts.URL, apiToken: bearer}),
+		reviewPollInterval: time.Millisecond,
+	}
+
+	// A short ctx deadline bounds the shared wait; the real handler answers 409
+	// merge_checks_pending on every POST (the merger always refuses unstable).
+	waitCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+
+	_, out, err := r.mergeRun(waitCtx, nil, MergeRunInput{RunID: row.ID.String(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun (cross-boundary): %v — the REAL server's 409 merge_checks_pending must be waited on, not surfaced as an error", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending (real handler → real client → real tool)", out.Status)
+	}
+	if strings.Contains(out.Message, "retry the merge") {
+		t.Errorf("message must NOT prescribe 'retry the merge': %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "FAILED") {
+		t.Errorf("message must name the already-failed-check possibility: %q", out.Message)
+	}
+	// The verdict row IS durable across the wait — read it back from the REAL
+	// audit repo (committed state, binding condition 4's durability claim).
+	entries, err := auditRepo.ListForRunByCategory(ctx, row.ID, "merge_verdict_recorded")
+	if err != nil {
+		t.Fatalf("list merge verdicts: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1 (verdict durable across the checks-pending wait)", len(entries))
+	}
+}
+
+// TestMergeVerdictSequenceFrom pins the best-effort details.verdict_sequence
+// reader across every value shape it must tolerate (E67.56 / #2717): a nil map,
+// the float64 a JSON decode yields, a json.Number, a native int64, and the
+// no-provenance fallbacks (absent key, wrong type) that both return 0.
+func TestMergeVerdictSequenceFrom(t *testing.T) {
+	cases := []struct {
+		name    string
+		details map[string]any
+		want    int64
+	}{
+		{name: "nil map", details: nil, want: 0},
+		{name: "float64 (json decode)", details: map[string]any{"verdict_sequence": float64(61595)}, want: 61595},
+		{name: "json.Number", details: map[string]any{"verdict_sequence": json.Number("42")}, want: 42},
+		{name: "native int64", details: map[string]any{"verdict_sequence": int64(9)}, want: 9},
+		{name: "absent key", details: map[string]any{"reason": "checks_pending"}, want: 0},
+		{name: "wrong type", details: map[string]any{"verdict_sequence": "not-a-number"}, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeVerdictSequenceFrom(tc.details); got != tc.want {
+				t.Errorf("mergeVerdictSequenceFrom(%v) = %d, want %d", tc.details, got, tc.want)
+			}
+		})
 	}
 }
 

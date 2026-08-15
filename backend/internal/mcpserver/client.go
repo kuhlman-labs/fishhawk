@@ -1730,9 +1730,13 @@ type MergeRunResult struct {
 //   - 403 run_token_forbidden (a run-bound agent token) / insufficient_scope
 //     (token lacks write:approvals)
 //   - 404 run_not_found
-//   - 409 run_not_mergeable (no PR URL; run failed/cancelled) or
+//   - 409 run_not_mergeable (no PR URL; run failed/cancelled),
 //     acceptance_gate_not_passed (the acceptance gate is not
-//     passed/not-declared/skipped-out-of-scope)
+//     passed/not-declared/skipped-out-of-scope), or merge_checks_pending
+//     (E67.56 / #2717 — the PR's required checks have not all passed, so GitHub
+//     will not queue the merge; the verdict row is durable; details carry
+//     verdict_sequence + reason:"checks_pending"). fishhawk_merge_run WAITS on
+//     this one rather than surfacing it as an error.
 //   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
 //     is retryable — re-POST re-queues with no duplicate row)
 //   - 503 merge_unconfigured (the merger seam is not wired)

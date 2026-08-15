@@ -1090,6 +1090,32 @@ func TestMergeRun_WireShape(t *testing.T) {
 			t.Errorf("err = %v, want *apiError 502 merge_dispatch_failed", err)
 		}
 	})
+
+	t.Run("409 merge_checks_pending surfaces as apiError with the verdict_sequence detail", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"merge_checks_pending",` +
+				`"message":"required checks have not all passed",` +
+				`"details":{"verdict_sequence":61595,"reason":"checks_pending"}}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		_, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err == nil {
+			t.Fatal("expected an error on 409 merge_checks_pending")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict || ae.Code != "merge_checks_pending" {
+			t.Fatalf("err = %v, want *apiError 409 merge_checks_pending", err)
+		}
+		// The verdict_sequence detail is the seam the tool's checks-pending
+		// classification reads for the surfaced VerdictSequence.
+		seq, ok := ae.Details["verdict_sequence"].(float64)
+		if !ok || int64(seq) != 61595 {
+			t.Errorf("details.verdict_sequence = %v, want 61595", ae.Details["verdict_sequence"])
+		}
+	})
 }
 
 // TestAutoDriveRunGate_DecodesDecisionRequired drives the REAL
