@@ -1,8 +1,13 @@
 package mcpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -1347,6 +1352,29 @@ func TestFloorAggregateDoesNotClaimCarriedFields(t *testing.T) {
 				}
 			}
 		}
+		// The AGGREGATE half (the low/test-vacuity fix-up): the '*' stored entry
+		// legitimately still carries the run-read + gate-view surfaces, so the
+		// only thing scoping its at-least promise AWAY from the carried-and-reduced
+		// fields is its re-worded reason. Assert that scoping language is present,
+		// so a regression reverting the reason to the old carried-fields-inclusive
+		// wording fails HERE instead of leaving every test green.
+		var agg *ElidedField
+		for i := range out.Elisions.Fields {
+			f := out.Elisions.Fields[i]
+			if f.Field == "*" && f.Aggregate && f.Class == string(classStored) {
+				agg = &out.Elisions.Fields[i]
+				break
+			}
+		}
+		if agg == nil {
+			t.Fatalf("no aggregate '*' stored entry at the floor: %+v", out.Elisions.Fields)
+		}
+		if !strings.Contains(agg.Pointer, "GET /v0/runs/"+runID) {
+			t.Errorf("aggregate '*' entry lost the run-read surface it legitimately carries: %+v", agg)
+		}
+		if !strings.Contains(agg.Reason, "NOT swept under this aggregate") {
+			t.Errorf("aggregate '*' reason lost the scoping language that keeps its at-least promise off the carried-and-reduced fields: %q", agg.Reason)
+		}
 	})
 	t.Run("campaign", func(t *testing.T) {
 		runID, campaignID := uuid.NewString(), uuid.NewString()
@@ -1568,10 +1596,16 @@ func reducibleFloorPaths(t reflect.Type) []string {
 
 // wiredRunRowFloorTypes is the SINGLE source of the run-row output types routed
 // through boundRunRowOutput, consumed by BOTH the reflection pin and the
-// per-type floor test so neither hand-counts (BINDING CONDITION 5). Go cannot
-// reflectively enumerate a package's types, so this slice is the source of
-// truth; the pin self-validates each entry structurally (it must embed a Run
-// field AND an *Elisions field) so a malformed entry fails rather than passing.
+// per-type floor test so neither hand-counts (BINDING CONDITION 5). Go's reflect
+// cannot enumerate a package's types at run time, so this slice is the consumed
+// source of truth — but it is NOT trusted on faith: two independent guards keep
+// it honest. (1) The reflection pin self-validates each entry structurally (it
+// must embed a Run field AND an *Elisions field), so a MALFORMED entry fails.
+// (2) TestWiredRunRowFloorTypesMatchesCallSites derives the wired set
+// PROGRAMMATICALLY from a go/ast scan of the package's non-test source for every
+// boundRunRowOutput call site and fails if this slice omits any of them — so a
+// MISSING entry (a future verb routed through boundRunRowOutput but never added
+// here) fails too, which self-validation alone could not catch (#2576 fix-up).
 func wiredRunRowFloorTypes() []reflect.Type {
 	return []reflect.Type{
 		reflect.TypeOf(GetActiveRunOutput{}),
@@ -1580,6 +1614,89 @@ func wiredRunRowFloorTypes() []reflect.Type {
 		reflect.TypeOf(ResumeRunOutput{}),
 		reflect.TypeOf(ReviveRunOutput{}),
 		reflect.TypeOf(StartCampaignItemRunOutput{}),
+	}
+}
+
+// callSiteWiredRunRowTypes scans the package's NON-TEST source for every
+// boundRunRowOutput call site and returns the concrete output-type name each one
+// routes. The type is read from the call's func-literal argument, whose first
+// parameter is `*T` (the rows / set closures both name it) — so the derivation
+// works whether the call passes a composite literal or a variable, and it will
+// NOT over-match GetRunStatusOutput, which carries a Run + *Elisions signature
+// yet is bounded by its OWN run-status ladder rather than boundRunRowOutput. This
+// is the genuinely programmatic derivation BINDING CONDITION 5 asked for.
+func callSiteWiredRunRowTypes(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok || id.Name != "boundRunRowOutput" {
+				return true
+			}
+			for _, arg := range call.Args {
+				fl, ok := arg.(*ast.FuncLit)
+				if !ok || fl.Type.Params == nil || len(fl.Type.Params.List) == 0 {
+					continue
+				}
+				star, ok := fl.Type.Params.List[0].Type.(*ast.StarExpr)
+				if !ok {
+					continue
+				}
+				if tid, ok := star.X.(*ast.Ident); ok {
+					found[tid.Name] = true
+					break
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// TestWiredRunRowFloorTypesMatchesCallSites is BINDING CONDITION 5's completeness
+// guard: the hand-maintained wiredRunRowFloorTypes() slice must EQUAL the set of
+// concrete types that actually reach boundRunRowOutput, derived programmatically
+// from an AST scan of the package source. A future verb that routes a new output
+// type through boundRunRowOutput without adding it to the slice fails HERE — the
+// exact "a type silently escapes both wired-type tests" failure mode the
+// reflection pin's structural self-validation could not catch (it flags a
+// MALFORMED entry, not a MISSING one; #2576 fix-up).
+func TestWiredRunRowFloorTypesMatchesCallSites(t *testing.T) {
+	callSites := callSiteWiredRunRowTypes(t)
+	if len(callSites) == 0 {
+		t.Fatal("the AST scan found no boundRunRowOutput call sites — the derivation is broken, not the list")
+	}
+	listed := map[string]bool{}
+	for _, typ := range wiredRunRowFloorTypes() {
+		listed[typ.Name()] = true
+	}
+	for name := range callSites {
+		if !listed[name] {
+			t.Errorf("%s reaches boundRunRowOutput but is MISSING from wiredRunRowFloorTypes() — add it, or it escapes both TestEveryWiredFloorCarryFieldIsClassified and TestBoundRunRow_FloorTierPerWiredOutputType", name)
+		}
+	}
+	for name := range listed {
+		if !callSites[name] {
+			t.Errorf("wiredRunRowFloorTypes() lists %s but no boundRunRowOutput call site routes it — remove the stale entry", name)
+		}
 	}
 }
 
@@ -1774,57 +1891,175 @@ func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 	}
 }
 
+// underBudgetWireCases derives its set from wiredRunRowFloorTypes() plus the two
+// page floors — the SAME programmatic derivation floorSurfaceCases() uses
+// (BINDING CONDITION 5) — so the under-budget coverage tracks the wired-type set
+// mechanically rather than from an independently hand-maintained pair. Each
+// driver builds a SMALL (under-budget) input and returns it alongside the bounded
+// output and the output's elisions block, so the test can assert both inertness
+// (no elisions) and byte-for-byte identity per type.
+func underBudgetWireCases() []struct {
+	name  string
+	drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+} {
+	smallRun := func(id string) Run {
+		return Run{ID: id, Repo: "o/n", WorkflowID: "feature_change", State: "running"}
+	}
+	runRowDrivers := map[reflect.Type]func(t *testing.T, budget int) (any, any, *Elisions){
+		reflect.TypeOf(GetActiveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := GetActiveRunOutput{Run: smallRun(uuid.NewString())}
+			got, err := boundOneRow(in, budget)
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(StartRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := StartRunOutput{Run: smallRun(id), Idempotent: true}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(CancelRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := CancelRunOutput{Run: smallRun(id), ReapedRunners: 5}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(ResumeRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ResumeRunOutput{Run: smallRun(id), Idempotent: true}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(ReviveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ReviveRunOutput{
+				Run:            smallRun(id),
+				RestoredStages: []ReviveRestoredStage{{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: "short", RestoredState: "pending"}},
+				NextStep:       reviveNextStepHint,
+			}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(StartCampaignItemRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := StartCampaignItemRunOutput{
+				Run:  smallRun(id),
+				Item: CampaignItem{ID: uuid.NewString(), IssueRef: "o/n#1", DependsOn: []string{"o/n#2"}, RunID: id, State: "running"},
+			}
+			// Mirror campaign.go's call site: the pointer override is present but,
+			// under budget, the ladder early-returns before it is ever consulted.
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
+				withFloorCarryPointer("item", func(field, reason string, n int) elidedField {
+					return newStoredElision(field, reason, pointerCampaignItems(uuid.NewString()).retrievalPointer, n)
+				}))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+	}
+
+	cases := make([]struct {
+		name  string
+		drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+	}, 0, len(runRowDrivers)+2)
+	for _, typ := range wiredRunRowFloorTypes() {
+		d := runRowDrivers[typ]
+		if d == nil {
+			continue // an unmapped wired type is caught by TestWiredRunRowFloorTypesMatchesCallSites; guarded below.
+		}
+		cases = append(cases, struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: typ.Name(), drive: d})
+	}
+	cases = append(cases,
+		struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: "ListRunsOutput", drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := ListRunsOutput{Items: []Run{smallRun(uuid.NewString())}, NextCursor: "cur-1"}
+			got, err := boundListRunsOutput(in, fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		}},
+		struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: "ListAuditOutput", drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ListAuditOutput{Items: auditPage(id, 3, "short"), NextCursor: "cur-1"}
+			got, err := boundListAuditOutput(in, id, "", fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		}},
+	)
+	return cases
+}
+
 // TestFloorUnderBudgetWireUnchanged is BINDING CONDITION 4: below the byte
 // threshold the ladder is provably INERT — the bounded response is byte-for-byte
 // identical to the input, with NO elisions block — per affected response type.
+// Coverage spans every wired run-row type PLUS the two page types (not only the
+// two whose floor behaviour changed), because the under-budget early return in
+// boundRunRowOutput / boundListRunsOutput / boundListAuditOutput is upstream of
+// every change in this diff and the condition's criterion is "provably inert
+// below the threshold" per type, not "nothing observably broke".
 func TestFloorUnderBudgetWireUnchanged(t *testing.T) {
 	budget := mcpResponseByteBudgetDefault
-
-	t.Run("ReviveRunOutput", func(t *testing.T) {
-		runID := uuid.NewString()
-		in := ReviveRunOutput{
-			Run:            Run{ID: runID, Repo: "o/n", WorkflowID: "feature_change", State: "running"},
-			RestoredStages: []ReviveRestoredStage{{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: "short", RestoredState: "pending"}},
-			NextStep:       reviveNextStepHint,
-		}
-		before := marshalLen(t, in)
-		got, err := boundRunRowOutput(in, runID, fixedBudget(budget),
-			func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
-			func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
-		if err != nil {
-			t.Fatalf("bound: %v", err)
-		}
-		if got.Elisions != nil {
-			t.Errorf("under-budget revive carries an elisions block: %+v", got.Elisions)
-		}
-		if n := marshalLen(t, got); n != before {
-			t.Errorf("under-budget revive changed size %d -> %d — the ladder is not inert below the threshold", before, n)
-		}
-	})
-
-	t.Run("StartCampaignItemRunOutput", func(t *testing.T) {
-		runID := uuid.NewString()
-		in := StartCampaignItemRunOutput{
-			Run:  Run{ID: runID, Repo: "o/n", WorkflowID: "feature_change", State: "running"},
-			Item: CampaignItem{ID: uuid.NewString(), IssueRef: "o/n#1", DependsOn: []string{"o/n#2"}, RunID: runID, State: "running"},
-		}
-		before := marshalLen(t, in)
-		got, err := boundRunRowOutput(in, runID, fixedBudget(budget),
-			func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
-			func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
-			withFloorCarryPointer("item", func(field, reason string, n int) elidedField {
-				return newStoredElision(field, reason, pointerCampaignItems(uuid.NewString()).retrievalPointer, n)
-			}))
-		if err != nil {
-			t.Fatalf("bound: %v", err)
-		}
-		if got.Elisions != nil {
-			t.Errorf("under-budget campaign item carries an elisions block: %+v", got.Elisions)
-		}
-		if n := marshalLen(t, got); n != before {
-			t.Errorf("under-budget campaign item changed size %d -> %d", before, n)
-		}
-	})
+	cases := underBudgetWireCases()
+	// The run-row half is derived from wiredRunRowFloorTypes(); guard against a
+	// wired type silently gaining no under-budget driver.
+	if len(cases) != len(wiredRunRowFloorTypes())+2 {
+		t.Fatalf("derived %d under-budget cases, want every wired type + 2 pages (%d)", len(cases), len(wiredRunRowFloorTypes())+2)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in, got, el := c.drive(t, budget)
+			if el != nil {
+				t.Errorf("under-budget %s carries an elisions block: %+v — the ladder is not inert below the threshold", c.name, el)
+			}
+			inRaw, err := json.Marshal(in)
+			if err != nil {
+				t.Fatalf("marshal in: %v", err)
+			}
+			gotRaw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal got: %v", err)
+			}
+			if !bytes.Equal(inRaw, gotRaw) {
+				t.Errorf("under-budget %s is not byte-for-byte identical below the threshold:\n in=%s\ngot=%s", c.name, inRaw, gotRaw)
+			}
+		})
+	}
 }
 
 // TestFloorCarry_NilCollectionRecordsNothing extends the degenerate-input
