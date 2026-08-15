@@ -132,6 +132,32 @@ type fakeBackend struct {
 	// plan_decomposed read.
 	perRunAuditCategoryReads map[string]int
 
+	// #2712 fixtures: GET /healthz and POST /v0/runs/{run_id}/reviews/reconcile.
+	//
+	// healthzProcessStart is the process_start value served, read under fb.mu on
+	// every probe so a test can CHANGE the restart boundary MID-WAIT (the
+	// binding-condition-1 case: the daemon restarts while the await is already
+	// polling). Empty omits the field (a daemon predating #2712).
+	// healthzStatus / healthzBody override the status and raw body for the
+	// undecidable branches. healthzReads counts probes so the TTL cache can be
+	// asserted.
+	healthzProcessStart string
+	healthzStatus       int
+	healthzBody         string
+	healthzReads        int
+
+	// reconcileRespByRun is the reconcile endpoint's 200 body per run;
+	// reconcileStatus overrides the status; reconcileCallsByRun counts calls;
+	// reconcileHook, when non-nil, runs under fb.mu on each call so a test can
+	// mutate the seeded audit (appending the synthesized terminal entry the
+	// real backend would write).
+	reconcileRespByRun   map[uuid.UUID]ReconcileReviewsResult
+	reconcileStatus      int
+	reconcileCallsByRun  map[uuid.UUID]int
+	reconcileHook        func(runID uuid.UUID)
+	reconcileLastRunID   uuid.UUID
+	reconcileAuthHeaders []string
+
 	// reviewFlip, when non-nil, is invoked under fb.mu on every per-run
 	// audit request with the requested category. The fishhawk_await_review
 	// poll-resolve test uses it to flip a pending review to complete
@@ -562,6 +588,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		stageWaitReadsByStageID:       map[uuid.UUID]int{},
 		stageWaitWaitsByStageID:       map[uuid.UUID][]int{},
 		stageWaitStatusByStageID:      map[uuid.UUID]int{},
+		healthzStatus:                 http.StatusOK,
+		reconcileRespByRun:            map[uuid.UUID]ReconcileReviewsResult{},
+		reconcileStatus:               http.StatusOK,
+		reconcileCallsByRun:           map[uuid.UUID]int{},
 		createRunStatus:               http.StatusCreated,
 		recoverStatus:                 http.StatusCreated,
 		cancelResp:                    map[uuid.UUID]Run{},
@@ -622,6 +652,58 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		cancelCampaignStatus:          http.StatusOK,
 	}
 	mux := http.NewServeMux()
+	// GET /healthz — the #2712 restart-boundary probe. Unauthenticated by
+	// contract; the handler records any Authorization header it DID receive so
+	// a test can prove the client sends none.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.healthzReads++
+		status := fb.healthzStatus
+		raw := fb.healthzBody
+		ps := fb.healthzProcessStart
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			fb.reconcileAuthHeaders = append(fb.reconcileAuthHeaders, "healthz:"+auth)
+		}
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if raw != "" {
+			_, _ = w.Write([]byte(raw))
+			return
+		}
+		body := map[string]any{"status": "ok", "version": "dev", "git_sha": "deadbeef"}
+		if ps != "" {
+			body["process_start"] = ps
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	})
+	// POST /v0/runs/{run_id}/reviews/reconcile — the #2712 on-demand recovery.
+	mux.HandleFunc("POST /v0/runs/{run_id}/reviews/reconcile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.reconcileCallsByRun[id]++
+		fb.reconcileLastRunID = id
+		status := fb.reconcileStatus
+		resp, ok := fb.reconcileRespByRun[id]
+		if fb.reconcileHook != nil {
+			fb.reconcileHook(id)
+		}
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if status >= 400 {
+			_, _ = w.Write([]byte(`{"error":{"code":"run_not_found","message":"no run with that id"}}`))
+			return
+		}
+		if !ok {
+			resp = ReconcileReviewsResult{RunID: id.String()}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		id, perr := uuid.Parse(r.PathValue("stage_id"))
@@ -2918,7 +3000,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// operator-reachable reap of a stage stranded in dispatched/running that
 	// retry_stage / revive_run / fixup_stage / dispatch_stage all refuse —
 	// taking the total 49 -> 50.
-	const wantToolCount = 50
+	//
+	// E67.55 (#2712) adds exactly ONE tool — fishhawk_reconcile_reviews, the
+	// on-demand recovery for a review round orphaned by a fishhawkd restart
+	// (the boot sweep's operator-reachable twin) — taking the total 50 -> 51.
+	const wantToolCount = 51
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -2951,6 +3037,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGateView {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
+	}
+
+	// fishhawk_reconcile_reviews (#2712) must be wire-visible: it is the only
+	// recovery for a restart-orphaned review round, and a registration
+	// regression would leave an operator whose gate degraded from two
+	// reviewers to one with no verb to clear it.
+	var sawReconcileReviews bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_reconcile_reviews" {
+			sawReconcileReviews = true
+			break
+		}
+	}
+	if !sawReconcileReviews {
+		t.Error("fishhawk_reconcile_reviews is not registered/visible over ListTools")
 	}
 
 	// fishhawk_arbitrate_acceptance (#2474) must be wire-visible AND its

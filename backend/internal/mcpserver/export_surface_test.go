@@ -146,6 +146,10 @@ var exportBaseline = []string{
 	"GetPlanOutput",
 	"GetRunStatusInput",
 	"GetRunStatusOutput",
+	// #2712: the decoded /healthz slice the restart-strand probe reads
+	// (process_start + the sibling identity fields). Exported alongside the
+	// other apiClient result types.
+	"HealthInfo",
 	"HostDispatchResult",
 	"InitInput",
 	"InitOutput",
@@ -195,6 +199,15 @@ var exportBaseline = []string{
 	"ReapFailureResult",
 	"ReapStageInput",
 	"ReapStageOutput",
+	// #2712: fishhawk_reconcile_reviews' tool I/O plus the apiClient result
+	// types for POST /v0/runs/{run_id}/reviews/reconcile. Exported for the
+	// same reason as the ReapStage* sibling verb above — the MCP SDK's
+	// jsonschema reflection advertises the nested per-stage row shape.
+	"ReconcileReviewsInput",
+	"ReconcileReviewsOutput",
+	"ReconcileReviewsResult",
+	"ReconcileReviewsStage",
+	"ReconciledReviewStage",
 	"RecordAutoDriveAct",
 	"RecordAutoDriveActResult",
 	"RecoverExemptPath",

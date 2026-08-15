@@ -327,9 +327,52 @@ func (r *runResolver) decodeLatestStartedConfiguredAgents(ctx context.Context, r
 // (sequences are >= 1), so both the no-fix-up implement path and the no-revise
 // plan path are byte-for-byte unchanged.
 func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stage string) (*ReviewStatus, error) {
-	cats, err := categoriesForStage(stage)
+	round, err := r.loadReviewRound(ctx, runID, stage)
 	if err != nil {
 		return nil, err
+	}
+	return r.reviewStatusFromRound(stage, round), nil
+}
+
+// reviewRound is ONE read of a stage's current review round: the latest
+// started anchor, the re-open floor, and the three floored terminal decodes.
+//
+// It exists so the status derivation and the #2712 restart-strand probe share
+// a SINGLE set of audit reads. Two independent read paths would both cost the
+// backend twice per poll tick AND could disagree about which entries belong to
+// the round — the exact class of bug the attempt-correlation work closed.
+type reviewRound struct {
+	Started  startedRound
+	SinceSeq int64
+	Reviewed []PlanReview
+	Skipped  []PlanReview
+	Failed   []PlanReview
+}
+
+// Landed is the round's terminal count: ANY terminal kind counts, matching
+// checkPlanReviewSettled's landed_terminal semantics.
+func (rd reviewRound) Landed() int {
+	return len(rd.Reviewed) + len(rd.Skipped) + len(rd.Failed)
+}
+
+// LandedRows is the union of the decoded terminal rows in the surface's
+// precedence order: real verdicts first, then synthesized failed, then skipped.
+func (rd reviewRound) LandedRows() []PlanReview {
+	union := make([]PlanReview, 0, rd.Landed())
+	union = append(union, rd.Reviewed...)
+	union = append(union, rd.Failed...)
+	union = append(union, rd.Skipped...)
+	return union
+}
+
+// loadReviewRound performs the round's audit reads. Query shape and count are
+// byte-for-byte what reviewStatusFor issued before the #2712 split: one
+// re-open-boundary read, three terminal reads, one started read.
+func (r *runResolver) loadReviewRound(ctx context.Context, runID uuid.UUID, stage string) (reviewRound, error) {
+	var out reviewRound
+	cats, err := categoriesForStage(stage)
+	if err != nil {
+		return out, err
 	}
 
 	// Resolve the per-stage round boundary the terminal-verdict reads are
@@ -343,32 +386,44 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	case "implement":
 		sinceSeq, err = r.latestImplementFixupSeq(ctx, runID)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 	case "plan":
 		sinceSeq, err = r.latestPlanRevisedSeq(ctx, runID)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 	}
+	out.SinceSeq = sinceSeq
 
-	reviewed, err := r.decodeReviewVerdicts(ctx, runID, cats.reviewed, sinceSeq)
+	out.Reviewed, err = r.decodeReviewVerdicts(ctx, runID, cats.reviewed, sinceSeq)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	skipped, err := r.decodeSkippedReviews(ctx, runID, cats.skipped, sinceSeq)
+	out.Skipped, err = r.decodeSkippedReviews(ctx, runID, cats.skipped, sinceSeq)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	failed, err := r.decodeFailedReviews(ctx, runID, cats.failed, sinceSeq)
+	out.Failed, err = r.decodeFailedReviews(ctx, runID, cats.failed, sinceSeq)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 
-	configured, started, err := r.decodeLatestStartedConfiguredAgents(ctx, runID, cats.started)
+	// The started anchor carries the round's ConfiguredAgents AND (for the
+	// strand probe) its dispatch timestamp; latestStartedRound is
+	// decodeLatestStartedConfiguredAgents's superset over the same one query.
+	out.Started, err = r.latestStartedRound(ctx, runID, cats.started)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
+	return out, nil
+}
+
+// reviewStatusFromRound is the pure status derivation over an already-read
+// round. Behavior is unchanged from the pre-#2712 inline form.
+func (r *runResolver) reviewStatusFromRound(stage string, rd reviewRound) *ReviewStatus {
+	reviewed, skipped, failed := rd.Reviewed, rd.Skipped, rd.Failed
+	configured, started := rd.Started.ConfiguredAgents, rd.Started.Exists
 
 	// Fallback (#1127): an absent or non-positive configured count — a run
 	// predating the ConfiguredAgents field, or a malformed/undecodable started
@@ -377,7 +432,7 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	// entry per reviewer invocation, so the count-based path below reliably
 	// reaches the threshold; this is defense-in-depth, not the normal path.
 	if configured <= 0 {
-		return r.reviewStatusFallback(stage, reviewed, skipped, failed, started), nil
+		return r.reviewStatusFallback(stage, reviewed, skipped, failed, started)
 	}
 
 	// Count-based completeness (#1127): ANY terminal kind counts toward the
@@ -387,9 +442,9 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	// reviewed/failed/skipped entries are already present, so a poll that
 	// catches the partial-landing window in the heterogeneous topology no
 	// longer returns 'complete' with only the first reviewer's verdict.
-	landed := len(reviewed) + len(skipped) + len(failed)
+	landed := rd.Landed()
 	if landed < configured {
-		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}, nil
+		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
 	}
 
 	// Round complete: resolve by the existing kind precedence (complete >
@@ -398,17 +453,14 @@ func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stag
 	// synthesized failed then synthesized skipped — so every configured
 	// reviewer is represented by exactly one row at the gate the operator acts
 	// on.
-	union := make([]PlanReview, 0, landed)
-	union = append(union, reviewed...)
-	union = append(union, failed...)
-	union = append(union, skipped...)
+	union := rd.LandedRows()
 	switch {
 	case len(reviewed) > 0:
-		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: union}, nil
+		return &ReviewStatus{Stage: stage, Status: "complete", Reviews: union}
 	case len(skipped) > 0:
-		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: union}, nil
+		return &ReviewStatus{Stage: stage, Status: "skipped", Reviews: union}
 	default:
-		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: union}, nil
+		return &ReviewStatus{Stage: stage, Status: "failed", Reviews: union}
 	}
 }
 
@@ -487,6 +539,236 @@ func (r *runResolver) latestPlanRevisedSeq(ctx context.Context, runID uuid.UUID)
 	return latestSeq, nil
 }
 
+// startedRound is the CURRENT review round's anchor: the latest
+// *_review_started entry's configured-agent count, dispatch timestamp and
+// audit sequence. decodeLatestStartedConfiguredAgents reads only the count;
+// the strand probe additionally needs the TIMESTAMP (to compare against the
+// serving daemon's boot instant) so this reads all three from one query.
+type startedRound struct {
+	ConfiguredAgents int
+	Timestamp        time.Time
+	Sequence         int64
+	Exists           bool
+}
+
+// latestStartedRound reads the run's *_review_started entries for the category
+// and returns the highest-sequence one. Mirrors
+// decodeLatestStartedConfiguredAgents's latest-wins selection (a fix-up or
+// revise appends a fresh started entry, so the latest anchors the CURRENT
+// round) and its permissive payload handling: an absent/undecodable payload
+// yields ConfiguredAgents 0 with Exists true, which the caller treats as
+// not-stranded via the existing #1127 fallback.
+func (r *runResolver) latestStartedRound(ctx context.Context, runID uuid.UUID, category string) (startedRound, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: category,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return startedRound{}, err
+	}
+	var latest *AuditEntry
+	for i := range entries {
+		if latest == nil || entries[i].Sequence > latest.Sequence {
+			latest = &entries[i]
+		}
+	}
+	if latest == nil {
+		return startedRound{}, nil
+	}
+	out := startedRound{Exists: true, Timestamp: latest.Timestamp, Sequence: latest.Sequence}
+	if latest.Payload == nil {
+		return out, nil
+	}
+	raw, merr := json.Marshal(latest.Payload)
+	if merr != nil {
+		return out, nil
+	}
+	var p struct {
+		ConfiguredAgents int `json:"configured_agents"`
+	}
+	if uerr := json.Unmarshal(raw, &p); uerr != nil {
+		return out, nil
+	}
+	out.ConfiguredAgents = p.ConfiguredAgents
+	return out, nil
+}
+
+// strandProbeCacheTTL bounds how long one resolved /healthz process_start is
+// reused WITHIN a single await call.
+//
+// It is deliberately a short TTL and NOT a per-call cache (#2712 binding
+// condition 1). The restart this probe exists to detect is an event that
+// happens DURING the wait — an operator lands one campaign item with
+// `scripts/dev post-merge` while another item's review is in flight — so a
+// boundary sampled once at call start and pinned for the full (up to 7200s)
+// window could never see it, and the wait would still burn its window against
+// a pre-restart boundary. Tens of seconds keeps the per-tick /healthz cost
+// bounded (at the 3s default poll cadence that is one probe per ~10 ticks)
+// while making the boundary re-observable mid-wait.
+const strandProbeCacheTTL = 30 * time.Second
+
+// healthBoundary is the resolved restart boundary plus WHEN it was resolved
+// (for the TTL) and, when it could not be resolved, why.
+type healthBoundary struct {
+	ProcessStart time.Time
+	// OK is true only when /healthz answered AND carried a parseable
+	// process_start. False means UNDECIDABLE — never a boundary.
+	OK        bool
+	Reason    string
+	FetchedAt time.Time
+}
+
+// resolveHealthBoundary returns the daemon's restart boundary, re-probing
+// /healthz when the cached sample is older than the TTL. cache is per-await-call
+// state owned by the caller; a nil cache probes every time.
+func (r *runResolver) resolveHealthBoundary(ctx context.Context, cache *healthBoundary, now time.Time) healthBoundary {
+	ttl := r.strandProbeTTL
+	if ttl <= 0 {
+		ttl = strandProbeCacheTTL
+	}
+	if cache != nil && !cache.FetchedAt.IsZero() && now.Sub(cache.FetchedAt) < ttl {
+		return *cache
+	}
+	hb := r.probeHealthBoundary(ctx, now)
+	if cache != nil {
+		*cache = hb
+	}
+	return hb
+}
+
+// probeHealthBoundary performs ONE /healthz read and classifies it. Every
+// failure mode is UNDECIDABLE with a reason — never a zero time.Time presented
+// as a boundary, which would compare as before every audit entry and convert
+// every pending review into a false strand.
+func (r *runResolver) probeHealthBoundary(ctx context.Context, now time.Time) healthBoundary {
+	info, err := r.api.Healthz(ctx)
+	switch {
+	case err != nil:
+		return healthBoundary{Reason: fmt.Sprintf("/healthz was unreachable (%v)", err), FetchedAt: now}
+	case info == nil:
+		return healthBoundary{Reason: "/healthz returned no body", FetchedAt: now}
+	case !info.ProcessStartOK:
+		return healthBoundary{
+			Reason:    "/healthz carries no parseable process_start (a fishhawkd predating #2712)",
+			FetchedAt: now,
+		}
+	default:
+		return healthBoundary{ProcessStart: info.ProcessStart, OK: true, FetchedAt: now}
+	}
+}
+
+// reviewStrand is the verdict of the restart-strand probe for one review round.
+//
+// Stranded means: the round's reviewers were dispatched by a fishhawkd process
+// that is GONE (the started entry predates the serving daemon's boot instant)
+// and fewer terminal verdicts landed than were configured — so no further
+// verdict can ever land and waiting is futile.
+//
+// Undecidable means the boundary could not be read at all; the caller must keep
+// waiting exactly as it would today. Both flags false means positively NOT
+// stranded — the reviewers belong to the serving process.
+type reviewStrand struct {
+	Stranded         bool
+	Undecidable      bool
+	Reason           string
+	LandedTerminal   int
+	ConfiguredAgents int
+	// LandedReviewers names the reviewers that DID report, so the surface can
+	// state the shortfall concretely ("1 of 2 configured reviewers landed;
+	// claude-fable-5 reported, 1 never did") rather than only that the round
+	// is stuck — the silent two-reviewers-to-one degradation is half of what
+	// makes this failure dangerous (#2712).
+	LandedReviewers    []string
+	StartedAt          time.Time
+	DaemonProcessStart time.Time
+}
+
+// MissingReviewers is the shortfall: configured minus landed, never negative.
+func (s reviewStrand) MissingReviewers() int {
+	if s.ConfiguredAgents <= s.LandedTerminal {
+		return 0
+	}
+	return s.ConfiguredAgents - s.LandedTerminal
+}
+
+// reviewerLabel renders one landed terminal row for the shortfall message.
+func reviewerLabel(p PlanReview) string {
+	switch {
+	case p.ReviewerModel != "" && p.Verdict != "":
+		return p.ReviewerModel + " (" + p.Verdict + ")"
+	case p.ReviewerModel != "":
+		return p.ReviewerModel
+	case p.Verdict != "":
+		return "unnamed reviewer (" + p.Verdict + ")"
+	default:
+		return "unnamed reviewer"
+	}
+}
+
+// reviewRoundStrand decides whether the CURRENT review round for the stage was
+// orphaned by a fishhawkd restart. It reuses the same per-round primitives
+// reviewStatusFor uses — the re-open floor (fix-up / revise), the three floored
+// terminal decoders, and the latest-started anchor — so the two can never
+// disagree about which entries belong to the round.
+//
+// Stranded requires ALL of:
+//
+//	(1) a *_review_started entry exists for the stage;
+//	(2) its ConfiguredAgents > 0 (else the #1127 fallback governs, not this);
+//	(3) landed terminals for THIS round < ConfiguredAgents;
+//	(4) /healthz resolved a parseable process_start;
+//	(5) the started entry's timestamp is BEFORE that boot instant.
+//
+// (4) failing is UNDECIDABLE — the wait continues unchanged. (5) failing is a
+// positive NOT-stranded: the reviewers were dispatched by the daemon serving
+// this request, so they are genuinely still running.
+func (r *runResolver) reviewRoundStrand(ctx context.Context, runID uuid.UUID, stage string, boundary healthBoundary) (*reviewStrand, error) {
+	round, err := r.loadReviewRound(ctx, runID, stage)
+	if err != nil {
+		return nil, err
+	}
+	return reviewRoundStrandFrom(round, boundary), nil
+}
+
+// reviewRoundStrandFrom is the pure strand derivation over an already-read
+// round — the form the await loop uses so one set of audit reads feeds both
+// the status and the diagnostic.
+func reviewRoundStrandFrom(round reviewRound, boundary healthBoundary) *reviewStrand {
+	started := round.Started
+	out := &reviewStrand{StartedAt: started.Timestamp, ConfiguredAgents: started.ConfiguredAgents}
+	if !started.Exists {
+		out.Reason = "no review has been dispatched for this stage"
+		return out
+	}
+	if started.ConfiguredAgents <= 0 {
+		out.Reason = "the review round records no configured agent count"
+		return out
+	}
+
+	landed := round.LandedRows()
+	out.LandedTerminal = len(landed)
+	for _, p := range landed {
+		out.LandedReviewers = append(out.LandedReviewers, reviewerLabel(p))
+	}
+	if out.LandedTerminal >= started.ConfiguredAgents {
+		out.Reason = "every configured reviewer has landed a terminal verdict"
+		return out
+	}
+
+	if !boundary.OK {
+		out.Undecidable = true
+		out.Reason = boundary.Reason
+		return out
+	}
+	out.DaemonProcessStart = boundary.ProcessStart
+	if !started.Timestamp.Before(boundary.ProcessStart) {
+		out.Reason = "the review was dispatched by the fishhawkd process now serving this request, so its reviewers are still running"
+		return out
+	}
+	out.Stranded = true
+	return out
+}
+
 // defaultReviewPollInterval is the fallback poll cadence for
 // fishhawk_await_review when the resolver's reviewPollInterval is unset.
 // Tests inject a sub-millisecond interval so the poll loop runs without
@@ -546,7 +828,7 @@ type AwaitReviewInput struct {
 // actionable next step.
 type AwaitReviewOutput struct {
 	Stage         string       `json:"stage"`
-	Status        string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
+	Status        string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed, stranded"`
 	Reviews       []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed"`
 	WaitedSeconds float64      `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
 	Message       string       `json:"message,omitempty" jsonschema:"actionable explanation when status=pending after the timeout"`
@@ -565,6 +847,18 @@ type AwaitReviewOutput struct {
 	// when long_wait or a progressToken was in effect, else 600 (#2490).
 	// Present on every return path.
 	TimeoutCapSeconds int `json:"timeout_cap_seconds" jsonschema:"the timeout cap actually applied to this call (600 by default, 7200 when long_wait or a progressToken was in effect)"`
+	// Stranded and the four fields below are the #2712 restart diagnostic. A
+	// stranded round can never land another verdict: its reviewers were
+	// dispatched by a fishhawkd process that has since restarted, so the wait
+	// resolves IMMEDIATELY instead of burning its full window and then
+	// claiming the dead reviewer is still running.
+	Stranded bool `json:"stranded,omitempty" jsonschema:"true when the round's reviewers were dispatched by a fishhawkd process that has since restarted and fewer than configured_agents verdicts landed — no further verdict can ever land; recover with fishhawk_reconcile_reviews"`
+	// Undecidable reports that the restart boundary could not be read, so the
+	// wait behaved exactly as it did before this diagnostic existed.
+	Undecidable       bool   `json:"undecidable,omitempty" jsonschema:"true when the dispatching daemon could not be verified (/healthz unreachable, or a fishhawkd predating process_start); the wait continued unchanged and a restart cannot be ruled out"`
+	LandedTerminal    int    `json:"landed_terminal,omitempty" jsonschema:"how many of the configured reviewers have landed a terminal verdict for the current round"`
+	ConfiguredAgents  int    `json:"configured_agents,omitempty" jsonschema:"how many agent reviewers the round was dispatched with; landed_terminal < configured_agents is the partial-landing shortfall"`
+	DaemonRestartedAt string `json:"daemon_restarted_at,omitempty" jsonschema:"RFC3339 boot instant of the fishhawkd now serving, when a restart was positively identified as the cause of the strand"`
 }
 
 // clampAwaitTimeout applies the default + cap. Non-positive falls back to
@@ -784,11 +1078,14 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, heartbeat, in.LongWait)
 	start := time.Now()
 
-	// Fast path: terminal / none returns immediately without polling.
-	st, err := r.reviewStatusFor(ctx, runID, in.Stage)
+	// Fast path: terminal / none returns immediately without polling. The
+	// round is read ONCE and both the status and the #2712 strand diagnostic
+	// are derived from it, so the diagnostic costs no extra audit round-trip.
+	round, err := r.loadReviewRound(ctx, runID, in.Stage)
 	if err != nil {
 		return nil, AwaitReviewOutput{}, fmt.Errorf("review status: %w", err)
 	}
+	st := r.reviewStatusFromRound(in.Stage, round)
 	if st.Status != "pending" {
 		return nil, r.awaitTerminalOutput(in.Stage, st, start, heartbeat, capSeconds), nil
 	}
@@ -812,6 +1109,18 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 		terminalInFlight = true
 	}
 
+	// Restart-strand probe (#2712). boundaryCache is PER-CALL state with a
+	// bounded TTL, re-probed across ticks: the restart that strands a review
+	// typically happens DURING this wait (an operator lands a sibling item
+	// with `scripts/dev post-merge` while this review is in flight), so a
+	// boundary pinned at call start could never see it. lastStrand carries the
+	// most recent verdict into the timeout message.
+	var boundaryCache healthBoundary
+	lastStrand := reviewRoundStrandFrom(round, r.resolveHealthBoundary(ctx, &boundaryCache, time.Now()))
+	if lastStrand.Stranded {
+		return nil, r.awaitStrandedOutput(in.Stage, lastStrand, start, heartbeat, capSeconds), nil
+	}
+
 	interval := r.reviewPollInterval
 	if interval <= 0 {
 		interval = defaultReviewPollInterval
@@ -825,7 +1134,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds), nil
+			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds, lastStrand), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in): keeps a
 			// long wait from being aborted by the client's idle timeout. Emitted
@@ -841,18 +1150,26 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 					Message:       awaitReviewProgressMessage(in.Stage, time.Since(start), terminalInFlight),
 				})
 			}
-			st, err := r.reviewStatusFor(pollCtx, runID, in.Stage)
+			round, err := r.loadReviewRound(pollCtx, runID, in.Stage)
 			if err != nil {
 				// A deadline hit mid-poll cancels the in-flight request;
 				// that is a timeout, not a transport failure — return
 				// pending rather than surfacing the cancellation as an error.
 				if pollCtx.Err() != nil {
-					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds), nil
+					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds, lastStrand), nil
 				}
 				return nil, AwaitReviewOutput{}, fmt.Errorf("poll review status: %w", err)
 			}
+			st := r.reviewStatusFromRound(in.Stage, round)
 			if st.Status != "pending" {
 				return nil, r.awaitTerminalOutput(in.Stage, st, start, heartbeat, capSeconds), nil
+			}
+			// Still pending: re-derive the strand verdict, re-probing the
+			// restart boundary on the TTL so a restart landing MID-WAIT is seen
+			// by THIS call rather than only by a subsequent one (#2712).
+			lastStrand = reviewRoundStrandFrom(round, r.resolveHealthBoundary(pollCtx, &boundaryCache, time.Now()))
+			if lastStrand.Stranded {
+				return nil, r.awaitStrandedOutput(in.Stage, lastStrand, start, heartbeat, capSeconds), nil
 			}
 			// Still pending: the review hasn't landed a verdict. If the run
 			// itself has gone terminal with NO review in flight the review
@@ -882,6 +1199,48 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 	}
 }
 
+// strandShortfall renders the partial-landing shortfall in concrete terms:
+// how many of how many configured reviewers reported, WHICH ones did, and how
+// many never will. A message that says only "stranded" leaves the more
+// dangerous half of #2712 open — an operator who silently went from two
+// reviewers to one has a degraded gate, not merely a stuck one.
+func strandShortfall(s *reviewStrand) string {
+	base := fmt.Sprintf("you heard from %d of %d configured reviewers", s.LandedTerminal, s.ConfiguredAgents)
+	if len(s.LandedReviewers) > 0 {
+		base += fmt.Sprintf(" (landed: %s)", strings.Join(s.LandedReviewers, ", "))
+	}
+	return fmt.Sprintf("%s; %d never reported and never will", base, s.MissingReviewers())
+}
+
+// awaitStrandedOutput builds the immediate 'stranded' resolution: the round's
+// reviewers died with a prior fishhawkd process, so no further verdict can
+// land. It names the shortfall concretely, states that the landed verdicts are
+// durable, and points at the recovery verb.
+func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start time.Time, heartbeat bool, timeoutCap int) AwaitReviewOutput {
+	out := AwaitReviewOutput{
+		Stage:               stage,
+		Status:              "stranded",
+		WaitedSeconds:       time.Since(start).Seconds(),
+		Heartbeat:           heartbeat,
+		TimeoutCapSeconds:   timeoutCap,
+		Stranded:            true,
+		LandedTerminal:      s.LandedTerminal,
+		ConfiguredAgents:    s.ConfiguredAgents,
+		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
+	}
+	if !s.DaemonProcessStart.IsZero() {
+		out.DaemonRestartedAt = s.DaemonProcessStart.UTC().Format(time.RFC3339)
+	}
+	out.Message = fmt.Sprintf(
+		"%s review CANNOT progress: it was dispatched at %s by a fishhawkd process that has since restarted (the daemon now serving booted at %s), so the reviewing goroutine died with that process and no further verdict will ever land. The gate DEGRADED rather than merely stalling — %s. The landed verdict(s) are durable audit entries and are preserved. Recover with fishhawk_reconcile_reviews (run_id=this run): it synthesizes ONLY the missing terminal entries, so nothing already landed is re-paid for, and the review then resolves to a terminal status you can act on.",
+		stage,
+		s.StartedAt.UTC().Format(time.RFC3339),
+		out.DaemonRestartedAt,
+		strandShortfall(s),
+	)
+	return out
+}
+
 // awaitPendingTimeoutOutput builds the resumable pending-after-timeout
 // response (#879). The wait holds no state, so a timeout is a documented,
 // idempotent checkpoint — not an error: the message frames the re-call (or a
@@ -897,7 +1256,17 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 // names fishhawk_revive_run instead of the ordinary still-running message. The
 // caller captures terminalInFlight during polling (with a live context) rather
 // than re-querying here, where the poll context is already cancelled.
-func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool, heartbeat bool, timeoutCap int) AwaitReviewOutput {
+// strand (#2712) carries the last restart-boundary verdict the poll loop
+// resolved (nil when the probe never produced one). It replaces the old
+// UNCONDITIONAL "the review is genuinely still running" assertion — which was
+// simply false for an orphaned round — with a claim bounded by what was
+// actually verified: a not-stranded verdict THAT ACTUALLY COMPARED THE BOUNDARY
+// (DaemonProcessStart non-zero) says the dispatching daemon is the one serving;
+// an undecidable verdict says so and names fishhawk_reconcile_reviews as the
+// recovery if a restart did happen; and a verdict from one of the early returns
+// that never reached the boundary check falls back to the neutral pre-#2712
+// wording rather than claiming a verification that never ran.
+func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool, heartbeat bool, timeoutCap int, strand *reviewStrand) AwaitReviewOutput {
 	out := AwaitReviewOutput{
 		Stage:               stage,
 		Status:              "pending",
@@ -905,6 +1274,11 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
 		Heartbeat:           heartbeat,
 		TimeoutCapSeconds:   timeoutCap,
+	}
+	if strand != nil {
+		out.Undecidable = strand.Undecidable
+		out.LandedTerminal = strand.LandedTerminal
+		out.ConfiguredAgents = strand.ConfiguredAgents
 	}
 	if terminalInFlight {
 		out.Message = fmt.Sprintf("%s review still pending after %ds and the run has reached a terminal state while the "+
@@ -915,11 +1289,36 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 			stage, timeout, suggestedReviewPollIntervalSeconds)
 		return out
 	}
-	out.Message = fmt.Sprintf("%s review still pending after %ds — the review is genuinely still running (no terminal "+
-		"audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have resolved to a "+
-		"definite 'failed' status). The wait holds nothing: re-call fishhawk_await_review to resume it, or poll "+
-		"fishhawk_get_run_status every %ds (the authoritative path). Check the fishhawkd logs if this persists.",
-		stage, timeout, suggestedReviewPollIntervalSeconds)
+	if strand != nil && strand.Undecidable {
+		out.Message = fmt.Sprintf("%s review still pending after %ds (no terminal audit entry yet; a reviewer that errored "+
+			"or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have resolved to a definite 'failed' status). The dispatching "+
+			"daemon could NOT be verified (%s): if fishhawkd restarted since this round was dispatched, its reviewer(s) "+
+			"died with that process and no verdict will ever land — %d of %d configured reviewers have reported so far. "+
+			"Try fishhawk_reconcile_reviews to synthesize only the missing terminal entries (already-landed verdicts are "+
+			"preserved), or re-call fishhawk_await_review / poll fishhawk_get_run_status every %ds (the authoritative path).",
+			stage, timeout, strand.Reason, strand.LandedTerminal, strand.ConfiguredAgents, suggestedReviewPollIntervalSeconds)
+		return out
+	}
+	verified := "no terminal audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have " +
+		"resolved to a definite 'failed' status"
+	// The positive liveness claim is gated on EVIDENCE THE BOUNDARY COMPARISON
+	// ACTUALLY RAN, not merely on the absence of a stranded/undecidable verdict.
+	// reviewRoundStrandFrom returns that same !Stranded && !Undecidable shape on
+	// three early returns that never consult /healthz at all — no started entry,
+	// ConfiguredAgents <= 0 (a pre-#1127 round, still reachable at the timeout
+	// path via reviewStatusFallback), and every-reviewer-landed. Claiming
+	// "verified" there would assert a check that was never performed — the same
+	// confident-wrong-signal class #2712 exists to eliminate, merely moved to
+	// the legacy-round edge. DaemonProcessStart is set ONLY after boundary.OK,
+	// so a non-zero value IS the proof the comparison happened.
+	if strand != nil && !strand.Stranded && !strand.Undecidable && !strand.DaemonProcessStart.IsZero() {
+		verified = "verified: the round was dispatched by the fishhawkd process currently serving, so its reviewer(s) are " +
+			"still running rather than orphaned by a restart"
+	}
+	out.Message = fmt.Sprintf("%s review still pending after %ds — the review is still running (%s). The wait holds "+
+		"nothing: re-call fishhawk_await_review to resume it, or poll fishhawk_get_run_status every %ds (the "+
+		"authoritative path). Check the fishhawkd logs if this persists.",
+		stage, timeout, verified, suggestedReviewPollIntervalSeconds)
 	return out
 }
 

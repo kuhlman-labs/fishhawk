@@ -850,6 +850,53 @@ child never can, and no verb un-cancels a run. So `cancelRun` reads the run row 
 costs at most a retry. `orphan_parent_ok:true` is the single documented override for both refusals and surfaces a
 warning naming the orphaned parent.
 
+## Restart-orphaned review recovery (`fishhawk_reconcile_reviews` + the await strand probe, [E67.55 / #2712](https://github.com/kuhlman-labs/fishhawk/issues/2712))
+
+When `fishhawkd` restarts while a plan or implement review is in flight, the detached reviewing goroutine dies with the
+process and no terminal `*_review_(reviewed|skipped|failed)` entry ever lands. `review_status` is derived from the audit
+trail (`reviewStatusFor`: `pending` while `landed_terminal < configured_agents`), so the round stays `pending` forever —
+the gate silently DEGRADES from N reviewers to the M that landed, and `fishhawk_await_review` used to burn its entire
+window and then assert the dead reviewer was "genuinely still running". Two surfaces close it.
+
+**The strand probe (`review.go`).** `reviewRoundStrandFrom` reports `Stranded` only when ALL of: a `*_review_started`
+entry exists; its `configured_agents > 0`; landed terminals for THIS round (same re-open floor and floored decoders
+`reviewStatusFor` uses) `< configured_agents`; `/healthz` resolved a PARSEABLE `process_start`; and the started entry's
+timestamp is BEFORE that boot instant. Every other outcome is not-stranded, and an unreadable boundary is a distinct
+`Undecidable` verdict carrying a reason.
+
+- **Fail-open is uniform.** `/healthz` unreachable, non-200, non-JSON, absent `process_start`, or an unparseable one all
+  degrade to `Undecidable` — the wait then behaves exactly as it did before this diagnostic existed. A zero `time.Time`
+  is NEVER presented as a boundary: it compares as before every audit entry and would convert every pending review into
+  a false strand, so `HealthInfo.ProcessStartOK` (present AND parseable) is the gate, not zero-ness.
+- **The boundary is re-probed DURING the wait on a bounded TTL** (`strandProbeCacheTTL`, 30s; per-call cache state, not a
+  per-call SAMPLE). This is load-bearing rather than a cost tweak: the restart that strands a review is an event that
+  happens DURING the wait — an operator lands a sibling campaign item with `scripts/dev post-merge` while this review is
+  in flight — so a boundary pinned at call start could never see it and the wait would still burn its window against a
+  pre-restart boundary. `TestAwaitReview_BoundaryChangesMidWait_SameCallDetectsStrand` begins polling under boundary A,
+  changes it to B mid-wait, and asserts the SAME in-flight call resolves.
+- **No extra audit reads.** The status and the strand verdict are both derived from ONE `loadReviewRound` per tick, so
+  the two can never disagree about which entries belong to the round and the diagnostic costs only the TTL'd `/healthz`.
+- **The report names the SHORTFALL, not just the stall**: `landed_terminal` of `configured_agents`, WHICH reviewers
+  reported, and how many never will — because the silent two-reviewers-to-one degradation is half of what makes this
+  failure dangerous. `ReviewStatus.Status` is deliberately UNCHANGED at `pending` (it feeds the approval/merge gates,
+  `drive_run` and `await_audit`); `stranded` is an await-surface diagnostic, not a new gate state.
+- The pending-after-timeout message no longer asserts liveness unconditionally: it says "verified: dispatched by the
+  daemon currently serving" only on a not-stranded verdict THAT ACTUALLY COMPARED THE BOUNDARY, and on `Undecidable` says
+  so and names the recovery. The claim is gated on a non-zero `DaemonProcessStart` — set only after `boundary.OK`, so it
+  IS the evidence the comparison ran — because `reviewRoundStrandFrom` returns the same not-stranded/not-undecidable
+  shape on three early returns that never consult `/healthz`: no started entry, `configured_agents <= 0` (a pre-#1127
+  round, still reachable at the timeout path via `reviewStatusFallback`), and every-reviewer-landed. Those fall back to
+  the neutral pre-#2712 wording; claiming verification there would move the same confident-wrong-signal to the
+  legacy-round edge.
+
+**The recovery verb.** `fishhawk_reconcile_reviews` wraps `POST /v0/runs/{run_id}/reviews/reconcile` (contract:
+`backend/internal/server/README.md`). It appends ONLY the missing terminal entries for the current round, so
+**already-landed verdicts are preserved verbatim** — a 1-of-2 round gets exactly one synthesized entry and the real
+verdict still reads back with its concerns at the gate — and a second call is a no-op (`round_already_settled`). It
+**refuses (no-op with a reason) a round this daemon still has in flight**: the server compares the round's dispatch
+timestamp against its own boot marker and answers `skip_reason: review_dispatched_by_this_process`, so invoking it
+against a healthy running review changes nothing. Requires `write:runs`; a 404/403 surfaces verbatim.
+
 ## `push_and_open_pr=false` is per-case, not global (`guardNoPRImplement`)
 
 `push_and_open_pr=false` (the runner's `--no-pr`) is supported on a **standalone** implement stage and refused on the

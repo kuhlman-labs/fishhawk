@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -12,15 +13,57 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// reconcileOrphanedReviewsPageSize bounds the running-run listing page the
-// startup reconcile walks, mirroring orchestrator.reconcileStuckRunsPageSize.
+// reconcileOrphanedReviewsPageSize bounds the run listing page the startup
+// reconcile walks per state, mirroring orchestrator.reconcileStuckRunsPageSize.
 const reconcileOrphanedReviewsPageSize = 100
+
+// reconcileOrphanedReviewStates is the set of NON-TERMINAL run states the boot
+// sweep pages. It is the #2712 root-cause fix: the sweep used to filter on
+// run.StateRunning ALONE, which made the plan-review half of #1781 dead code.
+// A run is CREATED pending (runs.go handleCreateRun) and, on the GATED plan
+// path, advancePlanStageTerminal (plan.go) parks the plan stage at
+// awaiting_approval WITHOUT calling Orchestrator.Advance — the first
+// pending->running transition happens at plan APPROVAL (approvals.go). So
+// EVERY plan review is dispatched while its run is still 'pending', and a
+// daemon restart mid-plan-review left a strand no boot sweep could ever heal.
+//
+// ListRuns takes a single equality string, so the filter cannot be expressed
+// as "not terminal"; the set is enumerated here and pinned against
+// run.State.IsTerminal() by TestReconcileOrphanedReviewStates_CoversEveryNonTerminalState
+// so a future non-terminal state cannot be silently omitted.
+var reconcileOrphanedReviewStates = []run.State{run.StatePending, run.StateRunning}
+
+// reconcileSkip* are the recorded reasons a stage's reconcile was a no-op.
+// The boot sweep ignores them; the on-demand endpoint (#2712) reports them so
+// an operator sees WHY nothing was healed instead of a silent success.
+const (
+	reconcileSkipNoStartedEntry = "no_review_started_entry"
+	reconcileSkipNoConfigured   = "no_configured_agents"
+	reconcileSkipNoStageID      = "started_entry_has_no_stage_id"
+	reconcileSkipInFlight       = "review_dispatched_by_this_process"
+	reconcileSkipAlreadySettled = "round_already_settled"
+)
+
+// reconciledStage is the per-stage outcome of one reconcile pass. It carries
+// the counts the on-demand endpoint reports and the skip reason when the pass
+// healed nothing.
+type reconciledStage struct {
+	Stage            string `json:"stage"`
+	ConfiguredAgents int    `json:"configured_agents"`
+	LandedBefore     int    `json:"landed_before"`
+	Synthesized      int    `json:"synthesized"`
+	Skipped          bool   `json:"skipped"`
+	SkipReason       string `json:"skip_reason,omitempty"`
+}
 
 // orphanedReviewStageKind describes one review-bearing stage's audit
 // categories: the *_review_started dispatch marker, the *_review_failed
 // terminal we synthesize, and the full terminal set (reviewed / skipped /
 // failed) counted against ConfiguredAgents.
 type orphanedReviewStageKind struct {
+	// label is the stage name the on-demand endpoint reports ("plan" /
+	// "implement"), matching the fishhawk_await_review stage vocabulary.
+	label     string
 	started   string
 	failed    string
 	terminals []string
@@ -33,11 +76,13 @@ type orphanedReviewStageKind struct {
 // heals, in a stable order.
 var orphanedReviewStages = []orphanedReviewStageKind{
 	{
+		label:     "plan",
 		started:   "plan_review_started",
 		failed:    "plan_review_failed",
 		terminals: []string{"plan_reviewed", "plan_review_skipped", "plan_review_failed"},
 	},
 	{
+		label:       "implement",
 		started:     "implement_review_started",
 		failed:      "implement_review_failed",
 		terminals:   []string{"implement_reviewed", "implement_review_skipped", "implement_review_failed"},
@@ -59,7 +104,9 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // entries < ConfiguredAgents), so it stays 'pending' forever and await_review
 // reports 'genuinely still running' indefinitely, wedging the gate.
 //
-// This pages every running run and, per review-bearing stage, reads the
+// This pages every NON-TERMINAL run (reconcileOrphanedReviewStates: pending +
+// running — see there for why 'pending' is load-bearing, #2712) and, per
+// review-bearing stage, reads the
 // LATEST *_review_started anchor (which carries ConfiguredAgents + Authority +
 // StageID). For a review whose latest started entry predates the current
 // process boot marker (s.processStart) with fewer landed terminals than
@@ -93,43 +140,51 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 
 	terminated := 0
 	failed := 0
-	offset := 0
-	for {
-		runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
-			State:  string(run.StateRunning),
-			Limit:  reconcileOrphanedReviewsPageSize,
-			Offset: offset,
-		})
-		if err != nil {
-			// A paging failure is systemic (not specific to one run), so
-			// abort the sweep — best-effort applies per-run, not to the
-			// listing itself. Mirrors orchestrator.ReconcileStuckRuns.
-			return terminated, fmt.Errorf("server: reconcile orphaned reviews: list runs: %w", err)
-		}
-		if len(runs) == 0 {
-			break
-		}
-		for _, r := range runs {
-			did, err := s.reconcileRunOrphanedReviews(ctx, r.ID)
+	// healed de-duplicates the run count across the state filters. A run
+	// cannot appear under two state filters in one pass, so this is defensive
+	// against a future state addition rather than load-bearing today.
+	healed := make(map[uuid.UUID]struct{})
+	for _, state := range reconcileOrphanedReviewStates {
+		offset := 0
+		for {
+			runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+				State:  string(state),
+				Limit:  reconcileOrphanedReviewsPageSize,
+				Offset: offset,
+			})
 			if err != nil {
-				failed++
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: skipped run on error",
-					slog.String("run_id", r.ID.String()),
-					slog.String("error", err.Error()),
-				)
-				continue
+				// A paging failure is systemic (not specific to one run), so
+				// abort the sweep — best-effort applies per-run, not to the
+				// listing itself. Mirrors orchestrator.ReconcileStuckRuns.
+				return terminated, fmt.Errorf("server: reconcile orphaned reviews: list %s runs: %w", state, err)
 			}
-			if did {
-				terminated++
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: terminated orphaned review(s)",
-					slog.String("run_id", r.ID.String()),
-				)
+			if len(runs) == 0 {
+				break
 			}
+			for _, r := range runs {
+				stages, err := s.reconcileRunOrphanedReviews(ctx, r.ID)
+				if err != nil {
+					failed++
+					s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: skipped run on error",
+						slog.String("run_id", r.ID.String()),
+						slog.String("error", err.Error()),
+					)
+					continue
+				}
+				if _, seen := healed[r.ID]; !seen && reconcileSynthesizedAny(stages) {
+					healed[r.ID] = struct{}{}
+					terminated++
+					s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: terminated orphaned review(s)",
+						slog.String("run_id", r.ID.String()),
+						slog.String("run_state", string(state)),
+					)
+				}
+			}
+			if len(runs) < reconcileOrphanedReviewsPageSize {
+				break
+			}
+			offset += len(runs)
 		}
-		if len(runs) < reconcileOrphanedReviewsPageSize {
-			break
-		}
-		offset += len(runs)
 	}
 
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: orphaned-review reconciliation complete",
@@ -139,24 +194,61 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 	return terminated, nil
 }
 
+// reconcileSynthesizedAny reports whether any stage in the pass emitted a
+// synthesized terminal entry — the run-level "healed" predicate the boot
+// sweep counts and the on-demand endpoint reports as `terminated`.
+func reconcileSynthesizedAny(stages []reconciledStage) bool {
+	for _, st := range stages {
+		if st.Synthesized > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileEmitStripes bounds the reconcile lock set. A fixed stripe count
+// (rather than a per-run map that grows without bound) keeps the lock memory
+// constant regardless of how many runs the process ever reconciles; two
+// unrelated runs colliding on a stripe only briefly serialize their (rare)
+// reconcile pass, which is harmless. Mirrors reportEmitLockFor (autodrive.go).
+const reconcileEmitStripes = 64
+
+var reconcileEmitMu [reconcileEmitStripes]sync.Mutex
+
+// reconcileEmitLockFor returns the stripe mutex guarding a run's
+// count-landed-terminals -> append-missing-terminals critical section. See
+// reconcileRunOrphanedReviews for why the section is serialized.
+func reconcileEmitLockFor(runID uuid.UUID) *sync.Mutex {
+	var h uint32
+	for _, b := range runID {
+		h = h*31 + uint32(b)
+	}
+	return &reconcileEmitMu[h%reconcileEmitStripes]
+}
+
 // reconcileRunOrphanedReviews handles both review stages for one run. Returns
-// whether it emitted any synthesized terminal entry for the run. When the
-// implement stage was healed it also republishes fishhawk_audit_complete so
-// the #947 review-pending presence gate reflects the now-terminal state.
-func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUID) (bool, error) {
-	emittedAny := false
-	emittedImplement := false
-	for _, stage := range orphanedReviewStages {
-		emitted, err := s.reconcileStageOrphanedReviews(ctx, runID, stage)
-		if err != nil {
-			return emittedAny, err
-		}
-		if emitted {
-			emittedAny = true
-			if stage.isImplement {
-				emittedImplement = true
-			}
-		}
+// the per-stage outcomes (counts + skip reasons) so the same helper serves the
+// boot sweep (which only needs "did anything land") and the on-demand endpoint
+// (which reports WHY nothing did). When the implement stage was healed it also
+// republishes fishhawk_audit_complete so the #947 review-pending presence gate
+// reflects the now-terminal state.
+//
+// The whole per-run pass runs under a per-run stripe lock. The idempotency of
+// this recovery rests on a READ-then-APPEND sequence — count the round's landed
+// terminals, append exactly (ConfiguredAgents - landed) — which is NOT atomic on
+// its own: two concurrent POST /v0/runs/{run_id}/reviews/reconcile callers (or
+// one racing the boot sweep) can both observe the same shortfall and each
+// synthesize it, persisting MORE terminal entries than the round configured.
+// Serializing the section per run makes the second caller re-count AFTER the
+// first has appended, so it sees landed == ConfiguredAgents and takes the
+// round_already_settled skip. A cross-PROCESS guarantee would need a DB-level
+// conditional write (an advisory lock or a uniqueness constraint on the
+// synthesized row); this closes the realistic single-daemon race, which is the
+// one an operator can actually trigger by double-clicking the verb.
+func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
+	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLocked(ctx, runID)
+	if err != nil {
+		return out, err
 	}
 	if emittedImplement {
 		// Re-derive and republish fishhawk_audit_complete so the review-
@@ -170,21 +262,60 @@ func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUI
 			s.recomputeAndPublishAuditComplete(ctx, runID)
 		}
 	}
-	return emittedAny, nil
+	return out, nil
+}
+
+// reconcileRunOrphanedReviewsLocked is the serialized count-and-append section:
+// both review stages of one run under that run's stripe lock. It returns
+// whether the implement stage synthesized anything so the caller can republish
+// fishhawk_audit_complete OUTSIDE the lock — that republish is a read + publish
+// which is idempotent on its own and must not extend the critical section.
+func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uuid.UUID) ([]reconciledStage, bool, error) {
+	lock := reconcileEmitLockFor(runID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	out := make([]reconciledStage, 0, len(orphanedReviewStages))
+	emittedImplement := false
+	for _, stage := range orphanedReviewStages {
+		res, err := s.reconcileStageOrphanedReviews(ctx, runID, stage)
+		if err != nil {
+			return out, emittedImplement, err
+		}
+		out = append(out, res)
+		if res.Synthesized > 0 && stage.isImplement {
+			emittedImplement = true
+		}
+	}
+	return out, emittedImplement, nil
 }
 
 // reconcileStageOrphanedReviews synthesizes the missing terminal
 // *_review_failed entries for one stage's CURRENT (latest-started) review
-// round when that round was orphaned by a prior-process restart. Returns
-// whether it emitted anything.
-func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (bool, error) {
+// round when that round was orphaned by a prior-process restart. Returns the
+// per-stage outcome: the round's counts, and — when it healed nothing — the
+// gate that refused it, so the on-demand endpoint can report a reason instead
+// of a silent no-op. Every gate is unchanged from the #1781 boot sweep; only
+// the return type carries more.
+//
+// MUST be called under the run's reconcileEmitLockFor stripe lock: the
+// count-landed -> append-missing sequence below is not atomic on its own (see
+// reconcileRunOrphanedReviews).
+func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (reconciledStage, error) {
+	out := reconciledStage{Stage: stage.label}
+	skip := func(reason string) reconciledStage {
+		out.Skipped = true
+		out.SkipReason = reason
+		return out
+	}
+
 	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, stage.started)
 	if err != nil {
-		return false, fmt.Errorf("list %s for run %s: %w", stage.started, runID, err)
+		return out, fmt.Errorf("list %s for run %s: %w", stage.started, runID, err)
 	}
 	if len(started) == 0 {
 		// No review was ever dispatched for this stage — nothing to heal.
-		return false, nil
+		return skip(reconcileSkipNoStartedEntry), nil
 	}
 
 	// The CURRENT attempt is the latest *_review_started (highest audit
@@ -199,16 +330,17 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 
 	var payload planreview.ReviewStartedPayload
 	if err := json.Unmarshal(latest.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode %s payload for run %s: %w", stage.started, runID, err)
+		return out, fmt.Errorf("decode %s payload for run %s: %w", stage.started, runID, err)
 	}
+	out.ConfiguredAgents = payload.ConfiguredAgents
 	if payload.ConfiguredAgents <= 0 {
 		// No reviewer was actually configured on this round — never pending.
-		return false, nil
+		return skip(reconcileSkipNoConfigured), nil
 	}
 	if latest.StageID == nil {
 		// A started entry always carries its stage id; defend anyway rather
 		// than emit a terminal entry with no stage anchor.
-		return false, nil
+		return skip(reconcileSkipNoStageID), nil
 	}
 
 	// Boot-marker gate: a review whose latest started entry is NOT before the
@@ -217,7 +349,7 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	// dispatch predates it; the comparison is load-bearing only if the pass is
 	// ever invoked mid-process-life.
 	if !latest.Timestamp.Before(s.processStart) {
-		return false, nil
+		return skip(reconcileSkipInFlight), nil
 	}
 
 	// Count landed terminals for THIS round only: audit sequence strictly
@@ -228,7 +360,7 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	for _, cat := range stage.terminals {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
 		if err != nil {
-			return false, fmt.Errorf("list %s for run %s: %w", cat, runID, err)
+			return out, fmt.Errorf("list %s for run %s: %w", cat, runID, err)
 		}
 		for _, e := range entries {
 			if e.Sequence > latest.Sequence {
@@ -236,9 +368,10 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 			}
 		}
 	}
+	out.LandedBefore = landed
 	if landed >= payload.ConfiguredAgents {
 		// Already settled for this round — idempotent no-op on a second pass.
-		return false, nil
+		return skip(reconcileSkipAlreadySettled), nil
 	}
 
 	// Emit exactly (ConfiguredAgents - landed) terminal *_review_failed
@@ -252,5 +385,6 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	for i := 0; i < missing; i++ {
 		s.emitReviewFailed(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", orphanedReviewRestartReason, false)
 	}
-	return true, nil
+	out.Synthesized = missing
+	return out, nil
 }

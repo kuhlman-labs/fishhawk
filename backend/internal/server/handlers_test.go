@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandleHealth(t *testing.T) {
@@ -85,6 +86,54 @@ func TestHandleHealth_StartNonce(t *testing.T) {
 	raw := rec.Body.String()
 	if want := `"start_nonce":"test-nonce-123"`; !strings.Contains(raw, want) {
 		t.Errorf("raw body missing %s: %s", want, raw)
+	}
+}
+
+// TestHandleHealth_ProcessStart pins the #2712 restart boundary on the wire:
+// the exact compact JSON byte shape a client greps/decodes, in RFC3339Nano
+// UTC, and its OMISSION when the boot marker is zero. The omission branch is
+// load-bearing: a caller must be able to tell "no boundary published" (an
+// older daemon) from a real instant, because a zero time compares as BEFORE
+// every audit entry and would turn every pending review into a false strand.
+func TestHandleHealth_ProcessStart(t *testing.T) {
+	boot := time.Date(2026, 8, 15, 9, 30, 15, 123456789, time.UTC)
+	s := New(Config{ProcessStart: boot})
+	rec := httptest.NewRecorder()
+	s.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	raw := rec.Body.String()
+	want := `"process_start":"` + boot.Format(time.RFC3339Nano) + `"`
+	if !strings.Contains(raw, want) {
+		t.Errorf("raw body missing %s: %s", want, raw)
+	}
+	// It round-trips back to the same instant through the client-side parse.
+	var body healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got, err := time.Parse(time.RFC3339Nano, body.ProcessStart)
+	if err != nil {
+		t.Fatalf("process_start %q does not parse as RFC3339Nano: %v", body.ProcessStart, err)
+	}
+	if !got.Equal(boot) {
+		t.Errorf("parsed process_start = %v, want %v", got, boot)
+	}
+	// start_nonce is untouched — process_start is an additive sibling.
+	if strings.Contains(raw, `"start_nonce"`) {
+		t.Errorf("start_nonce must stay omitted when unset: %s", raw)
+	}
+
+	// Zero marker: the key is omitted entirely. New() always stamps a marker,
+	// so the zero state is constructed directly.
+	zeroSrv := New(Config{})
+	zeroSrv.processStart = time.Time{}
+	zrec := httptest.NewRecorder()
+	zeroSrv.handleHealth(zrec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if strings.Contains(zrec.Body.String(), `"process_start"`) {
+		t.Errorf("process_start must be omitted for a zero boot marker: %s", zrec.Body.String())
 	}
 }
 

@@ -47,6 +47,12 @@ type runResolver struct {
 	// the poll loop runs without wall-clock sleeps.
 	reviewPollInterval time.Duration
 
+	// strandProbeTTL is how long fishhawk_await_review reuses one resolved
+	// /healthz process_start before re-probing WITHIN a single call (#2712).
+	// Zero falls back to strandProbeCacheTTL; tests inject a sub-millisecond
+	// value so a boundary CHANGED mid-wait is observed on the next tick.
+	strandProbeTTL time.Duration
+
 	// drivePollInterval is the poll cadence fishhawk_drive_run (#1700) uses
 	// while a stage or review is in flight. Zero falls back to
 	// defaultDrivePollInterval; tests inject a sub-millisecond value.
@@ -275,6 +281,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
 	registerReapStage(srv, resolver)
+	registerReconcileReviews(srv, resolver)
 	registerReviveRun(srv, resolver)
 	registerFileIssue(srv, resolver)
 	registerDraftEpic(srv, resolver)

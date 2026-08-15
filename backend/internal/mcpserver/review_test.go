@@ -3,6 +3,8 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // seedReviewStartedAudit appends a *_review_started audit entry to the
@@ -1789,4 +1797,589 @@ func TestAwaitReview_CarriesConcernEvidence(t *testing.T) {
 		t.Fatalf("Status = %q, want complete", out.Status)
 	}
 	assertConcernEvidenceDecoded(t, "await_review", out.Reviews, evidence, settledRef)
+}
+
+// --- #2712: restart-strand probe ---
+
+// strandBootA / strandBootB are two fishhawkd boot instants with a review
+// dispatch between them: a round started at strandDispatch belongs to the
+// process that booted at A, and is ORPHANED once the daemon has restarted and
+// reports B.
+var (
+	strandBootA    = time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	strandDispatch = strandBootA.Add(10 * time.Minute)
+	strandBootB    = strandBootA.Add(30 * time.Minute)
+)
+
+// seedReviewStartedAuditAt is seedReviewStartedAudit with an explicit dispatch
+// TIMESTAMP — the field the restart-strand probe compares against the daemon's
+// boot instant.
+func seedReviewStartedAuditAt(fb *fakeBackend, runID uuid.UUID, category string, configuredAgents int, authority string, ts time.Time) {
+	payload, _ := json.Marshal(map[string]any{
+		"configured_agents": configuredAgents,
+		"authority":         authority,
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:        uuid.New().String(),
+		Sequence:  int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:     runID.String(),
+		Timestamp: ts,
+		Category:  category,
+		Payload:   decoded,
+	})
+	fb.mu.Unlock()
+}
+
+// TestReviewRoundStrand_Branches pins ONE behavioral assertion per named
+// branch of reviewRoundStrand (#2712). The undecidable cases are the
+// fail-open direction: an unreadable boundary must never manufacture a strand.
+func TestReviewRoundStrand_Branches(t *testing.T) {
+	cases := []struct {
+		name            string
+		seed            func(fb *fakeBackend, runID uuid.UUID)
+		healthzStart    string
+		healthzStatus   int
+		healthzBody     string
+		wantStranded    bool
+		wantUndecidable bool
+	}{
+		{
+			name:         "no started entry is not stranded",
+			seed:         func(*fakeBackend, uuid.UUID) {},
+			healthzStart: strandBootB.Format(time.RFC3339Nano),
+		},
+		{
+			name: "zero configured agents is not stranded",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 0, "advisory", strandDispatch)
+			},
+			healthzStart: strandBootB.Format(time.RFC3339Nano),
+		},
+		{
+			name: "fully landed round is not stranded",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 1, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+			},
+			healthzStart: strandBootB.Format(time.RFC3339Nano),
+		},
+		{
+			name: "unrestarted daemon is not stranded",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+			},
+			// Boot BEFORE the dispatch: the process serving is the one that
+			// dispatched the round, so its reviewers are genuinely running.
+			healthzStart: strandBootA.Format(time.RFC3339Nano),
+		},
+		{
+			name: "healthz transport error is undecidable",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+			},
+			healthzStatus:   http.StatusInternalServerError,
+			wantUndecidable: true,
+		},
+		{
+			name: "healthz without process_start is undecidable",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+			},
+			healthzStart:    "",
+			wantUndecidable: true,
+		},
+		{
+			name: "unparseable process_start is undecidable",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+			},
+			healthzBody:     `{"status":"ok","process_start":"not-a-timestamp"}`,
+			wantUndecidable: true,
+		},
+		{
+			name: "restarted daemon with a partial landing is stranded",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+			},
+			healthzStart: strandBootB.Format(time.RFC3339Nano),
+			wantStranded: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			fb.healthzProcessStart = tc.healthzStart
+			fb.healthzBody = tc.healthzBody
+			if tc.healthzStatus != 0 {
+				fb.healthzStatus = tc.healthzStatus
+			}
+			tc.seed(fb, runID)
+
+			r := newResolver(srv, nil)
+			boundary := r.probeHealthBoundary(context.Background(), time.Now())
+			got, err := r.reviewRoundStrand(context.Background(), runID, "plan", boundary)
+			if err != nil {
+				t.Fatalf("reviewRoundStrand: %v", err)
+			}
+			if got.Stranded != tc.wantStranded {
+				t.Errorf("Stranded = %v, want %v (reason %q)", got.Stranded, tc.wantStranded, got.Reason)
+			}
+			if got.Undecidable != tc.wantUndecidable {
+				t.Errorf("Undecidable = %v, want %v (reason %q)", got.Undecidable, tc.wantUndecidable, got.Reason)
+			}
+			if got.Undecidable && got.Reason == "" {
+				t.Error("an undecidable verdict must carry a reason")
+			}
+			if got.Undecidable && !got.DaemonProcessStart.IsZero() {
+				t.Errorf("an undecidable verdict must not publish a boundary; got %v", got.DaemonProcessStart)
+			}
+		})
+	}
+}
+
+// TestReviewRoundStrand_FullyLandedNotStranded is the dedicated counterfactual
+// vehicle for the landed<configured conjunct (control (b)): a round whose
+// reviewers ALL landed is not stranded even under a restarted daemon —
+// deleting that conjunct would report a settled round as stranded.
+func TestReviewRoundStrand_FullyLandedNotStranded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.6-sol", Verdict: "approve"})
+
+	r := newResolver(srv, nil)
+	got, err := r.reviewRoundStrand(context.Background(), runID, "plan",
+		r.probeHealthBoundary(context.Background(), time.Now()))
+	if err != nil {
+		t.Fatalf("reviewRoundStrand: %v", err)
+	}
+	if got.Stranded {
+		t.Fatalf("Stranded = true for a fully-landed round (%d of %d); want false",
+			got.LandedTerminal, got.ConfiguredAgents)
+	}
+}
+
+// TestReviewRoundStrand_UnrestartedDaemonNotStranded is acceptance criterion
+// 4's control (counterfactual (c)): a genuinely in-flight review under a daemon
+// that has NOT restarted must never be reported as stranded. Deleting the
+// startedAt.Before(processStart) conjunct turns this RED.
+func TestReviewRoundStrand_UnrestartedDaemonNotStranded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// The serving daemon booted BEFORE the review was dispatched.
+	fb.healthzProcessStart = strandBootA.Format(time.RFC3339Nano)
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+
+	r := newResolver(srv, nil)
+	got, err := r.reviewRoundStrand(context.Background(), runID, "plan",
+		r.probeHealthBoundary(context.Background(), time.Now()))
+	if err != nil {
+		t.Fatalf("reviewRoundStrand: %v", err)
+	}
+	if got.Stranded {
+		t.Fatal("Stranded = true for a review dispatched by the SERVING daemon; the reviewer is alive, not orphaned")
+	}
+	if got.Undecidable {
+		t.Fatalf("Undecidable = true; want a positive not-stranded verdict (reason %q)", got.Reason)
+	}
+}
+
+// TestReviewRoundStrand_HealthzUnreachableIsUndecidable is counterfactual (d)'s
+// first vehicle: an unreachable /healthz must be UNDECIDABLE, never a zero
+// boundary — a zero time.Time compares as before every audit entry and would
+// convert every pending review into a false strand.
+func TestReviewRoundStrand_HealthzUnreachableIsUndecidable(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzStatus = http.StatusServiceUnavailable
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve"})
+
+	r := newResolver(srv, nil)
+	got, err := r.reviewRoundStrand(context.Background(), runID, "plan",
+		r.probeHealthBoundary(context.Background(), time.Now()))
+	if err != nil {
+		t.Fatalf("reviewRoundStrand: %v", err)
+	}
+	if got.Stranded {
+		t.Fatal("Stranded = true with an UNREADABLE restart boundary; the probe fabricated a strand")
+	}
+	if !got.Undecidable {
+		t.Fatal("Undecidable = false with an unreachable /healthz; want the fail-open degrade")
+	}
+}
+
+// TestAwaitReview_UnreachableHealthz_StillWaits is counterfactual (d)'s second
+// vehicle at the await surface: with the boundary unreadable the wait behaves
+// exactly as it did before this diagnostic existed — it keeps polling and
+// times out 'pending', never resolving 'stranded'.
+func TestAwaitReview_UnreachableHealthz_StillWaits(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzStatus = http.StatusServiceUnavailable
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+	r.strandProbeTTL = time.Nanosecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "plan_review_started" && startedQueries.Add(1) >= 4 {
+			cancel()
+		}
+	}
+
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID: runID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "pending" {
+		t.Fatalf("Status = %q, want pending — an unverifiable boundary must not resolve the wait", out.Status)
+	}
+	if out.Stranded {
+		t.Error("Stranded = true with an unreachable /healthz")
+	}
+	if !out.Undecidable {
+		t.Error("Undecidable = false; the timeout output must report that the daemon could not be verified")
+	}
+	if strings.Contains(out.Message, "genuinely still running") {
+		t.Errorf("the undecidable timeout message must NOT assert the reviewer is alive: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "fishhawk_reconcile_reviews") {
+		t.Errorf("the undecidable timeout message should name the recovery verb: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_StrandedResolvesImmediately covers the first-round-trip
+// resolution: an ALREADY-stranded round returns 'stranded' without burning the
+// timeout, and the message names the shortfall in concrete terms.
+func TestAwaitReview_StrandedResolvesImmediately(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 10 * time.Millisecond
+
+	start := time.Now()
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{
+		RunID: runID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "stranded" || !out.Stranded {
+		t.Fatalf("Status = %q / Stranded = %v, want stranded", out.Status, out.Stranded)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("await took %v, want an immediate resolution rather than the full timeout", elapsed)
+	}
+	if out.LandedTerminal != 1 || out.ConfiguredAgents != 2 {
+		t.Errorf("landed/configured = %d/%d, want 1/2", out.LandedTerminal, out.ConfiguredAgents)
+	}
+	if out.DaemonRestartedAt == "" {
+		t.Error("a stranded result must publish the daemon's boot instant")
+	}
+	// The shortfall must be CONCRETE — the silent two-reviewers-to-one
+	// degradation is half of what makes this failure dangerous.
+	for _, want := range []string{"1 of 2 configured reviewers", "claude-fable-5", "fishhawk_reconcile_reviews", "preserved"} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("stranded message missing %q: %q", want, out.Message)
+		}
+	}
+	if strings.Contains(out.Message, "genuinely still running") {
+		t.Errorf("a stranded result must not claim the reviewer is running: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_BoundaryChangesMidWait_SameCallDetectsStrand is BINDING
+// CONDITION 1's acceptance test. The wait begins under boundary A — the daemon
+// that dispatched the round, so the round is NOT stranded and polling starts —
+// and the boundary CHANGES to B mid-wait (the operator lands a sibling campaign
+// item with `scripts/dev post-merge` while this review is in flight). The SAME
+// in-flight call must detect the strand and return promptly; a boundary sampled
+// once at call start and pinned for the call could never see it.
+func TestAwaitReview_BoundaryChangesMidWait_SameCallDetectsStrand(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Boundary A: booted BEFORE the dispatch — reviewers alive, wait proceeds.
+	fb.healthzProcessStart = strandBootA.Format(time.RFC3339Nano)
+	seedReviewStartedAuditAt(fb, runID, "plan_review_started", 2, "advisory", strandDispatch)
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Verdict: "approve_with_concerns"})
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 200 * time.Microsecond
+	// A sub-millisecond TTL so the boundary is re-probed on the next tick.
+	r.strandProbeTTL = time.Nanosecond
+
+	// Flip the boundary to B (the RESTART) after the wait is already polling.
+	// The hook runs under fb.mu, which the /healthz handler also takes, so the
+	// change is observed by the next probe.
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "plan_review_started" && startedQueries.Add(1) == 3 {
+			fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+		}
+	}
+
+	start := time.Now()
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{
+		RunID: runID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "stranded" {
+		t.Fatalf("Status = %q, want stranded — the SAME call must see a restart that happens DURING the wait", out.Status)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("await took %v; the mid-wait strand must resolve promptly, not at the timeout", elapsed)
+	}
+	if out.WaitedSeconds <= 0 {
+		t.Error("waited_seconds should record the polling that happened before the restart was seen")
+	}
+	if startedQueries.Load() < 3 {
+		t.Fatalf("the wait resolved before the boundary changed (started queries = %d); the test did not exercise the mid-wait case",
+			startedQueries.Load())
+	}
+}
+
+// TestAwaitPendingTimeoutOutput_NoLivenessClaim pins the rewritten
+// pending-after-timeout message on both probe branches. The old unconditional
+// "the review is genuinely still running" assertion is the exact regression
+// #2712 reports: it was simply FALSE for an orphaned round.
+func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
+	r := &runResolver{}
+	start := time.Now()
+
+	// The 'verified' fixture carries a REAL boundary: DaemonProcessStart is set
+	// only after reviewRoundStrandFrom reached and passed the /healthz
+	// comparison, so it is the evidence the claim is gated on.
+	verified := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+		LandedTerminal: 1, ConfiguredAgents: 2,
+		StartedAt:          start.Add(-10 * time.Minute),
+		DaemonProcessStart: start.Add(-30 * time.Minute),
+	})
+	if !strings.Contains(verified.Message, "verified") {
+		t.Errorf("a positively not-stranded timeout should say the dispatching daemon was verified: %q", verified.Message)
+	}
+	if verified.Undecidable {
+		t.Error("Undecidable = true on a decided verdict")
+	}
+
+	// A strand from one of reviewRoundStrandFrom's early returns — here the
+	// ConfiguredAgents <= 0 legacy round, which is reachable at the timeout
+	// path via reviewStatusFallback — carries the SAME !Stranded &&
+	// !Undecidable shape while having never consulted /healthz at all (zero
+	// DaemonProcessStart). Claiming "verified" there asserts a check that was
+	// never performed, under a daemon that may well have restarted. It must
+	// fall back to the neutral pre-#2712 wording.
+	unprobed := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+		Reason: "the review round records no configured agent count",
+	})
+	if strings.Contains(unprobed.Message, "verified") {
+		t.Errorf("a strand that never reached the boundary check must NOT claim verification: %q", unprobed.Message)
+	}
+	if strings.Contains(unprobed.Message, "orphaned by a restart") {
+		t.Errorf("un-probed timeout message leaked the boundary-comparison wording: %q", unprobed.Message)
+	}
+	if !strings.Contains(unprobed.Message, "no terminal audit entry yet") {
+		t.Errorf("un-probed timeout should keep the neutral pre-#2712 wording: %q", unprobed.Message)
+	}
+	if unprobed.Undecidable {
+		t.Error("Undecidable = true on an early-return verdict")
+	}
+
+	undecidable := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+		Undecidable: true, Reason: "/healthz was unreachable (dial tcp: connection refused)",
+		LandedTerminal: 1, ConfiguredAgents: 2,
+	})
+	if strings.Contains(undecidable.Message, "genuinely still running") {
+		t.Errorf("the undecidable branch must NOT assert the reviewer is alive: %q", undecidable.Message)
+	}
+	for _, want := range []string{"could NOT be verified", "connection refused", "fishhawk_reconcile_reviews", "1 of 2"} {
+		if !strings.Contains(undecidable.Message, want) {
+			t.Errorf("undecidable timeout message missing %q: %q", want, undecidable.Message)
+		}
+	}
+	if !undecidable.Undecidable {
+		t.Error("Undecidable = false on an undecidable verdict")
+	}
+
+	// No probe verdict at all (the probe itself errored): the message stays
+	// on the pre-#2712 wording rather than claiming either way.
+	none := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, nil)
+	if none.Status != "pending" {
+		t.Errorf("Status = %q, want pending", none.Status)
+	}
+	if none.Undecidable {
+		t.Error("Undecidable = true with no probe verdict")
+	}
+}
+
+// TestAwaitReview_StrandedThenReconciled_EndToEnd is BINDING CONDITION 2's
+// cross-boundary control. Nothing here is hand-authored: the REAL MCP api
+// client issues real HTTP to the REAL registered fishhawkd handlers
+// (server.Handler(), including its bearerAuth + adminWrite wrappers), backed by
+// REAL PERSISTED audit rows in Postgres. A divergence between what the handler
+// emits and what the client decodes — the failure this change is most exposed
+// to, since it adds a new endpoint AND a new tool at once — turns it RED, which
+// a fake backend serving a body the test itself wrote could never catch.
+//
+// The scenario is the observed one (#2712): 2 configured plan reviewers, ONE
+// landed verdict, the dispatching daemon since restarted.
+func TestAwaitReview_StrandedThenReconciled_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	r0, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	planStage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r0.ID, Sequence: 0, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+
+	// The daemon serving this request booted AFTER the round was dispatched:
+	// the restart that orphaned the reviewers.
+	boot := time.Now().UTC()
+	dispatched := boot.Add(-15 * time.Minute)
+	appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, dispatched, "plan_review_started",
+		map[string]any{"configured_agents": 2, "authority": "advisory"})
+	appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, dispatched.Add(time.Minute), "plan_reviewed",
+		map[string]any{
+			"reviewer_kind": "agent", "reviewer_model": "claude-fable-5",
+			"authority": "advisory", "verdict": "approve_with_concerns",
+			"free_form": "the boot marker comparison needs a test",
+		})
+
+	const bearer = "fhk_reconcile_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:runs", "read:runs"}, PlainText: bearer,
+	}}
+	srv := server.New(server.Config{
+		RunRepo: runRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo, ProcessStart: boot,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+	r.reviewPollInterval = 10 * time.Millisecond
+
+	// (a) The wait resolves 'stranded' on the FIRST round-trip, well under the
+	// configured timeout, and never claims the dead reviewer is alive.
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID: r0.ID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "stranded" {
+		t.Fatalf("Status = %q, want stranded (message %q)", out.Status, out.Message)
+	}
+	if out.WaitedSeconds > 30 {
+		t.Errorf("waited_seconds = %v, want well under the 600s timeout", out.WaitedSeconds)
+	}
+	if out.LandedTerminal != 1 || out.ConfiguredAgents != 2 {
+		t.Errorf("landed/configured = %d/%d, want 1/2", out.LandedTerminal, out.ConfiguredAgents)
+	}
+	if strings.Contains(out.Message, "genuinely still running") {
+		t.Errorf("stranded message must not claim the reviewer is alive: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "1 of 2 configured reviewers") {
+		t.Errorf("stranded message must name the shortfall concretely: %q", out.Message)
+	}
+
+	// (b) The recovery tool, through the REAL endpoint, synthesizes exactly
+	// the ONE missing terminal entry.
+	_, rec, err := r.reconcileReviews(ctx, nil, ReconcileReviewsInput{RunID: r0.ID.String()})
+	if err != nil {
+		t.Fatalf("reconcileReviews: %v", err)
+	}
+	if !rec.Terminated {
+		t.Fatalf("terminated = false, want true; %+v", rec)
+	}
+	var planRow *ReconcileReviewsStage
+	for i := range rec.Stages {
+		if rec.Stages[i].Stage == "plan" {
+			planRow = &rec.Stages[i]
+		}
+	}
+	if planRow == nil {
+		t.Fatalf("no plan stage row in %+v", rec.Stages)
+	}
+	if planRow.Synthesized != 1 || planRow.LandedBefore != 1 || planRow.ConfiguredAgents != 2 {
+		t.Fatalf("plan row = %+v, want synthesized 1 / landed_before 1 / configured 2", *planRow)
+	}
+
+	// (c) The review now resolves terminal AND the original verdict survives
+	// verbatim — the no-re-pay assertion, read back through the same client.
+	st, err := r.reviewStatusFor(ctx, r0.ID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("review status = %q, want complete once the round settled", st.Status)
+	}
+	var sawOriginal bool
+	for _, rev := range st.Reviews {
+		if rev.ReviewerModel == "claude-fable-5" && rev.Verdict == "approve_with_concerns" &&
+			rev.FreeForm == "the boot marker comparison needs a test" {
+			sawOriginal = true
+		}
+	}
+	if !sawOriginal {
+		t.Fatalf("the landed claude-fable-5 approve_with_concerns verdict was not preserved verbatim: %+v", st.Reviews)
+	}
+	if len(st.Reviews) != 2 {
+		t.Errorf("reviews = %d rows, want 2 (the real verdict + one synthesized terminal)", len(st.Reviews))
+	}
+}
+
+// appendE2EAudit appends one real chained audit entry for the end-to-end test.
+func appendE2EAudit(t *testing.T, repo audit.Repository, runID uuid.UUID, stageID *uuid.UUID, ts time.Time, category string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal %s: %v", category, err)
+	}
+	kind := audit.ActorKind("system")
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: stageID, Timestamp: ts, Category: category,
+		ActorKind: &kind, Payload: raw,
+	}); err != nil {
+		t.Fatalf("AppendChained %s: %v", category, err)
+	}
 }

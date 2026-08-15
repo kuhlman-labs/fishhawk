@@ -541,3 +541,168 @@ func TestReconcileOrphanedReviews_NilReposError(t *testing.T) {
 		t.Error("want error when AuditRepo is nil")
 	}
 }
+
+// seedPendingRunForReconcile inserts a run in run.StatePending — the state a
+// run is actually in while its PLAN review is dispatched (#2712).
+func seedPendingRunForReconcile(t *testing.T, repo *fakeRepo) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	repo.runs[id] = &run.Run{
+		ID:        id,
+		State:     run.StatePending,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	return id
+}
+
+// TestReconcileOrphanedReviews_PendingRunPlanReview is the ROOT-CAUSE
+// regression pin for #2712: a run in run.StatePending — the state every gated
+// plan review is dispatched in, because the pending->running transition
+// happens at plan APPROVAL — with a partially-landed plan review must be
+// healed by the boot sweep. Before this change the sweep filtered on
+// State:running alone and left this strand permanently unrecoverable.
+//
+// COUNTERFACTUAL (e): deleting run.StatePending from
+// reconcileOrphanedReviewStates turns this RED.
+func TestReconcileOrphanedReviews_PendingRunPlanReview(t *testing.T) {
+	s, repo, au, _ := newReconcileServer(t)
+	runID := seedPendingRunForReconcile(t, repo)
+	stageID := uuid.New()
+	seedReviewAuditEntry(t, au, runID, stageID, 1, beforeBoot, "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityAdvisory})
+	seedReviewAuditEntry(t, au, runID, stageID, 2, beforeBoot, "plan_reviewed",
+		map[string]any{"reviewer_kind": "agent", "reviewer_model": "claude-fable-5", "verdict": "approve_with_concerns"})
+
+	n, err := s.ReconcileOrphanedReviews(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileOrphanedReviews: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("terminated runs = %d, want 1 (a PENDING run's orphaned plan review must be healed)", n)
+	}
+	failures := emittedReviewFailures(t, au, "plan_review_failed")
+	if len(failures) != 1 {
+		t.Fatalf("plan_review_failed emitted = %d, want exactly 1 (2 configured - 1 landed)", len(failures))
+	}
+}
+
+// TestReconcileOrphanedReviewStates_CoversEveryNonTerminalState guards the
+// enumerated state set against a future run.State addition: ListRuns takes a
+// single equality string, so the sweep cannot express "not terminal" as a
+// filter and the set must be maintained by hand. Every non-terminal state in
+// the closed run.State vocabulary must appear in it.
+func TestReconcileOrphanedReviewStates_CoversEveryNonTerminalState(t *testing.T) {
+	// The closed run.State vocabulary (backend/internal/run/run.go). A new
+	// state must be added HERE too — at which point this test decides whether
+	// the sweep must also page it.
+	all := []run.State{
+		run.StatePending, run.StateRunning,
+		run.StateSucceeded, run.StateFailed, run.StateCancelled,
+	}
+	swept := map[run.State]bool{}
+	for _, st := range reconcileOrphanedReviewStates {
+		swept[st] = true
+		if st.IsTerminal() {
+			t.Errorf("reconcileOrphanedReviewStates includes TERMINAL state %q; the sweep must page only non-terminal runs", st)
+		}
+	}
+	for _, st := range all {
+		if st.IsTerminal() {
+			continue
+		}
+		if !swept[st] {
+			t.Errorf("non-terminal run state %q is missing from reconcileOrphanedReviewStates; a review orphaned in that state would be unrecoverable by the boot sweep", st)
+		}
+	}
+}
+
+// TestReconcileStageOrphanedReviews_SkipReasons pins the recorded reason for
+// each gate that refuses to heal. The boot sweep ignores these; the on-demand
+// endpoint reports them, so an operator sees WHY nothing was healed.
+func TestReconcileStageOrphanedReviews_SkipReasons(t *testing.T) {
+	planStage := orphanedReviewStages[0]
+	cases := []struct {
+		name       string
+		seed       func(t *testing.T, au *auditFake, runID, stageID uuid.UUID)
+		wantReason string
+	}{
+		{
+			name:       "no started entry",
+			seed:       func(*testing.T, *auditFake, uuid.UUID, uuid.UUID) {},
+			wantReason: reconcileSkipNoStartedEntry,
+		},
+		{
+			name: "zero configured agents",
+			seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+				seedReviewAuditEntry(t, au, runID, stageID, 1, beforeBoot, "plan_review_started",
+					planreview.ReviewStartedPayload{ConfiguredAgents: 0})
+			},
+			wantReason: reconcileSkipNoConfigured,
+		},
+		{
+			name: "dispatched by this process",
+			seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+				seedReviewAuditEntry(t, au, runID, stageID, 1, afterBoot, "plan_review_started",
+					planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+			},
+			wantReason: reconcileSkipInFlight,
+		},
+		{
+			name: "round already settled",
+			seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+				seedReviewAuditEntry(t, au, runID, stageID, 1, beforeBoot, "plan_review_started",
+					planreview.ReviewStartedPayload{ConfiguredAgents: 1})
+				seedReviewAuditEntry(t, au, runID, stageID, 2, beforeBoot, "plan_reviewed",
+					map[string]any{"verdict": "approve"})
+			},
+			wantReason: reconcileSkipAlreadySettled,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := newReconcileServer(t)
+			runID := seedRunningRun(t, repo)
+			tc.seed(t, au, runID, uuid.New())
+
+			got, err := s.reconcileStageOrphanedReviews(context.Background(), runID, planStage)
+			if err != nil {
+				t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+			}
+			if got.Synthesized != 0 {
+				t.Fatalf("synthesized = %d, want 0", got.Synthesized)
+			}
+			if !got.Skipped || got.SkipReason != tc.wantReason {
+				t.Fatalf("skip = (%v, %q), want (true, %q)", got.Skipped, got.SkipReason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestReconcileStageOrphanedReviews_NilStageIDSkipReason covers the remaining
+// gate: a started entry with no stage anchor. It needs a raw audit entry
+// (seedReviewAuditEntry always sets a stage id), so it is seeded directly.
+func TestReconcileStageOrphanedReviews_NilStageIDSkipReason(t *testing.T) {
+	s, repo, au, _ := newReconcileServer(t)
+	runID := seedRunningRun(t, repo)
+	payload, err := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1})
+	if err != nil {
+		t.Fatalf("marshal started payload: %v", err)
+	}
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:     &rid,
+		Sequence:  1,
+		Timestamp: beforeBoot,
+		Category:  "plan_review_started",
+		Payload:   payload,
+	})
+
+	got, err := s.reconcileStageOrphanedReviews(context.Background(), runID, orphanedReviewStages[0])
+	if err != nil {
+		t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+	}
+	if got.Synthesized != 0 || got.SkipReason != reconcileSkipNoStageID {
+		t.Fatalf("got = %+v, want synthesized 0 and skip_reason %q", got, reconcileSkipNoStageID)
+	}
+}
