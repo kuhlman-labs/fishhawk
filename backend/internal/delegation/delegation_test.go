@@ -1174,8 +1174,40 @@ const realFlakeOutput = `--- FAIL: TestPostgres_AppendChained (12.41s)
     postgres_test.go:135: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/dd45dc0863d386b8e4a5e6a6a0829b4be99e4b5da54e667a192f6a142dfe5baf/json": context deadline exceeded
 FAIL`
 
+// realPortFlakeOutput / realDockerDownOutput are the VERBATIM #2718
+// occurrence outputs, mirroring the runner's portFlakeOutput2718 /
+// dockerDownOutput2718 fixtures. The two matchers live in different Go
+// modules and cannot share a fixture, so each is pinned against the same
+// corpus of verbatim observed text and a drift between them shows up as
+// a failing row.
+const realPortFlakeOutput = `--- FAIL: TestS3_Get_NotFound (12.37s)
+    s3_test.go:208: connection string: port "9000/tcp" not found
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/tracestore	18.512s`
+
+const realDockerDownOutput = `--- FAIL: TestPgtestNewPool (0.04s)
+    pgtest.go:214: start postgres: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	0.061s`
+
+// pgtestFixtureDumpOutput mirrors the runner's fixture of the same name: the
+// KNOWN and ACCEPTED misclassification of #2718 (operator condition 2).
+// backend/internal/pgtest/pgtest_test.go's own table fixtures carry the
+// daemon-unavailable marker strings AS DATA, so a genuine failure in that
+// package prints a marker in its `--- FAIL:` output and self-classifies as
+// infrastructure. Pinning it expecting-MET on THIS side too is what makes the
+// "both mirrors are pinned against the same corpus" claim true: a later
+// narrowing reddens this row as well, prompting the README residual paragraph
+// to be updated in the same change rather than drifting from behavior.
+const pgtestFixtureDumpOutput = `--- FAIL: TestIsDockerUnavailable/daemon_down (0.00s)
+    pgtest_test.go:116: isDockerUnavailable() = false, want true
+        err = Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/pgtest	0.112s`
+
 func realFlakeFailureReason() string {
-	return fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s", "scripts/test", 1, realFlakeOutput)
+	return flakeFailureReason(realFlakeOutput)
+}
+
+func flakeFailureReason(out string) string {
+	return fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s", "scripts/test", 1, out)
 }
 
 func TestInfraFlake(t *testing.T) {
@@ -1194,6 +1226,55 @@ func TestInfraFlake(t *testing.T) {
 			name:    "met: failure reason citing the trace event by name",
 			stages:  []*run.Stage{failedStage(1, run.FailureA, "verify aborted after verify_infra_flake_retry")},
 			wantMet: true,
+		},
+		{
+			// #2718 mirror rows: these ARE the counterfactual vehicles for the
+			// two new predicates in hasInfraFlakeSignature.
+			name:    "met: category-A failure embedding the #2718 port-not-found output",
+			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(realPortFlakeOutput))},
+			wantMet: true,
+		},
+		{
+			name:    "met: category-A failure embedding the #2718 daemon-unreachable output",
+			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(realDockerDownOutput))},
+			wantMet: true,
+		},
+		{
+			// ACCEPTED residual, not a defect — see pgtestFixtureDumpOutput.
+			name:    "met: pgtest table fixtures carrying the markers as DATA (accepted #2718 residual)",
+			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(pgtestFixtureDumpOutput))},
+			wantMet: true,
+		},
+		{
+			name:       "unmet: non-numeric quoted port",
+			stages:     []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(`port "invalid port" not found`))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			name:       "unmet: unquoted port mention",
+			stages:     []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason("port 9000/tcp not found"))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			// Word-boundary pin, mirroring the runner's row: `port` is the
+			// literal word, not an unbounded substring. Without the `\b` this
+			// reason classifies as a flake and turns a category-B retryable.
+			name: "unmet: prefix near-miss where port is a word suffix",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("--- FAIL: TestAirport (0.00s)\n    airport_test.go:8: airport \"9000/tcp\" not found\nFAIL"))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			name: "unmet: prose mentioning the Docker daemon without a connect failure",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("--- FAIL: TestDoc\n    doc_test.go:9: the docker daemon owns container lifecycle; we only inspect it"))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			name: "unmet: assertion failure in a package whose name contains docker",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("--- FAIL: TestPull\n    client_test.go:31: Pull(x) = 0, want 42\nFAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/dockerutil\t0.012s"))},
+			wantReason: "no infra-flake signature",
 		},
 		{
 			name:       "unmet: no failed stage",

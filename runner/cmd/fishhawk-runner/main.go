@@ -3899,6 +3899,68 @@ func isTestcontainersStartFlake(output string) bool {
 	return false
 }
 
+// testcontainersPortNotFoundRe matches testcontainers-go's
+// DockerContainer.MappedPort port-not-found rendering (#2718): the library
+// returns errdefs.ErrNotFound.WithMessage over a fmt.Sprintf that formats the
+// requested nat.Port with the %q verb — `port "9000/tcp" not found` — at
+// github.com/testcontainers/testcontainers-go@v0.43.0/docker.go:226.
+//
+// Requiring DIGITS, a slash and a lowercase protocol INSIDE the quotes is the
+// conservatism knob: ordinary prose naming a non-numeric port, or an unquoted
+// port mention, must not match.
+//
+// The leading `\b` makes `port` the literal WORD the doc claims, not an
+// unbounded substring: without it `airport "9000/tcp" not found` — a plausible
+// line in untrusted, diff-influenced verify output — classifies a category-B
+// failure as retryable infrastructure. The boundary costs nothing on the real
+// rendering, which is always preceded by a space, a colon or a line start.
+var testcontainersPortNotFoundRe = regexp.MustCompile(`\bport "[0-9]+/[a-z]+" not found`)
+
+// isTestcontainersPortFlake reports whether a failed verify's output carries
+// that rendering. The class is DIFF-INDEPENDENT: the message is produced when
+// `docker inspect` reports a RUNNING container with no host binding for the
+// requested port — a daemon/host condition (port exhaustion, a daemon under
+// litter pressure, a racing bind) that the tree under test cannot cause when
+// the failing package lies outside the change's scope, which is exactly the
+// observed shape on run 2187fa4c (a MinIO container in
+// backend/internal/tracestore, a package that change never touched).
+//
+// Matching is on testcontainers-go error text and can drift across library
+// upgrades; failure is safe in both directions exactly as isVerifyInfraFailure
+// states — a rewording degrades to today's fail-the-stage behavior, and a false
+// positive costs one extra verify run plus a retryable category. The table test
+// pins the verbatim #2718 output.
+func isTestcontainersPortFlake(output string) bool {
+	return testcontainersPortNotFoundRe.MatchString(output)
+}
+
+// dockerDaemonUnavailableMarkers are the renderings the Docker client produces
+// when the daemon is not reachable at all (#2718). The set is deliberately kept
+// in spirit with the isDockerUnavailable helpers this repo already ships —
+// backend/internal/tracestore/s3_test.go, backend/internal/postgres/postgres_test.go
+// and backend/internal/pgtest/pgtest.go — which treat exactly these strings as
+// "the host's Docker is not reachable", not "the code is wrong". Looser strings
+// (a bare "error during connect", or the word "docker" alone) are deliberately
+// EXCLUDED: they appear in ordinary test prose.
+var dockerDaemonUnavailableMarkers = []string{
+	"cannot connect to the docker daemon",
+	"is the docker daemon running",
+	"dial unix /var/run/docker.sock",
+}
+
+// isDockerDaemonUnavailable reports whether a failed verify's output carries a
+// daemon-unreachable marker. Matching is case-insensitive (the daemon renders
+// "Cannot connect to the Docker daemon…" capitalised).
+func isDockerDaemonUnavailable(output string) bool {
+	lowered := strings.ToLower(output)
+	for _, marker := range dockerDaemonUnavailableMarkers {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // golangciLintLockSignature is golangci-lint's refusal to start while another
 // process holds its global lock (#2645). Two concurrent local implement stages
 // reaching their verify gate at the same time make the loser's lint leg abort
@@ -3914,7 +3976,17 @@ const golangciLintLockSignature = "parallel golangci-lint is running"
 // of that tree exists:
 //
 //   - the #972 testcontainers container-start timeout (isTestcontainersStartFlake);
-//   - golangci-lint's global-lock contention (golangciLintLockSignature).
+//   - golangci-lint's global-lock contention (golangciLintLockSignature);
+//   - testcontainers-go's port-not-found rendering (isTestcontainersPortFlake);
+//   - a Docker daemon that is not reachable (isDockerDaemonUnavailable).
+//
+// The last two were added by #2718, whose evidence is run 2187fa4c: a MinIO
+// container in backend/internal/tracestore — a package outside that change's
+// scope — failed with `connection string: port "9000/tcp" not found`, a
+// signature that matched NEITHER recognised class (it carries no deadline text
+// and is not a signal death), so the absorb never fired and a ~43-minute
+// implement pass was discarded as category-B, recoverable only by re-running
+// the agent from scratch.
 //
 // Both committed-tree gates use this to re-run the verify ONCE in place
 // (without invoking the fix agent and without consuming a fix iteration), and
@@ -3944,8 +4016,22 @@ const golangciLintLockSignature = "parallel golangci-lint is running"
 // re-fails. It is NOT a verified-tree bypass. A stage that keeps returning
 // category-C on a signature its own output produces should be inspected, not
 // retried indefinitely.
+//
+// #2718 adds ONE concrete instance of that residual, named here rather than
+// left abstract: backend/internal/pgtest/pgtest_test.go's own table fixtures
+// carry the daemon-unavailable marker strings AS DATA, so a genuine failure in
+// that package prints a marker in its `--- FAIL:` output and steers itself to
+// category-C. That is a real loss of parking precision for one package, and it
+// is accepted under the identical bound — retry churn and delayed parking,
+// never a verified-tree bypass. A recurring category-C on that package should
+// be read as a self-produced signature, not a host problem. The corpus pins it
+// expecting-true (TestIsDockerDaemonUnavailable's pgtest-fixture row) so a
+// later narrowing reddens that row instead of letting doc and behavior drift.
 func isVerifyInfraFailure(output string) bool {
-	return isTestcontainersStartFlake(output) || strings.Contains(output, golangciLintLockSignature)
+	return isTestcontainersStartFlake(output) ||
+		strings.Contains(output, golangciLintLockSignature) ||
+		isTestcontainersPortFlake(output) ||
+		isDockerDaemonUnavailable(output)
 }
 
 // signalDeathSignatures are the `signal: <name>` renderings os/exec produces
@@ -4251,10 +4337,11 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			break
 		}
 
-		// Infrastructure-failure absorb (#972, widened by #2645): a failed
-		// verify whose output carries a diff-independent infra signature
-		// (isVerifyInfraFailure — container-start timeout or golangci-lint
-		// lock contention) is
+		// Infrastructure-failure absorb (#972, widened by #2645/#2718): a
+		// failed verify whose output carries a diff-independent infra
+		// signature (isVerifyInfraFailure — container-start timeout,
+		// golangci-lint lock contention, testcontainers port-not-found, or an
+		// unreachable Docker daemon) is
 		// re-run ONCE in place — repeat the iteration via the existing loop
 		// body (re-stage, re-commit, re-verify) WITHOUT invoking the fix agent
 		// and WITHOUT advancing iter, mirroring the maxFixInvokeInfraRetries
