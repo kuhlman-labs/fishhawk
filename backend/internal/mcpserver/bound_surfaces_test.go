@@ -1758,60 +1758,72 @@ type floorSurfaceCase struct {
 	name string
 	typ  reflect.Type
 	page bool
-	// drive builds this surface's floor output at budget and returns it plus its
-	// elisions block.
-	drive func(t *testing.T, budget int) (any, *Elisions)
+	// drive builds this surface's floor output at budget and returns the ORIGINAL
+	// (pre-bound) input, the bounded output, and its elisions block. The input is
+	// what lets the caller distinguish a field carried UNCHANGED (byte-identical to
+	// the input) from one carried in REDUCED form — the latter MUST be accompanied
+	// by a correctly-classified elision entry (#2576 binding condition 3 / the
+	// test_vacuity fix-up). A bare IsZero check cannot tell the two apart, nor can
+	// it catch an arbitrary non-zero replacement, so the earlier version of this
+	// test was vacuous.
+	drive func(t *testing.T, budget int) (in, out any, el *Elisions)
 }
 
 // floorSurfaceCases derives its set from wiredRunRowFloorTypes() plus the two
 // page floors, so the surface list is not independently hand-maintained
 // (BINDING CONDITION 5).
 func floorSurfaceCases() []floorSurfaceCase {
-	runRowDrivers := map[reflect.Type]func(t *testing.T, budget int) (any, *Elisions){
-		reflect.TypeOf(GetActiveRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
-			out, err := boundOneRow(GetActiveRunOutput{Run: floorForcingRun(uuid.NewString())}, budget)
+	runRowDrivers := map[reflect.Type]func(t *testing.T, budget int) (any, any, *Elisions){
+		reflect.TypeOf(GetActiveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := GetActiveRunOutput{Run: floorForcingRun(uuid.NewString())}
+			out, err := boundOneRow(in, budget)
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		},
-		reflect.TypeOf(StartRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
+		reflect.TypeOf(StartRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
 			runID := uuid.NewString()
-			out, err := boundRunRowOutput(StartRunOutput{Run: floorForcingRun(runID), Idempotent: true}, runID, fixedBudget(budget),
+			in := StartRunOutput{Run: floorForcingRun(runID), Idempotent: true}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
 				func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
 				func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		},
-		reflect.TypeOf(CancelRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
+		reflect.TypeOf(CancelRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
 			runID := uuid.NewString()
-			out, err := boundRunRowOutput(CancelRunOutput{Run: floorForcingRun(runID), ReapedRunners: 5}, runID, fixedBudget(budget),
+			in := CancelRunOutput{Run: floorForcingRun(runID), ReapedRunners: 5}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
 				func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
 				func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		},
-		reflect.TypeOf(ResumeRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
+		reflect.TypeOf(ResumeRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
 			runID := uuid.NewString()
-			out, err := boundRunRowOutput(ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}, runID, fixedBudget(budget),
+			in := ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
 				func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
 				func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		},
-		reflect.TypeOf(ReviveRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
-			out := boundReviveFloor(t, reviveFloorFixture(uuid.NewString(), ""), budget)
-			return out, out.Elisions
+		reflect.TypeOf(ReviveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := reviveFloorFixture(uuid.NewString(), "")
+			out := boundReviveFloor(t, in, budget)
+			return in, out, out.Elisions
 		},
-		reflect.TypeOf(StartCampaignItemRunOutput{}): func(t *testing.T, budget int) (any, *Elisions) {
-			out := boundCampaignItemFloor(t, campaignItemFloorFixture(uuid.NewString(), 3), uuid.NewString(), budget)
-			return out, out.Elisions
+		reflect.TypeOf(StartCampaignItemRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := campaignItemFloorFixture(uuid.NewString(), 3)
+			out := boundCampaignItemFloor(t, in, uuid.NewString(), budget)
+			return in, out, out.Elisions
 		},
 	}
 	cases := make([]floorSurfaceCase, 0, len(runRowDrivers)+2)
@@ -1819,40 +1831,95 @@ func floorSurfaceCases() []floorSurfaceCase {
 		cases = append(cases, floorSurfaceCase{name: typ.Name(), typ: typ, drive: runRowDrivers[typ]})
 	}
 	cases = append(cases,
-		floorSurfaceCase{name: "ListRunsOutput", typ: reflect.TypeOf(ListRunsOutput{}), page: true, drive: func(t *testing.T, budget int) (any, *Elisions) {
+		floorSurfaceCase{name: "ListRunsOutput", typ: reflect.TypeOf(ListRunsOutput{}), page: true, drive: func(t *testing.T, budget int) (any, any, *Elisions) {
 			items := make([]Run, 0, 20)
 			for i := 0; i < 20; i++ {
 				r := floorForcingRun(uuid.NewString())
 				items = append(items, r)
 			}
-			out, err := boundListRunsOutput(ListRunsOutput{Items: items, NextCursor: "cur-1"}, fixedBudget(budget))
+			in := ListRunsOutput{Items: items, NextCursor: "cur-1"}
+			out, err := boundListRunsOutput(in, fixedBudget(budget))
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		}},
-		floorSurfaceCase{name: "ListAuditOutput", typ: reflect.TypeOf(ListAuditOutput{}), page: true, drive: func(t *testing.T, budget int) (any, *Elisions) {
+		floorSurfaceCase{name: "ListAuditOutput", typ: reflect.TypeOf(ListAuditOutput{}), page: true, drive: func(t *testing.T, budget int) (any, any, *Elisions) {
 			runID := uuid.NewString()
 			items := auditPage(runID, 40, strings.Repeat("<", 20000))
 			for i := range items {
 				items[i].Category = strings.Repeat("category_", 400)
 				items[i].ID = strings.Repeat("id-", 400)
 			}
-			out, err := boundListAuditOutput(ListAuditOutput{Items: items, NextCursor: "cur-1"}, runID, "implement_reviewed", fixedBudget(budget))
+			in := ListAuditOutput{Items: items, NextCursor: "cur-1"}
+			out, err := boundListAuditOutput(in, runID, "implement_reviewed", fixedBudget(budget))
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
-			return out, out.Elisions
+			return in, out, out.Elisions
 		}},
 	)
 	return cases
 }
 
+// hasClassifiedFloorEntry reports whether the floor's ITEMISED (non-aggregate)
+// entries carry a correctly-classified entry accounting for the reduction of the
+// wire field `wire` — either an exact `field == wire` match or a nested
+// `wire.<sub>` reduction (item.depends_on for the `item` field). An entry with an
+// unrecognised class does NOT count, so a reduction reported under a garbage
+// class is treated as unaccounted-for.
+func hasClassifiedFloorEntry(el *Elisions, wire string) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate {
+			continue
+		}
+		if f.Field != wire && !strings.HasPrefix(f.Field, wire+".") {
+			continue
+		}
+		switch elisionClass(f.Class) {
+		case classStored, classOversizedCapable, classComputed:
+			return true
+		}
+	}
+	return false
+}
+
+// floorHasAggregate reports whether the floor emitted at least one aggregate
+// entry — the marked exception that stands in for the omitted omittable fields
+// and for the ladder-owned Run/items reductions.
+func floorHasAggregate(el *Elisions) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate {
+			return true
+		}
+	}
+	return false
+}
+
 // TestBoundRunRow_FloorTierPerWiredOutputType drives EVERY wired output type to
 // the FLOOR tier and asserts (a) tier == floor, (b) marshalled size at or under
-// max(budget, floor), and (c) NO non-omitempty field VANISHES — it is present
-// carrying its true value or its reduced value (BINDING CONDITION 3). This is
-// the done-means test for the issue's "floor-tier test per wired output type".
+// max(budget, floor), and (c) the NO-SILENT-LOSS contract of BINDING CONDITION 3:
+// every non-omitempty field is PRESENT carrying either its TRUE value (byte-
+// identical to the input) OR a REDUCED value that is ACCOMPANIED by a correctly-
+// classified elision entry naming it. This is the done-means test for the issue's
+// "floor-tier test per wired output type".
+//
+// The earlier version asserted only !IsZero(), which the test_vacuity concern
+// correctly flagged as vacuous: an arbitrary non-zero replacement, or a
+// truncated/capped non-omitempty field emitted WITHOUT its required elision
+// entry, both slip past IsZero. This version compares each field against the
+// original input to DISTINGUISH an unchanged carry from a bounded projection, and
+// for every observed reduction it REQUIRES a matching classified entry —
+// including the two page `items` fields, which the earlier version skipped
+// (ListRuns.items is []Run, silently dropped as ladder-owned; ListAudit.items got
+// only the IsZero check).
+//
+// The accounting is split by who OWNS the reduction. A non-page, non-ladder-owned
+// field (revive's restored_stages/next_step, the campaign item, the idempotent /
+// reaped_runners scalars) is ITEMISED per #2576, so a reduction there demands an
+// itemised entry — never the aggregate. The ladder-owned Run diagnosis core and
+// the page `items` fields are covered by the floor's marked AGGREGATE by design,
+// so a reduction there demands the aggregate be present instead.
 func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 	cases := floorSurfaceCases()
 	if len(cases) == 0 {
@@ -1863,9 +1930,10 @@ func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 	if mcpConvergenceFloorBytes > ceiling {
 		ceiling = mcpConvergenceFloorBytes
 	}
+	elisionsType := reflect.TypeOf((*Elisions)(nil))
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out, el := c.drive(t, budget)
+			in, out, el := c.drive(t, budget)
 			if el == nil || el.Tier != floorTierName {
 				t.Fatalf("did not reach the floor tier: %+v", el)
 			}
@@ -1875,16 +1943,56 @@ func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 			if err := validateWireElisions(el); err != nil {
 				t.Errorf("floor elisions violate their own classification: %v", err)
 			}
-			// (c) no non-omitempty, non-ladder-owned field silently vanishes.
-			rv := reflect.ValueOf(out)
-			rt := rv.Type()
+
+			// (c) NO-SILENT-LOSS: every non-omitempty field is present carrying its
+			// true value, or a reduced value with a matching classified entry.
+			ov := reflect.ValueOf(out)
+			iv := reflect.ValueOf(in)
+			rt := ov.Type()
 			for i := 0; i < rt.NumField(); i++ {
 				f := rt.Field(i)
-				if f.PkgPath != "" || jsonTagOmits(f) || ladderOwnedFloorField(f.Type) {
+				if f.PkgPath != "" || jsonTagOmits(f) || f.Type == elisionsType {
+					continue // unexported, omittable, or the elisions block itself
+				}
+				wire := wirePathFieldName(f)
+				outField := ov.Field(i)
+				// Presence: a non-omitempty field that went to its ZERO value has
+				// VANISHED — it reads on the wire as "there is no value" while the
+				// aggregate elision claims it was merely omitted.
+				if outField.IsZero() {
+					t.Errorf("%s: non-omitempty field %s (%q) VANISHED at the floor (zero value, no carried content)", c.name, f.Name, wire)
 					continue
 				}
-				if rv.Field(i).IsZero() {
-					t.Errorf("%s: non-omitempty field %s VANISHED at the floor (zero value, no carried content)", c.name, f.Name)
+
+				ladderOwned := ladderOwnedFloorField(f.Type)
+				if c.page || ladderOwned {
+					// The Run diagnosis core and the page `items` are reduced under
+					// the floor's marked AGGREGATE, not itemised — so require the
+					// aggregate to be present to account for the reduction.
+					if !floorHasAggregate(el) {
+						t.Errorf("%s: field %s (%q) is present but the floor emitted NO aggregate entry to account for its reduction", c.name, f.Name, wire)
+					}
+					continue
+				}
+
+				// Distinguish an UNCHANGED carry (byte-identical to the input) from a
+				// bounded PROJECTION. Only the latter needs a classified entry, and a
+				// bare IsZero check can tell neither apart nor catch an arbitrary
+				// non-zero replacement — which lands here as a reduction with no entry.
+				outRaw, err := json.Marshal(outField.Interface())
+				if err != nil {
+					t.Fatalf("marshal out field %s: %v", f.Name, err)
+				}
+				inRaw, err := json.Marshal(iv.Field(i).Interface())
+				if err != nil {
+					t.Fatalf("marshal in field %s: %v", f.Name, err)
+				}
+				if bytes.Equal(outRaw, inRaw) {
+					continue // carries its TRUE value unchanged
+				}
+				if !hasClassifiedFloorEntry(el, wire) {
+					t.Errorf("%s: non-omitempty field %s (%q) was carried in REDUCED form at the floor (out=%s want unchanged=%s) but NO itemised classified elision entry names it — a bounded projection with no entry reads as real (BINDING CONDITION 3)",
+						c.name, f.Name, wire, outRaw, inRaw)
 				}
 			}
 		})
