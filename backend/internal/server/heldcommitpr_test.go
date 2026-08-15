@@ -148,6 +148,12 @@ func TestHeldCommitPRTitleBody_ClosesNotDuplicated(t *testing.T) {
 		"colon form":    "## Summary\n\n- x\n\nCloses: #2570",
 		"mid-sentence":  "## Summary\n\nThis closes #2570 for good.",
 		"trailing dot":  "## Summary\n\n- x\n\nCloses #2570.",
+		// The elision must not be so blunt that it hides a REAL directive: an
+		// inline span earlier in the body, and a fenced block closed by a run
+		// LONGER than its opener (valid per CommonMark), both leave the trailing
+		// directive active.
+		"after an inline span":       "## Summary\n\nSee `the runbook` first.\n\nCloses #2570",
+		"after a longer closing run": "## Summary\n\n```\nsome code\n`````\n\nCloses #2570",
 	}
 	for name, body := range suppress {
 		t.Run("suppress/"+name, func(t *testing.T) {
@@ -177,6 +183,15 @@ func TestHeldCommitPRTitleBody_ClosesNotDuplicated(t *testing.T) {
 		"indented fence":       "## Summary\n\n  ```\n  Closes #2570\n  ```\n",
 		"inline code span":     "## Summary\n\nThe body must end with `Closes #2570` on its own line.",
 		"double-backtick span": "## Summary\n\nWrite ``Closes #2570`` at the end.",
+		// An elided inline span must leave a BOUNDARY behind. Eliding to nothing
+		// collapses this into the active directive "Closes  #2570" that the source
+		// text does not contain, and GitHub closes nothing for it.
+		"span between keyword and reference": "## Summary\n\nCloses `note` #2570",
+		// Only a VALID closing fence closes a block. A shorter backtick run and an
+		// info-string line are fence CONTENT; treating either as a closer exposes
+		// the directive that is still inside the block.
+		"shorter run inside a longer fence": "## Summary\n\n````\n```\nCloses #2570\n````\n",
+		"info-string line inside a fence":   "## Summary\n\n```\n```go\nCloses #2570\n```\n",
 	}
 	for name, body := range appendCases {
 		t.Run("append/"+name, func(t *testing.T) {
@@ -201,16 +216,27 @@ func TestHasClosingReference_ZeroIssueNumber(t *testing.T) {
 }
 
 // TestStripCodeContexts covers the elision helper's own branches: an
-// unterminated inline run is literal text (not a span), and a mismatched fence
-// delimiter does not close a fence.
+// unterminated inline run is literal text (not a span), an elided span leaves a
+// boundary rather than joining its neighbours, and only a VALID closing fence
+// (same character, at least as long as the opener, no info string) closes a
+// block.
 func TestStripCodeContexts(t *testing.T) {
 	cases := map[string]struct{ in, wantContains, wantMissing string }{
-		"inline span elided":       {"a `code` b", "a  b", "code"},
+		"inline span elided":       {"a `code` b", "a " + codeSpanElision + " b", "code"},
 		"unterminated run literal": {"a ` b Closes #1", "Closes #1", ""},
 		"fence elides its content": {"x\n```\nCloses #1\n```\ny", "y", "Closes #1"},
 		"mismatched fence stays open": {
 			"```\nCloses #1\n~~~\nCloses #2\n", "", "Closes #2",
 		},
+		// The elision leaves a boundary: the two sides must NOT join into text the
+		// source never contained.
+		"span leaves a boundary": {"Closes `note` #1", "", "Closes  #1"},
+		// Closing-fence validation: neither a shorter run nor an info-string line
+		// ends the block, so the directive inside stays elided.
+		"shorter run does not close": {"````\n```\nCloses #1\n````\ny", "y", "Closes #1"},
+		"info string does not close": {"```\n```go\nCloses #1\n```\ny", "y", "Closes #1"},
+		// ...but a LONGER closing run is valid, so what follows it is active text.
+		"longer run closes": {"```\nx\n`````\nCloses #1\n", "Closes #1", ""},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -135,7 +135,12 @@ func issueContextOf(runRow *run.Run) (title string, number int) {
 //     `Closes #2570foo` suppress the real append.
 //   - Closing-looking text inside INLINE CODE or a FENCED CODE BLOCK: a body that
 //     merely documents the syntax (“Closes #2570“) is not a directive. GitHub
-//     does not act on it, so neither do we.
+//     does not act on it, so neither do we. The elision that implements this must
+//     itself be false-positive-free in two ways the first cut was not: an elided
+//     inline span leaves a BOUNDARY behind rather than joining its neighbours
+//     ("Closes `note` #2570" is not a directive and must not collapse into one),
+//     and only a VALID closing fence closes a block, so an inner `~~~`, a shorter
+//     backtick run, or an info-string line cannot expose the rest of the block.
 func hasClosingReference(body string, n int) bool {
 	if n <= 0 {
 		return false
@@ -149,27 +154,39 @@ func hasClosingReference(body string, n int) bool {
 
 // stripCodeContexts blanks out fenced code blocks and inline code spans so a
 // scan for directives reads only the body's ACTIVE markdown (#2570). Lines are
-// preserved (as empty lines) rather than removed so nothing on either side of an
-// elision is accidentally joined into a match that the source text does not
+// preserved (as empty lines) rather than removed, and an elided inline span
+// leaves a BOUNDARY behind (see codeSpanElision), so nothing on either side of
+// an elision is accidentally joined into a match that the source text does not
 // contain.
 //
 // An unterminated fence swallows the rest of the body, matching CommonMark and
 // erring toward "no closing reference found" — the safe direction, since the
-// cost is a duplicate line rather than a silently un-closed issue.
+// cost is a duplicate line rather than a silently un-closed issue. Fence
+// RECOGNITION is asymmetric for the same reason: opening is liberal (an
+// over-eager open only elides more text) while CLOSING is strict, because a line
+// wrongly read as a closer exposes the rest of the block and can turn documented
+// syntax into an apparently active directive.
 func stripCodeContexts(body string) string {
 	var out strings.Builder
 	inFence := false
-	fenceMarker := ""
+	var fenceChar byte
+	fenceLen := 0
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimLeft(line, " \t")
-		if marker, ok := fenceDelimiter(trimmed); ok {
+		if c, n, rest, ok := fenceDelimiter(trimmed); ok {
 			if !inFence {
-				inFence, fenceMarker = true, marker
+				inFence, fenceChar, fenceLen = true, c, n
 				out.WriteByte('\n')
 				continue
 			}
-			if marker == fenceMarker {
-				inFence, fenceMarker = false, ""
+			// CommonMark §4.5: a CLOSING fence uses the same character, is AT
+			// LEAST as long as the opener, and carries no info string. A run that
+			// fails any of those is fence CONTENT — a `~~~` inside a ``` block, a
+			// three-backtick line inside a four-backtick block, or an info-string
+			// line like "```go". Accepting one as a closer would expose every
+			// following line of the block to the directive scan.
+			if c == fenceChar && n >= fenceLen && strings.TrimSpace(rest) == "" {
+				inFence, fenceChar, fenceLen = false, 0, 0
 				out.WriteByte('\n')
 				continue
 			}
@@ -184,27 +201,39 @@ func stripCodeContexts(body string) string {
 	return out.String()
 }
 
-// fenceDelimiter reports the code-fence delimiter a line opens or closes with —
-// a run of three or more backticks or tildes at the start of the (leading-space
-// trimmed) line.
-func fenceDelimiter(trimmed string) (string, bool) {
+// fenceDelimiter reports the code-fence run a line opens or closes with — a run
+// of three or more backticks or tildes at the start of the (leading-space
+// trimmed) line — returning the fence character, the run's LENGTH and the text
+// that follows it. Callers need all three: the length and the trailing text are
+// what distinguish a valid closing fence from ordinary fence content.
+func fenceDelimiter(trimmed string) (marker byte, length int, rest string, ok bool) {
 	for _, c := range []byte{'`', '~'} {
 		n := 0
 		for n < len(trimmed) && trimmed[n] == c {
 			n++
 		}
 		if n >= 3 {
-			return string(c), true
+			return c, n, trimmed[n:], true
 		}
 	}
-	return "", false
+	return 0, 0, "", false
 }
 
-// stripInlineCode removes inline code spans from one line: a run of N backticks
-// opens a span that the next run of EXACTLY N backticks closes (CommonMark's
-// rule, which is what lets a span contain a literal backtick). A run with no
-// matching closer is not a span — its backticks are emitted literally and the
-// scan continues past them.
+// codeSpanElision is what an elided inline code span leaves behind. Eliding to
+// NOTHING is a false-positive generator: "Closes `note` #2570" would collapse to
+// "Closes  #2570" and read as an active closing directive, suppressing the
+// required append even though GitHub closes nothing for that text. The
+// replacement must therefore be a single character that is neither whitespace
+// (so it breaks the `keyword <space> #n` shape) nor a word character (so a
+// keyword abutting a span still terminates for `\b`). NUL satisfies both and
+// cannot occur in a real markdown body.
+const codeSpanElision = "\x00"
+
+// stripInlineCode replaces inline code spans in one line with codeSpanElision: a
+// run of N backticks opens a span that the next run of EXACTLY N backticks
+// closes (CommonMark's rule, which is what lets a span contain a literal
+// backtick). A run with no matching closer is not a span — its backticks are
+// emitted literally and the scan continues past them.
 func stripInlineCode(line string) string {
 	var out strings.Builder
 	i := 0
@@ -230,6 +259,7 @@ func stripInlineCode(line string) string {
 				m++
 			}
 			if m-k == n {
+				out.WriteString(codeSpanElision)
 				i, closed = m, true
 				break
 			}
