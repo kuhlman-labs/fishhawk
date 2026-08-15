@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 )
@@ -2555,5 +2556,467 @@ func TestShipAcceptance_UnknownEffectiveVerdictFieldIgnored(t *testing.T) {
 	}
 	if res.Idempotent {
 		t.Error("Idempotent = true, want false")
+	}
+}
+
+// --- Held-commit PR text on the park / checkpoint reports (#2570) ---
+//
+// The runner captures the agent-authored PR title + body at park / checkpoint
+// time so a held-commit RESUME opens a real pull request instead of the
+// `chore: fishhawk implement stage <id>` placeholder. Three things have to hold:
+// the legacy bodies stay byte-identical when the text is absent, the text is
+// clamped, and — the control this change adds — the MARSHALLED body stays under
+// the backend's 32 KiB cap so the report can never 413 and strand the stage.
+
+// shipAndCapture POSTs args through the real ShipPullRequest against a fake
+// backend and returns the exact request bytes the backend received.
+func shipAndCapture(t *testing.T, args ShipPullRequestArgs) string {
+	t.Helper()
+	var receivedBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPullRequestResult{ID: "art-1"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	_, priv, _ := ed25519.GenerateKey(nil)
+	args.PrivateKey = priv
+	if _, err := c.ShipPullRequest(context.Background(), args); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	return string(receivedBody)
+}
+
+// TestFailureBody_ByteIdenticalWithoutPRText pins m8: with the PR text absent —
+// every pre-#2570 shape — the failure body marshals BYTE-IDENTICALLY to today,
+// both on a pre-push failure (no checkpoint at all) and on a checkpoint-bearing
+// one. Every signature and content hash over those bytes is therefore unchanged.
+func TestFailureBody_ByteIdenticalWithoutPRText(t *testing.T) {
+	prePush := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "B", Reason: "verify gate failed",
+	})
+	wantPrePush := `{"outcome":"failed","category":"B","reason":"verify gate failed"}`
+	if prePush != wantPrePush {
+		t.Errorf("pre-push failure body drifted:\n got: %s\nwant: %s", prePush, wantPrePush)
+	}
+
+	checkpointed := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "C", Reason: "open PR: 502",
+		Branch: "fishhawk/run-abc/stage-xyz", HeadSHA: "deadbeef",
+		BaseSHA: "feedface", TreeSHA: "treesha1",
+	})
+	wantCheckpointed := `{"outcome":"failed","category":"C","reason":"open PR: 502",` +
+		`"branch":"fishhawk/run-abc/stage-xyz","head_sha":"deadbeef",` +
+		`"base_sha":"feedface","verified_tree_sha":"treesha1"}`
+	if checkpointed != wantCheckpointed {
+		t.Errorf("checkpoint failure body drifted:\n got: %s\nwant: %s", checkpointed, wantCheckpointed)
+	}
+	for _, got := range []string{prePush, checkpointed} {
+		if strings.Contains(got, `"title"`) || strings.Contains(got, `"body"`) {
+			t.Errorf("a report with no PR text must omit both keys entirely: %s", got)
+		}
+	}
+}
+
+// TestParkBody_ByteIdenticalWithoutPRText is the park sibling of the above.
+func TestParkBody_ByteIdenticalWithoutPRText(t *testing.T) {
+	got := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "scope_park", Branch: "fishhawk/run-abc/stage-xyz",
+		HeadSHA: "deadbeef", BaseSHA: "feedface", TreeSHA: "treesha1",
+		MissingPaths: []string{"backend/internal/run/run.go"},
+	})
+	want := `{"outcome":"scope_park","branch":"fishhawk/run-abc/stage-xyz","head_sha":"deadbeef",` +
+		`"base_sha":"feedface","verified_tree_sha":"treesha1",` +
+		`"missing_paths":["backend/internal/run/run.go"]}`
+	if got != want {
+		t.Errorf("park body drifted from the pre-#2570 bytes:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestShipPullRequest_CarriesPRText: the happy path — the text the runner
+// captured reaches the backend on both report kinds, under the wire tags the
+// backend's existing success-artifact decode already declares.
+func TestShipPullRequest_CarriesPRText(t *testing.T) {
+	park := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "scope_park", Branch: "b", HeadSHA: "h", BaseSHA: "base", TreeSHA: "t",
+		MissingPaths: []string{"a.go"},
+		PRTitle:      "feat(server): carry PR text across a resume",
+		PRBody:       "## Summary\n\n- does the thing\n\nCloses #2570",
+	})
+	if !strings.Contains(park, `"title":"feat(server): carry PR text across a resume"`) {
+		t.Errorf("park body lost the PR title: %s", park)
+	}
+	if !strings.Contains(park, `"body":"## Summary`) {
+		t.Errorf("park body lost the PR body: %s", park)
+	}
+
+	failed := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "C", Reason: "open PR: 502",
+		Branch: "b", HeadSHA: "h", BaseSHA: "base", TreeSHA: "t",
+		PRTitle: "feat(server): carry PR text across a resume",
+		PRBody:  "## Summary\n\n- does the thing",
+	})
+	if !strings.Contains(failed, `"title":"feat(server): carry PR text across a resume"`) ||
+		!strings.Contains(failed, `"body":"## Summary`) {
+		t.Errorf("checkpoint failure body lost the PR text: %s", failed)
+	}
+}
+
+// TestShipPullRequest_ClampsPRText: the two nominal clamps. Both fields are
+// bounded even when the marshalled envelope would have fit anyway, so the wire
+// shape does not depend on how large the reason happens to be.
+func TestShipPullRequest_ClampsPRText(t *testing.T) {
+	got := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "scope_park", Branch: "b", HeadSHA: "h", BaseSHA: "base", TreeSHA: "t",
+		MissingPaths: []string{"a.go"},
+		PRTitle:      strings.Repeat("t", MaxHeldCommitPRTitleBytes+500),
+		PRBody:       strings.Repeat("b", MaxHeldCommitPRBodyBytes+5000),
+	})
+	var decoded struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("unmarshal park body: %v", err)
+	}
+	if len(decoded.Title) != MaxHeldCommitPRTitleBytes {
+		t.Errorf("title len = %d, want the clamp %d", len(decoded.Title), MaxHeldCommitPRTitleBytes)
+	}
+	if len(decoded.Body) != MaxHeldCommitPRBodyBytes {
+		t.Errorf("body len = %d, want the clamp %d", len(decoded.Body), MaxHeldCommitPRBodyBytes)
+	}
+}
+
+// TestClampRunes_NeverSplitsARune: the clamp cuts back to a rune boundary, so
+// truncation cannot emit invalid UTF-8 — which encoding/json would replace with
+// a THREE-byte U+FFFD per bad byte, growing the payload the clamp bounds.
+func TestClampRunes_NeverSplitsARune(t *testing.T) {
+	// "☃" is three bytes; a 4-byte budget must keep exactly one snowman.
+	s := strings.Repeat("☃", 4)
+	got := clampRunes(s, 4)
+	if got != "☃" {
+		t.Errorf("clampRunes(4 snowmen, 4) = %q, want one snowman", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("clampRunes produced invalid UTF-8: %q", got)
+	}
+	if got := clampRunes("abc", 10); got != "abc" {
+		t.Errorf("a string already under the cap must round-trip byte-identically, got %q", got)
+	}
+	if got := clampRunes("abc", 0); got != "" {
+		t.Errorf("a non-positive cap must empty the string, got %q", got)
+	}
+}
+
+// TestShipPullRequest_FailureBodyBudgetUnderCap is m5, and the counterfactual
+// vehicle for the size-budget control.
+//
+// IT MUST CATCH THE ESCAPE-EXPANSION FAILURE MODE, so the fixtures are built
+// from characters that GROW under Go's encoding/json — `<`, `>` and `&` each
+// become a six-byte `<`-style escape, a backslash doubles, and a control
+// character expands to `\uXXXX`. A strings.Repeat("a", …) fixture would prove
+// nothing: it marshals one byte per byte, so a raw-length budget would pass it
+// while still shipping a 4x-oversized body in production.
+//
+// The inputs are seeded BY CONSTRUCTION — sized past the cap directly, never by
+// calling the clamp inside this test's own setup — so deleting the control lands
+// the RED on the size assertion rather than on fixture setup.
+func TestShipPullRequest_FailureBodyBudgetUnderCap(t *testing.T) {
+	// Every rune here expands under encoding/json: 6 bytes for `<`, `>`, `&` and
+	// the control character, 2 for the backslash.
+	expanding := strings.Repeat("<>&\\\x01", 20*1024) // 100 KiB raw, ~520 KiB escaped
+	rawReason := strings.Repeat("<&", 40*1024)        // 80 KiB raw, ~480 KiB escaped
+
+	body := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "B", Reason: rawReason,
+		Branch: "fishhawk/run-abc/stage-xyz", HeadSHA: "deadbeef",
+		BaseSHA: "feedface", TreeSHA: "treesha1",
+		PRTitle: expanding, PRBody: expanding,
+	})
+
+	// THE assertion: the bytes that actually reached the backend fit the cap, so
+	// the report cannot 413 body_too_large and strand the stage in `running`.
+	if len(body) > MaxPullRequestReportBytes {
+		t.Errorf("marshalled failure body = %d bytes, want <= %d (a 413 here strands the implement stage)",
+			len(body), MaxPullRequestReportBytes)
+	}
+	// The report must still be a decodable, checkpoint-bearing failure — a body
+	// shrunk into uselessness would pass the size check and lose the recovery.
+	var decoded struct {
+		Outcome  string `json:"outcome"`
+		Category string `json:"category"`
+		Reason   string `json:"reason"`
+		HeadSHA  string `json:"head_sha"`
+		Branch   string `json:"branch"`
+	}
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("shrunk failure body is not valid JSON: %v", err)
+	}
+	if decoded.Outcome != "failed" || decoded.Category != "B" {
+		t.Errorf("shrunk body lost its discriminators: %+v", decoded)
+	}
+	if decoded.HeadSHA != "deadbeef" || decoded.Branch != "fishhawk/run-abc/stage-xyz" {
+		t.Errorf("shrinking must never drop the checkpoint coordinates: %+v", decoded)
+	}
+	if decoded.Reason == "" {
+		t.Error("shrinking must leave the operator some failure reason")
+	}
+}
+
+// TestShipPullRequest_ParkBodyBudgetUnderCap is the park sibling of m5.
+func TestShipPullRequest_ParkBodyBudgetUnderCap(t *testing.T) {
+	expanding := strings.Repeat("<>&\\\x01", 20*1024)
+	body := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "scope_park", Branch: "b", HeadSHA: "h", BaseSHA: "base", TreeSHA: "t",
+		MissingPaths: []string{"backend/internal/run/run.go"},
+		PRTitle:      expanding, PRBody: expanding,
+	})
+	if len(body) > MaxPullRequestReportBytes {
+		t.Errorf("marshalled park body = %d bytes, want <= %d", len(body), MaxPullRequestReportBytes)
+	}
+	var decoded struct {
+		Outcome      string   `json:"outcome"`
+		MissingPaths []string `json:"missing_paths"`
+	}
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("shrunk park body is not valid JSON: %v", err)
+	}
+	if decoded.Outcome != "scope_park" || len(decoded.MissingPaths) != 1 {
+		t.Errorf("shrinking must never drop the park's own payload: %+v", decoded)
+	}
+}
+
+// TestShipPullRequest_EscapeHeavyBodyKeepsNarrative is the counterfactual vehicle
+// for the truncate-before-dropping control (#2570 fix-up).
+//
+// THE FAILURE MODE IT CATCHES: an agent narrative whose ESCAPED form overshoots
+// the request budget was dropped wholesale, so the resume fell back to a
+// synthesized description even though a fitting prefix of the real `## Summary`
+// was available. The fixture is deliberately escape-heavy — `<` and `&` each
+// marshal to six bytes — so the clamped 8 KiB body is ~49 KiB on the wire and the
+// truncation rung is the one that runs. Both halves are asserted: the bytes fit
+// the 32 KiB cap AND the narrative survived.
+func TestShipPullRequest_EscapeHeavyBodyKeepsNarrative(t *testing.T) {
+	narrative := "## Summary\n\n- Rewrote " + strings.Repeat("<&", 6*1024)
+
+	body := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "B", Reason: "verify failed",
+		Branch: "fishhawk/run-abc/stage-xyz", HeadSHA: "deadbeef",
+		BaseSHA: "feedface", TreeSHA: "treesha1",
+		PRTitle: "feat(server): open a real PR on a resume", PRBody: narrative,
+	})
+
+	if len(body) > MaxPullRequestReportBytes {
+		t.Errorf("marshalled failure body = %d bytes, want <= %d", len(body), MaxPullRequestReportBytes)
+	}
+	var decoded struct {
+		Title  string `json:"title"`
+		PRBody string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("shrunk failure body is not valid JSON: %v", err)
+	}
+	if !strings.HasPrefix(decoded.PRBody, "## Summary\n\n- Rewrote <&") {
+		t.Errorf("escape-heavy narrative must survive as a prefix, not be dropped; got %.40q", decoded.PRBody)
+	}
+	if !strings.HasSuffix(decoded.PRBody, heldCommitPRBodyTruncationMarker) {
+		t.Errorf("a truncated body must carry the marker, got %.60q", decoded.PRBody)
+	}
+	if decoded.Title == "" {
+		t.Error("the recovered title must survive when only the body needed shrinking")
+	}
+}
+
+// TestShrinkFailureBodyFields_Ladder walks the rungs the end-to-end tests above
+// cannot reach individually, including the last two: shrinking the reason BELOW
+// MinFailureReportReasonBytes, and the shrink-exhausted false return.
+func TestShrinkFailureBodyFields_Ladder(t *testing.T) {
+	t.Run("fits after the nominal clamps", func(t *testing.T) {
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B", Reason: "short",
+			HeldCommitPRText: HeldCommitPRText{Title: "t", PRBody: "body"},
+		}
+		if !shrinkFailureBodyFields(b, MaxPullRequestReportBytes) {
+			t.Fatal("a tiny body must fit")
+		}
+		if b.Reason != "short" || b.Title != "t" || b.PRBody != "body" {
+			t.Errorf("a fitting body must not be shrunk: %+v", b)
+		}
+	})
+
+	t.Run("reason yields to its floor before the PR text is dropped", func(t *testing.T) {
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B",
+			Reason:           strings.Repeat("r", MaxFailureReportReasonBytes),
+			HeldCommitPRText: HeldCommitPRText{Title: "keep-me", PRBody: strings.Repeat("b", MaxHeldCommitPRBodyBytes)},
+		}
+		if !shrinkFailureBodyFields(b, MaxPullRequestReportBytes) {
+			t.Fatal("must fit by yielding the reason")
+		}
+		if b.Title != "keep-me" || b.PRBody == "" {
+			t.Errorf("the reason must yield before the PR text is dropped: title=%q bodyLen=%d", b.Title, len(b.PRBody))
+		}
+		if len(b.Reason) < MinFailureReportReasonBytes {
+			t.Errorf("reason shrank below its floor too early: %d", len(b.Reason))
+		}
+	})
+
+	t.Run("PR body TRUNCATES before it is dropped", func(t *testing.T) {
+		// An escaping reason at the floor plus an escaping PR body: the reason
+		// cannot yield further, but a PREFIX of the narrative still fits, so the
+		// body must be truncated rather than deleted (#2570 fix-up).
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B",
+			Reason: strings.Repeat("<", MinFailureReportReasonBytes),
+			HeldCommitPRText: HeldCommitPRText{
+				Title:  strings.Repeat("<", MaxHeldCommitPRTitleBytes),
+				PRBody: "## Summary\n\n" + strings.Repeat("<", MaxHeldCommitPRBodyBytes),
+			},
+		}
+		if !shrinkFailureBodyFields(b, MaxPullRequestReportBytes) {
+			t.Fatal("must fit by truncating the PR body")
+		}
+		if !strings.HasPrefix(b.PRBody, "## Summary") {
+			t.Errorf("the agent narrative must survive as a prefix, got %.40q", b.PRBody)
+		}
+		if !strings.HasSuffix(b.PRBody, heldCommitPRBodyTruncationMarker) {
+			t.Errorf("a truncated body must say so, got %.40q", b.PRBody)
+		}
+		if b.Reason == "" {
+			t.Error("the reason must survive when truncating the PR body is enough")
+		}
+		if got, _ := json.Marshal(b); len(got) > MaxPullRequestReportBytes {
+			t.Errorf("marshalled = %d bytes, want <= %d", len(got), MaxPullRequestReportBytes)
+		}
+	})
+
+	t.Run("PR text is dropped when no fitting prefix remains", func(t *testing.T) {
+		// The same shape against a cap that leaves less room than the retained-text
+		// floor: truncation cannot help, so the body and then the title must go.
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B",
+			Reason: strings.Repeat("<", MinFailureReportReasonBytes),
+			HeldCommitPRText: HeldCommitPRText{
+				Title:  strings.Repeat("<", MaxHeldCommitPRTitleBytes),
+				PRBody: strings.Repeat("<", MaxHeldCommitPRBodyBytes),
+			},
+		}
+		// The floor's own escaped cost (512 `<` → 3072 bytes) exceeds what this cap
+		// leaves after the floored reason and the clamped title.
+		if !shrinkFailureBodyFields(b, 27*1024) {
+			t.Fatal("must fit by dropping the PR text")
+		}
+		if b.PRBody != "" {
+			t.Errorf("the PR body must be dropped, got %d bytes", len(b.PRBody))
+		}
+		if b.Reason == "" {
+			t.Error("the reason must survive when dropping the PR text is enough")
+		}
+	})
+
+	t.Run("reason shrinks BELOW its floor when the cap demands it", func(t *testing.T) {
+		// No PR text to drop and an escaping reason that is still over at the
+		// floor, so the only remaining rung is to go below it.
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B",
+			Reason: strings.Repeat("<", MinFailureReportReasonBytes*2),
+		}
+		if !shrinkFailureBodyFields(b, MinFailureReportReasonBytes) {
+			t.Fatal("must fit by shrinking the reason below its floor")
+		}
+		if len(b.Reason) >= MinFailureReportReasonBytes {
+			t.Errorf("reason = %d bytes, want below the %d floor", len(b.Reason), MinFailureReportReasonBytes)
+		}
+		if got, _ := json.Marshal(b); len(got) > MinFailureReportReasonBytes {
+			t.Errorf("marshalled = %d bytes, want <= %d", len(got), MinFailureReportReasonBytes)
+		}
+	})
+
+	t.Run("shrink exhausted returns false", func(t *testing.T) {
+		// A cap smaller than the empty-field envelope itself: no rung can help, so
+		// the ladder must report failure rather than silently claim a fit.
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B", Reason: strings.Repeat("x", 100),
+		}
+		if shrinkFailureBodyFields(b, 4) {
+			t.Fatal("a cap below the empty envelope must report shrink-exhausted")
+		}
+		if b.Reason != "" {
+			t.Errorf("the exhausted ladder must have emptied every yielding field, reason = %q", b.Reason)
+		}
+	})
+}
+
+// TestShrinkHeldCommitPRBody covers the truncation helper's own edge branches:
+// an envelope that already fits is left byte-identical, and one where not even
+// the retained-text floor fits reports false with the original restored, so the
+// caller's drop rung sees exactly what it was handed.
+func TestShrinkHeldCommitPRBody(t *testing.T) {
+	t.Run("already fits", func(t *testing.T) {
+		b := &pullRequestFailureBody{Outcome: "failed", HeldCommitPRText: HeldCommitPRText{PRBody: "## Summary"}}
+		if !shrinkHeldCommitPRBody(b, &b.PRBody, MaxPullRequestReportBytes) {
+			t.Fatal("a tiny body must fit")
+		}
+		if b.PRBody != "## Summary" {
+			t.Errorf("a fitting body must not be touched, got %q", b.PRBody)
+		}
+	})
+
+	t.Run("no fitting prefix restores the original", func(t *testing.T) {
+		original := strings.Repeat("<", 4*1024)
+		b := &pullRequestFailureBody{Outcome: "failed", HeldCommitPRText: HeldCommitPRText{PRBody: original}}
+		if shrinkHeldCommitPRBody(b, &b.PRBody, 64) {
+			t.Fatal("a cap below the retained-text floor must report no fit")
+		}
+		if b.PRBody != original {
+			t.Errorf("a failed truncation must restore the original for the caller's drop rung")
+		}
+	})
+}
+
+// TestShrinkParkBodyFields_Ladder is the park sibling, including its own
+// exhausted-return rung.
+func TestShrinkParkBodyFields_Ladder(t *testing.T) {
+	b := &pullRequestScopeParkBody{
+		Outcome: "scope_park", Branch: "b", HeadSHA: "h", BaseSHA: "base", TreeSHA: "t",
+		MissingPaths:     []string{"a.go"},
+		HeldCommitPRText: HeldCommitPRText{Title: strings.Repeat("<", 400), PRBody: strings.Repeat("<", 40*1024)},
+	}
+	if !shrinkParkBodyFields(b, MaxPullRequestReportBytes) {
+		t.Fatal("must fit")
+	}
+	if len(b.Title) > MaxHeldCommitPRTitleBytes {
+		t.Errorf("title not clamped: %d", len(b.Title))
+	}
+	// The park ladder truncates the body too — the shortfall lists are small, so a
+	// large prefix of the narrative fits and must not be dropped.
+	if b.PRBody == "" {
+		t.Error("the park body must truncate to what fits, not be dropped wholesale")
+	}
+
+	// Exhausted: the shortfall payload alone exceeds the cap and is never dropped.
+	over := &pullRequestScopeParkBody{
+		Outcome: "scope_park", Branch: "b", HeadSHA: "h",
+		MissingPaths:     []string{strings.Repeat("p", 200)},
+		HeldCommitPRText: HeldCommitPRText{Title: "t", PRBody: "b"},
+	}
+	if shrinkParkBodyFields(over, 64) {
+		t.Fatal("a cap below the park's own payload must report shrink-exhausted")
+	}
+	if over.Title != "" || over.PRBody != "" {
+		t.Errorf("the exhausted ladder must have dropped the PR text: %+v", over)
 	}
 }

@@ -9626,7 +9626,7 @@ func TestResolvePushCheckpointResume_NilAuditRepo(t *testing.T) {
 func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	stage.Type = run.StageTypeReview
-	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); ok {
 		t.Error("a non-implement stage must never resume")
 	}
 }
@@ -9635,10 +9635,10 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	// Control: the SAME state without the fixup flag DOES resolve, so the RED
 	// below lands on the fixup guard rather than on a broken fixture.
-	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); !ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); !ok {
 		t.Fatal("fixture must resolve a checkpoint on a non-fixup dispatch")
 	}
-	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true); ok {
 		t.Error("a fix-up dispatch must re-invoke the agent, never take the resume short-circuit")
 	}
 }
@@ -9646,7 +9646,7 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 // TestResolvePushCheckpointResume_NilStage: the nil guard.
 func TestResolvePushCheckpointResume_NilStage(t *testing.T) {
 	s, runRow, _ := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false); ok {
 		t.Error("a nil stage must never resume")
 	}
 }
@@ -10960,6 +10960,229 @@ func TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks(t *testing.T) {
 	for _, want := range []string{"ac-create", "ac-list"} {
 		if !strings.Contains(resp.Prompt, want) {
 			t.Errorf("acceptance prompt missing plan criterion %q", want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Held-commit PR TEXT on the resume responses (#2570).
+//
+// CROSS-BOUNDARY, backend serve half. These drive the REAL /prompt and
+// /prompt-render handlers over real park / audit state and assert the recovered
+// (or synthesized) pull-request text comes back on the wire keys the runner
+// decodes — so a resume opens a real PR instead of the
+// `chore: fishhawk implement stage <id>` placeholder that leaves #2570 open.
+// ---------------------------------------------------------------------------
+
+// prTextFixture is exemptPromptFixture with a triggering-issue context, which
+// the issue-context FALLBACK arm needs. Kept separate so the golden-projection
+// fixture above keeps its no-issue-context run row unchanged.
+func prTextFixture(t *testing.T, park *run.ScopeCompletenessPark, issue *run.IssueContext,
+	entries []*audit.Entry) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	runID, stageID := uuid.New(), uuid.New()
+	au := &exemptAuditFake{}
+	for _, e := range entries {
+		id := stageID
+		e.StageID = &id
+		au.entries = append(au.entries, e)
+	}
+	priv, _ := sf.issue(t, runID)
+	triggerRef := "issue:2570"
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		IssueContext: issue,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, ScopeCompletenessPark: park}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, AuditRepo: au})
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{Number: 2570, Title: "t", Body: "b", State: "open"}}
+	return s, runID, stageID, priv
+}
+
+// prTextKeys drives BOTH surfaces over the same state and returns the two
+// held-commit PR-text values from each, asserting they agree — the runner-facing
+// /prompt and the SPA-readable /prompt-render must never disagree about what the
+// resumed PR will say.
+func prTextKeys(t *testing.T, park *run.ScopeCompletenessPark, issue *run.IssueContext,
+	entries []*audit.Entry) (title, body string) {
+	t.Helper()
+	s, runID, stageID, priv := prTextFixture(t, park, issue, entries)
+	read := func(keys map[string]json.RawMessage, surface string) (string, string) {
+		var gotTitle, gotBody string
+		if raw, ok := keys["held_commit_pr_title"]; ok {
+			if err := json.Unmarshal(raw, &gotTitle); err != nil {
+				t.Fatalf("%s: decode held_commit_pr_title: %v", surface, err)
+			}
+		}
+		if raw, ok := keys["held_commit_pr_body"]; ok {
+			if err := json.Unmarshal(raw, &gotBody); err != nil {
+				t.Fatalf("%s: decode held_commit_pr_body: %v", surface, err)
+			}
+		}
+		return gotTitle, gotBody
+	}
+	title, body = read(exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt"), "/prompt")
+	rTitle, rBody := read(exemptBodyKeys(t, promptRenderRequest(t, s, stageID), "/prompt-render"), "/prompt-render")
+	if rTitle != title || rBody != body {
+		t.Errorf("/prompt-render disagrees with /prompt about the resumed PR text:\n"+
+			" /prompt:        (%q, %q)\n /prompt-render: (%q, %q)", title, body, rTitle, rBody)
+	}
+	return title, body
+}
+
+func exemptDecided(stageID uuid.UUID) []*audit.Entry {
+	return []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}
+}
+
+// TestPromptHeldCommitPRText_ExemptServesRecoveredText: the park row's captured
+// agent text reaches both prompt surfaces.
+func TestPromptHeldCommitPRText_ExemptServesRecoveredText(t *testing.T) {
+	park := exemptPark()
+	park.PRTitle = "feat(server): carry agent PR text across a resume"
+	park.PRBody = "## Summary\n\n- capture at park time"
+
+	title, body := prTextKeys(t, park, &run.IssueContext{Title: "[E67.5] placeholder PR", Number: 2570},
+		exemptDecided(uuid.New()))
+	if title != "feat(server): carry agent PR text across a resume" {
+		t.Errorf("held_commit_pr_title = %q, want the recovered title", title)
+	}
+	if !strings.HasPrefix(body, "## Summary\n\n- capture at park time") {
+		t.Errorf("held_commit_pr_body = %q, want the recovered body", body)
+	}
+	if !strings.HasSuffix(body, "\n\nCloses #2570") {
+		t.Errorf("held_commit_pr_body must close the trigger issue, got %q", body)
+	}
+}
+
+// TestPromptHeldCommitPRText_ExemptLegacyRowAuditFallback pins the legacy-row
+// ladder branch (binding condition 6): a park row written BEFORE the struct
+// carried the PR text still recovers it from the newest scope_completeness_parked
+// audit payload — the same fallback shape #2563 uses for base_sha. Without this,
+// every park written between the runner and backend deploys would resume with
+// the placeholder despite the text being on disk.
+func TestPromptHeldCommitPRText_ExemptLegacyRowAuditFallback(t *testing.T) {
+	stageID := uuid.New()
+	park := exemptPark()
+	park.PRTitle, park.PRBody = "", "" // the pre-#2570 row shape
+
+	entries := []*audit.Entry{
+		scopeDecisionEntryPayload(stageID, CategoryScopeCompletenessParked, 1,
+			`{"pr_title":"fix(runner): recovered from the audit row","pr_body":"## Summary\n\n- from the parked payload"}`),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}
+	title, body := prTextKeys(t, park, &run.IssueContext{Title: "[E67.5] placeholder PR", Number: 2570}, entries)
+	if title != "fix(runner): recovered from the audit row" {
+		t.Errorf("held_commit_pr_title = %q, want the audit-payload fallback", title)
+	}
+	if !strings.HasPrefix(body, "## Summary\n\n- from the parked payload") {
+		t.Errorf("held_commit_pr_body = %q, want the audit-payload fallback", body)
+	}
+
+	t.Run("partial: park title, audit body", func(t *testing.T) {
+		p := exemptPark()
+		p.PRTitle, p.PRBody = "feat: from the park row", ""
+		gotTitle, gotBody := prTextKeys(t, p,
+			&run.IssueContext{Title: "[E67.5] placeholder PR", Number: 2570},
+			[]*audit.Entry{
+				scopeDecisionEntryPayload(uuid.New(), CategoryScopeCompletenessParked, 1,
+					`{"pr_title":"chore: stale","pr_body":"## Summary\n\n- from the parked payload"}`),
+				scopeDecisionEntry(uuid.New(), CategoryScopeCompletenessExempted, 2),
+			})
+		if gotTitle != "feat: from the park row" {
+			t.Errorf("the park ROW must win over the audit fallback for a field it carries, got %q", gotTitle)
+		}
+		if !strings.HasPrefix(gotBody, "## Summary\n\n- from the parked payload") {
+			t.Errorf("the audit fallback must fill only the MISSING field, got %q", gotBody)
+		}
+	})
+}
+
+// TestPromptHeldCommitPRText_ExemptIssueContextFallback is m2 on the wire: a
+// pre-#2570 park with no recoverable text anywhere still serves a real,
+// issue-closing PR body rather than nothing.
+func TestPromptHeldCommitPRText_ExemptIssueContextFallback(t *testing.T) {
+	park := exemptPark() // no PRTitle/PRBody — the pre-change row
+	title, body := prTextKeys(t, park,
+		&run.IssueContext{Title: "[E67.5] a resume opens a placeholder PR", Number: 2570},
+		exemptDecided(uuid.New()))
+	if title != "chore: [E67.5] a resume opens a placeholder PR" {
+		t.Errorf("held_commit_pr_title = %q, want the synthesized conventional title", title)
+	}
+	if !strings.HasSuffix(body, "\n\nCloses #2570") {
+		t.Errorf("the synthesized body must close the trigger issue, got %q", body)
+	}
+}
+
+// TestPromptHeldCommitPRText_ExemptNoContextOmitsKeys: neither recovered text
+// nor issue context leaves BOTH keys absent, so the runner keeps today's
+// placeholder — and, critically, the held-commit fields are STILL emitted.
+// Unrecoverable PR text is a quality gap, never a reason to withhold a resume.
+func TestPromptHeldCommitPRText_ExemptNoContextOmitsKeys(t *testing.T) {
+	stageID := uuid.New()
+	s, runID, sid, priv := prTextFixture(t, exemptPark(), nil, exemptDecided(stageID))
+	keys := exemptBodyKeys(t, promptRequest(t, s, runID, sid, priv, ""), "/prompt")
+	for _, k := range []string{"held_commit_pr_title", "held_commit_pr_body"} {
+		if raw, ok := keys[k]; ok {
+			t.Errorf("with nothing to recover or synthesize, %s must be absent, got %s", k, raw)
+		}
+	}
+	if raw, ok := keys["open_pr_from_held_commit"]; !ok || string(raw) != "true" {
+		t.Errorf("unrecoverable PR text must NEVER withhold the resume itself; open_pr_from_held_commit = %s (present=%t)", raw, ok)
+	}
+}
+
+// TestPromptHeldCommitPRText_CheckpointServesRecoveredText: the #2169 checkpoint
+// gate serves the text off the push_checkpoint payload it already decodes.
+func TestPromptHeldCommitPRText_CheckpointServesRecoveredText(t *testing.T) {
+	entry := scopeDecisionEntryPayload(uuid.New(), "pull_request_failed", 7, `{
+		"category":"C","reason":"open PR: 503",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+		`","base_sha":"`+checkpointBaseSHA+`","verified_tree_sha":"6666666666666666666666666666666666666666",`+
+		`"pr_title":"feat(runner): checkpointed subject","pr_body":"## Summary\n\n- checkpointed narrative"}}`)
+
+	title, body := prTextKeys(t, nil, &run.IssueContext{Title: "[E67.5] placeholder PR", Number: 2570},
+		[]*audit.Entry{entry})
+	if title != "feat(runner): checkpointed subject" {
+		t.Errorf("held_commit_pr_title = %q, want the checkpointed title", title)
+	}
+	if !strings.HasPrefix(body, "## Summary\n\n- checkpointed narrative") {
+		t.Errorf("held_commit_pr_body = %q, want the checkpointed body", body)
+	}
+	if !strings.HasSuffix(body, "\n\nCloses #2570") {
+		t.Errorf("the checkpointed body must close the trigger issue, got %q", body)
+	}
+}
+
+// TestPromptHeldCommitPRText_CheckpointFallsBackToIssueContext: a pre-#2570
+// checkpoint carries no text, so the issue-context fallback fills it.
+func TestPromptHeldCommitPRText_CheckpointFallsBackToIssueContext(t *testing.T) {
+	title, body := prTextKeys(t, nil,
+		&run.IssueContext{Title: "fix(runner): stop dropping the PR text", Number: 2570},
+		[]*audit.Entry{checkpointFailedEntry(7)})
+	if title != "fix(runner): stop dropping the PR text" {
+		t.Errorf("held_commit_pr_title = %q, want the conventional issue title verbatim", title)
+	}
+	if !strings.HasSuffix(body, "\n\nCloses #2570") {
+		t.Errorf("held_commit_pr_body = %q, want a synthesized issue-closing body", body)
+	}
+}
+
+// TestPromptHeldCommitPRText_NoResumeNoText: an ordinary implement dispatch
+// (no park, no checkpoint) never carries the PR-text keys, so no other
+// dispatch's response shape changes.
+func TestPromptHeldCommitPRText_NoResumeNoText(t *testing.T) {
+	s, runID, stageID, priv := prTextFixture(t, nil,
+		&run.IssueContext{Title: "[E67.5] placeholder PR", Number: 2570}, nil)
+	keys := exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+	for _, k := range []string{"held_commit_pr_title", "held_commit_pr_body"} {
+		if raw, ok := keys[k]; ok {
+			t.Errorf("an ordinary implement dispatch must not carry %s, got %s", k, raw)
 		}
 	}
 }

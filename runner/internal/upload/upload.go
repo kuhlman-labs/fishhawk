@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 )
@@ -580,6 +581,27 @@ type FetchedPrompt struct {
 	// so a legacy exempt dispatch and every non-resume dispatch stay
 	// byte-identical to today.
 	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
+	// HeldCommitPRTitle and HeldCommitPRBody are the pull-request text the
+	// held-commit resume opens its PR with (#2570) — the agent-authored title +
+	// body recovered from the park row / checkpoint payload, or the backend's
+	// documented issue-context fallback when no agent text survived. Served ONLY
+	// alongside the held-commit trio above; empty on every other dispatch.
+	//
+	// PER-FIELD, NOT ALL-OR-NOTHING (#2570 binding condition 4): each is used
+	// independently, so a recovered title is never discarded because the body was
+	// empty. The runner falls back to its own placeholder only for whichever
+	// field is empty.
+	//
+	// HeldCommitPRBody EXCLUDES the Fishhawk attribution footer: the opening
+	// runner owns that footer and appends it exactly once (see HeldCommitPRText).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+	// backend's promptResponse.HeldCommitPRTitle / HeldCommitPRBody
+	// (backend/internal/server/prompt.go). Same independent-struct-by-tag
+	// convention as the held-commit trio. A tag drift silently degrades the
+	// resume back to the placeholder — the exact defect #2570 fixes.
+	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
+	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the
@@ -806,6 +828,242 @@ const (
 	MaxFailureReportReasonBytes        = 30 * 1024
 	AggressiveFailureReportReasonBytes = 2 * 1024
 )
+
+// Held-commit PR-text caps (#2570). A park / checkpoint report now carries the
+// agent-authored PR title + body so a held-commit RESUME opens a real pull
+// request instead of the `chore: fishhawk implement stage <id>` placeholder.
+// That text is agent-authored and unbounded, so it must be budgeted against the
+// SAME 32*1024 request-body cap the reason is: an oversized body would 413
+// body_too_large and strand the stage in `running` — strictly worse than the
+// placeholder this carries the text to avoid.
+//
+// MaxPullRequestReportBytes MIRRORS the backend's maxPullRequestBundleBytes
+// (backend/internal/server/pullrequest.go). The backend rejects a body STRICTLY
+// GREATER than that, so a report marshalling to exactly this many bytes is
+// accepted. MinFailureReportReasonBytes is the floor the reason yields down to
+// before the PR text starts being dropped — below it the operator's failure
+// diagnosis stops being useful.
+// MinHeldCommitPRBodyBytes is the floor the recovered PR body TRUNCATES toward
+// before it is dropped wholesale. A body that no longer fits is shrunk to the
+// largest fitting prefix rather than deleted, so an escape-heavy `## Summary`
+// still reaches the resume instead of degrading it to the synthesized fallback;
+// below this floor the surviving fragment is not worth the bytes and the whole
+// field yields to the reason.
+const (
+	MaxHeldCommitPRTitleBytes   = 300
+	MaxHeldCommitPRBodyBytes    = 8 * 1024
+	MinHeldCommitPRBodyBytes    = 512
+	MinFailureReportReasonBytes = 4 * 1024
+	MaxPullRequestReportBytes   = 32 * 1024
+)
+
+// heldCommitPRBodyTruncationMarker is appended to a PR body the size budget
+// truncated, so the operator reading the resumed pull request can tell the
+// narrative is a fragment rather than everything the agent wrote.
+const heldCommitPRBodyTruncationMarker = "\n\n_[truncated by the runner to fit the report size cap]_"
+
+// clampRunes bounds s to at most max BYTES, cutting back to a rune boundary
+// (#2570). Rune-safety is load-bearing for the size budget, not just for
+// correctness of the text: a cut that split a multi-byte character would leave
+// invalid UTF-8, and encoding/json replaces each invalid byte with U+FFFD —
+// THREE bytes on the wire for one — so a byte-exact clamp could GROW the
+// serialized payload it exists to bound.
+func clampRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// marshalOverflow reports how many bytes v's JSON encoding exceeds max by
+// (negative or zero when it fits), and false when v cannot be marshalled.
+//
+// MEASURING THE SERIALIZED FORM IS THE WHOLE POINT (#2570). Budgeting raw
+// string lengths is wrong: encoding/json HTML-escapes by default, so each `<`,
+// `>` and `&` becomes a six-byte `<`-style escape, a backslash doubles, and
+// a control character expands to `\uXXXX`. A title/body/reason set that measures
+// comfortably under the cap by len() can be several times over it once
+// marshalled — which is exactly the 413 this budget exists to prevent.
+func marshalOverflow(v any, max int) (int, bool) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0, false
+	}
+	return len(b) - max, true
+}
+
+// shrinkHeldCommitPRBody shrinks the recovered PR body *prBody carries, in
+// place, until envelope's MARSHALLED form fits maxBytes — reporting whether it
+// now fits.
+//
+// TRUNCATE BEFORE DROPPING (#2570). The captured `## Summary` is the whole point
+// of carrying PR text through a park: dropping it wholesale because its ESCAPED
+// form overshot the budget degrades the resume to the synthesized fallback even
+// though a shorter prefix would have fit.
+//
+// The retained length is found by BINARY SEARCH over the original text, each
+// candidate MEASURED as marshalled bytes (see marshalOverflow) rather than
+// estimated from raw lengths — the escape expansion is per-character and wildly
+// non-uniform (six bytes for `<`, one for a letter), so no arithmetic on raw
+// lengths can predict where the cut lands. The search keeps the LARGEST fitting
+// prefix; a single overflow-sized cut would converge on the floor and throw away
+// narrative that fits.
+//
+// Every candidate is cut on a rune boundary (clampRunes), because invalid UTF-8
+// is re-encoded as a THREE-byte U+FFFD per bad byte and could GROW the payload
+// this bounds. When not even MinHeldCommitPRBodyBytes of retained text fits, the
+// original is restored and false is reported, leaving the field for the caller's
+// drop rung.
+func shrinkHeldCommitPRBody(envelope any, prBody *string, maxBytes int) bool {
+	fits := func() bool {
+		over, ok := marshalOverflow(envelope, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+
+	original := *prBody
+	lo, hi := MinHeldCommitPRBodyBytes, len(original)
+	best := -1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		*prBody = clampRunes(original, mid) + heldCommitPRBodyTruncationMarker
+		if fits() {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best < 0 {
+		*prBody = original
+		return false
+	}
+	*prBody = clampRunes(original, best) + heldCommitPRBodyTruncationMarker
+	return true
+}
+
+// shrinkFailureBodyFields shrinks a failure report in place until its MARSHALLED
+// form fits maxBytes, returning false only when even the emptied-field envelope
+// does not fit (#2570). The ladder yields the least valuable field first:
+//
+//  0. Apply the nominal clamps unconditionally — reason to
+//     MaxFailureReportReasonBytes (today's behavior, byte-for-byte), PR title and
+//     body to their own caps. A report that fits after this rung is byte-identical
+//     to what the pre-#2570 runner shipped whenever the PR text is absent.
+//  1. Yield the REASON down toward MinFailureReportReasonBytes, shrinking by the
+//     MEASURED marshalled overflow each pass (never by a raw-length delta — see
+//     marshalOverflow) and re-measuring, so the loop converges on the real
+//     serialized size however the text escapes.
+//  2. TRUNCATE the PR body to the largest prefix that fits, measured the same
+//     way (shrinkHeldCommitPRBody). A fragment of the agent's `## Summary` is
+//     worth far more to the resumed pull request than the synthesized fallback
+//     dropping it entirely would force.
+//  3. Drop the PR body, then the PR title. Recovered narrative is the expendable
+//     field: losing it costs a placeholder PR, losing the reason costs the
+//     operator the diagnosis of why the stage failed at all.
+//  4. Shrink the reason BELOW its floor, halving until it fits or empties. Only
+//     reachable when the envelope alone (outcome/category/checkpoint SHAs) plus a
+//     4 KiB reason still exceeds the cap.
+//  5. Shrink exhausted: even the empty-field envelope is over. Report false so
+//     the caller ships the un-shrinkable body and lets the backend's 413 (and the
+//     bounded aggressive retry) decide, rather than silently claiming a fit.
+func shrinkFailureBodyFields(body *pullRequestFailureBody, maxBytes int) bool {
+	body.Reason = TruncateReason(body.Reason, MaxFailureReportReasonBytes)
+	body.Title = clampRunes(body.Title, MaxHeldCommitPRTitleBytes)
+	body.PRBody = clampRunes(body.PRBody, MaxHeldCommitPRBodyBytes)
+
+	fits := func() bool {
+		over, ok := marshalOverflow(body, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+
+	// Rung 1: the reason yields to its floor.
+	for {
+		over, ok := marshalOverflow(body, maxBytes)
+		if !ok {
+			return false
+		}
+		if over <= 0 {
+			return true
+		}
+		next := len(body.Reason) - over
+		if next < MinFailureReportReasonBytes {
+			next = MinFailureReportReasonBytes
+		}
+		if next >= len(body.Reason) {
+			break
+		}
+		body.Reason = TruncateReason(body.Reason, next)
+	}
+
+	// Rung 2: the recovered PR body truncates to what fits.
+	if shrinkHeldCommitPRBody(body, &body.PRBody, maxBytes) {
+		return true
+	}
+
+	// Rung 3: drop the recovered PR text.
+	body.PRBody = ""
+	if fits() {
+		return true
+	}
+	body.Title = ""
+	if fits() {
+		return true
+	}
+
+	// Rung 4: the reason yields below its floor.
+	for n := MinFailureReportReasonBytes / 2; n >= 1; n /= 2 {
+		body.Reason = TruncateReason(body.Reason, n)
+		if fits() {
+			return true
+		}
+	}
+	body.Reason = ""
+
+	// Rung 5: shrink exhausted.
+	return fits()
+}
+
+// shrinkParkBodyFields is the park-report sibling of shrinkFailureBodyFields
+// (#2570). A park body carries no reason, so the ladder is the two PR-text
+// clamps, then TRUNCATING the body to what fits, then dropping the body and the
+// title when the shortfall lists alone push the marshalled form past the cap.
+// Returns false when even the PR-text-free body is over — the shortfall lists
+// are the park's whole payload and are never dropped, so that case is the
+// caller's to surface.
+func shrinkParkBodyFields(body *pullRequestScopeParkBody, maxBytes int) bool {
+	body.Title = clampRunes(body.Title, MaxHeldCommitPRTitleBytes)
+	body.PRBody = clampRunes(body.PRBody, MaxHeldCommitPRBodyBytes)
+
+	fits := func() bool {
+		over, ok := marshalOverflow(body, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+	if shrinkHeldCommitPRBody(body, &body.PRBody, maxBytes) {
+		return true
+	}
+	body.PRBody = ""
+	if fits() {
+		return true
+	}
+	body.Title = ""
+	return fits()
+}
 
 // TruncateReason bounds s to at most max bytes for a failure-report field
 // (#1791). When s already fits it is returned byte-identical. Otherwise the
@@ -1317,6 +1575,17 @@ type ShipPullRequestArgs struct {
 	// the fixup_pushed report populates it; with the json omitempty tag below the
 	// "pushed" child-push and "fixup_no_changes" bodies stay byte-identical.
 	ApplyPath string
+
+	// PRTitle and PRBody carry the agent-authored pull-request text onto the
+	// Outcome=="scope_park" park report and the checkpoint-bearing
+	// Outcome=="failed" report (#2570), so a held-commit RESUME opens a real pull
+	// request instead of the `chore: fishhawk implement stage <id>` placeholder.
+	// PRBody excludes the Fishhawk attribution footer — the OPENING runner owns
+	// it (see HeldCommitPRText). Both are clamped and budgeted against the
+	// backend's 32 KiB request cap before shipping; empty on every other outcome
+	// and on every pre-push failure, where the body stays byte-identical to today.
+	PRTitle string
+	PRBody  string
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -1346,6 +1615,12 @@ type pullRequestFailureBody struct {
 	HeadSHA         string `json:"head_sha,omitempty"`
 	BaseSHA         string `json:"base_sha,omitempty"`
 	VerifiedTreeSHA string `json:"verified_tree_sha,omitempty"`
+
+	// HeldCommitPRText is the agent-authored PR title + body the checkpoint
+	// carries (#2570), appended LAST and fully omitempty so every pre-#2570
+	// failure body — and therefore every signature and content hash over it — is
+	// BYTE-IDENTICAL. Populated only alongside a real checkpoint.
+	HeldCommitPRText
 }
 
 // pullRequestChildPushBody is the success-report wire shape ShipPullRequest
@@ -1365,6 +1640,29 @@ type pullRequestChildPushBody struct {
 	// "fixup_pushed" report. omitempty keeps the "pushed" child-push and
 	// "fixup_no_changes" bodies byte-identical when it is unset.
 	ApplyPath string `json:"apply_path,omitempty"`
+}
+
+// HeldCommitPRText is the agent-authored pull-request title + body a park or
+// checkpoint report carries so a held-commit RESUME opens a real pull request
+// (#2570). Both fields are omitempty on every body that embeds it, so a report
+// shipped WITHOUT recovered text — every pre-#2570 shape — marshals
+// BYTE-IDENTICALLY to today, and every signature and content hash over those
+// bytes is unchanged.
+//
+// FOOTER OWNERSHIP (#2570 binding condition 3). PRBody is the agent's body
+// WITHOUT the Fishhawk attribution footer. The footer is owned by the OPENING
+// runner and appended once at open time (openHeldCommitPR), never persisted
+// here — so a resumed PR carries exactly one footer, stamped with the branch and
+// audit URL of the run that actually opened it, and truncation can never clip it.
+//
+// The json tags (title/body) are the runner↔backend WIRE CONTRACT: they are
+// byte-identical to the backend's pullRequestBody Title/Body fields
+// (backend/internal/server/pullrequest.go), which the success artifact already
+// declares — so the backend's DisallowUnknownFields decoder accepts both
+// variants with no new decode field.
+type HeldCommitPRText struct {
+	Title  string `json:"title,omitempty"`
+	PRBody string `json:"body,omitempty"`
 }
 
 // pullRequestScopeParkBody is the scope-completeness park-report wire shape
@@ -1395,6 +1693,11 @@ type pullRequestScopeParkBody struct {
 	// omitempty so every pre-#2548 park body — and therefore every signature and
 	// content hash computed over it — is BYTE-IDENTICAL.
 	BuildRequiredPaths []string `json:"build_required_paths,omitempty"`
+
+	// HeldCommitPRText is the agent-authored PR title + body the park carries so
+	// the exempt resume opens a real pull request (#2570). Appended LAST and
+	// fully omitempty, so every pre-#2570 park body is BYTE-IDENTICAL.
+	HeldCommitPRText
 }
 
 // BindingAssertionReport is one unsatisfied operator-declared binding assertion
@@ -1446,17 +1749,28 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		// implement failure whose reason embeds the whole multi-module verify
 		// output would otherwise 413 body_too_large and strand the stage
 		// 'running'. The full text stays in the trace bundle + local log.
-		marshalled, err := json.Marshal(pullRequestFailureBody{
+		failure := pullRequestFailureBody{
 			Outcome:  args.Outcome,
 			Category: args.Category,
-			Reason:   TruncateReason(args.Reason, MaxFailureReportReasonBytes),
+			Reason:   args.Reason,
 			// PR-open checkpoint (#2169): empty on every pre-push failure, so the
 			// body stays byte-identical to the legacy shape there.
 			Branch:          args.Branch,
 			HeadSHA:         args.HeadSHA,
 			BaseSHA:         args.BaseSHA,
 			VerifiedTreeSHA: args.TreeSHA,
-		})
+			// Held-commit PR text (#2570): empty everywhere the checkpoint is,
+			// so the legacy body stays byte-identical there too.
+			HeldCommitPRText: HeldCommitPRText{Title: args.PRTitle, PRBody: args.PRBody},
+		}
+		// Budget the MARSHALLED bytes, not the raw field lengths (#2570): the
+		// reason's nominal 30 KiB clamp is applied inside, then the ladder yields
+		// fields until the SERIALIZED body fits the backend's cap. A false return
+		// means even the emptied envelope is over — ship it anyway and let the
+		// backend's 413 plus the bounded aggressive retry below decide, rather
+		// than dropping the report the stage's recovery depends on.
+		_ = shrinkFailureBodyFields(&failure, MaxPullRequestReportBytes)
+		marshalled, err := json.Marshal(failure)
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
 		}
@@ -1487,7 +1801,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		// body from the held commit details + the missing declared paths rather
 		// than the (absent) PR artifact. The backend records the park payload and
 		// transitions the implement stage to awaiting_scope_decision.
-		marshalled, err := json.Marshal(pullRequestScopeParkBody{
+		park := pullRequestScopeParkBody{
 			Outcome:               args.Outcome,
 			Branch:                args.Branch,
 			HeadSHA:               args.HeadSHA,
@@ -1496,7 +1810,13 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			MissingPaths:          args.MissingPaths,
 			UnsatisfiedAssertions: args.UnsatisfiedAssertions,
 			BuildRequiredPaths:    args.BuildRequiredPaths,
-		})
+			// Held-commit PR text (#2570) so the exempt resume opens a real PR.
+			// Empty on a pre-#2570 runner, where the body is byte-identical.
+			HeldCommitPRText: HeldCommitPRText{Title: args.PRTitle, PRBody: args.PRBody},
+		}
+		// Same marshalled-bytes budget as the failure body (#2570).
+		_ = shrinkParkBodyFields(&park, MaxPullRequestReportBytes)
+		marshalled, err := json.Marshal(park)
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request scope-park body: %w", err)
 		}
@@ -1612,6 +1932,13 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 					HeadSHA:         args.HeadSHA,
 					BaseSHA:         args.BaseSHA,
 					VerifiedTreeSHA: args.TreeSHA,
+					// The held-commit PR text (#2570) is DELIBERATELY dropped here.
+					// This rung exists because even the budgeted body was rejected,
+					// so it ships the minimum that still makes the stage recoverable:
+					// the checkpoint coordinates (without which the retry re-runs the
+					// whole agent) and a 2 KiB reason. The PR text costs only the
+					// placeholder title the backend's issue-context fallback then
+					// covers — the cheapest field to lose.
 				})
 				if mErr != nil {
 					return nil, fmt.Errorf("upload: marshal aggressive pull-request failure body: %w", mErr)

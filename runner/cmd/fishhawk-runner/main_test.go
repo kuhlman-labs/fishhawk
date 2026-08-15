@@ -12833,7 +12833,7 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), cfg,
-		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA, "",
+		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA, "", "", "",
 		&logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
@@ -14304,7 +14304,7 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 		backendURL: "https://api.fishhawk.test",
 	}
 	var logSink strings.Builder
-	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "cafef00ddeadbeef", "", &logSink, fu, issued); code != exitOK {
+	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "cafef00ddeadbeef", "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -14355,7 +14355,7 @@ func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
 	var logSink strings.Builder
 	// held SHA / branch deliberately empty → fail-closed (base SHA present so
 	// the RED lands on the branch/SHA guard, not the #2563 base-SHA guard).
-	if code := openHeldCommitPR(context.Background(), cfg, "", "", "cafef00ddeadbeef", "", &logSink, fu, issued); code != exitFailure {
+	if code := openHeldCommitPR(context.Background(), cfg, "", "", "cafef00ddeadbeef", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("missing held fields must fail, exit = %d", code)
 	}
 	if fpr.gotArgs != nil {
@@ -14394,7 +14394,7 @@ func TestOpenHeldCommitPR_MissingBaseSHAOpensNoPR(t *testing.T) {
 	var logSink strings.Builder
 	// held branch + SHA present, base SHA empty by construction → the #2563
 	// no-orphan guard must fire.
-	code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", "", &logSink, fu, issued)
+	code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", "", "", "", &logSink, fu, issued)
 
 	// THE load-bearing assertion, and it is FIRST and non-fatal so nothing masks
 	// it: no PR was opened on the forge (committed external state, read AFTER the
@@ -19329,7 +19329,7 @@ func TestOpenHeldCommitPR_ResumeSkipsAgentAndOpensPR(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil || fpr.gotArgs.Head != branch {
@@ -19392,7 +19392,7 @@ func TestOpenHeldCommitPR_ResumeAdoptsExistingPR(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if creates != 0 {
@@ -19440,7 +19440,7 @@ func TestOpenHeldCommitPR_ResumeStaleRemoteTipFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		movedCheckpoint, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued)
+		movedCheckpoint, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
 
 	// THE load-bearing assertion, first and non-fatal so nothing masks it: the
 	// forge was never touched. Deleting the guard reddens THIS line.
@@ -19478,7 +19478,7 @@ func TestOpenHeldCommitPR_ResumeMissingRemoteBranchFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, "fishhawk/never-pushed", "base-sha-2169", resumeKindPROpen, &logSink, fu, issued)
+		headSHA, "fishhawk/never-pushed", "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
 	if fpr.gotArgs != nil {
 		t.Errorf("a vanished branch must open NO PR, got: %+v", fpr.gotArgs)
 	}
@@ -19506,7 +19506,7 @@ func TestOpenHeldCommitPR_ResumeLsRemoteErrorFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued)
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
 	if fpr.gotArgs != nil {
 		t.Errorf("an unreadable remote tip must open NO PR, got: %+v", fpr.gotArgs)
 	}
@@ -19536,7 +19536,7 @@ func TestOpenHeldCommitPR_ResumeFailureReportCarriesCheckpoint(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a failed resume must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -19569,7 +19569,7 @@ func TestOpenHeldCommitPR_LegacyExemptPathUnchanged(t *testing.T) {
 	var logSink strings.Builder
 	// Empty resume kind = the legacy #1231 exempt resolution.
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("the legacy exempt path must not probe the remote tip; exit = %d\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -19598,7 +19598,7 @@ func TestOpenHeldCommitPR_LegacyExemptFailureReportCarriesNoCheckpoint(t *testin
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -19637,7 +19637,7 @@ func TestOpenHeldCommitPR_ShipRejectedAsInvalid_ReportsCategoryC(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -19671,7 +19671,7 @@ func TestOpenHeldCommitPR_LegacyExemptShipRejectedReportsCategoryC(t *testing.T)
 	var logSink strings.Builder
 	// Empty resume kind = the legacy #1231 exempt resolution.
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -20568,4 +20568,370 @@ func packageSourceDir(t *testing.T) string {
 		t.Fatal("runtime.Caller failed; cannot locate the package source dir")
 	}
 	return filepath.Dir(file)
+}
+
+// --- Held-commit resume opens a REAL pull request (#2570) ---
+//
+// CROSS-BOUNDARY, runner consume half. The backend serves the recovered (or
+// synthesized) PR text on the prompt response; these drive the REAL
+// openHeldCommitPR over it and assert what reached the forge opener.
+
+// TestOpenHeldCommitPR_UsesServedPRText is m1 and the DONE-MEANS behavioral
+// assertion: the title handed to the PR opener is the agent's conventional
+// subject and the body carries the agent's `## Summary` AND a `Closes #N` line,
+// so a no-op or comment-only touch of the resume path fails here.
+//
+// It also pins footer ownership (binding condition 3): the attribution footer
+// appears EXACTLY ONCE. The served body is footer-free by wire contract and this
+// runner is the one that opens the PR, so it owns the footer.
+func TestOpenHeldCommitPR_UsesServedPRText(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const servedTitle = "feat(server): carry agent PR text across a held-commit resume"
+	const servedBody = "## Summary\n\n- capture at park time\n\n## Test plan\n\n- [ ] run it\n\nCloses #2570"
+
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, servedTitle, servedBody,
+		&logSink, fu, issued); code != exitOK {
+		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("the resume must open a PR")
+	}
+	if fpr.gotArgs.Title != servedTitle {
+		t.Errorf("PR title = %q, want the served agent subject %q", fpr.gotArgs.Title, servedTitle)
+	}
+	if !strings.HasPrefix(fpr.gotArgs.Body, "## Summary\n\n- capture at park time") {
+		t.Errorf("PR body must open with the agent's own summary, got:\n%s", fpr.gotArgs.Body)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "Closes #2570") {
+		t.Errorf("PR body must carry the auto-close directive, got:\n%s", fpr.gotArgs.Body)
+	}
+	// The placeholder must be GONE — this is the defect #2570 names.
+	if strings.Contains(fpr.gotArgs.Title, "fishhawk implement stage") {
+		t.Errorf("the resume still opened the placeholder title: %q", fpr.gotArgs.Title)
+	}
+	// Footer ownership: exactly one.
+	if n := strings.Count(fpr.gotArgs.Body, "_Opened by [Fishhawk]"); n != 1 {
+		t.Errorf("attribution footer count = %d, want exactly 1:\n%s", n, fpr.gotArgs.Body)
+	}
+	// The shipped artifact must carry the same text the forge got.
+	var artifact struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("the resume must ship a pull_request artifact")
+	}
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &artifact); err != nil {
+		t.Fatalf("decode artifact: %v", err)
+	}
+	if artifact.Title != servedTitle || artifact.Body != fpr.gotArgs.Body {
+		t.Errorf("the shipped artifact must record exactly what was opened:\n title: %q\n body: %q", artifact.Title, artifact.Body)
+	}
+}
+
+// TestOpenHeldCommitPR_ServedPRTextPartial pins binding condition 4 on the
+// consume side: each served field is used independently, so a served title with
+// an empty body (or the reverse) is NOT discarded back to the placeholder pair.
+func TestOpenHeldCommitPR_ServedPRTextPartial(t *testing.T) {
+	t.Run("title only", func(t *testing.T) {
+		repo, branch, headSHA := checkpointResumeRepo(t)
+		fpr := withFakePROpenerOnly(t)
+		fu := newFakeUploader(t)
+		issued, _ := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+		var logSink strings.Builder
+		if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+			headSHA, branch, "base-sha-2169", resumeKindPROpen, "feat(server): served subject", "",
+			&logSink, fu, issued); code != exitOK {
+			t.Fatalf("exit = %d, want exitOK\n%s", code, logSink.String())
+		}
+		if fpr.gotArgs.Title != "feat(server): served subject" {
+			t.Errorf("a served title must survive an empty served body, got %q", fpr.gotArgs.Title)
+		}
+	})
+
+	t.Run("body only", func(t *testing.T) {
+		repo, branch, headSHA := checkpointResumeRepo(t)
+		fpr := withFakePROpenerOnly(t)
+		fu := newFakeUploader(t)
+		issued, _ := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+		var logSink strings.Builder
+		if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+			headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "## Summary\n\n- served narrative",
+			&logSink, fu, issued); code != exitOK {
+			t.Fatalf("exit = %d, want exitOK\n%s", code, logSink.String())
+		}
+		if !strings.HasPrefix(fpr.gotArgs.Body, "## Summary\n\n- served narrative") {
+			t.Errorf("a served body must survive an empty served title, got:\n%s", fpr.gotArgs.Body)
+		}
+		if !strings.Contains(fpr.gotArgs.Title, "fishhawk implement stage") {
+			t.Errorf("the MISSING title falls back to the placeholder half, got %q", fpr.gotArgs.Title)
+		}
+		if n := strings.Count(fpr.gotArgs.Body, "_Opened by [Fishhawk]"); n != 1 {
+			t.Errorf("attribution footer count = %d, want exactly 1", n)
+		}
+	})
+}
+
+// TestOpenHeldCommitPR_FallbackStillOpensPR is m3, the issue's explicit
+// counterfactual criterion: with NO served text (a pre-#2570 backend, or a run
+// with nothing recoverable) the resume STILL opens a PR and STILL ships the
+// artifact — it merely opens with today's placeholder. This change can never
+// make a resume start failing.
+//
+// It is ALSO the assertion that pins the plan's divergence from the issue's
+// proposal 1. If the /tmp handoff were still readable at resume time (it is
+// not — loadAgentAuthoredPR deletes it on every read path, and the parking pass
+// consumed it long before), the agent's title would appear here instead of the
+// placeholder and this assertion would fail.
+func TestOpenHeldCommitPR_FallbackStillOpensPR(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "",
+		&logSink, fu, issued); code != exitOK {
+		t.Fatalf("a resume with no served text must still succeed; exit = %d\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("a resume with no served text must STILL open a PR")
+	}
+	if !strings.Contains(fpr.gotArgs.Title, "fishhawk implement stage") {
+		t.Errorf("with no served text the placeholder is expected, got %q", fpr.gotArgs.Title)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "" {
+		t.Errorf("a resume with no served text must STILL ship the success artifact, got %+v", fu.gotPRArgs)
+	}
+}
+
+// TestOpenHeldCommitPR_FailureReReportsPRText is m6: a pr_open resume that
+// itself FAILS re-reports a checkpoint that STILL carries the served PR text, so
+// the next retry is not silently degraded back to the placeholder — the
+// repeatable-resume property #2169 established for the coordinates.
+func TestOpenHeldCommitPR_FailureReReportsPRText(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("forge 503")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const servedTitle = "feat(server): served subject"
+	const servedBody = "## Summary\n\n- served narrative"
+
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, servedTitle, servedBody,
+		&logSink, fu, issued); code != exitFailure {
+		t.Fatalf("a failed PR open must exit failure, got %d\n%s", code, logSink.String())
+	}
+	rep := lastFailureReport(fu)
+	if rep == nil {
+		t.Fatal("no failure report shipped")
+	}
+	if rep.PRTitle != servedTitle || rep.PRBody != servedBody {
+		t.Errorf("a failed resume must RE-CARRY the PR text so the next retry is not degraded;\n"+
+			" got title=%q body=%q", rep.PRTitle, rep.PRBody)
+	}
+	// The coordinates must still ride too — losing them would cost the resume.
+	if rep.Branch != branch || rep.HeadSHA != headSHA {
+		t.Errorf("the failure report must re-carry the coordinates, got branch=%q head=%q", rep.Branch, rep.HeadSHA)
+	}
+}
+
+// TestOpenHeldCommitPR_LegacyExemptFailureCarriesNoPRText: the #1231 legacy
+// exempt path reports WITHOUT a checkpoint, so its failure report carries no PR
+// text either — keeping that report's audit shape unchanged.
+func TestOpenHeldCommitPR_LegacyExemptFailureCarriesNoPRText(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("forge 503")
+	fu := newFakeUploader(t)
+	issued, _ := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	var logSink strings.Builder
+	// Empty resume kind = the legacy #1231 exempt resolution.
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", "", "feat: served", "## Summary",
+		&logSink, fu, issued); code != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
+	}
+	rep := lastFailureReport(fu)
+	if rep == nil {
+		t.Fatal("no failure report shipped")
+	}
+	if rep.PRTitle != "" || rep.PRBody != "" || rep.Branch != "" {
+		t.Errorf("the legacy exempt path reports without a checkpoint, so no PR text rides it; got %+v", rep)
+	}
+}
+
+// TestOpenPRAndShipArtifact_ParkCarriesAgentPRText is the CAPTURE half of the
+// cross-boundary seam (#2570): the REAL openPRAndShipArtifact park path ships a
+// scope_park report carrying the agent's PR title and body, which is what the
+// backend persists onto the park row for the exempt resume to open with.
+//
+// It also pins FOOTER OWNERSHIP (binding condition 3) at the capture point: the
+// PERSISTED body is footer-free, because the runner that later OPENS the pull
+// request appends the footer. Persisting a footered body would double it on
+// resume (or stamp it with the wrong branch), and truncation could clip it.
+func TestOpenPRAndShipArtifact_ParkCarriesAgentPRText(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "never-touched.txt", Operation: "modify"})
+
+	// The agent's PR-description handoff, exactly as the implement agent writes it.
+	prPath := withPRDescriptionPath(t, cfg.runID, cfg.stageID)
+	const agentTitle = "feat(server): carry agent PR text across a resume"
+	const agentBody = "## Summary\n\n- capture at park time\n\nCloses #2570"
+	if err := os.WriteFile(prPath, []byte(agentTitle+"\n\n"+agentBody+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued,
+		"", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on the scope-completeness park")
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("want a scope_park report, got: %+v", fu.gotPRArgs)
+	}
+	if fu.gotPRArgs.PRTitle != agentTitle {
+		t.Errorf("park report PRTitle = %q, want the agent's title %q", fu.gotPRArgs.PRTitle, agentTitle)
+	}
+	if fu.gotPRArgs.PRBody != agentBody {
+		t.Errorf("park report PRBody = %q, want the agent's body %q", fu.gotPRArgs.PRBody, agentBody)
+	}
+	if strings.Contains(fu.gotPRArgs.PRBody, "_Opened by [Fishhawk]") {
+		t.Errorf("the PERSISTED body must be footer-free — the opening runner owns the footer:\n%s", fu.gotPRArgs.PRBody)
+	}
+}
+
+// TestOpenPRAndShipArtifact_ParkWithoutAgentTextCarriesNoPlaceholder: when the
+// agent wrote NO PR description, the park must carry NOTHING rather than the
+// `chore: fishhawk implement stage <id>` placeholder. Persisting the placeholder
+// would defeat the whole point — the backend's issue-context fallback would then
+// never fire, because a placeholder is indistinguishable from recovered text.
+func TestOpenPRAndShipArtifact_ParkWithoutAgentTextCarriesNoPlaceholder(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "never-touched.txt", Operation: "modify"})
+	// Redirect the handoff paths into a temp dir and write NOTHING there.
+	withPRDescriptionPath(t, cfg.runID, cfg.stageID)
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued,
+		"", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("missing-scope-only must PARK, got: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("want a scope_park report, got: %+v", fu.gotPRArgs)
+	}
+	if fu.gotPRArgs.PRTitle != "" || fu.gotPRArgs.PRBody != "" {
+		t.Errorf("with no agent PR description the park must carry NO text (never the placeholder), got (%q, %q)",
+			fu.gotPRArgs.PRTitle, fu.gotPRArgs.PRBody)
+	}
+}
+
+// TestOpenPRAndShipArtifact_CheckpointCarriesAgentPRText: the checkpoint half of
+// the capture — a post-push failure's report carries the agent's PR text
+// alongside the coordinates, so the retry's resume opens a real pull request.
+func TestOpenPRAndShipArtifact_CheckpointCarriesAgentPRText(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("forge 503")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	prPath := withPRDescriptionPath(t, cfg.runID, cfg.stageID)
+	const agentTitle = "feat(server): carry agent PR text across a resume"
+	const agentBody = "## Summary\n\n- capture at checkpoint arm time"
+	if err := os.WriteFile(prPath, []byte(agentTitle+"\n\n"+agentBody+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	var cp pushCheckpoint
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued,
+		"", false, false, nil, false, verifiedTree, "", nil, nil, nil, &cp); err == nil {
+		t.Fatalf("a failing PR open must surface an error\n%s", logSink.String())
+	}
+	if !cp.armed {
+		t.Fatal("the checkpoint must be armed once the commit is pushed")
+	}
+	if cp.prTitle != agentTitle || cp.prBody != agentBody {
+		t.Errorf("the armed checkpoint must carry the agent's PR text, got (%q, %q)", cp.prTitle, cp.prBody)
+	}
+	if strings.Contains(cp.prBody, "_Opened by [Fishhawk]") {
+		t.Errorf("the checkpointed body must be footer-free, got:\n%s", cp.prBody)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NoCheckpointPRTextOnPrePushFailure: a PRE-push
+// failure leaves the checkpoint at its zero value, so no PR text can ride the
+// report and the failure body stays byte-identical to today's shape.
+func TestOpenPRAndShipArtifact_NoCheckpointPRTextOnPrePushFailure(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.githubRepo = "not-a-slug" // fails before the push
+	prPath := withPRDescriptionPath(t, cfg.runID, cfg.stageID)
+	if err := os.WriteFile(prPath, []byte("feat: x\n\n## Summary\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, _ := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+
+	var cp pushCheckpoint
+	var logSink strings.Builder
+	_ = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued,
+		"", false, false, nil, false, verifiedTree, "", nil, nil, nil, &cp)
+	if cp.armed || cp.prTitle != "" || cp.prBody != "" {
+		t.Errorf("a pre-push failure must leave the checkpoint zero-valued, got %+v", cp)
+	}
 }

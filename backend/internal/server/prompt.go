@@ -308,6 +308,24 @@ type promptResponse struct {
 	// tag drift degrades a pr_open resume into the legacy exempt path: still
 	// correct (same branch, same PR) but without the remote-tip guard.
 	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
+	// HeldCommitPRTitle / HeldCommitPRBody are the pull-request text the resumed
+	// runner opens its PR with (#2570): the agent-authored title + body recovered
+	// from the park row or the checkpoint payload, or the documented
+	// issue-context fallback when no agent text survived. Before this, a resume
+	// always opened `chore: fishhawk implement stage <id>` with no summary, no
+	// test plan and no `Closes #N`, so the trigger issue never auto-closed.
+	//
+	// Emitted ONLY alongside the held-commit fields above, and each independently
+	// omitempty — an unrecoverable field is emitted empty and the runner keeps
+	// its own placeholder half, so a resume never fails on missing text. The body
+	// is FOOTER-FREE; the opening runner appends the attribution footer once.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt.HeldCommitPRTitle / HeldCommitPRBody
+	// (runner/internal/upload/upload.go). Same independent-struct-by-tag
+	// convention as the four fields above.
+	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
+	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -1324,21 +1342,29 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// re-run. Fail-closed — see resolveHeldCommitExemption. A fix-up dispatch
 		// is refused inside the resolver (#2630) so the fetched fix-up prompt runs
 		// instead of the pre-agent held-commit short-circuit.
-		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
+		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
 			resp.OpenPRFromHeldCommit = true
-			resp.HeldCommitSHA = heldSHA
-			resp.HeldCommitBranch = heldBranch
-			resp.HeldCommitBaseSHA = heldBaseSHA
-		} else if heldSHA, heldBranch, heldBaseSHA, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
+			resp.HeldCommitSHA = held.sha
+			resp.HeldCommitBranch = held.branch
+			resp.HeldCommitBaseSHA = held.baseSHA
+			// #2570: the resolved PR text rides alongside, so the resume opens a
+			// real pull request rather than the placeholder. Empty when neither the
+			// agent text nor the issue-context fallback was available.
+			resp.HeldCommitPRTitle = held.prTitle
+			resp.HeldCommitPRBody = held.prBody
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
 			// PR-open CHECKPOINT resume (#2169), taken ONLY when the exempt
 			// resolution above returned false. An exempt-resolved park always wins:
 			// #1231 keeps precedence, and the two can never both set the fields (so
 			// the resume kind an exempt emission carries is always empty).
 			resp.OpenPRFromHeldCommit = true
-			resp.HeldCommitSHA = heldSHA
-			resp.HeldCommitBranch = heldBranch
-			resp.HeldCommitBaseSHA = heldBaseSHA
+			resp.HeldCommitSHA = held.sha
+			resp.HeldCommitBranch = held.branch
+			resp.HeldCommitBaseSHA = held.baseSHA
 			resp.HeldCommitResumeKind = resumeKindPROpen
+			// #2570, same as the exempt arm above.
+			resp.HeldCommitPRTitle = held.prTitle
+			resp.HeldCommitPRBody = held.prBody
 		}
 	}
 	// Plan-stage model routing (#1416): resolve the plan-model ladder and carry
@@ -1853,20 +1879,28 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// dispatch path so the rendered (SPA-readable) prompt response stays
 		// byte-consistent with the runner-facing one. A fix-up dispatch is refused
 		// inside the resolver (#2630) identically to the dispatch path.
-		if heldSHA, heldBranch, heldBaseSHA, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
+		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
 			resp.OpenPRFromHeldCommit = true
-			resp.HeldCommitSHA = heldSHA
-			resp.HeldCommitBranch = heldBranch
-			resp.HeldCommitBaseSHA = heldBaseSHA
-		} else if heldSHA, heldBranch, heldBaseSHA, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
+			resp.HeldCommitSHA = held.sha
+			resp.HeldCommitBranch = held.branch
+			resp.HeldCommitBaseSHA = held.baseSHA
+			// #2570: the resolved PR text rides alongside, so the resume opens a
+			// real pull request rather than the placeholder. Empty when neither the
+			// agent text nor the issue-context fallback was available.
+			resp.HeldCommitPRTitle = held.prTitle
+			resp.HeldCommitPRBody = held.prBody
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
 			// PR-open CHECKPOINT resume (#2169), same derivation + same
 			// exempt-wins precedence as the dispatch path so the rendered
 			// (SPA-readable) prompt response stays byte-consistent with it.
 			resp.OpenPRFromHeldCommit = true
-			resp.HeldCommitSHA = heldSHA
-			resp.HeldCommitBranch = heldBranch
-			resp.HeldCommitBaseSHA = heldBaseSHA
+			resp.HeldCommitSHA = held.sha
+			resp.HeldCommitBranch = held.branch
+			resp.HeldCommitBaseSHA = held.baseSHA
 			resp.HeldCommitResumeKind = resumeKindPROpen
+			// #2570, same as the exempt arm above.
+			resp.HeldCommitPRTitle = held.prTitle
+			resp.HeldCommitPRBody = held.prBody
 		}
 	}
 	// Plan-stage model routing (#1416), same derivation as the dispatch path so
@@ -3202,23 +3236,23 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // unproven or unshippable exemption. A missing base SHA fails closed here
 // because the runner would otherwise open the PR and then fail category-B
 // shipping an artifact the backend rejects (#2563), orphaning the PR.
-func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (sha, branch, baseSHA string, ok bool) {
+func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement || stage.ScopeCompletenessPark == nil {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	// FIX-UP REFUSAL (#2630): a fix-up dispatch carries a fix-up prompt the
 	// runner MUST run; emitting the held-commit fields would send it to the
 	// pre-agent openHeldCommitPR short-circuit and discard that prompt. Mirror
 	// the sibling resolvePushCheckpointResume's refusal exactly.
 	if fixup {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	if s.cfg.AuditRepo == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: audit repository unconfigured; omitting held-commit exempt fields",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	var newest *audit.Entry
 	var newestCategory string
@@ -3232,7 +3266,7 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 				slog.String("stage_id", stage.ID.String()),
 				slog.String("category", cat),
 				slog.String("error", err.Error()))
-			return "", "", "", false
+			return heldCommitResume{}, false
 		}
 		for _, e := range entries {
 			if e.StageID == nil || *e.StageID != stage.ID {
@@ -3248,7 +3282,7 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 		}
 	}
 	if newest == nil || newestCategory != CategoryScopeCompletenessExempted {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	park := stage.ScopeCompletenessPark
 	// #2548 BUILD-REQUIRED WITHHOLDING GATE — defence in depth behind the
@@ -3265,14 +3299,14 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()),
 			slog.Int("build_required_path_count", len(park.BuildRequiredPaths)))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	if park.HeldCommitSHA == "" || park.RunBranch == "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: exempt-resolved park carries no held commit; omitting held-commit exempt fields",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	// #2563: resolve the base SHA the exempt resume ships as the artifact's
 	// base_sha. Prefer the park field; fall back to the newest parked audit
@@ -3288,7 +3322,7 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 				slog.String("run_id", runRow.ID.String()),
 				slog.String("stage_id", stage.ID.String()),
 				slog.String("error", err.Error()))
-			return "", "", "", false
+			return heldCommitResume{}, false
 		}
 		base = payload.BaseSHA
 	}
@@ -3297,9 +3331,63 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 			"prompt: exempt-resolved park carries no base SHA (park.base_sha empty, no parked-audit fallback); omitting held-commit exempt fields",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
-	return park.HeldCommitSHA, park.RunBranch, base, true
+	// #2570: recover the agent-authored PR text so the resume opens a REAL pull
+	// request. Same legacy-row ladder as base_sha above — prefer the park row's
+	// own fields, fall back to the newest parked audit payload for a park written
+	// before the struct carried them. PER-FIELD (binding condition 4): the
+	// fallback fills whichever field the park row left empty, so a park carrying
+	// only a title is not discarded.
+	//
+	// UNRECOVERABLE PR TEXT IS NEVER A REASON TO WITHHOLD THE RESUME. Every
+	// branch here degrades to empty and lets the caller synthesize (or the runner
+	// fall back to its placeholder); the held-commit fields are emitted
+	// regardless. The text is a quality input, not a safety precondition — the
+	// fail-closed gates above are about opening a PR from an unintended head.
+	prTitle, prBody := park.PRTitle, park.PRBody
+	if (prTitle == "" || prBody == "") && newestParked != nil {
+		var payload struct {
+			PRTitle string `json:"pr_title"`
+			PRBody  string `json:"pr_body"`
+		}
+		if err := json.Unmarshal(newestParked.Payload, &payload); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: parked audit payload undecodable for PR-text recovery; the resume opens with synthesized text",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+		} else {
+			if prTitle == "" {
+				prTitle = payload.PRTitle
+			}
+			if prBody == "" {
+				prBody = payload.PRBody
+			}
+		}
+	}
+	title, body := heldCommitPRTitleBody(runRow, prTitle, prBody)
+	return heldCommitResume{
+		sha: park.HeldCommitSHA, branch: park.RunBranch, baseSHA: base,
+		prTitle: title, prBody: body,
+	}, true
+}
+
+// heldCommitResume is what the two held-commit resume gates return: the
+// coordinates the runner opens the PR from, plus the pull-request text it opens
+// with (#2570). Grouped into a struct rather than grown into a six-value tuple.
+//
+// prTitle/prBody are already RESOLVED — the recovered agent text, the
+// issue-context fallback, or empty when neither was available (see
+// heldCommitPRTitleBody). Empty is a legitimate value: the runner keeps its own
+// placeholder there, i.e. today's behavior. prBody is FOOTER-FREE; the opening
+// runner appends the attribution footer exactly once.
+type heldCommitResume struct {
+	sha     string
+	branch  string
+	baseSHA string
+	prTitle string
+	prBody  string
 }
 
 // resumeKindPROpen is the held_commit_resume_kind wire value for a PR-open
@@ -3359,19 +3447,19 @@ var pushCheckpointCategories = []string{
 // not a checkpoint-bearing pull_request_failed, or an undecodable payload. The
 // cost of a wrong emission is a PR opened from an unintended head; the cost of a
 // wrong omission is today's agent re-run. Those are not symmetric.
-func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (sha, branch, baseSHA string, ok bool) {
+func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	if fixup {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	if s.cfg.AuditRepo == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: audit repository unconfigured; omitting push-checkpoint resume fields",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	// Two walks in one pass: `newest` is the newest entry across EVERY category
 	// (the invalidators included), `newestFailed` the newest pull_request_failed
@@ -3389,7 +3477,7 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 				slog.String("stage_id", stage.ID.String()),
 				slog.String("category", cat),
 				slog.String("error", err.Error()))
-			return "", "", "", false
+			return heldCommitResume{}, false
 		}
 		for _, e := range entries {
 			if e.StageID == nil || *e.StageID != stage.ID {
@@ -3404,7 +3492,7 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 		}
 	}
 	if newestFailed == nil {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	// NEWEST-WINS. A pull_request_failed that is no longer this stage's newest
 	// terminal outcome has been superseded — the PR opened, the stage parked or
@@ -3413,13 +3501,18 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 	// has moved past). Self-invalidating by construction: a successful resume
 	// writes pull_request_opened, which makes this comparison fail next time.
 	if newest != newestFailed {
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	var payload struct {
 		PushCheckpoint *struct {
 			Branch  string `json:"branch"`
 			HeadSHA string `json:"head_sha"`
 			BaseSHA string `json:"base_sha"`
+			// #2570: the agent-authored PR text the checkpoint carried, so the
+			// resume opens a real pull request. Absent on every pre-#2570
+			// checkpoint, where heldCommitPRTitleBody synthesizes instead.
+			PRTitle string `json:"pr_title"`
+			PRBody  string `json:"pr_body"`
 		} `json:"push_checkpoint"`
 	}
 	if err := json.Unmarshal(newestFailed.Payload, &payload); err != nil {
@@ -3428,12 +3521,12 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	if payload.PushCheckpoint == nil {
 		// The ordinary pre-push failure: nothing was pushed, so there is nothing
 		// to resume. Not an anomaly — no WARN.
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
 	cp := payload.PushCheckpoint
 	if cp.HeadSHA == "" || cp.Branch == "" || cp.BaseSHA == "" {
@@ -3441,9 +3534,16 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 			"prompt: push_checkpoint incomplete; omitting push-checkpoint resume fields",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()))
-		return "", "", "", false
+		return heldCommitResume{}, false
 	}
-	return cp.HeadSHA, cp.Branch, cp.BaseSHA, true
+	// #2570: resolve the PR text off the same checkpoint payload. Empty recovered
+	// fields fall through to the issue-context synthesis; nothing here can
+	// withhold the resume.
+	title, body := heldCommitPRTitleBody(runRow, cp.PRTitle, cp.PRBody)
+	return heldCommitResume{
+		sha: cp.HeadSHA, branch: cp.Branch, baseSHA: cp.BaseSHA,
+		prTitle: title, prBody: body,
+	}, true
 }
 
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind

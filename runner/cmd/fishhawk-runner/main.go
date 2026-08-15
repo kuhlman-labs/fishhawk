@@ -471,6 +471,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptHeldBranch  string
 		exemptHeldBaseSHA string
 		exemptResumeKind  string
+		// exemptPRTitle / exemptPRBody carry the pull-request text the backend
+		// recovered for this resume (#2570) — the agent's own, or the documented
+		// issue-context fallback. Empty falls back to the runner placeholder.
+		exemptPRTitle string
+		exemptPRBody  string
 	)
 
 	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
@@ -558,7 +563,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -608,6 +613,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptHeldBranch = heldCommitBranch
 		exemptHeldBaseSHA = heldCommitBaseSHA
 		exemptResumeKind = heldCommitResumeKind
+		exemptPRTitle = heldCommitPRTitle
+		exemptPRBody = heldCommitPRBody
 		fixupExpectedHeadSHA = expectedHeadSHA
 		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
@@ -807,7 +814,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptOpenPR = false
 	}
 	if exemptOpenPR {
-		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, logSink, client, issuedKey)
+		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, exemptPRTitle, exemptPRBody, logSink, client, issuedKey)
 	}
 
 	if cfg.promptFile == "" {
@@ -2862,13 +2869,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2876,20 +2883,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -6245,7 +6252,7 @@ func heldCommitShipCategory(_ error) string {
 //     report re-carries the checkpoint, so a resume that itself fails (the
 //     outage is still up) leaves the NEXT retry_stage resumable rather than
 //     silently degrading back to a full agent re-run.
-func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind, servedPRTitle, servedPRBody string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
 	isPROpenResume := resumeKind == resumeKindPROpen
 	failedReason := "scope_exempt_open_pr"
 	if isPROpenResume {
@@ -6262,7 +6269,15 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		// reports WITHOUT a checkpoint, keeping #1231's audit shape unchanged.
 		var cp *pushCheckpoint
 		if isPROpenResume && heldBranch != "" && heldSHA != "" {
-			cp = &pushCheckpoint{branch: heldBranch, headSHA: heldSHA, baseSHA: heldBaseSHA, armed: true}
+			cp = &pushCheckpoint{
+				branch: heldBranch, headSHA: heldSHA, baseSHA: heldBaseSHA, armed: true,
+				// #2570: re-carry the SERVED PR text as well as the coordinates. A
+				// resume that itself fails must not ERASE the recovered text from
+				// the newest audit entry — that would silently degrade the NEXT
+				// retry back to the placeholder, the same repeatable-resume property
+				// #2169 established for the coordinates.
+				prTitle: servedPRTitle, prBody: servedPRBody,
+			}
 		}
 		// Best-effort: this closure returns exitFailure, so the detached reaper
 		// backstop engages regardless of whether the report landed.
@@ -6334,7 +6349,39 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 			cfg.runID, cfg.stageID, branch, heldSHA)
 	}
 
-	title, body := prTitleAndBody(cfg, branch, logSink)
+	// RECOVERED PR TEXT (#2570). The agent's PR description is unreachable from
+	// here — loadAgentAuthoredPR deletes the /tmp handoff on every read path, and
+	// the pass that parked or checkpointed already consumed it (on an ephemeral
+	// runner /tmp is gone outright) — so the backend round-trips it through the
+	// park row / checkpoint payload and serves it here. Without it this resume
+	// opens `chore: fishhawk implement stage <id>` with no summary, no test plan,
+	// and no `Closes #N`, so the trigger issue never auto-closes (#2570).
+	//
+	// PER-FIELD, not all-or-nothing (#2570 binding condition 4): each served
+	// field is used on its own, so a recovered title is never discarded because
+	// the body was empty (and vice versa). Whichever field is empty falls back to
+	// the placeholder half. The attribution footer is appended EXACTLY ONCE here —
+	// the served body is footer-free by contract (see prTitleAndBodyParts), and
+	// this is the runner that opens the PR, so it owns the footer.
+	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	if servedPRTitle != "" {
+		title = servedPRTitle
+	}
+	if servedPRBody != "" {
+		body = servedPRBody
+	}
+	// The placeholder body rolls its own attribution in, so it is the ONE body
+	// that must not be footered. Every other body — agent-authored (an
+	// unconsumed same-host handoff) or recovered — gets exactly one footer,
+	// identical to the ordinary prTitleAndBody path.
+	if servedPRBody != "" || agentAuthored {
+		body += prAttributionFooter(cfg, branch)
+	}
+	if servedPRTitle != "" || servedPRBody != "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"held_commit_pr_text_recovered","run_id":%q,"stage_id":%q,"title_recovered":%t,"body_recovered":%t}`+"\n",
+			cfg.runID, cfg.stageID, servedPRTitle != "", servedPRBody != "")
+	}
 	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
 	// --forge=gitlab exempt resolution opens a merge request via the GitLab
 	// MR opener against cfg.gitlabBaseURL, NOT a GitHub PR against the
@@ -6422,6 +6469,18 @@ type pushCheckpoint struct {
 	baseSHA         string
 	verifiedTreeSHA string
 	armed           bool
+
+	// prTitle and prBody are the agent-authored pull-request text this pass
+	// resolved (#2570), carried so the failure report persists it and the RESUME
+	// opens a real pull request instead of the
+	// `chore: fishhawk implement stage <id>` placeholder. Empty when the agent
+	// wrote no PR-description handoff — the resume then takes the backend's
+	// issue-context fallback, and failing that the placeholder, exactly as today.
+	//
+	// prBody is FOOTER-FREE: the opening runner appends the attribution footer
+	// once at open time (see prTitleAndBodyParts).
+	prTitle string
+	prBody  string
 }
 
 // openPRAndShipArtifact is the implement-stage post-processing
@@ -6580,7 +6639,18 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	isFixup := routing.isFixup
 	freshFetchBase := routing.freshFetchBase
 
-	title, body := prTitleAndBody(cfg, branch, logSink)
+	// #2570: resolve the PR text in its two halves so the park / checkpoint can
+	// persist the agent's FOOTER-FREE body. agentPRTitle/agentPRBody are empty
+	// unless the agent actually authored a PR description — the placeholder is
+	// never persisted, because persisting it would defeat the whole point of
+	// carrying text across the resume.
+	title, prBody, agentAuthoredPR := prTitleAndBodyParts(cfg, branch, logSink)
+	body := prBody
+	var agentPRTitle, agentPRBody string
+	if agentAuthoredPR {
+		agentPRTitle, agentPRBody = title, prBody
+		body += prAttributionFooter(cfg, branch)
+	}
 	// Initial (non-fix-up) implement commit message (#1686): prefer the agent's
 	// clean Conventional-Commits sidecar (consumed + deleted by
 	// loadImplementCommitMessage), falling back to today's title + "\n\n" + body
@@ -7343,6 +7413,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			MissingPaths:          cap.ScopeShortfall,
 			UnsatisfiedAssertions: toBindingAssertionReports(cap.AssertionShortfall),
 			BuildRequiredPaths:    cap.BuildRequiredShortfall,
+			// #2570: persist the agent's FOOTER-FREE PR text on the park so an
+			// exempt resolution opens a real pull request. Empty when the agent
+			// authored no PR description, where the backend falls back to its
+			// documented issue-context synthesis.
+			PRTitle: agentPRTitle,
+			PRBody:  agentPRBody,
 		}); err != nil {
 			return fmt.Errorf("report scope-completeness park: %w", err)
 		}
@@ -7415,6 +7491,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			baseSHA:         cap.BaseSHA,
 			verifiedTreeSHA: verifiedTreeSHA,
 			armed:           true,
+			// #2570: carry the agent's PR text so a PR-open failure's resume opens
+			// a real pull request. The /tmp handoff cannot serve this: it is read
+			// (and DELETED — loadAgentAuthoredPR's delete-after-read) far above,
+			// before CommitAndPush ran, and on an ephemeral runner /tmp is gone by
+			// the time the retry dispatches.
+			prTitle: agentPRTitle,
+			prBody:  agentPRBody,
 		}
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_open_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q}`+"\n",
@@ -7568,6 +7651,11 @@ func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer
 		args.HeadSHA = checkpoint.headSHA
 		args.BaseSHA = checkpoint.baseSHA
 		args.TreeSHA = checkpoint.verifiedTreeSHA
+		// #2570: the checkpoint's PR text rides the report too, so the resume
+		// opens a real pull request. Empty on every pre-push failure (the
+		// checkpoint is the zero value there), keeping that body byte-identical.
+		args.PRTitle = checkpoint.prTitle
+		args.PRBody = checkpoint.prBody
 	}
 	if _, err := client.ShipPullRequest(ctx, args); err != nil {
 		_, _ = fmt.Fprintf(logSink,
@@ -8830,38 +8918,54 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // auditable provenance is preserved without requiring the agent to
 // remember to include it in every PR.
 func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body string) {
+	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	if !agentAuthored {
+		// Fallback attribution is rolled into the body itself, so don't double up.
+		return title, body
+	}
+	return title, body + prAttributionFooter(cfg, branch)
+}
+
+// prTitleAndBodyParts is prTitleAndBody's pre-footer half (#2570). It returns
+// the agent-authored title + body WITHOUT the attribution footer (agentAuthored
+// true), or the generic Fishhawk placeholder whose attribution is already rolled
+// into its body (agentAuthored false).
+//
+// Split out so the held-commit park/checkpoint capture can persist the agent's
+// text FOOTER-FREE. Footer ownership is single and explicit (#2570 binding
+// condition 3): the runner that OPENS the pull request appends the footer,
+// exactly once, at open time — prTitleAndBody here on the ordinary path,
+// openHeldCommitPR on the resume path. Persisting a footered body would either
+// double the footer on resume or stamp it with the wrong branch/audit URL, and
+// the size clamp could clip it.
+func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool) {
 	agentTitle, agentBody, kind := loadAgentAuthoredPR(cfg, logSink)
 
-	switch kind {
-	case prSourceAgent:
-		title = agentTitle
-		body = agentBody
-	case prSourceFallback:
-		title = fmt.Sprintf("chore: fishhawk implement stage %s", shortID(cfg.stageID))
-		body = fmt.Sprintf(
+	if kind == prSourceAgent {
+		return agentTitle, agentBody, true
+	}
+	return fmt.Sprintf("chore: fishhawk implement stage %s", shortID(cfg.stageID)),
+		fmt.Sprintf(
 			"Opened by Fishhawk for run `%s`, stage `%s`.\n\nBranch: `%s`\nAudit log: see `%s/v0/runs/%s/audit`.\n",
 			cfg.runID, cfg.stageID, branch,
 			strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
-		)
-		// Footer for fallback is rolled into the body itself, so
-		// don't double up below.
-		return title, body
-	}
+		), false
+}
 
-	// Agent-authored path: append the attribution footer so
-	// reviewers can find the run + audit log even when the agent's
-	// body doesn't mention them.
-	//
-	// MIRRORED in backend/internal/orchestrator/orchestrator.go's
-	// consolidatedPRFooter (#1774), which appends the byte-identical literal to
-	// the decomposed-parent consolidated PR body. The backend is a separate Go
-	// module, so it cannot import this — keep the two literals in sync.
-	footer := fmt.Sprintf(
+// prAttributionFooter renders the Fishhawk attribution footer appended to an
+// agent-authored (or resume-recovered) PR body, so reviewers can find the run +
+// audit log even when the body doesn't mention them.
+//
+// MIRRORED in backend/internal/orchestrator/orchestrator.go's
+// consolidatedPRFooter (#1774), which appends the byte-identical literal to
+// the decomposed-parent consolidated PR body. The backend is a separate Go
+// module, so it cannot import this — keep the two literals in sync.
+func prAttributionFooter(cfg config, branch string) string {
+	return fmt.Sprintf(
 		"\n\n---\n_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `%s`, stage `%s`._\n_Branch: `%s` · Audit log: `%s/v0/runs/%s/audit`._\n",
 		cfg.runID, cfg.stageID, branch,
 		strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
 	)
-	return title, body + footer
 }
 
 // prSource categorizes where the PR title + body came from. Lets

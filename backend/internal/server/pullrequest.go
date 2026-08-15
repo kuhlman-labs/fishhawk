@@ -1233,6 +1233,13 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		// #2548: so does the build-required class, plus its sibling-slice
 		// attribution resolved just below.
 		BuildRequiredPaths: pr.BuildRequiredPaths,
+		// #2570: the agent-authored PR text, so an EXEMPT resume opens a real
+		// pull request instead of the placeholder. Decoded off the SUCCESS
+		// artifact's existing title/body fields — no new decode field — and empty
+		// on a pre-#2570 runner, where the resume takes the issue-context
+		// fallback. PRBody is footer-free by wire contract.
+		PRTitle: pr.Title,
+		PRBody:  pr.Body,
 	}
 
 	// #2548: attribute each build-required path to the sibling slice that owns
@@ -1273,6 +1280,19 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 	if len(pr.BuildRequiredPaths) > 0 {
 		payloadMap["build_required_paths"] = pr.BuildRequiredPaths
 		payloadMap["owning_slices"] = park.OwningSlices
+	}
+	// #2570: the agent-authored PR text, each key GATED on non-empty for the same
+	// reason as build_required_paths above — this payload is a raw map, not the
+	// omitempty park struct, so writing them unconditionally would stamp two JSON
+	// nulls onto every pre-#2570-shaped parked entry. The park ROW is the primary
+	// carrier; these keys are the legacy-row ladder's fallback (mirroring the
+	// #2563 base_sha ladder), read by resolveHeldCommitExemption when a park row
+	// predates the struct fields.
+	if pr.Title != "" {
+		payloadMap["pr_title"] = pr.Title
+	}
+	if pr.Body != "" {
+		payloadMap["pr_body"] = pr.Body
 	}
 	auditPayload, _ := json.Marshal(payloadMap)
 	appendParams := audit.ChainAppendParams{
@@ -1449,12 +1469,25 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// `running` until the SLA watchdog reaps it, converting a runner bug into a
 	// hung run. Recording nothing degrades to today's full agent re-run instead.
 	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" {
-		payloadFields["push_checkpoint"] = map[string]any{
+		checkpoint := map[string]any{
 			"branch":            pr.Branch,
 			"head_sha":          pr.HeadSHA,
 			"base_sha":          pr.BaseSHA,
 			"verified_tree_sha": pr.VerifiedTreeSHA,
 		}
+		// #2570: the agent-authored PR text rides the checkpoint so the resume
+		// opens a real pull request. Each key is GATED on non-empty so a
+		// pre-#2570 checkpoint payload is BYTE-IDENTICAL (this is a raw map, not
+		// an omitempty struct — writing them unconditionally would add two JSON
+		// nulls to every existing checkpoint entry). Like the coordinates, NOT
+		// enforced in validate(): a 400 would strand the stage in `running`.
+		if pr.Title != "" {
+			checkpoint["pr_title"] = pr.Title
+		}
+		if pr.Body != "" {
+			checkpoint["pr_body"] = pr.Body
+		}
+		payloadFields["push_checkpoint"] = checkpoint
 	}
 	auditPayload, _ := json.Marshal(payloadFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
