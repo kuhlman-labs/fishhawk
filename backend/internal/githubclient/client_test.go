@@ -1827,21 +1827,42 @@ func TestListRulesetRequiredChecks_Forbidden(t *testing.T) {
 
 func TestRulesetMatchesBranch(t *testing.T) {
 	cases := []struct {
-		name    string
-		include []string
-		exclude []string
-		branch  string
-		want    bool
+		name          string
+		include       []string
+		exclude       []string
+		branch        string
+		defaultBranch string
+		wantMatch     bool
+		wantAuth      bool
 	}{
-		{"nil conditions matches all", nil, nil, "main", true},
-		{"~ALL include", []string{"~ALL"}, nil, "main", true},
-		{"~DEFAULT_BRANCH on main", []string{"~DEFAULT_BRANCH"}, nil, "main", true},
-		{"~DEFAULT_BRANCH on develop", []string{"~DEFAULT_BRANCH"}, nil, "develop", false},
-		{"refs/heads/<branch>", []string{"refs/heads/main"}, nil, "main", true},
-		{"plain branch name", []string{"main"}, nil, "main", true},
-		{"non-matching include", []string{"refs/heads/release/*"}, nil, "main", false},
-		{"empty include treated as all", []string{}, nil, "main", true},
-		{"exclude wins over include", []string{"~ALL"}, []string{"refs/heads/main"}, "main", false},
+		{"nil conditions matches all", nil, nil, "main", "main", true, true},
+		{"~ALL include", []string{"~ALL"}, nil, "main", "main", true, true},
+		// Main-default coverage is preserved (#2506 widens correctness,
+		// it does not trade one default branch for another).
+		{"~DEFAULT_BRANCH on main default", []string{"~DEFAULT_BRANCH"}, nil, "main", "main", true, true},
+		// CONDITION 1(a): a repo defaulting to `master` with a
+		// ~DEFAULT_BRANCH ruleset must match — this went to a
+		// present-but-empty snapshot under the old hardcoded "main".
+		{"~DEFAULT_BRANCH on master default", []string{"~DEFAULT_BRANCH"}, nil, "master", "master", true, true},
+		// Understood-but-not-this-branch: ~DEFAULT_BRANCH names the
+		// default, which is not the queried branch — no match, authoritative.
+		{"~DEFAULT_BRANCH on non-default branch", []string{"~DEFAULT_BRANCH"}, nil, "develop", "main", false, true},
+		{"refs/heads/<branch>", []string{"refs/heads/main"}, nil, "main", "main", true, true},
+		{"plain branch name", []string{"main"}, nil, "main", "main", true, true},
+		// A literal ref naming a DIFFERENT branch is understood: no
+		// match, but authoritative — it definitely does not apply here.
+		{"literal other branch is authoritative non-match", []string{"refs/heads/release"}, nil, "main", "main", false, true},
+		// CONDITION 1(b): a glob we cannot evaluate poisons
+		// authoritativeness so the capture leaves the snapshot NIL.
+		{"unevaluatable glob include", []string{"refs/heads/release/*"}, nil, "main", "main", false, false},
+		// CONDITION 1(b): an unknown ~TOKEN is likewise un-evaluatable.
+		{"unknown tilde token", []string{"~SOMETHING_ELSE"}, nil, "main", "main", false, false},
+		// A matched token wins even when an un-evaluatable sibling is
+		// present: the ruleset applies, so nothing is hidden.
+		{"match wins over unevaluatable sibling", []string{"refs/heads/main", "refs/heads/release/*"}, nil, "main", "main", true, true},
+		{"empty include treated as all", []string{}, nil, "main", "main", true, true},
+		{"exclude wins over include", []string{"~ALL"}, []string{"refs/heads/main"}, "main", "main", false, true},
+		{"exclude ~DEFAULT_BRANCH on master default", []string{"~ALL"}, []string{"~DEFAULT_BRANCH"}, "master", "master", false, true},
 	}
 	type cond struct {
 		RefName *struct {
@@ -1858,15 +1879,15 @@ func TestRulesetMatchesBranch(t *testing.T) {
 					Exclude []string `json:"exclude"`
 				}{Include: tc.include, Exclude: tc.exclude}}
 			}
-			got := rulesetMatchesBranch((*struct {
+			gotMatch, gotAuth := rulesetMatchesBranch((*struct {
 				RefName *struct {
 					Include []string `json:"include"`
 					Exclude []string `json:"exclude"`
 				} `json:"ref_name"`
-			})(c), tc.branch)
-			if got != tc.want {
-				t.Errorf("rulesetMatchesBranch(%v, %q) = %v, want %v",
-					tc, tc.branch, got, tc.want)
+			})(c), tc.branch, tc.defaultBranch)
+			if gotMatch != tc.wantMatch || gotAuth != tc.wantAuth {
+				t.Errorf("rulesetMatchesBranch(%v, %q, %q) = (match=%v, auth=%v), want (match=%v, auth=%v)",
+					tc, tc.branch, tc.defaultBranch, gotMatch, gotAuth, tc.wantMatch, tc.wantAuth)
 			}
 		})
 	}

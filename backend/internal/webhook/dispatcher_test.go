@@ -876,12 +876,18 @@ type stubGitHub struct {
 	branchProtection      *forge.BranchProtection
 	branchProtectionErr   error
 	branchProtectionCalls int
-	// rulesets / rulesetsErr drive ListRulesetRequiredChecks
-	// (#251). Default zero-value returns an empty list.
-	rulesets       []forge.RulesetRequiredCheck
-	rulesetsErr    error
-	rulesetsCalls  int
-	rulesetsBranch string
+	// rulesets / rulesetsErr drive ListRulesetRequiredChecksForDefault
+	// (#251 / #2506). Default zero-value returns an empty list that is
+	// authoritative (rulesetsAuth) so existing snapshot tests behave as
+	// before; a test flips rulesetsAuth to false to exercise the
+	// non-authoritative arm.
+	rulesets              []forge.RulesetRequiredCheck
+	rulesetsErr           error
+	rulesetsAuthSet       bool
+	rulesetsAuth          bool
+	rulesetsCalls         int
+	rulesetsBranch        string
+	rulesetsDefaultBranch string
 }
 
 func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ forge.CredentialScope,
@@ -934,16 +940,23 @@ func (s *stubGitHub) GetBranchProtection(_ context.Context, _ forge.CredentialSc
 	return &forge.BranchProtection{}, nil
 }
 
-func (s *stubGitHub) ListRulesetRequiredChecks(_ context.Context, _ forge.CredentialScope,
-	_ forge.RepoRef, branch string) ([]forge.RulesetRequiredCheck, error) {
+func (s *stubGitHub) ListRulesetRequiredChecksForDefault(_ context.Context, _ forge.CredentialScope,
+	_ forge.RepoRef, branch, defaultBranch string) ([]forge.RulesetRequiredCheck, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rulesetsCalls++
 	s.rulesetsBranch = branch
+	s.rulesetsDefaultBranch = defaultBranch
 	if s.rulesetsErr != nil {
-		return nil, s.rulesetsErr
+		return nil, false, s.rulesetsErr
 	}
-	return s.rulesets, nil
+	// Default to authoritative so existing snapshot tests are unchanged;
+	// a test opts into the non-authoritative arm via rulesetsAuthSet.
+	auth := true
+	if s.rulesetsAuthSet {
+		auth = s.rulesetsAuth
+	}
+	return s.rulesets, auth, nil
 }
 
 // stubRuns is a tiny in-memory run.Repository covering the
@@ -2001,6 +2014,123 @@ func TestHandle_BranchProtectionNotFound_FallsThroughToRulesets(t *testing.T) {
 	}
 	if len(snap.Sources) != 1 || snap.Sources[0] != "ruleset:1" {
 		t.Errorf("Sources = %v, want [ruleset:1]", snap.Sources)
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestResolveRequiredChecks_Table(t *testing.T) {
+	// Pins the extracted ResolveRequiredChecks tri-state (#2506): the
+	// authoritative bool, the scope-missing / wrapped error arms, and
+	// that defaultBranch is threaded to the ruleset lookup.
+	scope := forge.FromGitHubInstallationID(42)
+	repo := forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}
+	cases := []struct {
+		name         string
+		setup        func(*stubGitHub)
+		wantNil      bool // snapshot pointer nil (only on the error arms)
+		wantContexts []string
+		wantAuth     bool
+		wantErr      error // sentinel to errors.Is against; nil means "no error"
+		wantSomeErr  bool  // a non-sentinel (wrapped transport) error
+	}{
+		{
+			name:     "both answer, nothing required -> authoritative empty",
+			setup:    func(g *stubGitHub) { g.branchProtection = &forge.BranchProtection{}; g.rulesets = nil },
+			wantAuth: true,
+		},
+		{
+			name:     "rulesets 404 -> non-authoritative empty",
+			setup:    func(g *stubGitHub) { g.branchProtection = &forge.BranchProtection{}; g.rulesetsErr = forge.ErrNotFound },
+			wantAuth: false,
+		},
+		{
+			name: "unevaluatable ruleset token -> non-authoritative",
+			setup: func(g *stubGitHub) {
+				g.branchProtection = &forge.BranchProtection{}
+				g.rulesetsAuthSet = true
+				g.rulesetsAuth = false
+			},
+			wantAuth: false,
+		},
+		{
+			name:    "classic 403 -> scope missing",
+			setup:   func(g *stubGitHub) { g.branchProtectionErr = forge.ErrForbidden },
+			wantNil: true, wantErr: errProtectionScopeMissing,
+		},
+		{
+			name: "rulesets 403 -> scope missing",
+			setup: func(g *stubGitHub) {
+				g.branchProtection = &forge.BranchProtection{}
+				g.rulesetsErr = forge.ErrForbidden
+			},
+			wantNil: true, wantErr: errProtectionScopeMissing,
+		},
+		{
+			name:    "classic transport error -> wrapped",
+			setup:   func(g *stubGitHub) { g.branchProtectionErr = errors.New("boom") },
+			wantNil: true, wantSomeErr: true,
+		},
+		{
+			name: "both contribute -> authoritative snapshot with contexts",
+			setup: func(g *stubGitHub) {
+				g.branchProtection = &forge.BranchProtection{RequiredStatusCheckContexts: []string{"ci/build"}}
+				g.rulesets = []forge.RulesetRequiredCheck{{RulesetID: 9, Contexts: []string{"CI Pass"}}}
+			},
+			wantContexts: []string{"ci/build", "CI Pass"}, wantAuth: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := &stubGitHub{}
+			tc.setup(gh)
+			snap, auth, err := ResolveRequiredChecks(context.Background(), gh, scope, repo, "main", "master")
+
+			switch {
+			case tc.wantErr != nil:
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+			case tc.wantSomeErr:
+				if err == nil || errors.Is(err, errProtectionScopeMissing) {
+					t.Fatalf("err = %v, want a wrapped transport error", err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("unexpected err: %v", err)
+				}
+			}
+
+			if tc.wantNil {
+				if snap != nil {
+					t.Fatalf("snapshot = %+v, want nil on error arm", snap)
+				}
+				return
+			}
+			if snap == nil {
+				t.Fatal("snapshot nil; want non-nil (err was nil)")
+			}
+			if auth != tc.wantAuth {
+				t.Errorf("authoritative = %v, want %v", auth, tc.wantAuth)
+			}
+			if !sameStrings(snap.Contexts, tc.wantContexts) {
+				t.Errorf("Contexts = %v, want %v", snap.Contexts, tc.wantContexts)
+			}
+			// defaultBranch must reach the ruleset lookup verbatim.
+			if gh.rulesetsDefaultBranch != "master" {
+				t.Errorf("rulesets defaultBranch = %q, want master", gh.rulesetsDefaultBranch)
+			}
+		})
 	}
 }
 

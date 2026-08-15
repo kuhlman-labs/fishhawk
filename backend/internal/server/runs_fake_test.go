@@ -99,9 +99,13 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		// bound checkout (E66.42 / #2482) survives the HTTP round-trip tests
 		// that drive this fake instead of Postgres.
 		WorkingDir: p.WorkingDir,
-		State:      run.StatePending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// Persist the required-checks snapshot (#2506) the same way, so an
+		// HTTP-seam assertion reads back what handleCreateRun -> capture
+		// passed rather than a dropped nil.
+		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
+		State:                  run.StatePending,
+		CreatedAt:              now,
+		UpdatedAt:              now,
 	}
 	f.runs[r.ID] = r
 	return r, nil
