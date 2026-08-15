@@ -101,7 +101,7 @@ The durable `(run_id, stage_id)` handle is the unit of waiting on a stage's exec
 
 ### Two stage vocabularies, one documented mapping ([#2494](https://github.com/kuhlman-labs/fishhawk/issues/2494))
 
-The five-value `stage_wait_status.status` is a coarser **BUCKET** than the eight-value raw stage `state` the REST API reports (`GET /v0/runs/{run_id}` `stages[].state`, `docs/api/v0.openapi.yaml`). They are deliberately different — the bucket answers *"should I keep polling?"*, the raw state answers *"where exactly is this stage?"* — and neither is renamed, because renaming either is a breaking wire change for every existing consumer. The mapping is **total** and is written down once, in `stage_wait.go`'s `StageWaitStatus` doc comment:
+The five-value `stage_wait_status.status` is a coarser **BUCKET** than the raw stage `state` the REST API reports — the thirteen `run.StageState` values (`GET /v0/runs/{run_id}` `stages[].state`, `docs/api/v0.openapi.yaml`). They are deliberately different — the bucket answers *"should I keep polling?"*, the raw state answers *"where exactly is this stage?"* — and neither is renamed, because renaming either is a breaking wire change for every existing consumer. The mapping is **total** and is written down once, in `stage_wait.go`'s `StageWaitStatus` doc comment:
 
 | backend stage `state` | `stage_wait_status.status` |
 | --- | --- |
@@ -110,12 +110,16 @@ The five-value `stage_wait_status.status` is a coarser **BUCKET** than the eight
 | `dispatched` | `pending` |
 | `awaiting_approval` | `pending` |
 | `awaiting_children` | `pending` |
+| `awaiting_input` | `pending` |
+| `awaiting_scope_decision` | `pending` |
+| `awaiting_deploy_approval` | `pending` |
+| `awaiting_deployment` | `pending` |
 | `running` | `running` |
 | `succeeded` | `succeeded` |
 | `failed` | `failed` |
 | `cancelled` | `cancelled` |
 
-Any state not named above also falls to `pending` — the conservative keep-polling default, so a backend that adds a state never strands a caller on a bucket it does not recognize. `docs/api/v0.openapi.yaml` and `docs/api/v0.md` carry the reciprocal pointer back here.
+The table enumerates every state that exists today, but the mapping is a **rule**, not an enumeration: `running` maps to `running`, the three terminal states map to themselves, and every other state — including one added after this table was written — falls to `pending`, the conservative keep-polling default, so a new backend state never strands a caller on a bucket it does not recognize. `stage_wait_test.go`'s `TestClassifyStageWaitStatus_MappingTable` pins the table against the `run.StageState` constants themselves (a renamed state breaks the build, a re-bucketed one fails the test) and `tools_test.go`'s `TestToolDescriptions_CursorAndStageVocabulary` asserts every pair is on the wire description. `docs/api/v0.openapi.yaml` and `docs/api/v0.md` carry the reciprocal pointer back here.
 
 ### `ReviewStatus.reviews[]` has ONE shape ([#2494](https://github.com/kuhlman-labs/fishhawk/issues/2494))
 

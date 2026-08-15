@@ -2446,7 +2446,9 @@ components:
           type: string
           enum:
             [pending, awaiting_host_dispatch, dispatched, running,
-             awaiting_approval, succeeded, failed, cancelled]
+             awaiting_approval, awaiting_children, awaiting_input,
+             awaiting_scope_decision, awaiting_deploy_approval,
+             awaiting_deployment, succeeded, failed, cancelled]
           description: |
             `awaiting_host_dispatch` is the parked-for-host-spawn state
             (#1912): a runner_kind-locked-`local` agent stage the backend wants
@@ -2456,13 +2458,17 @@ components:
             `dispatched` unambiguously means a spawn attempt exists.
 
             TWO VOCABULARIES (#2494). This raw `state` is the authoritative
-            eight-value stage state. The MCP surface reports a coarser
+            thirteen-value stage state (the `run.StageState` set, enumerated
+            above — the enum previously omitted the five park states
+            `awaiting_children`, `awaiting_input`, `awaiting_scope_decision`,
+            `awaiting_deploy_approval` and `awaiting_deployment`, which the API
+            has always been able to return). The MCP surface reports a coarser
             five-value BUCKET (`*_stage_wait_status.status`) answering "should
             I keep polling?"; neither is renamed, and the mapping is total:
-            `pending`, `awaiting_host_dispatch`, `dispatched`,
-            `awaiting_approval` and `awaiting_children` all bucket to
-            `pending`; `running` maps to `running`; `succeeded`, `failed` and
-            `cancelled` map to themselves. The mapping is written down once, in
+            `running` maps to `running`, `succeeded`, `failed` and `cancelled`
+            map to themselves, and every other state — including one added
+            later — buckets to `pending`, the conservative keep-polling
+            default. The mapping is written down once, in
             `backend/internal/mcpserver/stage_wait.go`.
         started_at:
           type: [string, "null"]

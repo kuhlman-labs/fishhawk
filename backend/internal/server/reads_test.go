@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1411,29 +1412,38 @@ func TestListRunAudit_BadUUID(t *testing.T) {
 	}
 }
 
-// assertCursorMessageNamesAcceptedInput asserts the three SUBSTANTIVE claims
-// #2494 promised a malformed-cursor message would make, not merely that the
-// token "next_cursor" appears somewhere. A token-only assertion stays green
-// with every explanatory clause deleted, which makes it a control that cannot
-// fail for the reason it exists.
+// cursorMessageClaims are the SUBSTANTIVE claims #2494 promised a malformed-
+// cursor message would make, not merely the tokens those claims are worded
+// with. A token-only assertion ("the word `index` appears") stays green when
+// the message is reworded to say the cursor IS an index, which makes it a
+// control that cannot fail for the reason it exists.
 //
-// The claims are pinned individually and loosely (a phrase each, never a whole
-// sentence) so an accurate rewording still passes:
-//   - the token is OPAQUE,
-//   - the only accepted value is a prior response's next_cursor, copied VERBATIM,
-//   - it is NOT AN OFFSET or an INDEX.
+// So the two NEGATED claims are matched as negations: a `not` must appear
+// within the same clause as the term. The patterns leave the wording BETWEEN
+// the negation and the term free (up to 40 chars, no sentence or clause
+// break), so an accurate rewording — "it is not an index or an offset", "this
+// is not an offset" — still passes while "it is an index" fails.
+var cursorMessageClaims = []struct {
+	name  string
+	match *regexp.Regexp
+}{
+	{"name next_cursor as the only accepted source", regexp.MustCompile(`next_cursor`)},
+	{"say the token is opaque", regexp.MustCompile(`\bopaque\b`)},
+	{"say it must be copied verbatim", regexp.MustCompile(`\bverbatim\b`)},
+	{"say it is NOT an offset", regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`)},
+	{"say it is NOT an index", regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`)},
+}
+
+// assertCursorMessageNamesAcceptedInput asserts every cursorMessageClaims
+// entry holds for one message, after lower-casing and collapsing whitespace
+// (so a claim spanning a line break is pinned to the claim, not to the current
+// wrap column).
 func assertCursorMessageNamesAcceptedInput(t *testing.T, where, msg string) {
 	t.Helper()
-	lower := strings.ToLower(msg)
-	for _, claim := range []struct{ name, needle string }{
-		{"names next_cursor as the source", "next_cursor"},
-		{"says the token is opaque", "opaque"},
-		{"says it must be copied verbatim", "verbatim"},
-		{"says it is not an offset", "not an offset"},
-		{"mentions index", "index"},
-	} {
-		if !strings.Contains(lower, claim.needle) {
-			t.Errorf("%s: message does not %s (missing %q): %s", where, claim.name, claim.needle, msg)
+	norm := strings.Join(strings.Fields(strings.ToLower(msg)), " ")
+	for _, claim := range cursorMessageClaims {
+		if !claim.match.MatchString(norm) {
+			t.Errorf("%s: message does not %s (no match for %s): %s", where, claim.name, claim.match, msg)
 		}
 	}
 }

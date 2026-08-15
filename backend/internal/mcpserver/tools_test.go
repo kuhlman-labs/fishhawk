@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -3283,6 +3284,33 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 	}
 }
 
+// cursorDescriptionClaims are the SUBSTANTIVE claims the `cursor` guidance has
+// to make on the wire, matched as claims rather than as the tokens they are
+// worded with. The two NEGATED claims need the negation IN the pattern: a bare
+// `strings.Contains(desc, "index")` stays green when the description is
+// reworded to say the cursor IS an index, which makes it a control that cannot
+// fail for the reason it exists (#2494). Each pattern leaves the wording
+// between the negation and the term free, so an accurate rewording still
+// passes. Mirrors assertCursorMessageNamesAcceptedInput in the server package,
+// which pins the same claims on the REST 400 message.
+var cursorDescriptionClaims = []struct {
+	name  string
+	match *regexp.Regexp
+}{
+	{"name next_cursor as the only accepted source", regexp.MustCompile(`next_cursor`)},
+	{"say the token is opaque", regexp.MustCompile(`\bopaque\b`)},
+	{"say it must be copied verbatim", regexp.MustCompile(`\bverbatim\b`)},
+	{"say it is NOT an offset", regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`)},
+	{"say it is NOT an index", regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`)},
+}
+
+// normalizeDescription lower-cases and collapses whitespace runs: the
+// descriptions are hard-wrapped prose, so a claim spanning a line break would
+// otherwise be pinned to the current wrap column rather than to the claim.
+func normalizeDescription(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+}
+
 // TestToolDescriptions_CursorAndStageVocabulary is the #2494 wire-visibility
 // test for the two documentation-shaped items: the audit-listing tool's
 // `cursor` guidance and the get_run_status stage-vocabulary mapping must
@@ -3304,34 +3332,42 @@ func TestToolDescriptions_CursorAndStageVocabulary(t *testing.T) {
 		t.Fatal("fishhawk_list_audit is not registered/visible over ListTools")
 	}
 	schemaCursorDesc := toolInputPropertyDescription(t, "fishhawk_list_audit", "cursor")
-	schemaLower := strings.Join(strings.Fields(strings.ToLower(schemaCursorDesc)), " ")
-	for _, want := range []string{"next_cursor", "opaque", "verbatim", "not an offset", "index"} {
-		if !strings.Contains(schemaLower, want) {
-			t.Errorf("fishhawk_list_audit cursor INPUT SCHEMA must state %q (#2494):\n%s", want, schemaCursorDesc)
-		}
-	}
-	// The description is hard-wrapped prose, so collapse runs of whitespace
-	// before matching — otherwise a needle spanning a line break is pinned to
-	// the current wrap column rather than to the claim.
-	auditLower := strings.Join(strings.Fields(strings.ToLower(auditDesc)), " ")
-	for _, want := range []string{"next_cursor", "opaque", "verbatim", "not an offset", "index"} {
-		if !strings.Contains(auditLower, want) {
-			t.Errorf("fishhawk_list_audit description must state %q about the cursor (#2494):\n%s", want, auditDesc)
+	for _, surface := range []struct{ where, text string }{
+		{"fishhawk_list_audit cursor INPUT SCHEMA", schemaCursorDesc},
+		{"fishhawk_list_audit description", auditDesc},
+	} {
+		norm := normalizeDescription(surface.text)
+		for _, claim := range cursorDescriptionClaims {
+			if !claim.match.MatchString(norm) {
+				t.Errorf("%s does not %s (no match for %s) (#2494):\n%s",
+					surface.where, claim.name, claim.match, surface.text)
+			}
 		}
 	}
 
 	// Item 4: the two-vocabulary mapping on the surface that reports both.
+	// EVERY documented state -> bucket pair must be on the wire, not a sample
+	// of three: a spot-check of awaiting_host_dispatch/awaiting_children stays
+	// green while the rest of the mapping disappears from the description. The
+	// pairs come from the same documentedStageWaitMapping the classification
+	// test pins the code against, so code and documentation cannot disagree.
 	statusDesc := descByName["fishhawk_get_run_status"]
 	if statusDesc == "" {
 		t.Fatal("fishhawk_get_run_status is not registered/visible over ListTools")
 	}
-	for _, want := range []string{"awaiting_host_dispatch", "awaiting_children", "bucket"} {
-		if !strings.Contains(strings.ToLower(statusDesc), strings.ToLower(want)) {
-			t.Errorf("fishhawk_get_run_status description must document the stage-vocabulary mapping term %q (#2494):\n%s", want, statusDesc)
+	statusNorm := normalizeDescription(statusDesc)
+	for _, m := range documentedStageWaitMapping {
+		pair := string(m.State) + " -> " + m.Bucket
+		if !strings.Contains(statusNorm, pair) {
+			t.Errorf("fishhawk_get_run_status description must document the stage-vocabulary mapping %q (#2494):\n%s",
+				pair, statusDesc)
 		}
 	}
+	if !strings.Contains(statusNorm, "bucket") {
+		t.Errorf("fishhawk_get_run_status description must name the wait status a BUCKET (#2494):\n%s", statusDesc)
+	}
 	// The reviews[] one-shape contract rides the same description.
-	if !strings.Contains(strings.ToLower(statusDesc), "always present") {
+	if !strings.Contains(statusNorm, "always present") {
 		t.Errorf("fishhawk_get_run_status description must state reviews[] is always present (#2494):\n%s", statusDesc)
 	}
 }

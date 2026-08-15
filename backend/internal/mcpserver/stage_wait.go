@@ -10,12 +10,13 @@ import "time"
 // fishhawk_await_review pattern (#878).
 //
 // TWO VOCABULARIES, ONE MAPPING (#2494). The REST surface reports a stage's
-// RAW backend `state` (eight values); this MCP surface reports a coarser
-// wait-status BUCKET (five values). They are deliberately different — the
-// bucket answers "should I keep polling?" — and neither is renamed, because
-// renaming either is a breaking wire change for every existing consumer. The
-// mapping is total and is the ONE place it is written down; the REST
-// companion docs (docs/api/v0.openapi.yaml, docs/api/v0.md) point back here.
+// RAW backend `state` — the thirteen run.StageState values; this MCP surface
+// reports a coarser wait-status BUCKET (five values). They are deliberately
+// different — the bucket answers "should I keep polling?" — and neither is
+// renamed, because renaming either is a breaking wire change for every
+// existing consumer. The mapping is total and is the ONE place it is written
+// down; the REST companion docs (docs/api/v0.openapi.yaml, docs/api/v0.md)
+// point back here.
 //
 //	backend stage state       -> stage_wait_status.status
 //	------------------------------------------------------
@@ -24,20 +25,33 @@ import "time"
 //	dispatched                -> pending
 //	awaiting_approval         -> pending
 //	awaiting_children         -> pending
+//	awaiting_input            -> pending
+//	awaiting_scope_decision   -> pending
+//	awaiting_deploy_approval  -> pending
+//	awaiting_deployment       -> pending
 //	running                   -> running
 //	succeeded                 -> succeeded
 //	failed                    -> failed
 //	cancelled                 -> cancelled
 //
-// Any state not named above also falls to "pending" — the conservative
-// keep-polling default, so a backend that adds a state never strands a
-// caller on a bucket it does not recognize.
+// The table enumerates every run.StageState that exists today, but the
+// mapping is stated as a RULE so it stays total as the backend grows:
+// `running` maps to "running", the three terminal states map to themselves,
+// and EVERY other state — including one added after this comment was written
+// — falls to "pending", the conservative keep-polling default, so a new
+// backend state never strands a caller on a bucket it does not recognize.
+// stage_wait_test.go's TestClassifyStageWaitStatus_MappingTable pins the table
+// against the run.StageState constants themselves, so a renamed state breaks
+// the build and a re-bucketed one fails the test.
 //
 // Status is one of:
 //
 //   - "pending"   — the stage exists but has not started running yet
-//     (backend state pending | awaiting_host_dispatch | dispatched |
-//     awaiting_approval | awaiting_children). awaiting_host_dispatch (#1912) is
+//     (every non-`running`, non-terminal backend state: pending |
+//     awaiting_host_dispatch | dispatched | awaiting_approval |
+//     awaiting_children | awaiting_input | awaiting_scope_decision |
+//     awaiting_deploy_approval | awaiting_deployment).
+//     awaiting_host_dispatch (#1912) is
 //     a runner_kind-locked-local agent stage parked for a host spawn — it is
 //     actionable (a host dispatch will start it), so it maps to the pending
 //     (keep-polling) bucket, not a terminal one. A polling agent should keep
@@ -65,7 +79,7 @@ import "time"
 // stageWaitPollCeilingSeconds]. See stageWaitPollIntervalSeconds.
 type StageWaitStatus struct {
 	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', 'review', or 'acceptance'"`
-	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled. This is a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending|awaiting_host_dispatch|dispatched|awaiting_approval|awaiting_children -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled"`
+	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled. This is a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled. Any state added later also buckets to pending (the conservative keep-polling default)"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status is non-terminal (pending/running); present only while non-terminal, omitted on terminal. Poll get_run_status on this cadence as the authoritative path to a terminal stage status"`
 	// ElapsedSeconds / AgentTimeoutSeconds / DeadlineSecondsRemaining are the
 	// stage's remaining-budget observability (#2540): how long the stage has been

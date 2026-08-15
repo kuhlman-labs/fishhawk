@@ -3231,30 +3231,99 @@ func TestCheckUnpricedModel_NoCrossSuppressionAtUpgradeBoundary(t *testing.T) {
 	}
 }
 
-// TestCheckUnpricedModel_FailedRequest_NoUsageManifestRatioIsZero is failure
-// mode (d): a manifest reporting NO usage at all (known_usage=false, every
-// token bucket zero) on a placeholder model still classifies as a failed
-// request, and cache_read_ratio is exactly 0 — never a NaN, which would make
-// the payload unmarshalable JSON.
-func TestCheckUnpricedModel_FailedRequest_NoUsageManifestRatioIsZero(t *testing.T) {
-	au := newAuditFake()
-	au.seeded = []*audit.Entry{
-		seedFailedRequestCostEntry(t, spendTestNow.Add(-1*time.Hour), syntheticModelID, 0, 0, 0, 0),
-	}
-	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+// TestShipTrace_FailedRequest_NoUsageManifestRatioIsZero is failure mode (d),
+// driven through the REAL recordCost path rather than a pre-built ledger row.
+//
+// The boundary this case exists to cover is manifest -> cost ledger: an
+// all-zero manifest is exactly the input where recordCost takes its
+// knownUsage=false branch, so a version that dropped the bracketed model id or
+// the zero token split on that branch would still satisfy a test that
+// hand-seeded a cost_recorded row and called checkUnpricedModel directly. So
+// the manifest goes in over the wire, and the assertions read the committed
+// ledger row AND the resulting alert: the placeholder still classifies as a
+// FAILED REQUEST (not an unpriced model), and cache_read_ratio is exactly 0 —
+// never a NaN, which would make the payload unmarshalable JSON.
+func TestShipTrace_FailedRequest_NoUsageManifestRatioIsZero(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
 	s.nowFunc = func() time.Time { return spendTestNow }
 
-	s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+	// Every token bucket zero: the manifest reported no usage at all.
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        syntheticModelID,
+	})
 
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (warn-only must not gate):\n%s", w.Code, w.Body.String())
+	}
+
+	// The manifest -> ledger hop: recordCost must preserve the bracketed model
+	// id and the zero split on its knownUsage=false branch, or the detector
+	// downstream can never classify the row.
+	costRows := appendedOfCategory(au, "cost_recorded")
+	if len(costRows) != 1 {
+		t.Fatalf("cost_recorded entries = %d, want 1", len(costRows))
+	}
+	var cp struct {
+		Model                 string `json:"model"`
+		KnownUsage            bool   `json:"known_usage"`
+		InputTokens           int    `json:"input_tokens"`
+		CacheReadInputTokens  int    `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens int    `json:"cache_write_input_tokens"`
+		OutputTokens          int    `json:"output_tokens"`
+	}
+	if err := json.Unmarshal(costRows[0].Payload, &cp); err != nil {
+		t.Fatalf("decode cost_recorded payload: %v", err)
+	}
+	if cp.Model != syntheticModelID {
+		t.Errorf("cost_recorded model = %q, want the bracketed placeholder %q preserved verbatim",
+			cp.Model, syntheticModelID)
+	}
+	if cp.KnownUsage {
+		t.Errorf("cost_recorded known_usage = true, want false for an all-zero manifest")
+	}
+	if cp.InputTokens != 0 || cp.CacheReadInputTokens != 0 ||
+		cp.CacheWriteInputTokens != 0 || cp.OutputTokens != 0 {
+		t.Errorf("cost_recorded token split = %d/%d/%d/%d, want all zero",
+			cp.InputTokens, cp.CacheReadInputTokens, cp.CacheWriteInputTokens, cp.OutputTokens)
+	}
+
+	// The ledger -> detector -> audit hop.
+	if got := appendedOfCategory(au, "unpriced_model_alert"); len(got) != 0 {
+		t.Errorf("unpriced_model_alert entries = %d, want 0 — a zero-usage failed request is not an unpriced model: %s",
+			len(got), got[0].Payload)
+	}
 	alerts := appendedOfCategory(au, "agent_request_failed_alert")
 	if len(alerts) != 1 {
 		t.Fatalf("agent_request_failed_alert entries = %d, want 1", len(alerts))
 	}
 	var ap struct {
-		CacheReadRatio float64 `json:"cache_read_ratio"`
+		FailedRequestModels   []string `json:"failed_request_models"`
+		InputTokens           int      `json:"input_tokens"`
+		CacheReadInputTokens  int      `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens int      `json:"cache_write_input_tokens"`
+		OutputTokens          int      `json:"output_tokens"`
+		CacheReadRatio        float64  `json:"cache_read_ratio"`
 	}
 	if err := json.Unmarshal(alerts[0].Payload, &ap); err != nil {
 		t.Fatalf("decode payload (a NaN ratio would fail to marshal): %v", err)
+	}
+	if !reflect.DeepEqual(ap.FailedRequestModels, []string{syntheticModelID}) {
+		t.Errorf("failed_request_models = %v, want [%s]", ap.FailedRequestModels, syntheticModelID)
+	}
+	if ap.InputTokens != 0 || ap.CacheReadInputTokens != 0 ||
+		ap.CacheWriteInputTokens != 0 || ap.OutputTokens != 0 {
+		t.Errorf("token evidence = %d/%d/%d/%d, want all zero",
+			ap.InputTokens, ap.CacheReadInputTokens, ap.CacheWriteInputTokens, ap.OutputTokens)
 	}
 	if ap.CacheReadRatio != 0 {
 		t.Errorf("cache_read_ratio = %v, want exactly 0 for a zero denominator", ap.CacheReadRatio)
