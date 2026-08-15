@@ -3285,23 +3285,61 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 }
 
 // cursorDescriptionClaims are the SUBSTANTIVE claims the `cursor` guidance has
-// to make on the wire, matched as claims rather than as the tokens they are
-// worded with. The two NEGATED claims need the negation IN the pattern: a bare
-// `strings.Contains(desc, "index")` stays green when the description is
-// reworded to say the cursor IS an index, which makes it a control that cannot
-// fail for the reason it exists (#2494). Each pattern leaves the wording
-// between the negation and the term free, so an accurate rewording still
-// passes. Mirrors assertCursorMessageNamesAcceptedInput in the server package,
-// which pins the same claims on the REST 400 message.
+// to make on the wire, asserted POSITIVELY rather than as the tokens they are
+// worded with. A bare `strings.Contains(desc, "opaque")` stays green when the
+// description is reworded to say the cursor is NOT opaque, which makes it a
+// control that cannot fail for the reason it exists (#2494).
+//
+// So each claim carries an `assert` pattern for its AFFIRMATIVE form — the
+// terms must stand in the right relation, not merely appear — plus, where an
+// affirmative form survives a negation intact ("need not be copied verbatim"
+// still contains "copied verbatim"), a `reject` pattern for the claim's
+// negation that must NOT match. The reviewer's reversal — "next_cursor is not
+// accepted; the cursor is not opaque and need not be copied verbatim; it is
+// not an offset or an index" — fails four of these six claims.
+//
+// Every gap is bounded and clause-bounded (`[^.;:]`), leaving the wording
+// between the terms free so an accurate rewording still passes. Mirrors
+// assertCursorMessageNamesAcceptedInput in the server package, which pins the
+// same claims on the REST 400 message.
 var cursorDescriptionClaims = []struct {
-	name  string
-	match *regexp.Regexp
+	name   string
+	assert *regexp.Regexp
+	reject *regexp.Regexp
 }{
-	{"name next_cursor as the only accepted source", regexp.MustCompile(`next_cursor`)},
-	{"say the token is opaque", regexp.MustCompile(`\bopaque\b`)},
-	{"say it must be copied verbatim", regexp.MustCompile(`\bverbatim\b`)},
-	{"say it is NOT an offset", regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`)},
-	{"say it is NOT an index", regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`)},
+	{
+		name:   "say that next_cursor is the ONLY accepted value",
+		assert: regexp.MustCompile(`\b(only|sole|solely|exclusively)\b[^.;:]{0,60}\bnext_cursor\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bnext_cursor\b`),
+	},
+	{
+		name:   "attribute that next_cursor to a PRIOR response",
+		assert: regexp.MustCompile(`\bprior\b[^.;:]{0,40}\bnext_cursor\b|\bnext_cursor\b[^.;:]{0,40}\bprior\b`),
+	},
+	{
+		name:   "say the token IS opaque",
+		assert: regexp.MustCompile(`\bopaque\b[^.;:]{0,40}\b(token|cursor|value|string)\b|\bis\s+opaque\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bopaque\b|\bopaque\b[^.;:]{0,30}\b(not|never)\b`),
+	},
+	{
+		// "verbatim" is the one claim with no stable affirmative verb to
+		// anchor on — copied / taken / reused / pasted verbatim are all
+		// accurate wordings — so requiring a particular one would fail an
+		// honest rewrite. Here the reject half carries the weight: the term
+		// must appear AND must not be negated, which is what rules out the
+		// "need not be copied verbatim" reversal.
+		name:   "require the value be reproduced VERBATIM",
+		assert: regexp.MustCompile(`\bverbatim\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bverbatim\b`),
+	},
+	{
+		name:   "say it is NOT an offset",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`),
+	},
+	{
+		name:   "say it is NOT an index",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`),
+	},
 }
 
 // normalizeDescription lower-cases and collapses whitespace runs: the
@@ -3338,9 +3376,13 @@ func TestToolDescriptions_CursorAndStageVocabulary(t *testing.T) {
 	} {
 		norm := normalizeDescription(surface.text)
 		for _, claim := range cursorDescriptionClaims {
-			if !claim.match.MatchString(norm) {
+			if !claim.assert.MatchString(norm) {
 				t.Errorf("%s does not %s (no match for %s) (#2494):\n%s",
-					surface.where, claim.name, claim.match, surface.text)
+					surface.where, claim.name, claim.assert, surface.text)
+			}
+			if claim.reject != nil && claim.reject.MatchString(norm) {
+				t.Errorf("%s REVERSES the claim it must %s (matched the negation %s) (#2494):\n%s",
+					surface.where, claim.name, claim.reject, surface.text)
 			}
 		}
 	}

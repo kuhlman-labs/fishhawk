@@ -1414,24 +1414,69 @@ func TestListRunAudit_BadUUID(t *testing.T) {
 
 // cursorMessageClaims are the SUBSTANTIVE claims #2494 promised a malformed-
 // cursor message would make, not merely the tokens those claims are worded
-// with. A token-only assertion ("the word `index` appears") stays green when
-// the message is reworded to say the cursor IS an index, which makes it a
+// with. A token-only assertion ("the word `opaque` appears") stays green when
+// the message is reworded to say the cursor is NOT opaque, which makes it a
 // control that cannot fail for the reason it exists.
 //
-// So the two NEGATED claims are matched as negations: a `not` must appear
-// within the same clause as the term. The patterns leave the wording BETWEEN
-// the negation and the term free (up to 40 chars, no sentence or clause
-// break), so an accurate rewording — "it is not an index or an offset", "this
-// is not an offset" — still passes while "it is an index" fails.
+// So each claim is asserted POSITIVELY, in two parts:
+//
+//   - assert — a pattern for the affirmative form of the claim. It requires
+//     the claim's terms to stand in the right relation (the cursor is only
+//     accepted FROM a prior response's next_cursor; the thing described as
+//     opaque is the token; the copying is verbatim), not merely to be present
+//     somewhere in the text.
+//   - reject — a pattern for the claim's NEGATION, which must NOT match.
+//     Some affirmative forms survive a negation intact ("need not be copied
+//     verbatim" still contains "copied verbatim"), so for those the reject
+//     half is what makes the claim load-bearing.
+//
+// The reviewer's reversal — "next_cursor is not accepted; the cursor is not
+// opaque and need not be copied verbatim; it is not an offset or an index" —
+// fails four of these six claims.
+//
+// Every gap is bounded and clause-bounded (`[^.;:]`, so a sentence, clause or
+// the error message's own "<what failed>: " prefix ends the window), which
+// leaves the wording BETWEEN the terms free. An accurate rewording — "it is
+// not an index or an offset", "an opaque pagination token, copied verbatim
+// from a prior response's next_cursor" — still passes.
 var cursorMessageClaims = []struct {
-	name  string
-	match *regexp.Regexp
+	name   string
+	assert *regexp.Regexp
+	reject *regexp.Regexp
 }{
-	{"name next_cursor as the only accepted source", regexp.MustCompile(`next_cursor`)},
-	{"say the token is opaque", regexp.MustCompile(`\bopaque\b`)},
-	{"say it must be copied verbatim", regexp.MustCompile(`\bverbatim\b`)},
-	{"say it is NOT an offset", regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`)},
-	{"say it is NOT an index", regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`)},
+	{
+		name:   "say that next_cursor is the ONLY accepted value",
+		assert: regexp.MustCompile(`\b(only|sole|solely|exclusively)\b[^.;:]{0,60}\bnext_cursor\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bnext_cursor\b`),
+	},
+	{
+		name:   "attribute that next_cursor to a PRIOR response",
+		assert: regexp.MustCompile(`\bprior\b[^.;:]{0,40}\bnext_cursor\b|\bnext_cursor\b[^.;:]{0,40}\bprior\b`),
+	},
+	{
+		name:   "say the token IS opaque",
+		assert: regexp.MustCompile(`\bopaque\b[^.;:]{0,40}\b(token|cursor|value|string)\b|\bis\s+opaque\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bopaque\b|\bopaque\b[^.;:]{0,30}\b(not|never)\b`),
+	},
+	{
+		// "verbatim" is the one claim with no stable affirmative verb to
+		// anchor on — copied / taken / reused / pasted verbatim are all
+		// accurate wordings — so requiring a particular one would fail an
+		// honest rewrite. Here the reject half carries the weight: the term
+		// must appear AND must not be negated, which is what rules out the
+		// "need not be copied verbatim" reversal.
+		name:   "require the value be reproduced VERBATIM",
+		assert: regexp.MustCompile(`\bverbatim\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bverbatim\b`),
+	},
+	{
+		name:   "say it is NOT an offset",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`),
+	},
+	{
+		name:   "say it is NOT an index",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`),
+	},
 }
 
 // assertCursorMessageNamesAcceptedInput asserts every cursorMessageClaims
@@ -1442,8 +1487,11 @@ func assertCursorMessageNamesAcceptedInput(t *testing.T, where, msg string) {
 	t.Helper()
 	norm := strings.Join(strings.Fields(strings.ToLower(msg)), " ")
 	for _, claim := range cursorMessageClaims {
-		if !claim.match.MatchString(norm) {
-			t.Errorf("%s: message does not %s (no match for %s): %s", where, claim.name, claim.match, msg)
+		if !claim.assert.MatchString(norm) {
+			t.Errorf("%s: message does not %s (no match for %s): %s", where, claim.name, claim.assert, msg)
+		}
+		if claim.reject != nil && claim.reject.MatchString(norm) {
+			t.Errorf("%s: message REVERSES the claim it must %s (matched the negation %s): %s", where, claim.name, claim.reject, msg)
 		}
 	}
 }
