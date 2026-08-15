@@ -1,8 +1,13 @@
 package mcpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -1116,6 +1121,1118 @@ func TestRunRowCtx_RowIDFallsBackToTheResponseRunID(t *testing.T) {
 	for _, f := range out.Elisions.Fields {
 		if f.Class == string(classOversizedCapable) && f.Pointer != want {
 			t.Errorf("pointer = %q, want the response-level fallback %q", f.Pointer, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// (7) #2576 — per-field reduction ITEMISATION at the floor
+// ---------------------------------------------------------------------------
+
+// elisionByField returns the FIRST ledger entry with the given dotted path.
+func elisionByField(el *Elisions, field string) (ElidedField, bool) {
+	if el == nil {
+		return ElidedField{}, false
+	}
+	for _, f := range el.Fields {
+		if f.Field == field {
+			return f, true
+		}
+	}
+	return ElidedField{}, false
+}
+
+func containsStr(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// reviveFloorFixture is a revive response whose oversized run FORCES the floor,
+// with a truncatable restored_stages (3 > floorCarryCollectionCap) carrying
+// multi-KB prior_reason strings and the ~330-char constant next_step. auditWarn
+// seeds the run_revived append OUTCOME: empty = clean append, non-empty = the
+// append FAILED so the audit walk cannot deliver restored_stages.
+func reviveFloorFixture(runID, auditWarn string) ReviveRunOutput {
+	return ReviveRunOutput{
+		Run: floorForcingRun(runID),
+		RestoredStages: []ReviveRestoredStage{
+			{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: strings.Repeat("agent harness 400. ", 4000), RestoredState: "pending"},
+			{StageID: uuid.NewString(), Type: "review", PriorCategory: "C", PriorReason: strings.Repeat("lineage lock. ", 4000), RestoredState: "pending"},
+			{StageID: uuid.NewString(), Type: "acceptance", PriorCategory: "D", PriorReason: "sla timeout", RestoredState: "awaiting_approval"},
+		},
+		NextStep:     reviveNextStepHint,
+		AuditWarning: auditWarn,
+	}
+}
+
+func boundReviveFloor(t *testing.T, out ReviveRunOutput, budget int) ReviveRunOutput {
+	t.Helper()
+	got, err := boundRunRowOutput(out, out.Run.ID, fixedBudget(budget),
+		func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
+	if err != nil {
+		t.Fatalf("bound revive: %v", err)
+	}
+	return got
+}
+
+// campaignItemFloorFixture is a start_campaign_item_run response whose oversized
+// run FORCES the floor, with a truncatable item.depends_on (dependsOn elements).
+func campaignItemFloorFixture(runID string, dependsOn int) StartCampaignItemRunOutput {
+	deps := make([]string, dependsOn)
+	for i := range deps {
+		deps[i] = fmt.Sprintf("kuhlman-labs/fishhawk#%d", 2500+i)
+	}
+	return StartCampaignItemRunOutput{
+		Run: floorForcingRun(runID),
+		Item: CampaignItem{
+			ID: uuid.NewString(), IssueRef: "kuhlman-labs/fishhawk#2576",
+			DependsOn: deps, RunID: runID, State: "running",
+			CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
+			UpdatedAt: time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC),
+		},
+	}
+}
+
+// boundCampaignItemFloor mirrors campaign.go's call site: the campaign-items
+// pointer is threaded from the caller via withFloorCarryPointer.
+func boundCampaignItemFloor(t *testing.T, out StartCampaignItemRunOutput, campaignID string, budget int) StartCampaignItemRunOutput {
+	t.Helper()
+	got, err := boundRunRowOutput(out, out.Run.ID, fixedBudget(budget),
+		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
+		withFloorCarryPointer("item", func(field, reason string, n int) elidedField {
+			return newStoredElision(field, reason, pointerCampaignItems(campaignID).retrievalPointer, n)
+		}))
+	if err != nil {
+		t.Fatalf("bound campaign item: %v", err)
+	}
+	return got
+}
+
+// TestFloorItemisesEveryCarriedReduction is the done-means test for the issue's
+// "REPORT what it reduced": a truncated restored_stages and a truncated
+// item.depends_on each produce their OWN entry with a non-zero omitted_count.
+// COUNTERFACTUAL: delete the recordTruncate/recordCap calls in floorCarrySlice /
+// floorCarryValue and both entries vanish — this goes RED on the missing entry.
+func TestFloorItemisesEveryCarriedReduction(t *testing.T) {
+	t.Run("revive restored_stages", func(t *testing.T) {
+		runID := uuid.NewString()
+		out := boundReviveFloor(t, reviveFloorFixture(runID, ""), mcpConvergenceFloorBytes)
+		if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+			t.Fatalf("fixture did not reach the floor: %+v", out.Elisions)
+		}
+		f, ok := elisionByField(out.Elisions, "restored_stages")
+		if !ok {
+			t.Fatalf("no restored_stages entry: %+v", out.Elisions.Fields)
+		}
+		if f.OmittedCount != 1 {
+			t.Errorf("restored_stages omitted_count = %d, want 1 (3 stages truncated to %d)", f.OmittedCount, floorCarryCollectionCap)
+		}
+	})
+	t.Run("campaign item.depends_on", func(t *testing.T) {
+		runID, campaignID := uuid.NewString(), uuid.NewString()
+		out := boundCampaignItemFloor(t, campaignItemFloorFixture(runID, 3), campaignID, mcpConvergenceFloorBytes)
+		if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+			t.Fatalf("fixture did not reach the floor: %+v", out.Elisions)
+		}
+		f, ok := elisionByField(out.Elisions, "item.depends_on")
+		if !ok {
+			t.Fatalf("no item.depends_on entry: %+v", out.Elisions.Fields)
+		}
+		if f.OmittedCount != 1 {
+			t.Errorf("item.depends_on omitted_count = %d, want 1 (3 deps truncated to %d)", f.OmittedCount, floorCarryCollectionCap)
+		}
+	})
+}
+
+// TestFloorCarry_RestoredStagesPointsAtTheAuditWalk asserts the class and the
+// EXACT pointer on a CLEAN revive (append succeeded). COUNTERFACTUAL: delete the
+// restored_stages floorCarryTable row and the fail-safe fires — class computed,
+// pointer EMPTY — so the pointer-value assertion goes RED.
+func TestFloorCarry_RestoredStagesPointsAtTheAuditWalk(t *testing.T) {
+	runID := uuid.NewString()
+	out := boundReviveFloor(t, reviveFloorFixture(runID, ""), mcpConvergenceFloorBytes)
+	f, ok := elisionByField(out.Elisions, "restored_stages")
+	if !ok {
+		t.Fatalf("no restored_stages entry: %+v", out.Elisions.Fields)
+	}
+	if f.Class != string(classOversizedCapable) {
+		t.Errorf("restored_stages class = %q, want oversized_capable", f.Class)
+	}
+	want := "GET /v0/runs/" + runID + "/audit"
+	if f.Pointer != want {
+		t.Errorf("restored_stages pointer = %q, want the audit walk %q (NOT the run read or gate view)", f.Pointer, want)
+	}
+}
+
+// TestFloorCarry_RestoredStages_AppendFailed_IsComputedNoPointer is BINDING
+// CONDITION 1's load-bearing test: when the run_revived append FAILED (audit_
+// warning set BY CONSTRUCTION), no run_revived row exists, so the audit walk
+// cannot deliver restored_stages. The class must fall back to computed with NO
+// pointer. COUNTERFACTUAL: delete the reviveAuditAppendFailed branch in the
+// restored_stages Build and it emits oversized_capable + the audit pointer —
+// RED on both the class and pointer assertions.
+func TestFloorCarry_RestoredStages_AppendFailed_IsComputedNoPointer(t *testing.T) {
+	runID := uuid.NewString()
+	out := boundReviveFloor(t, reviveFloorFixture(runID, "run_revived append failed: audit store unavailable"), mcpConvergenceFloorBytes)
+	f, ok := elisionByField(out.Elisions, "restored_stages")
+	if !ok {
+		t.Fatalf("no restored_stages entry: %+v", out.Elisions.Fields)
+	}
+	if f.Class != string(classComputed) {
+		t.Errorf("append-FAILED restored_stages class = %q, want computed — no run_revived row exists to retrieve", f.Class)
+	}
+	if f.Pointer != "" {
+		t.Errorf("append-FAILED restored_stages pointer = %q, want EMPTY — a pointer here promises content that provably is not there", f.Pointer)
+	}
+}
+
+// TestFloorCarry_NextStepIsComputedWithNoPointer asserts next_step (a constant
+// guidance string the MCP layer renders, never stored) is computed with an
+// EMPTY pointer.
+func TestFloorCarry_NextStepIsComputedWithNoPointer(t *testing.T) {
+	runID := uuid.NewString()
+	out := boundReviveFloor(t, reviveFloorFixture(runID, ""), mcpConvergenceFloorBytes)
+	f, ok := elisionByField(out.Elisions, "next_step")
+	if !ok {
+		t.Fatalf("no next_step entry: %+v", out.Elisions.Fields)
+	}
+	if f.Class != string(classComputed) {
+		t.Errorf("next_step class = %q, want computed (recomputed at read time, never stored)", f.Class)
+	}
+	if f.Pointer != "" {
+		t.Errorf("next_step pointer = %q, want EMPTY", f.Pointer)
+	}
+}
+
+// TestFloorCarry_CampaignItemPointsAtTheItemsEnumeration is BINDING CONDITION
+// 2's test: a TWO-LEVEL reported path (item.depends_on) resolves via the
+// longest-ancestor-prefix rule to the item row's campaign-items pointer, NOT the
+// computed fallback. COUNTERFACTUAL: delete the withFloorCarryPointer wiring at
+// the campaign call site (boundCampaignItemFloor) and the item row's nil Build
+// fails safe to a pointer-less computed entry — RED on the pointer VALUE.
+func TestFloorCarry_CampaignItemPointsAtTheItemsEnumeration(t *testing.T) {
+	runID, campaignID := uuid.NewString(), uuid.NewString()
+	out := boundCampaignItemFloor(t, campaignItemFloorFixture(runID, 3), campaignID, mcpConvergenceFloorBytes)
+	f, ok := elisionByField(out.Elisions, "item.depends_on")
+	if !ok {
+		t.Fatalf("no item.depends_on entry (a two-level path took the computed fallback?): %+v", out.Elisions.Fields)
+	}
+	if f.Class != string(classStored) {
+		t.Errorf("item.depends_on class = %q, want stored", f.Class)
+	}
+	want := "GET /v0/campaigns/" + campaignID + "/items"
+	if f.Pointer != want {
+		t.Errorf("item.depends_on pointer = %q, want the campaign-items enumeration %q", f.Pointer, want)
+	}
+}
+
+// TestFloorAggregateDoesNotClaimCarriedFields pins the honesty core: no entry —
+// aggregate or per-field — names the run read or the gate view as the surface
+// for a CARRIED-and-reduced field (restored_stages / next_step / item.depends_on).
+// The aggregate stored "*" entry's surfaces are those two, but they must stand
+// in ONLY for the OMITTED omittable fields, never for the itemised carried ones.
+func TestFloorAggregateDoesNotClaimCarriedFields(t *testing.T) {
+	runReadGateView := func(runID string) []string {
+		return []string{"GET /v0/runs/" + runID, "fishhawk_get_gate_view(run_id=" + runID + ")"}
+	}
+	t.Run("revive", func(t *testing.T) {
+		runID := uuid.NewString()
+		out := boundReviveFloor(t, reviveFloorFixture(runID, ""), mcpConvergenceFloorBytes)
+		bad := runReadGateView(runID)
+		for _, f := range out.Elisions.Fields {
+			if f.Field == "restored_stages" || f.Field == "next_step" {
+				if containsStr(bad, f.Pointer) {
+					t.Errorf("carried field %q points at the run read / gate view (%q) — that surface does not return it", f.Field, f.Pointer)
+				}
+			}
+		}
+		// The AGGREGATE half (the low/test-vacuity fix-up): the '*' stored entry
+		// legitimately still carries the run-read + gate-view surfaces, so the
+		// only thing scoping its at-least promise AWAY from the carried-and-reduced
+		// fields is its re-worded reason. Assert that scoping language is present,
+		// so a regression reverting the reason to the old carried-fields-inclusive
+		// wording fails HERE instead of leaving every test green.
+		var agg *ElidedField
+		for i := range out.Elisions.Fields {
+			f := out.Elisions.Fields[i]
+			if f.Field == "*" && f.Aggregate && f.Class == string(classStored) {
+				agg = &out.Elisions.Fields[i]
+				break
+			}
+		}
+		if agg == nil {
+			t.Fatalf("no aggregate '*' stored entry at the floor: %+v", out.Elisions.Fields)
+		}
+		if !strings.Contains(agg.Pointer, "GET /v0/runs/"+runID) {
+			t.Errorf("aggregate '*' entry lost the run-read surface it legitimately carries: %+v", agg)
+		}
+		if !strings.Contains(agg.Reason, "NOT swept under this aggregate") {
+			t.Errorf("aggregate '*' reason lost the scoping language that keeps its at-least promise off the carried-and-reduced fields: %q", agg.Reason)
+		}
+	})
+	t.Run("campaign", func(t *testing.T) {
+		runID, campaignID := uuid.NewString(), uuid.NewString()
+		out := boundCampaignItemFloor(t, campaignItemFloorFixture(runID, 3), campaignID, mcpConvergenceFloorBytes)
+		bad := runReadGateView(runID)
+		for _, f := range out.Elisions.Fields {
+			if strings.HasPrefix(f.Field, "item") {
+				if containsStr(bad, f.Pointer) {
+					t.Errorf("carried field %q points at the run read / gate view (%q)", f.Field, f.Pointer)
+				}
+			}
+		}
+	})
+}
+
+// --- synthetic response types for the defensive-branch tests ----------------
+
+type unclassifiedFloorOutput struct {
+	Run      Run       `json:"run"`
+	Mystery  []string  `json:"mystery"`
+	Elisions *Elisions `json:"elisions,omitempty"`
+}
+
+type manyFieldRow struct {
+	A string `json:"a"`
+	B string `json:"b"`
+	C string `json:"c"`
+	D string `json:"d"`
+	E string `json:"e"`
+	F string `json:"f"`
+	G string `json:"g"`
+	H string `json:"h"`
+}
+
+type manyReductionsOutput struct {
+	Run      Run            `json:"run"`
+	Rows     []manyFieldRow `json:"rows"`
+	Elisions *Elisions      `json:"elisions,omitempty"`
+}
+
+type deepInner struct {
+	Deep []string `json:"deep"`
+}
+
+type deepMid struct {
+	Inner deepInner `json:"inner"`
+}
+
+type deepFloorOutput struct {
+	Run      Run       `json:"run"`
+	Top      deepMid   `json:"top"`
+	Elisions *Elisions `json:"elisions,omitempty"`
+}
+
+// TestFloorCarry_UnclassifiedFieldNeverClaimsRetrieval drives a type ABSENT from
+// floorCarryTable: its reduced non-omitempty field must fail safe to a computed
+// entry with NO pointer. COUNTERFACTUAL: delete the `row == nil` fail-safe in
+// classifyFloorReduction and a nil-row deref panics — RED.
+func TestFloorCarry_UnclassifiedFieldNeverClaimsRetrieval(t *testing.T) {
+	runID := uuid.NewString()
+	out, err := boundRunRowOutput(
+		unclassifiedFloorOutput{Run: floorForcingRun(runID), Mystery: []string{"a", "b", "c", "d"}}, runID, fixedBudget(mcpConvergenceFloorBytes),
+		func(o *unclassifiedFloorOutput) []*Run { return []*Run{&o.Run} },
+		func(o *unclassifiedFloorOutput, e *Elisions) { o.Elisions = e })
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture did not reach the floor: %+v", out.Elisions)
+	}
+	f, ok := elisionByField(out.Elisions, "mystery")
+	if !ok {
+		t.Fatalf("no mystery entry: %+v", out.Elisions.Fields)
+	}
+	if f.Class != string(classComputed) {
+		t.Errorf("unclassified field class = %q, want the fail-safe computed", f.Class)
+	}
+	if f.Pointer != "" {
+		t.Errorf("unclassified field pointer = %q, want EMPTY — a field with no table row must never name a surface", f.Pointer)
+	}
+}
+
+// TestFloorCarry_EntryCountIsCapped drives MORE reductions than floorCarryEntryCap
+// and asserts exactly the cap of per-field entries plus ONE aggregate computed
+// spillover naming the remainder. COUNTERFACTUAL: delete the cap clamp in
+// addFloorCarryEntries and every reduction is itemised — the per-field count
+// exceeds the cap and no spillover appears — RED.
+func TestFloorCarry_EntryCountIsCapped(t *testing.T) {
+	runID := uuid.NewString()
+	long := strings.Repeat("x", 400)
+	rows := []manyFieldRow{
+		{A: long, B: long, C: long, D: long, E: long, F: long, G: long, H: long},
+		{A: long, B: long, C: long, D: long, E: long, F: long, G: long, H: long},
+		{A: long, B: long, C: long, D: long, E: long, F: long, G: long, H: long},
+	}
+	out, err := boundRunRowOutput(
+		manyReductionsOutput{Run: floorForcingRun(runID), Rows: rows}, runID, fixedBudget(mcpConvergenceFloorBytes),
+		func(o *manyReductionsOutput) []*Run { return []*Run{&o.Run} },
+		func(o *manyReductionsOutput, e *Elisions) { o.Elisions = e })
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	// "rows" (truncate) + rows.a..rows.h (8 caps) = 9 reduction paths > cap 4.
+	var perField, spillover int
+	for _, f := range out.Elisions.Fields {
+		switch {
+		case f.Aggregate && f.Class == string(classComputed):
+			spillover++
+		case !f.Aggregate:
+			perField++
+		}
+	}
+	if perField != floorCarryEntryCap {
+		t.Errorf("itemised %d per-field entries, want exactly the cap %d", perField, floorCarryEntryCap)
+	}
+	if spillover != 1 {
+		t.Errorf("got %d aggregate computed spillover entries, want exactly 1 naming the remainder", spillover)
+	}
+}
+
+// TestFloorCarry_DeepReductionRollsUp asserts a reduction nested DEEPER than two
+// levels rolls up to its nearest named two-level ancestor path (top.inner), not
+// a three-level path. COUNTERFACTUAL: remove the depth clamp in
+// floorCarryExtendPath and the entry appears at top.inner.deep — RED on the
+// present-at-ancestor assertion AND the absent-at-deep assertion.
+func TestFloorCarry_DeepReductionRollsUp(t *testing.T) {
+	runID := uuid.NewString()
+	out, err := boundRunRowOutput(
+		deepFloorOutput{Run: floorForcingRun(runID), Top: deepMid{Inner: deepInner{Deep: []string{"a", "b", "c", "d"}}}}, runID, fixedBudget(mcpConvergenceFloorBytes),
+		func(o *deepFloorOutput) []*Run { return []*Run{&o.Run} },
+		func(o *deepFloorOutput, e *Elisions) { o.Elisions = e })
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if _, ok := elisionByField(out.Elisions, "top.inner"); !ok {
+		t.Errorf("deep reduction did not roll up to the two-level ancestor top.inner: %+v", out.Elisions.Fields)
+	}
+	if _, ok := elisionByField(out.Elisions, "top.inner.deep"); ok {
+		t.Errorf("a THREE-level path top.inner.deep leaked past the depth bound: %+v", out.Elisions.Fields)
+	}
+}
+
+// TestFloorCarry_NoReductionRecordsNothing asserts an INERT floor stays inert: a
+// non-omitempty field carried WITHOUT reduction (a short collection, a short
+// string) records NO per-field entry. Guards the recordTruncate/recordCap
+// `<= 0` short-circuit — without it a zero-cap would emit a "0 bytes capped"
+// entry.
+func TestFloorCarry_NoReductionRecordsNothing(t *testing.T) {
+	runID := uuid.NewString()
+	out := boundReviveFloor(t, ReviveRunOutput{
+		Run:            floorForcingRun(runID),
+		RestoredStages: []ReviveRestoredStage{{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: "short", RestoredState: "pending"}},
+		NextStep:       "go",
+	}, mcpConvergenceFloorBytes)
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture did not reach the floor: %+v", out.Elisions)
+	}
+	for _, f := range out.Elisions.Fields {
+		if !f.Aggregate {
+			t.Errorf("an unreduced carried field still recorded a per-field entry: %+v", f)
+		}
+	}
+}
+
+// --- the reflection pin -----------------------------------------------------
+
+// walkReducibleType statically mirrors floorCarryValue's descent, adding a path
+// wherever a string (capped) or collection (truncated) sits. It is the type-side
+// twin of the runtime floorCarryRecorder, so the pin can require a table row for
+// every path the floor COULD reduce.
+func walkReducibleType(t reflect.Type, path string, add func(string)) {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		add(path)
+	case reflect.Slice:
+		add(path)
+		walkReducibleType(t.Elem(), path, add)
+	case reflect.Map:
+		add(path)
+		walkReducibleType(t.Elem(), path, add)
+	case reflect.Struct:
+		if t == reflect.TypeOf(time.Time{}) || hasUnexportedField(t) {
+			return
+		}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				continue
+			}
+			walkReducibleType(f.Type, floorCarryExtendPath(path, wirePathFieldName(f)), add)
+		}
+	}
+}
+
+func reducibleFloorPaths(t reflect.Type) []string {
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" || jsonTagOmits(f) || ladderOwnedFloorField(f.Type) {
+			continue
+		}
+		walkReducibleType(f.Type, wirePathFieldName(f), add)
+	}
+	return out
+}
+
+// wiredRunRowFloorTypes is the SINGLE source of the run-row output types routed
+// through boundRunRowOutput, consumed by BOTH the reflection pin and the
+// per-type floor test so neither hand-counts (BINDING CONDITION 5). Go's reflect
+// cannot enumerate a package's types at run time, so this slice is the consumed
+// source of truth — but it is NOT trusted on faith: two independent guards keep
+// it honest. (1) The reflection pin self-validates each entry structurally (it
+// must embed a Run field AND an *Elisions field), so a MALFORMED entry fails.
+// (2) TestWiredRunRowFloorTypesMatchesCallSites derives the wired set
+// PROGRAMMATICALLY from a go/ast scan of the package's non-test source for every
+// boundRunRowOutput call site and fails if this slice omits any of them — so a
+// MISSING entry (a future verb routed through boundRunRowOutput but never added
+// here) fails too, which self-validation alone could not catch (#2576 fix-up).
+func wiredRunRowFloorTypes() []reflect.Type {
+	return []reflect.Type{
+		reflect.TypeOf(GetActiveRunOutput{}),
+		reflect.TypeOf(StartRunOutput{}),
+		reflect.TypeOf(CancelRunOutput{}),
+		reflect.TypeOf(ResumeRunOutput{}),
+		reflect.TypeOf(ReviveRunOutput{}),
+		reflect.TypeOf(StartCampaignItemRunOutput{}),
+	}
+}
+
+// callSiteWiredRunRowTypes scans the package's NON-TEST source for every
+// boundRunRowOutput call site and returns the concrete output-type name each one
+// routes. The type is read from the call's func-literal argument, whose first
+// parameter is `*T` (the rows / set closures both name it) — so the derivation
+// works whether the call passes a composite literal or a variable, and it will
+// NOT over-match GetRunStatusOutput, which carries a Run + *Elisions signature
+// yet is bounded by its OWN run-status ladder rather than boundRunRowOutput. This
+// is the genuinely programmatic derivation BINDING CONDITION 5 asked for.
+func callSiteWiredRunRowTypes(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	found := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok || id.Name != "boundRunRowOutput" {
+				return true
+			}
+			for _, arg := range call.Args {
+				fl, ok := arg.(*ast.FuncLit)
+				if !ok || fl.Type.Params == nil || len(fl.Type.Params.List) == 0 {
+					continue
+				}
+				star, ok := fl.Type.Params.List[0].Type.(*ast.StarExpr)
+				if !ok {
+					continue
+				}
+				if tid, ok := star.X.(*ast.Ident); ok {
+					found[tid.Name] = true
+					break
+				}
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// TestWiredRunRowFloorTypesMatchesCallSites is BINDING CONDITION 5's completeness
+// guard: the hand-maintained wiredRunRowFloorTypes() slice must EQUAL the set of
+// concrete types that actually reach boundRunRowOutput, derived programmatically
+// from an AST scan of the package source. A future verb that routes a new output
+// type through boundRunRowOutput without adding it to the slice fails HERE — the
+// exact "a type silently escapes both wired-type tests" failure mode the
+// reflection pin's structural self-validation could not catch (it flags a
+// MALFORMED entry, not a MISSING one; #2576 fix-up).
+func TestWiredRunRowFloorTypesMatchesCallSites(t *testing.T) {
+	callSites := callSiteWiredRunRowTypes(t)
+	if len(callSites) == 0 {
+		t.Fatal("the AST scan found no boundRunRowOutput call sites — the derivation is broken, not the list")
+	}
+	listed := map[string]bool{}
+	for _, typ := range wiredRunRowFloorTypes() {
+		listed[typ.Name()] = true
+	}
+	for name := range callSites {
+		if !listed[name] {
+			t.Errorf("%s reaches boundRunRowOutput but is MISSING from wiredRunRowFloorTypes() — add it, or it escapes both TestEveryWiredFloorCarryFieldIsClassified and TestBoundRunRow_FloorTierPerWiredOutputType", name)
+		}
+	}
+	for name := range listed {
+		if !callSites[name] {
+			t.Errorf("wiredRunRowFloorTypes() lists %s but no boundRunRowOutput call site routes it — remove the stale entry", name)
+		}
+	}
+}
+
+func hasFieldOfType(t, want reflect.Type) bool {
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Type == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEveryWiredFloorCarryFieldIsClassified is the reflection pin (step 7): every
+// reducible non-omitempty field of every wired run-row output type resolves to a
+// floorCarryTable row via the single floorCarryRowFor rule, so a future verb's
+// unclassified field fails HERE rather than shipping a fail-safe entry nobody
+// notices. It also proves the walk is not vacuous and the table validates.
+func TestEveryWiredFloorCarryFieldIsClassified(t *testing.T) {
+	for _, typ := range wiredRunRowFloorTypes() {
+		// Structural self-validation of the single-source list (BINDING CONDITION 5).
+		if !hasFieldOfType(typ, reflect.TypeOf((*Elisions)(nil))) {
+			t.Errorf("%s is listed as a wired run-row type but has no *Elisions field", typ.Name())
+		}
+		if !hasFieldOfType(typ, reflect.TypeOf(Run{})) {
+			t.Errorf("%s is listed as a wired run-row type but embeds no Run field", typ.Name())
+		}
+		for _, path := range reducibleFloorPaths(typ) {
+			row := floorCarryRowFor(floorCarryTable[typ], path)
+			if row == nil {
+				t.Errorf("%s reducible field %q has no floorCarryTable row — classify it (or the floor will fail-safe it to a pointerless computed entry silently)", typ.Name(), path)
+				continue
+			}
+			switch row.Class {
+			case classStored, classOversizedCapable, classComputed:
+			default:
+				t.Errorf("%s field %q resolves to row %q with invalid class %q", typ.Name(), path, row.Path, row.Class)
+			}
+		}
+	}
+	// The walk must actually reach the nested reducible paths, or the pin is
+	// vacuous (BINDING CONDITION 2's two-level path is the key case).
+	revive := reducibleFloorPaths(reflect.TypeOf(ReviveRunOutput{}))
+	if !containsStr(revive, "restored_stages") || !containsStr(revive, "next_step") {
+		t.Errorf("the walk did not reach restored_stages / next_step: %v", revive)
+	}
+	campaign := reducibleFloorPaths(reflect.TypeOf(StartCampaignItemRunOutput{}))
+	if !containsStr(campaign, "item.depends_on") {
+		t.Errorf("the walk did not reach the two-level path item.depends_on: %v", campaign)
+	}
+	// A type with no reducible non-omitempty field contributes nothing.
+	if p := reducibleFloorPaths(reflect.TypeOf(GetActiveRunOutput{})); len(p) != 0 {
+		t.Errorf("GetActiveRunOutput reports reducible paths %v, want none", p)
+	}
+}
+
+// --- the per-wired-type floor tier test -------------------------------------
+
+type floorSurfaceCase struct {
+	name string
+	typ  reflect.Type
+	page bool
+	// drive builds this surface's floor output at budget and returns the ORIGINAL
+	// (pre-bound) input, the bounded output, and its elisions block. The input is
+	// what lets the caller distinguish a field carried UNCHANGED (byte-identical to
+	// the input) from one carried in REDUCED form — the latter MUST be accompanied
+	// by a correctly-classified elision entry (#2576 binding condition 3 / the
+	// test_vacuity fix-up). A bare IsZero check cannot tell the two apart, nor can
+	// it catch an arbitrary non-zero replacement, so the earlier version of this
+	// test was vacuous.
+	drive func(t *testing.T, budget int) (in, out any, el *Elisions)
+}
+
+// floorSurfaceCases derives its set from wiredRunRowFloorTypes() plus the two
+// page floors, so the surface list is not independently hand-maintained
+// (BINDING CONDITION 5).
+func floorSurfaceCases() []floorSurfaceCase {
+	runRowDrivers := map[reflect.Type]func(t *testing.T, budget int) (any, any, *Elisions){
+		reflect.TypeOf(GetActiveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := GetActiveRunOutput{Run: floorForcingRun(uuid.NewString())}
+			out, err := boundOneRow(in, budget)
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		},
+		reflect.TypeOf(StartRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			runID := uuid.NewString()
+			in := StartRunOutput{Run: floorForcingRun(runID), Idempotent: true}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
+				func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		},
+		reflect.TypeOf(CancelRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			runID := uuid.NewString()
+			in := CancelRunOutput{Run: floorForcingRun(runID), ReapedRunners: 5}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
+				func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		},
+		reflect.TypeOf(ResumeRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			runID := uuid.NewString()
+			in := ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}
+			out, err := boundRunRowOutput(in, runID, fixedBudget(budget),
+				func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		},
+		reflect.TypeOf(ReviveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := reviveFloorFixture(uuid.NewString(), "")
+			out := boundReviveFloor(t, in, budget)
+			return in, out, out.Elisions
+		},
+		reflect.TypeOf(StartCampaignItemRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := campaignItemFloorFixture(uuid.NewString(), 3)
+			out := boundCampaignItemFloor(t, in, uuid.NewString(), budget)
+			return in, out, out.Elisions
+		},
+	}
+	cases := make([]floorSurfaceCase, 0, len(runRowDrivers)+2)
+	for _, typ := range wiredRunRowFloorTypes() {
+		cases = append(cases, floorSurfaceCase{name: typ.Name(), typ: typ, drive: runRowDrivers[typ]})
+	}
+	cases = append(cases,
+		floorSurfaceCase{name: "ListRunsOutput", typ: reflect.TypeOf(ListRunsOutput{}), page: true, drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			items := make([]Run, 0, 20)
+			for i := 0; i < 20; i++ {
+				r := floorForcingRun(uuid.NewString())
+				items = append(items, r)
+			}
+			in := ListRunsOutput{Items: items, NextCursor: "cur-1"}
+			out, err := boundListRunsOutput(in, fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		}},
+		floorSurfaceCase{name: "ListAuditOutput", typ: reflect.TypeOf(ListAuditOutput{}), page: true, drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			runID := uuid.NewString()
+			items := auditPage(runID, 40, strings.Repeat("<", 20000))
+			for i := range items {
+				items[i].Category = strings.Repeat("category_", 400)
+				items[i].ID = strings.Repeat("id-", 400)
+			}
+			in := ListAuditOutput{Items: items, NextCursor: "cur-1"}
+			out, err := boundListAuditOutput(in, runID, "implement_reviewed", fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, out, out.Elisions
+		}},
+	)
+	return cases
+}
+
+// hasClassifiedFloorEntry reports whether the floor's ITEMISED (non-aggregate)
+// entries carry a correctly-classified entry accounting for the reduction of the
+// wire field `wire` — either an exact `field == wire` match or a nested
+// `wire.<sub>` reduction (item.depends_on for the `item` field). An entry with an
+// unrecognised class does NOT count, so a reduction reported under a garbage
+// class is treated as unaccounted-for.
+func hasClassifiedFloorEntry(el *Elisions, wire string) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate {
+			continue
+		}
+		if f.Field != wire && !strings.HasPrefix(f.Field, wire+".") {
+			continue
+		}
+		switch elisionClass(f.Class) {
+		case classStored, classOversizedCapable, classComputed:
+			return true
+		}
+	}
+	return false
+}
+
+// hasClassifiedElementDropEntry reports whether the floor's ITEMISED entries
+// carry a correctly-classified entry naming the wire field EXACTLY (never a
+// nested `wire.<sub>` child) whose omitted_count accounts for `dropped` dropped
+// elements. It exists because hasClassifiedFloorEntry's prefix match lets a
+// nested cap entry (e.g. restored_stages.prior_reason, a string cap that dropped
+// no ELEMENTS) stand in for a MISSING top-level element-drop entry — so a slice
+// that silently lost whole elements would read as accounted-for. A whole-element
+// loss is the #2576 failure mode (dropped ReviveRunOutput.RestoredStages), so it
+// must be named by an entry on the field itself, with its true dropped count.
+func hasClassifiedElementDropEntry(el *Elisions, wire string, dropped int) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate || f.Field != wire || f.OmittedCount != dropped {
+			continue
+		}
+		switch elisionClass(f.Class) {
+		case classStored, classOversizedCapable, classComputed:
+			return true
+		}
+	}
+	return false
+}
+
+// floorHasAggregate reports whether the floor emitted at least one aggregate
+// entry — the marked exception that stands in for the omitted omittable fields
+// and for the ladder-owned Run/items reductions.
+func floorHasAggregate(el *Elisions) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBoundRunRow_FloorTierPerWiredOutputType drives EVERY wired output type to
+// the FLOOR tier and asserts (a) tier == floor, (b) marshalled size at or under
+// max(budget, floor), and (c) the NO-SILENT-LOSS contract of BINDING CONDITION 3:
+// every non-omitempty field is PRESENT carrying either its TRUE value (byte-
+// identical to the input) OR a REDUCED value that is ACCOMPANIED by a correctly-
+// classified elision entry naming it. This is the done-means test for the issue's
+// "floor-tier test per wired output type".
+//
+// The earlier version asserted only !IsZero(), which the test_vacuity concern
+// correctly flagged as vacuous: an arbitrary non-zero replacement, or a
+// truncated/capped non-omitempty field emitted WITHOUT its required elision
+// entry, both slip past IsZero. This version compares each field against the
+// original input to DISTINGUISH an unchanged carry from a bounded projection, and
+// for every observed reduction it REQUIRES a matching classified entry —
+// including the two page `items` fields, which the earlier version skipped
+// (ListRuns.items is []Run, silently dropped as ladder-owned; ListAudit.items got
+// only the IsZero check).
+//
+// The accounting is split by who OWNS the reduction. A non-page, non-ladder-owned
+// field (revive's restored_stages/next_step, the campaign item, the idempotent /
+// reaped_runners scalars) is ITEMISED per #2576, so a reduction there demands an
+// itemised entry — never the aggregate. The ladder-owned Run diagnosis core and
+// the page `items` fields are covered by the floor's marked AGGREGATE by design,
+// so a reduction there demands the aggregate be present instead.
+//
+// For a reduced SLICE field the itemised-entry requirement is STRICTER than a
+// bare prefix match: a length shrink lost whole ELEMENTS, so it demands an entry
+// naming the field EXACTLY with the true dropped count. Without that, a nested
+// `wire.<sub>` cap entry (restored_stages.prior_reason — a string cap that
+// dropped no elements) would prefix-match and mask a MISSING element-drop entry,
+// letting a silent loss of whole RestoredStages read as accounted-for. The
+// test_vacuity fix-up closes exactly that hole, verified RED by suppressing only
+// the element-drop recorder while leaving the nested cap recorder intact.
+func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
+	cases := floorSurfaceCases()
+	if len(cases) == 0 {
+		t.Fatal("no wired surfaces derived")
+	}
+	budget := mcpConvergenceFloorBytes
+	ceiling := budget
+	if mcpConvergenceFloorBytes > ceiling {
+		ceiling = mcpConvergenceFloorBytes
+	}
+	elisionsType := reflect.TypeOf((*Elisions)(nil))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in, out, el := c.drive(t, budget)
+			if el == nil || el.Tier != floorTierName {
+				t.Fatalf("did not reach the floor tier: %+v", el)
+			}
+			if n := marshalLen(t, out); n > ceiling {
+				t.Errorf("floor-budget %s = %d bytes, want <= %d", c.name, n, ceiling)
+			}
+			if err := validateWireElisions(el); err != nil {
+				t.Errorf("floor elisions violate their own classification: %v", err)
+			}
+
+			// (c) NO-SILENT-LOSS: every non-omitempty field is present carrying its
+			// true value, or a reduced value with a matching classified entry.
+			ov := reflect.ValueOf(out)
+			iv := reflect.ValueOf(in)
+			rt := ov.Type()
+			for i := 0; i < rt.NumField(); i++ {
+				f := rt.Field(i)
+				if f.PkgPath != "" || jsonTagOmits(f) || f.Type == elisionsType {
+					continue // unexported, omittable, or the elisions block itself
+				}
+				wire := wirePathFieldName(f)
+				outField := ov.Field(i)
+				// Presence: a non-omitempty field that went to its ZERO value has
+				// VANISHED — it reads on the wire as "there is no value" while the
+				// aggregate elision claims it was merely omitted.
+				if outField.IsZero() {
+					t.Errorf("%s: non-omitempty field %s (%q) VANISHED at the floor (zero value, no carried content)", c.name, f.Name, wire)
+					continue
+				}
+
+				ladderOwned := ladderOwnedFloorField(f.Type)
+				if c.page || ladderOwned {
+					// The Run diagnosis core and the page `items` are reduced under
+					// the floor's marked AGGREGATE, not itemised — so require the
+					// aggregate to be present to account for the reduction.
+					if !floorHasAggregate(el) {
+						t.Errorf("%s: field %s (%q) is present but the floor emitted NO aggregate entry to account for its reduction", c.name, f.Name, wire)
+					}
+					continue
+				}
+
+				// Distinguish an UNCHANGED carry (byte-identical to the input) from a
+				// bounded PROJECTION. Only the latter needs a classified entry, and a
+				// bare IsZero check can tell neither apart nor catch an arbitrary
+				// non-zero replacement — which lands here as a reduction with no entry.
+				outRaw, err := json.Marshal(outField.Interface())
+				if err != nil {
+					t.Fatalf("marshal out field %s: %v", f.Name, err)
+				}
+				inRaw, err := json.Marshal(iv.Field(i).Interface())
+				if err != nil {
+					t.Fatalf("marshal in field %s: %v", f.Name, err)
+				}
+				if bytes.Equal(outRaw, inRaw) {
+					continue // carries its TRUE value unchanged
+				}
+				// A reduced SLICE field that lost whole ELEMENTS (its length
+				// shrank) must be accounted by an entry naming it EXACTLY, with the
+				// true dropped count — hasClassifiedFloorEntry's prefix match would
+				// otherwise let a nested `wire.<sub>` cap entry (a string cap that
+				// dropped no elements) mask the missing element-drop entry, and a
+				// silent loss of whole elements (dropped RestoredStages, #2576) would
+				// read as covered. This is the residual the test_vacuity fix-up
+				// closes over the prior prefix-only check.
+				if outField.Kind() == reflect.Slice && outField.Len() < iv.Field(i).Len() {
+					dropped := iv.Field(i).Len() - outField.Len()
+					if !hasClassifiedElementDropEntry(el, wire, dropped) {
+						t.Errorf("%s: slice field %s (%q) DROPPED %d element(s) at the floor (out=%s want unchanged=%s) but NO classified entry names %q EXACTLY with omitted_count=%d — a nested cap entry must not stand in for a whole-element silent loss (#2576 / BINDING CONDITION 3)",
+							c.name, f.Name, wire, dropped, outRaw, inRaw, wire, dropped)
+					}
+					continue
+				}
+				if !hasClassifiedFloorEntry(el, wire) {
+					t.Errorf("%s: non-omitempty field %s (%q) was carried in REDUCED form at the floor (out=%s want unchanged=%s) but NO itemised classified elision entry names it — a bounded projection with no entry reads as real (BINDING CONDITION 3)",
+						c.name, f.Name, wire, outRaw, inRaw)
+				}
+			}
+		})
+	}
+}
+
+// underBudgetWireCases derives its set from wiredRunRowFloorTypes() plus the two
+// page floors — the SAME programmatic derivation floorSurfaceCases() uses
+// (BINDING CONDITION 5) — so the under-budget coverage tracks the wired-type set
+// mechanically rather than from an independently hand-maintained pair. Each
+// driver builds a SMALL (under-budget) input and returns it alongside the bounded
+// output and the output's elisions block, so the test can assert both inertness
+// (no elisions) and byte-for-byte identity per type.
+func underBudgetWireCases() []struct {
+	name  string
+	drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+} {
+	smallRun := func(id string) Run {
+		return Run{ID: id, Repo: "o/n", WorkflowID: "feature_change", State: "running"}
+	}
+	runRowDrivers := map[reflect.Type]func(t *testing.T, budget int) (any, any, *Elisions){
+		reflect.TypeOf(GetActiveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := GetActiveRunOutput{Run: smallRun(uuid.NewString())}
+			got, err := boundOneRow(in, budget)
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(StartRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := StartRunOutput{Run: smallRun(id), Idempotent: true}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(CancelRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := CancelRunOutput{Run: smallRun(id), ReapedRunners: 5}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(ResumeRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ResumeRunOutput{Run: smallRun(id), Idempotent: true}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(ReviveRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ReviveRunOutput{
+				Run:            smallRun(id),
+				RestoredStages: []ReviveRestoredStage{{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: "short", RestoredState: "pending"}},
+				NextStep:       reviveNextStepHint,
+			}
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+		reflect.TypeOf(StartCampaignItemRunOutput{}): func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := StartCampaignItemRunOutput{
+				Run:  smallRun(id),
+				Item: CampaignItem{ID: uuid.NewString(), IssueRef: "o/n#1", DependsOn: []string{"o/n#2"}, RunID: id, State: "running"},
+			}
+			// Mirror campaign.go's call site: the pointer override is present but,
+			// under budget, the ladder early-returns before it is ever consulted.
+			got, err := boundRunRowOutput(in, id, fixedBudget(budget),
+				func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
+				func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
+				withFloorCarryPointer("item", func(field, reason string, n int) elidedField {
+					return newStoredElision(field, reason, pointerCampaignItems(uuid.NewString()).retrievalPointer, n)
+				}))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		},
+	}
+
+	cases := make([]struct {
+		name  string
+		drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+	}, 0, len(runRowDrivers)+2)
+	for _, typ := range wiredRunRowFloorTypes() {
+		d := runRowDrivers[typ]
+		if d == nil {
+			continue // an unmapped wired type is caught by TestWiredRunRowFloorTypesMatchesCallSites; guarded below.
+		}
+		cases = append(cases, struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: typ.Name(), drive: d})
+	}
+	cases = append(cases,
+		struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: "ListRunsOutput", drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			in := ListRunsOutput{Items: []Run{smallRun(uuid.NewString())}, NextCursor: "cur-1"}
+			got, err := boundListRunsOutput(in, fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		}},
+		struct {
+			name  string
+			drive func(t *testing.T, budget int) (in, got any, el *Elisions)
+		}{name: "ListAuditOutput", drive: func(t *testing.T, budget int) (any, any, *Elisions) {
+			id := uuid.NewString()
+			in := ListAuditOutput{Items: auditPage(id, 3, "short"), NextCursor: "cur-1"}
+			got, err := boundListAuditOutput(in, id, "", fixedBudget(budget))
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			return in, got, got.Elisions
+		}},
+	)
+	return cases
+}
+
+// TestFloorUnderBudgetWireUnchanged is BINDING CONDITION 4: below the byte
+// threshold the ladder is provably INERT — the bounded response is byte-for-byte
+// identical to the input, with NO elisions block — per affected response type.
+// Coverage spans every wired run-row type PLUS the two page types (not only the
+// two whose floor behaviour changed), because the under-budget early return in
+// boundRunRowOutput / boundListRunsOutput / boundListAuditOutput is upstream of
+// every change in this diff and the condition's criterion is "provably inert
+// below the threshold" per type, not "nothing observably broke".
+func TestFloorUnderBudgetWireUnchanged(t *testing.T) {
+	budget := mcpResponseByteBudgetDefault
+	cases := underBudgetWireCases()
+	// The run-row half is derived from wiredRunRowFloorTypes(); guard against a
+	// wired type silently gaining no under-budget driver.
+	if len(cases) != len(wiredRunRowFloorTypes())+2 {
+		t.Fatalf("derived %d under-budget cases, want every wired type + 2 pages (%d)", len(cases), len(wiredRunRowFloorTypes())+2)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in, got, el := c.drive(t, budget)
+			if el != nil {
+				t.Errorf("under-budget %s carries an elisions block: %+v — the ladder is not inert below the threshold", c.name, el)
+			}
+			inRaw, err := json.Marshal(in)
+			if err != nil {
+				t.Fatalf("marshal in: %v", err)
+			}
+			gotRaw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal got: %v", err)
+			}
+			if !bytes.Equal(inRaw, gotRaw) {
+				t.Errorf("under-budget %s is not byte-for-byte identical below the threshold:\n in=%s\ngot=%s", c.name, inRaw, gotRaw)
+			}
+		})
+	}
+}
+
+// TestFloorCarry_NilCollectionRecordsNothing extends the degenerate-input
+// coverage: a nil / empty non-omitempty collection at the floor records no entry
+// and does not panic.
+func TestFloorCarry_NilCollectionRecordsNothing(t *testing.T) {
+	runID := uuid.NewString()
+	out := boundReviveFloor(t, ReviveRunOutput{
+		Run:            floorForcingRun(runID),
+		RestoredStages: nil,
+		NextStep:       "",
+	}, mcpConvergenceFloorBytes)
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture did not reach the floor: %+v", out.Elisions)
+	}
+	for _, f := range out.Elisions.Fields {
+		if !f.Aggregate {
+			t.Errorf("a nil/empty collection produced a per-field entry: %+v", f)
 		}
 	}
 }
