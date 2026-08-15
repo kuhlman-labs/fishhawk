@@ -369,8 +369,9 @@ the permanent-strand class [#2630](https://github.com/kuhlman-labs/fishhawk/issu
 - **Any other spawn error is reported as a category-C stage failure** through the same `POST
   /v0/runs/{run_id}/stages/{stage_id}/reap-failure` closure the reaper would have used. This is authorized by
   construction: the reap handler's `reapProtectedParkStates` is a **closed allow-list of five PARK states** it must
-  never collapse, and `dispatched` is deliberately **not** among them — the reaper's authority is exactly
-  `{dispatched, running}`. The stage lands `failed`/category-C, which `fishhawk_retry_stage` recovers (for a local run
+  never collapse, and `dispatched` is deliberately **not** among them (the handler also refuses a terminal stage, so
+  the endpoint's reap authority spans `{pending, dispatched, running}`) — and the stage is `dispatched` here, which is
+  not a protected park. The stage lands `failed`/category-C, which `fishhawk_retry_stage` recovers (for a local run
   it parks the stage back at `awaiting_host_dispatch`, which `run_children` admits), so a subsequent `run_children`
   re-spawns the child.
 - **DISCLOSED RESIDUAL: if the report ITSELF fails, the child is STRANDED** in `dispatched` with no runner and no
@@ -736,9 +737,13 @@ A **write** tool needing `write:approvals`; a run-bound agent token is rejected 
 
 `fishhawk_reap_stage` is a **thin MCP verb over the EXISTING** `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure`
 endpoint, through the existing `apiClient.ReportStageFailure`. No new REST route, no schema change, no server-side
-change: the **server keeps sole authority** over what may be reaped (`reapProtectedParkStates` is a closed allow-list of
-five PARK states; the reaper's authority is exactly `{dispatched, running}`), and a protected-park refusal, a `404
-stage_not_found` and a `403 insufficient_scope` all surface verbatim.
+change: the **server keeps authority** over what the ENDPOINT may reap. The handler refuses a terminal stage and the
+five protected PARK states (`reapProtectedParkStates` is that closed allow-list), so the **endpoint's** reap authority
+spans `{pending, dispatched, running}` — `TestReapStageFailure_PendingAnchorSingleCAS` (server-side) pins that `pending`
+is a first-class reapable anchor. A protected-park refusal, a `404 stage_not_found` and a `403 insufficient_scope` all
+surface verbatim. **The DETACHED reaper only ever reports from `{dispatched, running}`** because its own runner-side
+allow-list (`reapStrandAllowList`, `run_stage.go`) is that narrower set; that is the distinction an older "the reaper's
+authority is exactly `{dispatched, running}`" phrasing conflated with the endpoint's own reach.
 
 It exists because a stage stranded in `dispatched`/`running` with no live runner was recoverable **only** by
 hand-POSTing that endpoint: `fishhawk_retry_stage` admits only a `failed` stage, `fishhawk_revive_run` only a
@@ -747,6 +752,38 @@ terminal-FAILED run, and `fishhawk_fixup_stage` / `fishhawk_dispatch_stage` both
 [#2363](https://github.com/kuhlman-labs/fishhawk/issues/2363)'s option 4(a): `run_children`'s spawn-error compensation
 when the category-C report ITSELF fails, and the reaper's `reportDetachedFailureWithRetry` exhausting its bounded
 backoff. Recovery sequence: **`fishhawk_reap_stage` → `fishhawk_retry_stage` → re-dispatch**.
+
+### The verb narrows to `{dispatched, running}`: a stable `pending` stage is refused ([E67.52 / #2700](https://github.com/kuhlman-labs/fishhawk/issues/2700))
+
+The endpoint accepts `pending`, but the **verb refuses it** — the endpoint and the verb are deliberately split. A stage
+observed in `pending` **has no dispatch in flight for its current attempt**, so there is no live runner to reap and
+nothing is stranded — this recovery verb, whose whole purpose is un-wedging a stage whose runner died, has no business
+failing a stage that is sitting in the queue. Note the claim is about the CURRENT ATTEMPT, not the stage's lifetime: an
+observed `pending` can carry a whole execution history behind it, because `fishhawk_retry_stage` re-parks a
+previously-attempted stage back into `pending`. The refusal therefore does **not** say the stage "never started"; it
+says its current attempt has no runner to clear.
+
+- **What fires it:** the observed pre-classification stage state is `pending` (`before == "pending"`). The guard runs
+  IMMEDIATELY after that state read and **before** the liveness probe and the HTTP hop, so it short-circuits ahead of
+  both (no probe call, zero reap-failure POSTs).
+- **Fail-open:** an unreadable or absent stage row leaves the observation unarmed, so the guard does **not** fire and
+  the reap proceeds — the same best-effort posture `confirmStrandBeforeReap` documents (refusing a recovery verb on a
+  transient read error would re-strand the stage it exists to clear). It is a narrowing layer over the server's
+  protected-park allow-list, not an invariant.
+- **Where to go instead:** the refusal points at `fishhawk_dispatch_stage` / `fishhawk_run_stage` (or
+  `fishhawk_run_children` for a decomposition child) to MOVE the pending stage, or `fishhawk_cancel_run` to abandon the
+  whole run.
+- **The escape hatch is unchanged:** the direct `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` still accepts a
+  `pending` stage, so an operator who genuinely means to fail one POSTs the endpoint directly. Keeping the endpoint
+  unrestricted while the verb carries the opinion is the intended split — **do not "fix" the apparent inconsistency by
+  loosening the verb.** Option (a) (refuse in the verb) was taken over option (b) (refuse at the endpoint) precisely so
+  the endpoint stays the escape hatch for an operator who knows what they are doing.
+
+`TestReapStage_StablePendingRefused` pins the refusal (message names `pending` and `fishhawk_dispatch_stage`, the probe
+ran ZERO times, zero POSTs), `TestReapStage_DispatchedAndRunningStillReaped` is the paired control that the guard is
+`pending`-specific (both still reap in one POST), `TestReapStage_UnreadableStageDoesNotTriggerPendingRefusal` pins the
+fail-open posture, and `TestReapStage_DescriptionStatesTrueReapAuthority` pins that the tool description names the
+pending refusal and no longer carries the old absolute authority claim.
 
 Inputs: `run_id` + `stage_id` (required), `category` (B or C, default C — enforced LOCALLY with the verb's own message,
 never a copy of the server's 400 text), `reason` (default `operator_reap_stranded_stage`), `detail`, `exit_code`.

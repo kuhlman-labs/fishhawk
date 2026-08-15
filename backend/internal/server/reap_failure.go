@@ -52,9 +52,19 @@ const maxReapFailureBodyBytes = 32 * 1024
 // handler must NEVER collapse to failed — the ONE shared predicate behind BOTH
 // reap guards (#2630). Each is a LIVE park owned by a resolver OTHER than the
 // reaper: a runner legitimately exits 0 into it, or a concurrent advance drives
-// the stage into it. The reaper's authority is exactly {dispatched, running} —
-// the states that mean a spawned runner exited WITHOUT settling the stage; every
-// other non-terminal state is a park it must leave alone.
+// the stage into it. This handler refuses a terminal stage and these five
+// protected parks, so the ENDPOINT's reap authority spans {pending, dispatched,
+// running} — TestReapStageFailure_PendingAnchorSingleCAS (reap_failure_test.go)
+// pins that 'pending' is a first-class reapable anchor (one pending → failed
+// CAS). The DETACHED reaper only ever REPORTS from {dispatched, running} because
+// its own runner-side allow-list (reapStrandAllowList, mcpserver run_stage.go) is
+// that narrower set — the states that mean a spawned runner exited WITHOUT
+// settling the stage — which is what an "authority is exactly {dispatched,
+// running}" phrasing used to conflate with the endpoint's own reach. The
+// fishhawk_reap_stage MCP VERB likewise narrows to {dispatched, running} by
+// refusing a stable pending stage client-side (E67.52 / #2700), but the endpoint
+// stays the unrestricted escape hatch and accepts pending. Every non-terminal
+// state that is not one of these five parks is reapable here.
 //
 //   - awaiting_children       — decomposition fan-in park (#1891/#1903)
 //   - awaiting_approval       — plan/gate park

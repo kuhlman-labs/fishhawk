@@ -578,6 +578,129 @@ func TestReapStage_UnobservableStageFailsOpen(t *testing.T) {
 	}
 }
 
+// (A) TestReapStage_StablePendingRefused is the counterfactual vehicle for the
+// stable-pending refusal (E67.52 / #2700). A stage seeded 'pending' — the bad
+// state written BY CONSTRUCTION, so the RED lands on the behavioural assertion
+// and not on fixture setup — is refused BEFORE the liveness probe and the HTTP
+// hop: the refusal names 'pending' and fishhawk_dispatch_stage, the injected
+// probe ran ZERO times (proving the guard precedes the classification, not
+// merely the POST), and the never-dialed seam recorded zero POSTs. Deleting the
+// guard lets the fake accept the POST and return transitioned:true — the
+// documented RED.
+func TestReapStage_StablePendingRefused(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	// A local run so, WITHOUT the guard, the classification would reach the probe
+	// — making the "probe ran zero times" assertion a real discriminator.
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "pending")
+	r, probeCalls := reapResolver(t, srv, runnerDead)
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("a stable pending stage must refuse the reap")
+	}
+	if !strings.Contains(err.Error(), `"pending"`) {
+		t.Errorf("refusal must name the observed pending state: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fishhawk_dispatch_stage") {
+		t.Errorf("refusal must point at fishhawk_dispatch_stage to move a pending stage: %v", err)
+	}
+	// The claim is about the CURRENT ATTEMPT, not the stage's lifetime — the
+	// refusal must not assert the stage "never started"/"never dispatched".
+	if strings.Contains(err.Error(), "never dispatched") || strings.Contains(err.Error(), "never started") {
+		t.Errorf("refusal must speak about the current attempt, not deny the stage's history: %v", err)
+	}
+	if *probeCalls != 0 {
+		t.Errorf("probe invoked %d times, want 0 (the guard precedes the liveness classification)", *probeCalls)
+	}
+	if got := reapHops(fb); got != 0 {
+		t.Errorf("reap-failure POSTs = %d, want 0 (a pending stage must never reach the backend)", got)
+	}
+}
+
+// (B) TestReapStage_DispatchedAndRunningStillReaped is the PAIRED CONTROL that
+// the pending guard is pending-SPECIFIC: the two genuinely-reapable strand
+// states still reap to failed in exactly one POST. An over-broad guard (e.g.
+// keying on != running instead of == pending) reddens the 'dispatched' arm.
+func TestReapStage_DispatchedAndRunningStillReaped(t *testing.T) {
+	for _, state := range []string{"dispatched", "running"} {
+		t.Run(state, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			seedLocalRun(fb, runID)
+			seedStrandedStage(fb, runID, stageID.String(), state)
+			r, _ := reapResolver(t, srv, runnerDead)
+
+			_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+				RunID: runID.String(), StageID: stageID.String(),
+			})
+			if err != nil {
+				t.Fatalf("a %q strand must still be reapable: %v", state, err)
+			}
+			if !out.Transitioned || out.StageState != "failed" {
+				t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
+			}
+			if got := reapHops(fb); got != 1 {
+				t.Errorf("reap-failure POSTs = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// (C) TestReapStage_UnreadableStageDoesNotTriggerPendingRefusal pins the pending
+// guard's FAIL-OPEN posture distinctly from the pre-existing
+// TestReapStage_UnobservableStageFailsOpen (which pins the same posture for the
+// race detectors — cross-referenced here rather than duplicated): an unreadable
+// stage list leaves the observation unarmed (beforeKnown false), so the pending
+// guard cannot fire and the reap still lands.
+func TestReapStage_UnreadableStageDoesNotTriggerPendingRefusal(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	fb.mu.Lock()
+	fb.stagesStatusByRun[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("an unreadable stage list must not refuse the reap: %v", err)
+	}
+	if !out.Transitioned || out.StageState != "failed" {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
+	}
+}
+
+// (D) TestReapStage_DescriptionStatesTrueReapAuthority is the done-means pin on a
+// prose-correctness change compilation cannot enforce: the extracted
+// reapStageDescription const must NAME 'pending' and the local refusal, and must
+// NOT carry the old absolute authority phrasing. Per the operator's binding
+// CONDITION 2 the assertions are LOOSE — they pin the CLAIM, not any whole
+// sentence, so a future accurate rewording does not redden the test — and the
+// ABSENCE half is load-bearing: it catches a partial correction that adds the
+// new claim while leaving the old false one standing.
+func TestReapStage_DescriptionStatesTrueReapAuthority(t *testing.T) {
+	d := reapStageDescription
+	if !strings.Contains(d, "pending") {
+		t.Error("description must name the pending state the verb refuses")
+	}
+	if !strings.Contains(d, "locally") {
+		t.Error("description must state the pending refusal is a LOCAL refusal")
+	}
+	// The absence half: neither the old absolute authority sentence nor its
+	// {dispatched, running}-only variant may remain.
+	for _, banned := range []string{"authority is exactly", "exactly {dispatched, running}"} {
+		if strings.Contains(d, banned) {
+			t.Errorf("description still carries the old absolute phrasing %q", banned)
+		}
+	}
+}
+
 // (D) TestReapStage_BackendRefusalSurfaces: the server stays the authority on
 // what may be reaped, and each of its refusals reaches the operator carrying
 // the backend's own code.
