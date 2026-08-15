@@ -1442,10 +1442,20 @@ Notes:
   (`pr_opened`), run failed (`run_failed`), and PR merged (`run_merged`) — and
   moves ONLY the project board Status column (the #1005 scope split: labels,
   fields, and epic links belong to filing). An entry is written for BOTH a
-  landed move AND a deliberate skip (the never-fight-the-human guard: a card a
-  human parked outside the expected source status is left untouched), so the
-  payload — `{trigger, issue_number, canonical_state, from, to, moved, skipped,
-  skip_reason}` — records what happened either way. Unlike `work_item_filed`,
+  landed move AND a deliberate DECISION skip (the never-fight-the-human guard: a
+  card a human parked outside the expected source status is left untouched), so
+  the payload — `{trigger, issue_number, canonical_state, from, to, moved,
+  skipped, skip_reason}` — records what happened either way. **The one carve-out
+  on that "audit every move AND every skip" contract (#2494):** a
+  `TransitionResult` carrying `not_applicable` — set by the provider for exactly
+  two skips, `no project configured` and `issue is not on the project board` — is
+  logged at INFO and appends NO entry, at all three emitters. A transition that
+  touched no work item has no work-item transition to record, and on a repo with
+  no board every lifecycle edge of every run wrote one, so the flood dominated
+  the audit tail. Every other skip is a DECISION about a work item that DOES
+  exist — including the projects-token-absent skip, which is an
+  operator-actionable misconfiguration worth one row per occurrence — and keeps
+  auditing unchanged. Unlike `work_item_filed`,
   this entry is NOT gated on the run being non-terminal: `run_merged` and
   `run_failed` fire as the run reaches a terminal state. The write is
   best-effort (the board move, if any, already happened) and never unwinds the
@@ -1459,8 +1469,10 @@ Notes:
   installation from the repo (like `handleCreateCampaign`) rather than from a run,
   and writes on the **GLOBAL chain** (`AppendGlobalChained`, a campaign is not a
   run) with `campaign_id` + `issue_number` in the payload instead of a run link.
-  It audits both a landed move and every deliberate skip (never-fight-the-human,
-  and the projects-token-absent skip #1107/#1114), matching the run-scoped hook.
+  It audits both a landed move and every deliberate DECISION skip
+  (never-fight-the-human, and the projects-token-absent skip #1107/#1114), and
+  suppresses the `not_applicable` skips exactly as the run-scoped hook does
+  (#2494).
   **Issue-lifecycle-scoped emitter (#1817).** The SAME `work_item_transitioned`
   category is ALSO written by a third, issue-scoped sibling entry point,
   `server/boardsync_issue_events.go::handleIssueLifecycleBoardSync` (audited via
@@ -1477,7 +1489,8 @@ Notes:
   already in `done` yields exactly one `moved=true` row plus one `skipped=true`
   row, never two moves) AND the deliberate `not_planned`/`duplicate`
   leave-in-place (the provider is not called; the skip is audited naming the
-  `state_reason`).
+  `state_reason`) — with the same `not_applicable` carve-out (#2494): a
+  no-project / not-on-board result is logged at INFO and appends nothing.
   Listed here so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an

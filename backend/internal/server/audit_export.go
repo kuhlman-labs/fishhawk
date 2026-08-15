@@ -639,20 +639,20 @@ func decodeExportCursor(raw string) (*exportCursor, error) {
 	}
 	b, err := base64.URLEncoding.DecodeString(raw)
 	if err != nil {
-		return nil, errors.New("cursor is not valid base64")
+		return nil, errors.New("cursor is not valid base64: " + cursorAcceptedInput)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	var c exportCursor
 	if err := dec.Decode(&c); err != nil {
-		return nil, errors.New("cursor is not in the expected shape")
+		return nil, errors.New("cursor is not in the expected shape: " + cursorAcceptedInput)
 	}
 	// Both keyset components are required: a decodable-but-incomplete
 	// cursor (e.g. base64("{}")) leaves a zero created_at / nil id that
 	// runAfterCursor would silently mis-order into an empty complete
 	// page. Reject it as malformed rather than reset to the first page.
 	if c.CreatedAt.IsZero() || c.ID == uuid.Nil {
-		return nil, errors.New("cursor is missing created_at or id")
+		return nil, errors.New("cursor is missing created_at or id: " + cursorAcceptedInput)
 	}
 	return &c, nil
 }

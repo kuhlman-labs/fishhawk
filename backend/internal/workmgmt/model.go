@@ -121,6 +121,23 @@ type TransitionResult struct {
 	To         string `json:"to,omitempty"`
 	Skipped    bool   `json:"skipped"`
 	SkipReason string `json:"skip_reason,omitempty"`
+	// NotApplicable narrows the Skipped set to the skips where there was NO
+	// WORK ITEM TO ACT ON at all (#2494): the target has no project
+	// configured, or the issue is not on the board. A transition that touched
+	// no work item has no work-item transition to record, so the board-sync
+	// audit call sites log those at INFO and append NO
+	// work_item_transitioned entry — on a repo with no board every lifecycle
+	// edge of every run otherwise wrote one, and that flood dominated the
+	// audit tail.
+	//
+	// It is deliberately NOT set on a DECISION skip — the
+	// never-fight-the-human source-set mismatch, a card already at target, an
+	// unmapped canonical state, an unreachable user-owned board. Those are
+	// real, audit-worthy outcomes about a work item that DOES exist (the
+	// unreachable-board case in particular is an operator-actionable
+	// misconfiguration worth one row per occurrence), and they keep auditing
+	// exactly as before.
+	NotApplicable bool `json:"not_applicable,omitempty"`
 }
 
 // Relations links a work item to other work. ParentEpic is the epic this

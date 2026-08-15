@@ -163,6 +163,14 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 //   - otherwise sets the Status single-select to the target option and
 //     reports Moved with from->to.
 //
+// Two of those skips — no project configured, and the issue not being on
+// the board — additionally set NotApplicable (#2494): there is no card to
+// act on, so the caller records no work_item_transitioned entry. The
+// remaining skips (unmapped canonical state, target status absent from the
+// board, unreachable user-owned board, never-fight-the-human source
+// mismatch, already-at-target) are DECISIONS about a real work item and
+// leave NotApplicable false, so they keep auditing.
+//
 // Genuine provider failures (issue/field resolution, the status read, the
 // set mutation) return an error; the lifecycle hook logs it best-effort and
 // never unwinds the run. Only the Status column is touched — never labels,
@@ -176,7 +184,11 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 	}
 	proj := req.Target.Project
 	if proj == nil {
-		return &workmgmt.TransitionResult{Skipped: true, SkipReason: "no project configured"}, nil
+		// NotApplicable (#2494): with no project configured there is no card
+		// anywhere to act on, so the caller suppresses the work_item_transitioned
+		// audit rather than recording a transition that touched nothing.
+		return &workmgmt.TransitionResult{Skipped: true, NotApplicable: true,
+			SkipReason: "no project configured"}, nil
 	}
 	if req.IssueNumber <= 0 {
 		return nil, errors.New("workmgmt/github: transition requires a positive issue number")
@@ -231,7 +243,11 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 		return nil, fmt.Errorf("workmgmt/github: read project item status: %w", err)
 	}
 	if !item.OnBoard {
-		return &workmgmt.TransitionResult{Skipped: true, To: toOption,
+		// NotApplicable (#2494): the issue carries no card, so there is no
+		// work item this transition could have moved — distinct from the
+		// DECISION skips below, which are real outcomes about a card that
+		// exists.
+		return &workmgmt.TransitionResult{Skipped: true, NotApplicable: true, To: toOption,
 			SkipReason: "issue is not on the project board"}, nil
 	}
 	current := item.Status

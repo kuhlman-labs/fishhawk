@@ -207,6 +207,50 @@ func TestClassifyStageWaitStatus(t *testing.T) {
 	}
 }
 
+// TestClassifyStageWaitStatus_MappingTable pins the documented backend-state
+// -> wait-status bucket mapping (#2494) over EVERY backend stage state, so the
+// table written down in stage_wait.go's doc comment, the jsonschema tag, the
+// MCP README, and the two API doc surfaces cannot drift from the code without
+// a test failure. It also pins the conservative default: an unrecognized state
+// buckets to `pending` (keep polling), never to a terminal status a caller
+// would stop on.
+func TestClassifyStageWaitStatus_MappingTable(t *testing.T) {
+	mapping := map[string]string{
+		"pending":                "pending",
+		"awaiting_host_dispatch": "pending",
+		"dispatched":             "pending",
+		"awaiting_approval":      "pending",
+		"awaiting_children":      "pending",
+		"running":                "running",
+		"succeeded":              "succeeded",
+		"failed":                 "failed",
+		"cancelled":              "cancelled",
+	}
+	for state, want := range mapping {
+		got := classifyStageWaitStatus("implement", state, "", nil, 0, waitBase)
+		if got.Status != want {
+			t.Errorf("backend state %q -> %q, want %q (the documented mapping)", state, got.Status, want)
+		}
+	}
+	// The five non-terminal states are exactly the ones the coarser bucket
+	// collapses; assert the bucket is genuinely coarser rather than 1:1.
+	if len(mapping) != 9 {
+		t.Fatalf("mapping table covers %d states, want all 9 backend stage states", len(mapping))
+	}
+	buckets := map[string]struct{}{}
+	for _, v := range mapping {
+		buckets[v] = struct{}{}
+	}
+	if len(buckets) != 5 {
+		t.Errorf("distinct wait-status buckets = %d, want 5", len(buckets))
+	}
+
+	// An unrecognized backend state falls to the keep-polling default.
+	if got := classifyStageWaitStatus("implement", "some_future_state", "", nil, 0, waitBase); got.Status != "pending" {
+		t.Errorf("unrecognized state -> %q, want the conservative pending default", got.Status)
+	}
+}
+
 // TestClassifyStageWaitStatus_Derived pins the classification contract against
 // the derived cadence (E48.62 / #2489): a NON-terminal stage carries the
 // derived value, and a TERMINAL stage omits it entirely even under a large

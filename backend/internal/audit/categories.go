@@ -78,6 +78,7 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_skipped_out_of_scope":         {},
 	"acceptance_triage_arbitrated":            {},
 	"acceptance_triage_decided":               {},
+	"agent_request_failed_alert":              {},
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},
 	"api_token_revoked":                       {},

@@ -9,6 +9,30 @@ import "time"
 // handle plus a server-suggested poll cadence, mirroring the ReviewStatus /
 // fishhawk_await_review pattern (#878).
 //
+// TWO VOCABULARIES, ONE MAPPING (#2494). The REST surface reports a stage's
+// RAW backend `state` (eight values); this MCP surface reports a coarser
+// wait-status BUCKET (five values). They are deliberately different — the
+// bucket answers "should I keep polling?" — and neither is renamed, because
+// renaming either is a breaking wire change for every existing consumer. The
+// mapping is total and is the ONE place it is written down; the REST
+// companion docs (docs/api/v0.openapi.yaml, docs/api/v0.md) point back here.
+//
+//	backend stage state       -> stage_wait_status.status
+//	------------------------------------------------------
+//	pending                   -> pending
+//	awaiting_host_dispatch    -> pending
+//	dispatched                -> pending
+//	awaiting_approval         -> pending
+//	awaiting_children         -> pending
+//	running                   -> running
+//	succeeded                 -> succeeded
+//	failed                    -> failed
+//	cancelled                 -> cancelled
+//
+// Any state not named above also falls to "pending" — the conservative
+// keep-polling default, so a backend that adds a state never strands a
+// caller on a bucket it does not recognize.
+//
 // Status is one of:
 //
 //   - "pending"   — the stage exists but has not started running yet
@@ -41,7 +65,7 @@ import "time"
 // stageWaitPollCeilingSeconds]. See stageWaitPollIntervalSeconds.
 type StageWaitStatus struct {
 	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', 'review', or 'acceptance'"`
-	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled"`
+	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled. This is a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending|awaiting_host_dispatch|dispatched|awaiting_approval|awaiting_children -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status is non-terminal (pending/running); present only while non-terminal, omitted on terminal. Poll get_run_status on this cadence as the authoritative path to a terminal stage status"`
 	// ElapsedSeconds / AgentTimeoutSeconds / DeadlineSecondsRemaining are the
 	// stage's remaining-budget observability (#2540): how long the stage has been

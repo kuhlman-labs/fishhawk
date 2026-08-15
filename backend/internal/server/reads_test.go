@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1408,6 +1409,75 @@ func TestListRunAudit_BadUUID(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
+}
+
+// assertCursorMessageNamesAcceptedInput asserts the three SUBSTANTIVE claims
+// #2494 promised a malformed-cursor message would make, not merely that the
+// token "next_cursor" appears somewhere. A token-only assertion stays green
+// with every explanatory clause deleted, which makes it a control that cannot
+// fail for the reason it exists.
+//
+// The claims are pinned individually and loosely (a phrase each, never a whole
+// sentence) so an accurate rewording still passes:
+//   - the token is OPAQUE,
+//   - the only accepted value is a prior response's next_cursor, copied VERBATIM,
+//   - it is NOT AN OFFSET or an INDEX.
+func assertCursorMessageNamesAcceptedInput(t *testing.T, where, msg string) {
+	t.Helper()
+	lower := strings.ToLower(msg)
+	for _, claim := range []struct{ name, needle string }{
+		{"names next_cursor as the source", "next_cursor"},
+		{"says the token is opaque", "opaque"},
+		{"says it must be copied verbatim", "verbatim"},
+		{"says it is not an offset", "not an offset"},
+		{"mentions index", "index"},
+	} {
+		if !strings.Contains(lower, claim.needle) {
+			t.Errorf("%s: message does not %s (missing %q): %s", where, claim.name, claim.needle, msg)
+		}
+	}
+}
+
+// TestDecodeOffsetCursor_MessageNamesNextCursor covers each malformed-offset-
+// cursor branch — non-base64, wrong shape, negative offset — and asserts every
+// message makes the accepted-input claims.
+func TestDecodeOffsetCursor_MessageNamesNextCursor(t *testing.T) {
+	cases := []struct {
+		name   string
+		cursor string
+	}{
+		{"non-base64", "not-base64!!"},
+		{"wrong shape", base64.URLEncoding.EncodeToString([]byte("nonsense"))},
+		{"negative offset", base64.URLEncoding.EncodeToString([]byte("offset:-7"))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeOffsetCursor(tc.cursor)
+			if err == nil {
+				t.Fatalf("decodeOffsetCursor(%q) = nil error, want a rejection", tc.cursor)
+			}
+			assertCursorMessageNamesAcceptedInput(t, tc.name, err.Error())
+		})
+	}
+}
+
+// TestListRunAudit_BadCursorBodyNamesAcceptedInput asserts the wording
+// actually reaches the operator through the 400 body, not just the decoder's
+// return value.
+func TestListRunAudit_BadCursorBodyNamesAcceptedInput(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?cursor=not-base64!!", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"cursor_invalid"`) {
+		t.Fatalf("body missing cursor_invalid: %s", w.Body.String())
+	}
+	assertCursorMessageNamesAcceptedInput(t, "GET /v0/runs/{id}/audit 400 body", w.Body.String())
 }
 
 func TestEncodeDecodeOffsetCursor(t *testing.T) {

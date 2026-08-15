@@ -40,7 +40,12 @@ import (
 //     not a bare 'pending'.
 //
 // Reviews is populated for the complete + skipped + failed states and empty
-// for none + pending.
+// for none + pending. It has ONE shape on every status (#2494): the field is
+// ALWAYS present and always a non-nil slice, rendering as `[]` on none and
+// pending rather than being absent. The prior `omitempty` made a consumer
+// handle two shapes — an absent key and an array — for the same field, so a
+// naive `len(reviews)` read against a none/pending status hit a missing key
+// instead of an empty list.
 //
 // PollIntervalSeconds is a server-suggested poll cadence (#879): it is
 // populated ONLY on the 'pending' status — the one state where a polling
@@ -52,7 +57,7 @@ import (
 type ReviewStatus struct {
 	Stage               string       `json:"stage" jsonschema:"the reviewed stage type: 'plan' or 'implement'"`
 	Status              string       `json:"status" jsonschema:"one of none, pending, complete, skipped, failed"`
-	Reviews             []PlanReview `json:"reviews,omitempty" jsonschema:"decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; empty for none/pending"`
+	Reviews             []PlanReview `json:"reviews" jsonschema:"ALWAYS present, one shape on every status: decoded verdicts when status=complete; synthesized skipped verdict(s) when status=skipped; synthesized failure reason when status=failed; an EMPTY array (never absent, never null) for none/pending"`
 	PollIntervalSeconds int          `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status=pending; present only on pending, omitted on terminal/none. Poll get_run_status on this cadence as the authoritative path to a terminal status"`
 }
 
@@ -444,7 +449,10 @@ func (r *runResolver) reviewStatusFromRound(stage string, rd reviewRound) *Revie
 	// longer returns 'complete' with only the first reviewer's verdict.
 	landed := rd.Landed()
 	if landed < configured {
-		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
+		// Reviews is an explicit empty slice, never nil (#2494): the field has
+		// one shape on every status, so a pending result renders "reviews":[].
+		return &ReviewStatus{Stage: stage, Status: "pending", Reviews: []PlanReview{},
+			PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
 	}
 
 	// Round complete: resolve by the existing kind precedence (complete >
@@ -481,9 +489,11 @@ func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed
 	case started:
 		// 'pending' is the one state where a polling agent should keep
 		// calling — advertise the server-suggested poll cadence (#879).
-		return &ReviewStatus{Stage: stage, Status: "pending", PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
+		// Reviews is an explicit empty slice, never nil (#2494).
+		return &ReviewStatus{Stage: stage, Status: "pending", Reviews: []PlanReview{},
+			PollIntervalSeconds: suggestedReviewPollIntervalSeconds}
 	default:
-		return &ReviewStatus{Stage: stage, Status: "none"}
+		return &ReviewStatus{Stage: stage, Status: "none", Reviews: []PlanReview{}}
 	}
 }
 

@@ -570,6 +570,43 @@ func TestAuditExport_BadLimitAndCursor(t *testing.T) {
 	})
 }
 
+// TestDecodeExportCursor_MessageNamesNextCursor covers each malformed-export-
+// cursor branch — non-base64, wrong shape, and each missing keyset component —
+// and asserts every message makes the accepted-input claims (#2494), not just
+// that the token "next_cursor" appears.
+func TestDecodeExportCursor_MessageNamesNextCursor(t *testing.T) {
+	cases := []struct {
+		name   string
+		cursor string
+	}{
+		{"non-base64", "not!base64!"},
+		{"wrong shape", base64.URLEncoding.EncodeToString([]byte(`{"unexpected":1}`))},
+		{"empty object", base64.URLEncoding.EncodeToString([]byte(`{}`))},
+		{"missing id", base64.URLEncoding.EncodeToString([]byte(`{"created_at":"2026-01-01T00:00:00Z"}`))},
+		{"missing created_at", base64.URLEncoding.EncodeToString([]byte(`{"id":"11111111-1111-1111-1111-111111111111"}`))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeExportCursor(tc.cursor)
+			if err == nil {
+				t.Fatalf("decodeExportCursor(%q) = nil error, want a rejection", tc.cursor)
+			}
+			assertCursorMessageNamesAcceptedInput(t, tc.name, err.Error())
+		})
+	}
+}
+
+// TestAuditExport_BadCursorBodyNamesAcceptedInput asserts the wording reaches
+// the operator through the export endpoint's 400 body.
+func TestAuditExport_BadCursorBodyNamesAcceptedInput(t *testing.T) {
+	s := configuredExportServer(&exportAuditFake{}, newFakeRepo(), &exportSigningFake{})
+	rec := doExport(s, "?cursor=not!base64!")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cursor_invalid") {
+		t.Fatalf("status %d body %s, want 400 cursor_invalid", rec.Code, rec.Body.String())
+	}
+	assertCursorMessageNamesAcceptedInput(t, "GET /v0/audit/export 400 body", rec.Body.String())
+}
+
 // (7) signing key ErrNotFound → run exported with signing_key omitted
 // while other runs keep theirs.
 func TestAuditExport_SigningKeyOmitted(t *testing.T) {

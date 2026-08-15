@@ -99,7 +99,11 @@ func TestReviewStatusFor_None_NoEntries(t *testing.T) {
 	if st.Status != "none" {
 		t.Errorf("Status = %q, want none", st.Status)
 	}
-	if st.Reviews != nil {
+	// #2494: reviews[] has ONE shape — present and EMPTY, never nil/absent.
+	if st.Reviews == nil {
+		t.Error("Reviews is nil for none; it must be a present, empty slice")
+	}
+	if len(st.Reviews) != 0 {
 		t.Errorf("Reviews should be empty for none; got %+v", st.Reviews)
 	}
 }
@@ -117,9 +121,83 @@ func TestReviewStatusFor_Pending_StartedOnly(t *testing.T) {
 	if st.Status != "pending" {
 		t.Errorf("Status = %q, want pending", st.Status)
 	}
-	if st.Reviews != nil {
+	// #2494: reviews[] has ONE shape — present and EMPTY, never nil/absent.
+	if st.Reviews == nil {
+		t.Error("Reviews is nil for pending; it must be a present, empty slice")
+	}
+	if len(st.Reviews) != 0 {
 		t.Errorf("Reviews should be empty for pending; got %+v", st.Reviews)
 	}
+}
+
+// TestReviewStatus_ReviewsAlwaysPresent pins the ONE-shape contract (#2494):
+// a none/pending ReviewStatus marshals with `"reviews":[]` — present and
+// empty, never absent and never null — while the terminal statuses still carry
+// their rows. This is the assertion that fails if `omitempty` is left on the
+// field or a construction path leaves the slice nil, so it covers both halves
+// of the change.
+func TestReviewStatus_ReviewsAlwaysPresent(t *testing.T) {
+	t.Run("none and pending marshal to an empty array", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		noneRun := uuid.New()
+		pendingRun := uuid.New()
+		seedReviewStartedAudit(fb, pendingRun, "plan_review_started", 1, "advisory")
+
+		for _, tc := range []struct {
+			name       string
+			runID      uuid.UUID
+			wantStatus string
+		}{
+			{"none", noneRun, "none"},
+			{"pending", pendingRun, "pending"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				st, err := r.reviewStatusFor(context.Background(), tc.runID, "plan")
+				if err != nil {
+					t.Fatalf("reviewStatusFor: %v", err)
+				}
+				if st.Status != tc.wantStatus {
+					t.Fatalf("Status = %q, want %q", st.Status, tc.wantStatus)
+				}
+				b, err := json.Marshal(st)
+				if err != nil {
+					t.Fatalf("marshal ReviewStatus: %v", err)
+				}
+				if !strings.Contains(string(b), `"reviews":[]`) {
+					t.Errorf("marshalled %s ReviewStatus = %s, want it to carry \"reviews\":[]", tc.wantStatus, b)
+				}
+			})
+		}
+	})
+
+	t.Run("complete still carries its rows", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "advisory")
+		seedPlanReviewAudit(fb, runID, PlanReview{
+			ReviewerKind: "agent",
+			Authority:    "advisory",
+			Verdict:      "approve",
+		})
+		r := newResolver(srv, nil)
+
+		st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+		if err != nil {
+			t.Fatalf("reviewStatusFor: %v", err)
+		}
+		if st.Status != "complete" || len(st.Reviews) != 1 {
+			t.Fatalf("status/reviews = %q/%d, want complete/1", st.Status, len(st.Reviews))
+		}
+		b, err := json.Marshal(st)
+		if err != nil {
+			t.Fatalf("marshal ReviewStatus: %v", err)
+		}
+		if strings.Contains(string(b), `"reviews":[]`) {
+			t.Errorf("marshalled complete ReviewStatus dropped its rows: %s", b)
+		}
+	})
 }
 
 func TestReviewStatusFor_Complete_ReviewedWinsOverStarted(t *testing.T) {

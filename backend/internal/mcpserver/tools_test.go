@@ -3283,6 +3283,118 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 	}
 }
 
+// TestToolDescriptions_CursorAndStageVocabulary is the #2494 wire-visibility
+// test for the two documentation-shaped items: the audit-listing tool's
+// `cursor` guidance and the get_run_status stage-vocabulary mapping must
+// actually reach the agent through ListTools, not merely exist in a source
+// comment. A comment-only touch of either site leaves the wire description
+// unchanged and fails here.
+//
+// It adds NO tool, so the wantToolCount surface-sweep invariant above is
+// deliberately untouched.
+func TestToolDescriptions_CursorAndStageVocabulary(t *testing.T) {
+	descByName := listToolDescriptions(t)
+
+	// Item 2: the cursor guidance the operator actually hit, asserted on BOTH
+	// wire surfaces — the tool description prose AND the `cursor` INPUT-SCHEMA
+	// property, which is what an agent filling the argument reads. Asserting
+	// only the prose leaves the schema free to keep the old vague text.
+	auditDesc := descByName["fishhawk_list_audit"]
+	if auditDesc == "" {
+		t.Fatal("fishhawk_list_audit is not registered/visible over ListTools")
+	}
+	schemaCursorDesc := toolInputPropertyDescription(t, "fishhawk_list_audit", "cursor")
+	schemaLower := strings.Join(strings.Fields(strings.ToLower(schemaCursorDesc)), " ")
+	for _, want := range []string{"next_cursor", "opaque", "verbatim", "not an offset", "index"} {
+		if !strings.Contains(schemaLower, want) {
+			t.Errorf("fishhawk_list_audit cursor INPUT SCHEMA must state %q (#2494):\n%s", want, schemaCursorDesc)
+		}
+	}
+	// The description is hard-wrapped prose, so collapse runs of whitespace
+	// before matching — otherwise a needle spanning a line break is pinned to
+	// the current wrap column rather than to the claim.
+	auditLower := strings.Join(strings.Fields(strings.ToLower(auditDesc)), " ")
+	for _, want := range []string{"next_cursor", "opaque", "verbatim", "not an offset", "index"} {
+		if !strings.Contains(auditLower, want) {
+			t.Errorf("fishhawk_list_audit description must state %q about the cursor (#2494):\n%s", want, auditDesc)
+		}
+	}
+
+	// Item 4: the two-vocabulary mapping on the surface that reports both.
+	statusDesc := descByName["fishhawk_get_run_status"]
+	if statusDesc == "" {
+		t.Fatal("fishhawk_get_run_status is not registered/visible over ListTools")
+	}
+	for _, want := range []string{"awaiting_host_dispatch", "awaiting_children", "bucket"} {
+		if !strings.Contains(strings.ToLower(statusDesc), strings.ToLower(want)) {
+			t.Errorf("fishhawk_get_run_status description must document the stage-vocabulary mapping term %q (#2494):\n%s", want, statusDesc)
+		}
+	}
+	// The reviews[] one-shape contract rides the same description.
+	if !strings.Contains(strings.ToLower(statusDesc), "always present") {
+		t.Errorf("fishhawk_get_run_status description must state reviews[] is always present (#2494):\n%s", statusDesc)
+	}
+}
+
+// toolInputPropertyDescription returns one tool input property's wire-visible
+// jsonschema description, the surface an agent reads when filling an argument
+// (distinct from the tool's own prose description).
+func toolInputPropertyDescription(t *testing.T, toolName, property string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != toolName {
+			continue
+		}
+		if tool.InputSchema == nil {
+			t.Fatalf("%s: no input schema on the wire", toolName)
+		}
+		// InputSchema is `any` on the wire type, so round-trip it through JSON
+		// rather than type-asserting a concrete schema implementation.
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("%s: marshal input schema: %v", toolName, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s: decode input schema: %v", toolName, err)
+		}
+		prop, ok := schema.Properties[property]
+		if !ok {
+			t.Fatalf("%s: input schema has no %q property", toolName, property)
+		}
+		return prop.Description
+	}
+	t.Fatalf("%s is not registered/visible over ListTools", toolName)
+	return ""
+}
+
 // listToolDescriptions connects an in-memory MCP session, registers the full
 // tool set, and returns each tool's wire-visible ListTools description keyed by
 // name. It is the shared setup the description-guidance assertions reuse.
