@@ -1884,6 +1884,28 @@ func hasClassifiedFloorEntry(el *Elisions, wire string) bool {
 	return false
 }
 
+// hasClassifiedElementDropEntry reports whether the floor's ITEMISED entries
+// carry a correctly-classified entry naming the wire field EXACTLY (never a
+// nested `wire.<sub>` child) whose omitted_count accounts for `dropped` dropped
+// elements. It exists because hasClassifiedFloorEntry's prefix match lets a
+// nested cap entry (e.g. restored_stages.prior_reason, a string cap that dropped
+// no ELEMENTS) stand in for a MISSING top-level element-drop entry — so a slice
+// that silently lost whole elements would read as accounted-for. A whole-element
+// loss is the #2576 failure mode (dropped ReviveRunOutput.RestoredStages), so it
+// must be named by an entry on the field itself, with its true dropped count.
+func hasClassifiedElementDropEntry(el *Elisions, wire string, dropped int) bool {
+	for _, f := range el.Fields {
+		if f.Aggregate || f.Field != wire || f.OmittedCount != dropped {
+			continue
+		}
+		switch elisionClass(f.Class) {
+		case classStored, classOversizedCapable, classComputed:
+			return true
+		}
+	}
+	return false
+}
+
 // floorHasAggregate reports whether the floor emitted at least one aggregate
 // entry — the marked exception that stands in for the omitted omittable fields
 // and for the ladder-owned Run/items reductions.
@@ -1920,6 +1942,15 @@ func floorHasAggregate(el *Elisions) bool {
 // itemised entry — never the aggregate. The ladder-owned Run diagnosis core and
 // the page `items` fields are covered by the floor's marked AGGREGATE by design,
 // so a reduction there demands the aggregate be present instead.
+//
+// For a reduced SLICE field the itemised-entry requirement is STRICTER than a
+// bare prefix match: a length shrink lost whole ELEMENTS, so it demands an entry
+// naming the field EXACTLY with the true dropped count. Without that, a nested
+// `wire.<sub>` cap entry (restored_stages.prior_reason — a string cap that
+// dropped no elements) would prefix-match and mask a MISSING element-drop entry,
+// letting a silent loss of whole RestoredStages read as accounted-for. The
+// test_vacuity fix-up closes exactly that hole, verified RED by suppressing only
+// the element-drop recorder while leaving the nested cap recorder intact.
 func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 	cases := floorSurfaceCases()
 	if len(cases) == 0 {
@@ -1989,6 +2020,22 @@ func TestBoundRunRow_FloorTierPerWiredOutputType(t *testing.T) {
 				}
 				if bytes.Equal(outRaw, inRaw) {
 					continue // carries its TRUE value unchanged
+				}
+				// A reduced SLICE field that lost whole ELEMENTS (its length
+				// shrank) must be accounted by an entry naming it EXACTLY, with the
+				// true dropped count — hasClassifiedFloorEntry's prefix match would
+				// otherwise let a nested `wire.<sub>` cap entry (a string cap that
+				// dropped no elements) mask the missing element-drop entry, and a
+				// silent loss of whole elements (dropped RestoredStages, #2576) would
+				// read as covered. This is the residual the test_vacuity fix-up
+				// closes over the prior prefix-only check.
+				if outField.Kind() == reflect.Slice && outField.Len() < iv.Field(i).Len() {
+					dropped := iv.Field(i).Len() - outField.Len()
+					if !hasClassifiedElementDropEntry(el, wire, dropped) {
+						t.Errorf("%s: slice field %s (%q) DROPPED %d element(s) at the floor (out=%s want unchanged=%s) but NO classified entry names %q EXACTLY with omitted_count=%d — a nested cap entry must not stand in for a whole-element silent loss (#2576 / BINDING CONDITION 3)",
+							c.name, f.Name, wire, dropped, outRaw, inRaw, wire, dropped)
+					}
+					continue
 				}
 				if !hasClassifiedFloorEntry(el, wire) {
 					t.Errorf("%s: non-omitempty field %s (%q) was carried in REDUCED form at the floor (out=%s want unchanged=%s) but NO itemised classified elision entry names it — a bounded projection with no entry reads as real (BINDING CONDITION 3)",
