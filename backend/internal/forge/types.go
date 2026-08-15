@@ -67,6 +67,22 @@ var (
 	// this sentinel (serve.go). Wrapped ALONGSIDE ErrValidation (both are
 	// reported via errors.Is) so existing ErrValidation callers are unaffected.
 	ErrPullRequestCleanStatus = errors.New("githubclient: pull request already in clean status")
+	// ErrPullRequestUnstableStatus means EnableAutoMerge was rejected because
+	// the PR is in GitHub's UNSTABLE mergeStateStatus — enablePullRequestAutoMerge
+	// refuses a PR whose required checks have not all passed (E67.56 / #2717).
+	// GitHub defines UNSTABLE as "mergeable with a non-passing commit status",
+	// which covers BOTH a still-pending required context AND one that has already
+	// COMPLETED and FAILED — so this sentinel is NOT proof the checks are merely
+	// unfinished, and a failed non-required check leaves a PR UNSTABLE forever.
+	// This is a NOT-YET (or never, on a failed check) precondition, not a dispatch
+	// failure: the operator merge path turns it into a bounded wait rather than an
+	// error whose remedy is guaranteed to fail. Deliberately NOT eligible for the
+	// ErrPullRequestCleanStatus synchronous-REST fallback: a REST squash merge on
+	// an UNSTABLE PR would SUCCEED and land the change before its pending checks
+	// report. Wrapped ALONGSIDE ErrValidation (both via errors.Is) so existing
+	// ErrValidation callers are unaffected. Keeps the "githubclient:" prefix to
+	// match the sibling sentinels moved into this package.
+	ErrPullRequestUnstableStatus = errors.New("githubclient: pull request checks have not settled (unstable status)")
 	// ErrPullRequestNotMergeable means the synchronous merge
 	// (PUT /repos/{owner}/{repo}/pulls/{number}/merge) returned 405 — the PR
 	// is not in a mergeable state (base moved, checks not settled, draft, …).

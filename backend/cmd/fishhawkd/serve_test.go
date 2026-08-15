@@ -756,6 +756,31 @@ func TestGithubAutoMerger_CleanStatus_RESTFallback(t *testing.T) {
 	}
 }
 
+// TestGithubAutoMerger_UnstableStatus_NoRESTFallback is the binding-condition-2
+// exclusion guard (E67.56 / #2717): an UNSTABLE-status enable rejection (the
+// PR's required checks have not all passed) must NOT take the clean-status REST
+// fallback — merging it synchronously would land the change before its pending
+// checks report. The error surfaces (wrapping the unstable sentinel) and the
+// REST merge PUT is NEVER served. Counterfactual: widening the fallback guard
+// from errors.Is(err, forge.ErrPullRequestCleanStatus) to a bare err != nil
+// makes this test RED on mergeHits.
+func TestGithubAutoMerger_UnstableStatus_NoRESTFallback(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		graphqlBody: `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	err := m.MergePullRequest(context.Background(), mergeFallbackRun())
+	if err == nil {
+		t.Fatal("MergePullRequest = nil, want the unstable-status enable error surfaced (no REST fallback)")
+	}
+	if !errors.Is(err, forge.ErrPullRequestUnstableStatus) {
+		t.Errorf("err = %v, want it to wrap forge.ErrPullRequestUnstableStatus", err)
+	}
+	if fg.mergeHits != 0 {
+		t.Errorf("REST merge fired %d times on an unstable-status PR, want 0 (checks pending — must not merge)", fg.mergeHits)
+	}
+}
+
 // TestGithubAutoMerger_EnableSuccess_NoFallback: a successful auto-merge enable
 // takes no REST fallback (the PR is queued, not merged synchronously).
 func TestGithubAutoMerger_EnableSuccess_NoFallback(t *testing.T) {

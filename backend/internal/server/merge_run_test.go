@@ -4,16 +4,28 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// unstableMergeErr is the multi-%w shape githubclient.EnableAutoMerge produces
+// on a checks-not-all-passed refusal (E67.56 / #2717): ErrValidation AND
+// ErrPullRequestUnstableStatus, carrying the verbatim production GraphQL message
+// from run a152a0a5.
+func unstableMergeErr() error {
+	return fmt.Errorf("%w: %w: enable auto-merge: Pull request Pull request is in unstable status",
+		forge.ErrValidation, forge.ErrPullRequestUnstableStatus)
+}
 
 // merge_run_test.go pins POST /v0/runs/{run_id}/merge (E48.7 / #1954): the
 // operator merge verb. One behavioral test per enumerated failure mode (the
@@ -634,6 +646,129 @@ func TestMergeRun_MergeDispatchFailed_502(t *testing.T) {
 	// The verdict row IS durable despite the dispatch failure.
 	if len(mergeVerdictRows(au)) != 1 {
 		t.Errorf("merge_verdict_recorded rows = %d, want 1 (verdict durable on 502)", len(mergeVerdictRows(au)))
+	}
+}
+
+// TestHandleMergeRun_UnstableDispatch_ChecksPending is the E67.56 / #2717 core:
+// a merger returning the unstable-status-wrapped sentinel yields 409
+// merge_checks_pending — an expected precondition, not a 502 fault. The body
+// names the checks-not-all-passed precondition AND the already-FAILED
+// possibility (binding condition 1), does NOT prescribe "retry the merge", and
+// the verdict row is durable. Counterfactual: deleting the step-6 branch makes
+// this test RED (the unstable error falls through to the generic 502).
+func TestHandleMergeRun_UnstableDispatch_ChecksPending(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Error.Code != "merge_checks_pending" {
+		t.Errorf("error code = %q, want merge_checks_pending", env.Error.Code)
+	}
+	// Binding condition 1: honest wording. The message must name the
+	// checks-not-all-passed precondition and the already-FAILED possibility, and
+	// must NOT prescribe the remedy that cannot work.
+	if !strings.Contains(env.Error.Message, "have not all passed") {
+		t.Errorf("message must name the checks-not-all-passed precondition: %q", env.Error.Message)
+	}
+	if !strings.Contains(env.Error.Message, "FAILED") {
+		t.Errorf("message must name the already-failed-check possibility: %q", env.Error.Message)
+	}
+	if strings.Contains(env.Error.Message, "retry the merge") {
+		t.Errorf("message must NOT prescribe 'retry the merge' (a remedy that cannot work): %q", env.Error.Message)
+	}
+	if env.Error.Details["reason"] != "checks_pending" {
+		t.Errorf("details.reason = %v, want checks_pending", env.Error.Details["reason"])
+	}
+	if env.Error.Details["pr_url"] != mergePR {
+		t.Errorf("details.pr_url = %v, want %q", env.Error.Details["pr_url"], mergePR)
+	}
+	if _, ok := env.Error.Details["verdict_sequence"]; !ok {
+		t.Errorf("details missing verdict_sequence: %v", env.Error.Details)
+	}
+	// The verdict row IS durable despite the checks-pending refusal.
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1 (verdict durable on the 409)", len(rows))
+	}
+}
+
+// TestHandleMergeRun_GenericDispatchFailure_Still502 is the counterfactual for
+// the not-swallowed criterion: a plain (non-sentinel) dispatch error still
+// yields 502 merge_dispatch_failed. Widening the checks-pending branch past the
+// unstable sentinel would turn this RED.
+func TestHandleMergeRun_GenericDispatchFailure_Still502(t *testing.T) {
+	merger := &fakeMerger{err: errBoom}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("merge_dispatch_failed")) {
+		t.Errorf("body missing merge_dispatch_failed: %s", w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("merge_checks_pending")) {
+		t.Errorf("a generic dispatch error must NOT be classified as checks-pending: %s", w.Body.String())
+	}
+}
+
+// TestHandleMergeRun_ChecksPending_IdempotentAcrossWait is binding condition 4's
+// committed-state control: across a 409 (unstable), a second 409 (unstable), and
+// a final 200 (healthy) there is EXACTLY ONE merge_verdict_recorded row — the
+// durability/idempotence contract pinned on persisted state, not on a
+// byte-identical error. The final POST re-dispatches with already_recorded:true.
+// Deleting the step-6 branch makes this RED (the first two POSTs would 502).
+func TestHandleMergeRun_ChecksPending_IdempotentAcrossWait(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+
+	// POST 1: checks pending → 409, verdict recorded.
+	w1 := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w1.Code != http.StatusConflict {
+		t.Fatalf("POST 1 status = %d, want 409:\n%s", w1.Code, w1.Body.String())
+	}
+	// POST 2: still checks pending → 409, no duplicate append.
+	w2 := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go again"}, withMergeOperator)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("POST 2 status = %d, want 409:\n%s", w2.Code, w2.Body.String())
+	}
+	// POST 3: checks cleared → the merge queues.
+	merger.err = nil
+	w3 := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go final"}, withMergeOperator)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("POST 3 status = %d, want 200:\n%s", w3.Code, w3.Body.String())
+	}
+	var resp3 mergeRunResponse
+	if err := json.Unmarshal(w3.Body.Bytes(), &resp3); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp3.AlreadyRecorded {
+		t.Error("POST 3 already_recorded = false, want true (the verdict was recorded on POST 1)")
+	}
+	if !resp3.MergeQueued {
+		t.Error("POST 3 merge_queued = false, want true (the merge re-dispatches once checks clear)")
+	}
+	// EXACTLY ONE merge_verdict_recorded row across all three POSTs.
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d after three POSTs, want 1 (no duplicate across the wait)", len(rows))
 	}
 }
 

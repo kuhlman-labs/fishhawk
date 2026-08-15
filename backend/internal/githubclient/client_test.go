@@ -1963,6 +1963,40 @@ func TestEnableAutoMerge_GraphQLError_AsValidation(t *testing.T) {
 	if !errors.Is(err, ErrPullRequestCleanStatus) {
 		t.Errorf("clean-status err should wrap ErrPullRequestCleanStatus, got %v", err)
 	}
+	// Mirrored negative: the clean-status class must NOT wrap the disjoint
+	// unstable-status sentinel (E67.56 / #2717).
+	if errors.Is(err, ErrPullRequestUnstableStatus) {
+		t.Errorf("clean-status err must NOT wrap ErrPullRequestUnstableStatus, got %v", err)
+	}
+}
+
+// TestEnableAutoMerge_UnstableGraphQLError_AsUnstableStatus feeds the VERBATIM
+// production GraphQL message from run a152a0a5 ("Pull request Pull request is in
+// unstable status", #2717) and asserts the multi-%w wrap: ErrValidation AND
+// ErrPullRequestUnstableStatus, and NOT the disjoint clean-status sentinel. This
+// is the counterfactual vehicle for the step-2 classification: deleting the
+// unstable branch in client.go makes this test RED on the errors.Is assertion.
+func TestEnableAutoMerge_UnstableGraphQLError_AsUnstableStatus(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.graphqlBody = `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+	if !errors.Is(err, ErrPullRequestUnstableStatus) {
+		t.Errorf("unstable-status err should wrap ErrPullRequestUnstableStatus, got %v", err)
+	}
+	// Disjoint from the clean-status class: the unstable message must NOT wrap
+	// ErrPullRequestCleanStatus, so the merge REST fallback never fires on it.
+	if errors.Is(err, ErrPullRequestCleanStatus) {
+		t.Errorf("unstable-status err must NOT wrap ErrPullRequestCleanStatus, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "unstable status") {
+		t.Errorf("err should surface the graphql message: %v", err)
+	}
 }
 
 // TestEnableAutoMerge_NonCleanGraphQLError_NotCleanStatus asserts a NON
@@ -1981,6 +2015,11 @@ func TestEnableAutoMerge_NonCleanGraphQLError_NotCleanStatus(t *testing.T) {
 	}
 	if errors.Is(err, ErrPullRequestCleanStatus) {
 		t.Errorf("non-clean-status err must NOT wrap ErrPullRequestCleanStatus, got %v", err)
+	}
+	// Nor the unstable-status sentinel: an unrelated enable failure wraps
+	// neither of the two merge-precondition sentinels (E67.56 / #2717).
+	if errors.Is(err, ErrPullRequestUnstableStatus) {
+		t.Errorf("unrelated enable err must NOT wrap ErrPullRequestUnstableStatus, got %v", err)
 	}
 }
 

@@ -57,14 +57,15 @@ const WorkflowSpecPath = ".fishhawk/workflows.yaml"
 // error value, so errors.Is holds across them and a caller may switch on
 // either. forge/types.go carries the per-sentinel contract.
 var (
-	ErrNotFound                = forge.ErrNotFound
-	ErrForbidden               = forge.ErrForbidden
-	ErrValidation              = forge.ErrValidation
-	ErrNotInstalled            = forge.ErrNotInstalled
-	ErrPullRequestExists       = forge.ErrPullRequestExists
-	ErrMergeConflict           = forge.ErrMergeConflict
-	ErrPullRequestCleanStatus  = forge.ErrPullRequestCleanStatus
-	ErrPullRequestNotMergeable = forge.ErrPullRequestNotMergeable
+	ErrNotFound                  = forge.ErrNotFound
+	ErrForbidden                 = forge.ErrForbidden
+	ErrValidation                = forge.ErrValidation
+	ErrNotInstalled              = forge.ErrNotInstalled
+	ErrPullRequestExists         = forge.ErrPullRequestExists
+	ErrMergeConflict             = forge.ErrMergeConflict
+	ErrPullRequestCleanStatus    = forge.ErrPullRequestCleanStatus
+	ErrPullRequestUnstableStatus = forge.ErrPullRequestUnstableStatus
+	ErrPullRequestNotMergeable   = forge.ErrPullRequestNotMergeable
 )
 
 // The Forge-surface vocabulary lives canonically in the forge package
@@ -1055,7 +1056,10 @@ func rulesetMatchesBranch(conditions *struct {
 // the installation; ErrForbidden for auth issues; ErrValidation when
 // GitHub rejects the auto-merge enable (e.g., branch protection
 // already met and the PR auto-merged synchronously, repo doesn't
-// allow auto-merge, or the merge method is disabled).
+// allow auto-merge, or the merge method is disabled). Two ErrValidation
+// rejections carry an additional wrapped sentinel: ErrPullRequestCleanStatus
+// (the PR is already merge-ready) and ErrPullRequestUnstableStatus (the PR's
+// required checks have not all passed — GitHub reports it in UNSTABLE status).
 //
 // Idempotent in practice: enabling auto-merge on a PR that already
 // has it queued returns success rather than failing. The dispatcher
@@ -1131,14 +1135,26 @@ func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScop
 	}
 	if len(gqlResp.Errors) > 0 {
 		msg := gqlResp.Errors[0].Message
+		lower := strings.ToLower(msg)
 		// A "clean status" rejection is the already-merge-ready case (#1954):
 		// the PR could be merged synchronously right now, so GitHub refuses to
 		// queue auto-merge. Wrap ErrPullRequestCleanStatus ALONGSIDE
 		// ErrValidation (Go multi-%w) so the operator merge path can fall back
 		// to a synchronous REST merge on this sentinel while every existing
 		// errors.Is(err, ErrValidation) caller is unchanged.
-		if strings.Contains(strings.ToLower(msg), "clean status") {
+		if strings.Contains(lower, "clean status") {
 			return fmt.Errorf("%w: %w: enable auto-merge: %s", ErrValidation, ErrPullRequestCleanStatus, msg)
+		}
+		// An "unstable status" rejection is the checks-not-all-passed case
+		// (E67.56 / #2717): GitHub refuses to queue auto-merge on a PR in
+		// UNSTABLE mergeStateStatus. Wrap ErrPullRequestUnstableStatus ALONGSIDE
+		// ErrValidation with the identical multi-%w shape. The two substrings
+		// ("clean status" vs "unstable status") are disjoint, so neither branch
+		// can capture the other's message. UNLIKE the clean-status class this is
+		// deliberately NOT eligible for the synchronous-REST fallback — a REST
+		// merge would land the PR before its pending checks report.
+		if strings.Contains(lower, "unstable status") {
+			return fmt.Errorf("%w: %w: enable auto-merge: %s", ErrValidation, ErrPullRequestUnstableStatus, msg)
 		}
 		return fmt.Errorf("%w: enable auto-merge: %s", ErrValidation, msg)
 	}

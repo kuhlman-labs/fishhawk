@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -79,8 +80,17 @@ type mergeRunResponse struct {
 // POST that finds an existing merge_verdict_recorded row appends NO duplicate
 // row and responds already_recorded:true, but ALWAYS re-dispatches the merge
 // helper — so a 502-then-reinvoke re-queues the merge without ever duplicating
-// the verdict. On the merge helper erroring the handler returns 502 stating the
-// verdict row is durable and the queue step is retryable.
+// the verdict.
+//
+// On the merge helper erroring the handler branches on the cause. A
+// checks-not-all-passed refusal (forge.ErrPullRequestUnstableStatus — GitHub
+// reports the PR in UNSTABLE status, E67.56 / #2717) returns 409
+// merge_checks_pending: an expected precondition, not a fault, so the operator
+// (and fishhawk_merge_run's bounded wait) is told the checks have not all
+// passed and that a failed check means inspecting the PR rather than waiting.
+// EVERY other error returns 502 merge_dispatch_failed stating the verdict row is
+// durable and the queue step is retryable — a genuine dispatch failure is never
+// masked as "just waiting".
 func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -305,6 +315,24 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// run-completion settle is left to the pull_request-closed webhook, which is
 	// why the MCP tool awaits the terminal state client-side.
 	if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
+		// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
+		// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
+		// status and refuses to queue auto-merge until its required checks pass.
+		// Classify it distinctly as 409 merge_checks_pending so the operator gets
+		// a remedy that can work (wait for the checks, or inspect the PR if a
+		// check has already failed) instead of the generic 502's "retry the
+		// merge", which reproduces the identical failure. The verdict row is
+		// already durable, so the tool re-POSTs across a bounded wait with no
+		// duplicate row. EVERY other error keeps the generic 502 so a real
+		// dispatch failure is never swallowed as "just waiting".
+		if errors.Is(merr, forge.ErrPullRequestUnstableStatus) {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
+				slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
+			s.writeError(w, r, http.StatusConflict, "merge_checks_pending",
+				"the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting.",
+				map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"})
+			return
+		}
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
 			slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
 		s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
