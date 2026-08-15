@@ -563,9 +563,10 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 	// reaper would have used. This is authorized by construction and needs no
 	// new endpoint: reapProtectedParkStates (backend/internal/server/reap_failure.go)
 	// is a CLOSED allow-list of five PARK states the reap handler must never
-	// collapse, and 'dispatched' is deliberately NOT among them — the reaper's
-	// authority is exactly {dispatched, running} — and the stage is 'dispatched'
-	// at exactly this point. The stage lands failed/category-C, the retryable
+	// collapse, and 'dispatched' is deliberately NOT among them (the handler also
+	// refuses a terminal stage, so the endpoint's reap authority spans {pending,
+	// dispatched, running}) — and the stage is 'dispatched' at exactly this point,
+	// which is not a protected park. The stage lands failed/category-C, the retryable
 	// infrastructure class, which fishhawk_retry_stage recovers: for a
 	// runner_kind local run it parks the stage back at awaiting_host_dispatch,
 	// a state implementStageDispatchable admits, so a SUBSEQUENT

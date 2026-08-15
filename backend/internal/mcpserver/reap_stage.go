@@ -12,10 +12,19 @@ import (
 // fishhawk_reap_stage (E67.47 / #2689) is the operator-reachable wrapper over
 // the EXISTING `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure`
 // endpoint. It adds no REST route, no schema and no server-side behaviour: the
-// SERVER stays the sole authority on what may be reaped
+// SERVER stays the authority on what the ENDPOINT may reap
 // (backend/internal/server/reap_failure.go's reapProtectedParkStates is a
-// CLOSED allow-list of five PARK states the reaper must never collapse, so the
-// reaper's authority is exactly {dispatched, running}).
+// CLOSED allow-list of five PARK states the reap handler must never collapse,
+// and it also refuses a terminal stage — so the ENDPOINT's reap authority spans
+// {pending, dispatched, running}). This VERB narrows that to {dispatched,
+// running} by refusing a stable 'pending' stage LOCALLY (E67.52 / #2700): a
+// stage observed in 'pending' has no dispatch in flight FOR ITS CURRENT ATTEMPT,
+// so there is no live runner to reap and nothing is stranded — whatever an
+// earlier attempt did (fishhawk_retry_stage re-parks a previously attempted
+// stage back into pending). The endpoint still accepts a pending stage — it is
+// the unrestricted escape hatch for an operator who genuinely means to fail one;
+// the verb carries the opinion. This split is deliberate; do not "fix" the
+// apparent inconsistency by loosening the verb.
 //
 // WHY A VERB IS NEEDED AT ALL. #2363's option 4(a) landed — run_children.go
 // spawns children through spawnRunnerStageDetachedFn, so every child IS
@@ -38,6 +47,12 @@ import (
 // recovery was a hand-rolled POST to the reap-failure endpoint. This verb is
 // that POST.
 const (
+	// reapStagePendingState is the stage state the VERB refuses locally (E67.52 /
+	// #2700). A stage observed in 'pending' has no dispatch in flight for its
+	// current attempt, so it is not a strand this recovery verb should fail. The
+	// package uses bare "pending" literals elsewhere and has no shared stage-state
+	// constant, so this literal is package-local.
+	reapStagePendingState = "pending"
 	// reapStageDefaultCategory is the retryable infrastructure class a reap
 	// reports. The endpoint accepts only B or C; C is what makes
 	// fishhawk_retry_stage applicable afterwards.
@@ -74,6 +89,20 @@ func reapStageNextStep(category string) string {
 	return reapStageNextStepHintC
 }
 
+// reapStagePendingRefusal is the message for the stable-pending refusal (E67.52
+// / #2700). It speaks about the CURRENT ATTEMPT, not the stage's lifetime: an
+// observed 'pending' can carry a whole execution history behind it (a prior
+// fishhawk_retry_stage re-parked it), so the true, load-bearing claim is that
+// pending has no dispatch in flight for its current attempt — nothing is
+// stranded to clear. It points the operator at the move that fits their
+// situation (dispatch it, or cancel the run) and names the direct endpoint as
+// the escape hatch for a deliberate pending fail.
+func reapStagePendingRefusal(stageID, runID string) error {
+	return fmt.Errorf(
+		"refusing to reap stage %s of run %s: it is observed in %q, which has no dispatch in flight for its current attempt — so there is no live runner to reap and nothing is stranded, whatever an earlier attempt did (fishhawk_retry_stage re-parks a previously attempted stage back into pending). To move a pending stage, dispatch it with fishhawk_dispatch_stage / fishhawk_run_stage (or fishhawk_run_children for a decomposition child), or use fishhawk_cancel_run to abandon the whole run. If you genuinely mean to FAIL a pending stage, the reap-failure endpoint still accepts it directly — POST /v0/runs/%s/stages/%s/reap-failure — because this VERB, not the server, is what narrows",
+		stageID, runID, reapStagePendingState, runID, stageID)
+}
+
 // runnerLivenessLabel renders a runnerLivenessVerdict as the operator-facing
 // string carried on ReapStageOutput.runner_liveness. Kept separate from the
 // verdict type (drive_run.go) so the wire vocabulary is owned by the verb that
@@ -94,7 +123,7 @@ func runnerLivenessLabel(v runnerLivenessVerdict) string {
 // defaulted locally.
 type ReapStageInput struct {
 	RunID    string `json:"run_id" jsonschema:"the Fishhawk run UUID owning the stranded stage"`
-	StageID  string `json:"stage_id" jsonschema:"the UUID of the stage stranded in dispatched or running with no live runner"`
+	StageID  string `json:"stage_id" jsonschema:"the UUID of the stage stranded in dispatched or running with no live runner; a stage observed in pending is refused locally (pending is not a strand — dispatch it instead)"`
 	Category string `json:"category,omitempty" jsonschema:"failure category to record; only B or C are accepted and the default C is the retryable infrastructure class that makes fishhawk_retry_stage applicable"`
 	Reason   string `json:"reason,omitempty" jsonschema:"short classification recorded on the failure; defaults to operator_reap_stranded_stage"`
 	Detail   string `json:"detail,omitempty" jsonschema:"optional longer diagnostic recorded alongside the reason (the runner log tail, the observed strand, the incident id)"`
@@ -114,14 +143,13 @@ type ReapStageOutput struct {
 	Warnings       []string `json:"warnings,omitempty" jsonschema:"non-fatal notes raised while classifying runner liveness, including the unverifiable-from-this-host note for a non-local runner_kind"`
 }
 
-// registerReapStage wires the fishhawk_reap_stage tool (E67.47 / #2689).
-//
-// Auth: operator write tool. The endpoint requires write:runs; a token without
-// it surfaces 403 insufficient_scope verbatim.
-func registerReapStage(srv *mcp.Server, resolver *runResolver) {
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "fishhawk_reap_stage",
-		Description: strings.TrimSpace(`
+// reapStageDescription is the fishhawk_reap_stage tool description, extracted to
+// a package-level const so the package's tests can assert its prose directly
+// (TestReapStage_DescriptionStatesTrueReapAuthority pins that it names the
+// pending refusal and no longer carries the old absolute authority claim). It is
+// a raw literal with leading/trailing whitespace trimmed at the registration
+// site, because strings.TrimSpace cannot run in a const initializer.
+const reapStageDescription = `
 Use this when a stage is STRANDED in 'dispatched' or 'running' with no live
 runner and every other recovery verb refuses it — fishhawk_retry_stage admits
 only a 'failed' stage, fishhawk_revive_run only a terminal-FAILED run, and
@@ -135,11 +163,21 @@ the retryable infrastructure class. After it lands the stage is 'failed' and
 fishhawk_retry_stage becomes applicable; the recovery sequence is
 fishhawk_reap_stage -> fishhawk_retry_stage -> re-dispatch.
 
-This can never destroy a live park. The SERVER stays the authority on what may
-be reaped: it refuses the five protected PARK states (awaiting_children,
-awaiting_approval, awaiting_input, awaiting_scope_decision,
-awaiting_host_dispatch) and its reap authority is exactly {dispatched, running}.
-A protected-park refusal surfaces here verbatim.
+This never destroys a live park, and it refuses a stable 'pending' stage
+locally. The SERVER refuses to reap a terminal stage and the five
+protected PARK states (awaiting_children, awaiting_approval, awaiting_input,
+awaiting_scope_decision, awaiting_host_dispatch), so the ENDPOINT's reap
+authority spans {pending, dispatched, running}. This VERB narrows that to
+{dispatched, running}: a stage observed in 'pending' has no dispatch in flight
+FOR ITS CURRENT ATTEMPT — there is no live runner to reap and nothing is
+stranded, whatever an earlier attempt did (fishhawk_retry_stage re-parks a
+previously attempted stage back into pending) — so the verb REFUSES it locally,
+before the liveness probe and the HTTP hop, and points you at
+fishhawk_dispatch_stage / fishhawk_run_stage (or fishhawk_run_children for a
+decomposition child) to move it, or fishhawk_cancel_run to abandon the run. A
+protected-park refusal from the server surfaces here verbatim. The reap-failure
+endpoint itself still accepts a pending stage — POST the route directly if you
+genuinely mean to fail one; the verb, not the server, carries this opinion.
 
 This is NOT fishhawk_cancel_run. On a decomposition CHILD a cancel permanently
 wedges the parent, because fishhawk_consolidate_slices requires every child to
@@ -179,16 +217,28 @@ Input:
 
 Tool errors:
   - invalid UUID, or a category outside {B, C} (both caught before the HTTP hop)
+  - a stable 'pending' stage (refused locally: pending is not a strand — dispatch
+    it instead; no HTTP hop)
   - a LIVE runner for a runner_kind=local run (refused; no HTTP hop)
   - stage_not_found (404)
   - the protected-park refusal (the stage is in one of the five park states)
   - insufficient_scope (403 — the token lacks write:runs)
-`),
+`
+
+// registerReapStage wires the fishhawk_reap_stage tool (E67.47 / #2689).
+//
+// Auth: operator write tool. The endpoint requires write:runs; a token without
+// it surfaces 403 insufficient_scope verbatim.
+func registerReapStage(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "fishhawk_reap_stage",
+		Description: strings.TrimSpace(reapStageDescription),
 	}, resolver.reapStage)
 }
 
 // reapStage is the tool handler. Every refusal short-circuits BEFORE the HTTP
-// hop: id parse, then the category allow-list, then the liveness classification.
+// hop: id parse, then the category allow-list, then the stable-pending refusal,
+// then the liveness classification.
 func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in ReapStageInput) (*mcp.CallToolResult, ReapStageOutput, error) {
 	runUUID, err := uuid.Parse(in.RunID)
 	if err != nil {
@@ -219,6 +269,29 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 	// detector in confirmStrandBeforeReap. An unreadable or absent row leaves
 	// that comparison unarmed (fail OPEN — see there).
 	before, beforeKnown := r.observeStageState(ctx, runUUID, in.StageID)
+
+	// STABLE-PENDING REFUSAL (E67.52 / #2700). A stage observed in 'pending' has
+	// no dispatch in flight FOR ITS CURRENT ATTEMPT, so there is no live runner to
+	// reap and nothing is stranded — this recovery verb has no business failing a
+	// stage that is sitting in the queue. Fire IMMEDIATELY after the state read
+	// and BEFORE the liveness classification, so it short-circuits ahead of BOTH
+	// the host probe and the HTTP hop (the file's 'every refusal short-circuits
+	// BEFORE the HTTP hop' contract).
+	//
+	// FAIL OPEN, by construction: an unreadable or absent stage row leaves
+	// beforeKnown false, so the guard does not fire — the same best-effort posture
+	// confirmStrandBeforeReap documents (refusing a recovery verb on a transient
+	// read error would re-strand the very stage it exists to clear). This is a
+	// narrowing layer on top of the server's protected-park allow-list, not an
+	// invariant.
+	//
+	// No second pending check is needed at the pre-POST re-confirmation: a stage
+	// moving INTO 'pending' mid-flight (a concurrent fishhawk_retry_stage re-park)
+	// is already refused by confirmStrandBeforeReap detector (1), the pre/post
+	// state comparison.
+	if beforeKnown && before == reapStagePendingState {
+		return nil, ReapStageOutput{}, reapStagePendingRefusal(in.StageID, in.RunID)
+	}
 
 	verdict, probed, warnings := r.classifyReapLivenessGated(ctx, runUUID, in.StageID)
 	if verdict == runnerLive {
