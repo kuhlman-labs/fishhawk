@@ -4782,6 +4782,29 @@ paths:
                       listener on the port is the daemon it started even
                       across OS pid reuse.
                     example: "9f86d081884c7d65"
+                  process_start:
+                    type: string
+                    format: date-time
+                    description: |
+                      RFC3339 (nanosecond precision) UTC instant this fishhawkd
+                      process booted — the same in-memory boot marker the
+                      orphaned-review reconcile compares audit timestamps
+                      against. Published so a CLIENT can make the same
+                      comparison: fishhawk_await_review reads it to decide
+                      whether an in-flight review's dispatching process is still
+                      alive, and reports the round as stranded (instead of
+                      waiting out its full timeout) when the review's
+                      *_review_started entry predates this instant with fewer
+                      than configured_agents terminal verdicts landed.
+
+                      An ADDITIVE SIBLING of start_nonce, not a replacement: the
+                      nonce proves listener identity but is opaque and
+                      unorderable, while a restart boundary must be COMPARED
+                      against an audit timestamp. Omitted when the marker is
+                      zero, so a caller can distinguish "no boundary published"
+                      from a real instant rather than decoding a zero time that
+                      would compare as before every audit entry.
+                    example: "2026-08-15T13:30:15.123456789Z"
         '503':
           description: Process is shutting down or otherwise not ready.
           content:
@@ -7252,6 +7275,138 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: Run repository not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/reviews/reconcile:
+    post:
+      operationId: reconcileRunReviews
+      summary: Terminate a review round orphaned by a fishhawkd restart
+      description: |
+        On-demand orphaned-review recovery (#2712) — the operator-reachable
+        twin of the boot sweep fishhawkd runs once at startup (#1781).
+
+        When fishhawkd restarts while a plan or implement review is in flight,
+        the detached reviewing goroutine dies with the process and no terminal
+        `*_review_(reviewed|skipped|failed)` entry ever lands. `review_status`
+        is derived from the audit trail, so the round stays `pending` forever:
+        the approval/merge gate never settles and `fishhawk_await_review` waits
+        out its whole window. The boot sweep heals exactly this — but only AT
+        BOOT, so an operator whose review was ALREADY orphaned had to restart
+        the daemon a second time. This endpoint runs the same per-run helper on
+        demand.
+
+        For each review-bearing stage it reads the CURRENT round (the latest
+        `*_review_started` entry, which carries `configured_agents`) and
+        appends only the MISSING count of terminal `*_review_failed` entries,
+        so `landed_terminal >= configured_agents` holds and the gate settles.
+
+        **Preserves landed verdicts.** Verdicts that already landed are durable
+        audit entries; they are never re-paid for or overwritten. A round with
+        1 of 2 reviewers landed gets exactly ONE synthesized entry.
+
+        **Idempotent.** A second call is a no-op reporting
+        `skip_reason: round_already_settled`.
+
+        **Refuses a live round.** The round's dispatch timestamp is compared
+        against this process's own boot marker (the same `process_start`
+        `/healthz` publishes): a round dispatched by the SERVING daemon is
+        still in flight and is left untouched with
+        `skip_reason: review_dispatched_by_this_process`. Unlike the boot
+        sweep this endpoint applies NO run-state filter — the caller names the
+        run — so that boot-marker gate is the control that keeps it from
+        terminating a live reviewer.
+
+        **Authorization.** Requires an authenticated identity carrying
+        `write:runs` (anonymous → 401; a token without the scope → 403),
+        mirroring the sibling recovery verb `reap-failure`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The reconcile pass ran. `terminated` is `true` when any stage's
+            orphaned round was terminated by THIS call; each `stages` row
+            reports the round's counts, or why nothing was healed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, terminated, stages]
+                properties:
+                  run_id:
+                    $ref: '#/components/schemas/UUID'
+                  terminated:
+                    type: boolean
+                    description: True when any stage synthesized a terminal entry on this call.
+                  stages:
+                    type: array
+                    description: One row per review-bearing stage, in a stable order.
+                    items:
+                      type: object
+                      required: [stage, configured_agents, landed_before, synthesized]
+                      properties:
+                        stage:
+                          type: string
+                          enum: [plan, implement]
+                        configured_agents:
+                          type: integer
+                          description: Agent reviewers the current round was dispatched with.
+                        landed_before:
+                          type: integer
+                          description: |
+                            Terminal verdicts already landed for the round
+                            before this call. These are preserved.
+                        synthesized:
+                          type: integer
+                          description: |
+                            Terminal `*_review_failed` entries appended by this
+                            call (`configured_agents - landed_before`); 0 when
+                            nothing needed healing.
+                        skipped:
+                          type: boolean
+                          description: True when this stage healed nothing.
+                        skip_reason:
+                          type: string
+                          enum:
+                            - no_review_started_entry
+                            - no_configured_agents
+                            - started_entry_has_no_stage_id
+                            - review_dispatched_by_this_process
+                            - round_already_settled
+                          description: Why nothing was healed for this stage.
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The identity lacks `write:runs` scope (`insufficient_scope`), or
+            the run belongs to another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `review_reconcile_failed` — the reconcile pass could not read the
+            run's audit trail. The cause is withheld from the client and
+            logged server-side.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_reconcile_unconfigured` — the run or audit repositories
+            are not wired.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

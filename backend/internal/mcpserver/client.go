@@ -1696,6 +1696,110 @@ func (c *apiClient) ReviveRun(ctx context.Context, runID uuid.UUID) (*ReviveRunR
 	return &res, nil
 }
 
+// HealthInfo is the decoded slice of GET /healthz this package needs. Only
+// the fields a tool reads are mirrored; the rest of the body is ignored.
+//
+// ProcessStartOK is the load-bearing field (#2712): it reports whether
+// process_start was BOTH present AND parseable. A caller must branch on it
+// rather than on ProcessStart being zero, because a zero time.Time compares as
+// BEFORE every audit timestamp — silently turning every pending review into a
+// false "the daemon restarted" verdict.
+type HealthInfo struct {
+	Version    string
+	GitSHA     string
+	StartNonce string
+
+	ProcessStart   time.Time
+	ProcessStartOK bool
+}
+
+// healthzBody is the wire shape /healthz answers with.
+type healthzBody struct {
+	Version      string `json:"version"`
+	GitSHA       string `json:"git_sha"`
+	StartNonce   string `json:"start_nonce"`
+	ProcessStart string `json:"process_start"`
+}
+
+// Healthz reads GET /healthz on the short (30s) client. The request is
+// deliberately UNAUTHENTICATED: /healthz is registered outside every auth
+// wrapper (backend/internal/server/handlers.go) and carries no run-scoped
+// data, so sending the caller's bearer would add a credential the endpoint
+// neither needs nor reads.
+//
+// An absent or unparseable process_start is NOT an error — the daemon may
+// predate the field (#2712) — it returns a HealthInfo with ProcessStartOK
+// false, which every caller must treat as "undecidable", never as a boundary.
+// A transport failure or non-200 IS returned as an error.
+func (c *apiClient) Healthz(ctx context.Context) (*HealthInfo, error) {
+	if c.baseURL == "" {
+		return nil, errors.New("apiClient: baseURL not set")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/healthz", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build healthz request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read healthz body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("healthz: HTTP %d", resp.StatusCode)
+	}
+	var body healthzBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, fmt.Errorf("decode healthz body: %w", err)
+	}
+	info := &HealthInfo{Version: body.Version, GitSHA: body.GitSHA, StartNonce: body.StartNonce}
+	if body.ProcessStart != "" {
+		if ts, perr := time.Parse(time.RFC3339Nano, body.ProcessStart); perr == nil {
+			info.ProcessStart = ts
+			info.ProcessStartOK = true
+		}
+	}
+	return info, nil
+}
+
+// ReconciledReviewStage mirrors one row of the reconcile endpoint's `stages`
+// array (backend/internal/server/review_reconcile.go::reconciledStage).
+type ReconciledReviewStage struct {
+	Stage            string `json:"stage"`
+	ConfiguredAgents int    `json:"configured_agents"`
+	LandedBefore     int    `json:"landed_before"`
+	Synthesized      int    `json:"synthesized"`
+	Skipped          bool   `json:"skipped"`
+	SkipReason       string `json:"skip_reason,omitempty"`
+}
+
+// ReconcileReviewsResult mirrors the 200 body of
+// POST /v0/runs/{run_id}/reviews/reconcile.
+type ReconcileReviewsResult struct {
+	RunID      string                  `json:"run_id"`
+	Terminated bool                    `json:"terminated"`
+	Stages     []ReconciledReviewStage `json:"stages"`
+}
+
+// ReconcileRunReviews invokes the on-demand orphaned-review recovery (#2712).
+// It is idempotent: the endpoint synthesizes only the MISSING terminal entries
+// for each stage's current round, so already-landed verdicts survive and a
+// second call reports skip_reason=round_already_settled.
+//
+// 4xx surfaces: 400 validation_failed (bad UUID), 401/403 (unauthenticated /
+// missing write:runs), 404 run_not_found.
+func (c *apiClient) ReconcileRunReviews(ctx context.Context, runID uuid.UUID) (*ReconcileReviewsResult, error) {
+	var res ReconcileReviewsResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reviews/reconcile", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // mergeRunRequest mirrors the backend's `POST /v0/runs/{run_id}/merge`
 // body (`backend/internal/server/merge_run.go::mergeRunRequest`, E48.7 /
 // #1954). Verdict is REQUIRED — the merge records an audited operator

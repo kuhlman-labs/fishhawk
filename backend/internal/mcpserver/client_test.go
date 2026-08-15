@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -1666,5 +1667,154 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	}
 	if _, present := gotRaw["amend_acceptance_criteria"]; present {
 		t.Errorf("amend_acceptance_criteria present on an amendment-less approve body: %#v", gotRaw)
+	}
+}
+
+// TestHealthz_DecodesProcessStart pins the #2712 restart-boundary read: the
+// client parses process_start into a time.Time and reports ProcessStartOK,
+// and it sends NO Authorization header (the endpoint is unauthenticated by
+// contract and carries no run-scoped data).
+func TestHealthz_DecodesProcessStart(t *testing.T) {
+	const iso = "2026-08-15T09:30:15.123456789Z"
+	var gotAuth, gotPath string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok","version":"dev","git_sha":"abc","start_nonce":"n1","process_start":"`+iso+`"}`)
+	})
+
+	info, err := c.Healthz(context.Background())
+	if err != nil {
+		t.Fatalf("Healthz: %v", err)
+	}
+	if gotPath != "/healthz" {
+		t.Errorf("path = %q, want /healthz", gotPath)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization header = %q, want none (the probe is unauthenticated)", gotAuth)
+	}
+	if !info.ProcessStartOK {
+		t.Fatal("ProcessStartOK = false for a well-formed process_start")
+	}
+	want, _ := time.Parse(time.RFC3339Nano, iso)
+	if !info.ProcessStart.Equal(want) {
+		t.Errorf("ProcessStart = %v, want %v", info.ProcessStart, want)
+	}
+	if info.StartNonce != "n1" || info.GitSHA != "abc" {
+		t.Errorf("info = %+v, want the sibling fields decoded too", info)
+	}
+}
+
+// TestHealthz_UndecidableBranches covers every way the boundary can fail to
+// resolve. NONE may present a zero time.Time as a real boundary — a zero time
+// compares as before every audit entry and would fabricate a strand.
+func TestHealthz_UndecidableBranches(t *testing.T) {
+	t.Run("absent process_start", func(t *testing.T) {
+		c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"ok","version":"dev"}`)
+		})
+		info, err := c.Healthz(context.Background())
+		if err != nil {
+			t.Fatalf("Healthz: %v", err)
+		}
+		if info.ProcessStartOK {
+			t.Error("ProcessStartOK = true with no process_start field")
+		}
+	})
+	t.Run("unparseable process_start", func(t *testing.T) {
+		c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"ok","process_start":"yesterday"}`)
+		})
+		info, err := c.Healthz(context.Background())
+		if err != nil {
+			t.Fatalf("Healthz: %v", err)
+		}
+		if info.ProcessStartOK {
+			t.Error("ProcessStartOK = true for an unparseable process_start")
+		}
+		if !info.ProcessStart.IsZero() {
+			t.Errorf("ProcessStart = %v, want the zero value left UNUSED (OK is the gate)", info.ProcessStart)
+		}
+	})
+	t.Run("non-200", func(t *testing.T) {
+		c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		if _, err := c.Healthz(context.Background()); err == nil {
+			t.Fatal("want an error on a non-200 /healthz")
+		}
+	})
+	t.Run("non-JSON body", func(t *testing.T) {
+		c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "not json")
+		})
+		if _, err := c.Healthz(context.Background()); err == nil {
+			t.Fatal("want an error on a non-JSON /healthz body")
+		}
+	})
+	t.Run("unset baseURL", func(t *testing.T) {
+		c := newAPIClient(config{})
+		if _, err := c.Healthz(context.Background()); err == nil {
+			t.Fatal("want an error when baseURL is unset")
+		}
+	})
+}
+
+// TestReconcileRunReviews_PostsAndDecodes pins the #2712 recovery call: a POST
+// to the run-scoped path, the bearer forwarded, and the per-stage rows decoded.
+func TestReconcileRunReviews_PostsAndDecodes(t *testing.T) {
+	runID := uuid.New()
+	var gotMethod, gotPath, gotAuth string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","terminated":true,"stages":[`+
+			`{"stage":"plan","configured_agents":2,"landed_before":1,"synthesized":1},`+
+			`{"stage":"implement","skipped":true,"skip_reason":"no_review_started_entry"}]}`)
+	})
+
+	res, err := c.ReconcileRunReviews(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ReconcileRunReviews: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if want := "/v0/runs/" + runID.String() + "/reviews/reconcile"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	if gotAuth != "Bearer tok-test" {
+		t.Errorf("Authorization = %q, want the bearer forwarded", gotAuth)
+	}
+	if !res.Terminated || len(res.Stages) != 2 {
+		t.Fatalf("res = %+v, want terminated with 2 stage rows", res)
+	}
+	if res.Stages[0].Synthesized != 1 || res.Stages[0].LandedBefore != 1 || res.Stages[0].ConfiguredAgents != 2 {
+		t.Errorf("plan row = %+v, want configured 2 / landed_before 1 / synthesized 1", res.Stages[0])
+	}
+	if !res.Stages[1].Skipped || res.Stages[1].SkipReason != "no_review_started_entry" {
+		t.Errorf("implement row = %+v, want the skip reason decoded", res.Stages[1])
+	}
+}
+
+// TestReconcileRunReviews_ErrorEnvelope covers the refusal path: the backend's
+// typed envelope surfaces as *apiError rather than a decode failure.
+func TestReconcileRunReviews_ErrorEnvelope(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"code":"run_not_found","message":"no run with that id"}}`)
+	})
+
+	_, err := c.ReconcileRunReviews(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("want an error on a 404")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.Code != "run_not_found" || ae.StatusCode != http.StatusNotFound {
+		t.Fatalf("error = %v, want a typed *apiError run_not_found/404", err)
 	}
 }

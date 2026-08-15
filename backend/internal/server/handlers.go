@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -77,6 +78,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
+	// On-demand orphaned-review recovery (#2712): the same per-run helper the
+	// boot sweep runs, reachable without restarting the daemon. adminWrite
+	// mirrors the sibling recovery verb reap-failure.
+	mux.HandleFunc("POST /v0/runs/{run_id}/reviews/reconcile", s.requireRunAccount(adminWrite, s.handleReconcileRunReviews))
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.requireRunAccount(readAccess, s.handleListRunStages))
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", s.requireRunAccount(readAccess, s.handleGetRunStage))
 	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure", s.requireRunAccount(adminWrite, s.handleReapStageFailure))
@@ -174,6 +179,17 @@ type healthResponse struct {
 	MinRunnerVersion string            `json:"min_runner_version"`
 	Schemas          map[string]string `json:"schemas"`
 	StartNonce       string            `json:"start_nonce,omitempty"`
+	// ProcessStart is the RFC3339Nano UTC instant this fishhawkd process
+	// booted — the same in-memory marker the orphaned-review reconcile
+	// compares audit timestamps against (#1781), published so a CLIENT can
+	// make the same comparison (#2712). It is an ADDITIVE SIBLING of
+	// start_nonce, not a replacement: the nonce proves listener IDENTITY
+	// (#1018) but is opaque and unorderable, while a restart boundary must be
+	// COMPARED against an audit entry's timestamp to decide whether the
+	// dispatching process is still alive. Omitted when the marker is zero, so
+	// a caller can tell "no boundary published" from a real instant rather
+	// than decoding a zero time that would compare as before every entry.
+	ProcessStart string `json:"process_start,omitempty"`
 }
 
 // handleHealth answers liveness probes with a small JSON payload that
@@ -181,6 +197,9 @@ type healthResponse struct {
 // field to confirm a deploy reached this instance. start_nonce echoes
 // Config.StartNonce verbatim (omitted when unset) so scripts/dev can
 // prove the listener on the port is the daemon it spawned (#1018).
+// process_start publishes the boot marker (#2712) so fishhawk_await_review
+// can decide whether an in-flight review's dispatching daemon is still the
+// one serving this request.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Status:           "ok",
@@ -194,6 +213,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"workflow-v2":      spec.EmbeddedSchemaHashV2(),
 		},
 		StartNonce: s.cfg.StartNonce,
+	}
+	if !s.processStart.IsZero() {
+		resp.ProcessStart = s.processStart.UTC().Format(time.RFC3339Nano)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
