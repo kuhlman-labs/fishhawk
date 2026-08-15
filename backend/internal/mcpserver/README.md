@@ -881,7 +881,13 @@ timestamp is BEFORE that boot instant. Every other outcome is not-stranded, and 
   failure dangerous. `ReviewStatus.Status` is deliberately UNCHANGED at `pending` (it feeds the approval/merge gates,
   `drive_run` and `await_audit`); `stranded` is an await-surface diagnostic, not a new gate state.
 - The pending-after-timeout message no longer asserts liveness unconditionally: it says "verified: dispatched by the
-  daemon currently serving" only on a POSITIVE not-stranded verdict, and on `Undecidable` says so and names the recovery.
+  daemon currently serving" only on a not-stranded verdict THAT ACTUALLY COMPARED THE BOUNDARY, and on `Undecidable` says
+  so and names the recovery. The claim is gated on a non-zero `DaemonProcessStart` — set only after `boundary.OK`, so it
+  IS the evidence the comparison ran — because `reviewRoundStrandFrom` returns the same not-stranded/not-undecidable
+  shape on three early returns that never consult `/healthz`: no started entry, `configured_agents <= 0` (a pre-#1127
+  round, still reachable at the timeout path via `reviewStatusFallback`), and every-reviewer-landed. Those fall back to
+  the neutral pre-#2712 wording; claiming verification there would move the same confident-wrong-signal to the
+  legacy-round edge.
 
 **The recovery verb.** `fishhawk_reconcile_reviews` wraps `POST /v0/runs/{run_id}/reviews/reconcile` (contract:
 `backend/internal/server/README.md`). It appends ONLY the missing terminal entries for the current round, so

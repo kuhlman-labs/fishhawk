@@ -1260,9 +1260,12 @@ func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start tim
 // resolved (nil when the probe never produced one). It replaces the old
 // UNCONDITIONAL "the review is genuinely still running" assertion — which was
 // simply false for an orphaned round — with a claim bounded by what was
-// actually verified: a positive not-stranded verdict says the dispatching
-// daemon is the one serving; an undecidable verdict says so and names
-// fishhawk_reconcile_reviews as the recovery if a restart did happen.
+// actually verified: a not-stranded verdict THAT ACTUALLY COMPARED THE BOUNDARY
+// (DaemonProcessStart non-zero) says the dispatching daemon is the one serving;
+// an undecidable verdict says so and names fishhawk_reconcile_reviews as the
+// recovery if a restart did happen; and a verdict from one of the early returns
+// that never reached the boundary check falls back to the neutral pre-#2712
+// wording rather than claiming a verification that never ran.
 func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool, heartbeat bool, timeoutCap int, strand *reviewStrand) AwaitReviewOutput {
 	out := AwaitReviewOutput{
 		Stage:               stage,
@@ -1298,7 +1301,17 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 	}
 	verified := "no terminal audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have " +
 		"resolved to a definite 'failed' status"
-	if strand != nil && !strand.Stranded && !strand.Undecidable {
+	// The positive liveness claim is gated on EVIDENCE THE BOUNDARY COMPARISON
+	// ACTUALLY RAN, not merely on the absence of a stranded/undecidable verdict.
+	// reviewRoundStrandFrom returns that same !Stranded && !Undecidable shape on
+	// three early returns that never consult /healthz at all — no started entry,
+	// ConfiguredAgents <= 0 (a pre-#1127 round, still reachable at the timeout
+	// path via reviewStatusFallback), and every-reviewer-landed. Claiming
+	// "verified" there would assert a check that was never performed — the same
+	// confident-wrong-signal class #2712 exists to eliminate, merely moved to
+	// the legacy-round edge. DaemonProcessStart is set ONLY after boundary.OK,
+	// so a non-zero value IS the proof the comparison happened.
+	if strand != nil && !strand.Stranded && !strand.Undecidable && !strand.DaemonProcessStart.IsZero() {
 		verified = "verified: the round was dispatched by the fishhawkd process currently serving, so its reviewer(s) are " +
 			"still running rather than orphaned by a restart"
 	}

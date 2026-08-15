@@ -2172,14 +2172,42 @@ func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
 	r := &runResolver{}
 	start := time.Now()
 
+	// The 'verified' fixture carries a REAL boundary: DaemonProcessStart is set
+	// only after reviewRoundStrandFrom reached and passed the /healthz
+	// comparison, so it is the evidence the claim is gated on.
 	verified := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
 		LandedTerminal: 1, ConfiguredAgents: 2,
+		StartedAt:          start.Add(-10 * time.Minute),
+		DaemonProcessStart: start.Add(-30 * time.Minute),
 	})
 	if !strings.Contains(verified.Message, "verified") {
 		t.Errorf("a positively not-stranded timeout should say the dispatching daemon was verified: %q", verified.Message)
 	}
 	if verified.Undecidable {
 		t.Error("Undecidable = true on a decided verdict")
+	}
+
+	// A strand from one of reviewRoundStrandFrom's early returns — here the
+	// ConfiguredAgents <= 0 legacy round, which is reachable at the timeout
+	// path via reviewStatusFallback — carries the SAME !Stranded &&
+	// !Undecidable shape while having never consulted /healthz at all (zero
+	// DaemonProcessStart). Claiming "verified" there asserts a check that was
+	// never performed, under a daemon that may well have restarted. It must
+	// fall back to the neutral pre-#2712 wording.
+	unprobed := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+		Reason: "the review round records no configured agent count",
+	})
+	if strings.Contains(unprobed.Message, "verified") {
+		t.Errorf("a strand that never reached the boundary check must NOT claim verification: %q", unprobed.Message)
+	}
+	if strings.Contains(unprobed.Message, "orphaned by a restart") {
+		t.Errorf("un-probed timeout message leaked the boundary-comparison wording: %q", unprobed.Message)
+	}
+	if !strings.Contains(unprobed.Message, "no terminal audit entry yet") {
+		t.Errorf("un-probed timeout should keep the neutral pre-#2712 wording: %q", unprobed.Message)
+	}
+	if unprobed.Undecidable {
+		t.Error("Undecidable = true on an early-return verdict")
 	}
 
 	undecidable := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
