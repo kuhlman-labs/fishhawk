@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -198,6 +199,70 @@ func TestReconcileRunReviews_Endpoint_PreservesLandedVerdicts(t *testing.T) {
 	}
 	if len(failedAfter) != 1 {
 		t.Fatalf("persisted plan_review_failed after a second call = %d, want still 1", len(failedAfter))
+	}
+}
+
+// TestReconcileRunReviews_Endpoint_ConcurrentCalls_SynthesizeOnlyMissing is the
+// CONCURRENCY control for the count-and-append critical section: the recovery's
+// idempotency rests on a read-then-append sequence (count this round's landed
+// terminals, append exactly ConfiguredAgents-landed), which is not atomic on its
+// own. Four simultaneous POSTs against the SAME orphaned round must persist
+// exactly the missing count — not one shortfall per caller.
+//
+// The bad state is seeded BY CONSTRUCTION (a pre-boot started entry with 2
+// configured reviewers and no landed verdict) and the assertion is made by
+// READING THE AUDIT BACK over a real pgtest database, so deleting the stripe
+// lock in reconcileRunOrphanedReviewsLocked lands RED on committed state.
+func TestReconcileRunReviews_Endpoint_ConcurrentCalls_SynthesizeOnlyMissing(t *testing.T) {
+	boot := time.Now().UTC()
+	s, runRepo, auditRepo := newPGReconcileServer(t, boot)
+	runID, stageID := seedPGReviewRun(t, runRepo)
+
+	const configured = 2
+	appendPGAudit(t, auditRepo, runID, &stageID, boot.Add(-10*time.Minute), "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: configured, Authority: planreview.AuthorityAdvisory})
+
+	// Fire the callers from a common start gate so they contend on the same
+	// round rather than serializing by launch order.
+	const callers = 4
+	start := make(chan struct{})
+	recs := make([]*httptest.ResponseRecorder, callers)
+	var wg sync.WaitGroup
+	for i := range recs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			recs[i] = postReconcile(t, s, runID.String(), reconcileEndpointIdentity())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	terminated := 0
+	for i, rec := range recs {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("caller %d status = %d, want 200; body %s", i, rec.Code, rec.Body.String())
+		}
+		if decodeReconcileBody(t, rec).Terminated {
+			terminated++
+		}
+	}
+
+	// COMMITTED STATE: exactly the missing count was persisted, however the
+	// callers interleaved.
+	failed, err := auditRepo.ListForRunByCategory(context.Background(), runID, "plan_review_failed")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory plan_review_failed: %v", err)
+	}
+	if len(failed) != configured {
+		t.Fatalf("persisted plan_review_failed = %d, want exactly %d — %d concurrent callers each synthesized the same shortfall",
+			len(failed), configured, callers)
+	}
+	// Under serialization exactly one caller can observe the shortfall; every
+	// later one re-counts after the append and takes the settled skip.
+	if terminated != 1 {
+		t.Errorf("callers reporting terminated = %d, want exactly 1", terminated)
 	}
 }
 

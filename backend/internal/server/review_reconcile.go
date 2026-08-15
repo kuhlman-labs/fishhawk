@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -205,24 +206,49 @@ func reconcileSynthesizedAny(stages []reconciledStage) bool {
 	return false
 }
 
+// reconcileEmitStripes bounds the reconcile lock set. A fixed stripe count
+// (rather than a per-run map that grows without bound) keeps the lock memory
+// constant regardless of how many runs the process ever reconciles; two
+// unrelated runs colliding on a stripe only briefly serialize their (rare)
+// reconcile pass, which is harmless. Mirrors reportEmitLockFor (autodrive.go).
+const reconcileEmitStripes = 64
+
+var reconcileEmitMu [reconcileEmitStripes]sync.Mutex
+
+// reconcileEmitLockFor returns the stripe mutex guarding a run's
+// count-landed-terminals -> append-missing-terminals critical section. See
+// reconcileRunOrphanedReviews for why the section is serialized.
+func reconcileEmitLockFor(runID uuid.UUID) *sync.Mutex {
+	var h uint32
+	for _, b := range runID {
+		h = h*31 + uint32(b)
+	}
+	return &reconcileEmitMu[h%reconcileEmitStripes]
+}
+
 // reconcileRunOrphanedReviews handles both review stages for one run. Returns
 // the per-stage outcomes (counts + skip reasons) so the same helper serves the
 // boot sweep (which only needs "did anything land") and the on-demand endpoint
 // (which reports WHY nothing did). When the implement stage was healed it also
 // republishes fishhawk_audit_complete so the #947 review-pending presence gate
 // reflects the now-terminal state.
+//
+// The whole per-run pass runs under a per-run stripe lock. The idempotency of
+// this recovery rests on a READ-then-APPEND sequence — count the round's landed
+// terminals, append exactly (ConfiguredAgents - landed) — which is NOT atomic on
+// its own: two concurrent POST /v0/runs/{run_id}/reviews/reconcile callers (or
+// one racing the boot sweep) can both observe the same shortfall and each
+// synthesize it, persisting MORE terminal entries than the round configured.
+// Serializing the section per run makes the second caller re-count AFTER the
+// first has appended, so it sees landed == ConfiguredAgents and takes the
+// round_already_settled skip. A cross-PROCESS guarantee would need a DB-level
+// conditional write (an advisory lock or a uniqueness constraint on the
+// synthesized row); this closes the realistic single-daemon race, which is the
+// one an operator can actually trigger by double-clicking the verb.
 func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
-	out := make([]reconciledStage, 0, len(orphanedReviewStages))
-	emittedImplement := false
-	for _, stage := range orphanedReviewStages {
-		res, err := s.reconcileStageOrphanedReviews(ctx, runID, stage)
-		if err != nil {
-			return out, err
-		}
-		out = append(out, res)
-		if res.Synthesized > 0 && stage.isImplement {
-			emittedImplement = true
-		}
+	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLocked(ctx, runID)
+	if err != nil {
+		return out, err
 	}
 	if emittedImplement {
 		// Re-derive and republish fishhawk_audit_complete so the review-
@@ -239,6 +265,31 @@ func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUI
 	return out, nil
 }
 
+// reconcileRunOrphanedReviewsLocked is the serialized count-and-append section:
+// both review stages of one run under that run's stripe lock. It returns
+// whether the implement stage synthesized anything so the caller can republish
+// fishhawk_audit_complete OUTSIDE the lock — that republish is a read + publish
+// which is idempotent on its own and must not extend the critical section.
+func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uuid.UUID) ([]reconciledStage, bool, error) {
+	lock := reconcileEmitLockFor(runID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	out := make([]reconciledStage, 0, len(orphanedReviewStages))
+	emittedImplement := false
+	for _, stage := range orphanedReviewStages {
+		res, err := s.reconcileStageOrphanedReviews(ctx, runID, stage)
+		if err != nil {
+			return out, emittedImplement, err
+		}
+		out = append(out, res)
+		if res.Synthesized > 0 && stage.isImplement {
+			emittedImplement = true
+		}
+	}
+	return out, emittedImplement, nil
+}
+
 // reconcileStageOrphanedReviews synthesizes the missing terminal
 // *_review_failed entries for one stage's CURRENT (latest-started) review
 // round when that round was orphaned by a prior-process restart. Returns the
@@ -246,6 +297,10 @@ func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUI
 // gate that refused it, so the on-demand endpoint can report a reason instead
 // of a silent no-op. Every gate is unchanged from the #1781 boot sweep; only
 // the return type carries more.
+//
+// MUST be called under the run's reconcileEmitLockFor stripe lock: the
+// count-landed -> append-missing sequence below is not atomic on its own (see
+// reconcileRunOrphanedReviews).
 func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (reconciledStage, error) {
 	out := reconciledStage{Stage: stage.label}
 	skip := func(reason string) reconciledStage {
