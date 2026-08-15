@@ -2134,6 +2134,67 @@ func TestResolveRequiredChecks_Table(t *testing.T) {
 	}
 }
 
+// TestHandle_ResolveRequiredChecks_ThreadsRefAsDefaultBranch pins the
+// dispatcher-wrapper behavior the reviewer flagged as an unpinned #2506
+// regression: resolveRequiredChecks threads the dispatched ref into BOTH the
+// branch AND the defaultBranch positions of ListRulesetRequiredChecksForDefault.
+// That threading is what makes the matcher (isolated-tested in githubclient's
+// TestRulesetMatchesBranch) evaluate ~DEFAULT_BRANCH against the ref the
+// dispatcher actually dispatches against rather than a hardcoded "main":
+//
+//   - include-flip: on a NON-main ref a ~DEFAULT_BRANCH ruleset now matches
+//     (branch == defaultBranch is true), where the old hardcoded-"main"
+//     evaluation did not — so a non-main dispatch flips from refuse
+//     (errNoBranchProtection) to capture-and-dispatch;
+//   - exclude-flip: the exclude arm now honors ~DEFAULT_BRANCH against that
+//     same ref.
+//
+// Both are INTENDED and fail-closed on this path (the dispatcher refuses an
+// empty snapshot with errNoBranchProtection, never a vacuous green). The
+// default-ref ("" -> "main") case stays byte-identical to the pre-#2506
+// dispatcher, which is why it is asserted alongside the non-main case.
+func TestHandle_ResolveRequiredChecks_ThreadsRefAsDefaultBranch(t *testing.T) {
+	cases := []struct {
+		name       string
+		defaultRef string
+		wantBranch string
+	}{
+		{name: "default ref stays main (byte-identical pre-#2506)", defaultRef: "", wantBranch: "main"},
+		{name: "non-main ref threaded as its own default branch", defaultRef: "develop", wantBranch: "develop"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, gh, runs, _ := newDispatcherWithStubs(t)
+			d.DefaultRef = tc.defaultRef
+			// Model the ~DEFAULT_BRANCH ruleset match the real matcher produces
+			// once the wrapper hands it branch == defaultBranch: a required
+			// check that on the old hardcoded-"main" evaluation of a non-main
+			// ref would NOT have been contributed (the include-flip's cause).
+			gh.branchProtection = &forge.BranchProtection{}
+			gh.rulesets = []forge.RulesetRequiredCheck{{RulesetID: 3, Contexts: []string{"CI Pass"}}}
+
+			if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			// The wrapper threads the dispatched ref into BOTH positions, so the
+			// matcher evaluates ~DEFAULT_BRANCH against the ref, not "main".
+			if gh.rulesetsBranch != tc.wantBranch {
+				t.Errorf("rulesets branch = %q, want %q", gh.rulesetsBranch, tc.wantBranch)
+			}
+			if gh.rulesetsDefaultBranch != tc.wantBranch {
+				t.Errorf("rulesets defaultBranch = %q, want %q (ref threaded into both positions)",
+					gh.rulesetsDefaultBranch, tc.wantBranch)
+			}
+			// A contributing ruleset captures-and-dispatches (a run row is
+			// created) rather than refusing — the include-flip's observable
+			// outcome on a non-main ref.
+			if len(runs.created) != 1 {
+				t.Fatalf("runs created = %d, want 1 (capture-and-dispatch, not refuse)", len(runs.created))
+			}
+		})
+	}
+}
+
 func TestHandle_SkipDoesntCreateRunOrAudit(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
 

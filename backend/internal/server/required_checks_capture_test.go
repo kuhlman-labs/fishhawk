@@ -131,6 +131,21 @@ func TestCaptureRequiredChecks_Degrades(t *testing.T) {
 		{name: "M6 classic protection 500", gh: newRequiredChecksGitHub(t, ghCfg{protectionStatus: http.StatusInternalServerError}), scope: inst, repo: "o/r"},
 		{name: "M7 rulesets list 404", gh: newRequiredChecksGitHub(t, ghCfg{rulesetsStatus: http.StatusNotFound}), scope: inst, repo: "o/r"},
 		{name: "M8 rulesets list 500", gh: newRequiredChecksGitHub(t, ghCfg{rulesetsStatus: http.StatusInternalServerError}), scope: inst, repo: "o/r"},
+		// M10 is the GHES edge (plan step 3(f)): classic protection returns
+		// REAL contexts (a known-non-empty snapshot) but the rulesets endpoint
+		// 404s, so the evaluation is non-authoritative. The capture deliberately
+		// DISCARDS the known-good classic contexts and fails closed to nil —
+		// #2497's checks_unresolved engages rather than a snapshot that might be
+		// missing a ruleset requirement the un-queried surface would have added.
+		{
+			name: "M10 classic contexts known but rulesets 404 (GHES) discards classic snapshot",
+			gh: newRequiredChecksGitHub(t, ghCfg{
+				protectionStatus: http.StatusOK,
+				protectionBody:   `{"required_status_checks":{"contexts":["ci/build"]}}`,
+				rulesetsStatus:   http.StatusNotFound,
+			}),
+			scope: inst, repo: "o/r",
+		},
 		{
 			name:  "M9 blocks past capture timeout",
 			gh:    newRequiredChecksGitHub(t, ghCfg{blockRepo: true}),
