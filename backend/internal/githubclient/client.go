@@ -875,19 +875,45 @@ func (c *Client) GetBranchProtection(ctx context.Context, scope forge.Credential
 // Returns nil + nil when the repo has no matching rulesets.
 //
 // Requires the App to hold `administration: read` (#252 / ADR-017).
+//
+// This is the legacy forge.Forge entrypoint: it evaluates
+// `~DEFAULT_BRANCH` against the v0 approximation "main" (byte-identical
+// to pre-#2506 behavior) and discards the authoritativeness signal. The
+// required-checks capture on the run-create path (#2506) instead calls
+// ListRulesetRequiredChecksForDefault with the repo's REAL default
+// branch so a repo defaulting to e.g. `master` resolves its
+// `~DEFAULT_BRANCH` rulesets correctly.
 func (c *Client) ListRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch string) ([]RulesetRequiredCheck, error) {
+	checks, _, err := c.listRulesetRequiredChecks(ctx, scope, repo, branch, "main")
+	return checks, err
+}
+
+// ListRulesetRequiredChecksForDefault is the default-branch-aware
+// variant (#2506): it matches `~DEFAULT_BRANCH` rulesets against the
+// supplied `defaultBranch` (not a hardcoded "main") and returns whether
+// the ruleset set was AUTHORITATIVELY evaluated — false when any active
+// branch ruleset carried a ref_name include token v0 cannot evaluate
+// (see rulesetMatchesBranch). The required-checks capture treats a
+// non-authoritative result as "greenness unknown" and leaves the run's
+// snapshot NIL rather than writing a present-but-empty one that would
+// read as "this repo requires nothing" (the #2497 vacuous-green bug).
+func (c *Client) ListRulesetRequiredChecksForDefault(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch, defaultBranch string) ([]RulesetRequiredCheck, bool, error) {
+	return c.listRulesetRequiredChecks(ctx, scope, repo, branch, defaultBranch)
+}
+
+func (c *Client) listRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch, defaultBranch string) ([]RulesetRequiredCheck, bool, error) {
 	installationID, err := installationIDForScope(scope)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if c.Tokens == nil {
-		return nil, errors.New("githubclient: client missing TokenProvider")
+		return nil, false, errors.New("githubclient: client missing TokenProvider")
 	}
 	if repo.Owner == "" || repo.Name == "" {
-		return nil, errors.New("githubclient: repo owner and name required")
+		return nil, false, errors.New("githubclient: repo owner and name required")
 	}
 	if branch == "" {
-		return nil, errors.New("githubclient: branch is required")
+		return nil, false, errors.New("githubclient: branch is required")
 	}
 
 	listEndpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
@@ -896,16 +922,16 @@ func (c *Client) ListRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 
 	listReq, err := c.buildRequest(ctx, http.MethodGet, listEndpoint, nil, installationID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	listResp, err := c.HTTP.Do(listReq)
 	if err != nil {
-		return nil, fmt.Errorf("githubclient: list rulesets: %w", err)
+		return nil, false, fmt.Errorf("githubclient: list rulesets: %w", err)
 	}
 	defer func() { _ = listResp.Body.Close() }()
 
 	if err := classifyStatus("list rulesets", listResp); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var summaries []struct {
@@ -914,24 +940,32 @@ func (c *Client) ListRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 		Enforcement string `json:"enforcement"`
 	}
 	if err := json.NewDecoder(listResp.Body).Decode(&summaries); err != nil {
-		return nil, fmt.Errorf("githubclient: decode rulesets list: %w", err)
+		return nil, false, fmt.Errorf("githubclient: decode rulesets list: %w", err)
 	}
 
+	// Authoritative until an active branch ruleset carries a ref_name
+	// condition v0 cannot evaluate. Rulesets filtered out before the
+	// fetch (non-branch target, non-active enforcement) definitively do
+	// not apply and never poison authoritativeness.
+	authoritative := true
 	var out []RulesetRequiredCheck
 	for _, s := range summaries {
 		if s.Target != "branch" || s.Enforcement != "active" {
 			continue
 		}
-		contexts, err := c.fetchRulesetContexts(ctx, installationID, repo, s.ID, branch)
+		contexts, auth, err := c.fetchRulesetContexts(ctx, installationID, repo, s.ID, branch, defaultBranch)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if !auth {
+			authoritative = false
 		}
 		if len(contexts) == 0 {
 			continue
 		}
 		out = append(out, RulesetRequiredCheck{RulesetID: s.ID, Contexts: contexts})
 	}
-	return out, nil
+	return out, authoritative, nil
 }
 
 // fetchRulesetContexts pulls a single ruleset and returns the
@@ -944,22 +978,26 @@ func (c *Client) ListRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 // or the literal branch name; `exclude` ignored). Rulesets with
 // complex match expressions land empty-handed; the operator's
 // fallback is to add a classic-protection row, which v0 does read.
-func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64, repo RepoRef, rulesetID int64, branch string) ([]string, error) {
+//
+// Returns the contexts, whether the ruleset's ref_name condition was
+// authoritatively evaluated (false when it carried an include token v0
+// cannot evaluate — see rulesetMatchesBranch), and any transport error.
+func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64, repo RepoRef, rulesetID int64, branch, defaultBranch string) ([]string, bool, error) {
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) +
 		"/rulesets/" + url.PathEscape(fmt.Sprintf("%d", rulesetID)))
 	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("githubclient: get ruleset: %w", err)
+		return nil, false, fmt.Errorf("githubclient: get ruleset: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if err := classifyStatus("get ruleset", resp); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var body struct {
@@ -979,11 +1017,12 @@ func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64,
 		} `json:"rules"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, fmt.Errorf("githubclient: decode ruleset: %w", err)
+		return nil, false, fmt.Errorf("githubclient: decode ruleset: %w", err)
 	}
 
-	if !rulesetMatchesBranch(body.Conditions, branch) {
-		return nil, nil
+	matches, authoritative := rulesetMatchesBranch(body.Conditions, branch, defaultBranch)
+	if !matches {
+		return nil, authoritative, nil
 	}
 
 	var contexts []string
@@ -998,47 +1037,76 @@ func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64,
 			contexts = append(contexts, c.Context)
 		}
 	}
-	return contexts, nil
+	return contexts, authoritative, nil
 }
 
-// rulesetMatchesBranch is the v0 condition matcher: honors `~ALL`,
-// `~DEFAULT_BRANCH` (only when branch is "main"; we don't have a
-// way to know the configured default here, and this is the v0
-// approximation), and exact branch-name matches against the
-// `refs/heads/<branch>` form GitHub returns. Rulesets with a
-// nil Conditions block are treated as "matches everything" —
-// GitHub's UI maps "no condition" to that.
+// rulesetMatchesBranch is the v0 condition matcher for whether a
+// ruleset's ref_name conditions cover `branch`, given the repo's
+// resolved default branch `defaultBranch`. It returns two bools:
+//
+//   - matches: whether the ruleset applies to `branch`.
+//   - authoritative: whether every include token was one this v0
+//     matcher understands. When an include carries a token the matcher
+//     cannot evaluate — an unknown `~TOKEN`, or an fnmatch glob such as
+//     `refs/heads/release/*` — authoritative is false and the caller
+//     must NOT treat a non-match as "nothing required": a requirement
+//     could be hidden behind a condition we did not evaluate. The
+//     required-checks capture (#2506) leaves its snapshot NIL in that
+//     case rather than writing a present-but-empty (vacuous-green) one.
+//
+// Honors `~ALL`, `~DEFAULT_BRANCH` (matching iff `branch` equals the
+// supplied `defaultBranch` — no longer a hardcoded "main", #2506), and
+// exact branch-name matches against the `refs/heads/<branch>` form
+// GitHub returns. Rulesets with a nil Conditions block are treated as
+// "matches everything" — GitHub's UI maps "no condition" to that. A
+// matched include is always authoritative; only a fully non-matching
+// set that contained an un-evaluatable token yields authoritative=false.
 func rulesetMatchesBranch(conditions *struct {
 	RefName *struct {
 		Include []string `json:"include"`
 		Exclude []string `json:"exclude"`
 	} `json:"ref_name"`
-}, branch string) bool {
+}, branch, defaultBranch string) (matches, authoritative bool) {
 	if conditions == nil || conditions.RefName == nil {
-		return true
+		return true, true
 	}
 	full := "refs/heads/" + branch
 	for _, ex := range conditions.RefName.Exclude {
-		if ex == full || ex == branch || ex == "~ALL" {
-			return false
+		if ex == full || ex == branch || ex == "~ALL" ||
+			(ex == "~DEFAULT_BRANCH" && branch == defaultBranch) {
+			return false, true
 		}
 	}
 	if len(conditions.RefName.Include) == 0 {
-		return true
+		return true, true
 	}
+	sawUnevaluatable := false
 	for _, in := range conditions.RefName.Include {
-		switch in {
-		case "~ALL":
-			return true
-		case "~DEFAULT_BRANCH":
-			if branch == "main" {
-				return true
+		switch {
+		case in == "~ALL":
+			return true, true
+		case in == "~DEFAULT_BRANCH":
+			if branch == defaultBranch {
+				return true, true
 			}
-		case full, branch:
-			return true
+			// Understood: names the default branch, which is not this
+			// branch. No match from this token, but still authoritative.
+		case in == full || in == branch:
+			return true, true
+		case strings.HasPrefix(in, "~") || strings.ContainsAny(in, "*?[]"):
+			// An unknown `~TOKEN` or an fnmatch glob we do not evaluate
+			// in v0 — could hide a requirement, so it poisons
+			// authoritativeness if nothing else matches.
+			sawUnevaluatable = true
+		default:
+			// A literal branch ref (`refs/heads/<other>` or plain
+			// `<other>`) naming a different branch — understood, no match.
 		}
 	}
-	return false
+	if sawUnevaluatable {
+		return false, false
+	}
+	return false, true
 }
 
 // EnableAutoMerge queues a PR for auto-merge once branch protection

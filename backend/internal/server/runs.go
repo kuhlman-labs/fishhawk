@@ -1388,6 +1388,16 @@ type CreateRunForTriggerParams struct {
 // prefixed "create run failed" or "create stages failed" so callers can
 // surface the existing diagnostic.
 func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerParams) (*run.Run, error) {
+	// Build the forge credential scope from the best-effort App installation
+	// (#713) for the required-checks capture below. A nil installation → a
+	// zero scope, which captureRequiredChecks reads as "no credential → nil
+	// snapshot" (the #2506 degrade). Kept forge-neutral here per the #1855
+	// credential-scope contract; the *int64 lives only on the sanctioned run
+	// persistence field.
+	var checksScope forge.CredentialScope
+	if p.InstallationID != nil {
+		checksScope = forge.FromGitHubInstallationID(*p.InstallationID)
+	}
 	createParams := run.CreateRunParams{
 		Repo:          p.Repo,
 		WorkflowID:    p.WorkflowID,
@@ -1406,6 +1416,18 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		IssueContext:   p.IssueContext,
 		IdempotencyKey: p.IdempotencyKey,
 		UpstreamRunID:  p.UpstreamRunID,
+		// Capture the required-status-checks snapshot for the local / MCP /
+		// CLI / campaign create paths (#2506), from the best-effort App
+		// installation resolved at handleCreateRun (runs.go, #713). Fail-safe:
+		// captureRequiredChecks returns NIL (never a present-but-empty
+		// snapshot) on every degrade, so a run whose checks can't be
+		// authoritatively resolved parks at #2497's checks_unresolved rather
+		// than regressing to vacuous green. NOTE the campaign-ticker exposure:
+		// this same seam is the campaign driver's per-item chokepoint, so the
+		// lookup is bounded by requiredChecksCaptureTimeout (see the capture
+		// helper). Nil when no App is attributable (local `gh`-token runs) —
+		// the pre-#2506 posture, honestly unresolved rather than falsely green.
+		RequiredChecksSnapshot: s.captureRequiredChecks(ctx, p.Repo, checksScope),
 	}
 	if p.HaveStageDefs {
 		// Cache the validated spec bytes on the row so the trace handler's
@@ -1426,11 +1448,13 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		return nil, fmt.Errorf("create run failed: %w", err)
 	}
 
-	// Create one Stage row per stage definition in the spec.
-	// Required-checks-snapshot capture is deliberately skipped for
-	// non-webhook creates — the snapshot lives behind GitHub's
-	// branch-protection API and these paths don't carry a token to query
-	// it; local-runner runs don't need it (no PR merge gate enforcement).
+	// Create one Stage row per stage definition in the spec. The
+	// required-checks snapshot is captured above via captureRequiredChecks
+	// (#2506) — the premise the old "deliberately skipped, no token" note
+	// rested on is obsolete: handleCreateRun resolves the App installation
+	// best-effort for the inline-spec path too (#713), so a token IS
+	// available whenever an App is attributable, and its absence degrades to
+	// a nil snapshot rather than a skip.
 	var createdStages []*run.Stage
 	if p.HaveStageDefs {
 		createdStages, err = webhook.CreateStagesFromSpec(ctx, s.cfg.RunRepo, created.ID, p.WorkflowDef.Stages)

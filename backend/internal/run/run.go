@@ -341,9 +341,16 @@ type Run struct {
 	// applicable rulesets at run-create time (#251 / ADR-017). The
 	// approval flow + the SPA read this to know which contexts must
 	// pass before the PR can merge — protection edits during the
-	// run don't shift the goalposts. Nil for runs created before
-	// the snapshot was wired (legacy rows) and for CLI / UI
-	// run-create paths that skip protection lookup.
+	// run don't shift the goalposts (FRESHNESS CONTRACT: resolved
+	// ONCE at run-create, never re-resolved for the life of the run;
+	// GitHub's own protected-branch enforcement remains the
+	// merge-time authority). Captured on the webhook path by the
+	// dispatcher and on the local / MCP / CLI / campaign create paths
+	// by the server (#2506, from the best-effort App installation),
+	// degrading to NIL — never a present-but-empty snapshot — on any
+	// lookup failure so the #2497 checks_unresolved arm engages rather
+	// than a vacuous green. Nil for legacy rows created before the
+	// snapshot was wired and for runs with no attributable installation.
 	RequiredChecksSnapshot *RequiredChecksSnapshot
 	// WorkflowSpec is the raw bytes of `.fishhawk/workflows.yaml`
 	// the dispatcher fetched + validated at run-create time (#283).
@@ -600,7 +607,13 @@ type RequiredChecksSnapshot struct {
 	// Sources records which surfaces contributed contexts to the
 	// union. Each entry is one of `branch_protection` or
 	// `ruleset:<id>`. Empty when the run was created before the
-	// snapshot was wired; never nil on a fresh dispatcher run.
+	// snapshot was wired, and legitimately empty on an
+	// AUTHORITATIVELY-empty snapshot — a repo that genuinely requires
+	// nothing yields a non-nil snapshot with zero Contexts and zero
+	// Sources (#2506). The dispatcher never persists such a snapshot
+	// (it refuses an empty result), but the server capture does: nil
+	// means "greenness unknown", present-but-empty means "nothing
+	// required".
 	Sources []string `json:"sources"`
 }
 

@@ -89,6 +89,102 @@ func TestCreateRun_WorkingDirRoundTripsOverHTTP(t *testing.T) {
 	}
 }
 
+// TestCreateRun_CapturesRulesetRequiredChecks is the cross-boundary test
+// (#2506, cf. #618): a real POST /v0/runs (runner_kind local, inline
+// workflow_spec) drives handleCreateRun -> CreateRunForTrigger -> capture ->
+// CreateRunParams -> the persisted run row, against a real *githubclient.Client
+// pointed at an httptest mux serving default_branch=main, a 404 classic
+// protection, and an active branch ruleset requiring CI Pass. It asserts the
+// created run row read back from the fake carries Contexts [CI Pass] — the
+// SHIPPED observable, not just that a file was touched (#1169).
+func TestCreateRun_CapturesRulesetRequiredChecks(t *testing.T) {
+	repo := newFakeRepo()
+	gh := newRequiredChecksGitHub(t, ghCfg{
+		defaultBranch: "main",
+		rulesetsList:  `[{"id":7,"target":"branch","enforcement":"active"}]`,
+		rulesetBodies: map[int64]string{7: rulesetBodyDefaultBranch("CI Pass")},
+	})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh})
+
+	raw, err := json.Marshal(map[string]any{
+		"repo":           "o/r",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repo.GetRun(context.Background(), got.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	snap := created.RequiredChecksSnapshot
+	if snap == nil {
+		t.Fatal("persisted run snapshot nil; want [CI Pass] captured through the HTTP seam")
+	}
+	if len(snap.Contexts) != 1 || snap.Contexts[0] != "CI Pass" {
+		t.Errorf("Contexts = %v, want [CI Pass]", snap.Contexts)
+	}
+	if len(snap.Sources) != 1 || snap.Sources[0] != "ruleset:7" {
+		t.Errorf("Sources = %v, want [ruleset:7]", snap.Sources)
+	}
+}
+
+// TestCreateRun_ProtectionLookupFailure_StillCreatesRunWithNilSnapshot is the
+// fail-safe companion: the same POST against a mux that 500s the protection
+// lookup still returns 201 and creates a run whose snapshot is NIL — run-create
+// never fails on a forge degrade, and a non-authoritative lookup never writes a
+// vacuous-green empty snapshot.
+func TestCreateRun_ProtectionLookupFailure_StillCreatesRunWithNilSnapshot(t *testing.T) {
+	repo := newFakeRepo()
+	gh := newRequiredChecksGitHub(t, ghCfg{protectionStatus: http.StatusInternalServerError})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh})
+
+	raw, err := json.Marshal(map[string]any{
+		"repo":           "o/r",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  minimalSpecYAML,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 despite the forge degrade:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repo.GetRun(context.Background(), got.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if created.RequiredChecksSnapshot != nil {
+		t.Fatalf("snapshot = %+v, want nil on a protection-lookup degrade", created.RequiredChecksSnapshot)
+	}
+}
+
 // TestCreateRun_RejectsRelativeWorkingDir is the C6 control: POST /v0/runs with a
 // relative working_dir is a 400 naming the field, AND no run row exists
 // afterwards. The second assertion reads COMMITTED STATE (the fake's run store)

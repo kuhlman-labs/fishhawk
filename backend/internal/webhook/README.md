@@ -39,6 +39,13 @@ Sub-topics, with full detail in [`docs/architecture/webhook-dispatcher.md`](../.
 - New App permission: none — `workflow_run` events are already in the App's `default_events` (per `manifest.go`); the webhook receiver was just dropping them as unrecognized.
 - SPA gets the failure-C `<FailureBanner>` Retry affordance for free since #173 covers category-C retry.
 
+## Required-checks resolution (`ResolveRequiredChecks`, #251 / #2506)
+
+`dispatcher.go::ResolveRequiredChecks(ctx, api ProtectionAPI, scope, repo, branch, defaultBranch)` is the shared seam that unions classic branch-protection + ruleset required-status-check contexts into a `run.RequiredChecksSnapshot`. It returns the snapshot, an `authoritative` bool, and an error.
+
+- **`authoritative`** is true only when BOTH surfaces answered definitively for `branch`: classic protection on a 200 or `ErrNotFound`, AND the rulesets list on a 200 with EVERY active branch ruleset's ref_name condition evaluatable. A rulesets 404 (GHES without the endpoint) OR a ruleset carrying an include token the v0 matcher can't evaluate (an unknown `~TOKEN` / an fnmatch glob) both yield `authoritative=false` — so a caller reading an empty snapshot as "nothing required" can't be misled by an un-queried or un-parsed surface. `~DEFAULT_BRANCH` rulesets match against the supplied `defaultBranch` (`githubclient.Client.ListRulesetRequiredChecksForDefault`), not a hardcoded `main`.
+- **The dispatcher REFUSES an empty result** (`d.resolveRequiredChecks` — the thin wrapper — returns `errNoBranchProtection` when the snapshot has zero contexts, discarding `authoritative`; v0 won't dispatch into an ungated repo), **while the server DEGRADES to nil** (`server.captureRequiredChecks` returns a nil snapshot on any error OR a non-authoritative result, so a local/MCP/CLI/campaign run parks at #2497's `checks_unresolved` rather than a vacuous green). The dispatcher's refuse-on-empty contract is byte-identical to pre-#2506.
+
 ## Blocking periodic budget (admission gate, `run_rejected_budget` / `run_admitted_budget_override`)
 
 Shared decision core: `backend/internal/webhook/budget_admission.go` (#688 / ADR-030) — `CostSummer` capability + `CheckBlockingBudget(ctx, summer, repo, workflowID, budgets, now, loc)`.

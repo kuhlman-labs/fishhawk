@@ -934,10 +934,26 @@ type GitHubAPI interface {
 		inputs githubclient.DispatchInputs) error
 	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope,
 		repo forge.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
+	ProtectionAPI
+}
+
+// ProtectionAPI is the narrow branch-protection + ruleset slice of
+// githubclient.Client that required-checks resolution needs. Carved out
+// of GitHubAPI so ResolveRequiredChecks — shared by the dispatcher and
+// the server's run-create capture (#2506) — depends only on the two
+// lookups it uses, and so a test can drive it without the full
+// dispatcher API. Satisfied by *githubclient.Client directly:
+// forge.BranchProtection / forge.RulesetRequiredCheck are the concrete
+// client's own return types (aliases at client.go).
+type ProtectionAPI interface {
 	GetBranchProtection(ctx context.Context, scope forge.CredentialScope,
 		repo forge.RepoRef, branch string) (*forge.BranchProtection, error)
-	ListRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope,
-		repo forge.RepoRef, branch string) ([]forge.RulesetRequiredCheck, error)
+	// ListRulesetRequiredChecksForDefault reports the active branch
+	// rulesets' required-status-check contexts AND whether the ruleset
+	// set was authoritatively evaluated for `branch`, matching
+	// `~DEFAULT_BRANCH` against `defaultBranch` (#2506).
+	ListRulesetRequiredChecksForDefault(ctx context.Context, scope forge.CredentialScope,
+		repo forge.RepoRef, branch, defaultBranch string) ([]forge.RulesetRequiredCheck, bool, error)
 }
 
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
@@ -2558,15 +2574,31 @@ var errNoBranchProtection = errors.New("no branch protection or ruleset covers t
 // (re-install the App to accept the new scope) precisely.
 var errProtectionScopeMissing = errors.New("app installation missing administration:read; re-install to accept the new scope")
 
-// resolveRequiredChecks queries classic branch protection +
-// rulesets and returns the union of required-status-check contexts
-// as a snapshot ready to persist on the run row (#251). Returns
-// errNoBranchProtection when neither surface contributes a context;
-// errProtectionScopeMissing when the App lacks the new permission;
-// any other error is a transport / GitHub-side issue and surfaces
-// to the caller as-is so step 3.5 can audit and refuse.
-func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.CredentialScope,
-	repo forge.RepoRef, branch string) (*run.RequiredChecksSnapshot, error) {
+// ResolveRequiredChecks queries classic branch protection + rulesets
+// and returns the union of required-status-check contexts as a snapshot
+// (#251), matching `~DEFAULT_BRANCH` rulesets against `defaultBranch`
+// (#2506). It is the shared seam behind BOTH the dispatcher's
+// refuse-on-empty gate and the server's run-create capture; the two
+// diverge only on how they treat the result: the dispatcher REFUSES an
+// empty snapshot, while the server DEGRADES to a nil snapshot.
+//
+// The returned bool is `authoritative`: true only when BOTH surfaces
+// answered definitively for this branch. Classic protection is
+// authoritative on a 200 or an ErrNotFound (a positive "no classic
+// protection"). The rulesets surface is authoritative only when the
+// list endpoint answered 200 AND every active branch ruleset's ref_name
+// condition was one the v0 matcher could evaluate — a rulesets 404
+// (GHES that doesn't expose the endpoint) OR an un-evaluatable include
+// token both yield authoritative=false, so a caller that reads an empty
+// snapshot as "nothing required" cannot be misled by an un-queried or
+// un-parsed surface (#2506, CONDITION 1(b)).
+//
+// Errors: errProtectionScopeMissing when the App lacks
+// `administration: read` (403 on either surface); the wrapped transport
+// error on any other failure. The snapshot is non-nil whenever err is
+// nil, with Contexts possibly empty.
+func ResolveRequiredChecks(ctx context.Context, api ProtectionAPI, scope forge.CredentialScope,
+	repo forge.RepoRef, branch, defaultBranch string) (*run.RequiredChecksSnapshot, bool, error) {
 	var contexts []string
 	var sources []string
 	seen := make(map[string]struct{})
@@ -2578,7 +2610,7 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 		contexts = append(contexts, c)
 	}
 
-	classic, classicErr := d.GitHub.GetBranchProtection(ctx, scope, repo, branch)
+	classic, classicErr := api.GetBranchProtection(ctx, scope, repo, branch)
 	switch {
 	case classicErr == nil:
 		if len(classic.RequiredStatusCheckContexts) > 0 {
@@ -2588,17 +2620,20 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 			}
 		}
 	case errors.Is(classicErr, forge.ErrNotFound):
-		// Branch isn't protected by the classic API — fall through
+		// Branch isn't protected by the classic API — a positive
+		// "no classic protection", still authoritative. Fall through
 		// to rulesets.
 	case errors.Is(classicErr, forge.ErrForbidden):
-		return nil, errProtectionScopeMissing
+		return nil, false, errProtectionScopeMissing
 	default:
-		return nil, fmt.Errorf("get branch protection: %w", classicErr)
+		return nil, false, fmt.Errorf("get branch protection: %w", classicErr)
 	}
 
-	rulesets, rulesetsErr := d.GitHub.ListRulesetRequiredChecks(ctx, scope, repo, branch)
+	rulesetsAuthoritative := false
+	rulesets, rulesetsAuth, rulesetsErr := api.ListRulesetRequiredChecksForDefault(ctx, scope, repo, branch, defaultBranch)
 	switch {
 	case rulesetsErr == nil:
+		rulesetsAuthoritative = rulesetsAuth
 		for _, r := range rulesets {
 			if len(r.Contexts) == 0 {
 				continue
@@ -2609,23 +2644,42 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 			}
 		}
 	case errors.Is(rulesetsErr, forge.ErrForbidden):
-		return nil, errProtectionScopeMissing
+		return nil, false, errProtectionScopeMissing
 	default:
 		// 404 from the rulesets endpoint is unusual but not fatal —
 		// some self-hosted GHES versions don't expose it. Fall
-		// through with whatever classic protection contributed.
+		// through with whatever classic protection contributed, but
+		// mark the result NON-authoritative: we did not query the
+		// surface, so an empty snapshot is not a positive "nothing
+		// required".
 		if !errors.Is(rulesetsErr, forge.ErrNotFound) {
-			return nil, fmt.Errorf("list rulesets: %w", rulesetsErr)
+			return nil, false, fmt.Errorf("list rulesets: %w", rulesetsErr)
 		}
 	}
 
-	if len(contexts) == 0 {
-		return nil, errNoBranchProtection
-	}
 	return &run.RequiredChecksSnapshot{
 		Contexts: contexts,
 		Sources:  sources,
-	}, nil
+	}, rulesetsAuthoritative, nil
+}
+
+// resolveRequiredChecks is the dispatcher's thin wrapper over the shared
+// ResolveRequiredChecks (#2506). It preserves the dispatcher's
+// byte-identical refuse-on-empty contract (#251): the DEFAULT ref is
+// also the repo's default branch on this path, so `branch` doubles as
+// `defaultBranch`, and the authoritativeness signal is discarded because
+// the dispatcher already refuses BOTH the authoritative-empty and the
+// non-authoritative-empty cases with errNoBranchProtection.
+func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.CredentialScope,
+	repo forge.RepoRef, branch string) (*run.RequiredChecksSnapshot, error) {
+	snap, _, err := ResolveRequiredChecks(ctx, d.GitHub, scope, repo, branch, branch)
+	if err != nil {
+		return nil, err
+	}
+	if len(snap.Contexts) == 0 {
+		return nil, errNoBranchProtection
+	}
+	return snap, nil
 }
 
 // writeProtectionRefusalAudit logs the dispatcher's refusal to
