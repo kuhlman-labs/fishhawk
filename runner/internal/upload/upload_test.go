@@ -2798,6 +2798,48 @@ func TestShipPullRequest_ParkBodyBudgetUnderCap(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_EscapeHeavyBodyKeepsNarrative is the counterfactual vehicle
+// for the truncate-before-dropping control (#2570 fix-up).
+//
+// THE FAILURE MODE IT CATCHES: an agent narrative whose ESCAPED form overshoots
+// the request budget was dropped wholesale, so the resume fell back to a
+// synthesized description even though a fitting prefix of the real `## Summary`
+// was available. The fixture is deliberately escape-heavy — `<` and `&` each
+// marshal to six bytes — so the clamped 8 KiB body is ~49 KiB on the wire and the
+// truncation rung is the one that runs. Both halves are asserted: the bytes fit
+// the 32 KiB cap AND the narrative survived.
+func TestShipPullRequest_EscapeHeavyBodyKeepsNarrative(t *testing.T) {
+	narrative := "## Summary\n\n- Rewrote " + strings.Repeat("<&", 6*1024)
+
+	body := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Outcome: "failed", Category: "B", Reason: "verify failed",
+		Branch: "fishhawk/run-abc/stage-xyz", HeadSHA: "deadbeef",
+		BaseSHA: "feedface", TreeSHA: "treesha1",
+		PRTitle: "feat(server): open a real PR on a resume", PRBody: narrative,
+	})
+
+	if len(body) > MaxPullRequestReportBytes {
+		t.Errorf("marshalled failure body = %d bytes, want <= %d", len(body), MaxPullRequestReportBytes)
+	}
+	var decoded struct {
+		Title  string `json:"title"`
+		PRBody string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("shrunk failure body is not valid JSON: %v", err)
+	}
+	if !strings.HasPrefix(decoded.PRBody, "## Summary\n\n- Rewrote <&") {
+		t.Errorf("escape-heavy narrative must survive as a prefix, not be dropped; got %.40q", decoded.PRBody)
+	}
+	if !strings.HasSuffix(decoded.PRBody, heldCommitPRBodyTruncationMarker) {
+		t.Errorf("a truncated body must carry the marker, got %.60q", decoded.PRBody)
+	}
+	if decoded.Title == "" {
+		t.Error("the recovered title must survive when only the body needed shrinking")
+	}
+}
+
 // TestShrinkFailureBodyFields_Ladder walks the rungs the end-to-end tests above
 // cannot reach individually, including the last two: shrinking the reason BELOW
 // MinFailureReportReasonBytes, and the shrink-exhausted false return.
@@ -2832,9 +2874,38 @@ func TestShrinkFailureBodyFields_Ladder(t *testing.T) {
 		}
 	})
 
-	t.Run("PR text is dropped when the reason floor is not enough", func(t *testing.T) {
-		// An escaping reason at the floor plus escaping PR text: the reason cannot
-		// yield further, so the PR body and then the title must go.
+	t.Run("PR body TRUNCATES before it is dropped", func(t *testing.T) {
+		// An escaping reason at the floor plus an escaping PR body: the reason
+		// cannot yield further, but a PREFIX of the narrative still fits, so the
+		// body must be truncated rather than deleted (#2570 fix-up).
+		b := &pullRequestFailureBody{
+			Outcome: "failed", Category: "B",
+			Reason: strings.Repeat("<", MinFailureReportReasonBytes),
+			HeldCommitPRText: HeldCommitPRText{
+				Title:  strings.Repeat("<", MaxHeldCommitPRTitleBytes),
+				PRBody: "## Summary\n\n" + strings.Repeat("<", MaxHeldCommitPRBodyBytes),
+			},
+		}
+		if !shrinkFailureBodyFields(b, MaxPullRequestReportBytes) {
+			t.Fatal("must fit by truncating the PR body")
+		}
+		if !strings.HasPrefix(b.PRBody, "## Summary") {
+			t.Errorf("the agent narrative must survive as a prefix, got %.40q", b.PRBody)
+		}
+		if !strings.HasSuffix(b.PRBody, heldCommitPRBodyTruncationMarker) {
+			t.Errorf("a truncated body must say so, got %.40q", b.PRBody)
+		}
+		if b.Reason == "" {
+			t.Error("the reason must survive when truncating the PR body is enough")
+		}
+		if got, _ := json.Marshal(b); len(got) > MaxPullRequestReportBytes {
+			t.Errorf("marshalled = %d bytes, want <= %d", len(got), MaxPullRequestReportBytes)
+		}
+	})
+
+	t.Run("PR text is dropped when no fitting prefix remains", func(t *testing.T) {
+		// The same shape against a cap that leaves less room than the retained-text
+		// floor: truncation cannot help, so the body and then the title must go.
 		b := &pullRequestFailureBody{
 			Outcome: "failed", Category: "B",
 			Reason: strings.Repeat("<", MinFailureReportReasonBytes),
@@ -2843,7 +2914,9 @@ func TestShrinkFailureBodyFields_Ladder(t *testing.T) {
 				PRBody: strings.Repeat("<", MaxHeldCommitPRBodyBytes),
 			},
 		}
-		if !shrinkFailureBodyFields(b, MaxPullRequestReportBytes) {
+		// The floor's own escaped cost (512 `<` → 3072 bytes) exceeds what this cap
+		// leaves after the floored reason and the clamped title.
+		if !shrinkFailureBodyFields(b, 27*1024) {
 			t.Fatal("must fit by dropping the PR text")
 		}
 		if b.PRBody != "" {
@@ -2887,6 +2960,33 @@ func TestShrinkFailureBodyFields_Ladder(t *testing.T) {
 	})
 }
 
+// TestShrinkHeldCommitPRBody covers the truncation helper's own edge branches:
+// an envelope that already fits is left byte-identical, and one where not even
+// the retained-text floor fits reports false with the original restored, so the
+// caller's drop rung sees exactly what it was handed.
+func TestShrinkHeldCommitPRBody(t *testing.T) {
+	t.Run("already fits", func(t *testing.T) {
+		b := &pullRequestFailureBody{Outcome: "failed", HeldCommitPRText: HeldCommitPRText{PRBody: "## Summary"}}
+		if !shrinkHeldCommitPRBody(b, &b.PRBody, MaxPullRequestReportBytes) {
+			t.Fatal("a tiny body must fit")
+		}
+		if b.PRBody != "## Summary" {
+			t.Errorf("a fitting body must not be touched, got %q", b.PRBody)
+		}
+	})
+
+	t.Run("no fitting prefix restores the original", func(t *testing.T) {
+		original := strings.Repeat("<", 4*1024)
+		b := &pullRequestFailureBody{Outcome: "failed", HeldCommitPRText: HeldCommitPRText{PRBody: original}}
+		if shrinkHeldCommitPRBody(b, &b.PRBody, 64) {
+			t.Fatal("a cap below the retained-text floor must report no fit")
+		}
+		if b.PRBody != original {
+			t.Errorf("a failed truncation must restore the original for the caller's drop rung")
+		}
+	})
+}
+
 // TestShrinkParkBodyFields_Ladder is the park sibling, including its own
 // exhausted-return rung.
 func TestShrinkParkBodyFields_Ladder(t *testing.T) {
@@ -2900,6 +3000,11 @@ func TestShrinkParkBodyFields_Ladder(t *testing.T) {
 	}
 	if len(b.Title) > MaxHeldCommitPRTitleBytes {
 		t.Errorf("title not clamped: %d", len(b.Title))
+	}
+	// The park ladder truncates the body too — the shortfall lists are small, so a
+	// large prefix of the narrative fits and must not be dropped.
+	if b.PRBody == "" {
+		t.Error("the park body must truncate to what fits, not be dropped wholesale")
 	}
 
 	// Exhausted: the shortfall payload alone exceeds the cap and is never dropped.

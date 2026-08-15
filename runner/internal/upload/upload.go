@@ -843,12 +843,24 @@ const (
 // accepted. MinFailureReportReasonBytes is the floor the reason yields down to
 // before the PR text starts being dropped — below it the operator's failure
 // diagnosis stops being useful.
+// MinHeldCommitPRBodyBytes is the floor the recovered PR body TRUNCATES toward
+// before it is dropped wholesale. A body that no longer fits is shrunk to the
+// largest fitting prefix rather than deleted, so an escape-heavy `## Summary`
+// still reaches the resume instead of degrading it to the synthesized fallback;
+// below this floor the surviving fragment is not worth the bytes and the whole
+// field yields to the reason.
 const (
 	MaxHeldCommitPRTitleBytes   = 300
 	MaxHeldCommitPRBodyBytes    = 8 * 1024
+	MinHeldCommitPRBodyBytes    = 512
 	MinFailureReportReasonBytes = 4 * 1024
 	MaxPullRequestReportBytes   = 32 * 1024
 )
+
+// heldCommitPRBodyTruncationMarker is appended to a PR body the size budget
+// truncated, so the operator reading the resumed pull request can tell the
+// narrative is a fragment rather than everything the agent wrote.
+const heldCommitPRBodyTruncationMarker = "\n\n_[truncated by the runner to fit the report size cap]_"
 
 // clampRunes bounds s to at most max BYTES, cutting back to a rune boundary
 // (#2570). Rune-safety is load-bearing for the size budget, not just for
@@ -887,6 +899,58 @@ func marshalOverflow(v any, max int) (int, bool) {
 	return len(b) - max, true
 }
 
+// shrinkHeldCommitPRBody shrinks the recovered PR body *prBody carries, in
+// place, until envelope's MARSHALLED form fits maxBytes — reporting whether it
+// now fits.
+//
+// TRUNCATE BEFORE DROPPING (#2570). The captured `## Summary` is the whole point
+// of carrying PR text through a park: dropping it wholesale because its ESCAPED
+// form overshot the budget degrades the resume to the synthesized fallback even
+// though a shorter prefix would have fit.
+//
+// The retained length is found by BINARY SEARCH over the original text, each
+// candidate MEASURED as marshalled bytes (see marshalOverflow) rather than
+// estimated from raw lengths — the escape expansion is per-character and wildly
+// non-uniform (six bytes for `<`, one for a letter), so no arithmetic on raw
+// lengths can predict where the cut lands. The search keeps the LARGEST fitting
+// prefix; a single overflow-sized cut would converge on the floor and throw away
+// narrative that fits.
+//
+// Every candidate is cut on a rune boundary (clampRunes), because invalid UTF-8
+// is re-encoded as a THREE-byte U+FFFD per bad byte and could GROW the payload
+// this bounds. When not even MinHeldCommitPRBodyBytes of retained text fits, the
+// original is restored and false is reported, leaving the field for the caller's
+// drop rung.
+func shrinkHeldCommitPRBody(envelope any, prBody *string, maxBytes int) bool {
+	fits := func() bool {
+		over, ok := marshalOverflow(envelope, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+
+	original := *prBody
+	lo, hi := MinHeldCommitPRBodyBytes, len(original)
+	best := -1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		*prBody = clampRunes(original, mid) + heldCommitPRBodyTruncationMarker
+		if fits() {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best < 0 {
+		*prBody = original
+		return false
+	}
+	*prBody = clampRunes(original, best) + heldCommitPRBodyTruncationMarker
+	return true
+}
+
 // shrinkFailureBodyFields shrinks a failure report in place until its MARSHALLED
 // form fits maxBytes, returning false only when even the emptied-field envelope
 // does not fit (#2570). The ladder yields the least valuable field first:
@@ -899,13 +963,17 @@ func marshalOverflow(v any, max int) (int, bool) {
 //     MEASURED marshalled overflow each pass (never by a raw-length delta — see
 //     marshalOverflow) and re-measuring, so the loop converges on the real
 //     serialized size however the text escapes.
-//  2. Drop the PR body, then the PR title. Recovered narrative is the expendable
+//  2. TRUNCATE the PR body to the largest prefix that fits, measured the same
+//     way (shrinkHeldCommitPRBody). A fragment of the agent's `## Summary` is
+//     worth far more to the resumed pull request than the synthesized fallback
+//     dropping it entirely would force.
+//  3. Drop the PR body, then the PR title. Recovered narrative is the expendable
 //     field: losing it costs a placeholder PR, losing the reason costs the
 //     operator the diagnosis of why the stage failed at all.
-//  3. Shrink the reason BELOW its floor, halving until it fits or empties. Only
+//  4. Shrink the reason BELOW its floor, halving until it fits or empties. Only
 //     reachable when the envelope alone (outcome/category/checkpoint SHAs) plus a
 //     4 KiB reason still exceeds the cap.
-//  4. Shrink exhausted: even the empty-field envelope is over. Report false so
+//  5. Shrink exhausted: even the empty-field envelope is over. Report false so
 //     the caller ships the un-shrinkable body and lets the backend's 413 (and the
 //     bounded aggressive retry) decide, rather than silently claiming a fit.
 func shrinkFailureBodyFields(body *pullRequestFailureBody, maxBytes int) bool {
@@ -940,7 +1008,12 @@ func shrinkFailureBodyFields(body *pullRequestFailureBody, maxBytes int) bool {
 		body.Reason = TruncateReason(body.Reason, next)
 	}
 
-	// Rung 2: drop the recovered PR text.
+	// Rung 2: the recovered PR body truncates to what fits.
+	if shrinkHeldCommitPRBody(body, &body.PRBody, maxBytes) {
+		return true
+	}
+
+	// Rung 3: drop the recovered PR text.
 	body.PRBody = ""
 	if fits() {
 		return true
@@ -950,7 +1023,7 @@ func shrinkFailureBodyFields(body *pullRequestFailureBody, maxBytes int) bool {
 		return true
 	}
 
-	// Rung 3: the reason yields below its floor.
+	// Rung 4: the reason yields below its floor.
 	for n := MinFailureReportReasonBytes / 2; n >= 1; n /= 2 {
 		body.Reason = TruncateReason(body.Reason, n)
 		if fits() {
@@ -959,16 +1032,17 @@ func shrinkFailureBodyFields(body *pullRequestFailureBody, maxBytes int) bool {
 	}
 	body.Reason = ""
 
-	// Rung 4: shrink exhausted.
+	// Rung 5: shrink exhausted.
 	return fits()
 }
 
 // shrinkParkBodyFields is the park-report sibling of shrinkFailureBodyFields
-// (#2570). A park body carries no reason, so the ladder is only the two PR-text
-// clamps followed by dropping the body and then the title when the shortfall
-// lists alone push the marshalled form past the cap. Returns false when even the
-// PR-text-free body is over — the shortfall lists are the park's whole payload
-// and are never dropped, so that case is the caller's to surface.
+// (#2570). A park body carries no reason, so the ladder is the two PR-text
+// clamps, then TRUNCATING the body to what fits, then dropping the body and the
+// title when the shortfall lists alone push the marshalled form past the cap.
+// Returns false when even the PR-text-free body is over — the shortfall lists
+// are the park's whole payload and are never dropped, so that case is the
+// caller's to surface.
 func shrinkParkBodyFields(body *pullRequestScopeParkBody, maxBytes int) bool {
 	body.Title = clampRunes(body.Title, MaxHeldCommitPRTitleBytes)
 	body.PRBody = clampRunes(body.PRBody, MaxHeldCommitPRBodyBytes)
@@ -978,6 +1052,9 @@ func shrinkParkBodyFields(body *pullRequestScopeParkBody, maxBytes int) bool {
 		return ok && over <= 0
 	}
 	if fits() {
+		return true
+	}
+	if shrinkHeldCommitPRBody(body, &body.PRBody, maxBytes) {
 		return true
 	}
 	body.PRBody = ""
