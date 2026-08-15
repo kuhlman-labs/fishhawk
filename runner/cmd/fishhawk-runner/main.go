@@ -3908,7 +3908,13 @@ func isTestcontainersStartFlake(output string) bool {
 // Requiring DIGITS, a slash and a lowercase protocol INSIDE the quotes is the
 // conservatism knob: ordinary prose naming a non-numeric port, or an unquoted
 // port mention, must not match.
-var testcontainersPortNotFoundRe = regexp.MustCompile(`port "[0-9]+/[a-z]+" not found`)
+//
+// The leading `\b` makes `port` the literal WORD the doc claims, not an
+// unbounded substring: without it `airport "9000/tcp" not found` — a plausible
+// line in untrusted, diff-influenced verify output — classifies a category-B
+// failure as retryable infrastructure. The boundary costs nothing on the real
+// rendering, which is always preceded by a space, a colon or a line start.
+var testcontainersPortNotFoundRe = regexp.MustCompile(`\bport "[0-9]+/[a-z]+" not found`)
 
 // isTestcontainersPortFlake reports whether a failed verify's output carries
 // that rendering. The class is DIFF-INDEPENDENT: the message is produced when

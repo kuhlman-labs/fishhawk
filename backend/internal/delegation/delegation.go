@@ -910,8 +910,10 @@ var infraFlakeMarkers = []string{
 // testcontainers-go's DockerContainer.MappedPort port-not-found
 // rendering (#2718): `port "9000/tcp" not found`. Requiring digits, a
 // slash and a lowercase protocol inside the quotes keeps ordinary prose
-// naming a non-numeric or unquoted port from matching.
-var testcontainersPortNotFoundRe = regexp.MustCompile(`port "[0-9]+/[a-z]+" not found`)
+// naming a non-numeric or unquoted port from matching, and the leading
+// `\b` makes `port` the literal word rather than an unbounded substring
+// (without it `airport "9000/tcp" not found` would classify as a flake).
+var testcontainersPortNotFoundRe = regexp.MustCompile(`\bport "[0-9]+/[a-z]+" not found`)
 
 // dockerDaemonUnavailableMarkers mirror the runner's daemon-unreachable
 // marker set (#2718), itself kept in spirit with the isDockerUnavailable

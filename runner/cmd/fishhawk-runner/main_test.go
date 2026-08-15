@@ -10222,6 +10222,10 @@ func TestIsTestcontainersPortFlake(t *testing.T) {
 		{"verbatim #972 approval-package failure", flakeOutputApproval, false},
 		{"non-numeric quoted port", `port "invalid port" not found`, false},
 		{"unquoted port mention", "port 9000/tcp not found", false},
+		// Word-boundary pin: `port` is the literal word the doc claims, not an
+		// unbounded substring. Without the `\b` this line classifies as
+		// infrastructure and turns a category-B failure retryable.
+		{"prefix near-miss: port is a word suffix", `--- FAIL: TestAirport (0.00s)` + "\n" + `    airport_test.go:8: airport "9000/tcp" not found` + "\nFAIL", false},
 		{"quoted port without the not-found tail", `port "9000/tcp" is already allocated`, false},
 		{"ordinary assertion failure", ordinaryFailOutput, false},
 		{"empty output", "", false},
@@ -10305,6 +10309,8 @@ func TestIsVerifyInfraFailure(t *testing.T) {
 		// #2718 false-positive guards: the widening must not claim these.
 		{"non-numeric quoted port", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port \"invalid port\" not found\nFAIL", false, false, false},
 		{"unquoted port mention", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port 9000/tcp not found\nFAIL", false, false, false},
+		// Word-boundary pin at the WIRING level (see TestIsTestcontainersPortFlake).
+		{"prefix near-miss: port is a word suffix", "--- FAIL: TestAirport (0.00s)\n    airport_test.go:8: airport \"9000/tcp\" not found\nFAIL", false, false, false},
 		{"prose mentioning the Docker daemon without a connect failure", "--- FAIL: TestDoc (0.00s)\n    doc_test.go:9: the docker daemon owns container lifecycle; we only inspect it\nFAIL", false, false, false},
 		{"assertion failure in a package whose name contains docker", "--- FAIL: TestPull (0.00s)\n    client_test.go:31: Pull(x) = 0, want 42\nFAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/dockerutil\t0.012s", false, false, false},
 		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false, false, false},

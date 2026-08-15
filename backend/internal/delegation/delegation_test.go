@@ -1188,6 +1188,20 @@ const realDockerDownOutput = `--- FAIL: TestPgtestNewPool (0.04s)
     pgtest.go:214: start postgres: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
 FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	0.061s`
 
+// pgtestFixtureDumpOutput mirrors the runner's fixture of the same name: the
+// KNOWN and ACCEPTED misclassification of #2718 (operator condition 2).
+// backend/internal/pgtest/pgtest_test.go's own table fixtures carry the
+// daemon-unavailable marker strings AS DATA, so a genuine failure in that
+// package prints a marker in its `--- FAIL:` output and self-classifies as
+// infrastructure. Pinning it expecting-MET on THIS side too is what makes the
+// "both mirrors are pinned against the same corpus" claim true: a later
+// narrowing reddens this row as well, prompting the README residual paragraph
+// to be updated in the same change rather than drifting from behavior.
+const pgtestFixtureDumpOutput = `--- FAIL: TestIsDockerUnavailable/daemon_down (0.00s)
+    pgtest_test.go:116: isDockerUnavailable() = false, want true
+        err = Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/pgtest	0.112s`
+
 func realFlakeFailureReason() string {
 	return flakeFailureReason(realFlakeOutput)
 }
@@ -1226,6 +1240,12 @@ func TestInfraFlake(t *testing.T) {
 			wantMet: true,
 		},
 		{
+			// ACCEPTED residual, not a defect — see pgtestFixtureDumpOutput.
+			name:    "met: pgtest table fixtures carrying the markers as DATA (accepted #2718 residual)",
+			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(pgtestFixtureDumpOutput))},
+			wantMet: true,
+		},
+		{
 			name:       "unmet: non-numeric quoted port",
 			stages:     []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(`port "invalid port" not found`))},
 			wantReason: "no infra-flake signature",
@@ -1233,6 +1253,15 @@ func TestInfraFlake(t *testing.T) {
 		{
 			name:       "unmet: unquoted port mention",
 			stages:     []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason("port 9000/tcp not found"))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			// Word-boundary pin, mirroring the runner's row: `port` is the
+			// literal word, not an unbounded substring. Without the `\b` this
+			// reason classifies as a flake and turns a category-B retryable.
+			name: "unmet: prefix near-miss where port is a word suffix",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("--- FAIL: TestAirport (0.00s)\n    airport_test.go:8: airport \"9000/tcp\" not found\nFAIL"))},
 			wantReason: "no infra-flake signature",
 		},
 		{
