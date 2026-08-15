@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -888,8 +889,9 @@ func soloLowUnmetReason(open []*concern.Concern) string {
 }
 
 // infraFlakeMarkers are the container-start markers of the
-// testcontainers start-timeout signature (#972). The set mirrors the
-// runner's isTestcontainersStartFlake matcher — the single emit site
+// testcontainers start-timeout signature (#972; the mirror was widened
+// alongside the runner's by #2718 — see hasInfraFlakeSignature). The set
+// mirrors the runner's isTestcontainersStartFlake matcher — the single emit site
 // for the flake classification: a category-A verify failure's
 // FailureReason embeds the verify output verbatim ("verify command %q
 // still failing after %d iteration(s):\n<output>"), so the signature
@@ -904,15 +906,55 @@ var infraFlakeMarkers = []string{
 	"wait until ready",
 }
 
+// testcontainersPortNotFoundRe mirrors the runner's matcher of
+// testcontainers-go's DockerContainer.MappedPort port-not-found
+// rendering (#2718): `port "9000/tcp" not found`. Requiring digits, a
+// slash and a lowercase protocol inside the quotes keeps ordinary prose
+// naming a non-numeric or unquoted port from matching.
+var testcontainersPortNotFoundRe = regexp.MustCompile(`port "[0-9]+/[a-z]+" not found`)
+
+// dockerDaemonUnavailableMarkers mirror the runner's daemon-unreachable
+// marker set (#2718), itself kept in spirit with the isDockerUnavailable
+// helpers in backend/internal/pgtest, backend/internal/postgres and
+// backend/internal/tracestore.
+var dockerDaemonUnavailableMarkers = []string{
+	"cannot connect to the docker daemon",
+	"is the docker daemon running",
+	"dial unix /var/run/docker.sock",
+}
+
 // hasInfraFlakeSignature reports whether a failure reason carries the
 // infra-flake classification: the literal verify_infra_flake_retry
-// marker, or the conservative testcontainers signature ("context
+// marker, the conservative testcontainers start signature ("context
 // deadline exceeded" AND a container-start marker — an ordinary test
-// failure that merely mentions a deadline never matches).
+// failure that merely mentions a deadline never matches), the
+// testcontainers port-not-found rendering, or a daemon-unreachable
+// marker. The last two mirror the runner's #2718 widening; the two live
+// in different Go modules and cannot share a fixture, so each is pinned
+// against the same corpus of verbatim observed outputs.
 func hasInfraFlakeSignature(reason string) bool {
 	if strings.Contains(reason, "verify_infra_flake_retry") {
 		return true
 	}
+	if hasTestcontainersStartSignature(reason) {
+		return true
+	}
+	if testcontainersPortNotFoundRe.MatchString(reason) {
+		return true
+	}
+	lowered := strings.ToLower(reason)
+	for _, marker := range dockerDaemonUnavailableMarkers {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTestcontainersStartSignature is the #972 container-start-timeout
+// half: "context deadline exceeded" AND at least one container-start
+// marker.
+func hasTestcontainersStartSignature(reason string) bool {
 	if !strings.Contains(reason, "context deadline exceeded") {
 		return false
 	}

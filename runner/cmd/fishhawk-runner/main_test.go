@@ -10135,6 +10135,10 @@ func TestIsTestcontainersStartFlake(t *testing.T) {
 	}{
 		{"verbatim #972 approval-package failure", flakeOutputApproval, true},
 		{"verbatim #972 audit-package failure", flakeOutputAudit, true},
+		// The #2718 classes are DISTINCT, not a loosening of this matcher: the
+		// deadline matcher must keep refusing both new signatures.
+		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, false},
+		{"verbatim #2718 daemon-unreachable failure", dockerDownOutput2718, false},
 		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false},
 		{"deadline without container marker", "--- FAIL: TestFetch (30.00s)\n    fetch_test.go:42: Get \"http://example.com/api\": context deadline exceeded\nFAIL", false},
 		{"container marker without deadline", "--- FAIL: TestStart (5.00s)\n    main_test.go:10: failed to start container: image not found\nFAIL", false},
@@ -10173,6 +10177,104 @@ const segfaultOutput2656 = `--- FAIL: TestWorktreeIsolation_Integration (0.27s)
     worktreesDir: rev-parse --git-common-dir: signal: segmentation fault
 FAIL	github.com/kuhlman-labs/fishhawk/runner/cmd/fishhawk-runner`
 
+// The two VERBATIM #2718 occurrence outputs, commented the way the constants
+// above are: the matchers must hold against the real observed text, not an
+// abbreviation, so a testcontainers-go wording change fails this test instead
+// of silently dropping coverage.
+//
+// portFlakeOutput2718 reproduces the #2718 issue body's failure block
+// byte-for-byte (run 2187fa4c, 2026-08-14): a MinIO container in
+// backend/internal/tracestore — a package that change never touched — failed
+// with testcontainers-go's MappedPort port-not-found rendering. It is embedded
+// in surrounding ok-package lines so the fixture is shaped like real full-suite
+// output. Note it carries NO deadline text and no `signal: <name>` rendering:
+// that is precisely why the pre-#2718 matcher set never claimed it.
+const portFlakeOutput2718 = `ok  	github.com/kuhlman-labs/fishhawk/backend/internal/timescale	0.213s
+ok  	github.com/kuhlman-labs/fishhawk/backend/internal/token	4.902s
+--- FAIL: TestS3_Get_NotFound (12.37s)
+    s3_test.go:208: connection string: port "9000/tcp" not found
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/tracestore	18.512s
+ok  	github.com/kuhlman-labs/fishhawk/backend/internal/upload	1.884s`
+
+// dockerDownOutput2718 is the daemon-unreachable block: the Docker client's
+// own rendering when the daemon is not answering at all, as the repo's
+// isDockerUnavailable helpers already recognise it.
+const dockerDownOutput2718 = `--- FAIL: TestPgtestNewPool (0.04s)
+    pgtest.go:214: start postgres: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+FAIL
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	0.061s`
+
+// TestIsTestcontainersPortFlake is a UNIT pin on the #2718 port matcher — NOT
+// a counterfactual vehicle for the isVerifyInfraFailure wiring (it calls the
+// helper directly, so deleting a disjunct of the disjunction cannot redden it;
+// operator condition 3). The wiring's vehicles are TestIsVerifyInfraFailure and
+// the behavioral cases.
+func TestIsTestcontainersPortFlake(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, true},
+		{"daemon-unreachable output is a DIFFERENT class", dockerDownOutput2718, false},
+		// The classes are distinct, not a loosening of the deadline matcher:
+		// the #972 outputs carry `port: "invalid port"`, which must not match.
+		{"verbatim #972 approval-package failure", flakeOutputApproval, false},
+		{"non-numeric quoted port", `port "invalid port" not found`, false},
+		{"unquoted port mention", "port 9000/tcp not found", false},
+		{"quoted port without the not-found tail", `port "9000/tcp" is already allocated`, false},
+		{"ordinary assertion failure", ordinaryFailOutput, false},
+		{"empty output", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTestcontainersPortFlake(tt.output); got != tt.want {
+				t.Errorf("isTestcontainersPortFlake(...) = %v, want %v\noutput:\n%s", got, tt.want, tt.output)
+			}
+		})
+	}
+}
+
+// pgtestFixtureDumpOutput is the KNOWN and ACCEPTED misclassification of #2718
+// (operator condition 2), pinned in the corpus rather than left in README
+// prose: backend/internal/pgtest/pgtest_test.go's own table fixtures carry the
+// daemon-unavailable marker strings AS DATA, so a genuine failure in that
+// package prints a marker in its `--- FAIL:` output and self-classifies as
+// infrastructure. This is not a matcher bug — it is the residual the widening
+// accepts, bounded to retry churn and delayed parking (the push decision reads
+// the verify OUTCOME, never this classifier). Pinning it expecting-true is the
+// honest encoding: if a later narrowing makes it false, THIS row is the prompt
+// to update the runner README's residual paragraph in the same change.
+const pgtestFixtureDumpOutput = `--- FAIL: TestIsDockerUnavailable/daemon_down (0.00s)
+    pgtest_test.go:116: isDockerUnavailable() = false, want true
+        err = Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/pgtest	0.112s`
+
+// TestIsDockerDaemonUnavailable is the second UNIT pin (same caveat as
+// TestIsTestcontainersPortFlake: it is not a wiring counterfactual vehicle).
+func TestIsDockerDaemonUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"verbatim #2718 daemon-unreachable failure", dockerDownOutput2718, true},
+		{"socket dial failure", "dial unix /var/run/docker.sock: connect: no such file or directory\nFAIL", true},
+		// ACCEPTED residual, not a defect — see pgtestFixtureDumpOutput.
+		{"pgtest table fixtures carrying the markers as DATA (accepted #2718 residual)", pgtestFixtureDumpOutput, true},
+		{"port-not-found output is a DIFFERENT class", portFlakeOutput2718, false},
+		{"prose mentioning the Docker daemon without a connect failure", "--- FAIL: TestDoc (0.00s)\n    doc_test.go:9: the docker daemon owns container lifecycle; we only inspect it\nFAIL", false},
+		{"assertion failure in a package whose name contains docker", "--- FAIL: TestPull (0.00s)\n    client_test.go:31: Pull(x) = 0, want 42\nFAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/dockerutil\t0.012s", false},
+		{"verbatim #972 approval-package failure (URL-escaped socket, not a dial)", flakeOutputApproval, false},
+		{"empty output", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDockerDaemonUnavailable(tt.output); got != tt.want {
+				t.Errorf("isDockerDaemonUnavailable(...) = %v, want %v\noutput:\n%s", got, tt.want, tt.output)
+			}
+		})
+	}
+}
+
 // TestIsVerifyInfraFailure pins BOTH matchers and, load-bearingly, the
 // NARROWING between them (#2645 operator condition 1): the signal-death rule
 // belongs only to the pre-push strict re-verify (isReverifyInfraFailure), and
@@ -10195,6 +10297,16 @@ func TestIsVerifyInfraFailure(t *testing.T) {
 		{"supervisor terminate rendering", "signal: terminated\nFAIL\texample.com/mod", false, true, false},
 		{"verbatim #972 approval-package failure", flakeOutputApproval, true, true, true},
 		{"verbatim #972 audit-package failure", flakeOutputAudit, true, true, true},
+		// #2718 widening. These rows ARE the counterfactual vehicle for the two
+		// new disjuncts: deleting either from isVerifyInfraFailure reddens them.
+		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, true, true, true},
+		{"verbatim #2718 daemon-unreachable failure", dockerDownOutput2718, true, true, true},
+		{"pgtest fixtures carrying the markers as DATA (accepted #2718 residual)", pgtestFixtureDumpOutput, true, true, true},
+		// #2718 false-positive guards: the widening must not claim these.
+		{"non-numeric quoted port", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port \"invalid port\" not found\nFAIL", false, false, false},
+		{"unquoted port mention", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port 9000/tcp not found\nFAIL", false, false, false},
+		{"prose mentioning the Docker daemon without a connect failure", "--- FAIL: TestDoc (0.00s)\n    doc_test.go:9: the docker daemon owns container lifecycle; we only inspect it\nFAIL", false, false, false},
+		{"assertion failure in a package whose name contains docker", "--- FAIL: TestPull (0.00s)\n    client_test.go:31: Pull(x) = 0, want 42\nFAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/dockerutil\t0.012s", false, false, false},
 		{"ordinary assertion failure", "--- FAIL: TestGet (0.00s)\n    reg_test.go:7: Get(x) = 0, want 42\nFAIL\nFAIL\texample.com/mod\t0.012s\nFAIL", false, false, false},
 		{"prose mentioning signals but no signal: <name> rendering", "--- FAIL: TestNotifier (0.01s)\n    notifier_test.go:12: expected a signal on the channel; got none (signal handling is async)\nFAIL", false, false, false},
 		{"empty output", "", false, false, false},
@@ -10320,13 +10432,21 @@ const flakeEchoLine = `wait until ready: mapped port: check target: retries: 9, 
 // invocation — the minimal reproduction of a one-shot infra flake.
 func flakeThenPassVerifyCmd(t *testing.T) string {
 	t.Helper()
+	return infraSignatureThenModuleTestsCmd(t, flakeEchoLine)
+}
+
+// infraSignatureThenModuleTestsCmd is the same shape, parameterised on the
+// infra signature the first invocation prints, so the fix-loop absorb can be
+// exercised once per recognised class (#2718).
+func infraSignatureThenModuleTestsCmd(t *testing.T, output string) string {
+	t.Helper()
 	dir := t.TempDir()
 	sentinel := filepath.Join(dir, "flaked")
 	script := filepath.Join(dir, "verify.sh")
 	mustWrite(t, script, "#!/bin/sh\n"+
 		"if [ ! -e "+sentinel+" ]; then\n"+
 		"  : > "+sentinel+"\n"+
-		"  echo '"+flakeEchoLine+"'\n"+
+		"  cat <<'FISHHAWK_VERIFY_EOF'\n"+output+"\nFISHHAWK_VERIFY_EOF\n"+
 		"  exit 1\n"+
 		"fi\n"+
 		"cd mod && go test ./...\n")
@@ -10339,73 +10459,84 @@ func flakeThenPassVerifyCmd(t *testing.T) string {
 // passes. The flake must NOT invoke the fix agent and must NOT consume a
 // verifyMaxIterations unit, and it must be RECORDED as a
 // verify_infra_flake_retry trace event + log line, never swallowed.
+//
+// Parameterised per recognised signature class. The #2718 rows are issue AC2's
+// assert-an-invocation-count: the gate re-runs WITHOUT re-invoking the agent.
 func TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn(t *testing.T) {
-	repo := verifyFixBaseRepo(t)
-	// The scope tree is green from the start — the only failure is the flake.
-	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
-	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	for _, tc := range []struct{ name, output string }{
+		{"testcontainers start timeout (#972)", flakeEchoLine},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := verifyFixBaseRepo(t)
+			// The scope tree is green from the start — the only failure is the flake.
+			mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+			mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
 
-	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
-	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
-	withFakeInvoker(t, invoker)
+			// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+			invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+			withFakeInvoker(t, invoker)
 
-	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	fu := newFakeUploader(t)
-	fu.promptResp = &upload.FetchedPrompt{
-		StageID:             verifyFixStageID,
-		StageType:           "implement",
-		Prompt:              "implement",
-		PromptHash:          "h",
-		VerifyCommand:       flakeThenPassVerifyCmd(t),
-		VerifyMaxIterations: 1,
-		ScopeFiles: []upload.ScopeFile{
-			{Path: "mod/reg.go", Operation: "modify"},
-			{Path: "mod/reg_test.go", Operation: "create"},
-		},
-	}
-	withFakeUploader(t, fu)
-	fp := &fakePusher{}
-	fpr := &fakePROpener{}
-	withFakeGitOps(t, fp, fpr)
+			implementEnv(t, "kuhlman-labs/fishhawk", "main")
+			fu := newFakeUploader(t)
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:             verifyFixStageID,
+				StageType:           "implement",
+				Prompt:              "implement",
+				PromptHash:          "h",
+				VerifyCommand:       infraSignatureThenModuleTestsCmd(t, tc.output),
+				VerifyMaxIterations: 1,
+				ScopeFiles: []upload.ScopeFile{
+					{Path: "mod/reg.go", Operation: "modify"},
+					{Path: "mod/reg_test.go", Operation: "create"},
+				},
+			}
+			withFakeUploader(t, fu)
+			fp := &fakePusher{}
+			fpr := &fakePROpener{}
+			withFakeGitOps(t, fp, fpr)
 
-	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
-	var stderr strings.Builder
-	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
-	if got != exitOK {
-		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
-	}
-	// ZERO fix-agent invocations: the flake retry is verify-only.
-	if invoker.callIdx != 1 {
-		t.Errorf("Invoke call count = %d, want 1 (initial only — no fix re-invoke on a flake)", invoker.callIdx)
-	}
-	if fp.gotArgs == nil {
-		t.Error("CommitAndPush should run after the absorbed flake")
-	}
-	if fpr.gotArgs == nil {
-		t.Error("OpenPR should run after the absorbed flake")
-	}
+			bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+			var stderr strings.Builder
+			got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+			if got != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+			}
+			// ZERO fix-agent invocations: the flake retry is verify-only.
+			if invoker.callIdx != 1 {
+				t.Errorf("Invoke call count = %d, want 1 (initial only — no fix re-invoke on a flake)", invoker.callIdx)
+			}
+			if fp.gotArgs == nil {
+				t.Error("CommitAndPush should run after the absorbed flake")
+			}
+			if fpr.gotArgs == nil {
+				t.Error("OpenPR should run after the absorbed flake")
+			}
 
-	events := readBundleEvents(t, bundlePath)
-	verifyRuns, flakeRetries := 0, 0
-	for _, ev := range events {
-		switch ev.Kind {
-		case "verify_run":
-			verifyRuns++
-		case "verify_infra_flake_retry":
-			flakeRetries++
-		}
+			events := readBundleEvents(t, bundlePath)
+			verifyRuns, flakeRetries := 0, 0
+			for _, ev := range events {
+				switch ev.Kind {
+				case "verify_run":
+					verifyRuns++
+				case "verify_infra_flake_retry":
+					flakeRetries++
+				}
+			}
+			if verifyRuns != 2 {
+				t.Errorf("verify_run events = %d, want 2 (flaked + retried)", verifyRuns)
+			}
+			if flakeRetries != 1 {
+				t.Errorf("verify_infra_flake_retry events = %d, want 1 (recorded, not swallowed)", flakeRetries)
+			}
+			if !strings.Contains(stderr.String(), "verify_infra_flake_retry") {
+				t.Errorf("missing verify_infra_flake_retry log line:\n%s", stderr.String())
+			}
+			// Budget NOT burned: 2 verify attempts against max_iterations=1, passed.
+			assertVerifySummary(t, events, "passed", 2, 1)
+		})
 	}
-	if verifyRuns != 2 {
-		t.Errorf("verify_run events = %d, want 2 (flaked + retried)", verifyRuns)
-	}
-	if flakeRetries != 1 {
-		t.Errorf("verify_infra_flake_retry events = %d, want 1 (recorded, not swallowed)", flakeRetries)
-	}
-	if !strings.Contains(stderr.String(), "verify_infra_flake_retry") {
-		t.Errorf("missing verify_infra_flake_retry log line:\n%s", stderr.String())
-	}
-	// Budget NOT burned: 2 verify attempts against max_iterations=1, passed.
-	assertVerifySummary(t, events, "passed", 2, 1)
 }
 
 // TestRun_VerifyFixLoop_PersistentInfraFlake_FallsThroughToFixLoop: the flake
@@ -12919,33 +13050,41 @@ func TestRunVerifyGateCommitted_FailReturnsEmptyTree(t *testing.T) {
 // category-C infrastructure (ErrVerifyInfraFailure), not the category-B red
 // tree ErrCommittedTestsFailed asserts.
 func TestRunVerifyGateCommitted_InfraFailureClassifiesInfraSentinel(t *testing.T) {
-	repo, _, _ := verifiedTreeRepo(t)
-	cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, lintLockOutput2645))
-	var logSink strings.Builder
-	events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
-	if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
-		t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
-	}
-	if errors.Is(err, gitops.ErrCommittedTestsFailed) {
-		t.Errorf("the infra failure must NOT also wrap the category-B sentinel: %v", err)
-	}
-	if got := pushFailureCategory(err); got != "C" {
-		t.Errorf("pushFailureCategory = %q, want C", got)
-	}
-	if tree != "" {
-		t.Errorf("failing gate must return an empty verified tree, got %q", tree)
-	}
-	var verifyRuns, retries int
-	for _, ev := range events {
-		switch ev.Kind {
-		case "verify_run":
-			verifyRuns++
-		case "verify_infra_flake_retry":
-			retries++
-		}
-	}
-	if verifyRuns != 2 || retries != 1 {
-		t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
+	for _, tc := range []struct{ name, output string }{
+		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _ := verifiedTreeRepo(t)
+			cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, tc.output))
+			var logSink strings.Builder
+			events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+			if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
+				t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
+			}
+			if errors.Is(err, gitops.ErrCommittedTestsFailed) {
+				t.Errorf("the infra failure must NOT also wrap the category-B sentinel: %v", err)
+			}
+			if got := pushFailureCategory(err); got != "C" {
+				t.Errorf("pushFailureCategory = %q, want C", got)
+			}
+			if tree != "" {
+				t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+			}
+			var verifyRuns, retries int
+			for _, ev := range events {
+				switch ev.Kind {
+				case "verify_run":
+					verifyRuns++
+				case "verify_infra_flake_retry":
+					retries++
+				}
+			}
+			if verifyRuns != 2 || retries != 1 {
+				t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
+			}
+		})
 	}
 }
 
@@ -13213,44 +13352,55 @@ func ordinaryFailVerifyCmd(t *testing.T) string {
 // strict re-verify runs — and fails ONCE for an infrastructure reason. The
 // absorb re-runs it in place against the same real head; the retry passes, so
 // the approved implement pass is pushed rather than discarded.
+// Parameterised per recognised signature class so the recovery path (absorb,
+// retry passes, pass ships) is pinned for each — including the two #2718
+// classes.
 func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyRetriedThenPushes(t *testing.T) {
-	repo, bare, branch := verifiedTreeRepo(t)
-	fpr := withFakePROpenerOnly(t)
-	fu := newFakeUploader(t)
-	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
-	if gerr != nil || verifiedTree == "" {
-		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
-	}
+	for _, tc := range []struct{ name, output string }{
+		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, branch := verifiedTreeRepo(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+			if gerr != nil || verifiedTree == "" {
+				t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+			}
 
-	moveBareMain(t, bare)
+			moveBareMain(t, bare)
 
-	var logSink strings.Builder
-	cfg := verifiedTreeCfg(repo, infraThenPassVerifyCmd(t, lintLockOutput2645))
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
-		t.Fatalf("openPRAndShipArtifact = %v, want nil (the infra failure must be absorbed)\n%s", err, logSink.String())
-	}
-	logs := logSink.String()
-	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
-		t.Errorf("expected verified_tree_mismatch:\n%s", logs)
-	}
-	if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
-		t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (once-per-stage bound)", n)
-	}
-	if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
-		t.Errorf("re-verify verify_run events = %d, want 2 (the failed re-verify AND its retry are both recorded)", n)
-	}
-	if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
-		t.Errorf("expected pushed_tree_reverified after the absorbed retry passed:\n%s", logs)
-	}
-	if fpr.gotArgs == nil {
-		t.Error("OpenPR should have run after the re-verified push")
-	}
-	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
-		t.Errorf("run branch %s missing from the bare remote after the absorbed retry passed: %v", branch, rerr)
+			var logSink strings.Builder
+			cfg := verifiedTreeCfg(repo, infraThenPassVerifyCmd(t, tc.output))
+			if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+				t.Fatalf("openPRAndShipArtifact = %v, want nil (the infra failure must be absorbed)\n%s", err, logSink.String())
+			}
+			logs := logSink.String()
+			if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
+				t.Errorf("expected verified_tree_mismatch:\n%s", logs)
+			}
+			if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
+				t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (once-per-stage bound)", n)
+			}
+			if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
+				t.Errorf("re-verify verify_run events = %d, want 2 (the failed re-verify AND its retry are both recorded)", n)
+			}
+			if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
+				t.Errorf("expected pushed_tree_reverified after the absorbed retry passed:\n%s", logs)
+			}
+			if fpr.gotArgs == nil {
+				t.Error("OpenPR should have run after the re-verified push")
+			}
+			if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+				t.Errorf("run branch %s missing from the bare remote after the absorbed retry passed: %v", branch, rerr)
+			}
+		})
 	}
 }
 
@@ -13264,6 +13414,8 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraReverifyClassifiesCateg
 	for _, tc := range []struct{ name, output string }{
 		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
 		{"segfaulting git rev-parse (#2656 occurrence)", segfaultOutput2656},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, bare, branch := verifiedTreeRepo(t)
@@ -13421,6 +13573,109 @@ func TestOpenPRAndShipArtifact_ScopeDriftReverifyFailureStaysCategoryB(t *testin
 	}
 }
 
+// nearMissRedTreeOutput is a genuinely RED tree whose failing test output
+// brushes against both #2718 classes without carrying either signature: it
+// names a port unquoted, quotes a non-numeric one, and mentions the Docker
+// daemon in prose, inside a package whose import path contains "docker". It is
+// the adversarial shape for the widening.
+const nearMissRedTreeOutput = `--- FAIL: TestClientPull (0.03s)
+    client_test.go:31: Pull(ctx) = 0, want 42
+    client_test.go:34: port 9000/tcp not found in the recorded bindings
+    client_test.go:37: got port "primary" not found, want the fallback
+    client_test.go:41: note: the docker daemon owns container lifecycle here
+FAIL
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/dockerutil	0.061s`
+
+// TestScopeViolationStaysCategoryB_Widened is issue AC3's counterfactual, taken
+// at the widened classifier: the #2718 widening must not make EVERY gate
+// failure retryable. Three arms:
+//
+//	(a) the single-shot committed-tree gate on a red tree whose output brushes
+//	    against both new classes — still ErrCommittedTestsFailed / category-B,
+//	    with ZERO verify_infra_flake_retry events;
+//	(b) the same output through the pre-push strict re-verify — still
+//	    ErrPushedTreeNotVerified / category-B, with origin untouched;
+//	(c) the constraint-violation push sentinels through pushFailureCategory —
+//	    still category-B after the widening.
+//
+// HONEST LABELLING (operator condition 3): this is a GUARD, not a
+// counterfactual vehicle. Deleting either new disjunct leaves it green, because
+// the outputs it drives were already classified non-infra. Its job is to fail
+// if a future loosening claims them.
+func TestScopeViolationStaysCategoryB_Widened(t *testing.T) {
+	t.Run("committed-tree gate on a near-miss red tree", func(t *testing.T) {
+		repo, _, _ := verifiedTreeRepo(t)
+		cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, nearMissRedTreeOutput))
+		var logSink strings.Builder
+		events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+		if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+			t.Fatalf("err = %v, want ErrCommittedTestsFailed", err)
+		}
+		if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+			t.Errorf("a red tree that merely mentions ports and docker must NOT classify infra: %v", err)
+		}
+		if got := pushFailureCategory(err); got != "B" {
+			t.Errorf("pushFailureCategory = %q, want B", got)
+		}
+		if tree != "" {
+			t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+		}
+		for _, ev := range events {
+			if ev.Kind == "verify_infra_flake_retry" {
+				t.Error("the absorb must not fire on a near-miss red tree")
+			}
+		}
+	})
+
+	t.Run("pre-push strict re-verify on a near-miss red tree", func(t *testing.T) {
+		repo, bare, branch := verifiedTreeRepo(t)
+		fpr := withFakePROpenerOnly(t)
+		fu := newFakeUploader(t)
+		issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+		if gerr != nil || verifiedTree == "" {
+			t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+		}
+		moveBareMain(t, bare)
+
+		var logSink strings.Builder
+		cfg := verifiedTreeCfg(repo, scriptedVerifyCmd(t, nearMissRedTreeOutput))
+		err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+		if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+			t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
+		}
+		if got := pushFailureCategory(err); got != "B" {
+			t.Errorf("pushFailureCategory = %q, want B", got)
+		}
+		if n := strings.Count(logSink.String(), `"event":"verify_infra_flake_retry"`); n != 0 {
+			t.Errorf("verify_infra_flake_retry events = %d, want 0", n)
+		}
+		if fpr.gotArgs != nil {
+			t.Error("OpenPR must not run on a blocked push")
+		}
+		if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+			t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+		}
+	})
+
+	t.Run("constraint-violation push sentinels", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			err  error
+		}{
+			{"ErrCommitOutOfScope", fmt.Errorf("push: %w", gitops.ErrCommitOutOfScope)},
+			{"ErrScopeFilesMissing", fmt.Errorf("push: %w", gitops.ErrScopeFilesMissing)},
+		} {
+			if got := pushFailureCategory(tc.err); got != "B" {
+				t.Errorf("pushFailureCategory(%s) = %q, want B after the #2718 widening", tc.name, got)
+			}
+		}
+	})
+}
+
 // TestOpenPRAndShipArtifact_SignalDeathWithScopeDeltaStaysCategoryB is the
 // integration proof of the #2645 operator-condition-1 NARROWING. The signal
 // rule buys the infrastructure classification only when the change's own
@@ -13480,47 +13735,55 @@ func TestOpenPRAndShipArtifact_SignalDeathWithScopeDeltaStaysCategoryB(t *testin
 // so the verdict is ErrPushedTreeNotVerified / category-B, not the category-C
 // the first failure alone would have bought.
 func TestOpenPRAndShipArtifact_MixedCauseReverifyClassifiesCategoryB(t *testing.T) {
-	repo, bare, branch := verifiedTreeRepo(t)
-	fpr := withFakePROpenerOnly(t)
-	fu := newFakeUploader(t)
-	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
-	if gerr != nil || verifiedTree == "" {
-		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
-	}
+	for _, tc := range []struct{ name, first string }{
+		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, branch := verifiedTreeRepo(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+			if gerr != nil || verifiedTree == "" {
+				t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+			}
 
-	moveBareMain(t, bare)
+			moveBareMain(t, bare)
 
-	var logSink strings.Builder
-	cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, lintLockOutput2645, ordinaryFailOutput))
-	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
-	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
-		t.Fatalf("err = %v, want ErrPushedTreeNotVerified (the RETRY's ordinary failure decides)", err)
-	}
-	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
-		t.Errorf("the first failure's infra signature must not survive an ordinary retry failure: %v", err)
-	}
-	if got := pushFailureCategory(err); got != "B" {
-		t.Errorf("pushFailureCategory = %q, want B", got)
-	}
-	if !strings.Contains(err.Error(), ordinaryFailOutput) {
-		t.Errorf("the message must carry the RETRY's output, not the absorbed first failure's:\n%s", err)
-	}
-	logs := logSink.String()
-	if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
-		t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (the absorb did fire)", n)
-	}
-	if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
-		t.Errorf("re-verify verify_run events = %d, want 2 (both the absorbed failure and its retry)", n)
-	}
-	if fpr.gotArgs != nil {
-		t.Error("OpenPR must not run on a blocked push")
-	}
-	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
-		t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+			var logSink strings.Builder
+			cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, tc.first, ordinaryFailOutput))
+			err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+			if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+				t.Fatalf("err = %v, want ErrPushedTreeNotVerified (the RETRY's ordinary failure decides)", err)
+			}
+			if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+				t.Errorf("the first failure's infra signature must not survive an ordinary retry failure: %v", err)
+			}
+			if got := pushFailureCategory(err); got != "B" {
+				t.Errorf("pushFailureCategory = %q, want B", got)
+			}
+			if !strings.Contains(err.Error(), ordinaryFailOutput) {
+				t.Errorf("the message must carry the RETRY's output, not the absorbed first failure's:\n%s", err)
+			}
+			logs := logSink.String()
+			if n := strings.Count(logs, `"event":"verify_infra_flake_retry"`); n != 1 {
+				t.Errorf("verify_infra_flake_retry events = %d, want exactly 1 (the absorb did fire)", n)
+			}
+			if n := strings.Count(logs, `"event":"verify_run"`); n != 2 {
+				t.Errorf("re-verify verify_run events = %d, want 2 (both the absorbed failure and its retry)", n)
+			}
+			if fpr.gotArgs != nil {
+				t.Error("OpenPR must not run on a blocked push")
+			}
+			if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+				t.Errorf("run branch %s reached the bare remote despite the blocked push (tip %s)", branch, strings.TrimSpace(string(out)))
+			}
+		})
 	}
 }
 
@@ -13529,33 +13792,41 @@ func TestOpenPRAndShipArtifact_MixedCauseReverifyClassifiesCategoryB(t *testing.
 // failure absorbed once, then an ordinary failure on the retry. The gate must
 // classify from the retry's output — ErrCommittedTestsFailed / category-B.
 func TestRunVerifyGateCommitted_MixedCauseClassifiesCommittedTestsFailed(t *testing.T) {
-	repo, _, _ := verifiedTreeRepo(t)
-	cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, lintLockOutput2645, ordinaryFailOutput))
-	var logSink strings.Builder
-	events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
-	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
-		t.Fatalf("err = %v, want ErrCommittedTestsFailed (the RETRY's ordinary failure decides)", err)
-	}
-	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
-		t.Errorf("the absorbed first failure's infra signature must not decide the verdict: %v", err)
-	}
-	if got := pushFailureCategory(err); got != "B" {
-		t.Errorf("pushFailureCategory = %q, want B", got)
-	}
-	if tree != "" {
-		t.Errorf("failing gate must return an empty verified tree, got %q", tree)
-	}
-	var verifyRuns, retries int
-	for _, ev := range events {
-		switch ev.Kind {
-		case "verify_run":
-			verifyRuns++
-		case "verify_infra_flake_retry":
-			retries++
-		}
-	}
-	if verifyRuns != 2 || retries != 1 {
-		t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
+	for _, tc := range []struct{ name, first string }{
+		{"golangci-lint lock contention (#2645)", lintLockOutput2645},
+		{"testcontainers port not found (#2718)", portFlakeOutput2718},
+		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _ := verifiedTreeRepo(t)
+			cfg := verifiedTreeCfg(repo, firstThenRestVerifyCmd(t, tc.first, ordinaryFailOutput))
+			var logSink strings.Builder
+			events, tree, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+			if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+				t.Fatalf("err = %v, want ErrCommittedTestsFailed (the RETRY's ordinary failure decides)", err)
+			}
+			if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+				t.Errorf("the absorbed first failure's infra signature must not decide the verdict: %v", err)
+			}
+			if got := pushFailureCategory(err); got != "B" {
+				t.Errorf("pushFailureCategory = %q, want B", got)
+			}
+			if tree != "" {
+				t.Errorf("failing gate must return an empty verified tree, got %q", tree)
+			}
+			var verifyRuns, retries int
+			for _, ev := range events {
+				switch ev.Kind {
+				case "verify_run":
+					verifyRuns++
+				case "verify_infra_flake_retry":
+					retries++
+				}
+			}
+			if verifyRuns != 2 || retries != 1 {
+				t.Errorf("verify_run=%d verify_infra_flake_retry=%d, want 2 and 1", verifyRuns, retries)
+			}
+		})
 	}
 }
 
