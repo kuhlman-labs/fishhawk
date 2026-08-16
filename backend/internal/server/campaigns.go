@@ -53,8 +53,14 @@ type campaignResponse struct {
 	// issue-run, the campaign block IS each issue-run's effective contract when
 	// present.
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527): the absolute path every item run minted from this campaign
+	// inherits when the per-item call passes none. omitempty so an unbound
+	// campaign carries no working_dir key — the same convention runResponse
+	// uses for the run-level binding.
+	WorkingDir string    `json:"working_dir,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 	// Idempotent is set true ONLY on an idempotent-replay response: a POST
 	// /v0/campaigns whose Idempotency-Key resolved to an existing campaign,
 	// returned 200 instead of minting a duplicate at 201 (E25.13 / #1455).
@@ -149,6 +155,15 @@ type createCampaignRequest struct {
 	// Empty/omitted WITH epic_ref sweeps every child — the backward-compatible
 	// default; empty/omitted WITHOUT epic_ref fails 400 validation_failed.
 	Items []string `json:"items,omitempty"`
+	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527): bound ONCE here, every item run minted from this campaign
+	// inherits it when POST /v0/campaigns/{id}/runs passes no per-item
+	// working_dir. When non-empty it must be ABSOLUTE (400 validation_failed
+	// otherwise) — a relative binding would resolve against the daemon host's
+	// cwd and poison every run that inherited it. Omit for no binding: each
+	// item run then needs #2498's explicit per-item value (a local one is
+	// refused working_dir_required without either).
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
@@ -161,8 +176,11 @@ func toCampaignResponse(c *campaign.Campaign) campaignResponse {
 		// Raw JSON passthrough: nil bytes → omitted (omitempty), so a campaign
 		// with no override carries no operator_agent key.
 		OperatorAgent: json.RawMessage(c.OperatorAgent),
-		CreatedAt:     c.CreatedAt,
-		UpdatedAt:     c.UpdatedAt,
+		// The campaign-level checkout binding (E48.87 / #2527). Empty → omitted,
+		// so an unbound campaign carries no working_dir key.
+		WorkingDir: c.WorkingDir,
+		CreatedAt:  c.CreatedAt,
+		UpdatedAt:  c.UpdatedAt,
 	}
 }
 
@@ -426,6 +444,22 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "operator_agent"})
 		return
 	}
+	// working_dir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527). When non-empty it must be ABSOLUTE — the same guard
+	// handleStartCampaignItemRun and handleCreateRun apply to their per-run
+	// bindings, applied here because a relative binding stored on the campaign
+	// would be inherited by every item run and resolve against the daemon host's
+	// cwd rather than the operator's project (the #1866 contamination shape,
+	// multiplied across the batch). Validated HERE — with the other body checks,
+	// BEFORE the Idempotency-Key lookup and the installation resolution — so a
+	// bad value costs no forge round-trip and the refusal is reachable without a
+	// live forge.
+	if req.WorkingDir != "" && !filepath.IsAbs(req.WorkingDir) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"working_dir must be an absolute path",
+			map[string]any{"field": "working_dir", "got": req.WorkingDir})
+		return
+	}
 
 	// Idempotency-Key (E25.13 / #1455). When set, a previously-created campaign
 	// with the same (repo, key) is returned 200 + idempotent:true instead of
@@ -626,6 +660,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// assembly (E25.12). Nil = no override; the campaign inherits each
 	// issue-run's workflow contract unchanged.
 	assembly.OperatorAgent = operatorAgentBytes
+	// Thread the validated campaign-level checkout binding onto the assembly so
+	// it reaches the persisted campaign (E48.87 / #2527). Empty = no binding;
+	// every item run then falls back to #2498's explicit per-item working_dir.
+	assembly.WorkingDir = req.WorkingDir
 	// Thread the non-empty Idempotency-Key onto the assembly so it is stored on
 	// the campaign (E25.13), making a later replay resolvable. Empty = nil = no
 	// key (the unchanged default).
@@ -1307,8 +1345,13 @@ type startCampaignItemRunRequest struct {
 	WorkflowRef string `json:"workflow_ref,omitempty"`
 	RunnerKind  string `json:"runner_kind,omitempty"`
 	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) so the
-	// later runner-spawning verbs inherit it. Empty leaves the run unbound (the
-	// github_actions path). When non-empty it must be absolute — the handler
+	// later runner-spawning verbs inherit it. As of E48.87 / #2527 it is an
+	// OVERRIDE of the campaign's own working_dir binding and is needed only when
+	// the campaign carries none: empty falls through to the campaign binding,
+	// and a local item with neither is refused working_dir_required. A non-empty
+	// value that DIFFERS from the campaign binding is accepted as a deliberate
+	// override (a campaign is a batch; an item in another checkout is
+	// conceivable) and logged. When non-empty it must be absolute — the handler
 	// 400s a relative value the same way POST /v0/runs does. The
 	// DisallowUnknownFields decoder makes declaring the field mandatory for it
 	// to be accepted at all.
@@ -1330,6 +1373,13 @@ type startCampaignItemRunRequest struct {
 // running, and derives/advances the campaign so a pending campaign moves to
 // running on its first dispatch. A non-empty non-absolute working_dir 400s
 // validation_failed, mirroring POST /v0/runs.
+//
+// The minted run's checkout is resolved through the E48.87 / #2527 ladder —
+// explicit per-item value (accepted even when it conflicts, as a deliberate
+// override) > the campaign's own working_dir binding (re-validated absolute) >
+// a working_dir_required 400 for a local item with neither. The ladder runs
+// BEFORE any mutation (item restart, run mint, link) so a refusal leaves no
+// committed state.
 //
 // The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
 // unconfigured deployment answers 503 (not 401), matching the other campaign
@@ -1421,6 +1471,57 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, r, http.StatusConflict, "campaign_not_startable",
 			detail,
 			map[string]any{"campaign_id": id.String(), "state": string(c.State)})
+		return
+	}
+
+	// Resolve the minted run's checkout through the campaign ladder (E48.87 /
+	// #2527). The campaign binds the checkout ONCE at create; this is where an
+	// item run inherits it, so the operator stops re-typing an identical
+	// absolute path per item. Three rungs, in order:
+	//
+	//  1. An explicit per-item working_dir WINS — including when it DIFFERS from
+	//     the campaign binding, which is ACCEPTED as a deliberate override
+	//     rather than refused. Unlike resolveWorkingDirForRun's run binding
+	//     (which anchors an in-flight run whose branch lineage already lives in
+	//     one tree, so a conflict there is incoherent), a campaign is a BATCH:
+	//     an item legitimately executing in a different checkout is conceivable,
+	//     and refusing would make the parameter #2498 shipped useless as the
+	//     override the issue calls it. The divergence is logged so the applied
+	//     resolution is observable, and the minted run row carries the value
+	//     that actually applied.
+	//  2. Otherwise INHERIT the campaign's binding — re-validated through the
+	//     same absolute-path gate an explicit value passes, so a relative value
+	//     smuggled onto a campaign row (a direct DB write, or a row predating
+	//     the create-time guard) cannot bypass validation by arriving through a
+	//     different door.
+	//  3. Otherwise, a LOCAL item with no resolvable checkout is refused
+	//     working_dir_required. This is #2498's rung-3 refusal relocated from
+	//     the MCP tool to here, because the MCP layer cannot see the campaign's
+	//     binding without a read; it stays transport-independent (it fires for
+	//     stdio and HTTP MCP clients alike) and now also covers direct REST
+	//     callers, which the MCP-only guard never did.
+	workingDir := req.WorkingDir
+	switch {
+	case workingDir != "":
+		if c.WorkingDir != "" && filepath.Clean(workingDir) != filepath.Clean(c.WorkingDir) {
+			s.cfg.Logger.Info("campaign item run overrides the campaign working_dir binding",
+				"campaign_id", id.String(),
+				"issue_ref", req.IssueRef,
+				"campaign_working_dir", c.WorkingDir,
+				"override_working_dir", workingDir)
+		}
+	case c.WorkingDir != "":
+		if !filepath.IsAbs(c.WorkingDir) {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"the campaign's bound working_dir is not an absolute path, so it cannot be inherited; pass an absolute working_dir for this item",
+				map[string]any{"field": "working_dir", "got": c.WorkingDir, "campaign_id": id.String()})
+			return
+		}
+		workingDir = c.WorkingDir
+	case req.RunnerKind == string(run.RunnerKindLocal):
+		s.writeError(w, r, http.StatusBadRequest, "working_dir_required",
+			"a local item run needs a resolvable checkout: bind working_dir once at fishhawk_start_campaign so every item run inherits it, or pass an absolute working_dir for this item",
+			map[string]any{"field": "working_dir", "campaign_id": id.String(), "issue_ref": req.IssueRef})
 		return
 	}
 
@@ -1650,7 +1751,10 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		WorkflowID:  req.WorkflowID,
 		WorkflowRef: req.WorkflowRef,
 		RunnerKind:  req.RunnerKind,
-		WorkingDir:  req.WorkingDir,
+		// The LADDER-RESOLVED checkout (E48.87 / #2527), not req.WorkingDir: an
+		// item run that passed none inherits the campaign's binding here, and the
+		// minted run row therefore records the resolution that actually applied.
+		WorkingDir: workingDir,
 	})
 	if err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "campaign_run_start_failed",

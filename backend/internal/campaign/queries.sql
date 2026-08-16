@@ -4,8 +4,8 @@
 -- internal/run/queries.sql.
 
 -- name: CreateCampaign :one
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: GetCampaign :one

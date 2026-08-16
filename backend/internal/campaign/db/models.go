@@ -64,6 +64,7 @@ type Campaign struct {
 	OperatorAgent  []byte             `json:"operator_agent"`
 	IdempotencyKey *string            `json:"idempotency_key"`
 	AccountID      *uuid.UUID         `json:"account_id"`
+	WorkingDir     string             `json:"working_dir"`
 }
 
 type CampaignItem struct {

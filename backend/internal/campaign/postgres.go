@@ -47,6 +47,9 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		// IdempotencyKey is the OPTIONAL create idempotency key (E25.13). Nil
 		// persists as NULL — no key; the partial unique index excludes NULLs.
 		IdempotencyKey: p.IdempotencyKey,
+		// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+		// #2527). Empty persists as the '' no-binding default.
+		WorkingDir: p.WorkingDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -550,8 +553,14 @@ func rowToCampaign(c campaigndb.Campaign) *Campaign {
 		EpicRef:     c.EpicRef,
 		State:       State(c.State),
 		PausePolicy: PausePolicy(c.PausePolicy),
-		CreatedAt:   c.CreatedAt.Time,
-		UpdatedAt:   c.UpdatedAt.Time,
+		// The campaign-level checkout binding (E48.87 / #2527), read straight
+		// back from the NOT NULL column. Empty is the no-binding default. This
+		// ONE mapper covers every campaign read path (get / by-idempotency-key /
+		// list / lock-for-update / state-update), so the binding is visible
+		// wherever a campaign row is.
+		WorkingDir: c.WorkingDir,
+		CreatedAt:  c.CreatedAt.Time,
+		UpdatedAt:  c.UpdatedAt.Time,
 	}
 	// JSONB → raw []byte passthrough. A NULL/empty column yields nil (no
 	// override) rather than an empty slice, so the unchanged-behavior path is
