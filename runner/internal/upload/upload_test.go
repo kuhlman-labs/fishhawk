@@ -1445,6 +1445,197 @@ func TestFetchScopeAmendments_RejectsMissingInputs(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// #2748 — the REAL upload client against a real httptest.Server. The runner's
+// end-to-end tests drive a fakeUploader and therefore cannot see a defect in
+// this layer; these pin the wire contract itself.
+// ---------------------------------------------------------------------------
+
+// TestFetchScopeAmendments_WaitSecondsSerialization pins BOTH directions of the
+// `?wait=N` parameter. The ABSENCE on a zero/negative value is the load-bearing
+// half: it is what keeps the existing #961 refresh and #2601 undecided-detection
+// requests byte-identical to their pre-#2748 shape.
+func TestFetchScopeAmendments_WaitSecondsSerialization(t *testing.T) {
+	cases := []struct {
+		name     string
+		wait     int
+		wantURL  string
+		wantWait string
+	}{
+		{name: "positive", wait: 30, wantURL: "/v0/runs/run-abc/scope-amendments?wait=30", wantWait: "30"},
+		{name: "zero", wait: 0, wantURL: "/v0/runs/run-abc/scope-amendments", wantWait: ""},
+		{name: "negative", wait: -5, wantURL: "/v0/runs/run-abc/scope-amendments", wantWait: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotURL, gotRawQuery string
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+				gotURL = r.URL.String()
+				gotRawQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"items":[]}`)
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+			if _, err := c.FetchScopeAmendments(context.Background(), FetchScopeAmendmentsArgs{
+				RunID: "run-abc", MCPToken: "fhm_x", WaitSeconds: tc.wait,
+			}); err != nil {
+				t.Fatalf("FetchScopeAmendments: %v", err)
+			}
+			if gotURL != tc.wantURL {
+				t.Errorf("request URL = %q, want %q", gotURL, tc.wantURL)
+			}
+			if tc.wantWait == "" && gotRawQuery != "" {
+				t.Errorf("a non-positive WaitSeconds must emit NO query string, got %q", gotRawQuery)
+			}
+		})
+	}
+}
+
+func TestRequestScopeAmendment_HappyPath(t *testing.T) {
+	var gotMethod, gotPath, gotAuth, gotContentType, gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotContentType = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"id":"amd-1","run_id":"run-abc","stage_id":"stage-9","status":"pending","reason":"renumber","paths":[{"path":"m/0071_x.up.sql","operation":"create"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	got, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{
+		RunID:    "run-abc",
+		MCPToken: "fhm_runnerheld",
+		Paths: []ScopeAmendmentPath{
+			{Path: "m/0071_x.up.sql", Operation: "create"},
+			{Path: "m/0071_x.down.sql", Operation: "create"},
+		},
+		Reason: "migration renumbered 0070 -> 0071",
+	})
+	if err != nil {
+		t.Fatalf("RequestScopeAmendment: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v0/runs/run-abc/scope-amendments" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotAuth != "Bearer fhm_runnerheld" {
+		t.Errorf("Authorization = %q, want the run-bound fhm_ bearer", gotAuth)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q", gotContentType)
+	}
+	var body struct {
+		Paths  []ScopeAmendmentPath `json:"paths"`
+		Reason string               `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("decode request body %q: %v", gotBody, err)
+	}
+	if len(body.Paths) != 2 ||
+		body.Paths[0].Path != "m/0071_x.up.sql" || body.Paths[0].Operation != "create" ||
+		body.Paths[1].Path != "m/0071_x.down.sql" || body.Paths[1].Operation != "create" {
+		t.Errorf("request paths = %+v, want both created paths with operation create", body.Paths)
+	}
+	if body.Reason != "migration renumbered 0070 -> 0071" {
+		t.Errorf("request reason = %q", body.Reason)
+	}
+	if got == nil || got.ID != "amd-1" || got.Status != "pending" ||
+		len(got.Paths) != 1 || got.Paths[0].Path != "m/0071_x.up.sql" {
+		t.Errorf("decoded response = %+v", got)
+	}
+}
+
+func TestRequestScopeAmendment_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   error
+	}{
+		{"budget_exhausted", http.StatusUnprocessableEntity, `{"error":{"code":"amendment_budget_exhausted"}}`, ErrAmendmentBudgetExhausted},
+		{"stage_not_implement", http.StatusConflict, `{"error":{"code":"stage_not_implement"}}`, ErrStageNotImplement},
+		{"forbidden", http.StatusForbidden, `{"error":{"code":"insufficient_scope"}}`, ErrScopeAmendmentForbidden},
+		{"not_found", http.StatusNotFound, ``, ErrNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+			_, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{
+				RunID: "run-abc", MCPToken: "fhm_x",
+				Paths:  []ScopeAmendmentPath{{Path: "m/0071_x.up.sql", Operation: "create"}},
+				Reason: "r",
+			})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			// Each mapping must stay DISTINGUISHABLE from the other two.
+			for _, other := range []error{ErrAmendmentBudgetExhausted, ErrStageNotImplement, ErrScopeAmendmentForbidden, ErrNotFound} {
+				if other != tc.want && errors.Is(err, other) {
+					t.Errorf("err %v must not also match %v", err, other)
+				}
+			}
+		})
+	}
+}
+
+func TestRequestScopeAmendment_UnmappedStatus(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"code":"internal_error"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{
+		RunID: "run-abc", MCPToken: "fhm_x",
+		Paths:  []ScopeAmendmentPath{{Path: "m/0071_x.up.sql", Operation: "create"}},
+		Reason: "r",
+	})
+	if err == nil || !strings.Contains(err.Error(), "500") {
+		t.Errorf("err = %v, want a status error carrying 500", err)
+	}
+}
+
+func TestRequestScopeAmendment_RejectsMissingInputs(t *testing.T) {
+	c := New("http://nowhere")
+	paths := []ScopeAmendmentPath{{Path: "m/0071_x.up.sql", Operation: "create"}}
+	if _, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{MCPToken: "fhm_x", Paths: paths, Reason: "r"}); err == nil || !strings.Contains(err.Error(), "run_id") {
+		t.Errorf("err = %v, want run_id error", err)
+	}
+	if _, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{RunID: "r", Paths: paths, Reason: "r"}); err == nil || !strings.Contains(err.Error(), "mcp token") {
+		t.Errorf("err = %v, want mcp token error", err)
+	}
+	if _, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{RunID: "r", MCPToken: "fhm_x", Reason: "r"}); err == nil || !strings.Contains(err.Error(), "path") {
+		t.Errorf("err = %v, want path error", err)
+	}
+	if _, err := c.RequestScopeAmendment(context.Background(), RequestScopeAmendmentArgs{RunID: "r", MCPToken: "fhm_x", Paths: paths, Reason: "  "}); err == nil || !strings.Contains(err.Error(), "reason") {
+		t.Errorf("err = %v, want reason error", err)
+	}
+}
+
 func TestReportStageProgress_HappyPath(t *testing.T) {
 	var receivedAuth, receivedPath, receivedBody string
 	mux := http.NewServeMux()

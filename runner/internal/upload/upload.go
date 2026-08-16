@@ -93,6 +93,21 @@ var (
 	// run on a repo with no App). Callers switch on this sentinel to
 	// fall back to the operator's `gh` CLI token for push + PR (#713).
 	ErrNoInstallation = errors.New("upload: run has no GitHub App installation")
+	// ErrAmendmentBudgetExhausted is returned by RequestScopeAmendment when
+	// the backend responds 422 (amendment_budget_exhausted): the stage has
+	// already spent its per-stage scope-amendment budget (rows are counted,
+	// so denied requests consume it too). Non-retryable within the stage;
+	// the caller falls open to the un-amended scope (#2748).
+	ErrAmendmentBudgetExhausted = errors.New("upload: stage scope-amendment budget exhausted")
+	// ErrStageNotImplement is returned by RequestScopeAmendment when the
+	// backend responds 409 (stage_not_implement): the run has no executing
+	// implement stage to hang the amendment off. Non-retryable; the caller
+	// falls open (#2748).
+	ErrStageNotImplement = errors.New("upload: run has no executing implement stage")
+	// ErrScopeAmendmentForbidden is returned by RequestScopeAmendment on a
+	// 403 — the token is not run-bound, is cross-run, or lacks
+	// write:scope-amendments. Non-retryable; the caller falls open (#2748).
+	ErrScopeAmendmentForbidden = errors.New("upload: token may not request scope amendments for this run")
 )
 
 // Client wraps a net/http.Client with a base URL. Construct via
@@ -2042,6 +2057,14 @@ func (c *Client) FetchMCPToken(ctx context.Context, args FetchMCPTokenArgs) (*Fe
 type FetchScopeAmendmentsArgs struct {
 	RunID    string
 	MCPToken string
+	// WaitSeconds, when POSITIVE, adds the backend's `?wait=N` bounded
+	// long-poll: the server holds the request up to N seconds and returns
+	// as soon as a pending amendment is decided (#2748's decision park
+	// reuses it). Zero or negative omits the query parameter ENTIRELY, so
+	// the request is byte-identical to the pre-#2748 shape — that absence
+	// is what keeps the #961 pre-commit refresh and the #2601
+	// undecided-detection call sites unchanged.
+	WaitSeconds int
 }
 
 // ScopeAmendmentPath is one requested path + operation inside a
@@ -2090,6 +2113,11 @@ func (c *Client) FetchScopeAmendments(ctx context.Context, args FetchScopeAmendm
 
 	endpoint := fmt.Sprintf("%s/v0/runs/%s/scope-amendments",
 		c.BaseURL, url.PathEscape(args.RunID))
+	// Purely additive: a non-positive WaitSeconds appends NOTHING, keeping
+	// the existing call sites' request byte-identical (#2748).
+	if args.WaitSeconds > 0 {
+		endpoint += "?wait=" + strconv.Itoa(args.WaitSeconds)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -2115,6 +2143,91 @@ func (c *Client) FetchScopeAmendments(ctx context.Context, args FetchScopeAmendm
 		return nil, ErrNotFound
 	default:
 		return nil, statusError("fetch scope amendments", resp)
+	}
+}
+
+// RequestScopeAmendmentArgs collects the inputs for RequestScopeAmendment.
+// MCPToken is the run-bound fhm_ bearer FetchMCPToken returned — the SAME
+// token FetchScopeAmendments and the agent's poll loop use, so the backend
+// keeps exactly one agent-side auth path for the amendment surface. No
+// signing key: the endpoint authenticates on the bearer alone.
+type RequestScopeAmendmentArgs struct {
+	RunID    string
+	MCPToken string
+	Paths    []ScopeAmendmentPath
+	Reason   string
+}
+
+// requestScopeAmendmentBody is the POST wire shape the backend's
+// scopeAmendmentRequest decodes.
+type requestScopeAmendmentBody struct {
+	Paths  []ScopeAmendmentPath `json:"paths"`
+	Reason string               `json:"reason"`
+}
+
+// RequestScopeAmendment POSTs a scope-amendment request to
+// /v0/runs/{run_id}/scope-amendments bearing the run-bound MCP token, and
+// returns the created (pending) amendment row (#2748). The runner uses it to
+// turn a recognized migration renumber into an operator DECISION rather than
+// a silent substitution.
+//
+// SINGLE ATTEMPT, no retry: every non-201 outcome is a decision the caller
+// falls open on (proceeding with the un-amended scope), so a retry would only
+// burn stage wall clock. The three distinguishable refusals get their own
+// sentinels — 422 amendment_budget_exhausted, 409 stage_not_implement, 403 —
+// so the caller can name the branch it took in its trace event.
+func (c *Client) RequestScopeAmendment(ctx context.Context, args RequestScopeAmendmentArgs) (*ScopeAmendment, error) {
+	if args.RunID == "" {
+		return nil, errors.New("upload: run_id required")
+	}
+	if args.MCPToken == "" {
+		return nil, errors.New("upload: mcp token required")
+	}
+	if len(args.Paths) == 0 {
+		return nil, errors.New("upload: at least one path required")
+	}
+	if strings.TrimSpace(args.Reason) == "" {
+		return nil, errors.New("upload: reason required")
+	}
+
+	body, err := json.Marshal(requestScopeAmendmentBody{Paths: args.Paths, Reason: args.Reason})
+	if err != nil {
+		return nil, fmt.Errorf("upload: marshal scope amendment request: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/scope-amendments",
+		c.BaseURL, url.PathEscape(args.RunID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("upload: build scope-amendment request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+args.MCPToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload: request scope amendment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusCreated, http.StatusOK:
+		var out ScopeAmendment
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, fmt.Errorf("upload: decode scope-amendment response: %w", err)
+		}
+		return &out, nil
+	case http.StatusUnprocessableEntity:
+		return nil, fmt.Errorf("%w: %s", ErrAmendmentBudgetExhausted, readBriefBody(resp))
+	case http.StatusConflict:
+		return nil, fmt.Errorf("%w: %s", ErrStageNotImplement, readBriefBody(resp))
+	case http.StatusForbidden:
+		return nil, fmt.Errorf("%w: %s", ErrScopeAmendmentForbidden, readBriefBody(resp))
+	case http.StatusNotFound:
+		return nil, ErrNotFound
+	default:
+		return nil, statusError("request scope amendment", resp)
 	}
 }
 
