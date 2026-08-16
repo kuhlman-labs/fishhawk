@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // TestAPIError_Error pins the apiError.Error() rendering (#1548): a
@@ -211,6 +216,157 @@ func TestRunMirror_DecodesPredictedRuntimeMinutes(t *testing.T) {
 	}
 	if omitted.PredictedRuntimeMinutes != 0 {
 		t.Errorf("Run.PredictedRuntimeMinutes = %d, want 0 when the key is omitted", omitted.PredictedRuntimeMinutes)
+	}
+}
+
+// TestStageMirror_DecodesProgress pins the client Stage mirror's progress json
+// tags against the backend stageResponse (#2541). Same #371-class trap as the
+// Run mirrors above: a tag that does not byte-match the backend silently
+// decodes to nil/zero, the stage-wait projection reports no progress, and the
+// operator still sees one bit — the exact failure this issue exists to
+// eliminate, shipped green. The literal keys here are the backend's wire tags.
+func TestStageMirror_DecodesProgress(t *testing.T) {
+	const head = `{"id":"11111111-1111-1111-1111-111111111111",` +
+		`"run_id":"22222222-2222-2222-2222-222222222222","sequence":1,"type":"implement",` +
+		`"executor":{"kind":"agent","ref":"claude"},"state":"running",`
+	const tail = `"created_at":"2026-08-15T00:00:00Z","updated_at":"2026-08-15T00:00:00Z"}`
+	const progress = `"progress":{"last_event":"assistant","turns_this_attempt":9,` +
+		`"tokens_this_attempt":13402,"reported_at":"2026-08-15T00:00:00Z"},`
+
+	var got Stage
+	if err := json.Unmarshal([]byte(head+progress+tail), &got); err != nil {
+		t.Fatalf("decode Stage: %v", err)
+	}
+	if got.Progress == nil {
+		t.Fatal("Stage.Progress nil — json tag mismatch (#371 trap)?")
+	}
+	if got.Progress.LastEvent != "assistant" || got.Progress.TurnsThisAttempt != 9 || got.Progress.TokensThisAttempt != 13402 {
+		t.Errorf("Stage.Progress = %+v, want the decoded heartbeat", *got.Progress)
+	}
+
+	// Mixed-version degrade: an older backend omits the key → nil, no progress.
+	var omitted Stage
+	if err := json.Unmarshal([]byte(head+tail), &omitted); err != nil {
+		t.Fatalf("decode Stage (key omitted): %v", err)
+	}
+	if omitted.Progress != nil {
+		t.Errorf("Stage.Progress = %+v, want nil when the key is omitted", *omitted.Progress)
+	}
+}
+
+// TestStageProgress_CrossBoundaryEndToEnd (approval condition 2) carries a
+// RUNNER-PRODUCED heartbeat all the way through the real seam chain: HTTP
+// ingest -> Postgres persistence -> Stage response serialization -> MCP client
+// decode -> StageWaitStatus projection, asserting the operator-visible
+// last_event / turns_this_attempt / tokens_this_attempt at the FAR end.
+// E1/E2/E3 each cover a segment; this one spans the whole backend path so the
+// #371-class silent-nil failure (a json tag drift anywhere along it) cannot ship
+// green. It also proves elapsed_seconds is derived server-side from started_at,
+// NOT taken from the heartbeat (the heartbeat carries elapsed_seconds:999, which
+// must not appear).
+//
+// RUNNER LEG IS SIMULATED — acknowledged limitation (#2541 fix-up, condition 2).
+// The test starts from the verbatim heartbeat LINE the agent adapter emits, but
+// it maps that line to the ingest body INLINE (below) rather than calling the
+// runner's real parseStageProgressLine + upload.Client.ReportStageProgress:
+// those live in runner/, a SEPARATE Go module this backend test tree cannot
+// import. So the runner -> wire leg is pinned PIECEWISE, not spanned here —
+// runner/internal/upload/upload_test.go's TestReportStageProgress_HappyPath
+// asserts the literal wire keys ("last_event" / "turns_this_attempt" /
+// "tokens_this_attempt") that the inline mapping here and the backend handler
+// both mirror. Residual risk: those two files' string literals drift together
+// (a runner-side key rename would then 400 on the backend's DisallowUnknownFields
+// and be swallowed by the fail-open reporter — the exact #371-class condition).
+// E2 (runner's TestRun_ProgressHeartbeatReachesBackend) likewise asserts
+// fakeUploader args rather than a decoded httptest POST body, so it too stops
+// short of the wire. This piecewise seam is called out in the PR body.
+func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 0, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
+		if _, err := runRepo.TransitionStage(ctx, stage.ID, to, nil); err != nil {
+			t.Fatalf("transition stage %s: %v", to, err)
+		}
+	}
+
+	s := server.New(server.Config{RunRepo: runRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	// RUNNER WRITE: the exact stage_progress heartbeat LINE the agent adapter
+	// emits (elapsed_seconds:999 is deliberately absurd — it must never surface).
+	const heartbeat = `{"event":"stage_progress","elapsed_seconds":999,"turns":9,"tokens_so_far":13402,"last_event_kind":"assistant"}`
+	var hb struct {
+		Turns       int    `json:"turns"`
+		TokensSoFar int    `json:"tokens_so_far"`
+		LastEvent   string `json:"last_event_kind"`
+	}
+	if err := json.Unmarshal([]byte(heartbeat), &hb); err != nil {
+		t.Fatalf("parse heartbeat line: %v", err)
+	}
+	// The runner reporter's field mapping (turns -> turns_this_attempt, etc.),
+	// elapsed_seconds dropped because the backend derives it.
+	reportBody, _ := json.Marshal(map[string]any{
+		"last_event":          hb.LastEvent,
+		"turns_this_attempt":  hb.Turns,
+		"tokens_this_attempt": hb.TokensSoFar,
+	})
+
+	// HTTP INGEST -> POSTGRES: POST the report to the real backend.
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		ts.URL+"/v0/runs/"+row.ID.String()+"/stages/"+stage.ID.String()+"/progress",
+		bytes.NewReader(reportBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST progress: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST progress status = %d, want 204", resp.StatusCode)
+	}
+
+	// STAGE RESPONSE SERIALIZATION -> MCP CLIENT DECODE: read via the real client.
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-e2e"})
+	stages, err := client.ListRunStages(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("ListRunStages: %v", err)
+	}
+	if len(stages) != 1 || stages[0].Progress == nil {
+		t.Fatalf("decoded stages = %+v, want one with progress", stages)
+	}
+
+	// STAGEWAITSTATUS PROJECTION: the operator-visible far end.
+	st := stageWaitStatusFor(stages, "implement", "running", 0, time.Now().UTC())
+	if st == nil {
+		t.Fatal("stage wait status nil")
+	}
+	if st.LastEvent != "assistant" || st.TurnsThisAttempt == nil || *st.TurnsThisAttempt != 9 ||
+		st.TokensThisAttempt == nil || *st.TokensThisAttempt != 13402 {
+		t.Errorf("far-end projection = {last_event:%q turns:%v tokens:%v}, want assistant/9/13402",
+			st.LastEvent, st.TurnsThisAttempt, st.TokensThisAttempt)
+	}
+	// elapsed_seconds is derived from started_at (a few seconds), never 999.
+	if st.ElapsedSeconds == 999 {
+		t.Errorf("elapsed_seconds = 999 — it leaked from the heartbeat instead of started_at")
 	}
 }
 

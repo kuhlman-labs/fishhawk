@@ -98,6 +98,28 @@ type StageWaitStatus struct {
 	ElapsedSeconds           int  `json:"elapsed_seconds,omitempty" jsonschema:"seconds the stage has been running (from its server-recorded started_at); present only while non-terminal and when the agent wall clock is known"`
 	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for this stage; present only while non-terminal and when resolved"`
 	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of agent budget left before the runner kills the stage (agent_timeout_seconds - elapsed_seconds, clamped at 0); present only while non-terminal and when the budget is known. A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
+	// LastEvent / TurnsThisAttempt / TokensThisAttempt are the stage's
+	// mid-execution progress heartbeat (#2541): the agent's last event kind and
+	// the turn/token counters from the runner's most recent stage_progress
+	// report, so a poll during a running stage shows real activity instead of a
+	// single 'running' bit. Populated ONLY while non-terminal and ONLY when the
+	// stage has reported a heartbeat; a stage with neither budget nor progress
+	// keeps the byte-identical pre-#2540 shape. The counters are per-attempt and
+	// RESET on an in-driver re-spawn — elapsed_seconds is the cumulative,
+	// re-spawn-monotonic value (it is derived from started_at, not from the
+	// heartbeat).
+	//
+	// TurnsThisAttempt / TokensThisAttempt are POINTERS so an explicit reported
+	// ZERO (a valid heartbeat's first turn, or a fresh attempt after a re-spawn)
+	// is preserved on the wire rather than dropped by omitempty (#2541 fix-up):
+	// a plain omitempty int cannot distinguish "progress reported, count is 0"
+	// from "no progress", and the contract is that a heartbeat POPULATES the
+	// per-attempt counters. They are non-nil (and so serialized, even at 0) iff
+	// progress is present on a non-terminal stage; nil — hence omitted — when
+	// progress is absent or the stage is terminal.
+	LastEvent         string `json:"last_event,omitempty" jsonschema:"the agent's last event kind from the most recent progress heartbeat (e.g. 'assistant'); present only while non-terminal and when the stage has reported progress"`
+	TurnsThisAttempt  *int   `json:"turns_this_attempt,omitempty" jsonschema:"parsed-event count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present (including an explicit 0) only while non-terminal and when the stage has reported progress"`
+	TokensThisAttempt *int   `json:"tokens_this_attempt,omitempty" jsonschema:"cumulative token count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present (including an explicit 0) only while non-terminal and when the stage has reported progress"`
 }
 
 // suggestedStageWaitPollIntervalSeconds is the FLOOR of the derived stage-wait
@@ -292,10 +314,26 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 				elapsed := stageElapsed(s.StartedAt, now)
 				st.AgentTimeoutSeconds = s.AgentTimeoutSeconds
 				st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, elapsed)
-				// ElapsedSeconds is meaningful only alongside a known budget, so it
-				// rides the same positive-budget condition (kept absent otherwise so
-				// the wire shape is byte-identical to pre-#2540 for an unknown budget).
-				if s.AgentTimeoutSeconds > 0 {
+				// Mid-execution progress heartbeat (#2541): project the per-attempt
+				// counters + last_event onto the wait status. elapsed_seconds is NOT
+				// taken from the heartbeat — it stays the started_at derivation, so it
+				// is cumulative and monotonic across in-driver re-spawns.
+				if s.Progress != nil {
+					st.LastEvent = s.Progress.LastEvent
+					// Copy into locals and take their addresses so an explicit 0
+					// counter is preserved on the wire (pointer fields, above) —
+					// a reported zero is "progress present, count 0", not absent.
+					turns := s.Progress.TurnsThisAttempt
+					tokens := s.Progress.TokensThisAttempt
+					st.TurnsThisAttempt = &turns
+					st.TokensThisAttempt = &tokens
+				}
+				// ElapsedSeconds is meaningful alongside a known budget OR a reported
+				// heartbeat; its population condition widens from `budget > 0` to
+				// `budget > 0 || progress present` (#2541) so a stage with progress but
+				// an unresolved budget still reports elapsed, while a stage with NEITHER
+				// keeps the byte-identical pre-#2540 shape.
+				if s.AgentTimeoutSeconds > 0 || s.Progress != nil {
 					st.ElapsedSeconds = int(elapsed.Seconds())
 				}
 			}

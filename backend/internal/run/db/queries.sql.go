@@ -332,6 +332,77 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 	return i, err
 }
 
+const getStageProgress = `-- name: GetStageProgress :one
+SELECT progress FROM stages WHERE id = $1
+`
+
+// Reads back just the heartbeat payload for one stage (#2541). Progress-only
+// projection: no SELECT * expansion, no Stage model dependency.
+func (q *Queries) GetStageProgress(ctx context.Context, id uuid.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getStageProgress, id)
+	var progress []byte
+	err := row.Scan(&progress)
+	return progress, err
+}
+
+const listStageProgressForRun = `-- name: ListStageProgressForRun :many
+SELECT id, progress FROM stages WHERE run_id = $1
+`
+
+type ListStageProgressForRunRow struct {
+	ID       uuid.UUID `json:"id"`
+	Progress []byte    `json:"progress"`
+}
+
+// Reads every stage's heartbeat payload for a run in one round-trip (#2541),
+// so the run-stages list handler pays one query rather than N. id + progress
+// only — no SELECT * expansion.
+func (q *Queries) ListStageProgressForRun(ctx context.Context, runID uuid.UUID) ([]ListStageProgressForRunRow, error) {
+	rows, err := q.db.Query(ctx, listStageProgressForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStageProgressForRunRow
+	for rows.Next() {
+		var i ListStageProgressForRunRow
+		if err := rows.Scan(&i.ID, &i.Progress); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const recordStageProgress = `-- name: RecordStageProgress :execrows
+UPDATE stages
+   SET progress = $2
+ WHERE id = $1
+   AND state NOT IN ('succeeded', 'failed', 'cancelled')
+`
+
+type RecordStageProgressParams struct {
+	ID       uuid.UUID `json:"id"`
+	Progress []byte    `json:"progress"`
+}
+
+// Last-writer-wins projection of the runner's stage_progress heartbeat onto
+// the stage row (#2541). The terminal-state predicate IS the refusal: a
+// heartbeat that arrives after the stage settled matches ZERO rows (execrows
+// returns 0), so the handler answers 409 without a prior read — there is no
+// check-then-write window (#2536). Touches ONLY the progress column, so no
+// existing stages SELECT list expands and the sqlc Stage model is unchanged.
+func (q *Queries) RecordStageProgress(ctx context.Context, arg RecordStageProgressParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordStageProgress, arg.ID, arg.Progress)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getStage = `-- name: GetStage :one
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages WHERE id = $1
 `

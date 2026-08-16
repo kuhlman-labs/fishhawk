@@ -2118,6 +2118,79 @@ func (c *Client) FetchScopeAmendments(ctx context.Context, args FetchScopeAmendm
 	}
 }
 
+// ReportStageProgressArgs collects the inputs for ReportStageProgress. MCPToken
+// is the run-bound fhm_ bearer FetchMCPToken returned — the SAME token the
+// agent's poll loop and FetchScopeAmendments use, so the backend has one
+// agent-side auth path for the progress surface (#2541). No signing key: the
+// endpoint authenticates on the bearer.
+type ReportStageProgressArgs struct {
+	RunID             string
+	StageID           string
+	MCPToken          string
+	LastEvent         string
+	TurnsThisAttempt  int
+	TokensThisAttempt int
+}
+
+// reportStageProgressBody is the POST wire shape. reported_at is server-stamped,
+// so it is not sent.
+type reportStageProgressBody struct {
+	LastEvent         string `json:"last_event"`
+	TurnsThisAttempt  int    `json:"turns_this_attempt"`
+	TokensThisAttempt int    `json:"tokens_this_attempt"`
+}
+
+// ReportStageProgress POSTs the runner's stage_progress heartbeat to
+// /v0/runs/{run_id}/stages/{stage_id}/progress bearing the run-bound MCP token
+// (#2541), projecting last_event / turns / tokens onto the stage row so an
+// operator poll returns real activity.
+//
+// SINGLE ATTEMPT, no retry and no backoff — deliberately unlike ShipTrace /
+// ShipPlan: the next ~15s heartbeat supersedes a lost report, so a retry would
+// only pile work behind a slow backend. 204/200 → nil; every other status and
+// every transport error → a wrapped error for the caller to log and drop.
+func (c *Client) ReportStageProgress(ctx context.Context, args ReportStageProgressArgs) error {
+	if args.RunID == "" || args.StageID == "" {
+		return errors.New("upload: run_id and stage_id required")
+	}
+	if args.MCPToken == "" {
+		return errors.New("upload: mcp token required")
+	}
+
+	body, err := json.Marshal(reportStageProgressBody{
+		LastEvent:         args.LastEvent,
+		TurnsThisAttempt:  args.TurnsThisAttempt,
+		TokensThisAttempt: args.TokensThisAttempt,
+	})
+	if err != nil {
+		return fmt.Errorf("upload: marshal stage progress: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/stages/%s/progress",
+		c.BaseURL, url.PathEscape(args.RunID), url.PathEscape(args.StageID))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("upload: build stage progress request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+args.MCPToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload: report stage progress: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusOK:
+		return nil
+	default:
+		return statusError("report stage progress", resp)
+	}
+}
+
 // FetchInstallationTokenArgs collects the inputs for FetchInstallationToken.
 type FetchInstallationTokenArgs struct {
 	RunID      string

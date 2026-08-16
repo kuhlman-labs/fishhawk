@@ -1,0 +1,47 @@
+-- 0070: stages.progress — the runner's mid-execution stage_progress
+-- heartbeat, projected onto the stage row so an operator poll returns
+-- last_event / turns / tokens instead of a single 'running' bit (E48.96 /
+-- #2541).
+--
+-- Additive, nullable, no backfill — byte-for-byte the shape migration 0035
+-- used for scope_completeness_park: NULL for every stage that has not yet
+-- reported a heartbeat, and for every stage on a run that predates this
+-- column. The payload is written last-writer-wins by the progress ingest
+-- endpoint every ~15s for the life of a running stage and read back by the
+-- two stage observability handlers; no code outside the three dedicated
+-- progress-only queries touches it, so no existing stages SELECT list or
+-- sqlc Stage model changes.
+--
+-- updated_at SIDE EFFECT + CONSUMER AUDIT (#2541 approval condition 4). The
+-- BEFORE-UPDATE trigger stages_set_updated_at (migration 0001) fires on ANY
+-- stages UPDATE, so each heartbeat bumps stages.updated_at every ~15s for the
+-- life of a running stage. Audited every stages.updated_at reader (queries.sql
+-- ORDER BY updated_at: ListStagesAwaitingApproval, ListReviewStagesAwaitingApproval,
+-- ListDeployStagesAwaitingDeployment, ListDeployStagesRollbackPending,
+-- ListStagesDispatched, ListStagesAwaitingChildren; plus every Stage.UpdatedAt
+-- Go read). All but one filter to states in which NO agent runs (awaiting_*,
+-- deploy_*), so a heartbeat — which fires only during agent EXECUTION — never
+-- touches their rows. The ONE genuine consumer is the dispatch watchdog
+-- (backend/internal/dispatchwatchdog): it computes now-UpdatedAt for state=
+-- 'dispatched' stages and fails infra-stuck ones (category C). A stage stays
+-- 'dispatched' DURING agent execution (trace.go transitions dispatched->running
+-- ->terminal only at trace-upload time), so heartbeats DO bump a dispatched
+-- stage's updated_at. This is a genuine SEMANTIC CHANGE the reviewer must weigh
+-- (a design question, surfaced not absorbed): the watchdog now measures "time
+-- since last heartbeat" rather than "time since dispatch". Its PRIMARY purpose
+-- is preserved — a truly infra-stuck stage has no runner, emits no heartbeat, so
+-- updated_at stays at dispatch time and it still fires — but a legitimately
+-- long-running agent that heartbeats no longer trips it. See the run README +
+-- the PR body's condition-4 note.
+--
+-- OPERATOR SIGN-OFF (condition 4). The operator SIGNED OFF on the updated_at
+-- tradeoff above; this is no longer an open merge gate. Reasoning: the dispatch
+-- watchdog is OFF BY DEFAULT (--enable-dispatch-watchdog, serve.go), and even
+-- when enabled its default --dispatch-watchdog-timeout is 1h — which EQUALS the
+-- 3600s agent wall clock the runner enforces. So the only residual case — a
+-- genuinely wedged stage that is somehow still heartbeating — is already bounded
+-- by that wall clock: the runner SIGKILLs the stage at 3600s regardless of
+-- updated_at. A follow-up is filed to give the watchdog a dedicated heartbeat
+-- timestamp (rather than the generic stages_set_updated_at trigger) BEFORE the
+-- watchdog is enabled by default. Decided by the operator at the gate.
+ALTER TABLE stages ADD COLUMN progress JSONB;

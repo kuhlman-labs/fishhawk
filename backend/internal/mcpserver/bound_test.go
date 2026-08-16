@@ -93,6 +93,7 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 			Executor: StageExecutor{Kind: "agent", Ref: "claude"}, State: "failed",
 			StartedAt: &now, EndedAt: &now,
 			FailureCategory: strptr("category_a"), FailureReason: &reason,
+			Progress:  &StageProgress{LastEvent: "assistant", TurnsThisAttempt: 9, TokensThisAttempt: 13402, ReportedAt: now},
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}

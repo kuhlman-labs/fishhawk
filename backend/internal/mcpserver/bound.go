@@ -627,6 +627,15 @@ var runStatusPathTable = []pathClassification{
 	// skeleton-ledger entry, so it neither bypasses the budget nor perturbs the
 	// diagnosis-skeleton size the floor assertions pin.
 	{Path: "stages[].agent_timeout_seconds", Tier: tierNever},
+	// progress (#2541) is a redundant decode-mirror of the authoritative
+	// operator-facing values carried on the three *_stage_wait_status blocks
+	// (last_event / turns_this_attempt / tokens_this_attempt / elapsed_seconds),
+	// exactly like the adjacent agent_timeout_seconds row. Because StageProgress
+	// is NOT promoted into retainedCompositeTypes(), classifiedResponsePaths
+	// treats it as a single leaf, so this one tierNever row satisfies the
+	// reflection pin without adding a skeleton-ledger entry or perturbing the
+	// floor assertions.
+	{Path: "stages[].progress", Tier: tierNever},
 	{Path: "stages[].failure_reason", Tier: "T7", Class: classOversizedCapable, Surfaces: restStages, Unbounded: unboundedStages},
 	{Path: "stages[].id", Tier: "skeleton", Class: classStored, Surfaces: restStages},
 	{Path: "stages[].run_id", Tier: "skeleton", Class: classStored, Surfaces: restStages},

@@ -689,6 +689,16 @@ The SDK-independent REST analogue of the scope-amendment `?wait` long-poll, appl
 - Composes existing repo reads only (`RunRepo.GetStage`/`GetRun`, `AuditRepo.ListForRunByCategory`); no orchestration/runner/MCP-tool contract change.
 - Companion to the `dispatch_stage` durable non-blocking dispatch work (#1232) that will make the single-session in-band decision native.
 
+## Stage progress heartbeat ingest (`stage_progress.go`, E48.96 / #2541)
+
+`POST /v0/runs/{run_id}/stages/{stage_id}/progress` (`handleReportStageProgress`) projects the runner's mid-execution `stage_progress` heartbeat onto the stage row so an operator poll returns `last_event` / `turns_this_attempt` / `tokens_this_attempt` (via the `Stage.progress` field, and the derived `elapsed_seconds` on the MCP stage-wait status) instead of a single `running` bit.
+
+- **Tier + auth impact inventory is empty.** Registered at `memberWrite` on the byte-identical path shape as the sibling host-dispatch route, so the run-bound `fhm_` bearer the runner already holds admits it and **no new token capability is introduced** (`fishhawkd token migrate` reports `scanned=N migrated=0`).
+- **Consumer-side narrow capability.** The handler type-asserts `s.cfg.RunRepo` for `stageProgressStore` (the `runCostRecorder` / `runnerKindResolver` precedent); a RunRepo that does not implement it answers `503 progress_unsupported` rather than panicking. `run.StageProgressStore` is the concrete-repo capability it mirrors.
+- **Input validation.** `run_id`/`stage_id` are parsed as UUIDs (400 `validation_failed`); the body is decoded with `DisallowUnknownFields` (an unknown field → 400); a negative `turns_this_attempt`/`tokens_this_attempt` → 400; `last_event` is CLAMPED to `progressLastEventMaxLen = 128` runes; `reported_at` is stamped server-side from the request clock — the runner does not get to set it.
+- **The 409 `stage_terminal` refusal IS the UPDATE's own `WHERE state NOT IN (...)` predicate** (`RecordStageProgress`, `:execrows`): a heartbeat that arrives after the stage settled matches zero rows (`applied=false`) and is answered 409 with `details {stage_id, state}` — no read-then-write window (#2536). Success is `204 No Content` (the reader is the stage read). The stage-belongs-to-run handle is verified (404 `stage_not_found` on mismatch), mirroring host-dispatch.
+- **`updated_at` side effect (condition 4).** The heartbeat UPDATE bumps `stages.updated_at` every ~15s via the `stages_set_updated_at` trigger. The one consumer that observes it is the dispatch watchdog (`state='dispatched'`, which a stage holds during agent execution); the audit + the design-question note live in `run/README.md` and migration 0070.
+
 ## Plan-gate scope/constraint pre-check (#658)
 
 `scope_precheck.go::runScopePrecheck` — called from `handleShipPlan` (`plan.go`) right after the `plan_generated` audit append and before `runPlanReviews`.
