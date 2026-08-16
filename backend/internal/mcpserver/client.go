@@ -3070,9 +3070,31 @@ type Stage struct {
 	// older backend that omits the key — the derivation then reports no deadline
 	// (nil), the mixed-version degrade. The json tag MUST byte-match the backend
 	// or the field silently decodes to zero — the #371-class wire-mirror trap.
-	AgentTimeoutSeconds int       `json:"agent_timeout_seconds,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	AgentTimeoutSeconds int `json:"agent_timeout_seconds,omitempty"`
+	// Progress mirrors the backend stageResponse.progress (#2541): the runner's
+	// mid-execution stage_progress heartbeat, so a mid-stage poll projects real
+	// activity (last_event / turns / tokens) onto the stage-wait status instead
+	// of a single 'running' bit. Nil when the stage has not reported, on a
+	// legacy run, or on an older backend that omits the key. The json tag MUST
+	// byte-match the backend or the field silently decodes to nil — the
+	// #371-class wire-mirror trap.
+	Progress  *StageProgress `json:"progress,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+// StageProgress mirrors the backend stageResponse.progress sub-schema (#2541).
+// The counters are cumulative WITHIN THE CURRENT AGENT ATTEMPT ONLY and reset on
+// an in-driver re-spawn — the per-attempt meaning is encoded in the field names.
+// Elapsed is NOT carried here: the operator-facing elapsed_seconds on the
+// stage-wait status is derived server-side from the stage's started_at, which
+// makes it cumulative and monotonic across re-spawns. Each json tag MUST
+// byte-match the backend or that field silently decodes to zero (the #371 trap).
+type StageProgress struct {
+	LastEvent         string    `json:"last_event"`
+	TurnsThisAttempt  int       `json:"turns_this_attempt"`
+	TokensThisAttempt int       `json:"tokens_this_attempt"`
+	ReportedAt        time.Time `json:"reported_at"`
 }
 
 // StageExecutor mirrors the OpenAPI sub-schema. The closed-set

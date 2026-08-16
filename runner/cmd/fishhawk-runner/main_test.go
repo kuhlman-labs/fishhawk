@@ -252,6 +252,7 @@ type fakeUploader struct {
 	mcpTokenErr    error
 	retryStageErr  error
 	acceptanceErr  error
+	progressErr    error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -279,6 +280,10 @@ type fakeUploader struct {
 	gotMCPTokenArgs   *upload.FetchMCPTokenArgs
 	gotRetryArgs      []upload.RetryStageArgs
 	gotAcceptanceArgs *upload.ShipAcceptanceArgs
+	// Progress-report seam (#2541): records every ReportStageProgress call,
+	// guarded by a mutex because the tee POSTs from an async goroutine.
+	progressMu      sync.Mutex
+	gotProgressArgs []upload.ReportStageProgressArgs
 
 	// Lineage-completion read seam (#1137): lineageComplete maps a run id
 	// to its reported completion; lineageCompleteErr forces an error;
@@ -547,6 +552,21 @@ func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.Fetch
 func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
 	f.gotRetryArgs = append(f.gotRetryArgs, args)
 	return f.retryStageErr
+}
+
+func (f *fakeUploader) ReportStageProgress(_ context.Context, args upload.ReportStageProgressArgs) error {
+	f.progressMu.Lock()
+	f.gotProgressArgs = append(f.gotProgressArgs, args)
+	f.progressMu.Unlock()
+	return f.progressErr
+}
+
+// progressArgs returns a copy of the recorded ReportStageProgress calls under
+// the mutex — the tee reports from an async goroutine.
+func (f *fakeUploader) progressArgs() []upload.ReportStageProgressArgs {
+	f.progressMu.Lock()
+	defer f.progressMu.Unlock()
+	return append([]upload.ReportStageProgressArgs(nil), f.gotProgressArgs...)
 }
 
 // RunLineageComplete stubs the #1137 lineage-completion read the worktree
@@ -2400,12 +2420,13 @@ func TestRun_FetchPrompt_MCPTokenFetchFailure_StillProceeds(t *testing.T) {
 	}
 }
 
-// TestRun_WiresProgressSinkToLogSink confirms run() sets the
-// Invocation's ProgressSink to the mutex-guarded wrapper around the same
-// logSink it writes lifecycle lines to, so the agent adapter's
-// stage_progress heartbeats land on the stream the fishhawk-mcp relay
-// forwards (#580) while staying serialized against the mid-stage
-// scope-amendment watcher's concurrent writes (#1035).
+// TestRun_WiresProgressSinkToLogSink confirms run() wires the Invocation's
+// ProgressSink as a *progressTee wrapping the mutex-guarded *syncWriter around
+// the same logSink it writes lifecycle lines to (#580 relay contract unchanged;
+// the tee added by #2541 only wraps it). The heartbeat bytes still land on the
+// stream the fishhawk-mcp relay forwards while staying serialized against the
+// mid-stage scope-amendment watcher's concurrent writes (#1035), and the tee
+// forwards them byte-identically.
 func TestRun_WiresProgressSinkToLogSink(t *testing.T) {
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	withFakeInvoker(t, invoker)
@@ -2432,12 +2453,82 @@ func TestRun_WiresProgressSinkToLogSink(t *testing.T) {
 	if invoker.gotInv == nil {
 		t.Fatal("invoker.gotInv nil — invocation not captured")
 	}
-	sw, ok := invoker.gotInv.ProgressSink.(*syncWriter)
+	tee, ok := invoker.gotInv.ProgressSink.(*progressTee)
 	if !ok {
-		t.Fatalf("ProgressSink = %T, want *syncWriter wrapping the logSink", invoker.gotInv.ProgressSink)
+		t.Fatalf("ProgressSink = %T, want *progressTee wrapping the syncWriter", invoker.gotInv.ProgressSink)
+	}
+	sw, ok := tee.sink.(*syncWriter)
+	if !ok {
+		t.Fatalf("progressTee.sink = %T, want *syncWriter wrapping the logSink", tee.sink)
 	}
 	if sw.w != io.Writer(&stderr) {
 		t.Errorf("ProgressSink wraps %v, want the logSink passed to run()", sw.w)
+	}
+	// The tee's diagnostic sink is the SAME mutex-guarded syncWriter that
+	// carries heartbeat forwarding (approval condition 1) — not the raw sink.
+	if tee.diag != io.Writer(sw) {
+		t.Errorf("progressTee.diag = %v, want the same *syncWriter as the forward sink", tee.diag)
+	}
+}
+
+// TestRun_ProgressHeartbeatReachesBackend (E2) runs run() end to end: the fake
+// invoker writes one stage_progress heartbeat line to inv.ProgressSink, and the
+// test asserts BOTH the exact stderr bytes (byte-identical forwarding, the #580
+// relay contract) AND one decoded POST carrying the parsed per-attempt counters
+// — the runner -> HTTP seam of the #2541 cross-boundary path.
+func TestRun_ProgressHeartbeatReachesBackend(t *testing.T) {
+	const heartbeat = `{"event":"stage_progress","elapsed_seconds":42,"turns":7,"tokens_so_far":13402,"last_event_kind":"assistant"}` + "\n"
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			// Model the agent adapter's heartbeat goroutine: one whole line.
+			_, _ = io.WriteString(inv.ProgressSink, heartbeat)
+		},
+	}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// Byte-identical forwarding: the exact heartbeat line is on stderr.
+	if !strings.Contains(stderr.String(), heartbeat) {
+		t.Errorf("stderr missing the verbatim heartbeat line:\n%s", stderr.String())
+	}
+	// The async report must have landed exactly once with the parsed counters.
+	tee, ok := invoker.gotInv.ProgressSink.(*progressTee)
+	if !ok {
+		t.Fatalf("ProgressSink = %T, want *progressTee", invoker.gotInv.ProgressSink)
+	}
+	tee.waitForReports()
+	reports := fu.progressArgs()
+	if len(reports) != 1 {
+		t.Fatalf("ReportStageProgress calls = %d, want 1", len(reports))
+	}
+	r := reports[0]
+	if r.RunID != "11111111-2222-3333-4444-555555555555" || r.StageID != "22222222-3333-4444-5555-666666666666" {
+		t.Errorf("report ids = {run:%q stage:%q}", r.RunID, r.StageID)
+	}
+	if r.LastEvent != "assistant" || r.TurnsThisAttempt != 7 || r.TokensThisAttempt != 13402 {
+		t.Errorf("report = {last:%q turns:%d tokens:%d}, want assistant/7/13402", r.LastEvent, r.TurnsThisAttempt, r.TokensThisAttempt)
+	}
+	if r.MCPToken == "" {
+		t.Error("report carried no bearer token")
 	}
 }
 

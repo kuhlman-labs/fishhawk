@@ -1445,6 +1445,72 @@ func TestFetchScopeAmendments_RejectsMissingInputs(t *testing.T) {
 	}
 }
 
+func TestReportStageProgress_HappyPath(t *testing.T) {
+	var receivedAuth, receivedPath, receivedBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/progress", func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		receivedPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{
+		RunID: "run-abc", StageID: "stage-xyz", MCPToken: "fhm_runnerheld",
+		LastEvent: "assistant", TurnsThisAttempt: 9, TokensThisAttempt: 13402,
+	})
+	if err != nil {
+		t.Fatalf("ReportStageProgress: %v", err)
+	}
+	if receivedAuth != "Bearer fhm_runnerheld" {
+		t.Errorf("Authorization = %q, want the run-bound fhm_ bearer", receivedAuth)
+	}
+	if receivedPath != "/v0/runs/run-abc/stages/stage-xyz/progress" {
+		t.Errorf("path = %q", receivedPath)
+	}
+	// The body carries the per-attempt counters and NO reported_at (server-stamped).
+	for _, want := range []string{`"last_event":"assistant"`, `"turns_this_attempt":9`, `"tokens_this_attempt":13402`} {
+		if !strings.Contains(receivedBody, want) {
+			t.Errorf("body %q missing %q", receivedBody, want)
+		}
+	}
+	if strings.Contains(receivedBody, "reported_at") {
+		t.Errorf("body must not send reported_at (server-stamped): %q", receivedBody)
+	}
+}
+
+func TestReportStageProgress_Non2xxIsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/progress", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"stage_terminal"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{
+		RunID: "run-abc", StageID: "stage-xyz", MCPToken: "fhm_x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "409") {
+		t.Errorf("err = %v, want status error carrying 409", err)
+	}
+}
+
+func TestReportStageProgress_RejectsMissingInputs(t *testing.T) {
+	c := New("http://nowhere")
+	if err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{StageID: "s", MCPToken: "fhm_x"}); err == nil || !strings.Contains(err.Error(), "run_id") {
+		t.Errorf("err = %v, want run_id/stage_id error", err)
+	}
+	if err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{RunID: "r", StageID: "s"}); err == nil || !strings.Contains(err.Error(), "mcp token") {
+		t.Errorf("err = %v, want mcp token error", err)
+	}
+}
+
 // runLineageServer spins a httptest server whose GET /v0/runs/{run_id}
 // returns body for any run id, and returns a Client pointed at it.
 func runLineageServer(t *testing.T, status int, body string) *Client {

@@ -225,6 +225,49 @@ func TestGetStage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestStageProgress_WireSemanticsAreOnTheSchema pins the per-attempt-versus-
+// cumulative meaning on the WIRE SCHEMA, not just in prose (#2541): the
+// marshalled Stage JSON must use the keys turns_this_attempt /
+// tokens_this_attempt, and the progress object must carry NO elapsed_seconds
+// (the operator-facing elapsed is derived server-side from started_at, not from
+// the heartbeat). It also pins the omitempty contract: a stageResponse with no
+// progress serves the byte-identical pre-#2541 shape (no "progress" key).
+func TestStageProgress_WireSemanticsAreOnTheSchema(t *testing.T) {
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	resp := stageResponse{
+		ID: uuid.New(), RunID: uuid.New(), Type: "implement", State: "running",
+		Progress: &stageProgress{
+			LastEvent:         "assistant",
+			TurnsThisAttempt:  9,
+			TokensThisAttempt: 13402,
+			ReportedAt:        now,
+		},
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for _, want := range []string{`"turns_this_attempt":9`, `"tokens_this_attempt":13402`, `"last_event":"assistant"`, `"reported_at":`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("marshalled Stage JSON missing %q:\n%s", want, body)
+		}
+	}
+	// elapsed_seconds must NOT live inside progress — it is derived, not carried.
+	if strings.Contains(body, "elapsed_seconds") {
+		t.Errorf("progress must NOT carry elapsed_seconds (it is server-derived):\n%s", body)
+	}
+
+	// omitempty: no progress => no key, byte-identical pre-#2541 shape.
+	bare, err := json.Marshal(stageResponse{ID: uuid.New(), RunID: uuid.New(), Type: "implement", State: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(bare), "progress") {
+		t.Errorf("stageResponse without progress must omit the key:\n%s", bare)
+	}
+}
+
 // TestStageResolvedModel_FromAudit drives the per-stage resolved_model
 // observability seam end to end (#1427): a model_resolved audit entry keyed
 // to the implement stage must surface as resolved_model on BOTH the single

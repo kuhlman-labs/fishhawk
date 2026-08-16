@@ -86,6 +86,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", s.requireRunAccount(readAccess, s.handleGetRunStage))
 	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure", s.requireRunAccount(adminWrite, s.handleReapStageFailure))
 	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", s.requireRunAccount(memberWrite, s.handleHostDispatchStage))
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/progress", s.requireRunAccount(memberWrite, s.handleReportStageProgress))
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.requireRunAccount(readAccess, s.handleListRunAudit))
 	mux.HandleFunc("GET /v0/runs/{run_id}/gate-view", s.requireRunAccount(readAccess, s.handleGetRunGateView))
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", s.requireRunAccount(readAccess, s.handleGetRunBudget))

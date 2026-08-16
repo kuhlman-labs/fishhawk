@@ -260,3 +260,26 @@ UPDATE stages
        self_retry_count = self_retry_count + 1
  WHERE id = $1
 RETURNING *;
+
+-- name: RecordStageProgress :execrows
+-- Last-writer-wins projection of the runner's stage_progress heartbeat onto
+-- the stage row (#2541). The terminal-state predicate IS the refusal: a
+-- heartbeat that arrives after the stage settled matches ZERO rows (execrows
+-- returns 0), so the handler answers 409 without a prior read — there is no
+-- check-then-write window (#2536). Touches ONLY the progress column, so no
+-- existing stages SELECT list expands and the sqlc Stage model is unchanged.
+UPDATE stages
+   SET progress = $2
+ WHERE id = $1
+   AND state NOT IN ('succeeded', 'failed', 'cancelled');
+
+-- name: GetStageProgress :one
+-- Reads back just the heartbeat payload for one stage (#2541). Progress-only
+-- projection: no SELECT * expansion, no Stage model dependency.
+SELECT progress FROM stages WHERE id = $1;
+
+-- name: ListStageProgressForRun :many
+-- Reads every stage's heartbeat payload for a run in one round-trip (#2541),
+-- so the run-stages list handler pays one query rather than N. id + progress
+-- only — no SELECT * expansion.
+SELECT id, progress FROM stages WHERE run_id = $1;

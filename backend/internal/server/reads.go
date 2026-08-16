@@ -56,6 +56,41 @@ type stageResponse struct {
 	// observability read handlers (handleGetStage, handleListRunStages); the
 	// action endpoints that build a stageResponse leave it at the zero default.
 	AgentTimeoutSeconds int `json:"agent_timeout_seconds"`
+	// Progress is the runner's mid-execution stage_progress heartbeat projected
+	// onto the stage row (#2541): last_event / turns_this_attempt /
+	// tokens_this_attempt / reported_at, so a mid-stage poll returns real
+	// activity instead of a single 'running' bit. omitempty (a POINTER) so a
+	// stage that has not reported — and every action endpoint that builds a
+	// stageResponse — serves the byte-identical pre-#2541 shape. Populated ONLY
+	// by the two observability read handlers (handleGetStage,
+	// handleListRunStages); best-effort, left nil on a store-assertion miss or a
+	// read error, matching the resolved_model / agent_timeout reads above.
+	Progress *stageProgress `json:"progress,omitempty"`
+}
+
+// stageProgress mirrors run.StageProgress on the wire. The per-attempt-versus-
+// cumulative meaning is encoded in the FIELD NAMES (turns_this_attempt /
+// tokens_this_attempt reset on an in-driver re-spawn), and elapsed is
+// deliberately absent — the operator-facing elapsed_seconds is derived
+// server-side from started_at (see the StageWaitStatus projection), which makes
+// it cumulative and monotonic across re-spawns.
+type stageProgress struct {
+	LastEvent         string    `json:"last_event"`
+	TurnsThisAttempt  int       `json:"turns_this_attempt"`
+	TokensThisAttempt int       `json:"tokens_this_attempt"`
+	ReportedAt        time.Time `json:"reported_at"`
+}
+
+func toStageProgress(p *run.StageProgress) *stageProgress {
+	if p == nil {
+		return nil
+	}
+	return &stageProgress{
+		LastEvent:         p.LastEvent,
+		TurnsThisAttempt:  p.TurnsThisAttempt,
+		TokensThisAttempt: p.TokensThisAttempt,
+		ReportedAt:        p.ReportedAt,
+	}
 }
 
 type stageExecutor struct {
@@ -167,12 +202,24 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 	if rr, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID); gerr == nil {
 		runRow = rr
 	}
+	// Fetch the whole run's heartbeat map ONCE (no N+1), mirroring the single
+	// run-row fetch above. Best-effort: a store-assertion miss or read error
+	// leaves progressByStage nil and every stage's progress nil.
+	var progressByStage map[uuid.UUID]run.StageProgress
+	if store, ok := s.cfg.RunRepo.(stageProgressStore); ok {
+		if m, perr := store.StageProgressForRun(r.Context(), runID); perr == nil {
+			progressByStage = m
+		}
+	}
 	items := make([]stageResponse, 0, len(stages))
 	for _, st := range stages {
 		resp := toStageResponse(st)
 		resp.ResolvedModel = s.resolvedModelForStage(r.Context(), st)
 		if runRow != nil {
 			resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, st.Type)
+		}
+		if p, ok := progressByStage[st.ID]; ok {
+			resp.Progress = toStageProgress(&p)
 		}
 		items = append(items, resp)
 	}
@@ -211,6 +258,13 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 	// Fail open to 0 on a run-fetch error or unparseable spec.
 	if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), got.RunID); gerr == nil {
 		resp.AgentTimeoutSeconds = s.resolveAgentTimeout(r.Context(), runRow, got.Type)
+	}
+	// Mid-execution heartbeat (#2541), best-effort: nil on a store-assertion
+	// miss or read error, matching the resolved_model / agent_timeout posture.
+	if store, ok := s.cfg.RunRepo.(stageProgressStore); ok {
+		if p, perr := store.StageProgressByID(r.Context(), got.ID); perr == nil {
+			resp.Progress = toStageProgress(p)
+		}
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

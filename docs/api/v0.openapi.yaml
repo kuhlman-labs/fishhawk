@@ -2523,12 +2523,84 @@ components:
             and `GET /v0/runs/{run_id}/stages`); `0` on the
             action-endpoint responses that build a Stage.
           example: 3600
+        progress:
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/StageProgress'
+          description: |
+            The runner's mid-execution `stage_progress` heartbeat projected
+            onto the stage row (#2541), so a poll during a running stage
+            returns real activity instead of a single `running` bit.
+            Null/omitted until the stage reports its first heartbeat, and on
+            every stage of a run that predates the column. Populated only on
+            the observability read paths (`GET /v0/stages/{stage_id}` and
+            `GET /v0/runs/{run_id}/stages`); omitted on the action-endpoint
+            responses that build a Stage. Written by
+            `POST /v0/runs/{run_id}/stages/{stage_id}/progress`.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    StageProgress:
+      type: object
+      description: |
+        A stage's most recent mid-execution heartbeat (#2541). The counters
+        are cumulative WITHIN THE CURRENT AGENT ATTEMPT ONLY and reset on an
+        in-driver re-spawn — the per-attempt semantics are encoded in the
+        field names (`turns_this_attempt` / `tokens_this_attempt`). Note the
+        operator-facing `elapsed_seconds` is deliberately NOT part of
+        `progress`: it is derived server-side from the stage's `started_at`,
+        which makes it cumulative and monotonic across re-spawns, and it is
+        surfaced on the MCP stage-wait status rather than here.
+      required: [last_event, turns_this_attempt, tokens_this_attempt, reported_at]
+      properties:
+        last_event:
+          type: string
+          description: |
+            The agent's last event kind from the most recent heartbeat
+            (e.g. `assistant`). Clamped to 128 runes at ingest.
+          example: assistant
+        turns_this_attempt:
+          type: integer
+          description: |
+            Parsed-event count so far in the CURRENT agent attempt; resets on
+            an in-driver re-spawn (the observed 9, 9, 5 series).
+          example: 9
+        tokens_this_attempt:
+          type: integer
+          description: |
+            Cumulative token count so far in the CURRENT agent attempt; resets
+            on an in-driver re-spawn.
+          example: 13402
+        reported_at:
+          type: string
+          format: date-time
+          description: |
+            Server-stamped ingest time of this heartbeat. The runner does not
+            set it.
+
+    StageProgressReport:
+      type: object
+      description: |
+        The request body of `POST /v0/runs/{run_id}/stages/{stage_id}/progress`
+        (#2541). `reported_at` is NOT accepted — it is stamped server-side.
+        Unknown fields are rejected.
+      required: [last_event, turns_this_attempt, tokens_this_attempt]
+      properties:
+        last_event:
+          type: string
+          example: assistant
+        turns_this_attempt:
+          type: integer
+          minimum: 0
+          example: 9
+        tokens_this_attempt:
+          type: integer
+          minimum: 0
+          example: 13402
 
     StageGate:
       type: object
@@ -7737,6 +7809,74 @@ paths:
         '503':
           description: |
             The run repository is not wired (`host_dispatch_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/stages/{stage_id}/progress:
+    post:
+      operationId: reportStageProgress
+      summary: Record a stage's mid-execution progress heartbeat
+      description: |
+        Projects the runner's `stage_progress` heartbeat onto the stage row
+        (#2541), last-writer-wins, so an operator poll during a running stage
+        returns `last_event` / `turns_this_attempt` / `tokens_this_attempt`
+        (via the stage's `progress` field, and the derived `elapsed_seconds`
+        on the MCP stage-wait status) instead of a single `running` bit.
+
+        Written by the runner every ~15s from the same run-bound bearer token
+        it already holds, at the same `memberWrite` tier and path shape as the
+        sibling host-dispatch route — so no new token capability is introduced.
+        The reporter is fail-open by construction on the runner side: a lost
+        heartbeat is superseded ~15s later and can never fail a stage.
+
+        `reported_at` is stamped server-side; the runner does not set it.
+        `last_event` is clamped to 128 runes and negative counters are
+        rejected, so an unbounded or nonsensical payload can never be
+        persisted. Unknown body fields are rejected.
+
+        **Terminal refusal.** A heartbeat that arrives after the stage settled
+        (`succeeded` / `failed` / `cancelled`) matches zero rows and returns
+        409 `stage_terminal` — the terminal predicate IS the UPDATE's own
+        `WHERE state NOT IN (...)`, so there is no read-then-write window.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StageProgressReport' }
+      responses:
+        '204':
+          description: The heartbeat was recorded. No body.
+        '400':
+          description: |
+            A malformed `run_id`/`stage_id`, an invalid body (bad JSON, an
+            unknown field, or a negative counter) — `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: |
+            `stage_not_found` — no stage with that id, or the stage's `run_id`
+            does not match the path `run_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `stage_terminal` — the stage has settled, so progress is no longer
+            accepted. `details` carries `stage_id` and `state`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run repository is not wired or does not support stage progress
+            (`progress_unsupported`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

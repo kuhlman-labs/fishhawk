@@ -104,6 +104,7 @@ type uploadClient interface {
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
 	FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error)
+	ReportStageProgress(ctx context.Context, args upload.ReportStageProgressArgs) error
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
 	RunLineageComplete(ctx context.Context, runID string) (bool, error)
 }
@@ -959,6 +960,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				cfg.runID, mcpTok.TokenID, mcpTok.ExpiresAt.Format(time.RFC3339))
 		}
 	}
+
+	// Tee the progress sink so each stage_progress heartbeat also POSTs to the
+	// backend (#2541), projecting last_event / turns / tokens onto the stage row.
+	// The tee forwards the incoming bytes to the wrapped sink UNCHANGED (the
+	// heartbeat line stays byte-identical on stderr) and its failure diagnostics
+	// go through logSink — the SAME mutex-guarded syncWriter that carries the
+	// heartbeat forwarding, so an async report's error log and a later heartbeat
+	// write share one synchronization boundary (approval condition 1). Ordering
+	// is deliberate: the acceptance stage is issued NO MCP token (ADR-050
+	// decision #2) and a failed token fetch also leaves mcpBearerToken empty — in
+	// both cases the tee degrades to a pure pass-through, so acceptance keeps its
+	// zero-credential posture and nothing regresses.
+	inv.ProgressSink = newProgressTee(inv.ProgressSink, client, cfg.runID, cfg.stageID, mcpBearerToken, logSink)
 
 	// Acceptance-agent containment (E31.7 / #1535, ADR-050 / ADR-049 #4).
 	// The acceptance agent validates the RUNNING INSTANCE from intent +

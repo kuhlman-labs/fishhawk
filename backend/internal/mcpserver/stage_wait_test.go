@@ -430,6 +430,78 @@ func TestStageWaitStatusFor_DeadlineFields(t *testing.T) {
 	requireWaitDeadlineKeysAbsent(t, acc, "unknown-budget stage")
 }
 
+// TestStageWaitStatusFor_ProjectsProgress (E3 / DONE-MEANS) asserts a
+// mid-execution wait status is no longer one bit: the runner's heartbeat
+// counters + last_event land on the status, while elapsed_seconds comes from
+// started_at (NOT from the heartbeat — the mirror carries no elapsed, so a
+// stray heartbeat elapsed can never leak in).
+func TestStageWaitStatusFor_ProjectsProgress(t *testing.T) {
+	stages := []Stage{{
+		Type: "implement", State: "running", StartedAt: startedAgo(600 * time.Second),
+		AgentTimeoutSeconds: 3600,
+		Progress:            &StageProgress{LastEvent: "assistant", TurnsThisAttempt: 9, TokensThisAttempt: 13402, ReportedAt: waitBase},
+	}}
+	impl := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+	if impl == nil {
+		t.Fatal("implement wait status nil")
+	}
+	if impl.LastEvent != "assistant" || impl.TurnsThisAttempt != 9 || impl.TokensThisAttempt != 13402 {
+		t.Errorf("progress not projected: %+v", impl)
+	}
+	// elapsed_seconds is the started_at derivation (600), never a heartbeat value.
+	if impl.ElapsedSeconds != 600 {
+		t.Errorf("elapsed_seconds = %d, want 600 (from started_at, not the heartbeat)", impl.ElapsedSeconds)
+	}
+}
+
+// TestStageWaitStatusFor_ElapsedPresentWithProgressAndNoBudget pins the
+// widened population condition (#2541): a stage with progress but
+// agent_timeout_seconds == 0 still reports elapsed_seconds (and the progress
+// fields), while the budget/deadline fields stay omitted.
+func TestStageWaitStatusFor_ElapsedPresentWithProgressAndNoBudget(t *testing.T) {
+	stages := []Stage{{
+		Type: "implement", State: "running", StartedAt: startedAgo(120 * time.Second),
+		Progress: &StageProgress{LastEvent: "tool_use", TurnsThisAttempt: 3, TokensThisAttempt: 500, ReportedAt: waitBase},
+	}}
+	impl := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+	if impl == nil {
+		t.Fatal("implement wait status nil")
+	}
+	if impl.ElapsedSeconds != 120 {
+		t.Errorf("elapsed_seconds = %d, want 120 (progress present forces elapsed even with no budget)", impl.ElapsedSeconds)
+	}
+	if impl.LastEvent != "tool_use" || impl.TurnsThisAttempt != 3 {
+		t.Errorf("progress not projected: %+v", impl)
+	}
+	// Budget unknown → agent_timeout / deadline stay omitted.
+	if impl.AgentTimeoutSeconds != 0 || impl.DeadlineSecondsRemaining != nil {
+		t.Errorf("budget fields present with no resolved budget: %+v", impl)
+	}
+}
+
+// TestStageWaitStatusFor_ShapeUnchangedWithoutProgressOrBudget pins the
+// byte-identical pre-#2540 shape when a non-terminal stage has NEITHER budget
+// NOR progress: none of the deadline OR progress keys appear on the wire.
+func TestStageWaitStatusFor_ShapeUnchangedWithoutProgressOrBudget(t *testing.T) {
+	stages := []Stage{{
+		Type: "implement", State: "running", StartedAt: startedAgo(120 * time.Second),
+	}}
+	impl := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+	if impl == nil {
+		t.Fatal("implement wait status nil")
+	}
+	requireWaitDeadlineKeysAbsent(t, impl, "no-progress-no-budget stage")
+	b, err := json.Marshal(impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"last_event", "turns_this_attempt", "tokens_this_attempt"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("wire carries %q with no progress, want omitted:\n%s", key, b)
+		}
+	}
+}
+
 // TestAmendmentPollWindowConstantsInSync is the cross-package drift guard
 // (#2540 approval condition 4): the server's surfaced poll window
 // (server.AmendmentPollWindowSeconds, 900) and this package's operator-facing
