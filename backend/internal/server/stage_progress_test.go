@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -132,6 +133,68 @@ func TestReportStageProgress_EndToEndReachesStageRead(t *testing.T) {
 	}
 	if list.Items[0].Progress.LastEvent != "assistant" || list.Items[0].Progress.TurnsThisAttempt != 9 || list.Items[0].Progress.TokensThisAttempt != 13402 {
 		t.Errorf("list-read progress = %+v", *list.Items[0].Progress)
+	}
+}
+
+// TestReportStageProgress_CrossAccountForbidden closes the authorization gap the
+// plan's risk section named ("Falsified by TestReportStageProgress_*
+// authorization cases if wrong"). The mux-driven E1/siblings admit anonymous
+// requests because their seeded run has no account, so the memberWrite tier's
+// cross-run 403 was never exercised. Here a bearer token bound to account A
+// POSTs a heartbeat to a run owned by account B and must be refused 403
+// account_forbidden by the requireRunAccount(memberWrite, ...) middleware BEFORE
+// the handler runs — the byte-identical wrapper the adjacent host-dispatch route
+// carries. Driven through the full mux (Handler()) with a real Authorization
+// header so the route REGISTRATION wiring is what enforces it.
+func TestReportStageProgress_CrossAccountForbidden(t *testing.T) {
+	fr, _, runB, _ := seedAuthzRuns()
+	repo := &stubAPITokenRepo{tok: &apitoken.Token{
+		ID:        uuid.New(),
+		Subject:   "github:op",
+		AccountID: authzAcctA,
+		PlainText: "fhk_account_a_token",
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: fr, APITokenRepo: repo})
+
+	// stage_id is any UUID: the middleware resolves the run via run_id and
+	// refuses before the handler ever touches the stage.
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+runB.ID.String()+"/stages/"+uuid.New().String()+"/progress",
+		progressBody(t, stageProgressReport{LastEvent: "assistant", TurnsThisAttempt: 1}))
+	req.Header.Set("Authorization", "Bearer "+repo.tok.PlainText)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "account_forbidden") {
+		t.Errorf("body = %s, want account_forbidden", w.Body.String())
+	}
+}
+
+// TestReportStageProgress_OversizedBodyRejected pins the http.MaxBytesReader
+// body cap: a VALID-JSON but oversized payload (past progressMaxBodyBytes) is
+// refused 400 at decode rather than being read wholesale into memory. Paired
+// against valid JSON so that WITHOUT the cap the same body decodes to a 204 —
+// the discriminating counterfactual for the size guard.
+func TestReportStageProgress_OversizedBodyRejected(t *testing.T) {
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	runID, stageID := seedRunningStage(t, repo)
+
+	// A single valid last_event string larger than the cap: the body is
+	// well-formed JSON, so a 400 can only come from the byte cap, not a parse
+	// error.
+	huge := strings.Repeat("x", progressMaxBodyBytes+1024)
+	w := postProgressMux(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: huge, TurnsThisAttempt: 1,
+	}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body cap):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "validation_failed") {
+		t.Errorf("body = %s, want validation_failed", w.Body.String())
 	}
 }
 

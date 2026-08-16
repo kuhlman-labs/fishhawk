@@ -16,6 +16,16 @@ import (
 // clamped at ingest.
 const progressLastEventMaxLen = 128
 
+// progressMaxBodyBytes bounds the request body BEFORE decode. The clamp above
+// bounds what is PERSISTED, but not what is ALLOCATED per request:
+// json.NewDecoder would otherwise read an arbitrarily large payload into memory
+// before the clamp runs. The report is three small fields — a 128-rune
+// last_event plus two ints — so a few KiB is ample; an oversized body trips the
+// decode-error branch and returns 400. The route sits behind
+// requireRunAccount(memberWrite), so only a run-bound bearer holder can reach
+// this, but the cap is cheap defense in depth.
+const progressMaxBodyBytes = 16 << 10
+
 // stageProgressStore is the CONSUMER-SIDE narrow capability the progress ingest
 // and stage-read handlers assert for on s.cfg.RunRepo (the runCostRecorder /
 // runnerKindResolver precedent). It is deliberately NOT part of run.Repository
@@ -82,6 +92,7 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, progressMaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	var body stageProgressReport
