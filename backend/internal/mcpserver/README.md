@@ -397,20 +397,24 @@ the permanent-strand class [#2630](https://github.com/kuhlman-labs/fishhawk/issu
   construction: the reap handler's `reapProtectedParkStates` is a **closed allow-list of five PARK states** it must
   never collapse, and `dispatched` is deliberately **not** among them (the handler also refuses a terminal stage, so
   the endpoint's reap authority spans `{pending, dispatched, running}`) — and the stage is `dispatched` here, which is
-  not a protected park. The stage lands `failed`/category-C, which `fishhawk_retry_stage` recovers (for a local run
-  it parks the stage back at `awaiting_host_dispatch`, which `run_children` admits), so a subsequent `run_children`
-  re-spawns the child.
+  not a protected park. The report is called **FIRST and its OUTCOME decides the single warning**
+  ([#2695](https://github.com/kuhlman-labs/fishhawk/issues/2695) item 4), so the disclosure never contradicts itself.
+  On a **successful** report the stage lands `failed`/category-C — and only then is the one warning's "reported it as a
+  category-C stage failure … recover with `fishhawk_retry_stage`" claim TRUE (for a local run the retry parks the stage
+  back at `awaiting_host_dispatch`, which `run_children` admits, so a subsequent `run_children` re-spawns the child).
 - **DISCLOSED RESIDUAL: if the report ITSELF fails, the child is STRANDED** in `dispatched` with no runner and no
-  reaper. `fishhawk_retry_stage` does **not** clear it — `run.RetryStage` admits only a stage already in state
-  `failed`, and refuses anything else `ErrRetryNotApplicable`. The verb that actually clears it is the reap-failure
-  REST endpoint the compensation just failed to reach: `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` with
-  `{"category":"C","reason":"runner_spawn_failed"}`, after which `fishhawk_retry_stage` becomes applicable. Since
-  [#2689](https://github.com/kuhlman-labs/fishhawk/issues/2689) that endpoint HAS an MCP verb —
-  **`fishhawk_reap_stage`** — so the second warning now prescribes
+  reaper. A single self-contained strand disclosure is emitted — with **no preceding success claim to retract** (the
+  old ordering appended an unconditional success claim and then a "…that report ALSO failed" second warning, so a failed
+  compensation returned two contradictory recovery instructions). `fishhawk_retry_stage` does **not** clear it —
+  `run.RetryStage` admits only a stage already in state `failed`, and refuses anything else `ErrRetryNotApplicable`. The
+  verb that actually clears it is the reap-failure REST endpoint the compensation just failed to reach: `POST
+  /v0/runs/{run_id}/stages/{stage_id}/reap-failure` with `{"category":"C","reason":"runner_spawn_failed"}`, after which
+  `fishhawk_retry_stage` becomes applicable. Since [#2689](https://github.com/kuhlman-labs/fishhawk/issues/2689) that
+  endpoint HAS an MCP verb — **`fishhawk_reap_stage`** — so the strand warning prescribes
   `fishhawk_reap_stage` → `fishhawk_retry_stage` → re-invoke `fishhawk_run_children`, keeping the literal endpoint only
   as the fallback for a client that has not picked the verb up. This is still a disclosed residual, not a claimed
-  recovery; `TestRunChildren_FailedCompensationDisclosesStrand` pins the honest behaviour and the recovery the warning
-  names.
+  recovery; `TestRunChildren_FailedCompensationDisclosesStrand` pins the honest behaviour (exactly one warning, and it
+  does not claim a successful report) and the recovery the warning names.
 
 **Pre-existing, unfixed, and stated plainly:** `fishhawk_dispatch_stage` has the SAME uncompensated shape today — it
 marks the host dispatch, spawns, and returns a spawn error bare, leaving the single stage `dispatched` with no runner.
@@ -434,6 +438,22 @@ detection anywhere in the verb. A transition-keyed release could neither fire be
 
 Every release — **including `timeout`** — carries the same `ChildrenStatus` snapshot and a `next_step`; a timeout's
 `next_step` re-arms the wait, since a timeout is a resumable checkpoint, not a terminal state.
+
+**Timeout default is 600s ([#2695](https://github.com/kuhlman-labs/fishhawk/issues/2695) item 2).** An omitted
+`timeout_seconds` resolves to **600s**, not the shared 360s review default — reconciling with [#2363](https://github.com/kuhlman-labs/fishhawk/issues/2363)'s
+approved 600s contract (`clampAwaitChildrenTimeout`, an await_children-specific default). The cap ladder is unchanged:
+600s, raised to 7200s via `long_wait:true` or a client `progressToken`. So an omitted value with neither opt-in waits
+the **full 600s cap** by construction, and no other await verb's 360s default is touched.
+
+**The fan-in snapshot read is category-filtered and paginated ([#2695](https://github.com/kuhlman-labs/fishhawk/issues/2695)
+item 1).** The snapshot's fan-in markers (`slices_integrated` / `slice_integration_conflict`) land **late** in a
+decomposed parent's audit, so the old single unfiltered 500-entry window silently dropped the newest marker on any
+parent with a longer history — every await then timed out. `latestFanInAudit` instead issues a **category-filtered**
+read per fan-in kind and walks each to its **LAST page** (the endpoint returns entries ascending, so the max-Sequence
+entry `childrenStatusFor` keeps is always on the last page). The walk **fails loud** rather than returning a stale page:
+a history exceeding the per-category page cap, and a non-progressing (looping) cursor, each surface as their OWN wrapped
+`read parent audit` error (distinct diagnoses), so `awaitChildrenEvaluate` sees a read FAILURE — never a confidently
+wrong snapshot.
 
 `children_dispatchable` keys on the child's **implement-stage** state, NOT its run-level state. A local decomposed
 child parked by `RuleChildrenDispatch` has its RUN advanced to `running` while its implement stage sits at

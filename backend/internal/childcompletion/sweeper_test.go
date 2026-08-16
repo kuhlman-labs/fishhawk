@@ -1332,6 +1332,98 @@ func TestSweeper_WaveIntegrationCleanRunsDispatchBackstop(t *testing.T) {
 	}
 }
 
+// TestSweeper_WaveConflictClearedOnEverySettlingExit is the item-5 control
+// (#2695). waveConflicts must be cleared on EVERY all-terminal settling exit, not
+// just one — the acceptance criterion is "no entry remains after settlement". It
+// drives a mid-fan-out conflict tick to SET the dedup key, then a settling tick
+// for each of the four enumerated exits — any-child-failed settlement,
+// bounded-retry give-up, slice-conflict transition, and clean integration — and
+// asserts the key is gone (committed map state read under the sweeper mutex).
+// Deleting the settling-path clearWaveConflict calls reddens every subtest; the
+// counterfactual is recorded in the PR body.
+func TestSweeper_WaveConflictClearedOnEverySettlingExit(t *testing.T) {
+	ctx := context.Background()
+	conflict := &SliceConflict{SliceIndex: 1, ChildRunID: uuid.New(), Detail: "slice 1"}
+
+	// seedConflictThenTerminal drives ONE mid-fan-out conflict tick (children not
+	// all terminal) to record the dedup key, asserts it is present, then flips the
+	// children to the all-terminal set the settling tick will resolve.
+	seedConflictThenTerminal := func(t *testing.T, terminal []*run.Run, integ Integrator) (*Sweeper, uuid.UUID) {
+		t.Helper()
+		parentRun, _, rs := midFanOutParent()
+		wi := &recordingWaveIntegrator{conflict: conflict}
+		s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Integrate: integ, Logger: slog.Default()}
+		if err := s.Tick(ctx); err != nil {
+			t.Fatalf("conflict tick: %v", err)
+		}
+		s.mu.Lock()
+		_, present := s.waveConflicts[parentRun]
+		s.mu.Unlock()
+		if !present {
+			t.Fatalf("precondition: waveConflicts key not set after the mid-fan-out conflict tick")
+		}
+		rs.mu.Lock()
+		rs.childrenByParent[parentRun] = terminal
+		rs.mu.Unlock()
+		return s, parentRun
+	}
+
+	assertCleared := func(t *testing.T, s *Sweeper, parentRun uuid.UUID) {
+		t.Helper()
+		s.mu.Lock()
+		_, present := s.waveConflicts[parentRun]
+		s.mu.Unlock()
+		if present {
+			t.Error("waveConflicts key still set after settlement — a settling exit leaked it")
+		}
+	}
+
+	bothSucceeded := func() []*run.Run {
+		return []*run.Run{mkChild(uuid.New(), run.StateSucceeded), mkChild(uuid.New(), run.StateSucceeded)}
+	}
+
+	t.Run("clean integration settle", func(t *testing.T) {
+		s, parent := seedConflictThenTerminal(t, bothSucceeded(), &recordingIntegrator{}) // nil conflict/err → clean
+		if err := s.Tick(ctx); err != nil {
+			t.Fatalf("settling tick: %v", err)
+		}
+		assertCleared(t, s, parent)
+	})
+
+	t.Run("any-child-failed settle", func(t *testing.T) {
+		// A failed child with no stages is non-recoverable → the parent settles to
+		// failed-C via the shared transition (Integrate nil, anyFailed path).
+		terminal := []*run.Run{mkChild(uuid.New(), run.StateSucceeded), mkChild(uuid.New(), run.StateFailed)}
+		s, parent := seedConflictThenTerminal(t, terminal, nil)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatalf("settling tick: %v", err)
+		}
+		assertCleared(t, s, parent)
+	})
+
+	t.Run("slice-conflict transition settle", func(t *testing.T) {
+		integ := &recordingIntegrator{conflict: &SliceConflict{SliceIndex: 0, ChildRunID: uuid.New(), Detail: "settle conflict"}}
+		s, parent := seedConflictThenTerminal(t, bothSucceeded(), integ)
+		if err := s.Tick(ctx); err != nil {
+			t.Fatalf("settling tick: %v", err)
+		}
+		assertCleared(t, s, parent)
+	})
+
+	t.Run("bounded-retry give-up settle", func(t *testing.T) {
+		integ := &recordingIntegrator{returnErr: errors.New("integration boom")}
+		s, parent := seedConflictThenTerminal(t, bothSucceeded(), integ)
+		// The give-up fires on the maxIntegrationAttempts-th all-terminal error
+		// tick; the mid-fan-out conflict tick did not touch the shared counter.
+		for i := 0; i < maxIntegrationAttempts; i++ {
+			if err := s.Tick(ctx); err != nil {
+				t.Fatalf("give-up tick %d: %v", i, err)
+			}
+		}
+		assertCleared(t, s, parent)
+	})
+}
+
 // TestSweeper_NilWaveIntegrateIsNoOp asserts the nil-safe field preserves the
 // pre-#2363 posture exactly: the not-all-terminal branch still returns cleanly
 // with no transition and no panic.

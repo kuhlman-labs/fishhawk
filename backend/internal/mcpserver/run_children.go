@@ -571,26 +571,38 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 	// runner_kind local run it parks the stage back at awaiting_host_dispatch,
 	// a state implementStageDispatchable admits, so a SUBSEQUENT
 	// fishhawk_run_children re-spawns the child.
-	res.Warnings = append(res.Warnings, fmt.Sprintf(
-		"spawn failed after the host-dispatch marker had already flipped the stage to 'dispatched': %v. Reported it as a category-C stage failure so the stage is retryable; recover with fishhawk_retry_stage (which parks a local child back at awaiting_host_dispatch) then re-invoke fishhawk_run_children.", spawnErr))
-	if rerr := report(ctx, "C", "runner_spawn_failed", spawnErr.Error(), 0); rerr != nil {
-		// A FAILED COMPENSATION IS A DISCLOSED RESIDUAL STRAND, not a claimed
-		// recovery. The stage stays 'dispatched' with no runner and no reaper.
-		// fishhawk_retry_stage does NOT clear it: run.RetryStage admits ONLY a
-		// stage in state 'failed' (backend/internal/run — a non-failed stage is
-		// refused ErrRetryNotApplicable), so a 'dispatched' stage is out of its
-		// reach. The verb that actually clears it is the reap-failure REST
-		// endpoint this compensation just failed to reach — POST
-		// /v0/runs/{run_id}/stages/{stage_id}/reap-failure with category C —
-		// whose authority IS {dispatched, running}; once that lands the stage is
-		// 'failed' and fishhawk_retry_stage becomes applicable. Since #2689 that
-		// endpoint HAS an MCP verb — fishhawk_reap_stage — so the warning
-		// prescribes the verb and keeps the literal endpoint only as the fallback
-		// for a client that has not picked it up yet.
+	// Report-BEFORE-claim ordering (#2695 item 4): call report FIRST and let its
+	// OUTCOME decide the single warning, so the disclosure never contradicts
+	// itself. A success and a failure are mutually exclusive branches — exactly
+	// one warning is appended — instead of an unconditional success claim followed
+	// by a possible "…that report ALSO failed" retraction.
+	rerr := report(ctx, "C", "runner_spawn_failed", spawnErr.Error(), 0)
+	if rerr == nil {
+		// The report SUCCEEDED: the stage lands failed/category-C, the retryable
+		// infrastructure class fishhawk_retry_stage recovers (for a local run it
+		// parks the stage back at awaiting_host_dispatch, which
+		// implementStageDispatchable admits, so a SUBSEQUENT fishhawk_run_children
+		// re-spawns the child). Only now is the claim TRUE.
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
-			"the category-C failure report ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Recover with fishhawk_reap_stage(run_id:%q, stage_id:%q, category:\"C\"), then fishhawk_retry_stage, then re-invoke fishhawk_run_children. (Fallback for a client without that verb: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}.)",
-			rerr, d.runID, d.stageID, r.api.baseURL, d.runID, d.stageID))
+			"spawn failed after the host-dispatch marker had already flipped the stage to 'dispatched': %v. Reported it as a category-C stage failure so the stage is retryable; recover with fishhawk_retry_stage (which parks a local child back at awaiting_host_dispatch) then re-invoke fishhawk_run_children.", spawnErr))
+		return res
 	}
+	// The report FAILED: a single self-contained strand disclosure, with NO
+	// preceding success claim to contradict. The stage is genuinely STRANDED in
+	// 'dispatched' with no runner and no reaper. fishhawk_retry_stage does NOT
+	// clear it: run.RetryStage admits ONLY a stage in state 'failed'
+	// (backend/internal/run — a non-failed stage is refused ErrRetryNotApplicable),
+	// so a 'dispatched' stage is out of its reach. The verb that actually clears it
+	// is the reap-failure REST endpoint this compensation just failed to reach —
+	// POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure with category C — whose
+	// authority IS {dispatched, running}; once that lands the stage is 'failed' and
+	// fishhawk_retry_stage becomes applicable. Since #2689 that endpoint HAS an MCP
+	// verb — fishhawk_reap_stage — so the warning prescribes the verb and keeps the
+	// literal endpoint only as the fallback for a client that has not picked it up
+	// yet.
+	res.Warnings = append(res.Warnings, fmt.Sprintf(
+		"spawn failed after the host-dispatch marker had already flipped the stage to 'dispatched' (%v), and the category-C failure report meant to make it retryable ALSO failed (%v), so this child's implement stage is STRANDED in 'dispatched' with no runner and no reaper. fishhawk_retry_stage will NOT clear it — it admits only a 'failed' stage. Recover with fishhawk_reap_stage(run_id:%q, stage_id:%q, category:\"C\"), then fishhawk_retry_stage, then re-invoke fishhawk_run_children. (Fallback for a client without that verb: POST %s/v0/runs/%s/stages/%s/reap-failure with {\"category\":\"C\",\"reason\":\"runner_spawn_failed\"}.)",
+		spawnErr, rerr, d.runID, d.stageID, r.api.baseURL, d.runID, d.stageID))
 	return res
 }
 

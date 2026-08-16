@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -127,6 +128,13 @@ type fakeBackend struct {
 	perRunAuditNextByRun     map[uuid.UUID]string
 	perRunAuditStatus        int
 	perRunAuditLastQueryByID map[uuid.UUID]string
+	// perRunAuditNeverEndByRun, when set for a run, makes the audit endpoint
+	// return an ALWAYS-advancing non-empty next_cursor (offset+limit) regardless
+	// of how much data exists — simulating an unbounded / pathological fan-in
+	// history so the paginated fan-in walk's page-cap exhaustion is testable
+	// without seeding hundreds of thousands of entries (#2695, binding
+	// condition 1).
+	perRunAuditNeverEndByRun map[uuid.UUID]bool
 
 	// #1147: counts per-run audit reads by category so the children-status
 	// cost-gate test can assert a non-decomposed run issues no
@@ -583,6 +591,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		auditCalledByID:               map[uuid.UUID]int{},
 		perRunAuditByRun:              map[uuid.UUID][]AuditEntry{},
 		perRunAuditNextByRun:          map[uuid.UUID]string{},
+		perRunAuditNeverEndByRun:      map[uuid.UUID]bool{},
 		perRunAuditLastQueryByID:      map[uuid.UUID]string{},
 		perRunAuditCategoryReads:      map[string]int{},
 		stageWaitByStageID:            map[uuid.UUID]RunStageWait{},
@@ -1582,7 +1591,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			fb.reviewFlip(r.URL.Query().Get("category"))
 		}
 		all := fb.perRunAuditByRun[id]
-		next := fb.perRunAuditNextByRun[id]
+		literalNext, hasLiteralNext := fb.perRunAuditNextByRun[id]
+		neverEnd := fb.perRunAuditNeverEndByRun[id]
+		status := fb.perRunAuditStatus
 		fb.mu.Unlock()
 		// Mirror the backend's category filter: when a category query
 		// param is set, return only entries of that category. The
@@ -1616,8 +1627,51 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			}
 			items = filtered
 		}
-		w.WriteHeader(fb.perRunAuditStatus)
-		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: next})
+		// Mirror the backend's limit + cursor pagination (reads.go
+		// handleListRunAudit), applied AFTER the category + since_sequence
+		// filters to match handler order (#2695). The cursor is base64("offset:<n>"),
+		// the exact encoding the server's decodeOffsetCursor accepts — hand-rolled
+		// locally so the fake needs no server internals. This is what makes the
+		// item-1 category-paginated fan-in read testable rather than vacuous (the
+		// #2660 blind-spot class): without it a >500-entry regression would pass on
+		// the unfixed single-page read.
+		//
+		// BACK-COMPAT: when perRunAuditNextByRun[id] is EXPLICITLY set (key
+		// present), keep today's behavior — the full filtered slice plus that
+		// literal cursor, ignoring limit/cursor — so the existing pagination-shape
+		// tests that pre-seed a literal next cursor stay green.
+		nextCursor := ""
+		if hasLiteralNext {
+			nextCursor = literalNext
+		} else if limitStr, cursorStr := r.URL.Query().Get("limit"), r.URL.Query().Get("cursor"); limitStr != "" || cursorStr != "" {
+			offset, oerr := decodeFakeOffsetCursor(cursorStr)
+			if oerr != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			limit := len(items) // absent limit → whole (filtered) slice, as the old fake did
+			if limitStr != "" {
+				n, lerr := strconv.Atoi(limitStr)
+				if lerr != nil || n < 1 {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				limit = n
+			}
+			items, nextCursor = fakePageOffset(items, offset, limit)
+			if neverEnd {
+				// Pathological/unbounded history: always hand back an ADVANCING
+				// non-empty cursor so a paginated walk never terminates (exercises
+				// the fan-in page-cap exhaustion, #2695).
+				pageLen := limit
+				if pageLen < 1 {
+					pageLen = 1
+				}
+				nextCursor = encodeFakeOffsetCursor(offset + pageLen)
+			}
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(listAuditResult{Items: items, NextCursor: nextCursor})
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", func(w http.ResponseWriter, r *http.Request) {
 		id, perr := uuid.Parse(r.PathValue("run_id"))
@@ -6710,13 +6764,16 @@ func TestListAudit_FiltersForwarded(t *testing.T) {
 	runID := uuid.New()
 	stageID := uuid.New()
 
+	// A VALID base64 offset cursor (the fake now decodes it faithfully, as the
+	// backend does, and 400s on junk like the old "tok-abc" fixture, #2695).
+	cursor := encodeFakeOffsetCursor(10)
 	r := newResolver(srv, nil)
 	_, _, err := r.listAudit(context.Background(), nil, ListAuditInput{
 		RunID:    runID.String(),
 		Category: "approval_submitted",
 		StageID:  stageID.String(),
 		Limit:    25,
-		Cursor:   "tok-abc",
+		Cursor:   cursor,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -6726,7 +6783,7 @@ func TestListAudit_FiltersForwarded(t *testing.T) {
 		"category=approval_submitted",
 		"stage_id=" + stageID.String(),
 		"limit=25",
-		"cursor=tok-abc",
+		"cursor=" + cursor,
 	} {
 		if !strings.Contains(q, want) {
 			t.Errorf("query missing %q: %s", want, q)
@@ -6749,6 +6806,100 @@ func TestListAudit_Limit_ClampedTo200(t *testing.T) {
 	q := fb.perRunAuditLastQueryByID[runID]
 	if !strings.Contains(q, "limit=200") {
 		t.Errorf("limit should clamp to 200; got %q", q)
+	}
+}
+
+// decodeFakeOffsetCursor decodes the fake audit endpoint's cursor. It mirrors
+// the server's decodeOffsetCursor (backend/internal/server/reads.go) byte for
+// byte: base64("offset:<n>"), empty → 0, malformed → error. Hand-rolled locally
+// so the fake never imports server internals (#2695).
+func decodeFakeOffsetCursor(cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	raw, err := base64.URLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, fmt.Errorf("cursor is not valid base64")
+	}
+	var offset int
+	if _, err := fmt.Sscanf(string(raw), "offset:%d", &offset); err != nil {
+		return 0, fmt.Errorf("cursor is not in expected shape")
+	}
+	if offset < 0 {
+		return 0, fmt.Errorf("cursor offset must be non-negative")
+	}
+	return offset, nil
+}
+
+// encodeFakeOffsetCursor is the fake's mirror of the server's
+// encodeOffsetCursor (#2695).
+func encodeFakeOffsetCursor(offset int) string {
+	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("offset:%d", offset)))
+}
+
+// fakePageOffset mirrors the server's pageOffset generic: items[offset:offset+limit]
+// plus the encoded next-offset cursor, empty at the end (#2695).
+func fakePageOffset(items []AuditEntry, offset, limit int) ([]AuditEntry, string) {
+	if offset >= len(items) {
+		return nil, ""
+	}
+	end := offset + limit
+	if end >= len(items) {
+		return items[offset:], ""
+	}
+	return items[offset:end], encodeFakeOffsetCursor(end)
+}
+
+// TestFakeBackend_PerRunAuditHonorsLimitAndCursor pins the fake audit endpoint's
+// ascending/limit/base64-offset-cursor semantics against the backend handler's
+// contract (reads.go handleListRunAudit). Without this the item-1 counterfactual
+// (a >500-entry history that hides the fan-in marker beyond page one) would be
+// vacuous — the fixture, not the fix, would decide the result (#2660 / #2695).
+func TestFakeBackend_PerRunAuditHonorsLimitAndCursor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+
+	const total = 600
+	entries := make([]AuditEntry, 0, total)
+	for i := 0; i < total; i++ {
+		entries = append(entries, AuditEntry{
+			ID:       uuid.NewString(),
+			Sequence: int64(i + 1),
+			RunID:    runID.String(),
+			Category: "stage_advanced",
+		})
+	}
+	fb.perRunAuditByRun[runID] = entries
+
+	// Page 1: limit=500 returns 500 entries + a non-empty cursor.
+	page1, next1, err := r.api.ListRunAudit(context.Background(), runID, ListRunAuditFilter{Limit: 500})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if len(page1) != 500 {
+		t.Fatalf("page 1 len = %d, want 500 (the endpoint's cap honored)", len(page1))
+	}
+	if next1 == "" {
+		t.Fatal("page 1 next_cursor is empty; want a cursor pointing at the remaining entries")
+	}
+	if page1[0].Sequence != 1 || page1[499].Sequence != 500 {
+		t.Errorf("page 1 is not ascending [1..500]: first=%d last=%d", page1[0].Sequence, page1[499].Sequence)
+	}
+
+	// Page 2: following the cursor yields the remaining 100 entries + no cursor.
+	page2, next2, err := r.api.ListRunAudit(context.Background(), runID, ListRunAuditFilter{Limit: 500, Cursor: next1})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if len(page2) != 100 {
+		t.Fatalf("page 2 len = %d, want 100 (the remainder past the cursor)", len(page2))
+	}
+	if page2[0].Sequence != 501 || page2[99].Sequence != 600 {
+		t.Errorf("page 2 is not the [501..600] remainder: first=%d last=%d", page2[0].Sequence, page2[99].Sequence)
+	}
+	if next2 != "" {
+		t.Errorf("page 2 next_cursor = %q, want empty (end of the history)", next2)
 	}
 }
 
