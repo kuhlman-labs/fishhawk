@@ -6178,8 +6178,14 @@ func openChangeRequestWithReauth(
 		return res, nil
 	}
 	if !errors.Is(err, gitops.ErrUnauthorized) {
-		// Byte-identical pass-through: the error value itself, not a wrap.
-		return nil, err
+		// Byte-identical pass-through: BOTH return values verbatim — the error
+		// value itself, not a wrap, AND whatever result the opener paired with
+		// it. openImplementChangeRequest returns a nil result on every error
+		// path today, so this is identical to returning nil; forwarding res
+		// rather than nil means the pass-through does not silently drop a
+		// partial result if that ever changes, so the "error implies nil
+		// result" invariant is not load-bearing at this seam.
+		return res, err
 	}
 
 	heldSeconds := int64(runnerNow().Sub(heldSince) / time.Second)
