@@ -137,9 +137,20 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !applied {
+		// The UPDATE's WHERE-state predicate matched zero rows: the stage went
+		// terminal at or before this report. Report the state OBSERVED AFTER the
+		// refusal, not the pre-update read — the stage can transition running ->
+		// terminal between the handle-verification GetStage above and the atomic
+		// UPDATE, and the pre-update value would then say "running" for a stage
+		// the write correctly refused as terminal. Re-read; fall back to the
+		// pre-update state only if the re-read itself fails.
+		state := string(stage.State)
+		if cur, err := s.cfg.RunRepo.GetStage(r.Context(), stageID); err == nil {
+			state = string(cur.State)
+		}
 		s.writeError(w, r, http.StatusConflict, "stage_terminal",
 			"stage is terminal; progress is no longer accepted",
-			map[string]any{"stage_id": stageID.String(), "state": string(stage.State)})
+			map[string]any{"stage_id": stageID.String(), "state": state})
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

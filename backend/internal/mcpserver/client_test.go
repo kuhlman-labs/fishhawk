@@ -359,8 +359,9 @@ func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 	if st == nil {
 		t.Fatal("stage wait status nil")
 	}
-	if st.LastEvent != "assistant" || st.TurnsThisAttempt != 9 || st.TokensThisAttempt != 13402 {
-		t.Errorf("far-end projection = {last_event:%q turns:%d tokens:%d}, want assistant/9/13402",
+	if st.LastEvent != "assistant" || st.TurnsThisAttempt == nil || *st.TurnsThisAttempt != 9 ||
+		st.TokensThisAttempt == nil || *st.TokensThisAttempt != 13402 {
+		t.Errorf("far-end projection = {last_event:%q turns:%v tokens:%v}, want assistant/9/13402",
 			st.LastEvent, st.TurnsThisAttempt, st.TokensThisAttempt)
 	}
 	// elapsed_seconds is derived from started_at (a few seconds), never 999.

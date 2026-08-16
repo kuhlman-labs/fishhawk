@@ -445,7 +445,8 @@ func TestStageWaitStatusFor_ProjectsProgress(t *testing.T) {
 	if impl == nil {
 		t.Fatal("implement wait status nil")
 	}
-	if impl.LastEvent != "assistant" || impl.TurnsThisAttempt != 9 || impl.TokensThisAttempt != 13402 {
+	if impl.LastEvent != "assistant" || impl.TurnsThisAttempt == nil || *impl.TurnsThisAttempt != 9 ||
+		impl.TokensThisAttempt == nil || *impl.TokensThisAttempt != 13402 {
 		t.Errorf("progress not projected: %+v", impl)
 	}
 	// elapsed_seconds is the started_at derivation (600), never a heartbeat value.
@@ -470,7 +471,7 @@ func TestStageWaitStatusFor_ElapsedPresentWithProgressAndNoBudget(t *testing.T) 
 	if impl.ElapsedSeconds != 120 {
 		t.Errorf("elapsed_seconds = %d, want 120 (progress present forces elapsed even with no budget)", impl.ElapsedSeconds)
 	}
-	if impl.LastEvent != "tool_use" || impl.TurnsThisAttempt != 3 {
+	if impl.LastEvent != "tool_use" || impl.TurnsThisAttempt == nil || *impl.TurnsThisAttempt != 3 {
 		t.Errorf("progress not projected: %+v", impl)
 	}
 	// Budget unknown → agent_timeout / deadline stay omitted.
@@ -498,6 +499,47 @@ func TestStageWaitStatusFor_ShapeUnchangedWithoutProgressOrBudget(t *testing.T) 
 	for _, key := range []string{"last_event", "turns_this_attempt", "tokens_this_attempt"} {
 		if strings.Contains(string(b), key) {
 			t.Errorf("wire carries %q with no progress, want omitted:\n%s", key, b)
+		}
+	}
+}
+
+// TestStageWaitStatusFor_ZeroCountersPresentOnWire pins the #2541 fix-up: a
+// heartbeat reporting ZERO turns and ZERO tokens (a valid first-turn / post-
+// re-spawn heartbeat) must still carry turns_this_attempt:0 and
+// tokens_this_attempt:0 on the wire — the contract is that a heartbeat POPULATES
+// the per-attempt counters, so an operator polling a fresh attempt sees 0, not a
+// missing field indistinguishable from "no progress". This is the boundary every
+// other projection test misses (they all use positive counters).
+//
+// It is the counterfactual for the pointer change: reverting the two fields to
+// plain omitempty ints drops both keys from the wire here (the reported zero
+// becomes the zero value omitempty elides) and reddens this test, while the
+// no-progress omission is still pinned by
+// TestStageWaitStatusFor_ShapeUnchangedWithoutProgressOrBudget above.
+func TestStageWaitStatusFor_ZeroCountersPresentOnWire(t *testing.T) {
+	stages := []Stage{{
+		Type: "implement", State: "running", StartedAt: startedAgo(30 * time.Second),
+		Progress: &StageProgress{LastEvent: "assistant", TurnsThisAttempt: 0, TokensThisAttempt: 0, ReportedAt: waitBase},
+	}}
+	impl := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+	if impl == nil {
+		t.Fatal("implement wait status nil")
+	}
+	// Decoded struct: the pointers are non-nil and point at the reported 0.
+	if impl.TurnsThisAttempt == nil || *impl.TurnsThisAttempt != 0 {
+		t.Errorf("turns_this_attempt = %v, want a non-nil pointer to 0 (progress present)", impl.TurnsThisAttempt)
+	}
+	if impl.TokensThisAttempt == nil || *impl.TokensThisAttempt != 0 {
+		t.Errorf("tokens_this_attempt = %v, want a non-nil pointer to 0 (progress present)", impl.TokensThisAttempt)
+	}
+	// Byte-level: both keys appear on the wire even though the values are 0.
+	b, err := json.Marshal(impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"turns_this_attempt":0`, `"tokens_this_attempt":0`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("wire missing %s for a zero-counter heartbeat (progress present must populate it):\n%s", want, b)
 		}
 	}
 }

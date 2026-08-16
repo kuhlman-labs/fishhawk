@@ -34,11 +34,14 @@
 -- long-running agent that heartbeats no longer trips it. See the run README +
 -- the PR body's condition-4 note.
 --
--- NOT OPERATOR-ACCEPTED (fix-up). Condition 4 RESERVED this call for the
--- operator ("stop and say so — that is a design question, not something to
--- absorb"). This migration does not decide it: merge is GATED on the operator
--- either explicitly signing off on the tradeoff above OR directing a follow-up
--- that scopes the watchdog off progress-only bumps (e.g. a dedicated heartbeat
--- timestamp instead of relying on the generic stages_set_updated_at trigger).
--- Surfaced here; decided by the operator at the gate.
+-- OPERATOR SIGN-OFF (condition 4). The operator SIGNED OFF on the updated_at
+-- tradeoff above; this is no longer an open merge gate. Reasoning: the dispatch
+-- watchdog is OFF BY DEFAULT (--enable-dispatch-watchdog, serve.go), and even
+-- when enabled its default --dispatch-watchdog-timeout is 1h — which EQUALS the
+-- 3600s agent wall clock the runner enforces. So the only residual case — a
+-- genuinely wedged stage that is somehow still heartbeating — is already bounded
+-- by that wall clock: the runner SIGKILLs the stage at 3600s regardless of
+-- updated_at. A follow-up is filed to give the watchdog a dedicated heartbeat
+-- timestamp (rather than the generic stages_set_updated_at trigger) BEFORE the
+-- watchdog is enabled by default. Decided by the operator at the gate.
 ALTER TABLE stages ADD COLUMN progress JSONB;

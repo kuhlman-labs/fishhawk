@@ -380,6 +380,87 @@ func TestReportStageProgress_StoreErrorReturns500(t *testing.T) {
 	}
 }
 
+// TestReportStageProgress_TerminalRaceReportsObservedState pins the
+// transition-between-read-and-write race: the stage is 'running' at the handler's
+// handle-verification GetStage, then settles terminal before the atomic UPDATE,
+// which refuses the write (applied=false). The 409 details must carry the state
+// OBSERVED AFTER the refusal (succeeded), not the stale pre-update read
+// (running). raceProgressRepo drives exactly that ordering — first GetStage
+// returns running, RecordStageProgress refuses, second GetStage returns
+// succeeded.
+//
+// Counterfactual: reverting the handler to report the pre-update stage.State
+// makes the body say "running" and reddens the two state assertions below, while
+// the terminal-refusal 409 status itself (byte-identical either way) does not
+// discriminate — which is why this asserts on the reported STATE, not just the
+// code.
+func TestReportStageProgress_TerminalRaceReportsObservedState(t *testing.T) {
+	stageID := uuid.New()
+	runID := uuid.New()
+	repo := &raceProgressRepo{
+		stageGetRepo: &stageGetRepo{stagesRunRepo: newStagesRunRepo()},
+		stageID:      stageID,
+		runID:        runID,
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	w := postProgressDirect(t, s, runID.String(), stageID.String(),
+		progressBody(t, stageProgressReport{LastEvent: "assistant", TurnsThisAttempt: 1}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "stage_terminal") {
+		t.Errorf("body = %s, want stage_terminal", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"state":"succeeded"`) {
+		t.Errorf("body = %s, want the state observed after the refusal (succeeded)", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"state":"running"`) {
+		t.Errorf("body = %s, reports the STALE pre-update running state", w.Body.String())
+	}
+	// The handler read the handle once (verification) and once again after the
+	// refusal — proving the reported state came from a post-refusal re-read.
+	if repo.getCalls < 2 {
+		t.Errorf("GetStage called %d times, want >= 2 (handle verify + post-refusal re-read)", repo.getCalls)
+	}
+}
+
+// raceProgressRepo satisfies run.Repository (via stageGetRepo) AND
+// stageProgressStore. Its GetStage returns 'running' on the first call (the
+// handler's handle verification) and 'succeeded' on every later call (the stage
+// settled before the write), while RecordStageProgress always refuses
+// (applied=false), modelling a stage that goes terminal between the read and the
+// write.
+type raceProgressRepo struct {
+	*stageGetRepo
+	stageID  uuid.UUID
+	runID    uuid.UUID
+	getCalls int
+}
+
+func (r *raceProgressRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	if id != r.stageID {
+		return nil, run.ErrNotFound
+	}
+	r.getCalls++
+	state := run.StageStateSucceeded
+	if r.getCalls == 1 {
+		state = run.StageStateRunning
+	}
+	return &run.Stage{ID: r.stageID, RunID: r.runID, State: state}, nil
+}
+
+func (r *raceProgressRepo) RecordStageProgress(context.Context, uuid.UUID, run.StageProgress) (bool, error) {
+	return false, nil
+}
+
+func (r *raceProgressRepo) StageProgressByID(context.Context, uuid.UUID) (*run.StageProgress, error) {
+	return nil, nil
+}
+
+func (r *raceProgressRepo) StageProgressForRun(context.Context, uuid.UUID) (map[uuid.UUID]run.StageProgress, error) {
+	return nil, nil
+}
+
 // erroringProgressRepo satisfies both run.Repository (via stageGetRepo) AND
 // stageProgressStore, returning a seeded stage from GetStage and an error from
 // RecordStageProgress so the handler's 500 branch is reached.

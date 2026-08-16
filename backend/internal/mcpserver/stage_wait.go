@@ -108,9 +108,18 @@ type StageWaitStatus struct {
 	// RESET on an in-driver re-spawn — elapsed_seconds is the cumulative,
 	// re-spawn-monotonic value (it is derived from started_at, not from the
 	// heartbeat).
+	//
+	// TurnsThisAttempt / TokensThisAttempt are POINTERS so an explicit reported
+	// ZERO (a valid heartbeat's first turn, or a fresh attempt after a re-spawn)
+	// is preserved on the wire rather than dropped by omitempty (#2541 fix-up):
+	// a plain omitempty int cannot distinguish "progress reported, count is 0"
+	// from "no progress", and the contract is that a heartbeat POPULATES the
+	// per-attempt counters. They are non-nil (and so serialized, even at 0) iff
+	// progress is present on a non-terminal stage; nil — hence omitted — when
+	// progress is absent or the stage is terminal.
 	LastEvent         string `json:"last_event,omitempty" jsonschema:"the agent's last event kind from the most recent progress heartbeat (e.g. 'assistant'); present only while non-terminal and when the stage has reported progress"`
-	TurnsThisAttempt  int    `json:"turns_this_attempt,omitempty" jsonschema:"parsed-event count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present only while non-terminal and when the stage has reported progress"`
-	TokensThisAttempt int    `json:"tokens_this_attempt,omitempty" jsonschema:"cumulative token count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present only while non-terminal and when the stage has reported progress"`
+	TurnsThisAttempt  *int   `json:"turns_this_attempt,omitempty" jsonschema:"parsed-event count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present (including an explicit 0) only while non-terminal and when the stage has reported progress"`
+	TokensThisAttempt *int   `json:"tokens_this_attempt,omitempty" jsonschema:"cumulative token count so far in the CURRENT agent attempt; resets on an in-driver re-spawn. present (including an explicit 0) only while non-terminal and when the stage has reported progress"`
 }
 
 // suggestedStageWaitPollIntervalSeconds is the FLOOR of the derived stage-wait
@@ -311,8 +320,13 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 				// is cumulative and monotonic across in-driver re-spawns.
 				if s.Progress != nil {
 					st.LastEvent = s.Progress.LastEvent
-					st.TurnsThisAttempt = s.Progress.TurnsThisAttempt
-					st.TokensThisAttempt = s.Progress.TokensThisAttempt
+					// Copy into locals and take their addresses so an explicit 0
+					// counter is preserved on the wire (pointer fields, above) —
+					// a reported zero is "progress present, count 0", not absent.
+					turns := s.Progress.TurnsThisAttempt
+					tokens := s.Progress.TokensThisAttempt
+					st.TurnsThisAttempt = &turns
+					st.TokensThisAttempt = &tokens
 				}
 				// ElapsedSeconds is meaningful alongside a known budget OR a reported
 				// heartbeat; its population condition widens from `budget > 0` to
