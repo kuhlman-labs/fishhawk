@@ -504,10 +504,10 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 			State: "implement_awaiting_scope_decision",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_decide_scope_completeness",
-				Params:       map[string]string{"run_id": run.ID, "decision": "exempt|fail"},
-				Precondition: "the implement stage parked at awaiting_scope_decision (its SOLE committed-tree gate shortfall was the #1151 missing-declared-scope-file check OR an #1171 unsatisfied binding assertion; the gate-verified commit is already on the run branch). Read the shortfall (missing_paths / unsatisfied_assertions) + held SHA from the scope_completeness_parked audit entry first",
+				Params:       map[string]string{"run_id": run.ID, "decision": "exempt|amend|fail"},
+				Precondition: "the implement stage parked at awaiting_scope_decision (its SOLE committed-tree gate shortfall was the #1151 missing-declared-scope-file check, an #1171 unsatisfied binding assertion, OR a #2548 build-required scope drift on a decomposition child; the gate-verified commit is already on the run branch). Read the shortfall (missing_paths / unsatisfied_assertions / build_required_paths) + held SHA from the scope_completeness_parked audit entry first",
 				Consumes:     consumesNone,
-				Reason:       "decide in-band: exempt accepts the already-committed tree and returns the stage to dispatch, so the held commit's PR opens with NO agent re-run (on a local run, dispatch the stage to spawn the runner); fail falls through to today's category-B fail-and-restore",
+				Reason:       "decide in-band: exempt accepts the already-committed tree and returns the stage to dispatch, so the held commit's PR opens with NO agent re-run (on a local run, dispatch the stage to spawn the runner); amend widens this stage's scope with the paths you name and resumes it so the agent re-runs — the ONLY non-fail resolution for a build_required_paths park, whose exempt is refused because its held tree is red by construction; fail falls through to today's category-B fail-and-restore",
 			}},
 		}
 	case "awaiting_approval", "succeeded":

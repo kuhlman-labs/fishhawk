@@ -2144,7 +2144,37 @@ type ScopeCompletenessDecisionResult struct {
 	RunBranch      string   `json:"run_branch,omitempty"`
 	MissingPaths   []string `json:"missing_paths,omitempty"`
 	PullRequestURL string   `json:"pull_request_url,omitempty"`
+
+	// --- `amend` only (#2591) ---
+
+	// AmendedPaths are the paths folded into the parked stage's effective
+	// scope, each keeping its declared operation.
+	AmendedPaths []ScopeAmendmentPathEntry `json:"amended_paths,omitempty"`
+	// AmendmentID is the pre-approved #961 scope-amendment row the widening
+	// landed on. Stable across a retry — the row is reused, never duplicated.
+	AmendmentID string `json:"amendment_id,omitempty"`
+	// OwnerAttributionUnresolved is true when the backend's owner-slice guard
+	// could not establish ownership for at least one amended path. It can only
+	// be true alongside AcknowledgedOwnerUnresolved: unacknowledged, that arm
+	// is REFUSED 409 amend_owner_attribution_unresolved.
+	OwnerAttributionUnresolved bool `json:"owner_attribution_unresolved,omitempty"`
+	// AcknowledgedOwnerUnresolved echoes the operator's explicit
+	// acknowledge_owner_unresolved, so the relaxation reads as a deliberate,
+	// audited decision rather than a silent default.
+	AcknowledgedOwnerUnresolved bool `json:"acknowledged_owner_unresolved,omitempty"`
+	// AgentAmendmentBudgetRemaining is how many of the stage's #961 mid-stage
+	// amendment slots the RE-RUN agent still has; an operator amend consumes
+	// one, so the cost is surfaced rather than hidden.
+	AgentAmendmentBudgetRemaining int `json:"agent_amendment_budget_remaining,omitempty"`
 }
+
+// ScopeAmendmentPathEntry is one {path, operation} entry an `amend`
+// scope-completeness decision folds into the parked stage's effective scope
+// (#2591). It is an ALIAS of ScopeAmendmentPath rather than a second struct:
+// the two are the same wire shape (the amend channel IS the #961 channel — the
+// decision mints a pre-approved amendment row), so a duplicate declaration
+// could only drift. The distinct name is what the amend surfaces refer to.
+type ScopeAmendmentPathEntry = ScopeAmendmentPath
 
 // scopeCompletenessDecisionRequest mirrors the backend's decision body
 // (`backend/internal/server/scope_completeness.go::scopeCompletenessDecisionRequest`
@@ -2153,23 +2183,48 @@ type ScopeCompletenessDecisionResult struct {
 type scopeCompletenessDecisionRequest struct {
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
+	// Paths carries the `amend` decision's widening (#2591). Required and
+	// non-empty on amend; the backend 400s a non-amend decision that carries it.
+	Paths []ScopeAmendmentPathEntry `json:"paths,omitempty"`
+	// AcknowledgeOwnerUnresolved re-admits an amend whose owner-slice guard
+	// could not resolve ownership for a submitted path. The guard fails CLOSED
+	// without it (409 amend_owner_attribution_unresolved).
+	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty"`
 }
 
 // DecideScopeCompleteness resolves an implement stage parked in
 // awaiting_scope_decision via
 // `POST /v0/runs/{run_id}/scope-completeness/decision` (#1231). decision is
-// "exempt" (open the PR from the held commit with NO agent re-run) or "fail"
-// (fall through to category-B); reason is required. Operator-token-only
-// (write:stages); the backend rejects run-bound agent tokens
-// (run_token_forbidden). 4xx surfaces:
-//   - 400 validation_failed (decision not exempt/fail, empty reason)
+// "exempt" (open the PR from the held commit with NO agent re-run), "amend"
+// (widen the parked stage's effective scope with `paths` and RESUME it so the
+// agent re-runs, #2591), or "fail" (fall through to category-B); reason is
+// required. paths is required on amend and rejected otherwise;
+// acknowledgeOwnerUnresolved re-admits an amend the owner-slice guard could not
+// prove safe. Operator-token-only (write:stages); the backend rejects run-bound
+// agent tokens (run_token_forbidden). 4xx surfaces:
+//   - 400 validation_failed (decision not exempt/amend/fail, empty reason,
+//     paths absent on amend or present on a non-amend, invalid path entry)
 //   - 403 run_token_forbidden (a run-bound agent token attempted the decision)
 //   - 403 insufficient_scope (token lacks write:stages)
 //   - 404 run_not_found
 //   - 409 scope_completeness_not_parked (the stage is not parked in
 //     awaiting_scope_decision)
-func (c *apiClient) DecideScopeCompleteness(ctx context.Context, runID uuid.UUID, decision, reason string) (*ScopeCompletenessDecisionResult, error) {
-	body, err := json.Marshal(scopeCompletenessDecisionRequest{Decision: decision, Reason: reason})
+//   - 409 amend_incomplete_coverage (the amend omits a build_required_path)
+//   - 409 amend_refused_owner_slice_active (a path's owning sibling slice has
+//     already started its implement pass)
+//   - 409 amend_owner_attribution_unresolved (ownership unprovable and not
+//     acknowledged)
+//   - 409 amend_budget_exhausted (the stage's amend-and-resume budget is spent)
+//   - 500 amend_unrecorded / amend_resume_failed (the stage is left parked;
+//     re-POST — the amendment row is reused, not duplicated)
+func (c *apiClient) DecideScopeCompleteness(ctx context.Context, runID uuid.UUID, decision, reason string,
+	paths []ScopeAmendmentPathEntry, acknowledgeOwnerUnresolved bool) (*ScopeCompletenessDecisionResult, error) {
+	body, err := json.Marshal(scopeCompletenessDecisionRequest{
+		Decision:                   decision,
+		Reason:                     reason,
+		Paths:                      paths,
+		AcknowledgeOwnerUnresolved: acknowledgeOwnerUnresolved,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal scope-completeness decision: %w", err)
 	}

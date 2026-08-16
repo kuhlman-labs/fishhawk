@@ -694,8 +694,8 @@ func TestNextActions_AwaitingScopeDecision_DecideArm(t *testing.T) {
 	if dec.Params["run_id"] != run.ID {
 		t.Errorf("decide params = %v, want run_id=%s", dec.Params, run.ID)
 	}
-	if dec.Params["decision"] != "exempt|fail" {
-		t.Errorf("decide params = %v, want the exempt|fail decision hint", dec.Params)
+	if dec.Params["decision"] != "exempt|amend|fail" {
+		t.Errorf("decide params = %v, want the exempt|amend|fail decision hint (#2591 added amend)", dec.Params)
 	}
 	if !strings.Contains(dec.Reason, "no agent re-run") && !strings.Contains(dec.Reason, "NO agent re-run") {
 		t.Errorf("decide reason should name the zero-re-run exempt semantics; got %q", dec.Reason)
@@ -2911,5 +2911,30 @@ func TestNextActions_AwaitingScopeDecision_GeneralizedToBothShortfallClasses(t *
 	}
 	if !strings.Contains(dec.Reason, "returns the stage to dispatch") {
 		t.Errorf("reason must state that exempt returns the stage to dispatch (not that the PR opens instantly); got %q", dec.Reason)
+	}
+}
+
+// TestNextActions_AwaitingScopeDecision_OffersAmend pins the #2591 surface: the
+// parked arm must tell the operator amend EXISTS and that it is the only
+// non-fail resolution for a build-required park — an operator who only ever
+// sees "exempt|fail" on the class whose exempt is refused has no route forward
+// but to fail the pass, which is the whole problem the amend decision closes.
+func TestNextActions_AwaitingScopeDecision_OffersAmend(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	dec := findAction(t, na, "fishhawk_decide_scope_completeness")
+	if !strings.Contains(dec.Params["decision"], "amend") {
+		t.Errorf("decision hint must offer amend; got %q", dec.Params["decision"])
+	}
+	if !strings.Contains(dec.Reason, "amend widens") {
+		t.Errorf("reason must describe what amend does; got %q", dec.Reason)
+	}
+	if !strings.Contains(dec.Reason, "build_required_paths") {
+		t.Errorf("reason must name amend as the non-fail resolution for a build_required_paths park; got %q", dec.Reason)
+	}
+	if !strings.Contains(dec.Precondition, "build_required_paths") {
+		t.Errorf("precondition must point the operator at the build_required_paths payload key; got %q", dec.Precondition)
 	}
 }

@@ -266,6 +266,11 @@ var exportBaseline = []string{
 	"RuntimeCalibrationOutput",
 	"ScopeAmendmentItem",
 	"ScopeAmendmentPath",
+	// #2591: the {path, operation} entry an `amend` scope-completeness
+	// decision folds into the parked stage's scope. An ALIAS of
+	// ScopeAmendmentPath (the amend channel IS the #961 channel), exported for
+	// the same jsonschema-reflection reason as its neighbours.
+	"ScopeAmendmentPathEntry",
 	"ScopeCompletenessDecisionResult",
 	"ScopePrecheck",
 	"ScopePrecheckViolation",

@@ -208,3 +208,193 @@ func TestDecideScopeCompleteness_AssertionClassParkResult(t *testing.T) {
 		t.Errorf("State = %q, want pending (#2501: exempt resumes in place for an agent-free re-dispatch)", out.Result.State)
 	}
 }
+
+// --- fishhawk_decide_scope_completeness: the `amend` decision (#2591) ---
+
+// TestDecideScopeCompleteness_AmendThreadsBody pins the wire threading: the
+// decision AND the paths array reach the backend with each entry's declared
+// operation intact (an operation dropped in transit would silently downgrade a
+// `create` to a `modify` and re-fail the #818/#825 created-file gate), and the
+// amend-only response fields decode.
+func TestDecideScopeCompleteness_AmendThreadsBody(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.decideScopeCompletenessResp[runID] = ScopeCompletenessDecisionResult{
+		RunID:    runID.String(),
+		StageID:  uuid.New().String(),
+		Decision: "amend",
+		State:    "pending",
+		AmendedPaths: []ScopeAmendmentPathEntry{
+			{Path: "backend/internal/server/prompt.go", Operation: "modify"},
+			{Path: "backend/internal/server/new.go", Operation: "create"},
+		},
+		AmendmentID:                   "8f14e45f-ceea-467a-9b2e-1f0d0b2b0000",
+		AgentAmendmentBudgetRemaining: 1,
+	}
+
+	_, out, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+		RunID:    runID.String(),
+		Decision: "amend",
+		Reason:   "the coupled endpoint file is build-required by this slice",
+		Paths: []ScopeAmendmentPathEntry{
+			{Path: "backend/internal/server/prompt.go", Operation: "modify"},
+			{Path: "backend/internal/server/new.go", Operation: "create"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("decideScopeCompleteness: %v", err)
+	}
+	if fb.decideScopeCompletenessBody.Decision != "amend" {
+		t.Errorf("body = %+v, want decision=amend threaded", fb.decideScopeCompletenessBody)
+	}
+	got := fb.decideScopeCompletenessBody.Paths
+	if len(got) != 2 {
+		t.Fatalf("body paths = %+v, want both entries threaded", got)
+	}
+	if got[0].Path != "backend/internal/server/prompt.go" || got[0].Operation != "modify" {
+		t.Errorf("body paths[0] = %+v, want the modify entry with its operation intact", got[0])
+	}
+	if got[1].Path != "backend/internal/server/new.go" || got[1].Operation != "create" {
+		t.Errorf("body paths[1] = %+v, want the create entry with its operation intact", got[1])
+	}
+	if out.Result.AmendmentID != "8f14e45f-ceea-467a-9b2e-1f0d0b2b0000" {
+		t.Errorf("AmendmentID = %q, want the pre-approved row id decoded", out.Result.AmendmentID)
+	}
+	if out.Result.AgentAmendmentBudgetRemaining != 1 {
+		t.Errorf("AgentAmendmentBudgetRemaining = %d, want the surfaced cost of the operator amend",
+			out.Result.AgentAmendmentBudgetRemaining)
+	}
+	if len(out.Result.AmendedPaths) != 2 {
+		t.Errorf("AmendedPaths = %+v, want both amended entries decoded", out.Result.AmendedPaths)
+	}
+}
+
+// TestDecideScopeCompleteness_AmendThreadsAcknowledgement pins the
+// acknowledge_owner_unresolved flag reaching the backend and the audited
+// acknowledgement decoding back — the flag is the operator's explicit
+// risk-taking, so a silently dropped `true` would turn a knowing decision into
+// a 409 the operator cannot clear.
+func TestDecideScopeCompleteness_AmendThreadsAcknowledgement(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.decideScopeCompletenessResp[runID] = ScopeCompletenessDecisionResult{
+		RunID:                       runID.String(),
+		StageID:                     uuid.New().String(),
+		Decision:                    "amend",
+		State:                       "pending",
+		OwnerAttributionUnresolved:  true,
+		AcknowledgedOwnerUnresolved: true,
+	}
+
+	_, out, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+		RunID:                      runID.String(),
+		Decision:                   "amend",
+		Reason:                     "attribution degraded; accepting the sibling-conflict risk",
+		Paths:                      []ScopeAmendmentPathEntry{{Path: "a/b.go", Operation: "modify"}},
+		AcknowledgeOwnerUnresolved: true,
+	})
+	if err != nil {
+		t.Fatalf("decideScopeCompleteness: %v", err)
+	}
+	if !fb.decideScopeCompletenessBody.AcknowledgeOwnerUnresolved {
+		t.Errorf("body = %+v, want acknowledge_owner_unresolved threaded true", fb.decideScopeCompletenessBody)
+	}
+	if !out.Result.AcknowledgedOwnerUnresolved || !out.Result.OwnerAttributionUnresolved {
+		t.Errorf("result = %+v, want the audited acknowledgement decoded on BOTH flags", out.Result)
+	}
+}
+
+// TestDecideScopeCompleteness_RejectsAmendWithoutPathsBeforeHTTP: an amend with
+// nothing to fold is a no-op. Asserted through the NEVER-DIALED httptest seam
+// (the backend handler's per-run counter stays empty) rather than only on the
+// error string, so a rejection that actually reached the wire cannot pass.
+func TestDecideScopeCompleteness_RejectsAmendWithoutPathsBeforeHTTP(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+
+	_, _, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+		RunID:    runID.String(),
+		Decision: "amend",
+		Reason:   "widen the slice",
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires paths") {
+		t.Errorf("err = %v, want an amend-without-paths rejection before the HTTP hop", err)
+	}
+	if len(fb.decideScopeCompletenessCalled) != 0 {
+		t.Errorf("backend DIALED despite the pre-HTTP rejection: %v", fb.decideScopeCompletenessCalled)
+	}
+}
+
+// TestDecideScopeCompleteness_RejectsPathsOnNonAmendBeforeHTTP: paths on an
+// exempt/fail decision would silently go nowhere. Same never-dialed seam.
+func TestDecideScopeCompleteness_RejectsPathsOnNonAmendBeforeHTTP(t *testing.T) {
+	for _, decision := range []string{"exempt", "fail"} {
+		t.Run(decision, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+
+			_, _, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+				RunID:    uuid.New().String(),
+				Decision: decision,
+				Reason:   "r",
+				Paths:    []ScopeAmendmentPathEntry{{Path: "a/b.go", Operation: "modify"}},
+			})
+			if err == nil || !strings.Contains(err.Error(), "only be supplied with decision") {
+				t.Errorf("err = %v, want a paths-on-non-amend rejection before the HTTP hop", err)
+			}
+			if len(fb.decideScopeCompletenessCalled) != 0 {
+				t.Errorf("backend DIALED despite the pre-HTTP rejection: %v", fb.decideScopeCompletenessCalled)
+			}
+		})
+	}
+}
+
+// TestDecideScopeCompleteness_RejectsBadDecisionNamesAmend keeps the enum
+// message honest now that a third decision exists.
+func TestDecideScopeCompleteness_RejectsBadDecisionNamesAmend(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+		RunID:    uuid.New().String(),
+		Decision: "approve",
+		Reason:   "x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "amend") {
+		t.Errorf("err = %v, want the enum error to name amend", err)
+	}
+}
+
+// TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced pins each new 409 /
+// 500 refusal reaching the operator by CODE, so a backend guard cannot fire
+// while the tool reports something generic.
+func TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced(t *testing.T) {
+	for _, code := range []string{
+		"amend_incomplete_coverage",
+		"amend_refused_owner_slice_active",
+		"amend_owner_attribution_unresolved",
+		"amend_budget_exhausted",
+		"amend_unrecorded",
+		"amend_resume_failed",
+	} {
+		t.Run(code, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			fb.decideScopeCompletenessStatus = http.StatusConflict
+			fb.decideScopeCompletenessErr = `{"error":{"code":"` + code + `","message":"refused"}}`
+			r := newResolver(srv, nil)
+
+			_, _, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+				RunID:    uuid.New().String(),
+				Decision: "amend",
+				Reason:   "forced",
+				Paths:    []ScopeAmendmentPathEntry{{Path: "a/b.go", Operation: "modify"}},
+			})
+			if err == nil || !strings.Contains(err.Error(), code) {
+				t.Errorf("err = %v, want %q surfaced", err, code)
+			}
+		})
+	}
+}
