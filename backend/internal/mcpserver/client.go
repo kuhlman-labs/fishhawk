@@ -2158,6 +2158,13 @@ type ScopeCompletenessDecisionResult struct {
 	// be true alongside AcknowledgedOwnerUnresolved: unacknowledged, that arm
 	// is REFUSED 409 amend_owner_attribution_unresolved.
 	OwnerAttributionUnresolved bool `json:"owner_attribution_unresolved,omitempty"`
+	// OwnerUnresolvedPaths names each path whose ownership could not be
+	// resolved, with the reason it could not, so the operator taking the risk
+	// can see WHICH boundary is unprovable and WHY rather than only that one
+	// was. Mirrors the handler's `owner_unresolved_paths`; without it the
+	// per-path detail would be silently dropped by JSON decoding and reachable
+	// only from the audit entry or the raw HTTP response.
+	OwnerUnresolvedPaths []ScopeCompletenessUnresolvedOwner `json:"owner_unresolved_paths,omitempty"`
 	// AcknowledgedOwnerUnresolved echoes the operator's explicit
 	// acknowledge_owner_unresolved, so the relaxation reads as a deliberate,
 	// audited decision rather than a silent default.
@@ -2175,6 +2182,16 @@ type ScopeCompletenessDecisionResult struct {
 // decision mints a pre-approved amendment row), so a duplicate declaration
 // could only drift. The distinct name is what the amend surfaces refer to.
 type ScopeAmendmentPathEntry = ScopeAmendmentPath
+
+// ScopeCompletenessUnresolvedOwner is one submitted path whose OWNING slice the
+// backend's amend guard could not establish, with the reason it could not
+// (#2591). Mirrors the handler's `amendUnresolvedOwner` {path, reason} shape;
+// declared here rather than imported for the same reason the result struct is —
+// the MCP server's apiClient is a thin local copy of the wire shape.
+type ScopeCompletenessUnresolvedOwner struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
 
 // scopeCompletenessDecisionRequest mirrors the backend's decision body
 // (`backend/internal/server/scope_completeness.go::scopeCompletenessDecisionRequest`

@@ -459,29 +459,58 @@ func TestAmend_IncompleteCoverage409(t *testing.T) {
 }
 
 // TestAmend_OwnerSliceActive409 (counterfactual: the owner-slice guard). The
-// sibling that OWNS the coupled path has already STARTED its implement pass, so
-// from that moment two branches can carry divergent edits to one file. The
-// started state is seeded BY CONSTRUCTION (StartedAt set at fixture time).
+// sibling that OWNS the coupled path has already begun its implement pass, so
+// from that moment two branches can carry divergent edits to one file.
+//
+// One arm per DISJUNCT of the refusal predicate — `StartedAt != nil ||
+// State == succeeded` — each seeded BY CONSTRUCTION at fixture time. The
+// succeeded-with-nil-StartedAt arm is not hypothetical bookkeeping: it is the
+// exact combination (a legacy or manually-transitioned row) the second disjunct
+// exists for, and without it deleting that disjunct leaves the suite green.
 func TestAmend_OwnerSliceActive409(t *testing.T) {
-	f := newAmendFixture(t)
 	started := time.Now().UTC().Add(-time.Minute)
-	f.sibImpl.StartedAt = &started
-	f.sibImpl.State = run.StageStateRunning
+	for _, tc := range []struct {
+		name  string
+		setup func(*amendFixture)
+		why   string
+	}{
+		{
+			name: "StartedAtSet",
+			setup: func(f *amendFixture) {
+				f.sibImpl.StartedAt = &started
+				f.sibImpl.State = run.StageStateRunning
+			},
+			why: "an amend whose owning sibling slice is already running",
+		},
+		{
+			name: "SucceededWithNilStartedAt",
+			setup: func(f *amendFixture) {
+				f.sibImpl.StartedAt = nil // the row carries no start stamp...
+				f.sibImpl.State = run.StageStateSucceeded
+			},
+			why: "an amend whose owning sibling slice has already SUCCEEDED with no start stamp",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAmendFixture(t)
+			tc.setup(f)
 
-	w := postAmend(t, f, scopeAmendBody("widen despite the active sibling"))
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+			w := postAmend(t, f, scopeAmendBody("widen despite the active sibling"))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			if !strings.Contains(body, "amend_refused_owner_slice_active") {
+				t.Errorf("body must name amend_refused_owner_slice_active: %s", body)
+			}
+			for _, want := range []string{`"slice_index":1`, "prompt plumbing", f.sibling.ID.String()} {
+				if !strings.Contains(body, want) {
+					t.Errorf("details must carry %q so the operator knows WHICH boundary is live: %s", want, body)
+				}
+			}
+			f.assertNoSideEffects(t, tc.why)
+		})
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "amend_refused_owner_slice_active") {
-		t.Errorf("body must name amend_refused_owner_slice_active: %s", body)
-	}
-	for _, want := range []string{`"slice_index":1`, "prompt plumbing", f.sibling.ID.String()} {
-		if !strings.Contains(body, want) {
-			t.Errorf("details must carry %q so the operator knows WHICH boundary is live: %s", want, body)
-		}
-	}
-	f.assertNoSideEffects(t, "an amend whose owning sibling slice is already running")
 }
 
 // TestAmend_OwnerSliceNotStartedAllowed is the OTHER side of the StartedAt

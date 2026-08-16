@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -286,6 +287,9 @@ func TestDecideScopeCompleteness_AmendThreadsAcknowledgement(t *testing.T) {
 		State:                       "pending",
 		OwnerAttributionUnresolved:  true,
 		AcknowledgedOwnerUnresolved: true,
+		OwnerUnresolvedPaths: []ScopeCompletenessUnresolvedOwner{
+			{Path: "a/b.go", Reason: "no_owning_slice_entry"},
+		},
 	}
 
 	_, out, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
@@ -303,6 +307,27 @@ func TestDecideScopeCompleteness_AmendThreadsAcknowledgement(t *testing.T) {
 	}
 	if !out.Result.AcknowledgedOwnerUnresolved || !out.Result.OwnerAttributionUnresolved {
 		t.Errorf("result = %+v, want the audited acknowledgement decoded on BOTH flags", out.Result)
+	}
+	// The per-path detail is what makes the relaxation legible: WHICH boundary
+	// is unprovable and WHY, not merely that one is.
+	if len(out.Result.OwnerUnresolvedPaths) != 1 ||
+		out.Result.OwnerUnresolvedPaths[0].Path != "a/b.go" ||
+		out.Result.OwnerUnresolvedPaths[0].Reason != "no_owning_slice_entry" {
+		t.Errorf("result owner_unresolved_paths = %+v, want the acknowledged path AND its reason decoded",
+			out.Result.OwnerUnresolvedPaths)
+	}
+	// Decoded from a HANDLER-shaped literal, not the seeded struct: the hop
+	// above round-trips one type through itself, so it cannot catch a json tag
+	// that has drifted from `backend/internal/server`'s response shape.
+	var wire ScopeCompletenessDecisionResult
+	if err := json.Unmarshal([]byte(
+		`{"owner_unresolved_paths":[{"path":"c/d.go","reason":"owning_slice_index_absent"}]}`), &wire); err != nil {
+		t.Fatalf("unmarshal handler-shaped body: %v", err)
+	}
+	if len(wire.OwnerUnresolvedPaths) != 1 || wire.OwnerUnresolvedPaths[0].Path != "c/d.go" ||
+		wire.OwnerUnresolvedPaths[0].Reason != "owning_slice_index_absent" {
+		t.Errorf("handler-shaped body decoded to %+v, want the {path, reason} entry — the json tags must mirror the handler",
+			wire.OwnerUnresolvedPaths)
 	}
 }
 
@@ -369,20 +394,29 @@ func TestDecideScopeCompleteness_RejectsBadDecisionNamesAmend(t *testing.T) {
 }
 
 // TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced pins each new 409 /
-// 500 refusal reaching the operator by CODE, so a backend guard cannot fire
-// while the tool reports something generic.
+// 500 refusal reaching the operator by CODE — replayed at the status the
+// backend REALLY emits for it — so a backend guard cannot fire while the tool
+// reports something generic.
 func TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced(t *testing.T) {
-	for _, code := range []string{
-		"amend_incomplete_coverage",
-		"amend_refused_owner_slice_active",
-		"amend_owner_attribution_unresolved",
-		"amend_budget_exhausted",
-		"amend_unrecorded",
-		"amend_resume_failed",
+	// Each row carries the status the backend ACTUALLY emits for that code: the
+	// two persistence failures are 500s, and replaying them at 409 would leave
+	// the 5xx-class path (a client-side retry or error-envelope branch keyed on
+	// the status rather than the code) untested.
+	for _, tc := range []struct {
+		code   string
+		status int
+	}{
+		{"amend_incomplete_coverage", http.StatusConflict},
+		{"amend_refused_owner_slice_active", http.StatusConflict},
+		{"amend_owner_attribution_unresolved", http.StatusConflict},
+		{"amend_budget_exhausted", http.StatusConflict},
+		{"amend_unrecorded", http.StatusInternalServerError},
+		{"amend_resume_failed", http.StatusInternalServerError},
 	} {
+		code := tc.code
 		t.Run(code, func(t *testing.T) {
 			fb, srv := newFakeBackend(t)
-			fb.decideScopeCompletenessStatus = http.StatusConflict
+			fb.decideScopeCompletenessStatus = tc.status
 			fb.decideScopeCompletenessErr = `{"error":{"code":"` + code + `","message":"refused"}}`
 			r := newResolver(srv, nil)
 

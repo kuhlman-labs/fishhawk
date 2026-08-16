@@ -272,6 +272,11 @@ var exportBaseline = []string{
 	// the same jsonschema-reflection reason as its neighbours.
 	"ScopeAmendmentPathEntry",
 	"ScopeCompletenessDecisionResult",
+	// #2591: the {path, reason} entry naming a path whose owning slice the
+	// backend's amend guard could not establish. Nested in
+	// ScopeCompletenessDecisionResult, so exported for the same
+	// jsonschema-reflection reason as its neighbours.
+	"ScopeCompletenessUnresolvedOwner",
 	"ScopePrecheck",
 	"ScopePrecheckViolation",
 	"SecurityFinding",
