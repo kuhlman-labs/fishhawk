@@ -114,6 +114,8 @@ Returns the decided park record. Tool errors:
   - empty reason (caught before the HTTP hop)
   - amend with no paths, or paths on a non-amend decision (caught before the
     HTTP hop)
+  - acknowledge_owner_unresolved on a non-amend decision — it is amend-only and
+    would otherwise be silently ignored (caught before the HTTP hop)
   - validation_failed (400)
   - run_token_forbidden (a run-bound agent token attempted the decision, 403)
   - insufficient_scope (token lacks write:stages, 403)
@@ -155,6 +157,13 @@ func (r *runResolver) decideScopeCompleteness(ctx context.Context, _ *mcp.CallTo
 	}
 	if in.Decision != "amend" && len(in.Paths) > 0 {
 		return nil, DecideScopeCompletenessOutput{}, fmt.Errorf("paths may only be supplied with decision \"amend\", got decision %q", in.Decision)
+	}
+	// Same rejection for the acknowledgement: only the amend arm runs an
+	// owner-slice guard, so on exempt/fail the flag lands nowhere. Forwarding it
+	// would let the operator believe they had taken an AUDITED risk that no
+	// audit entry records.
+	if in.Decision != "amend" && in.AcknowledgeOwnerUnresolved {
+		return nil, DecideScopeCompletenessOutput{}, fmt.Errorf("acknowledge_owner_unresolved may only be supplied with decision \"amend\", got decision %q", in.Decision)
 	}
 	result, err := r.api.DecideScopeCompleteness(ctx, runID, in.Decision, in.Reason, in.Paths, in.AcknowledgeOwnerUnresolved)
 	if err != nil {

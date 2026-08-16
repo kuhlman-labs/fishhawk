@@ -1132,6 +1132,96 @@ func TestAmend_RepeatedParkEpisodesEachSpendASlot(t *testing.T) {
 	}
 }
 
+// TestAmend_UnidentifiableEpisodeMintsARowPerAttempt (counterfactual: the
+// `episode != ""` guard on the in-flight row lookup). amendEpisodeKey returns
+// "" for a park carrying NEITHER a held commit nor a verified tree SHA, and the
+// handler then skips the lookup entirely — reuse is refused outright and every
+// attempt mints its OWN row.
+//
+// That is the DOCUMENTED fail-closed direction, and this pins it as behaviour
+// rather than prose: over-counting against the amend cap is safe (a third
+// attempt is refused), while over-spending the re-run agent's two #961 slots is
+// merely reported honestly by agent_amendment_budget_remaining. The unsafe
+// alternative — reusing a row on an episode nothing can identify — would let a
+// re-parking stage amend forever under one amendment_id.
+//
+// The SHA-less park is seeded BY CONSTRUCTION so the RED lands on the
+// behavioral assertion, not on a fixture-setup failure.
+func TestAmend_UnidentifiableEpisodeMintsARowPerAttempt(t *testing.T) {
+	f := newAmendFixture(t)
+	park := *f.stage.ScopeCompletenessPark
+	park.HeldCommitSHA = ""
+	park.VerifiedTreeSHA = ""
+	f.stage.ScopeCompletenessPark = &park
+	f.s.cfg.RunRepo = &transitionFailRepo{orchestratorRepo: f.rr, failures: 1}
+	body := scopeAmendBody("widen the slice")
+
+	// ATTEMPT 1 fails mid-sequence: the row and the entry are committed, the
+	// resume is not — the exact shape the reuse path exists to fold.
+	w := postAmend(t, f, body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "amend_resume_failed") {
+		t.Errorf("body must name amend_resume_failed: %s", w.Body.String())
+	}
+	got, _ := f.rr.GetStage(context.Background(), f.stage.ID)
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Fatalf("stage state = %q, want it left parked when the resume failed", got.State)
+	}
+	first := f.approvedRows(t)
+	if len(first) != 1 {
+		t.Fatalf("%d approved rows after the failed attempt, want 1", len(first))
+	}
+
+	// THE RETRY. With no identifiable episode there is no reuse: it must MINT a
+	// second row rather than adopt the orphan.
+	w2 := postAmend(t, f, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200; body = %s", w2.Code, w2.Body.String())
+	}
+	rows := f.approvedRows(t)
+	if len(rows) != 2 {
+		t.Fatalf("%d approved rows after failure+retry on a SHA-less park, want 2 — an episode nothing can "+
+			"identify must refuse reuse, because adopting a row across unidentifiable episodes uncaps the "+
+			"amend loop", len(rows))
+	}
+	var resp scopeCompletenessDecisionResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.AmendmentID == first[0].ID.String() {
+		t.Errorf("the retry reused amendment %s despite an unidentifiable episode", resp.AmendmentID)
+	}
+	if resp.AgentAmendmentBudgetRemaining != maxScopeAmendmentsPerStage-2 {
+		t.Errorf("agent_amendment_budget_remaining = %d, want %d — the over-spend is REPORTED, not hidden",
+			resp.AgentAmendmentBudgetRemaining, maxScopeAmendmentsPerStage-2)
+	}
+
+	// THE CAP COUNTED BOTH. Each attempt spent its own slot, so a third is
+	// refused — the fail-CLOSED half of the trade-off.
+	used, err := f.s.countScopeCompletenessAmends(context.Background(), f.child.ID, f.stage.ID)
+	if err != nil {
+		t.Fatalf("countScopeCompletenessAmends: %v", err)
+	}
+	if used != 2 {
+		t.Fatalf("amend budget used = %d after two SHA-less attempts, want 2 — each attempt must count on its "+
+			"own against the cap", used)
+	}
+	f.stage.State = run.StageStateAwaitingScopeDecision
+	w3 := postAmend(t, f, body)
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("third attempt status = %d, want 409 — an unidentifiable episode must over-count against the "+
+			"cap, never under-count; body = %s", w3.Code, w3.Body.String())
+	}
+	if !strings.Contains(w3.Body.String(), "amend_budget_exhausted") {
+		t.Errorf("body must name amend_budget_exhausted: %s", w3.Body.String())
+	}
+	if after := f.approvedRows(t); len(after) != 2 {
+		t.Errorf("%d approved rows after the capped third attempt, want the 2 from the earlier attempts", len(after))
+	}
+}
+
 // TestAmend_TransitionFailureOnTheFinalSlotStaysRetryable (counterfactual: the
 // cap's already-counted-retry admission). A resume failure on the SECOND — and
 // last — permitted amend has ALREADY appended that amendment's audit entry, so a
@@ -1394,6 +1484,14 @@ func TestAmend_BadInput400(t *testing.T) {
 		{"EmptyReason", `{"decision":"amend","reason":"  ","paths":[{"path":"a/b.go","operation":"modify"}]}`},
 		{"PathsOnExempt", `{"decision":"exempt","reason":"r","paths":[{"path":"a/b.go","operation":"modify"}]}`},
 		{"PathsOnFail", `{"decision":"fail","reason":"r","paths":[{"path":"a/b.go","operation":"modify"}]}`},
+		// acknowledge_owner_unresolved is amend-only for the same reason paths
+		// are: only the amend arm runs an owner-slice guard, so on exempt/fail
+		// the flag lands nowhere and the operator would believe they had taken
+		// an AUDITED risk that no audit entry records. The `fail` arm is the
+		// sharp one — unrejected it FAILS the stage, so assertNoSideEffects
+		// reads a state change, not merely a wrong status code.
+		{"AcknowledgementOnExempt", `{"decision":"exempt","reason":"r","acknowledge_owner_unresolved":true}`},
+		{"AcknowledgementOnFail", `{"decision":"fail","reason":"r","acknowledge_owner_unresolved":true}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAmendFixture(t)

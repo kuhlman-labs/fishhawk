@@ -240,6 +240,16 @@ func (s *Server) handleDecideScopeCompleteness(w http.ResponseWriter, r *http.Re
 			map[string]any{"field": "paths", "decision": reqBody.Decision})
 		return
 	}
+	// acknowledge_owner_unresolved belongs to `amend` alone for the same reason:
+	// only the amend arm runs an owner-slice guard, so on exempt/fail the flag
+	// would be silently ignored and the caller would believe they had made an
+	// audited risk decision that was never recorded anywhere.
+	if reqBody.Decision != "amend" && reqBody.AcknowledgeOwnerUnresolved {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"acknowledge_owner_unresolved may only be supplied with decision \"amend\"",
+			map[string]any{"field": "acknowledge_owner_unresolved", "decision": reqBody.Decision})
+		return
+	}
 	if strings.TrimSpace(reqBody.Reason) == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"reason is required: state why the parked scope-completeness shortfall is exempted or failed",

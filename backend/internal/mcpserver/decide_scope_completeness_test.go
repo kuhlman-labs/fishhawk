@@ -377,6 +377,33 @@ func TestDecideScopeCompleteness_RejectsPathsOnNonAmendBeforeHTTP(t *testing.T) 
 	}
 }
 
+// TestDecideScopeCompleteness_RejectsAcknowledgementOnNonAmendBeforeHTTP: the
+// acknowledgement is amend-only — only the amend arm runs an owner-slice guard
+// — so on exempt/fail it would be forwarded, silently ignored, and recorded on
+// no audit entry, leaving the operator believing they had taken an AUDITED
+// risk. Same never-dialed seam: the flag must not reach the wire at all.
+func TestDecideScopeCompleteness_RejectsAcknowledgementOnNonAmendBeforeHTTP(t *testing.T) {
+	for _, decision := range []string{"exempt", "fail"} {
+		t.Run(decision, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+
+			_, _, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+				RunID:                      uuid.New().String(),
+				Decision:                   decision,
+				Reason:                     "r",
+				AcknowledgeOwnerUnresolved: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "acknowledge_owner_unresolved may only be supplied") {
+				t.Errorf("err = %v, want an acknowledgement-on-non-amend rejection before the HTTP hop", err)
+			}
+			if len(fb.decideScopeCompletenessCalled) != 0 {
+				t.Errorf("backend DIALED despite the pre-HTTP rejection: %v", fb.decideScopeCompletenessCalled)
+			}
+		})
+	}
+}
+
 // TestDecideScopeCompleteness_RejectsBadDecisionNamesAmend keeps the enum
 // message honest now that a third decision exists.
 func TestDecideScopeCompleteness_RejectsBadDecisionNamesAmend(t *testing.T) {

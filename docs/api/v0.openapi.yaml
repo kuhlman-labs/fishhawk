@@ -13987,7 +13987,12 @@ paths:
                     proceeds AND records the acknowledgement on the response
                     and the `scope_completeness_amended` audit entry, so the
                     relaxation is an audited operator decision. It never
-                    relaxes `amend_refused_owner_slice_active`.
+                    relaxes `amend_refused_owner_slice_active`. Supplying it
+                    with any other decision is 400 `validation_failed`: only
+                    the amend arm runs an owner-slice guard, so on
+                    `exempt`/`fail` it would be silently ignored and the
+                    caller would believe an unrecorded risk decision had been
+                    audited.
       responses:
         '200':
           description: |
