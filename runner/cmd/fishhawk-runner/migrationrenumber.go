@@ -323,31 +323,106 @@ var (
 
 // maybeParkForMigrationRenumber is the run() call site's single entry point:
 // recognize, and if anything is recognized, park for the decision. Returns the
-// substitution exemptions to honor (nil unless an amendment was APPROVED).
+// substitution exemptions to honor (nil unless an amendment was APPROVED) plus
+// the substitutions that were APPROVED, which the base-rebase re-invoke arm
+// passes back in as `prior`.
+//
+// prior is empty on the first call. On the re-invoke it carries attempt 1's
+// APPROVED substitutions, whose created paths the approval folded into
+// cfg.scopeFiles — see dropAbsentFoldedCreations for why that provenance
+// cannot be re-derived from the declared set alone.
 //
 // Fail-open throughout: a recognition error logs one line and returns nil, and
 // every driver refusal returns nil, so the caller proceeds into today's
 // unchanged created-out-of-scope path.
-func maybeParkForMigrationRenumber(ctx context.Context, client uploadClient, cfg *config, mcpToken string, logSink io.Writer) []scopeExemption {
+func maybeParkForMigrationRenumber(ctx context.Context, client uploadClient, cfg *config, mcpToken string, prior []migrationRenumber, logSink io.Writer) ([]scopeExemption, []migrationRenumber) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
-	subs, err := recognizeMigrationRenumbers(repoDir, scopePaths(cfg.scopeFiles))
+	declared, carried, err := dropAbsentFoldedCreations(repoDir, scopePaths(cfg.scopeFiles), prior)
 	if err != nil {
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"migration_renumber_scan_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
-			cfg.runID, cfg.stageID, err.Error())
-		return nil
+		emitMigrationRenumberScanSkipped(cfg, err, logSink)
+		return nil, nil
+	}
+	subs, err := recognizeMigrationRenumbers(repoDir, declared)
+	if err != nil {
+		emitMigrationRenumberScanSkipped(cfg, err, logSink)
+		return nil, nil
 	}
 	if len(subs) == 0 {
-		return nil
+		return nil, nil
 	}
 	approved, exemptions := parkForMigrationRenumberAmendment(ctx, client, cfg, mcpToken, subs, logSink)
 	if !approved {
-		return nil
+		return nil, nil
 	}
-	return exemptions
+	return append(carried, exemptions...), subs
+}
+
+// dropAbsentFoldedCreations removes from `declared` the created paths of the
+// ALREADY-APPROVED substitutions in `prior` that the re-invoked agent has since
+// removed from the work tree, and returns one exemption per dropped path.
+//
+// WHY THE CALLER MUST SUPPLY THE PROVENANCE (#2748 fix-up). Attempt 1's approval
+// folds the created pair (say 0071) into cfg.scopeFiles. If the base-rebase
+// re-invoke renumbers AGAIN (0071 → 0072), the declared set now holds TWO absent
+// same-slug pairs (the plan's 0070 and the folded 0071) both resolving to the
+// one on-disk 0072 pair — which the recognition's strict global 1:1 sweep
+// rejects wholesale, so no amendment is offered and the second ship falls into
+// category-B. That state is structurally IDENTICAL to the genuinely ambiguous
+// C5 shape (a plan declaring two same-slug migrations and delivering one), so no
+// predicate over (declared, on-disk) alone can tell them apart. The difference
+// is provenance, which only the caller holds: the 0071 pair entered scope.files
+// by an approved amendment, not by the plan. Dropping exactly those paths
+// preserves the strict sweep untouched for every other shape.
+//
+// The drop is CONDITIONAL on both created paths being ABSENT. A prior pair the
+// re-invoked agent left in place stays declared, so the "created pair already
+// declared" branch still disqualifies it and no second amendment is filed for a
+// substitution that already landed. A half-present pair (one path absent) is
+// likewise left declared — the conservative direction.
+//
+// The returned exemptions cover the dropped paths themselves: they remain in
+// cfg.scopeFiles from the first fold but are no longer in the work tree, so
+// without them the #1151 scope-completeness gate would demand a file the
+// re-invoke deliberately abandoned.
+//
+// Lstat errors are returned so the caller falls open, exactly as a recognition
+// error does.
+func dropAbsentFoldedCreations(repoDir string, declared []string, prior []migrationRenumber) ([]string, []scopeExemption, error) {
+	if len(prior) == 0 {
+		return declared, nil, nil
+	}
+	drop := make(map[string]struct{}, len(prior)*2)
+	var exemptions []scopeExemption
+	for _, s := range prior {
+		absent, err := bothDeclaredAbsent(repoDir, s.CreatedUp, s.CreatedDown)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !absent {
+			continue
+		}
+		reason := fmt.Sprintf(
+			"migration %s → %s (slug %q) was folded into scope.files by an approved amendment on this stage's first attempt; the base-rebase re-invoke renumbered again, so the folded path is no longer in the work tree",
+			s.DeclaredNumber, s.CreatedNumber, s.Slug)
+		for _, p := range []string{s.CreatedUp, s.CreatedDown} {
+			drop[p] = struct{}{}
+			exemptions = append(exemptions, scopeExemption{Path: p, Reason: reason})
+		}
+	}
+	if len(drop) == 0 {
+		return declared, nil, nil
+	}
+	out := make([]string, 0, len(declared))
+	for _, p := range declared {
+		if _, skip := drop[p]; skip {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out, exemptions, nil
 }
 
 // parkForMigrationRenumberAmendment files ONE scope amendment naming exactly
@@ -433,18 +508,49 @@ func parkForMigrationRenumberAmendment(ctx context.Context, client uploadClient,
 // amendment leaves `pending`, the decision budget elapses, the fetch fails, or
 // the context is cancelled. Returns one of approved|denied|undecided|unavailable
 // plus a short detail.
+//
+// THE BUDGET BOUNDS THE BLOCKED REQUEST, not just the gaps between requests
+// (#2748 fix-up). Checking the deadline only after a request returns lets a
+// long-poll issued just under the deadline hold the stage for another full
+// migrationRenumberWaitSeconds — and for as long as the server likes if it does
+// not honor `?wait` at all. So every iteration bounds its fetch BOTH ways: the
+// per-request `?wait=N` hold is capped at the whole seconds remaining, and the
+// request carries a context deadline at the budget so a server ignoring `?wait`
+// cannot outlast it either.
+//
+// A fetch that fails because THAT derived deadline fired is an UNDECIDED
+// amendment, not an unavailable backend: the budget is what ended the request,
+// and classifying it as unavailable would report a healthy backend as broken.
+// A cancellation of the PARENT context still classifies unavailable.
 func awaitMigrationRenumberDecision(ctx context.Context, client uploadClient, cfg *config, mcpToken, amendmentID string) (string, string) {
 	deadline := time.Now().Add(migrationRenumberDecisionBudget)
+	undecided := func() (string, string) {
+		return "undecided", fmt.Sprintf("no decision within %s", migrationRenumberDecisionBudget)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return "unavailable", err.Error()
 		}
-		items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return undecided()
+		}
+		fetchCtx, cancel := context.WithDeadline(ctx, deadline)
+		items, err := client.FetchScopeAmendments(fetchCtx, upload.FetchScopeAmendmentsArgs{
 			RunID:       cfg.runID,
 			MCPToken:    mcpToken,
-			WaitSeconds: migrationRenumberWaitSeconds,
+			WaitSeconds: boundedRenumberWaitSeconds(remaining),
 		})
+		cancel()
 		if err != nil {
+			// Classify by the CAUSE, not by the clock: a backend failure that
+			// happens to land near the deadline is still an unavailable
+			// backend. Only OUR derived deadline firing — with the parent
+			// context still healthy, so a stage-level deadline is not being
+			// mislabelled — means the amendment is genuinely undecided.
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return undecided()
+			}
 			return "unavailable", err.Error()
 		}
 		for _, a := range items {
@@ -458,15 +564,37 @@ func awaitMigrationRenumberDecision(ctx context.Context, client uploadClient, cf
 				return "denied", a.DecisionReason
 			}
 		}
-		if !time.Now().Before(deadline) {
-			return "undecided", fmt.Sprintf("no decision within %s", migrationRenumberDecisionBudget)
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return undecided()
+		}
+		pause := migrationRenumberPollInterval
+		if pause > remaining {
+			pause = remaining
 		}
 		select {
 		case <-ctx.Done():
 			return "unavailable", ctx.Err().Error()
-		case <-time.After(migrationRenumberPollInterval):
+		case <-time.After(pause):
 		}
 	}
+}
+
+// boundedRenumberWaitSeconds is the `?wait=N` hold for one long-poll: the
+// per-request cap, FLOORED to the whole seconds left in the decision budget so
+// the server is never asked to hold past it. A sub-second remainder yields 0,
+// which omits the query parameter entirely and makes the request return
+// immediately — the loop then observes the expired deadline and reports
+// undecided.
+func boundedRenumberWaitSeconds(remaining time.Duration) int {
+	if remaining <= 0 {
+		return 0
+	}
+	secs := int(remaining / time.Second)
+	if secs > migrationRenumberWaitSeconds {
+		return migrationRenumberWaitSeconds
+	}
+	return secs
 }
 
 // migrationRenumberReason spells out each declared→created substitution so the
@@ -482,6 +610,15 @@ func migrationRenumberReason(subs []migrationRenumber) string {
 	}
 	b.WriteString(". Approving folds ONLY the created path(s) into scope.files and exempts the stale declared path(s) from the scope-completeness gate. This request carries NO proof the new number is the right one — that is your call. Denying (or leaving it undecided) changes nothing: the stage fails category-B on the created-out-of-scope gate with origin untouched.")
 	return b.String()
+}
+
+// emitMigrationRenumberScanSkipped is the one fail-open reason line: a
+// filesystem error anywhere in the pre-park scan (the folded-path absence check
+// or the recognition predicate itself) leaves the stage on today's path.
+func emitMigrationRenumberScanSkipped(cfg *config, err error, logSink io.Writer) {
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"migration_renumber_scan_skipped","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+		cfg.runID, cfg.stageID, err.Error())
 }
 
 func emitMigrationRenumberRecognized(cfg *config, subs []migrationRenumber, logSink io.Writer) {

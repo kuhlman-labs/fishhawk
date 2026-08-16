@@ -22369,6 +22369,78 @@ func TestRun_MigrationRenumber_StagedAndUnstaged_BothRecognized(t *testing.T) {
 	}
 }
 
+// TestRun_MigrationRenumber_ReinvokeRenumbersAgain_SecondAmendmentFiled pins
+// the run() WIRING of the approve-then-reinvoke-with-a-new-number path: attempt
+// 1's APPROVED substitutions must reach the re-invoke's recognition as `prior`,
+// or the folded 0071 pair and the plan's 0070 pair collide in the strict 1:1
+// sweep and the second renumber is silently never offered.
+//
+// CommitAndPush is faked so the first call returns ErrBaseRebaseConflict and the
+// retry succeeds — the #989 re-invoke arm — without needing a genuine
+// stash-reapply conflict. The assertion is the SECOND amendment request and the
+// paths it names; a wiring regression drops it to one request.
+func TestRun_MigrationRenumber_ReinvokeRenumbersAgain_SecondAmendmentFiled(t *testing.T) {
+	pinRenumberBudget(t, 2*time.Second)
+	repo, _, _ := migrationRenumberRepo(t)
+	second := []string{
+		renumberMigDir + "/0072_campaigns_working_dir.up.sql",
+		renumberMigDir + "/0072_campaigns_working_dir.down.sql",
+	}
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(callIdx int, inv agent.Invocation) {
+			if callIdx == 0 {
+				writeRenumbered(t, repo)
+				return
+			}
+			// The re-invoked agent renumbers AGAIN. mirrorWorkingTree copies
+			// but never deletes, so the abandoned pair is removed from the
+			// isolated worktree too — as the real agent would.
+			for _, d := range []string{repo, inv.WorkingDir} {
+				if d == "" {
+					continue
+				}
+				for _, n := range []string{"0071_campaigns_working_dir.up.sql", "0071_campaigns_working_dir.down.sql"} {
+					if rerr := os.Remove(filepath.Join(d, renumberMigDir, n)); rerr != nil && !os.IsNotExist(rerr) {
+						t.Fatal(rerr)
+					}
+				}
+			}
+			for _, p := range second {
+				mustWrite(t, filepath.Join(repo, filepath.FromSlash(p)), "-- renumbered again\n")
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "approved")
+	withFakeUploader(t, fu)
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	code := run(renumberRunArgs(t, repo), &stderr)
+
+	if invoker.callIdx != 2 {
+		t.Fatalf("invoker called %d times, want 2 (base invoke + one re-invoke):\n%s", invoker.callIdx, stderr.String())
+	}
+	if len(fu.gotRequestAmendmentArgs) != 2 {
+		t.Fatalf("RequestScopeAmendment calls = %d, want 2 (one per renumber):\n%s", len(fu.gotRequestAmendmentArgs), stderr.String())
+	}
+	want := []upload.ScopeAmendmentPath{
+		{Path: second[0], Operation: "create"},
+		{Path: second[1], Operation: "create"},
+	}
+	got := fu.gotRequestAmendmentArgs[1].Paths
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("second amendment paths = %+v, want exactly %+v", got, want)
+	}
+	if code != exitOK {
+		t.Errorf("run = %d, want exitOK once the second renumber is approved:\n%s", code, stderr.String())
+	}
+}
+
 // failureClassification extracts the runner's terminal classification line —
 // the JSONL record carrying "category" — from a run's log.
 func failureClassification(t *testing.T, log string) string {

@@ -2467,8 +2467,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// Gated on willOpenPR, precisely the applicability set of the gate's
 			// open-PR arm. Fail-open: nil exemptions leave everything unchanged.
 			var renumberExemptions []scopeExemption
+			var renumberSubs []migrationRenumber
 			if willOpenPR {
-				renumberExemptions = maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, logSink)
+				renumberExemptions, renumberSubs = maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, nil, logSink)
 			}
 			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(mergeExemptions(validatedExemptions, operatorExemptions), renumberExemptions), renumberExemptions, &prCheckpoint)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
@@ -2520,12 +2521,28 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// — the re-invoke rebased onto a fresh base and may have
 					// renumbered differently (or not at all). An already-approved
 					// amendment re-recognized here needs no second request: its
-					// created paths are already in cfg.scopeFiles, so the
-					// "created pair already declared" branch disqualifies it and
-					// the exemptions below simply carry over.
+					// created paths are still on disk and already in
+					// cfg.scopeFiles, so the "created pair already declared"
+					// branch disqualifies it and the exemptions below simply
+					// carry over.
+					//
+					// attempt 1's APPROVED substitutions are passed back in as
+					// the only thing recognition cannot re-derive: their created
+					// paths entered cfg.scopeFiles by an amendment rather than by
+					// the plan. When the re-invoked agent renumbers AGAIN those
+					// folded paths go absent, and without that provenance the two
+					// same-slug absent declared pairs collide in the strict 1:1
+					// sweep and the second renumber is never offered (see
+					// dropAbsentFoldedCreations).
+					//
+					// The re-invoke is the LAST park in the stage (the block is
+					// linear — a second conflict falls through to category-B), so
+					// its own substitutions have no further consumer and are
+					// discarded.
 					if willOpenPR {
-						renumberExemptions = mergeExemptions(renumberExemptions,
-							maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, logSink))
+						reinvokeRenumberExemptions, _ :=
+							maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, renumberSubs, logSink)
+						renumberExemptions = mergeExemptions(renumberExemptions, reinvokeRenumberExemptions)
 					}
 					reinvokeExemptions := mergeExemptions(mergeExemptions(validatedExemptions, operatorExemptions), renumberExemptions)
 					// Supplemental re-invoke delta (#1218): the trace bundle (and its

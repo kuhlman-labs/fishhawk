@@ -561,7 +561,7 @@ func TestMaybeParkForMigrationRenumber_ScanErrorFailsOpen(t *testing.T) {
 	cfg := renumberDriverCfg()
 	cfg.workingDir = repo
 	var log strings.Builder
-	if got := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", &log); got != nil {
+	if got, _ := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", nil, &log); got != nil {
 		t.Fatalf("a scan error must fail open, got %+v", got)
 	}
 	if !strings.Contains(log.String(), `"event":"migration_renumber_scan_skipped"`) {
@@ -580,7 +580,7 @@ func TestMaybeParkForMigrationRenumber_NoRecognitionIsSilent(t *testing.T) {
 	cfg := renumberDriverCfg()
 	cfg.workingDir = repo
 	var log strings.Builder
-	if got := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", &log); got != nil {
+	if got, _ := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", nil, &log); got != nil {
 		t.Fatalf("nothing recognized must return nil, got %+v", got)
 	}
 	if log.String() != "" {
@@ -588,6 +588,318 @@ func TestMaybeParkForMigrationRenumber_NoRecognitionIsSilent(t *testing.T) {
 	}
 	if len(fu.gotRequestAmendmentArgs) != 0 {
 		t.Errorf("no recognition must not POST an amendment")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2748 fix-up — the decision budget bounds the BLOCKED request, not just the
+// gaps between requests.
+// ---------------------------------------------------------------------------
+
+// TestBoundedRenumberWaitSeconds pins the per-request `?wait=N` cap: never more
+// than the fixed hold, never more than the whole seconds left in the budget,
+// and 0 (which omits the parameter entirely) once under a second remains.
+func TestBoundedRenumberWaitSeconds(t *testing.T) {
+	orig := migrationRenumberWaitSeconds
+	migrationRenumberWaitSeconds = 30
+	t.Cleanup(func() { migrationRenumberWaitSeconds = orig })
+
+	cases := []struct {
+		remaining time.Duration
+		want      int
+	}{
+		{-time.Second, 0},
+		{0, 0},
+		{500 * time.Millisecond, 0},
+		{time.Second, 1},
+		{1500 * time.Millisecond, 1},
+		{7 * time.Second, 7},
+		{29999 * time.Millisecond, 29},
+		{30 * time.Second, 30},
+		{15 * time.Minute, 30},
+	}
+	for _, tc := range cases {
+		if got := boundedRenumberWaitSeconds(tc.remaining); got != tc.want {
+			t.Errorf("boundedRenumberWaitSeconds(%s) = %d, want %d", tc.remaining, got, tc.want)
+		}
+	}
+}
+
+// blockingAmendmentUploader is a fakeUploader whose FetchScopeAmendments
+// genuinely BLOCKS — the shape the ordinary fake cannot produce, since it
+// returns immediately and so never exercises the bound on a request in flight.
+// It returns as soon as the request context is done (a well-behaved server
+// honouring the deadline the client imposed) or after hold elapses (a server
+// that ignores `?wait` entirely), whichever comes first.
+type blockingAmendmentUploader struct {
+	*fakeUploader
+	hold      time.Duration
+	waitSeen  []int
+	unblocked int
+}
+
+func (b *blockingAmendmentUploader) FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error) {
+	b.waitSeen = append(b.waitSeen, args.WaitSeconds)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(b.hold):
+		b.unblocked++
+		return b.fakeUploader.FetchScopeAmendments(context.Background(), args)
+	}
+}
+
+// TestAwaitMigrationRenumberDecision_BlockedFetchHonoursBudget is the
+// budget-boundary vehicle: the backend holds the long-poll far longer than the
+// whole decision budget. The park must still return within the budget, and must
+// classify the expiry as UNDECIDED (the amendment really is undecided) rather
+// than as an unavailable backend.
+//
+// The bound is asserted on ELAPSED WALL CLOCK, not on error identity: a driver
+// that checked the deadline only between requests returns the same "undecided"
+// string — it just returns it ~hold later, having pinned the stage open.
+func TestAwaitMigrationRenumberDecision_BlockedFetchHonoursBudget(t *testing.T) {
+	const budget = 60 * time.Millisecond
+	// hold is deliberately 50x the budget: an unbounded fetch overshoots by a
+	// margin no scheduling jitter can explain away.
+	const hold = 3 * time.Second
+	pinRenumberBudget(t, budget)
+
+	inner := newFakeUploader(t)
+	inner.amendmentsAfterRequest = decidedRow("pending")
+	bu := &blockingAmendmentUploader{fakeUploader: inner, hold: hold}
+	cfg := renumberDriverCfg()
+
+	start := time.Now()
+	approved, exemptions, log := runRenumberDriver(t, context.Background(), bu, cfg, "fhm_token")
+	elapsed := time.Since(start)
+
+	if approved || exemptions != nil {
+		t.Fatalf("a blocked fetch at the budget boundary must fail open: approved=%v exemptions=%+v", approved, exemptions)
+	}
+	assertDecidedEvent(t, log, "undecided")
+	// Generous ceiling (10x the budget, still 5x under the hold) so the
+	// assertion discriminates the unbounded fetch without being flaky.
+	if elapsed > 10*budget {
+		t.Errorf("the park held for %s with a %s budget — the blocked long-poll is not bounded by the remaining budget", elapsed, budget)
+	}
+	if bu.unblocked != 0 {
+		t.Errorf("the fetch returned on its own %d time(s); the budget deadline must be what ends it", bu.unblocked)
+	}
+	if len(bu.waitSeen) == 0 {
+		t.Fatal("no fetch was issued")
+	}
+	for i, w := range bu.waitSeen {
+		if w > int(budget/time.Second) {
+			t.Errorf("fetch %d asked the server to hold %ds, more than the %s budget", i, w, budget)
+		}
+	}
+}
+
+// TestAwaitMigrationRenumberDecision_PollPauseBoundedByBudget covers the other
+// way the loop can outlive its budget: a server that returns IMMEDIATELY (no
+// pending row to hold on) sends the driver into the poll-interval pause, which
+// must itself be capped at the time left. With a 2s cadence and a 40ms budget an
+// uncapped pause overshoots by ~50x.
+func TestAwaitMigrationRenumberDecision_PollPauseBoundedByBudget(t *testing.T) {
+	const budget = 40 * time.Millisecond
+	origB, origP := migrationRenumberDecisionBudget, migrationRenumberPollInterval
+	migrationRenumberDecisionBudget = budget
+	migrationRenumberPollInterval = 2 * time.Second
+	t.Cleanup(func() {
+		migrationRenumberDecisionBudget = origB
+		migrationRenumberPollInterval = origP
+	})
+
+	fu := newFakeUploader(t)
+	fu.amendmentsAfterRequest = decidedRow("pending")
+	cfg := renumberDriverCfg()
+
+	start := time.Now()
+	approved, exemptions, log := runRenumberDriver(t, context.Background(), fu, cfg, "fhm_token")
+	elapsed := time.Since(start)
+
+	if approved || exemptions != nil {
+		t.Fatalf("must fail open: approved=%v exemptions=%+v", approved, exemptions)
+	}
+	assertDecidedEvent(t, log, "undecided")
+	if elapsed > 10*budget {
+		t.Errorf("the park held for %s with a %s budget — the poll pause is not capped at the remaining budget", elapsed, budget)
+	}
+}
+
+// TestAwaitMigrationRenumberDecision_ParentContextStillUnavailable guards the
+// classification split the budget bound introduces from over-broadening: the
+// budget-expiry branch must claim ONLY our own derived deadline. A PARENT
+// cancellation and a PARENT deadline (the stage-level timeout) are both
+// `unavailable` — the amendment's fate is unknown because the process is going
+// away, not because the decision budget ran out. The parent deadline is the
+// discriminating case: its error IS context.DeadlineExceeded, so only the
+// parent-health check keeps it out of the undecided branch.
+func TestAwaitMigrationRenumberDecision_ParentContextStillUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+	}{
+		{"parent_cancelled", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				cancel()
+			}()
+			return ctx, cancel
+		}},
+		{"parent_deadline", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 20*time.Millisecond)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A budget far longer than the parent's life, so only the parent
+			// context can end the fetch.
+			pinRenumberBudget(t, time.Minute)
+			inner := newFakeUploader(t)
+			inner.amendmentsAfterRequest = decidedRow("pending")
+			bu := &blockingAmendmentUploader{fakeUploader: inner, hold: time.Minute}
+			cfg := renumberDriverCfg()
+
+			ctx, cancel := tc.ctx()
+			defer cancel()
+
+			approved, exemptions, log := runRenumberDriver(t, ctx, bu, cfg, "fhm_token")
+			if approved || exemptions != nil {
+				t.Fatalf("a dead parent context must fail open: approved=%v exemptions=%+v", approved, exemptions)
+			}
+			assertDecidedEvent(t, log, "unavailable")
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2748 fix-up — approve, then re-invoke with a NEW number.
+// ---------------------------------------------------------------------------
+
+const (
+	created2Up = migDir + "/0072_campaigns_working_dir.up.sql"
+	created2Dn = migDir + "/0072_campaigns_working_dir.down.sql"
+)
+
+// TestMaybeParkForMigrationRenumber_ReinvokeRenumbersAgain is the
+// approve-then-reinvoke-with-a-new-number regression. Attempt 1 renumbers
+// 0070 → 0071 and the operator approves, folding the 0071 pair into
+// cfg.scopeFiles. The base-rebase re-invoke then renumbers AGAIN, 0071 → 0072.
+//
+// Without the folded-path provenance the declared set now holds TWO absent
+// same-slug pairs (0070 and the folded 0071) both claiming the one on-disk 0072
+// pair; the strict global 1:1 sweep rejects the whole result and NO second
+// amendment is offered — the second ship falls into category-B for making the
+// correct rename, which is exactly the defect #2748 exists to close.
+func TestMaybeParkForMigrationRenumber_ReinvokeRenumbersAgain(t *testing.T) {
+	pinRenumberBudget(t, time.Minute)
+	repo := renumberRepo(t, createdUp, createdDn)
+	fu := newFakeUploader(t)
+	fu.requestAmendmentDecision = "approved"
+	cfg := renumberDriverCfg()
+	cfg.workingDir = repo
+
+	var log strings.Builder
+	exemptions, subs := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", nil, &log)
+	if len(subs) != 1 || len(exemptions) != 2 {
+		t.Fatalf("attempt 1: subs=%+v exemptions=%+v, want one substitution and two exemptions:\n%s", subs, exemptions, log.String())
+	}
+	if !containsString(scopePaths(cfg.scopeFiles), createdUp) {
+		t.Fatalf("attempt 1's approval must fold the created pair: %v", scopePaths(cfg.scopeFiles))
+	}
+
+	// The re-invoked agent renumbers AGAIN: the folded 0071 pair leaves the
+	// work tree and a 0072 pair takes its place.
+	for _, p := range []string{createdUp, createdDn} {
+		if err := os.Remove(filepath.Join(repo, filepath.FromSlash(p))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{created2Up, created2Dn} {
+		if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(p)), []byte("-- sql\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	log.Reset()
+	exemptions2, subs2 := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", subs, &log)
+	if len(subs2) != 1 {
+		t.Fatalf("the re-invoked renumber must be recognized, got %+v:\n%s", subs2, log.String())
+	}
+	if subs2[0].CreatedUp != created2Up || subs2[0].CreatedDown != created2Dn {
+		t.Errorf("the second substitution must name the 0072 pair, got %+v", subs2[0])
+	}
+	if len(fu.gotRequestAmendmentArgs) != 2 {
+		t.Fatalf("RequestScopeAmendment calls = %d, want 2 (one per renumber)", len(fu.gotRequestAmendmentArgs))
+	}
+	req := fu.gotRequestAmendmentArgs[1]
+	want := []upload.ScopeAmendmentPath{
+		{Path: created2Up, Operation: "create"},
+		{Path: created2Dn, Operation: "create"},
+	}
+	if len(req.Paths) != 2 || req.Paths[0] != want[0] || req.Paths[1] != want[1] {
+		t.Errorf("second amendment paths = %+v, want exactly %+v", req.Paths, want)
+	}
+	// The ABANDONED folded pair carries its own exemptions: it is still in
+	// cfg.scopeFiles from attempt 1's fold but no longer in the work tree, so
+	// without them the scope-completeness gate demands a file the re-invoke
+	// deliberately dropped.
+	gotExempt := map[string]bool{}
+	for _, e := range exemptions2 {
+		gotExempt[e.Path] = true
+	}
+	for _, p := range []string{createdUp, createdDn, declaredUp, declaredDn} {
+		if !gotExempt[p] {
+			t.Errorf("exemptions %+v missing %s", exemptions2, p)
+		}
+	}
+}
+
+// TestMaybeParkForMigrationRenumber_ReinvokeKeepsFoldedPair is the other half of
+// the same control: when the re-invoked agent LEAVES the approved pair in
+// place, the folded path stays declared, the "created pair already declared"
+// branch disqualifies it, and NO second amendment is filed. Dropping the folded
+// paths unconditionally — rather than only when they are absent — files a
+// spurious second request and burns the stage's amendment budget.
+func TestMaybeParkForMigrationRenumber_ReinvokeKeepsFoldedPair(t *testing.T) {
+	pinRenumberBudget(t, time.Minute)
+	repo := renumberRepo(t, createdUp, createdDn)
+	fu := newFakeUploader(t)
+	fu.requestAmendmentDecision = "approved"
+	cfg := renumberDriverCfg()
+	cfg.workingDir = repo
+
+	var log strings.Builder
+	_, subs := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", nil, &log)
+	if len(subs) != 1 {
+		t.Fatalf("attempt 1 must recognize the renumber, got %+v:\n%s", subs, log.String())
+	}
+
+	// The re-invoke changes nothing about the migrations.
+	exemptions2, subs2 := maybeParkForMigrationRenumber(context.Background(), fu, cfg, "fhm_token", subs, &log)
+	if len(subs2) != 0 || exemptions2 != nil {
+		t.Errorf("an unchanged re-invoke must offer nothing: subs=%+v exemptions=%+v", subs2, exemptions2)
+	}
+	if len(fu.gotRequestAmendmentArgs) != 1 {
+		t.Errorf("RequestScopeAmendment calls = %d, want 1 — the already-folded pair must not be re-requested", len(fu.gotRequestAmendmentArgs))
+	}
+}
+
+// TestDropAbsentFoldedCreations_HalfPresentPairStaysDeclared: a folded pair with
+// only ONE path removed is left declared — the conservative direction, since a
+// half-renumber is not a coherent substitution.
+func TestDropAbsentFoldedCreations_HalfPresentPairStaysDeclared(t *testing.T) {
+	repo := renumberRepo(t, createdUp)
+	declared := []string{declaredUp, declaredDn, createdUp, createdDn}
+	got, exemptions, err := dropAbsentFoldedCreations(repo, declared, renumberSubs)
+	if err != nil {
+		t.Fatalf("dropAbsentFoldedCreations: %v", err)
+	}
+	if len(got) != len(declared) || exemptions != nil {
+		t.Errorf("a half-present folded pair must stay declared: got=%v exemptions=%+v", got, exemptions)
 	}
 }
 
