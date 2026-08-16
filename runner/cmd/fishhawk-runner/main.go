@@ -6124,6 +6124,105 @@ func openImplementChangeRequest(ctx context.Context, cfg config, token string, a
 	return newPROpener(token).OpenPR(ctx, args)
 }
 
+// runnerNow is the wall clock the re-auth path reports its held-token age from.
+// Package-level so tests inject a deterministic clock (there was no such seam in
+// this package before #2730).
+var runnerNow = time.Now
+
+// openChangeRequestWithReauth opens the implement-stage change request and, on a
+// 401 ONLY, re-authenticates and re-attempts EXACTLY ONCE (#2730).
+//
+// The fault it closes: the credential is minted at the TOP of
+// openPRAndShipArtifact but the forge write happens after CommitAndPush — whose
+// committed-tree re-verify can run for minutes — and the backend's
+// githubapp.CachedProvider only guarantees RefreshLeadTime (5m) of remaining life
+// at mint. A GitHub App installation token lives ~1 hour, so a full-hour stage
+// can push the gate-verified commit successfully and then die `401 Bad
+// credentials` at PR-open, failing the whole stage after the work already landed
+// on the run branch.
+//
+// The contract, all three parts load-bearing:
+//
+//   - 401-ONLY. The trigger is errors.Is(err, gitops.ErrUnauthorized), which the
+//     gitops layer wraps onto 401 responses only. A 403 (valid credential,
+//     insufficient permission), a 422, or a 5xx passes through UNCHANGED — same
+//     error value, same downstream category, no re-mint, no second attempt.
+//   - EXACTLY ONCE. The re-attempt is straight-line code, not a loop, so a
+//     genuinely-invalid credential costs one extra HTTP call and never becomes an
+//     unbounded retry.
+//   - NO DUPLICATE PR. gitops.OpenPR is idempotent adopt-then-create (#2167): it
+//     lists by head first and adopts, so a re-attempt after a partial failure
+//     cannot open a second pull request.
+//
+// heldSince is when THIS runner obtained the token, so the reported
+// token_held_seconds is a LOWER BOUND on true token age — CachedProvider can
+// serve an already-aged cached token. The field is named for what it measures
+// (see the runner README).
+//
+// Each outcome is self-diagnosing in the recorded failure reason: an expiry a
+// fresh credential FIXES is not a failure at all (just a
+// pr_open_reauth_succeeded event), a re-mint that itself failed names both
+// faults, and a fresh credential rejected too is reported explicitly as a
+// genuinely-invalid credential rather than a mid-stage expiry.
+func openChangeRequestWithReauth(
+	ctx context.Context,
+	cfg config,
+	logSink io.Writer,
+	token string,
+	heldSince time.Time,
+	remint func(context.Context) (string, error),
+	args gitops.OpenPRArgs,
+) (*gitops.OpenPRResult, error) {
+	res, err := openImplementChangeRequest(ctx, cfg, token, args)
+	if err == nil {
+		return res, nil
+	}
+	if !errors.Is(err, gitops.ErrUnauthorized) {
+		// Byte-identical pass-through: the error value itself, not a wrap.
+		return nil, err
+	}
+
+	heldSeconds := int64(runnerNow().Sub(heldSince) / time.Second)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pr_open_reauth_attempted","run_id":%q,"stage_id":%q,"token_held_seconds":%d}`+"\n",
+		cfg.runID, cfg.stageID, heldSeconds)
+
+	fresh, mintErr := remint(ctx)
+	if mintErr != nil {
+		return nil, fmt.Errorf("the forge rejected the credential this stage had held for %ds, and re-minting a fresh one failed (%v): %w",
+			heldSeconds, mintErr, err)
+	}
+
+	res, err2 := openImplementChangeRequest(ctx, cfg, fresh, args)
+	if err2 == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_open_reauth_succeeded","run_id":%q,"stage_id":%q,"token_held_seconds":%d}`+"\n",
+			cfg.runID, cfg.stageID, heldSeconds)
+		return res, nil
+	}
+	if errors.Is(err2, gitops.ErrUnauthorized) {
+		return nil, fmt.Errorf("a freshly minted credential was rejected too, so this is NOT a mid-stage token expiry: the credential is genuinely invalid for this repo — %s: %w",
+			reauthRemedyHint(cfg), err2)
+	}
+	return nil, fmt.Errorf("after credential refresh: %w", err2)
+}
+
+// reauthRemedyHint names the operator-side fix for a genuinely-invalid
+// credential, per forge.
+func reauthRemedyHint(cfg config) string {
+	if cfg.forge == forgeGitLab {
+		return "verify FISHHAWK_GITLAB_TOKEN is valid and carries `api` scope"
+	}
+	repoHint := cfg.githubRepo
+	if repoHint == "" {
+		repoHint = os.Getenv("GITHUB_REPOSITORY")
+	}
+	if repoHint == "" {
+		repoHint = "the target repo"
+	}
+	return fmt.Sprintf("verify the Fishhawk GitHub App is installed on %s with pull-request write access", repoHint)
+}
+
 // implementBranchRouting is the resolved branch routing for an implement
 // push: which branch the stage commits to and which of the three mutually
 // exclusive paths (fix-up / decomposed child / standalone) it is on.
@@ -6425,6 +6524,12 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	if err != nil {
 		return fail("C", err.Error())
 	}
+	// When this runner obtained the credential, for the 401 re-auth path's
+	// token_held_seconds (#2730).
+	tokenHeldSince := runnerNow()
+	remint := func(rctx context.Context) (string, error) {
+		return mintImplementToken(rctx, cfg, client, issued, logSink)
+	}
 
 	// REMOTE-TIP GUARD (#2169), pr_open resume ONLY. Re-prove the run branch
 	// still points at the checkpointed head BEFORE touching the forge. ADR-035
@@ -6488,7 +6593,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// MR opener against cfg.gitlabBaseURL, NOT a GitHub PR against the
 	// hardcoded api.github.com base — which would transmit the minted
 	// FISHHAWK_GITLAB_TOKEN to an unintended host and fail the stage.
-	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
+	prRes, err := openChangeRequestWithReauth(ctx, cfg, logSink, token, tokenHeldSince, remint, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
 		Head:  branch,
@@ -6654,9 +6759,23 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// actions/checkout) and the Ed25519 one here (used by push +
 	// PR). Both attribute to the App; auth_method on each entry
 	// identifies which path served. (#201.)
+	//
+	// MINTING HERE IS NOT SUFFICIENT (#2730). This mint is at the TOP of the
+	// function, but the forge write is far below, AFTER CommitAndPush — whose
+	// committed-tree verify (and its verify-fix loop) can run for minutes. The
+	// backend cache only guarantees RefreshLeadTime (5m) of remaining life at
+	// mint (backend/internal/githubapp/cache.go), so the credential can die in
+	// that gap: the push on this token succeeds and the PR-open 401s, failing
+	// the whole stage after the gate-verified commit already landed. The
+	// PR-open call therefore routes through openChangeRequestWithReauth, which
+	// re-mints and re-attempts exactly once on a 401.
 	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
 	if err != nil {
 		return err
+	}
+	tokenHeldSince := runnerNow()
+	remintImplementToken := func(rctx context.Context) (string, error) {
+		return mintImplementToken(rctx, cfg, client, issued, logSink)
 	}
 
 	// Repo: --github-repo flag > GITHUB_REPOSITORY env. The flag
@@ -7605,7 +7724,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA)
 	}
 
-	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
+	prRes, err := openChangeRequestWithReauth(ctx, cfg, logSink, token, tokenHeldSince, remintImplementToken, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
 		Head:  branch,

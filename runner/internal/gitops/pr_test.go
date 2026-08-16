@@ -3,6 +3,7 @@ package gitops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -488,6 +489,114 @@ func TestOpenPR_ListByHeadErrorStatus(t *testing.T) {
 	}
 }
 
+// #2730 (a). A create-POST 401 is classified ErrUnauthorized so the runner can
+// re-authenticate once, and STILL carries the status + body text an operator
+// reads today (the sentinel rides as a trailing wrap, it does not replace it).
+func TestOpenPR_CreateUnauthorizedClassified(t *testing.T) {
+	stub, srv := newStubAPI(t)
+	stub.createResponses = []stubResp{{code: http.StatusUnauthorized, body: `{"message":"Bad credentials"}`}}
+	c := newRetryClient(srv)
+
+	_, err := c.OpenPR(context.Background(), OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("errors.Is(err, ErrUnauthorized) = false; err = %v", err)
+	}
+	for _, want := range []string{"gitops: open PR:", "401", "Bad credentials"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to retain %q", err, want)
+		}
+	}
+}
+
+// #2730 (b). OpenPR lists by head BEFORE it creates, so an expired credential is
+// rejected on the GET first: same classification, same retained text.
+func TestOpenPR_ListByHeadUnauthorizedClassified(t *testing.T) {
+	stub, srv := newStubAPI(t)
+	stub.listResponses = []stubResp{{code: http.StatusUnauthorized, body: `{"message":"Bad credentials"}`}}
+	c := newRetryClient(srv)
+
+	_, err := c.OpenPR(context.Background(), OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("errors.Is(err, ErrUnauthorized) = false; err = %v", err)
+	}
+	for _, want := range []string{"gitops: list PRs by head:", "401", "Bad credentials"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to retain %q", err, want)
+		}
+	}
+	if stub.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (the GET failed first)", stub.createCalls)
+	}
+}
+
+// #2730 (c). SINGLE ROUND TRIP on 401 — the control that pins 401 OUT of
+// retryableStatus. Replaying a dead credential against the same endpoint cannot
+// succeed, so the caller (not doRetrying) owns the re-attempt. Adding 401 to
+// retryableStatus reddens these counts (MaxRetries=3 → 4 round trips).
+func TestOpenPR_UnauthorizedSingleRoundTrip(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		stub, srv := newStubAPI(t)
+		stub.createResponses = []stubResp{{code: http.StatusUnauthorized, body: `{"message":"Bad credentials"}`}}
+		c := newRetryClient(srv)
+		if _, err := c.OpenPR(context.Background(), OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"}); err == nil {
+			t.Fatal("expected an error")
+		}
+		if stub.createCalls != 1 {
+			t.Errorf("createCalls = %d, want exactly 1 (401 is not retried in place)", stub.createCalls)
+		}
+	})
+	t.Run("list", func(t *testing.T) {
+		stub, srv := newStubAPI(t)
+		stub.listResponses = []stubResp{{code: http.StatusUnauthorized, body: `{"message":"Bad credentials"}`}}
+		c := newRetryClient(srv)
+		if _, err := c.OpenPR(context.Background(), OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"}); err == nil {
+			t.Fatal("expected an error")
+		}
+		if stub.listCalls != 1 {
+			t.Errorf("listCalls = %d, want exactly 1 (401 is not retried in place)", stub.listCalls)
+		}
+	})
+}
+
+// #2730 (d). The negative controls: the classification is 401-ONLY, so no other
+// failure makes the runner re-mint. A plain permission 403 (valid credential,
+// insufficient permission), a non-duplicate 422, and an exhausted 500 all report
+// errors.Is(err, ErrUnauthorized) == false.
+func TestOpenPR_NonUnauthorizedFailuresNotClassified(t *testing.T) {
+	cases := []struct {
+		name   string
+		create stubResp
+	}{
+		{"plain permission 403", stubResp{code: http.StatusForbidden, body: `{"message":"Resource not accessible by integration"}`}},
+		{"non-duplicate 422", stubResp{code: http.StatusUnprocessableEntity, body: `{"message":"Validation Failed","errors":[{"message":"No commits between main and h"}]}`}},
+		{"sustained 500", stubResp{code: http.StatusInternalServerError, body: `{"message":"down"}`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub, srv := newStubAPI(t)
+			stub.createResponses = []stubResp{tc.create}
+			c := newRetryClient(srv)
+			c.MaxRetries = 1
+			_, err := c.OpenPR(context.Background(), OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if errors.Is(err, ErrUnauthorized) {
+				t.Errorf("a %s must NOT be classified ErrUnauthorized; err = %v", tc.name, err)
+			}
+			if stub.createCalls == 0 {
+				t.Error("fixture bug: the create POST must actually fire for this control to mean anything")
+			}
+		})
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	mk := func(headers map[string]string) *http.Response {
@@ -561,6 +670,9 @@ func TestRetryableStatus(t *testing.T) {
 		{500, nil, true}, {503, nil, true}, {599, nil, true}, {429, nil, true},
 		{403, rl, true}, {403, primary, true}, {403, nil, false},
 		{404, nil, false}, {422, nil, false}, {201, nil, false},
+		// 401 stays NON-retryable (#2730): the caller re-authenticates, an
+		// in-place replay of a dead credential cannot succeed.
+		{401, nil, false}, {401, rl, false},
 	}
 	for _, tc := range cases {
 		if got := retryableStatus(tc.code, tc.h); got != tc.want {
