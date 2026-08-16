@@ -261,7 +261,7 @@ func TestDecideScopeCompleteness_MissingScope403(t *testing.T) {
 }
 
 // TestDecideScopeCompleteness_BadDecision400 / empty reason pin the input
-// validation: only exempt|fail with a non-empty reason is accepted.
+// validation: only exempt|amend|fail with a non-empty reason is accepted.
 func TestDecideScopeCompleteness_BadInput400(t *testing.T) {
 	s, _, _, runRow, _ := scopeCompletenessServer(t)
 	for _, body := range []string{
@@ -273,6 +273,25 @@ func TestDecideScopeCompleteness_BadInput400(t *testing.T) {
 		w := postScopeCompletenessDecision(t, s, runRow.ID, body, operatorWriteStages)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("body %s: status = %d, want 400; body = %s", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestDecideScopeCompleteness_BadDecisionMessageNamesEveryDecision pins the
+// enum error TEXT, not just its status (#2591). The message IS the operator's
+// discovery surface for the decision set: one that still reads
+// `must be "exempt" or "fail"` would tell an operator holding a build-required
+// park — the class whose exempt is refused outright — that their only remaining
+// move is to fail the pass, which is exactly the dead end amend closes.
+func TestDecideScopeCompleteness_BadDecisionMessageNamesEveryDecision(t *testing.T) {
+	s, _, _, runRow, _ := scopeCompletenessServer(t)
+	w := postScopeCompletenessDecision(t, s, runRow.ID, `{"decision":"maybe","reason":"r"}`, operatorWriteStages)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{"exempt", "amend", "fail"} {
+		if !strings.Contains(w.Body.String(), `\"`+want+`\"`) {
+			t.Errorf("the enum error must name %q as an admissible decision: %s", want, w.Body.String())
 		}
 	}
 }

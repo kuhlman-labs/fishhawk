@@ -13895,13 +13895,13 @@ paths:
   /v0/runs/{run_id}/scope-completeness/decision:
     post:
       operationId: decideScopeCompleteness
-      summary: Exempt or fail a parked scope-completeness shortfall (operator)
+      summary: Exempt, amend or fail a parked scope-completeness shortfall (operator)
       description: |
-        Records the operator's exempt-or-fail decision on an implement
-        stage parked in `awaiting_scope_decision` (#1231): the stage's
-        ONLY committed-tree gate failure was the scope-completeness
-        "missing declared scope file(s)" check, and the runner already
-        pushed its gate-verified commit to the run branch (no PR).
+        Records the operator's exempt-, amend- or fail decision on an
+        implement stage parked in `awaiting_scope_decision` (#1231): the
+        stage's ONLY committed-tree gate failure was a scope-completeness
+        shortfall, and the runner already pushed its gate-verified commit
+        to the run branch (no PR).
 
         **Auth: operator bearer/session ONLY** — bearer tokens require
         `write:stages`. Run-bound `fhm_` tokens are rejected outright
@@ -13920,6 +13920,24 @@ paths:
         path) and a `scope_completeness_failed` entry is appended
         best-effort. A stage not currently parked returns 409
         (`stage_not_parked`).
+
+        On `amend` (#2591) the `paths` are folded into THIS stage's
+        effective scope as a pre-approved #961 scope-amendment row and the
+        stage resumes to `pending`, so the agent RE-RUNS against the wider
+        scope. The held commit is left untouched on the run branch
+        (ADR-035). `amend` is the only non-fail resolution for a
+        BUILD-REQUIRED-class park, whose `exempt` is refused outright. The
+        amend must cover every `build_required_path` the park recorded
+        (else 409 `amend_incomplete_coverage`), is refused when a path's
+        OWNING sibling slice has already started its implement pass (409
+        `amend_refused_owner_slice_active`), is refused when ownership
+        cannot be RESOLVED unless `acknowledge_owner_unresolved` is true
+        (409 `amend_owner_attribution_unresolved`), and is capped per stage
+        (409 `amend_budget_exhausted`). The row, the audit entry and the
+        resume are three writes with no shared transaction, so the amend is
+        IDEMPOTENT: a re-POST of the same decision REUSES the row rather
+        than minting a second, which would silently spend one of the
+        re-run agent's two mid-stage #961 slots.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -13933,12 +13951,48 @@ paths:
               properties:
                 decision:
                   type: string
-                  enum: [exempt, fail]
+                  enum: [exempt, amend, fail]
                 reason:
                   type: string
                   description: |
-                    Operator note explaining the exemption or failure;
-                    recorded on the audit entry. Required and non-empty.
+                    Operator note explaining the exemption, the widening or
+                    the failure; recorded on the audit entry. Required and
+                    non-empty.
+                paths:
+                  type: array
+                  description: |
+                    `amend` ONLY (#2591) — the files to fold into the parked
+                    stage's effective scope. Required and non-empty on
+                    `amend`; supplying it with any other decision is 400.
+                    Same {path, operation} vocabulary and the same
+                    repo-relative containment validation as a #961 mid-stage
+                    scope amendment.
+                  items:
+                    type: object
+                    required: [path, operation]
+                    properties:
+                      path:
+                        type: string
+                        description: Repo-relative; absolute or `..`-containing paths are rejected.
+                      operation:
+                        type: string
+                        enum: [modify, create]
+                acknowledge_owner_unresolved:
+                  type: boolean
+                  description: |
+                    `amend` ONLY — re-admits an amend whose owner-slice guard
+                    could not RESOLVE ownership for a submitted path. The
+                    guard fails CLOSED by default (409
+                    `amend_owner_attribution_unresolved`); setting this true
+                    proceeds AND records the acknowledgement on the response
+                    and the `scope_completeness_amended` audit entry, so the
+                    relaxation is an audited operator decision. It never
+                    relaxes `amend_refused_owner_slice_active`. Supplying it
+                    with any other decision is 400 `validation_failed`: only
+                    the amend arm runs an owner-slice guard, so on
+                    `exempt`/`fail` it would be silently ignored and the
+                    caller would believe an unrecorded risk decision had been
+                    audited.
       responses:
         '200':
           description: |
@@ -13960,7 +14014,7 @@ paths:
                   stage_id: { $ref: '#/components/schemas/UUID' }
                   decision:
                     type: string
-                    enum: [exempt, fail]
+                    enum: [exempt, amend, fail]
                   state:
                     type: string
                     description: The implement stage's resulting state.
@@ -14010,8 +14064,68 @@ paths:
                         path: { type: string }
                         slice_index: { type: integer }
                         slice_title: { type: string }
+                  amended_paths:
+                    type: array
+                    description: |
+                      Present on `amend` (#2591) — the validated paths folded
+                      into the parked stage's effective scope, each keeping its
+                      declared operation.
+                    items:
+                      type: object
+                      required: [path, operation]
+                      properties:
+                        path: { type: string }
+                        operation:
+                          type: string
+                          enum: [modify, create]
+                  amendment_id:
+                    type: string
+                    format: uuid
+                    description: |
+                      Present on `amend` — the pre-approved #961 scope-amendment
+                      row the widening landed on. Stable across a retry: the row
+                      is reused, never duplicated.
+                  owner_attribution_unresolved:
+                    type: boolean
+                    description: |
+                      Present on `amend` when the owner-slice guard could not
+                      establish ownership for at least one amended path. It can
+                      only be true alongside `acknowledged_owner_unresolved` —
+                      unacknowledged, that arm is refused 409.
+                  owner_unresolved_paths:
+                    type: array
+                    description: |
+                      Present on an acknowledged `amend` — each path whose
+                      ownership could not be resolved, with the reason
+                      (`no_owning_slice_entry`, `owning_slice_index_absent`,
+                      `sibling_lookup_failed`, `owning_slice_run_not_found`,
+                      `owning_slice_stages_unreadable`,
+                      `owning_slice_implement_stage_absent`).
+                    items:
+                      type: object
+                      required: [path, reason]
+                      properties:
+                        path: { type: string }
+                        reason: { type: string }
+                  acknowledged_owner_unresolved:
+                    type: boolean
+                    description: |
+                      Present on `amend` — echoes the operator's explicit
+                      `acknowledge_owner_unresolved`, so the response records
+                      that the relaxation was deliberate.
+                  agent_amendment_budget_remaining:
+                    type: integer
+                    description: |
+                      Present on `amend` — how many of the stage's two #961
+                      mid-stage amendment slots the RE-RUN agent still has. An
+                      operator amend consumes one (the cap counts ROWS), so the
+                      cost is surfaced rather than hidden.
         '400':
-          description: Malformed run_id, decision not exempt/fail, or empty reason.
+          description: |
+            Malformed run_id, decision not exempt/amend/fail, empty reason,
+            `paths` absent on `amend` or supplied with any other decision, or a
+            path entry that is empty, absolute, `..`-containing, or carries an
+            operation other than modify/create.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14044,7 +14158,33 @@ paths:
             left parked and NO exempted entry is appended; the only admissible
             decision is `fail`. `details` carries `shortfall_class`,
             `build_required_paths`, `owning_slices`, and
-            `admissible_decisions`.
+            `admissible_decisions`. Since #2591 `amend` is also admissible for
+            this class — it is the only non-fail resolution.
+
+            `amend_incomplete_coverage` (#2591) — the amended `paths` do not
+            cover every `build_required_path` the park recorded, so a re-run
+            would re-park identically and burn a full agent pass. `details`
+            carries `uncovered_paths` and `build_required_paths`.
+
+            `amend_refused_owner_slice_active` (#2591) — a submitted path is
+            owned by a sibling slice whose implement pass has already STARTED,
+            the window in which two branches can carry divergent edits to one
+            file. `details` carries `path`, `slice_index`, `slice_title`,
+            `sibling_run_id` and `sibling_implement_state`.
+
+            `amend_owner_attribution_unresolved` (#2591) — the OWNING slice of
+            at least one submitted path could not be resolved, so the amend
+            cannot be shown to preserve the single-owner-file invariant. The
+            guard fails CLOSED: `details` names each unresolved path with its
+            reason, and the operator re-admits it with
+            `acknowledge_owner_unresolved: true`.
+
+            `amend_budget_exhausted` (#2591) — this stage has already been
+            amended-and-resumed the maximum number of times; the remaining
+            resolution is `fail` plus a corrected decomposition.
+
+            Every 409 leaves the stage parked with NO amendment row and NO
+            audit entry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14055,6 +14195,15 @@ paths:
             prompt emission gate reads as authorization does not exist
             (#2501). The decision is refused and the stage is left
             parked in `awaiting_scope_decision`; re-POST it.
+
+            `amend_unrecorded` (#2591) — the scope-amendment row or the
+            `scope_completeness_amended` audit entry could not be written, so
+            the widening the re-run would execute against does not exist. The
+            stage is left parked; re-POST it — the amendment row is REUSED, not
+            duplicated, so a retry cannot drain the agent's #961 budget.
+
+            `amend_resume_failed` (#2591) — the widening was recorded but the
+            parked stage could not be resumed. Same retry-safe shape.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -1162,7 +1162,8 @@ Notes:
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
-  `scope_completeness_exempted`, and `scope_completeness_failed` (#1231/#2501/#2548) — are
+  `scope_completeness_exempted`, `scope_completeness_amended`, and
+  `scope_completeness_failed` (#1231/#2501/#2548/#2591) — are
   **internal audit kinds, not issue-comment surfaces**. Nothing in `issuecomment`
   posts them; they have no Notifier methods.
   `server/pullrequest.go::parkScopeCompletenessStage` writes the parked entry
@@ -1213,7 +1214,25 @@ Notes:
   carry them, since `exempt` refuses that class before writing anything.
   The `gate_evidence` field on the exempted entry reuses the #1153
   channel so a downstream implement-review gate reads the shortfall as
-  operator-exempted rather than re-failing on it. Delivery to the operator is
+  operator-exempted rather than re-failing on it.
+  The same handler writes the **amended** entry (E67.18 / #2591; user actor;
+  payload = the failed entry's key set PLUS `paths` and `amendment_id`,
+  plus `owning_slices` when the owner-slice guard RESOLVED an attribution,
+  plus `owner_attribution_unresolved` / `owner_unresolved_paths` /
+  `acknowledged_owner_unresolved` ONLY when the operator explicitly
+  acknowledged unresolvable ownership) when an operator AMENDS the parked
+  stage's effective scope with the paths it actually needed and the stage
+  resumes to `pending`, so the agent re-runs against the wider scope. The
+  additional keys are written on this category ONLY, so both older decision
+  payloads stay byte-identical. `amendment_id` names the pre-approved #961
+  scope-amendment row the widening landed on and is STABLE across a retry —
+  the amend reuses its own orphaned row rather than minting a second, and the
+  per-stage amend cap counts DISTINCT `amendment_id`s rather than raw entries.
+  The amended entry is not only a record: `server/prompt.go::resolveHeldCommitExemption`
+  walks it in the decision-plus-invalidator set below, so an amend DEMOTES a
+  stale `exempted` decision on the same stage (an amend means "do not ship this
+  tree"). That is why its append is BLOCKING — a failure returns 500
+  `amend_unrecorded` and leaves the stage parked. Delivery to the operator is
   poll-based via `fishhawk_get_run_status` / `next_actions` (sibling slice); no
   comment surface is involved. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for comment surfaces.
@@ -1309,7 +1328,7 @@ Notes:
   read back at the next dispatch by
   `server/prompt.go::resolvePushCheckpointResume`, which — when this entry is
   still the stage's NEWEST across `pull_request_failed` /
-  `pull_request_opened` / the three `scope_completeness_*` kinds /
+  `pull_request_opened` / the four `scope_completeness_*` kinds /
   `fixup_pushed` / `child_pushed` — emits the held-commit prompt fields plus
   `held_commit_resume_kind:"pr_open"` so the runner re-attempts ONLY the
   idempotent `OpenPR` from the pushed head, with no agent re-invocation. A

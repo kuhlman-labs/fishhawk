@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
 
 // The three scope-completeness audit kinds (#1231) are internal audit
@@ -46,6 +47,20 @@ const (
 	// stage_id, decision, reason, decided_by, missing_paths,
 	// unsatisfied_assertions}.
 	CategoryScopeCompletenessFailed = "scope_completeness_failed"
+
+	// CategoryScopeCompletenessAmended is written by the decision handler on
+	// an `amend` decision (#2591): the operator WIDENED the parked implement
+	// stage's effective scope with a pre-approved #961 scope-amendment row and
+	// resumed the stage, so the agent re-runs against the wider scope instead
+	// of the pass failing category-B. Payload carries the exempted/failed keys
+	// plus {paths, amendment_id, owning_slices, owner_attribution_unresolved,
+	// owner_unresolved_paths, acknowledged_owner_unresolved}.
+	//
+	// It is ALSO an INVALIDATOR of a stale `exempted` decision: prompt.go's
+	// resolveHeldCommitExemption walks this category so an amend DEMOTES an
+	// earlier exempt on the same stage (an amend means "do NOT ship this tree",
+	// the #2630 sticky-re-entry shape).
+	CategoryScopeCompletenessAmended = "scope_completeness_amended"
 )
 
 // unsatisfiedAssertion is one operator-declared binding assertion (#1171) the
@@ -80,8 +95,26 @@ func toRunUnsatisfiedAssertions(in []unsatisfiedAssertion) []run.UnsatisfiedAsse
 // scopeCompletenessDecisionRequest is the JSON body of POST
 // /v0/runs/{run_id}/scope-completeness/decision.
 type scopeCompletenessDecisionRequest struct {
-	Decision string `json:"decision"` // exempt | fail
+	Decision string `json:"decision"` // exempt | amend | fail
 	Reason   string `json:"reason"`
+	// Paths are the files an `amend` decision folds into the parked implement
+	// stage's effective scope (#2591). Required and non-empty on `amend`,
+	// rejected on any other decision. Same {path, operation} vocabulary and
+	// the same scopeamendment.ValidatePaths validation as a #961 mid-stage
+	// amendment, because an amend IS one — a pre-approved row on this stage.
+	Paths []scopeamendment.PathEntry `json:"paths,omitempty"`
+	// AcknowledgeOwnerUnresolved re-admits an `amend` whose owner-slice guard
+	// could not RESOLVE ownership for one or more submitted paths (#2591
+	// binding condition 1). The guard fails CLOSED by default — unknown
+	// ownership is exactly the case in which a sibling slice might already hold
+	// divergent edits to the file — so an unresolved path refuses the amend 409
+	// amend_owner_attribution_unresolved. Setting this to true makes the
+	// operator take that risk KNOWINGLY: the amend proceeds and the
+	// acknowledgement is recorded on both the response and the
+	// scope_completeness_amended audit entry, so it is an audited decision
+	// rather than a silent default. It never relaxes the RESOLVED-and-started
+	// refusal (amend_refused_owner_slice_active).
+	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty"`
 }
 
 // scopeCompletenessDecisionResponse echoes the resolved decision back to
@@ -103,8 +136,37 @@ type scopeCompletenessDecisionResponse struct {
 	BuildRequiredPaths    []string                   `json:"build_required_paths,omitempty"`
 	// OwningSlices attributes each build-required path to the sibling slice that
 	// declares it, so the operator's `fail` response already names the boundary
-	// to correct before re-running.
+	// to correct before re-running. On an `amend` response it names the RESOLVED
+	// owning slice of each amended path — the sibling that will see the same file
+	// edited on another branch.
 	OwningSlices []run.BuildRequiredOwner `json:"owning_slices,omitempty"`
+
+	// --- `amend` only (#2591) ---
+
+	// AmendedPaths are the validated, normalized paths folded into the parked
+	// stage's effective scope, each keeping its declared operation.
+	AmendedPaths []scopeamendment.PathEntry `json:"amended_paths,omitempty"`
+	// AmendmentID is the pre-approved #961 scope-amendment row the widening
+	// landed on. Stable across a retry of a failed amend (the row is REUSED,
+	// never duplicated) so the budget below cannot silently drain.
+	AmendmentID string `json:"amendment_id,omitempty"`
+	// OwnerAttributionUnresolved is true when the owner-slice guard could not
+	// establish ownership for at least one submitted path. It can only be true
+	// alongside AcknowledgedOwnerUnresolved — the unresolved arm otherwise
+	// refuses the amend outright (409 amend_owner_attribution_unresolved).
+	OwnerAttributionUnresolved bool `json:"owner_attribution_unresolved,omitempty"`
+	// OwnerUnresolvedPaths names each path whose ownership could not be
+	// resolved, with the reason, so the acknowledgement is auditable in detail.
+	OwnerUnresolvedPaths []amendUnresolvedOwner `json:"owner_unresolved_paths,omitempty"`
+	// AcknowledgedOwnerUnresolved echoes the operator's explicit
+	// acknowledge_owner_unresolved, so the response records that the relaxation
+	// was a deliberate operator decision.
+	AcknowledgedOwnerUnresolved bool `json:"acknowledged_owner_unresolved,omitempty"`
+	// AgentAmendmentBudgetRemaining is how many of the stage's #961 mid-stage
+	// amendment slots the RE-RUN agent still has. An operator amend consumes one
+	// (maxScopeAmendmentsPerStage counts ROWS), so the cost is surfaced rather
+	// than hidden.
+	AgentAmendmentBudgetRemaining int `json:"agent_amendment_budget_remaining,omitempty"`
 }
 
 // handleDecideScopeCompleteness implements POST
@@ -163,11 +225,29 @@ func (s *Server) handleDecideScopeCompleteness(w http.ResponseWriter, r *http.Re
 		return
 	}
 	switch reqBody.Decision {
-	case "exempt", "fail":
+	case "exempt", "amend", "fail":
 	default:
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"decision must be \"exempt\" or \"fail\"",
+			"decision must be \"exempt\", \"amend\", or \"fail\"",
 			map[string]any{"field": "decision", "got": reqBody.Decision})
+		return
+	}
+	// paths belong to `amend` alone: accepting them on exempt/fail would let a
+	// caller believe a widening was recorded when nothing folded them anywhere.
+	if reqBody.Decision != "amend" && len(reqBody.Paths) > 0 {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"paths may only be supplied with decision \"amend\"",
+			map[string]any{"field": "paths", "decision": reqBody.Decision})
+		return
+	}
+	// acknowledge_owner_unresolved belongs to `amend` alone for the same reason:
+	// only the amend arm runs an owner-slice guard, so on exempt/fail the flag
+	// would be silently ignored and the caller would believe they had made an
+	// audited risk decision that was never recorded anywhere.
+	if reqBody.Decision != "amend" && reqBody.AcknowledgeOwnerUnresolved {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"acknowledge_owner_unresolved may only be supplied with decision \"amend\"",
+			map[string]any{"field": "acknowledge_owner_unresolved", "decision": reqBody.Decision})
 		return
 	}
 	if strings.TrimSpace(reqBody.Reason) == "" {
@@ -177,7 +257,7 @@ func (s *Server) handleDecideScopeCompleteness(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	stage, err := s.resolveParkedScopeStage(r, runID)
+	runRow, stage, err := s.resolveParkedScopeStage(r, runID)
 	if err != nil {
 		if errors.Is(err, run.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "run_not_found",
@@ -195,31 +275,40 @@ func (s *Server) handleDecideScopeCompleteness(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if reqBody.Decision == "exempt" {
+	switch reqBody.Decision {
+	case "exempt":
 		s.exemptScopeCompleteness(w, r, runID, stage, reqBody.Reason, id.Subject)
-		return
+	case "amend":
+		s.amendScopeCompleteness(w, r, runID, runRow, stage, reqBody, id.Subject)
+	default:
+		s.failScopeCompleteness(w, r, runID, stage, reqBody.Reason, id.Subject)
 	}
-	s.failScopeCompleteness(w, r, runID, stage, reqBody.Reason, id.Subject)
 }
 
-// resolveParkedScopeStage returns the run's implement stage when it is
-// currently parked in awaiting_scope_decision; nil when the run exists but
-// no implement stage is parked (→ 409). run.ErrNotFound when the run
+// resolveParkedScopeStage returns the run row and its implement stage when that
+// stage is currently parked in awaiting_scope_decision; a nil STAGE when the run
+// exists but no implement stage is parked (→ 409). run.ErrNotFound when the run
 // itself doesn't exist.
-func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run.Stage, error) {
-	if _, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
-		return nil, err
+//
+// The run row is RETURNED rather than discarded because the `amend` arm's
+// owner-slice guard needs it (DecomposedFrom / SliceIndex) — re-fetching it
+// there would be a second round-trip whose error branch is unreachable anyway,
+// since any GetRun failure is already refused here.
+func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run.Run, *run.Stage, error) {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		return nil, nil, err
 	}
 	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, st := range stages {
 		if st.Type == run.StageTypeImplement && st.State == run.StageStateAwaitingScopeDecision {
-			return st, nil
+			return runRow, st, nil
 		}
 	}
-	return nil, nil
+	return runRow, nil, nil
 }
 
 // exemptScopeCompleteness resolves an `exempt` decision: it resumes the
@@ -280,7 +369,7 @@ func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
-		CategoryScopeCompletenessExempted, reason, decidedBy); err != nil {
+		CategoryScopeCompletenessExempted, reason, decidedBy, nil); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "exemption_unrecorded",
 			"the exemption could not be recorded in the audit chain; the stage is left parked — re-POST the decision",
 			map[string]any{"error": err.Error()})
@@ -344,7 +433,7 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 	// Best-effort, deliberately (see exemptScopeCompleteness): the `failed` entry
 	// authorizes nothing downstream and the stage is already terminally failed.
 	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
-		CategoryScopeCompletenessFailed, reason, decidedBy); err != nil {
+		CategoryScopeCompletenessFailed, reason, decidedBy, nil); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			CategoryScopeCompletenessFailed+" audit append failed",
 			slog.String("run_id", runID.String()),
@@ -370,14 +459,21 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-// writeScopeCompletenessDecisionAudit appends the exempted/failed decision
-// audit entry, pinning the operator's reason and the parked held-commit
-// coordinates into the chain. It RETURNS the append error rather than
-// swallowing it (#2501): each caller decides how load-bearing its entry is —
-// exemptScopeCompleteness refuses the decision (the entry is the emission
-// gate's authorization proof), failScopeCompleteness logs and continues.
+// writeScopeCompletenessDecisionAudit appends the exempted/failed/amended
+// decision audit entry, pinning the operator's reason and the parked
+// held-commit coordinates into the chain. It RETURNS the append error rather
+// than swallowing it (#2501): each caller decides how load-bearing its entry is
+// — exemptScopeCompleteness refuses the decision (the entry is the emission
+// gate's authorization proof), amendScopeCompleteness refuses it too (a stage
+// whose widening the chain never recorded must never be dispatched),
+// failScopeCompleteness logs and continues.
+//
+// extra carries the caller-specific payload keys and MUST be nil for the
+// exempted/failed categories: those two payload key sets are a wire contract
+// #2548 already promised not to touch, and #2591 keeps that promise the same
+// way — by ADDING keys only on the new category's entry.
 func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid.UUID,
-	stage *run.Stage, category, reason, decidedBy string) error {
+	stage *run.Stage, category, reason, decidedBy string, extra map[string]any) error {
 	actorKind := actorKindForSubject(decidedBy)
 	stageID := stage.ID
 	payloadMap := map[string]any{
@@ -414,6 +510,9 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 			// operator-exempted rather than re-failing on it.
 			payloadMap["gate_evidence"] = CategoryScopeCompletenessExempted
 		}
+	}
+	for k, v := range extra {
+		payloadMap[k] = v
 	}
 	payload, _ := json.Marshal(payloadMap)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{

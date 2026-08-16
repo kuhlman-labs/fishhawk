@@ -3189,6 +3189,7 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 	CategoryScopeCompletenessParked,
 	CategoryScopeCompletenessExempted,
 	CategoryScopeCompletenessFailed,
+	CategoryScopeCompletenessAmended,
 	"pull_request_opened",
 	"fixup_pushed",
 	"child_pushed",

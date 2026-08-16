@@ -65,7 +65,12 @@ import "sort"
 // `confirmed` delta-verification resolution REFUSED because the evidence
 // contradicts it (the raising reviewer rejected in the same round, the operator
 // routed the concern with executed reproduction evidence, the fix-up pass landed
-// no changes, or the evidence lookup itself failed). When a new
+// no changes, or the evidence lookup itself failed). E67.18 / #2591 added
+// scope_completeness_amended, the operator's amend-and-resume decision on a
+// parked scope-completeness shortfall — it records the paths folded into the
+// stage's effective scope, and it is ALSO read as an invalidator by
+// server/prompt.go::resolveHeldCommitExemption, which demotes a stale
+// `exempted` decision when an amend supersedes it. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -216,6 +221,7 @@ var KnownCategories = map[string]struct{}{
 	"runtime_observed":                        {},
 	"scope_amendment_decided":                 {},
 	"scope_amendment_requested":               {},
+	"scope_completeness_amended":              {},
 	"scope_completeness_exempted":             {},
 	"scope_completeness_failed":               {},
 	"scope_completeness_parked":               {},

@@ -9742,6 +9742,43 @@ func TestResolveHeldCommitExemption_WithholdsForBuildRequiredPark(t *testing.T) 
 	}
 }
 
+// TestResolveHeldCommitExemption_AmendedDemotesStaleExempt is the #2591
+// prompt-gate counterfactual: an `amend` on a stage that was EARLIER exempted
+// must DEMOTE that exemption. An amend means "do NOT ship this tree, re-run
+// against a wider scope", so leaving `exempted` newest would re-emit
+// open_pr_from_held_commit / held_commit_sha / held_commit_branch /
+// held_commit_base_sha and send the runner to its pre-agent openHeldCommitPR
+// short-circuit, discarding the widened re-run entirely — the #2630 sticky
+// re-entry shape.
+//
+// Both entries are seeded BY CONSTRUCTION (audit fixtures), never by calling
+// the decision endpoint, so the RED lands on the emission assertion rather than
+// on fixture setup. Deleting CategoryScopeCompletenessAmended from
+// scopeCompletenessDecisionInvalidatorCategories makes the amended entry
+// invisible to the newest-wins walk, `exempted` wins again, and all four keys
+// are emitted.
+func TestResolveHeldCommitExemption_AmendedDemotesStaleExempt(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptPromptKeys rewrites StageID
+
+	keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessAmended, 3), // NEWER
+	}, nil)
+	assertNoExemptKeys(t, keys, "an amend that supersedes an earlier exempt on the same stage")
+
+	// CONTROL: the identical fixture WITHOUT the amended entry DOES emit, so the
+	// assertion above discriminates the new invalidator rather than some
+	// unrelated precondition failure.
+	controlKeys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}, nil)
+	if _, ok := controlKeys["held_commit_sha"]; !ok {
+		t.Fatalf("control: the SAME fixture without the amended entry must still emit the held-commit fields; got keys %v", controlKeys)
+	}
+}
+
 // makeApproveWithSliceAddScopeFilesEntry builds an approval_submitted audit
 // entry carrying the CANONICAL index-keyed per-slice add map (#2515) — the
 // exact shape writeApprovalAudit records.
