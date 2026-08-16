@@ -3,6 +3,7 @@ package gitops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,48 @@ func TestOpenMR_GitLabError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("err = %v, want GitLab message in error", err)
+	}
+}
+
+// TestOpenMR_UnauthorizedClassified mirrors the GitHub 401 classification on the
+// GitLab MR create (#2730), so the runner's forge-agnostic re-auth helper
+// recognizes the fault identically on both forges. The status + body text is
+// retained; a non-401 GitLab failure stays unclassified (TestOpenMR_GitLabError's
+// 409 is the paired negative control below).
+func TestOpenMR_UnauthorizedClassified(t *testing.T) {
+	stub, srv := newStubGitLabAPI(t)
+	stub.respCode = http.StatusUnauthorized
+	stub.respBody = `{"message":"401 Unauthorized"}`
+	c := &OpenMRClient{BaseURL: srv.URL, Token: "glpat-expired"}
+
+	_, err := c.OpenMR(context.Background(), OpenMRArgs{
+		ProjectPath:  "group/project",
+		SourceBranch: "fishhawk/branch", TargetBranch: "main", Title: "Add a thing",
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("errors.Is(err, ErrUnauthorized) = false; err = %v", err)
+	}
+	for _, want := range []string{"gitops: open MR:", "401"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to retain %q", err, want)
+		}
+	}
+
+	// Negative control, same call shape: a 409 is NOT a credential fault.
+	stub.respCode = http.StatusConflict
+	stub.respBody = `{"message":["Another open merge request already exists"]}`
+	_, err = c.OpenMR(context.Background(), OpenMRArgs{
+		ProjectPath:  "group/project",
+		SourceBranch: "fishhawk/branch", TargetBranch: "main", Title: "Add a thing",
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		t.Errorf("a 409 must NOT be classified ErrUnauthorized; err = %v", err)
 	}
 }
 

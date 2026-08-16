@@ -275,8 +275,14 @@ type fakeUploader struct {
 	// prErrSeq, when non-empty, takes precedence over prErr: call i returns
 	// prErrSeq[i] (the last entry repeats). The #2169 ship-failure test needs
 	// the success ship to fail while the FAILURE REPORT that follows lands.
-	prErrSeq          []error
-	gotInstTokenArgs  *upload.FetchInstallationTokenArgs
+	prErrSeq         []error
+	gotInstTokenArgs *upload.FetchInstallationTokenArgs
+	// Installation-token sequence seam (#2730). When instTokenSeq is non-empty
+	// the Nth FetchInstallationToken call returns the Nth entry (the last
+	// repeats), so a test can model a re-mint handing back a FRESH token after
+	// the held one expired. instTokenCalls counts every call, sequence or not.
+	instTokenSeq      []string
+	instTokenCalls    int
 	gotMCPTokenArgs   *upload.FetchMCPTokenArgs
 	gotRetryArgs      []upload.RetryStageArgs
 	gotAcceptanceArgs *upload.ShipAcceptanceArgs
@@ -502,11 +508,22 @@ func (f *fakeUploader) ShipPullRequest(_ context.Context, args upload.ShipPullRe
 func (f *fakeUploader) FetchInstallationToken(_ context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error) {
 	a := args
 	f.gotInstTokenArgs = &a
+	f.instTokenCalls++
 	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
 		return nil, err
 	}
 	if f.instTokenErr != nil {
 		return nil, f.instTokenErr
+	}
+	// Per-call token sequence (#2730): the re-auth path mints TWICE in one
+	// stage, and the whole point is that the second mint yields a DIFFERENT
+	// token. Default (nil) keeps every existing test on the single token.
+	if len(f.instTokenSeq) > 0 {
+		i := f.instTokenCalls - 1
+		if i >= len(f.instTokenSeq) {
+			i = len(f.instTokenSeq) - 1
+		}
+		return &upload.FetchInstallationTokenResult{Token: f.instTokenSeq[i]}, nil
 	}
 	return &upload.FetchInstallationTokenResult{Token: "ghs_app_token"}, nil
 }
@@ -21301,5 +21318,445 @@ func TestOpenPRAndShipArtifact_NoCheckpointPRTextOnPrePushFailure(t *testing.T) 
 		"", false, false, nil, false, verifiedTree, "", nil, nil, nil, &cp)
 	if cp.armed || cp.prTitle != "" || cp.prBody != "" {
 		t.Errorf("a pre-push failure must leave the checkpoint zero-valued, got %+v", cp)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR-open credential re-authentication (#2730). One test per named branch of
+// openChangeRequestWithReauth, plus two CROSS-LAYER tests that drive the REAL
+// gitops.OpenPRClient against an httptest GitHub API so the sentinel/errors.Is
+// seam BETWEEN the two packages is observed rather than assumed.
+// ---------------------------------------------------------------------------
+
+// reauthOpenerLog records every openImplementChangeRequest attempt the fake
+// opener served, keyed by the TOKEN each attempt was made with — token identity
+// is how a "stale" credential is modelled, seeded by construction rather than by
+// calling the control under test.
+type reauthOpenerLog struct {
+	// errFor maps a token to the error that token's attempt returns. A token
+	// with no entry succeeds.
+	errFor map[string]error
+	tokens []string
+	args   []gitops.OpenPRArgs
+}
+
+type reauthFakeOpener struct {
+	log   *reauthOpenerLog
+	token string
+}
+
+func (f reauthFakeOpener) OpenPR(_ context.Context, args gitops.OpenPRArgs) (*gitops.OpenPRResult, error) {
+	f.log.tokens = append(f.log.tokens, f.token)
+	f.log.args = append(f.log.args, args)
+	if err := f.log.errFor[f.token]; err != nil {
+		return nil, err
+	}
+	return &gitops.OpenPRResult{PRNumber: 42, PRURL: "https://github.com/o/r/pull/42"}, nil
+}
+
+func withReauthFakeOpener(t *testing.T, errFor map[string]error) *reauthOpenerLog {
+	t.Helper()
+	log := &reauthOpenerLog{errFor: errFor}
+	orig := newPROpener
+	newPROpener = func(token string) prOpener { return reauthFakeOpener{log: log, token: token} }
+	t.Cleanup(func() { newPROpener = orig })
+	return log
+}
+
+// unauthorizedErr is the error shape gitops really produces on a 401: the
+// today-unchanged status + body text with ErrUnauthorized wrapped in.
+func unauthorizedErr() error {
+	return fmt.Errorf(`gitops: open PR: 401: {"message":"Bad credentials"} (%w)`, gitops.ErrUnauthorized)
+}
+
+// withFixedRunnerNow pins the re-auth clock so token_held_seconds is exact.
+func withFixedRunnerNow(t *testing.T, at time.Time) {
+	t.Helper()
+	orig := runnerNow
+	runnerNow = func() time.Time { return at }
+	t.Cleanup(func() { runnerNow = orig })
+}
+
+func reauthCfg() config {
+	return config{runID: "run-2730", stageID: "stage-2730", githubRepo: "kuhlman-labs/fishhawk"}
+}
+
+const (
+	reauthStaleToken = "ghs_stale_expired"
+	reauthFreshToken = "ghs_fresh_minted"
+)
+
+// reauthHeldSeconds is the deterministic held age every helper test reports:
+// the clock is pinned 42 minutes after the token was obtained.
+const reauthHeldSeconds = 42 * 60
+
+func reauthArgs() gitops.OpenPRArgs {
+	return gitops.OpenPRArgs{Owner: "kuhlman-labs", Repo: "fishhawk", Head: "fishhawk/run-2730/stage-2730", Base: "main", Title: "t", Body: "b"}
+}
+
+// T6. The bug this change closes: the stage reaches PR-open holding a credential
+// that expired during the agent run + committed-tree verify. A 401 followed by a
+// re-mint OPENS THE PR — the stage does not fail — and exactly one PR results.
+func TestOpenChangeRequestWithReauth_StaleTokenReauthsAndOpens(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	log := withReauthFakeOpener(t, map[string]error{reauthStaleToken: unauthorizedErr()})
+	var sink strings.Builder
+	reminted := 0
+	remint := func(context.Context) (string, error) { reminted++; return reauthFreshToken, nil }
+
+	res, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err != nil {
+		t.Fatalf("a 401 a fresh credential fixes must not fail the stage: %v\n%s", err, sink.String())
+	}
+	if res == nil || res.PRNumber != 42 {
+		t.Fatalf("result = %+v, want the opened PR", res)
+	}
+	if reminted != 1 {
+		t.Errorf("remint called %d times, want exactly 1", reminted)
+	}
+	// EXACTLY ONE PR: two opener attempts, the second under the FRESH token.
+	if want := []string{reauthStaleToken, reauthFreshToken}; !reflect.DeepEqual(log.tokens, want) {
+		t.Errorf("attempt tokens = %v, want %v", log.tokens, want)
+	}
+	if len(log.args) == 2 && log.args[0] != log.args[1] {
+		t.Errorf("the re-attempt must re-issue the SAME request: %+v vs %+v", log.args[0], log.args[1])
+	}
+	out := sink.String()
+	if !strings.Contains(out, `"event":"pr_open_reauth_attempted"`) {
+		t.Errorf("missing pr_open_reauth_attempted:\n%s", out)
+	}
+	wantEvent := fmt.Sprintf(`{"event":"pr_open_reauth_succeeded","run_id":"run-2730","stage_id":"stage-2730","token_held_seconds":%d}`, reauthHeldSeconds)
+	if !strings.Contains(out, wantEvent) {
+		t.Errorf("missing the success event with the deterministic held age.\nwant: %s\ngot:\n%s", wantEvent, out)
+	}
+}
+
+// T7. A genuinely-invalid credential: every token 401s. The failure must say so
+// explicitly (NOT an expiry), and the attempt count must be EXACTLY TWO — the
+// structural bound that stops a bad credential becoming an unbounded retry loop.
+func TestOpenChangeRequestWithReauth_BadCredentialBoundedToTwoAttempts(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	log := withReauthFakeOpener(t, map[string]error{
+		reauthStaleToken: unauthorizedErr(),
+		reauthFreshToken: unauthorizedErr(),
+	})
+	var sink strings.Builder
+	remint := func(context.Context) (string, error) { return reauthFreshToken, nil }
+
+	_, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err == nil {
+		t.Fatal("a credential rejected twice must fail the stage")
+	}
+	if len(log.tokens) != 2 {
+		t.Errorf("opener attempts = %d (%v), want EXACTLY 2 (the re-attempt is straight-line, not a loop)", len(log.tokens), log.tokens)
+	}
+	for _, want := range []string{"freshly minted credential was rejected too", "NOT a mid-stage token expiry", "kuhlman-labs/fishhawk"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to name %q", err, want)
+		}
+	}
+}
+
+// T8. The re-mint itself failed (the backend is down). ONE opener attempt, and
+// the reason names BOTH faults so the operator is not left guessing which broke.
+func TestOpenChangeRequestWithReauth_RemintFailureNamesBothFaults(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	log := withReauthFakeOpener(t, map[string]error{reauthStaleToken: unauthorizedErr()})
+	var sink strings.Builder
+	remint := func(context.Context) (string, error) {
+		return "", errors.New("fetch installation token: backend unreachable")
+	}
+
+	_, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err == nil {
+		t.Fatal("a failed re-mint must fail the stage")
+	}
+	if len(log.tokens) != 1 {
+		t.Errorf("opener attempts = %d (%v), want 1 (no token to re-attempt with)", len(log.tokens), log.tokens)
+	}
+	for _, want := range []string{"401", "Bad credentials", "backend unreachable", fmt.Sprintf("held for %ds", reauthHeldSeconds)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to name %q", err, want)
+		}
+	}
+	if !errors.Is(err, gitops.ErrUnauthorized) {
+		t.Errorf("the original 401 must stay in the chain; err = %v", err)
+	}
+}
+
+// T9. NON-401 PASS-THROUGH. A 5xx-shaped failure must reach the caller with its
+// text UNCHANGED, no re-mint, and no second attempt — the control that stops a
+// permission/validation/transport fault being misread as an expiry.
+func TestOpenChangeRequestWithReauth_Non401PassesThroughUnchanged(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	original := errors.New(`gitops: open PR: 500: {"message":"server error"}`)
+	log := withReauthFakeOpener(t, map[string]error{reauthStaleToken: original})
+	var sink strings.Builder
+	reminted := 0
+	remint := func(context.Context) (string, error) { reminted++; return reauthFreshToken, nil }
+
+	_, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err == nil {
+		t.Fatal("expected the underlying error")
+	}
+	if !errors.Is(err, original) || err.Error() != original.Error() {
+		t.Errorf("a non-401 must pass through byte-identically: got %q, want %q", err, original)
+	}
+	if reminted != 0 {
+		t.Errorf("remint called %d times on a non-401, want 0", reminted)
+	}
+	if len(log.tokens) != 1 {
+		t.Errorf("opener attempts = %d, want 1 (no re-attempt on a non-401)", len(log.tokens))
+	}
+	if strings.Contains(sink.String(), "reauth") {
+		t.Errorf("a non-401 must emit no re-auth event:\n%s", sink.String())
+	}
+}
+
+// T10. The SECOND attempt fails for a different reason (a 422). That is not a
+// credential fault, so it is reported annotated 'after credential refresh' — not
+// as a bad credential, which would send the operator to the App installation.
+func TestOpenChangeRequestWithReauth_SecondAttemptNon401Annotated(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	log := withReauthFakeOpener(t, map[string]error{
+		reauthStaleToken: unauthorizedErr(),
+		reauthFreshToken: errors.New(`gitops: open PR: 422: {"message":"Validation Failed"}`),
+	})
+	var sink strings.Builder
+	remint := func(context.Context) (string, error) { return reauthFreshToken, nil }
+
+	_, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err == nil {
+		t.Fatal("expected the second attempt's error")
+	}
+	if len(log.tokens) != 2 {
+		t.Errorf("opener attempts = %d, want 2", len(log.tokens))
+	}
+	for _, want := range []string{"after credential refresh", "422", "Validation Failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to name %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "freshly minted credential was rejected too") {
+		t.Errorf("a 422 must NOT be reported as a bad credential; err = %v", err)
+	}
+	if errors.Is(err, gitops.ErrUnauthorized) {
+		t.Errorf("a 422 after refresh must not classify as unauthorized; err = %v", err)
+	}
+}
+
+// T11. The held-commit / pr-open RESUME path re-auths too: same stale-then-fresh
+// sequence driven through the REAL openHeldCommitPR, whose re-mint comes from the
+// real mintImplementToken against the fake uploader's token sequence.
+func TestOpenHeldCommitPR_ResumeReauthsExpiredToken(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	log := withReauthFakeOpener(t, map[string]error{reauthStaleToken: unauthorizedErr()})
+	fu := newFakeUploader(t)
+	fu.instTokenSeq = []string{reauthStaleToken, reauthFreshToken}
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
+		t.Fatalf("resume exit = %d, want exitOK (the 401 must be re-authenticated)\n%s", code, logSink.String())
+	}
+	if want := []string{reauthStaleToken, reauthFreshToken}; !reflect.DeepEqual(log.tokens, want) {
+		t.Errorf("attempt tokens = %v, want %v", log.tokens, want)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "" {
+		t.Fatalf("the re-authenticated resume must still ship the success artifact, got %+v", fu.gotPRArgs)
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_open_reauth_succeeded"`) {
+		t.Errorf("the resume must record the re-auth:\n%s", logSink.String())
+	}
+}
+
+// reauthPRServer is the httptest GitHub API the two cross-layer tests drive the
+// REAL gitops.OpenPRClient against. It routes on BOTH (method, path) AND the
+// Authorization bearer, modelling the real OpenPR sequence: the list-by-head GET
+// runs BEFORE the create POST, so a stale bearer is rejected on whichever request
+// it reaches first, while the fresh bearer gets a well-formed EMPTY list for the
+// GET and a 201 for the POST.
+type reauthPRServer struct {
+	freshAuth string
+	// createStatus/createBody let the initial-422 control make the create POST
+	// actually FIRE and fail; zero means 201 + a well-formed PR.
+	createStatus int
+	createBody   string
+
+	auths       []string // every request's Authorization, in order
+	createAuths []string // the create POSTs' Authorization, in order
+}
+
+func newReauthPRServer(t *testing.T, s *reauthPRServer) *httptest.Server {
+	t.Helper()
+	unauthorized := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"message":"Bad credentials"}`)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		s.auths = append(s.auths, auth)
+		if auth != s.freshAuth {
+			unauthorized(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`) // no existing PR: the create POST is reached
+	})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/pulls", func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		s.auths = append(s.auths, auth)
+		s.createAuths = append(s.createAuths, auth)
+		if auth != s.freshAuth {
+			unauthorized(w)
+			return
+		}
+		if s.createStatus != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(s.createStatus)
+			_, _ = io.WriteString(w, s.createBody)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"number":42,"html_url":"https://github.com/kuhlman-labs/fishhawk/pull/42"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// withRealPROpenerAgainst points the production PR-opener seam at the real
+// gitops.OpenPRClient, so the sentinel classification and the runner's
+// errors.Is-gated re-mint MEET at the package seam.
+func withRealPROpenerAgainst(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	orig := newPROpener
+	newPROpener = func(token string) prOpener {
+		return &gitops.OpenPRClient{Token: token, APIBase: srv.URL, MaxRetries: 1, RetryBackoff: time.Microsecond}
+	}
+	t.Cleanup(func() { newPROpener = orig })
+}
+
+// T13 (CROSS-LAYER). The REAL gitops.OpenPRClient against a bearer-routed
+// httptest GitHub API: the stale bearer 401s on the list-by-head GET it reaches
+// first, the helper re-mints, and the re-attempt completes the real
+// GET-then-POST sequence. The load-bearing assertion is anchored to the CREATE
+// POST specifically — exactly one create, carrying an Authorization DIFFERENT
+// from the stale one the first attempt used.
+func TestOpenChangeRequestWithReauth_CrossLayerRealClient(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	rec := &reauthPRServer{freshAuth: "Bearer " + reauthFreshToken}
+	srv := newReauthPRServer(t, rec)
+	withRealPROpenerAgainst(t, srv)
+	var sink strings.Builder
+	remint := func(context.Context) (string, error) { return reauthFreshToken, nil }
+
+	res, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err != nil {
+		t.Fatalf("the real client's 401 must be re-authenticated end to end: %v\n%s", err, sink.String())
+	}
+	if res == nil || res.PRNumber != 42 {
+		t.Fatalf("result = %+v, want the created PR", res)
+	}
+	staleAuth := "Bearer " + reauthStaleToken
+	if len(rec.auths) == 0 || rec.auths[0] != staleAuth {
+		t.Fatalf("requests = %v, want the FIRST one to carry the stale bearer", rec.auths)
+	}
+	if len(rec.createAuths) != 1 {
+		t.Fatalf("create POSTs = %d (%v), want exactly 1 (adopt-then-create must not duplicate)", len(rec.createAuths), rec.createAuths)
+	}
+	if rec.createAuths[0] == staleAuth {
+		t.Errorf("the create POST carried the STALE bearer %q — the re-attempt did not use the re-minted credential", rec.createAuths[0])
+	}
+	if rec.createAuths[0] != rec.freshAuth {
+		t.Errorf("create POST Authorization = %q, want the freshly minted %q", rec.createAuths[0], rec.freshAuth)
+	}
+	if !strings.Contains(sink.String(), `"event":"pr_open_reauth_succeeded"`) {
+		t.Errorf("missing the success event:\n%s", sink.String())
+	}
+}
+
+// T12 (CROSS-LAYER negative control, binding condition 2). An INITIAL 422 with
+// the create POST ACTUALLY FIRING: list-by-head returns an empty list so the
+// create is reached, and the create fails 422 for a non-duplicate reason. The
+// helper must make EXACTLY ONE attempt, never re-mint, and pass the error text
+// through unchanged. This is a real control, not a vacuous one: a 422 adopted via
+// list-by-head would never exercise the create at all.
+func TestOpenChangeRequestWithReauth_Initial422FiresCreateAndPassesThrough(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	withFixedRunnerNow(t, now)
+	rec := &reauthPRServer{
+		// The FIRST (and only) credential is accepted by the server, so the
+		// failure is genuinely the 422 and not an auth artifact.
+		freshAuth:    "Bearer " + reauthStaleToken,
+		createStatus: http.StatusUnprocessableEntity,
+		createBody:   `{"message":"Validation Failed","errors":[{"message":"No commits between main and the head branch"}]}`,
+	}
+	srv := newReauthPRServer(t, rec)
+	withRealPROpenerAgainst(t, srv)
+	var sink strings.Builder
+	reminted := 0
+	remint := func(context.Context) (string, error) { reminted++; return reauthFreshToken, nil }
+
+	_, err := openChangeRequestWithReauth(context.Background(), reauthCfg(), &sink,
+		reauthStaleToken, now.Add(-reauthHeldSeconds*time.Second), remint, reauthArgs())
+	if err == nil {
+		t.Fatal("a 422 must fail")
+	}
+	if len(rec.createAuths) != 1 {
+		t.Fatalf("create POSTs = %d, want exactly 1 — the control is vacuous unless the create FIRES", len(rec.createAuths))
+	}
+	if reminted != 0 {
+		t.Errorf("remint called %d times on a 422, want 0", reminted)
+	}
+	// Text unchanged from today's: the gitops message, with no re-auth annotation.
+	if want := `gitops: open PR: 422: {"message":"Validation Failed","errors":[{"message":"No commits between main and the head branch"}]}`; err.Error() != want {
+		t.Errorf("err = %q, want today's text %q", err.Error(), want)
+	}
+	if errors.Is(err, gitops.ErrUnauthorized) {
+		t.Errorf("a 422 must not classify as unauthorized; err = %v", err)
+	}
+	if strings.Contains(sink.String(), "reauth") {
+		t.Errorf("a 422 must emit no re-auth event:\n%s", sink.String())
+	}
+}
+
+// reauthRemedyHint is message-only, but each of its three branches names a
+// DIFFERENT operator action, so a wrong branch sends the operator to the wrong
+// place. One case each: GitLab, GitHub with a configured repo, and GitHub
+// degrading to the GITHUB_REPOSITORY env var then to a generic phrase.
+func TestReauthRemedyHint(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "")
+	if got := reauthRemedyHint(config{forge: forgeGitLab}); !strings.Contains(got, "FISHHAWK_GITLAB_TOKEN") || !strings.Contains(got, "api") {
+		t.Errorf("gitlab hint = %q, want the token + scope remedy", got)
+	}
+	if got := reauthRemedyHint(reauthCfg()); !strings.Contains(got, "GitHub App") || !strings.Contains(got, "kuhlman-labs/fishhawk") {
+		t.Errorf("github hint = %q, want the App installation remedy naming the configured repo", got)
+	}
+	t.Setenv("GITHUB_REPOSITORY", "env-owner/env-repo")
+	if got := reauthRemedyHint(config{}); !strings.Contains(got, "env-owner/env-repo") {
+		t.Errorf("hint with no --github-repo = %q, want the GITHUB_REPOSITORY fallback", got)
+	}
+	t.Setenv("GITHUB_REPOSITORY", "")
+	if got := reauthRemedyHint(config{}); !strings.Contains(got, "the target repo") {
+		t.Errorf("hint with no repo at all = %q, want the generic phrase", got)
 	}
 }

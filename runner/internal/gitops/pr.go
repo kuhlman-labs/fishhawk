@@ -62,6 +62,22 @@ const (
 	maxRetryDelay       = 20 * time.Second
 )
 
+// ErrUnauthorized reports that the forge rejected the credential itself with a
+// 401 — the credential is expired or invalid. The common cause is an expired
+// GitHub App installation token: those live ~1 hour, and an implement stage that
+// mints one before a long agent invocation + committed-tree re-verify can reach
+// the PR-open call after it died (#2730).
+//
+// It is DELIBERATELY not retried in place: 401 stays out of retryableStatus
+// because replaying a dead credential against the same endpoint cannot succeed.
+// The CALLER owns re-authentication — the runner's openChangeRequestWithReauth
+// keys its single bounded re-mint-and-re-attempt on errors.Is(err, this).
+//
+// Wrapped into the non-2xx branches of the PR create POST, the list-by-head GET,
+// and the GitLab MR create, each of which keeps its existing status + body text
+// so nothing an operator reads today disappears.
+var ErrUnauthorized = errors.New("gitops: forge rejected the credential (401 unauthorized)")
+
 // OpenPRArgs collects the inputs for a single PR creation.
 type OpenPRArgs struct {
 	Owner string // "kuhlman-labs"
@@ -182,6 +198,12 @@ func (c *OpenPRClient) createPR(ctx context.Context, httpClient *http.Client, ap
 		if resp.StatusCode == http.StatusUnprocessableEntity && strings.Contains(strings.ToLower(brief), "already exists") {
 			return nil, true, nil
 		}
+		// A 401 is the credential itself being rejected: classify it so the
+		// caller can re-authenticate once (#2730). The status + body text is
+		// unchanged; the sentinel rides as a trailing wrap.
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, false, fmt.Errorf("gitops: open PR: %d: %s (%w)", resp.StatusCode, brief, ErrUnauthorized)
+		}
 		return nil, false, fmt.Errorf("gitops: open PR: %d: %s", resp.StatusCode, brief)
 	}
 
@@ -216,6 +238,11 @@ func (c *OpenPRClient) listOpenPRByHead(ctx context.Context, httpClient *http.Cl
 
 	if resp.StatusCode != http.StatusOK {
 		brief := readBriefBody(resp.Body, 512)
+		// The adopt GET runs BEFORE the create POST, so an expired credential
+		// is rejected here first: classify it identically (#2730).
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("gitops: list PRs by head: %d: %s (%w)", resp.StatusCode, brief, ErrUnauthorized)
+		}
 		return nil, fmt.Errorf("gitops: list PRs by head: %d: %s", resp.StatusCode, brief)
 	}
 

@@ -99,6 +99,14 @@ func (c *OpenMRClient) OpenMR(ctx context.Context, args OpenMRArgs) (*OpenPRResu
 
 	if resp.StatusCode != http.StatusCreated {
 		brief := readBriefBody(resp.Body, 512)
+		// Mirror the GitHub classification (#2730) so the runner's forge-agnostic
+		// re-auth helper behaves identically on both forges. A GitLab re-mint
+		// returns the same operator-supplied FISHHAWK_GITLAB_TOKEN, so the bounded
+		// single re-attempt simply fails again and is reported as a bad
+		// credential — the correct outcome for a static token.
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, fmt.Errorf("gitops: open MR: %d: %s (%w)", resp.StatusCode, brief, ErrUnauthorized)
+		}
 		return nil, fmt.Errorf("gitops: open MR: %d: %s", resp.StatusCode, brief)
 	}
 
