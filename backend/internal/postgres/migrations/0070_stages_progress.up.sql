@@ -33,4 +33,12 @@
 -- updated_at stays at dispatch time and it still fires — but a legitimately
 -- long-running agent that heartbeats no longer trips it. See the run README +
 -- the PR body's condition-4 note.
+--
+-- NOT OPERATOR-ACCEPTED (fix-up). Condition 4 RESERVED this call for the
+-- operator ("stop and say so — that is a design question, not something to
+-- absorb"). This migration does not decide it: merge is GATED on the operator
+-- either explicitly signing off on the tradeoff above OR directing a follow-up
+-- that scopes the watchdog off progress-only bumps (e.g. a dedicated heartbeat
+-- timestamp instead of relying on the generic stages_set_updated_at trigger).
+-- Surfaced here; decided by the operator at the gate.
 ALTER TABLE stages ADD COLUMN progress JSONB;

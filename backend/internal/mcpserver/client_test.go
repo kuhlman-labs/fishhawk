@@ -255,15 +255,31 @@ func TestStageMirror_DecodesProgress(t *testing.T) {
 }
 
 // TestStageProgress_CrossBoundaryEndToEnd (approval condition 2) carries a
-// RUNNER-PRODUCED heartbeat all the way through the real seam chain: runner
-// write -> HTTP ingest -> Postgres persistence -> Stage response serialization
-// -> MCP client decode -> StageWaitStatus projection, asserting the
-// operator-visible last_event / turns_this_attempt / tokens_this_attempt at the
-// FAR end. E1/E2/E3 each cover a segment; this one spans the whole path so the
+// RUNNER-PRODUCED heartbeat all the way through the real seam chain: HTTP
+// ingest -> Postgres persistence -> Stage response serialization -> MCP client
+// decode -> StageWaitStatus projection, asserting the operator-visible
+// last_event / turns_this_attempt / tokens_this_attempt at the FAR end.
+// E1/E2/E3 each cover a segment; this one spans the whole backend path so the
 // #371-class silent-nil failure (a json tag drift anywhere along it) cannot ship
 // green. It also proves elapsed_seconds is derived server-side from started_at,
 // NOT taken from the heartbeat (the heartbeat carries elapsed_seconds:999, which
 // must not appear).
+//
+// RUNNER LEG IS SIMULATED — acknowledged limitation (#2541 fix-up, condition 2).
+// The test starts from the verbatim heartbeat LINE the agent adapter emits, but
+// it maps that line to the ingest body INLINE (below) rather than calling the
+// runner's real parseStageProgressLine + upload.Client.ReportStageProgress:
+// those live in runner/, a SEPARATE Go module this backend test tree cannot
+// import. So the runner -> wire leg is pinned PIECEWISE, not spanned here —
+// runner/internal/upload/upload_test.go's TestReportStageProgress_HappyPath
+// asserts the literal wire keys ("last_event" / "turns_this_attempt" /
+// "tokens_this_attempt") that the inline mapping here and the backend handler
+// both mirror. Residual risk: those two files' string literals drift together
+// (a runner-side key rename would then 400 on the backend's DisallowUnknownFields
+// and be swallowed by the fail-open reporter — the exact #371-class condition).
+// E2 (runner's TestRun_ProgressHeartbeatReachesBackend) likewise asserts
+// fakeUploader args rather than a decoded httptest POST body, so it too stops
+// short of the wire. This piecewise seam is called out in the PR body.
 func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
