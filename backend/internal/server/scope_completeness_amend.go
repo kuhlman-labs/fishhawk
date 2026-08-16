@@ -35,7 +35,47 @@ const maxScopeCompletenessAmendsPerStage = 2
 // by path) but NOT for the budget, which counts ROWS via
 // ScopeAmendmentRepo.CountByStage — so every failed-then-retried cycle would
 // silently eat one of the re-run agent's two #961 slots.
+//
+// The marker alone is NOT a sufficient reuse key: a stage that is amended,
+// re-runs and PARKS AGAIN presents the identical (stage, reason, path set) on
+// its second episode, and reusing the first episode's row there would keep the
+// cap counting ONE distinct amendment forever — an unbounded amend loop, which
+// is precisely what maxScopeCompletenessAmendsPerStage exists to stop. So the
+// marker also carries a PARK-EPISODE key (see amendEpisodeKey): a retry within
+// one episode matches, a fresh park never does.
 const operatorAmendReasonPrefix = "scope-completeness amend: "
+
+// amendEpisodeKey identifies the CURRENT park episode, so an incomplete RETRY of
+// this episode's amend is distinguishable from a NEW park that happens to submit
+// byte-identical paths and reason.
+//
+// The held commit is the episode's identity: each park records the commit the
+// agent's pass actually pushed, and a re-run under the widened scope produces a
+// different one (that re-run is the whole point of an amend — it edits files the
+// prior pass could not). VerifiedTreeSHA is the fallback for a park row that
+// carries no held commit.
+//
+// An empty key means the episode CANNOT be identified. Reuse is then refused
+// outright and every attempt mints its own row: that direction over-counts
+// against the cap (fail-CLOSED on the control) and only over-spends the agent's
+// #961 budget on a retry (observability, and reported honestly by
+// agent_amendment_budget_remaining) — whereas reusing on an unidentifiable
+// episode would silently uncap the amend loop.
+func amendEpisodeKey(park *run.ScopeCompletenessPark) string {
+	if park == nil {
+		return ""
+	}
+	if park.HeldCommitSHA != "" {
+		return park.HeldCommitSHA
+	}
+	return park.VerifiedTreeSHA
+}
+
+// operatorAmendMarkerReason renders the marker reason stored on the row: the
+// prefix, this park episode's key, and the operator's own prose.
+func operatorAmendMarkerReason(episode, reason string) string {
+	return operatorAmendReasonPrefix + "[" + episode + "] " + strings.TrimSpace(reason)
+}
 
 // amendUnresolvedOwner is one submitted path whose OWNING slice the guard could
 // not establish, with the reason it could not. Surfaced on the 409 details, and
@@ -98,19 +138,29 @@ type amendOwnerActiveRefusal struct {
 //
 // ORDERING IS LOAD-BEARING, in this exact sequence:
 //
-//	(a) validate paths        — 400, nothing touched
-//	(b) coverage check        — 409, nothing touched
-//	(c) per-stage amend cap    — 409, nothing touched
-//	(d) owner-slice guard      — 409, nothing touched
-//	(e) pre-approved row       — 500 amend_unrecorded, stage left PARKED
-//	(f) amended audit entry    — 500 amend_unrecorded, stage left PARKED
-//	(g) resume to pending      — 500 amend_resume_failed, stage left PARKED
-//	(h) orchestrator advance   — best-effort WARN (mirrors both existing arms)
+//	(a) validate paths         — 400, nothing touched
+//	(b) coverage check         — 409, nothing touched
+//	(c) in-flight row lookup   — 500 amend_unrecorded, READ-ONLY, nothing touched
+//	(d) per-stage amend cap    — 409, nothing touched
+//	(e) owner-slice guard      — 409, nothing touched
+//	(f) pre-approved row       — 500 amend_unrecorded, stage left PARKED
+//	(g) amended audit entry    — 500 amend_unrecorded, stage left PARKED
+//	(h) resume to pending      — 500 amend_resume_failed, stage left PARKED
+//	(i) orchestrator advance    — best-effort WARN (mirrors both existing arms)
 //
-// Steps (a)-(d) are the no-side-effect refusals; a stage whose widening the
-// chain never recorded is never dispatched. Every step from (e) on is RETRY-SAFE:
-// re-POSTing the same amend reuses the row (e), re-appends an entry keyed to the
-// same amendment_id so the cap is unmoved (c/f), and re-attempts the resume (g).
+// Steps (a)-(e) are the no-side-effect refusals; a stage whose widening the
+// chain never recorded is never dispatched. Every step from (f) on is RETRY-SAFE:
+// re-POSTing the same amend reuses this episode's row (f), re-appends an entry
+// keyed to the same amendment_id so the cap is unmoved (g), and re-attempts the
+// resume (h).
+//
+// (c) runs BEFORE the cap deliberately. A resume failure on the LAST permitted
+// amend has already recorded that amendment against the cap, so a cap check that
+// ignored the in-flight row would refuse the retry amend_budget_exhausted and
+// strand the stage parked with no admissible decision left. The cap therefore
+// admits a request that resolves to an amendment it has ALREADY counted — the
+// retry adds no new amendment — while a request resolving to no such row is
+// capped exactly as before.
 func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	runRow *run.Run, stage *run.Stage, reqBody scopeCompletenessDecisionRequest, decidedBy string) {
 	if s.cfg.ScopeAmendmentRepo == nil {
@@ -149,22 +199,45 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// (c) PER-STAGE AMEND CAP.
-	used, err := s.countScopeCompletenessAmends(ctx, runID, stage.ID)
+	// (c) IN-FLIGHT ROW LOOKUP — read-only. Which pre-approved row, if any, THIS
+	// exact decision already minted within THIS park episode. Keyed on the episode
+	// so a fresh park never adopts a completed episode's row (and so cannot amend
+	// forever under one amendment_id).
+	episode := amendEpisodeKey(park)
+	markerReason := operatorAmendMarkerReason(episode, reqBody.Reason)
+	var inflight *scopeamendment.Amendment
+	if episode != "" {
+		inflight, err = s.findOperatorAmendRow(ctx, runID, stage.ID, paths, markerReason)
+		if err != nil {
+			// Refuse rather than risk a duplicate: without the prior rows we cannot
+			// tell a fresh amend from a retry, and guessing wrong drains the agent's
+			// budget silently.
+			s.writeError(w, r, http.StatusInternalServerError, "amend_unrecorded",
+				"the scope widening could not be recorded; the stage is left parked — re-POST the decision",
+				map[string]any{internalCauseKey: err.Error()})
+			return
+		}
+	}
+
+	// (d) PER-STAGE AMEND CAP.
+	usage, err := s.scopeCompletenessAmendUsage(ctx, runID, stage.ID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"count prior scope-completeness amendments failed",
 			map[string]any{internalCauseKey: err.Error()})
 		return
 	}
-	if used >= maxScopeCompletenessAmendsPerStage {
+	// A retry of an amendment the cap ALREADY counted adds no new amendment, so it
+	// stays admissible at the boundary — otherwise a resume failure on the last
+	// permitted amend would strand the stage parked with no decision left.
+	if usage.count >= maxScopeCompletenessAmendsPerStage && !usage.records(inflight) {
 		s.writeError(w, r, http.StatusConflict, "amend_budget_exhausted",
 			"this stage has exhausted its amend-and-resume budget; the remaining resolution is \"fail\" plus a corrected decomposition",
-			map[string]any{"max": maxScopeCompletenessAmendsPerStage, "used": used})
+			map[string]any{"max": maxScopeCompletenessAmendsPerStage, "used": usage.count})
 		return
 	}
 
-	// (d) OWNER-SLICE GUARD. The run row comes from resolveParkedScopeStage,
+	// (e) OWNER-SLICE GUARD. The run row comes from resolveParkedScopeStage,
 	// which already refused a GetRun failure — re-fetching it here would add a
 	// round-trip whose error branch no request could reach.
 	guard, refusal := s.resolveAmendOwnerGuard(ctx, runRow, park, paths)
@@ -197,12 +270,12 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 	}
 	acknowledged := len(guard.unresolved) > 0 && reqBody.AcknowledgeOwnerUnresolved
 
-	// (e) The pre-approved #961 row — the SAME create+auto-approve mechanism
+	// (f) The pre-approved #961 row — the SAME create+auto-approve mechanism
 	// recover.go uses, so no prompt.go fold change is needed: the row is already
 	// APPROVED, and resolveApprovedScopeAmendmentEntries filters on status alone
 	// with no origin discriminator.
-	amendmentID, err := s.resolveOrCreateOperatorAmendRow(ctx, runID, stage.ID, paths,
-		reqBody.Reason, decidedBy)
+	amendmentID, err := s.resolveOrCreateOperatorAmendRow(ctx, inflight, runID, stage.ID, paths,
+		markerReason, decidedBy)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "amend_unrecorded",
 			"the scope widening could not be recorded; the stage is left parked — re-POST the decision",
@@ -294,16 +367,41 @@ func uncoveredBuildRequiredPaths(required []string, submitted []scopeamendment.P
 	return out
 }
 
+// scopeAmendUsage is what this stage has already spent against the per-stage
+// amend cap: how many DISTINCT amendments it has recorded, and WHICH — the
+// second half being what lets a retry of an already-counted amendment stay
+// admissible at the cap boundary.
+type scopeAmendUsage struct {
+	count int
+	ids   map[string]struct{}
+}
+
+// records reports whether the cap has ALREADY counted this row's amendment, i.e.
+// whether re-POSTing it would add a new amendment (it would not).
+func (u scopeAmendUsage) records(a *scopeamendment.Amendment) bool {
+	if a == nil {
+		return false
+	}
+	_, ok := u.ids[a.ID.String()]
+	return ok
+}
+
 // countScopeCompletenessAmends counts the DISTINCT amendments already applied to
 // this stage — see maxScopeCompletenessAmendsPerStage for why the key is
 // amendment_id and not the raw entry count.
 func (s *Server) countScopeCompletenessAmends(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
+	usage, err := s.scopeCompletenessAmendUsage(ctx, runID, stageID)
+	return usage.count, err
+}
+
+// scopeCompletenessAmendUsage is countScopeCompletenessAmends plus the identity
+// of each counted amendment.
+func (s *Server) scopeCompletenessAmendUsage(ctx context.Context, runID, stageID uuid.UUID) (scopeAmendUsage, error) {
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryScopeCompletenessAmended)
 	if err != nil {
-		return 0, err
+		return scopeAmendUsage{}, err
 	}
-	seen := make(map[string]struct{}, len(entries))
-	n := 0
+	usage := scopeAmendUsage{ids: make(map[string]struct{}, len(entries))}
 	for _, e := range entries {
 		if e.StageID == nil || *e.StageID != stageID {
 			continue
@@ -314,16 +412,16 @@ func (s *Server) countScopeCompletenessAmends(ctx context.Context, runID, stageI
 		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.AmendmentID == "" {
 			// Unkeyable: count it on its own rather than folding it into another
 			// amendment's slot — the cap fails CLOSED.
-			n++
+			usage.count++
 			continue
 		}
-		if _, dup := seen[payload.AmendmentID]; dup {
+		if _, dup := usage.ids[payload.AmendmentID]; dup {
 			continue
 		}
-		seen[payload.AmendmentID] = struct{}{}
-		n++
+		usage.ids[payload.AmendmentID] = struct{}{}
+		usage.count++
 	}
-	return n, nil
+	return usage, nil
 }
 
 // agentAmendmentBudgetRemaining reports how many of the stage's TWO #961
@@ -461,53 +559,57 @@ func implementStageOf(stages []*run.Stage) *run.Stage {
 	return nil
 }
 
+// findOperatorAmendRow is the READ-ONLY half of the idempotence: the row THIS
+// decision already minted within THIS park episode, or nil.
+//
+// The reuse key is (stage, marker reason INCLUDING the episode key, identical
+// path set), which is exactly what a re-POST of the same decision within one
+// park presents — and, because of the episode key, exactly what a SECOND park
+// submitting byte-identical input does NOT present.
+func (s *Server) findOperatorAmendRow(ctx context.Context, runID, stageID uuid.UUID,
+	paths []scopeamendment.PathEntry, markerReason string) (*scopeamendment.Amendment, error) {
+	existing, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range existing {
+		if a == nil || a.StageID != stageID || a.Reason != markerReason || !samePathSet(a.Paths, paths) {
+			continue
+		}
+		if a.Status == scopeamendment.StatusApproved || a.Status == scopeamendment.StatusPending {
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
 // resolveOrCreateOperatorAmendRow returns the pre-approved #961 row carrying the
-// widening, creating it only when this stage does not already have an identical
-// one.
+// widening: the in-flight row findOperatorAmendRow resolved, or a freshly minted
+// one when there is none.
 //
 // IDEMPOTENT BY REUSE (binding condition 2). The row, the audit entry and the
 // stage transition are three separate writes with no shared transaction, so a
 // failure at either of the later two leaves an orphaned APPROVED row behind. A
 // duplicate row is inert for the effective scope (foldScopeEntries dedupes by
 // path) but NOT for the budget, which counts ROWS — so a naive retry would eat
-// one of the re-run agent's two #961 slots per failed cycle. Reuse is keyed on
-// (stage, marker reason, identical path set), which is exactly what a re-POST of
-// the same decision presents. A PENDING orphan (Create succeeded, Decide failed)
-// is completed rather than duplicated.
+// one of the re-run agent's two #961 slots per failed cycle. A PENDING orphan
+// (Create succeeded, the auto-approve Decide did not) is COMPLETED rather than
+// duplicated.
 //
 // A retry that changes the paths or the reason is a DIFFERENT amendment and
 // correctly mints its own row; the orphan then stays and does consume a slot.
 // That residual is surfaced, not hidden: the response's
 // agent_amendment_budget_remaining reports the true remaining budget.
-func (s *Server) resolveOrCreateOperatorAmendRow(ctx context.Context, runID, stageID uuid.UUID,
-	paths []scopeamendment.PathEntry, reason, decidedBy string) (uuid.UUID, error) {
-	markerReason := operatorAmendReasonPrefix + strings.TrimSpace(reason)
-
-	existing, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
-	if err != nil {
-		// Refuse rather than risk a duplicate: without the prior rows we cannot
-		// tell a fresh amend from a retry, and guessing wrong drains the agent's
-		// budget silently.
-		return uuid.Nil, err
-	}
-	for _, a := range existing {
-		if a == nil || a.StageID != stageID || a.Reason != markerReason || !samePathSet(a.Paths, paths) {
-			continue
+func (s *Server) resolveOrCreateOperatorAmendRow(ctx context.Context, inflight *scopeamendment.Amendment,
+	runID, stageID uuid.UUID, paths []scopeamendment.PathEntry, markerReason, decidedBy string) (uuid.UUID, error) {
+	if inflight != nil {
+		if inflight.Status == scopeamendment.StatusApproved {
+			return inflight.ID, nil
 		}
-		switch a.Status {
-		case scopeamendment.StatusApproved:
-			return a.ID, nil
-		case scopeamendment.StatusPending:
-			if _, err := s.cfg.ScopeAmendmentRepo.Decide(ctx, scopeamendment.DecideParams{
-				ID:        a.ID,
-				Status:    scopeamendment.StatusApproved,
-				Reason:    "pre-approved by the amending operator",
-				DecidedBy: decidedBy,
-			}); err != nil {
-				return uuid.Nil, err
-			}
-			return a.ID, nil
+		if err := s.approveOperatorAmendRow(ctx, inflight.ID, decidedBy); err != nil {
+			return uuid.Nil, err
 		}
+		return inflight.ID, nil
 	}
 
 	amendment, err := s.cfg.ScopeAmendmentRepo.Create(ctx, scopeamendment.CreateParams{
@@ -519,15 +621,22 @@ func (s *Server) resolveOrCreateOperatorAmendRow(ctx context.Context, runID, sta
 	if err != nil {
 		return uuid.Nil, err
 	}
-	if _, err := s.cfg.ScopeAmendmentRepo.Decide(ctx, scopeamendment.DecideParams{
-		ID:        amendment.ID,
-		Status:    scopeamendment.StatusApproved,
-		Reason:    "pre-approved by the amending operator",
-		DecidedBy: decidedBy,
-	}); err != nil {
+	if err := s.approveOperatorAmendRow(ctx, amendment.ID, decidedBy); err != nil {
 		return uuid.Nil, err
 	}
 	return amendment.ID, nil
+}
+
+// approveOperatorAmendRow auto-approves the operator's own row: the amend
+// decision IS the approval, so the #961 row is never left for a second gate.
+func (s *Server) approveOperatorAmendRow(ctx context.Context, id uuid.UUID, decidedBy string) error {
+	_, err := s.cfg.ScopeAmendmentRepo.Decide(ctx, scopeamendment.DecideParams{
+		ID:        id,
+		Status:    scopeamendment.StatusApproved,
+		Reason:    "pre-approved by the amending operator",
+		DecidedBy: decidedBy,
+	})
+	return err
 }
 
 // samePathSet compares two path sets as SETS of {path, operation}, so ordering

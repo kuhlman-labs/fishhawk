@@ -125,6 +125,34 @@ func (f *amendFixture) approvedRows(t *testing.T) []*scopeamendment.Amendment {
 	return out
 }
 
+// pendingRows returns the PENDING scope-amendment rows on the parked stage —
+// the orphan shape a failed auto-approve leaves behind.
+func (f *amendFixture) pendingRows(t *testing.T) []*scopeamendment.Amendment {
+	t.Helper()
+	all, err := f.sa.ListByRun(context.Background(), f.child.ID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	var out []*scopeamendment.Amendment
+	for _, a := range all {
+		if a.StageID == f.stage.ID && a.Status == scopeamendment.StatusPending {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// repark puts the stage back in awaiting_scope_decision on a NEW park episode:
+// the same shortfall, but the HELD COMMIT differs, which is what a re-run under
+// the widened scope produces.
+func (f *amendFixture) repark(t *testing.T, heldSHA string) {
+	t.Helper()
+	next := *f.stage.ScopeCompletenessPark
+	next.HeldCommitSHA = heldSHA
+	f.stage.ScopeCompletenessPark = &next
+	f.stage.State = run.StageStateAwaitingScopeDecision
+}
+
 // assertNoSideEffects is the shape every amend REFUSAL must present: the stage
 // is still parked, no amendment row exists, and no amended-kind audit entry was
 // written. It reads COMMITTED STATE, not the error identity — a control that
@@ -587,6 +615,16 @@ func TestAmend_OwnerAttributionUnresolvedFailsClosed(t *testing.T) {
 			},
 			wantReason: amendOwnerUnresolvedNoImplement,
 		},
+		{
+			// The sibling's stage list is unreadable, so whether its implement
+			// pass has begun is unknown — the same uncertainty, reached through a
+			// repository seam rather than a fixture field.
+			name: "OwningSliceStagesUnreadable",
+			setup: func(f *amendFixture) {
+				f.s.cfg.RunRepo = &listStagesErrRepo{orchestratorRepo: f.rr, failFor: f.sibling.ID}
+			},
+			wantReason: amendOwnerUnresolvedStagesUnread,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAmendFixture(t)
@@ -621,6 +659,23 @@ type listRunsErrRepo struct {
 
 func (r *listRunsErrRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("sibling listing unavailable")
+}
+
+// listStagesErrRepo makes ListStagesForRun fail for ONE run — the OWNING
+// SIBLING. Scoping it that way is load-bearing: the decision handler resolves
+// the parked stage through the same call on the AMENDING child, so a repo that
+// failed for every run would refuse upstream (500 internal_error) and the
+// owner-guard branch under test would never be reached.
+type listStagesErrRepo struct {
+	*orchestratorRepo
+	failFor uuid.UUID
+}
+
+func (r *listStagesErrRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if runID == r.failFor {
+		return nil, errors.New("stage listing unavailable")
+	}
+	return r.orchestratorRepo.ListStagesForRun(ctx, runID)
 }
 
 // TestAmend_OwnerListRunsErrorFailsClosed: an unreadable sibling list is not
@@ -658,6 +713,11 @@ func TestAmend_UnresolvedAcknowledgementReadmitsAndIsRecorded(t *testing.T) {
 			amendOwnerUnresolvedNoEntry},
 		{"SiblingLookupFailed", func(f *amendFixture) { f.s.cfg.RunRepo = &listRunsErrRepo{f.rr} },
 			amendOwnerUnresolvedSiblingLookup},
+		{"OwningSliceStagesUnreadable",
+			func(f *amendFixture) {
+				f.s.cfg.RunRepo = &listStagesErrRepo{orchestratorRepo: f.rr, failFor: f.sibling.ID}
+			},
+			amendOwnerUnresolvedStagesUnread},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAmendFixture(t)
@@ -940,6 +1000,208 @@ func TestAmend_TransitionFailureLeavesStageParked(t *testing.T) {
 	// One row and one entry exist from the failed attempt; the retry must add
 	// NEITHER a second row NOR a second amend against the cap.
 	assertRetryLandsExactlyOneRow(t, f, postAmend(t, f, scopeAmendBody("widen the slice")))
+}
+
+// decideFailScopeAmendmentRepo fails the first N Decide calls while leaving
+// Create intact — the shape that strands a PENDING orphan: the row exists but
+// the operator's auto-approval never landed on it.
+type decideFailScopeAmendmentRepo struct {
+	*fakeScopeAmendmentRepo
+	failures int
+}
+
+func (d *decideFailScopeAmendmentRepo) Decide(ctx context.Context, p scopeamendment.DecideParams) (*scopeamendment.Amendment, error) {
+	if d.failures > 0 {
+		d.failures--
+		return nil, errors.New("amendment decision store unavailable")
+	}
+	return d.fakeScopeAmendmentRepo.Decide(ctx, p)
+}
+
+// TestAmend_PendingOrphanIsCompletedNotDuplicated is the Create-succeeded-but-
+// auto-approve-Decide-failed arm of binding condition 2. It is the one
+// mid-sequence failure that leaves a row in a NON-approved state, so it has its
+// own reuse branch (StatusPending → complete it) that the two approved-orphan
+// retry tests cannot exercise.
+//
+// A real Decide outage followed by a retry would otherwise either duplicate the
+// row — draining one of the re-run agent's two #961 slots — or silently reuse an
+// UNDECIDED row, which `resolveApprovedScopeAmendmentEntries` filters out, so the
+// stage would resume with the widening not actually in its effective scope.
+func TestAmend_PendingOrphanIsCompletedNotDuplicated(t *testing.T) {
+	f := newAmendFixture(t)
+	f.s.cfg.ScopeAmendmentRepo = &decideFailScopeAmendmentRepo{fakeScopeAmendmentRepo: f.sa, failures: 1}
+
+	w := postAmend(t, f, scopeAmendBody("widen the slice"))
+	// COMMITTED STATE FIRST: an undecided row is not a recorded widening, so the
+	// stage must stay parked with no APPROVED row and no amended entry.
+	f.assertNoSideEffects(t, "an amend whose auto-approve Decide failed")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "amend_unrecorded") {
+		t.Errorf("body must name amend_unrecorded: %s", w.Body.String())
+	}
+
+	// The orphan the retry must COMPLETE rather than duplicate.
+	pending := f.pendingRows(t)
+	if len(pending) != 1 {
+		t.Fatalf("%d pending amendment rows after the Decide failure, want exactly 1", len(pending))
+	}
+	orphanID := pending[0].ID
+
+	assertRetryLandsExactlyOneRow(t, f, postAmend(t, f, scopeAmendBody("widen the slice")))
+	rows := f.approvedRows(t)
+	if rows[0].ID != orphanID {
+		t.Errorf("the retry landed on row %s, want the COMPLETED pending orphan %s — minting a second row "+
+			"drains one of the re-run agent's two #961 slots", rows[0].ID, orphanID)
+	}
+	if left := f.pendingRows(t); len(left) != 0 {
+		t.Errorf("%d pending amendment row(s) left after the retry, want 0 — an undecided row is not folded "+
+			"into the effective scope, so the stage would resume without the widening", len(left))
+	}
+}
+
+// TestAmend_RepeatedParkEpisodesEachSpendASlot (counterfactual: the
+// park-EPISODE component of the reuse key). Reuse must recognize an INCOMPLETE
+// RETRY of this park, and nothing else. A stage that is amended, re-runs and
+// PARKS AGAIN presents a byte-identical (stage, reason, path set) on its second
+// episode: keyed on that alone, the second amend would adopt the first's row,
+// the cap would keep counting ONE distinct amendment_id, and the operator could
+// amend without limit — an unbounded loop burning a full agent pass per attempt,
+// which is exactly what maxScopeCompletenessAmendsPerStage exists to stop.
+//
+// Each episode is seeded BY CONSTRUCTION (a fresh park with the held commit the
+// re-run would have pushed), so the RED lands on the behavioral assertion.
+func TestAmend_RepeatedParkEpisodesEachSpendASlot(t *testing.T) {
+	f := newAmendFixture(t)
+	body := scopeAmendBody("the coupled prompt.go is build-required by this slice")
+
+	// EPISODE 1 — the first park, amended.
+	if w := postAmend(t, f, body); w.Code != http.StatusOK {
+		t.Fatalf("episode 1 status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	first := f.approvedRows(t)
+	if len(first) != 1 {
+		t.Fatalf("%d approved rows after episode 1, want 1", len(first))
+	}
+
+	// EPISODE 2 — the re-run parked again on a NEW held commit and the operator
+	// submits the IDENTICAL decision. This is a SECOND amend, not a retry.
+	f.repark(t, "4444444444444444444444444444444444444444")
+	w2 := postAmend(t, f, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("episode 2 status = %d, want 200; body = %s", w2.Code, w2.Body.String())
+	}
+	if rows := f.approvedRows(t); len(rows) != 2 {
+		t.Fatalf("%d approved rows after episode 2, want 2 — a NEW park episode must mint its OWN amendment, "+
+			"not adopt the completed episode's row", len(rows))
+	}
+	var resp2 scopeCompletenessDecisionResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatal(err)
+	}
+	if resp2.AmendmentID == first[0].ID.String() {
+		t.Errorf("episode 2 reused episode 1's amendment %s: the cap counts DISTINCT amendment_ids, so reusing "+
+			"across park episodes lets the two-amend cap be bypassed indefinitely", resp2.AmendmentID)
+	}
+	used, err := f.s.countScopeCompletenessAmends(context.Background(), f.child.ID, f.stage.ID)
+	if err != nil {
+		t.Fatalf("countScopeCompletenessAmends: %v", err)
+	}
+	if used != 2 {
+		t.Errorf("amend budget used = %d after two park episodes, want 2", used)
+	}
+
+	// EPISODE 3 — the cap now bites. Without the episode key it never would.
+	f.repark(t, "5555555555555555555555555555555555555555")
+	w3 := postAmend(t, f, body)
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("episode 3 status = %d, want 409 — a third park episode amended with identical input must be "+
+			"CAPPED, not admitted forever; body = %s", w3.Code, w3.Body.String())
+	}
+	if !strings.Contains(w3.Body.String(), "amend_budget_exhausted") {
+		t.Errorf("body must name amend_budget_exhausted: %s", w3.Body.String())
+	}
+	got, _ := f.rr.GetStage(context.Background(), f.stage.ID)
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want it left parked by the capped third episode", got.State)
+	}
+	if rows := f.approvedRows(t); len(rows) != 2 {
+		t.Errorf("%d approved rows after the capped third episode, want the 2 from episodes 1-2", len(rows))
+	}
+}
+
+// TestAmend_TransitionFailureOnTheFinalSlotStaysRetryable (counterfactual: the
+// cap's already-counted-retry admission). A resume failure on the SECOND — and
+// last — permitted amend has ALREADY appended that amendment's audit entry, so a
+// plain `used >= max` check refuses the retry amend_budget_exhausted and strands
+// the stage parked with no admissible decision left: the widening is recorded,
+// the stage is not resumed, and no further amend can ever move it.
+//
+// TestAmend_TransitionFailureLeavesStageParked starts from zero prior amends and
+// so never reaches this boundary. The prior amend here is seeded BY
+// CONSTRUCTION as an audit entry, not by driving the endpoint twice.
+func TestAmend_TransitionFailureOnTheFinalSlotStaysRetryable(t *testing.T) {
+	f := newAmendFixture(t)
+	stageID := f.stage.ID
+	priorID := uuid.New().String()
+	payload, _ := json.Marshal(map[string]any{"amendment_id": priorID})
+	if _, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: f.child.ID, StageID: &stageID, Category: CategoryScopeCompletenessAmended, Payload: payload,
+	}); err != nil {
+		t.Fatalf("seed the prior amend entry: %v", err)
+	}
+	f.s.cfg.RunRepo = &transitionFailRepo{orchestratorRepo: f.rr, failures: 1}
+
+	// The SECOND — and last — permitted amend, whose resume fails.
+	w := postAmend(t, f, scopeAmendBody("widen the slice"))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "amend_resume_failed") {
+		t.Errorf("body must name amend_resume_failed: %s", w.Body.String())
+	}
+	got, _ := f.rr.GetStage(context.Background(), stageID)
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Fatalf("stage state = %q, want it left parked when the resume failed", got.State)
+	}
+	// The cap is now AT its limit and the in-flight amendment is one of the two.
+	used, err := f.s.countScopeCompletenessAmends(context.Background(), f.child.ID, stageID)
+	if err != nil {
+		t.Fatalf("countScopeCompletenessAmends: %v", err)
+	}
+	if used != maxScopeCompletenessAmendsPerStage {
+		t.Fatalf("amend budget used = %d after the failed second amend, want %d — the fixture must reach the "+
+			"cap boundary for this test to mean anything", used, maxScopeCompletenessAmendsPerStage)
+	}
+
+	// THE RETRY. It re-POSTs an amendment the cap has already counted, so it adds
+	// no new amendment and must stay admissible.
+	w2 := postAmend(t, f, scopeAmendBody("widen the slice"))
+	if w2.Code == http.StatusConflict {
+		t.Fatalf("the retry was refused at the cap (%s): the widening is recorded but the stage is not resumed, "+
+			"so the stage is stranded parked with no admissible decision left", w2.Body.String())
+	}
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200; body = %s", w2.Code, w2.Body.String())
+	}
+	resumed, _ := f.rr.GetStage(context.Background(), stageID)
+	if resumed.State != run.StageStatePending {
+		t.Errorf("stage state after the retry = %q, want pending", resumed.State)
+	}
+	if rows := f.approvedRows(t); len(rows) != 1 {
+		t.Errorf("%d approved amendment rows after failure+retry, want exactly 1 — the retry must REUSE the "+
+			"in-flight row", len(rows))
+	}
+	after, err := f.s.countScopeCompletenessAmends(context.Background(), f.child.ID, stageID)
+	if err != nil {
+		t.Fatalf("countScopeCompletenessAmends: %v", err)
+	}
+	if after != maxScopeCompletenessAmendsPerStage {
+		t.Errorf("amend budget used = %d after the retry, want %d — a retry re-appends an entry keyed to the "+
+			"SAME amendment_id and must not spend a further slot", after, maxScopeCompletenessAmendsPerStage)
+	}
 }
 
 // TestAmend_ListByRunFailureRefusesRatherThanDuplicating: without the prior
