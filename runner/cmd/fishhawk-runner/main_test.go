@@ -313,6 +313,23 @@ type fakeUploader struct {
 	amendmentsSeq  [][]upload.ScopeAmendment
 	amendmentCalls int
 
+	// Scope-amendment REQUEST seam (#2748). gotRequestAmendmentArgs records
+	// every POST — the gate-not-widened safety tests assert it stays EMPTY.
+	// amendmentsAfterRequest, when non-nil, replaces f.amendments once the
+	// request lands, so the decision long-poll observes the operator's answer.
+	gotRequestAmendmentArgs []upload.RequestScopeAmendmentArgs
+	requestAmendmentErr     error
+	requestAmendmentID      string
+	requestAmendmentStageID string
+	requestAmendmentNil     bool
+	amendmentsAfterRequest  []upload.ScopeAmendment
+	// requestAmendmentDecision, when set, makes the fake behave like the real
+	// backend: the row the subsequent list-poll returns ECHOES the request's
+	// own paths under this status. Without the echo a widened request could
+	// not fold the extra paths, which would make the #2748 C6 counterfactual
+	// vacuous.
+	requestAmendmentDecision string
+
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
 	promptResp *upload.FetchedPrompt
@@ -564,6 +581,47 @@ func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.Fetch
 		return f.amendmentsSeq[idx], nil
 	}
 	return f.amendments, nil
+}
+
+// RequestScopeAmendment stubs the #2748 POST. Records every call (so the
+// gate-not-widened safety tests can assert a call count of ZERO) and, unless
+// requestAmendmentErr is set, returns a pending row whose id is
+// requestAmendmentID and whose paths/reason echo the request. When
+// amendmentsAfterRequest is non-nil it REPLACES f.amendments, so the decision
+// long-poll that follows observes the operator's answer.
+func (f *fakeUploader) RequestScopeAmendment(_ context.Context, args upload.RequestScopeAmendmentArgs) (*upload.ScopeAmendment, error) {
+	a := args
+	f.gotRequestAmendmentArgs = append(f.gotRequestAmendmentArgs, a)
+	if f.requestAmendmentErr != nil {
+		return nil, f.requestAmendmentErr
+	}
+	id := f.requestAmendmentID
+	if id == "" {
+		id = "amd-renumber"
+	}
+	row := &upload.ScopeAmendment{
+		ID:      id,
+		RunID:   args.RunID,
+		StageID: f.requestAmendmentStageID,
+		Paths:   args.Paths,
+		Reason:  args.Reason,
+		Status:  "pending",
+	}
+	if f.requestAmendmentDecision != "" {
+		f.amendments = []upload.ScopeAmendment{{
+			ID:     id,
+			RunID:  args.RunID,
+			Paths:  args.Paths,
+			Reason: args.Reason,
+			Status: f.requestAmendmentDecision,
+		}}
+	} else if f.amendmentsAfterRequest != nil {
+		f.amendments = f.amendmentsAfterRequest
+	}
+	if f.requestAmendmentNil {
+		return nil, nil
+	}
+	return row, nil
 }
 
 func (f *fakeUploader) RetryStage(_ context.Context, args upload.RetryStageArgs) error {
@@ -21758,5 +21816,627 @@ func TestReauthRemedyHint(t *testing.T) {
 	t.Setenv("GITHUB_REPOSITORY", "")
 	if got := reauthRemedyHint(config{}); !strings.Contains(got, "the target repo") {
 		t.Errorf("hint with no repo at all = %q, want the generic phrase", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2748 — migration-number collision: the DECISION park, end to end through
+// run() against a real work tree and a real local bare origin. These are the
+// behavioural vehicles; the recognition predicate's own refusal branches live
+// in migrationrenumber_test.go.
+// ---------------------------------------------------------------------------
+
+const (
+	renumberRunID   = "aaaa1111bbbb2222cccc3333dddd4444"
+	renumberStageID = "eeee5555ffff66667777888899990000"
+	renumberMigDir  = "backend/internal/postgres/migrations"
+)
+
+// migrationRenumberRepo builds the #2748 fixture: a real repo with a local bare
+// `origin`, a url.insteadOf rewrite so the production push path stays local, a
+// migrations directory holding one BASE migration, and a dirty in-scope edit.
+// NO collision is seeded at stage start — the sibling lands DURING the agent
+// invocation, which is the timing the issue describes.
+func migrationRenumberRepo(t *testing.T) (repo, bare, branch string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.MkdirAll(filepath.Join(repo, renumberMigDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(repo, "a.txt"), "base\n")
+	mustWrite(t, filepath.Join(repo, renumberMigDir, "0069_base.up.sql"), "-- base up\n")
+	mustWrite(t, filepath.Join(repo, renumberMigDir, "0069_base.down.sql"), "-- base down\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+	runGit("push", "origin", "main")
+	runGit("config", "url."+bare+".insteadOf", "https://github.com/test-owner/test-repo")
+
+	// The agent's in-scope edit to the declared modify file.
+	mustWrite(t, filepath.Join(repo, "a.txt"), "agent change\n")
+
+	branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(renumberRunID), shortID(renumberStageID))
+	return repo, bare, branch
+}
+
+// renumberPrompt declares the STALE 0070 pair (the number the plan pinned) plus
+// the in-scope modify file.
+func renumberPrompt() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:    "eeee5555-ffff-6666-7777-888899990000",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "a.txt", Operation: "modify"},
+			{Path: renumberMigDir + "/0070_campaigns_working_dir.up.sql", Operation: "create"},
+			{Path: renumberMigDir + "/0070_campaigns_working_dir.down.sql", Operation: "create"},
+		},
+	}
+}
+
+func renumberRunArgs(t *testing.T, repo string) []string {
+	t.Helper()
+	return []string{
+		"--run-id", "aaaa1111-bbbb-2222-cccc-3333dddd4444",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "eeee5555-ffff-6666-7777-888899990000",
+		"--working-dir", repo,
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", filepath.Join(t.TempDir(), "trace.jsonl.gz"),
+	}
+}
+
+// landSiblingMigration commits a SIBLING item's migration onto the bare
+// origin's main from a side clone — the collision appearing mid-stage.
+func landSiblingMigration(t *testing.T, bare string) {
+	t.Helper()
+	side := filepath.Join(t.TempDir(), "sibling")
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run(filepath.Dir(side), "clone", "-b", "main", bare, side)
+	run(side, "config", "user.name", "sibling")
+	run(side, "config", "user.email", "sibling@example.com")
+	run(side, "config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(side, renumberMigDir, "0070_stages_progress.up.sql"), "-- sibling up\n")
+	mustWrite(t, filepath.Join(side, renumberMigDir, "0070_stages_progress.down.sql"), "-- sibling down\n")
+	run(side, "add", "-A")
+	run(side, "commit", "-m", "sibling takes 0070")
+	run(side, "push", "origin", "main")
+}
+
+// writeRenumbered writes the correctly-renumbered 0071 pair into the operator
+// checkout (mirrored into the isolated worktree by the fake invoker).
+func writeRenumbered(t *testing.T, repo string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_campaigns_working_dir.up.sql"), "-- renumbered up\n")
+	mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_campaigns_working_dir.down.sql"), "-- renumbered down\n")
+}
+
+// renumberUploader wires the fake backend for a run whose amendment resolves to
+// `status`; an empty status leaves the amendment pending forever (the undecided
+// path). stageAdd, when non-nil, runs extra agent work inside the invocation.
+func renumberUploader(t *testing.T, status string) *fakeUploader {
+	t.Helper()
+	fu := newFakeUploader(t)
+	fu.promptResp = renumberPrompt()
+	fu.requestAmendmentID = "amd-renumber-e2e"
+	// The decided row ECHOES the request, as the real backend does.
+	fu.requestAmendmentDecision = status
+	return fu
+}
+
+// remoteHasPath reports whether the bare origin's branch tip carries `path`.
+func remoteHasPath(t *testing.T, bare, branch, path string) bool {
+	t.Helper()
+	out, err := exec.Command("git", "--git-dir="+bare, "ls-tree", "-r", "--name-only", "refs/heads/"+branch).Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == path {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRun_MigrationRenumber_SiblingLandsMidStage_ParksForAmendment is THE
+// MOTIVATING TIMING: no collision exists at stage start. During the agent
+// invocation a sibling lands 0070 on the base AND the agent renumbers its own
+// pair to 0071. The stage must PARK for a scope-amendment decision naming
+// exactly the two created 0071 paths with operation `create`.
+func TestRun_MigrationRenumber_SiblingLandsMidStage_ParksForAmendment(t *testing.T) {
+	pinRenumberBudget(t, 2*time.Second)
+	repo, bare, branch := migrationRenumberRepo(t)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			landSiblingMigration(t, bare)
+			writeRenumbered(t, repo)
+		},
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "approved")
+	withFakeUploader(t, fu)
+	fpr := withFakePROpenerOnly(t)
+
+	var stderr strings.Builder
+	code := run(renumberRunArgs(t, repo), &stderr)
+
+	if len(fu.gotRequestAmendmentArgs) != 1 {
+		t.Fatalf("RequestScopeAmendment calls = %d, want exactly 1:\n%s", len(fu.gotRequestAmendmentArgs), stderr.String())
+	}
+	req := fu.gotRequestAmendmentArgs[0]
+	want := []upload.ScopeAmendmentPath{
+		{Path: renumberMigDir + "/0071_campaigns_working_dir.up.sql", Operation: "create"},
+		{Path: renumberMigDir + "/0071_campaigns_working_dir.down.sql", Operation: "create"},
+	}
+	if len(req.Paths) != 2 || req.Paths[0] != want[0] || req.Paths[1] != want[1] {
+		t.Fatalf("amendment paths = %+v, want exactly %+v", req.Paths, want)
+	}
+	if !strings.Contains(stderr.String(), `"event":"migration_renumber_recognized"`) {
+		t.Errorf("missing the recognition event:\n%s", stderr.String())
+	}
+	if code != exitOK {
+		t.Fatalf("run = %d, want exitOK on the approved park:\n%s", code, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Errorf("the approved park must still open the PR")
+	}
+	_ = branch
+}
+
+// TestRun_MigrationRenumber_AmendmentApproved_CommitLandsWithCreatedPaths: the
+// operator approves — the push lands, the pushed commit carries BOTH 0071
+// paths, and the stale declared 0070 paths are NOT demanded by the
+// scope-completeness gate.
+func TestRun_MigrationRenumber_AmendmentApproved_CommitLandsWithCreatedPaths(t *testing.T) {
+	pinRenumberBudget(t, 2*time.Second)
+	repo, bare, branch := migrationRenumberRepo(t)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke:              func(_ int, _ agent.Invocation) { writeRenumbered(t, repo) },
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "approved")
+	withFakeUploader(t, fu)
+	fpr := withFakePROpenerOnly(t)
+
+	var stderr strings.Builder
+	if code := run(renumberRunArgs(t, repo), &stderr); code != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", code, stderr.String())
+	}
+	for _, p := range []string{
+		renumberMigDir + "/0071_campaigns_working_dir.up.sql",
+		renumberMigDir + "/0071_campaigns_working_dir.down.sql",
+	} {
+		if !remoteHasPath(t, bare, branch, p) {
+			t.Errorf("pushed commit on %s missing the approved created path %s", branch, p)
+		}
+	}
+	if fpr.gotArgs == nil {
+		t.Error("the approved substitution must open the PR")
+	}
+	// The stale declared paths were EXEMPTED, not demanded.
+	if strings.Contains(stderr.String(), `"event":"scope_files_missing"`) {
+		t.Errorf("the substituted declared paths must not be demanded:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"decision":"approved"`) {
+		t.Errorf("missing the approved decision event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged is C7's
+// behavioural vehicle. The operator DENIES: nothing changes, the
+// created-out-of-scope gate fires exactly as it does today, and — the assertion
+// that reddens when the driver stops honouring the denial — NO run branch ref
+// appears on the bare origin.
+func TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged(t *testing.T) {
+	pinRenumberBudget(t, 2*time.Second)
+	repo, bare, branch := migrationRenumberRepo(t)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke:              func(_ int, _ agent.Invocation) { writeRenumbered(t, repo) },
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "denied")
+	withFakeUploader(t, fu)
+	fpr := withFakePROpenerOnly(t)
+
+	var stderr strings.Builder
+	code := run(renumberRunArgs(t, repo), &stderr)
+	// COMMITTED STATE, not error identity: a fold that happened anyway would
+	// return no different error here, but it WOULD put a ref on the remote.
+	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("origin must be untouched on the denial, but branch %s exists (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on the denial:\n%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("a denial must keep today's category-B:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"created_out_of_scope"`) {
+		t.Errorf("the unchanged created-out-of-scope gate must still fire:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"decision":"denied"`) {
+		t.Errorf("missing the denied decision event:\n%s", stderr.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("no PR may be opened on the denial")
+	}
+}
+
+// TestRun_MigrationRenumber_Undecided_CategoryBUnchanged: the budget expires
+// with the amendment still pending. Same outcome as a denial — the operator
+// latency costs the stage nothing beyond today's failure.
+func TestRun_MigrationRenumber_Undecided_CategoryBUnchanged(t *testing.T) {
+	pinRenumberBudget(t, 20*time.Millisecond)
+	repo, bare, branch := migrationRenumberRepo(t)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke:              func(_ int, _ agent.Invocation) { writeRenumbered(t, repo) },
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "pending")
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	if code := run(renumberRunArgs(t, repo), &stderr); code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on an undecided amendment:\n%s", code, stderr.String())
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+		t.Errorf("origin must be untouched when no decision lands")
+	}
+	if !strings.Contains(stderr.String(), `"decision":"undecided"`) {
+		t.Errorf("missing the undecided decision event:\n%s", stderr.String())
+	}
+}
+
+// TestRun_MigrationRenumber_NonRenumberCreatedFile_NoParkOffered is THE
+// PRIMARY SAFETY ASSERTION and the standing gate-not-widened proof: a created
+// file that is NOT a recognized renumber fails category-B outright with a
+// RequestScopeAmendment call count of ZERO. Two shapes.
+func TestRun_MigrationRenumber_NonRenumberCreatedFile_NoParkOffered(t *testing.T) {
+	cases := []struct {
+		name  string
+		write func(t *testing.T, repo string)
+	}{
+		{"plain_created_file", func(t *testing.T, repo string) {
+			mustWrite(t, filepath.Join(repo, "created.txt"), "net-new, undeclared\n")
+		}},
+		{"migration_with_unmatched_slug", func(t *testing.T, repo string) {
+			mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_unrelated_slug.up.sql"), "-- up\n")
+			mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_unrelated_slug.down.sql"), "-- down\n")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinRenumberBudget(t, 2*time.Second)
+			repo, bare, branch := migrationRenumberRepo(t)
+			write := tc.write
+			invoker := &fakeInvoker{
+				mirrorWorkingTreeFrom: repo,
+				canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+				onInvoke:              func(_ int, _ agent.Invocation) { write(t, repo) },
+			}
+			withFakeInvoker(t, invoker)
+			implementEnv(t, "test-owner/test-repo", "main")
+			fu := renumberUploader(t, "approved")
+			withFakeUploader(t, fu)
+			fpr := withFakePROpenerOnly(t)
+
+			var stderr strings.Builder
+			code := run(renumberRunArgs(t, repo), &stderr)
+			if len(fu.gotRequestAmendmentArgs) != 0 {
+				t.Fatalf("no park may be offered for a non-renumber created file, got %+v", fu.gotRequestAmendmentArgs)
+			}
+			if code != exitFailure {
+				t.Fatalf("run = %d, want exitFailure:\n%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), `"event":"created_out_of_scope"`) {
+				t.Errorf("the gate must still fire:\n%s", stderr.String())
+			}
+			if fpr.gotArgs != nil {
+				t.Error("no PR may be opened")
+			}
+			if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+				t.Errorf("origin must be untouched")
+			}
+		})
+	}
+}
+
+// TestRun_MigrationRenumber_MixedCreatedSet_AmendmentNamesOnlyRecognized is
+// C6's vehicle, and the reason the safety test above is not enough on its own:
+// the work tree carries BOTH a genuinely recognized renumber pair AND an
+// unrelated out-of-scope created file. The amendment must name ONLY the two
+// recognized paths, so approval cannot fold the unrelated file and the push is
+// still refused. Asserted by READING THE PUSHED STATE — deleting the
+// names-only-recognized restriction makes the unrelated file ride the approved
+// amendment onto the bare origin, which an error-identity assertion could not
+// see.
+func TestRun_MigrationRenumber_MixedCreatedSet_AmendmentNamesOnlyRecognized(t *testing.T) {
+	pinRenumberBudget(t, 2*time.Second)
+	repo, bare, branch := migrationRenumberRepo(t)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			writeRenumbered(t, repo)
+			mustWrite(t, filepath.Join(repo, "created.txt"), "unrelated, undeclared\n")
+		},
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "test-owner/test-repo", "main")
+	fu := renumberUploader(t, "approved")
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	code := run(renumberRunArgs(t, repo), &stderr)
+
+	if len(fu.gotRequestAmendmentArgs) != 1 {
+		t.Fatalf("RequestScopeAmendment calls = %d, want 1:\n%s", len(fu.gotRequestAmendmentArgs), stderr.String())
+	}
+	// PUSHED STATE is the primary assertion: the unrelated file must never
+	// reach origin. Errorf (not Fatalf) on the request-shape check below so a
+	// widened amendment reddens BOTH, and the pushed-state read still runs.
+	if remoteHasPath(t, bare, branch, "created.txt") {
+		t.Errorf("the unrelated created file reached the bare origin on %s — the amendment widened the gate", branch)
+	}
+	for _, p := range fu.gotRequestAmendmentArgs[0].Paths {
+		if p.Path == "created.txt" {
+			t.Errorf("the amendment named the UNRELATED created file: %+v", fu.gotRequestAmendmentArgs[0].Paths)
+		}
+	}
+	if code != exitFailure {
+		t.Errorf("run = %d, want exitFailure — the unrelated file still trips the gate:\n%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"created_out_of_scope"`) {
+		t.Errorf("the gate must still fire on the unrelated file:\n%s", stderr.String())
+	}
+}
+
+// TestRun_MigrationRenumber_NonMigrationsDirectory_NotRecognized: a created
+// pair under a directory whose basename is not `migrations` is a fixture, not a
+// migration — no park, category-B.
+func TestRun_MigrationRenumber_NonMigrationsDirectory_NotRecognized(t *testing.T) {
+	for _, dir := range []string{"backend/testdata/migrations-fixtures", "backend/fixtures"} {
+		t.Run(dir, func(t *testing.T) {
+			pinRenumberBudget(t, 2*time.Second)
+			repo, _, _ := migrationRenumberRepo(t)
+			target := dir
+			invoker := &fakeInvoker{
+				mirrorWorkingTreeFrom: repo,
+				canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+				onInvoke: func(_ int, _ agent.Invocation) {
+					if err := os.MkdirAll(filepath.Join(repo, target), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					mustWrite(t, filepath.Join(repo, target, "0071_campaigns_working_dir.up.sql"), "-- up\n")
+					mustWrite(t, filepath.Join(repo, target, "0071_campaigns_working_dir.down.sql"), "-- down\n")
+				},
+			}
+			withFakeInvoker(t, invoker)
+			implementEnv(t, "test-owner/test-repo", "main")
+			fu := renumberUploader(t, "approved")
+			fu.promptResp = renumberPrompt()
+			fu.promptResp.ScopeFiles = []upload.ScopeFile{
+				{Path: "a.txt", Operation: "modify"},
+				{Path: target + "/0070_campaigns_working_dir.up.sql", Operation: "create"},
+				{Path: target + "/0070_campaigns_working_dir.down.sql", Operation: "create"},
+			}
+			withFakeUploader(t, fu)
+
+			var stderr strings.Builder
+			code := run(renumberRunArgs(t, repo), &stderr)
+			if len(fu.gotRequestAmendmentArgs) != 0 {
+				t.Fatalf("a non-migrations directory must not be recognized, got %+v", fu.gotRequestAmendmentArgs)
+			}
+			if code != exitFailure {
+				t.Fatalf("run = %d, want exitFailure:\n%s", code, stderr.String())
+			}
+		})
+	}
+}
+
+// TestRun_MigrationRenumber_IncoherentPairNotOffered: a mismatched up/down pair
+// and a half-pair are not offered as an amendment.
+func TestRun_MigrationRenumber_IncoherentPairNotOffered(t *testing.T) {
+	cases := []struct {
+		name  string
+		write func(t *testing.T, repo string)
+	}{
+		{"mismatched_numbers", func(t *testing.T, repo string) {
+			mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_campaigns_working_dir.up.sql"), "-- up\n")
+			mustWrite(t, filepath.Join(repo, renumberMigDir, "0072_campaigns_working_dir.down.sql"), "-- down\n")
+		}},
+		{"half_pair", func(t *testing.T, repo string) {
+			mustWrite(t, filepath.Join(repo, renumberMigDir, "0071_campaigns_working_dir.up.sql"), "-- up\n")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pinRenumberBudget(t, 2*time.Second)
+			repo, _, _ := migrationRenumberRepo(t)
+			write := tc.write
+			invoker := &fakeInvoker{
+				mirrorWorkingTreeFrom: repo,
+				canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+				onInvoke:              func(_ int, _ agent.Invocation) { write(t, repo) },
+			}
+			withFakeInvoker(t, invoker)
+			implementEnv(t, "test-owner/test-repo", "main")
+			fu := renumberUploader(t, "approved")
+			withFakeUploader(t, fu)
+
+			var stderr strings.Builder
+			code := run(renumberRunArgs(t, repo), &stderr)
+			if len(fu.gotRequestAmendmentArgs) != 0 {
+				t.Fatalf("an incoherent pair must not be offered, got %+v", fu.gotRequestAmendmentArgs)
+			}
+			if code != exitFailure {
+				t.Fatalf("run = %d, want exitFailure:\n%s", code, stderr.String())
+			}
+		})
+	}
+}
+
+// TestRun_MigrationRenumber_StagedAndUnstaged_BothRecognized is the
+// staging-indifference property the declared-driven filesystem scan buys: the
+// same scenario run with the created files left untracked and with the agent
+// having `git add`ed them produces an IDENTICAL amendment request. A
+// recognition built on `git ls-files --others --exclude-standard` could not
+// hold this.
+func TestRun_MigrationRenumber_StagedAndUnstaged_BothRecognized(t *testing.T) {
+	requests := map[string][]upload.ScopeAmendmentPath{}
+	for _, staged := range []bool{false, true} {
+		name := "unstaged"
+		if staged {
+			name = "staged"
+		}
+		t.Run(name, func(t *testing.T) {
+			pinRenumberBudget(t, 2*time.Second)
+			repo, _, _ := migrationRenumberRepo(t)
+			doStage := staged
+			invoker := &fakeInvoker{
+				mirrorWorkingTreeFrom: repo,
+				canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+				onInvoke: func(_ int, inv agent.Invocation) {
+					writeRenumbered(t, repo)
+					if !doStage {
+						return
+					}
+					// Stage inside the isolated worktree the runner handed the agent.
+					mirrorWorkingTree(repo, inv.WorkingDir)
+					cmd := exec.Command("git", "add", renumberMigDir)
+					cmd.Dir = inv.WorkingDir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("git add: %v\n%s", err, out)
+					}
+				},
+			}
+			withFakeInvoker(t, invoker)
+			implementEnv(t, "test-owner/test-repo", "main")
+			fu := renumberUploader(t, "approved")
+			withFakeUploader(t, fu)
+			withFakePROpenerOnly(t)
+
+			var stderr strings.Builder
+			run(renumberRunArgs(t, repo), &stderr)
+			if len(fu.gotRequestAmendmentArgs) != 1 {
+				t.Fatalf("RequestScopeAmendment calls = %d, want 1 (%s):\n%s", len(fu.gotRequestAmendmentArgs), name, stderr.String())
+			}
+			requests[name] = fu.gotRequestAmendmentArgs[0].Paths
+		})
+	}
+	if len(requests) == 2 && fmt.Sprint(requests["staged"]) != fmt.Sprint(requests["unstaged"]) {
+		t.Errorf("recognition must be staging-indifferent: staged=%v unstaged=%v", requests["staged"], requests["unstaged"])
+	}
+}
+
+// failureClassification extracts the runner's terminal classification line —
+// the JSONL record carrying "category" — from a run's log.
+func failureClassification(t *testing.T, log string) string {
+	t.Helper()
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, `"category":`) {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestRun_MigrationRenumber_ParkExpiry_ClassificationMatchesUnparked is
+// operator condition 5: a run whose park BLOCKS and then expires undecided must
+// not surface a different failure class than the same run reaches when the park
+// never blocks at all.
+//
+// The control is the same fixture with the amendment POST refused (422 budget
+// exhausted): recognition runs, the driver falls open IMMEDIATELY, and the
+// stage proceeds down the un-parked path. The subject is the identical fixture
+// whose amendment stays `pending` until the decision budget expires. Both
+// classification records must be byte-identical apart from timing-free content.
+//
+// This also covers the deadline-during-park shape on the runner side: the only
+// runner-observable form of "the stage deadline expired while parked" is the
+// process context being cancelled, and the driver's ctx branch returns
+// (false, nil) exactly as the budget branch does — pinned by the
+// ctx_cancelled case in TestParkForMigrationRenumber_FailOpenBranches.
+func TestRun_MigrationRenumber_ParkExpiry_ClassificationMatchesUnparked(t *testing.T) {
+	classify := func(t *testing.T, expire bool) string {
+		t.Helper()
+		if expire {
+			pinRenumberBudget(t, 20*time.Millisecond)
+		} else {
+			pinRenumberBudget(t, 2*time.Second)
+		}
+		repo, _, _ := migrationRenumberRepo(t)
+		invoker := &fakeInvoker{
+			mirrorWorkingTreeFrom: repo,
+			canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			onInvoke:              func(_ int, _ agent.Invocation) { writeRenumbered(t, repo) },
+		}
+		withFakeInvoker(t, invoker)
+		implementEnv(t, "test-owner/test-repo", "main")
+		fu := renumberUploader(t, "pending")
+		if !expire {
+			// The un-parked control: the POST is refused, so the driver returns
+			// immediately and the stage never blocks.
+			fu.requestAmendmentErr = upload.ErrAmendmentBudgetExhausted
+		}
+		withFakeUploader(t, fu)
+
+		var stderr strings.Builder
+		if code := run(renumberRunArgs(t, repo), &stderr); code != exitFailure {
+			t.Fatalf("run = %d, want exitFailure:\n%s", code, stderr.String())
+		}
+		got := failureClassification(t, stderr.String())
+		if got == "" {
+			t.Fatalf("no classification record in:\n%s", stderr.String())
+		}
+		return got
+	}
+	parked := classify(t, true)
+	unparked := classify(t, false)
+	if parked != unparked {
+		t.Errorf("a parked-then-expired run must not surface a different failure class:\nparked   = %s\nunparked = %s", parked, unparked)
+	}
+	if !strings.Contains(parked, `"category":"B"`) {
+		t.Errorf("both paths must stay category-B, got %s", parked)
 	}
 }

@@ -104,6 +104,7 @@ type uploadClient interface {
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
 	FetchMCPToken(ctx context.Context, args upload.FetchMCPTokenArgs) (*upload.FetchMCPTokenResult, error)
 	FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error)
+	RequestScopeAmendment(ctx context.Context, args upload.RequestScopeAmendmentArgs) (*upload.ScopeAmendment, error)
 	ReportStageProgress(ctx context.Context, args upload.ReportStageProgressArgs) error
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
 	RunLineageComplete(ctx context.Context, runID string) (bool, error)
@@ -2453,7 +2454,23 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// branch, and passed into the failure report below so a retry_stage can
 			// resume the PR open with no agent re-invocation.
 			var prCheckpoint pushCheckpoint
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions), nil, &prCheckpoint)
+			// Migration-number collision park (#2748). Placed HERE, immediately
+			// before the ship, and NOT inside verifyCommit: by the time that
+			// closure runs, CommitAndPush has already staged the scope-only
+			// commit against the NARROW declared set, so honoring an approval
+			// there would mean redoing the whole FreshFetchBase/stash/stage/
+			// commit/verify cycle. This is the point that DECIDES whether the
+			// created-out-of-scope gate will fire, and it is the same pre-commit
+			// position refreshScopeAmendments (above) already folds approved
+			// amendment paths at — so the fold mechanism is reused verbatim and
+			// recognition is indifferent to whether the agent staged the files.
+			// Gated on willOpenPR, precisely the applicability set of the gate's
+			// open-PR arm. Fail-open: nil exemptions leave everything unchanged.
+			var renumberExemptions []scopeExemption
+			if willOpenPR {
+				renumberExemptions = maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, logSink)
+			}
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(mergeExemptions(validatedExemptions, operatorExemptions), renumberExemptions), renumberExemptions, &prCheckpoint)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -2497,7 +2514,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// operator's exempt_scope_files exemptions came from the prompt
 					// and MUST persist across the re-invoke. mergeExemptions unions
 					// them so the second gate call still subtracts the operator set.
-					reinvokeExemptions := mergeExemptions(validatedExemptions, operatorExemptions)
+					// Fresh-slice discipline (#2748): re-run recognition from
+					// scratch against the work tree as the RE-INVOKED agent left
+					// it, rather than carrying attempt 1's substitutions forward
+					// — the re-invoke rebased onto a fresh base and may have
+					// renumbered differently (or not at all). An already-approved
+					// amendment re-recognized here needs no second request: its
+					// created paths are already in cfg.scopeFiles, so the
+					// "created pair already declared" branch disqualifies it and
+					// the exemptions below simply carry over.
+					if willOpenPR {
+						renumberExemptions = mergeExemptions(renumberExemptions,
+							maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, logSink))
+					}
+					reinvokeExemptions := mergeExemptions(mergeExemptions(validatedExemptions, operatorExemptions), renumberExemptions)
 					// Supplemental re-invoke delta (#1218): the trace bundle (and its
 					// scope_files_exempted gate_evidence fold) already shipped above
 					// under #742 forward gating, BEFORE this re-invoke reloaded the
