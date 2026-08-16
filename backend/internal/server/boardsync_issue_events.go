@@ -197,9 +197,20 @@ func issueExpectedSourceStates(event string, conv workmgmt.Conventions) []string
 // leave-in-place) — on the GLOBAL audit chain (a closed issue has no run; the
 // repo + issue number + state_reason travel in the payload). Best-effort: a
 // missing audit repo or an append error logs and returns. Audits BOTH a move
-// and every skip, matching the run- and campaign-scoped hooks (#1012).
+// and every DECISION skip, matching the run- and campaign-scoped hooks (#1012)
+// — but NOT a NotApplicable result (#2494), which is logged at INFO and
+// appends nothing: a transition that touched no work item has no work-item
+// transition to record.
 func (s *Server) auditIssueBoardTransition(ctx context.Context, event, repo string, issueNum int, stateReason, canonical string, res *workmgmt.TransitionResult) {
 	if s.cfg.AuditRepo == nil || res == nil {
+		return
+	}
+	if res.NotApplicable {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "issue board transition: no work item to act on",
+			slog.String("event", event),
+			slog.String("repo", repo),
+			slog.Int("issue_number", issueNum),
+			slog.String("skip_reason", res.SkipReason))
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{

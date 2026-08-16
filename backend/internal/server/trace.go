@@ -1992,6 +1992,19 @@ func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, 
 	}
 }
 
+// categoryUnpricedModelAlert / categoryAgentRequestFailedAlert are the two
+// warn-only alert categories checkUnpricedModel emits. They are DISJOINT by
+// construction (#2494): a cost row whose model id is a bracket-wrapped
+// placeholder ("<synthetic>") records a request that never reached a model
+// and is reported as agent_request_failed_alert with the token-ratio
+// evidence, leaving unpriced_model_alert to mean only what it says — a real
+// model with no price. Both are registered in audit.KnownCategories, so
+// fishhawk_await_audit can be armed on either.
+const (
+	categoryUnpricedModelAlert      = "unpriced_model_alert"
+	categoryAgentRequestFailedAlert = "agent_request_failed_alert"
+)
+
 // checkUnpricedModel reads the recent cost_recorded audit history across
 // all runs and emits a warn-only unpriced_model_alert when a dispatched
 // model recorded a cost row it could not price — either the model id was
@@ -1999,6 +2012,12 @@ func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, 
 // reported no usable usage (known_usage=false) (#1870). Per ADR-044 the
 // pricing table stays human-authoritative — this alarms, it never
 // auto-prices.
+//
+// It ALSO emits the sibling agent_request_failed_alert (#2494) when an
+// in-window cost row carried a failed-request placeholder model id, with
+// the token-ratio evidence (fresh input, cache read/write, output, derived
+// cache-read ratio) that makes the diagnosis legible. The two emits are
+// INDEPENDENT: either, both, or neither can fire on one call.
 //
 // It is warn-only and best-effort throughout, identical in posture to
 // checkSpendAlert: the trace upload is already stored, audited, and
@@ -2032,36 +2051,142 @@ func (s *Server) checkUnpricedModel(ctx context.Context, runID, stageID uuid.UUI
 	samples := make([]unpricedmodel.Sample, 0, len(costEntries))
 	for _, e := range costEntries {
 		var p struct {
-			Model      string `json:"model"`
-			KnownModel bool   `json:"known_model"`
-			KnownUsage bool   `json:"known_usage"`
+			Model                 string `json:"model"`
+			KnownModel            bool   `json:"known_model"`
+			KnownUsage            bool   `json:"known_usage"`
+			InputTokens           int    `json:"input_tokens"`
+			CacheReadInputTokens  int    `json:"cache_read_input_tokens"`
+			CacheWriteInputTokens int    `json:"cache_write_input_tokens"`
+			OutputTokens          int    `json:"output_tokens"`
 		}
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			continue
 		}
 		samples = append(samples, unpricedmodel.Sample{
-			Time:       e.Timestamp,
-			Model:      p.Model,
-			KnownModel: p.KnownModel,
-			KnownUsage: p.KnownUsage,
+			Time:                  e.Timestamp,
+			Model:                 p.Model,
+			KnownModel:            p.KnownModel,
+			KnownUsage:            p.KnownUsage,
+			InputTokens:           p.InputTokens,
+			CacheReadInputTokens:  p.CacheReadInputTokens,
+			CacheWriteInputTokens: p.CacheWriteInputTokens,
+			OutputTokens:          p.OutputTokens,
 		})
 	}
 
-	// Prior alerts feed the once-per-window dedup: expand each prior
+	// Prior alerts feed the once-per-window dedup, read from BOTH streams so
+	// each class dedups against its OWN history (#2494): a prior
 	// unpriced_model_alert payload's unpriced_models / unknown_usage_models
-	// arrays into one Alert per model id at the entry's timestamp.
-	alertCategory := "unpriced_model_alert"
-	alertEntries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &alertCategory})
+	// arrays expand into unpriced-class Alerts, and a prior
+	// agent_request_failed_alert payload's failed_request_models array
+	// expands into failed-request-class Alerts. They deliberately do NOT
+	// cross-suppress — see unpricedmodel.Evaluate.
+	priorAlerts, ok := s.priorUnpricedAlerts(ctx, runID)
+	if !ok {
+		return
+	}
+
+	d := unpricedmodel.Evaluate(samples, priorAlerts, s.nowFunc().UTC(), unpricedmodel.Window)
+
+	if d.Tripped {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"unpriced model: dispatched model(s) recorded uncosted rows",
+			slog.String("run_id", runID.String()),
+			slog.Any("unpriced_models", d.UnpricedModels),
+			slog.Any("unknown_usage_models", d.UnknownUsageModels),
+			slog.String("triggering_model", triggeringModel))
+
+		modelCount := len(d.UnpricedModels) + len(d.UnknownUsageModels)
+		payload, _ := json.Marshal(map[string]any{
+			"unpriced_models":      d.UnpricedModels,
+			"unknown_usage_models": d.UnknownUsageModels,
+			"model_count":          modelCount,
+			"triggering_model":     triggeringModel,
+			"window_start":         d.WindowStart.Format(time.RFC3339),
+			"window_hours":         d.Window.Hours(),
+		})
+		systemKind := audit.ActorKind("system")
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: s.nowFunc().UTC(),
+			Category:  categoryUnpricedModelAlert,
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"unpriced model: append unpriced_model_alert audit entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+
+	if !d.FailedRequestTripped {
+		return
+	}
+
+	ev := d.FailedRequestEvidence
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"agent request failed: cost row(s) carry a placeholder model id, not a model",
+		slog.String("run_id", runID.String()),
+		slog.Any("failed_request_models", d.FailedRequestModels),
+		slog.Float64("cache_read_ratio", ev.CacheReadRatio),
+		slog.String("triggering_model", triggeringModel))
+
+	failedPayload, _ := json.Marshal(map[string]any{
+		"failed_request_models":    d.FailedRequestModels,
+		"model_count":              len(d.FailedRequestModels),
+		"triggering_model":         triggeringModel,
+		"input_tokens":             ev.InputTokens,
+		"cache_read_input_tokens":  ev.CacheReadInputTokens,
+		"cache_write_input_tokens": ev.CacheWriteInputTokens,
+		"output_tokens":            ev.OutputTokens,
+		"cache_read_ratio":         ev.CacheReadRatio,
+		"window_start":             d.WindowStart.Format(time.RFC3339),
+		"window_hours":             d.Window.Hours(),
+	})
+	failedKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: s.nowFunc().UTC(),
+		Category:  categoryAgentRequestFailedAlert,
+		ActorKind: &failedKind,
+		Payload:   failedPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"agent request failed: append agent_request_failed_alert audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// priorUnpricedAlerts reads the once-per-window dedup history for BOTH
+// alert streams and returns one unpricedmodel.Alert per (model, class)
+// occurrence. The bool is false when either read failed — the caller's
+// warn-only skip, matching checkUnpricedModel's best-effort posture (the
+// upload is already stored and cost-recorded, so a ListAll failure logs
+// and returns rather than unwinding anything).
+//
+// Each stream expands into its OWN class (Alert.FailedRequest), so a prior
+// unpriced_model_alert never suppresses a failed-request alert and vice
+// versa — the strict-independence decision recorded on
+// unpricedmodel.Evaluate.
+func (s *Server) priorUnpricedAlerts(ctx context.Context, runID uuid.UUID) ([]unpricedmodel.Alert, bool) {
+	var out []unpricedmodel.Alert
+
+	unpricedCategory := categoryUnpricedModelAlert
+	unpricedEntries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &unpricedCategory})
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"unpriced model: list unpriced_model_alert entries failed — skipping check",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return
+		return nil, false
 	}
-
-	var priorAlerts []unpricedmodel.Alert
-	for _, e := range alertEntries {
+	for _, e := range unpricedEntries {
 		var p struct {
 			UnpricedModels     []string `json:"unpriced_models"`
 			UnknownUsageModels []string `json:"unknown_usage_models"`
@@ -2070,49 +2195,35 @@ func (s *Server) checkUnpricedModel(ctx context.Context, runID, stageID uuid.UUI
 			continue
 		}
 		for _, m := range p.UnpricedModels {
-			priorAlerts = append(priorAlerts, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
+			out = append(out, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
 		}
 		for _, m := range p.UnknownUsageModels {
-			priorAlerts = append(priorAlerts, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
+			out = append(out, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
 		}
 	}
 
-	d := unpricedmodel.Evaluate(samples, priorAlerts, s.nowFunc().UTC(), unpricedmodel.Window)
-	if !d.Tripped {
-		return
-	}
-
-	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-		"unpriced model: dispatched model(s) recorded uncosted rows",
-		slog.String("run_id", runID.String()),
-		slog.Any("unpriced_models", d.UnpricedModels),
-		slog.Any("unknown_usage_models", d.UnknownUsageModels),
-		slog.String("triggering_model", triggeringModel))
-
-	modelCount := len(d.UnpricedModels) + len(d.UnknownUsageModels)
-	payload, _ := json.Marshal(map[string]any{
-		"unpriced_models":      d.UnpricedModels,
-		"unknown_usage_models": d.UnknownUsageModels,
-		"model_count":          modelCount,
-		"triggering_model":     triggeringModel,
-		"window_start":         d.WindowStart.Format(time.RFC3339),
-		"window_hours":         d.Window.Hours(),
-	})
-	systemKind := audit.ActorKind("system")
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: s.nowFunc().UTC(),
-		Category:  "unpriced_model_alert",
-		ActorKind: &systemKind,
-		Payload:   payload,
-	}); err != nil {
+	failedCategory := categoryAgentRequestFailedAlert
+	failedEntries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &failedCategory})
+	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"unpriced model: append unpriced_model_alert audit entry failed",
+			"unpriced model: list agent_request_failed_alert entries failed — skipping check",
 			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
+		return nil, false
 	}
+	for _, e := range failedEntries {
+		var p struct {
+			FailedRequestModels []string `json:"failed_request_models"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		for _, m := range p.FailedRequestModels {
+			out = append(out, unpricedmodel.Alert{Time: e.Timestamp, Model: m, FailedRequest: true})
+		}
+	}
+
+	return out, true
 }
 
 // runCostSummer is the optional capability checkBudgetAlerts uses to

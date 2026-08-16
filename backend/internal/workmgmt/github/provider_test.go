@@ -1174,6 +1174,112 @@ func TestProvider_Transition_SkipsWhenCanonicalStateUnmapped(t *testing.T) {
 	}
 }
 
+// TestProvider_Transition_NotApplicableClassification pins which skips are
+// NOT-APPLICABLE (there is no work item to act on, so the caller records no
+// work_item_transitioned entry, #2494) and which are DECISIONS about a real
+// work item (which keep auditing). Every outcome the Transition path can
+// produce is asserted, so a future skip added without a deliberate
+// classification shows up as a missing row here rather than as silent audit
+// suppression or a re-flood.
+func TestProvider_Transition_NotApplicableClassification(t *testing.T) {
+	cases := []struct {
+		name              string
+		build             func() (*fakeAPI, workmgmt.TransitionRequest)
+		wantMoved         bool
+		wantNotApplicable bool
+	}{
+		{
+			name: "no project configured",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				req := runStartedRequest()
+				req.Target.Project = nil
+				return transitionAPI("Backlog", true), req
+			},
+			wantNotApplicable: true,
+		},
+		{
+			name: "issue not on the board",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				return transitionAPI("", false), runStartedRequest()
+			},
+			wantNotApplicable: true,
+		},
+		{
+			name: "unreachable user-owned board",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				api := transitionAPI("Backlog", true)
+				api.projectsTokenConfigured = false
+				return api, runStartedRequest()
+			},
+			// Deliberately NOT not-applicable: an operator-actionable
+			// misconfiguration worth one audit row per occurrence.
+			wantNotApplicable: false,
+		},
+		{
+			name: "unmapped canonical state",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				req := runStartedRequest()
+				req.CanonicalState = workmgmt.CanonicalStateDone
+				req.States = map[string]string{workmgmt.CanonicalStateInProgress: "In Progress"}
+				return transitionAPI("Backlog", true), req
+			},
+			wantNotApplicable: false,
+		},
+		{
+			name: "target not a board option",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				api := transitionAPI("Backlog", true)
+				delete(api.meta.StatusOptions, "In Progress")
+				return api, runStartedRequest()
+			},
+			wantNotApplicable: false,
+		},
+		{
+			name: "never-fight-the-human source mismatch",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				return transitionAPI("Blocked", true), runStartedRequest()
+			},
+			wantNotApplicable: false,
+		},
+		{
+			name: "already at target",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				req := runStartedRequest()
+				req.ExpectedSourceStates = []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateInProgress}
+				return transitionAPI("In Progress", true), req
+			},
+			wantNotApplicable: false,
+		},
+		{
+			name: "landed move",
+			build: func() (*fakeAPI, workmgmt.TransitionRequest) {
+				return transitionAPI("Backlog", true), runStartedRequest()
+			},
+			wantMoved:         true,
+			wantNotApplicable: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api, req := tc.build()
+			res, err := New(api).Transition(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Transition: %v", err)
+			}
+			if res.Moved != tc.wantMoved {
+				t.Errorf("Moved = %v, want %v (%+v)", res.Moved, tc.wantMoved, res)
+			}
+			if res.Skipped == tc.wantMoved {
+				t.Errorf("Skipped = %v alongside Moved = %v (%+v)", res.Skipped, res.Moved, res)
+			}
+			if res.NotApplicable != tc.wantNotApplicable {
+				t.Errorf("NotApplicable = %v, want %v (skip_reason %q)",
+					res.NotApplicable, tc.wantNotApplicable, res.SkipReason)
+			}
+		})
+	}
+}
+
 func TestProvider_Transition_ResolveErrorsPropagate(t *testing.T) {
 	api := transitionAPI("Backlog", true)
 	api.nodeIDErr = errors.New("issue gone")

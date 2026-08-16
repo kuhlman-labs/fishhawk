@@ -2446,7 +2446,9 @@ components:
           type: string
           enum:
             [pending, awaiting_host_dispatch, dispatched, running,
-             awaiting_approval, succeeded, failed, cancelled]
+             awaiting_approval, awaiting_children, awaiting_input,
+             awaiting_scope_decision, awaiting_deploy_approval,
+             awaiting_deployment, succeeded, failed, cancelled]
           description: |
             `awaiting_host_dispatch` is the parked-for-host-spawn state
             (#1912): a runner_kind-locked-`local` agent stage the backend wants
@@ -2454,6 +2456,20 @@ components:
             by the host-dispatch marker (POST
             `/v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). Post-#1912
             `dispatched` unambiguously means a spawn attempt exists.
+
+            TWO VOCABULARIES (#2494). This raw `state` is the authoritative
+            thirteen-value stage state (the `run.StageState` set, enumerated
+            above — the enum previously omitted the five park states
+            `awaiting_children`, `awaiting_input`, `awaiting_scope_decision`,
+            `awaiting_deploy_approval` and `awaiting_deployment`, which the API
+            has always been able to return). The MCP surface reports a coarser
+            five-value BUCKET (`*_stage_wait_status.status`) answering "should
+            I keep polling?"; neither is renamed, and the mapping is total:
+            `running` maps to `running`, `succeeded`, `failed` and `cancelled`
+            map to themselves, and every other state — including one added
+            later — buckets to `pending`, the conservative keep-polling
+            default. The mapping is written down once, in
+            `backend/internal/mcpserver/stage_wait.go`.
         started_at:
           type: [string, "null"]
           format: date-time
@@ -5470,7 +5486,15 @@ paths:
             dev-loop runs).
           schema: { type: string, enum: [github_actions, local] }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - name: cursor
+          in: query
+          description: |
+            OPAQUE pagination token. The only accepted value is the
+            `next_cursor` field of a prior response for this endpoint,
+            copied VERBATIM. It is not an offset or an index and cannot
+            be constructed by hand; a malformed value is rejected with
+            400 `cursor_invalid`, never silently reset to the first page.
+          schema: { type: string }
       responses:
         '200':
           description: Page of runs.
@@ -7764,7 +7788,15 @@ paths:
             next `<category>` entry after sequence N" never needs
             pagination or a tail-sized limit.
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - name: cursor
+          in: query
+          description: |
+            OPAQUE pagination token. The only accepted value is the
+            `next_cursor` field of a prior response for this endpoint,
+            copied VERBATIM. It is not an offset or an index and cannot
+            be constructed by hand; a malformed value is rejected with
+            400 `cursor_invalid`, never silently reset to the first page.
+          schema: { type: string }
       responses:
         '200':
           description: Page of audit entries.
@@ -8153,7 +8185,15 @@ paths:
         - { name: category, in: query, schema: { type: string } }
         - { name: run_id, in: query, schema: { $ref: '#/components/schemas/UUID' } }
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - name: cursor
+          in: query
+          description: |
+            OPAQUE pagination token. The only accepted value is the
+            `next_cursor` field of a prior response for this endpoint,
+            copied VERBATIM. It is not an offset or an index and cannot
+            be constructed by hand; a malformed value is rejected with
+            400 `cursor_invalid`, never silently reset to the first page.
+          schema: { type: string }
       responses:
         '200':
           description: Page of audit entries, time-descending across both chains.
@@ -8247,7 +8287,7 @@ paths:
         - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: include_global, in: query, description: "Include the run-less chain partitions on the first page, scoped to the caller (#2097): a tenant sees only its own account partition, an operator/no-account caller sees the untenanted nil-UUID partition plus every tenant partition. Default true; set false to omit.", schema: { type: boolean, default: true } }
         - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+        - { name: cursor, in: query, description: "OPAQUE keyset continuation token. The only accepted value is a prior page's X-Fishhawk-Export-Next-Cursor header value, copied VERBATIM; it is not an offset or an index and cannot be constructed by hand. A malformed value is rejected with 400 `cursor_invalid`, never silently reset to the first page.", schema: { type: string } }
       responses:
         '200':
           description: |
@@ -8342,7 +8382,7 @@ paths:
         - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: include_global, in: query, description: "Include the run-less chain partition rows (empty run_id/repo cells) on the first page, scoped to the caller (#2097): a tenant sees only its own account partition, an operator/no-account caller sees the untenanted partition plus every tenant partition. Default true; set false to omit.", schema: { type: boolean, default: true } }
         - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded, not rows).", schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+        - { name: cursor, in: query, description: "OPAQUE keyset continuation token. The only accepted value is a prior page's X-Fishhawk-Export-Next-Cursor header value, copied VERBATIM; it is not an offset or an index and cannot be constructed by hand. A malformed value is rejected with 400 `cursor_invalid`, never silently reset to the first page.", schema: { type: string } }
         - { name: approver, in: query, description: "CSV-only entry filter: keep only approval_submitted entries whose actor_subject equals this value. ANDed with category and the run-level filters.", schema: { type: string } }
         - { name: category, in: query, description: "CSV-only entry filter: keep only entries of this exact category. ANDed with approver and the run-level filters.", schema: { type: string } }
       responses:
@@ -8439,7 +8479,7 @@ paths:
         - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+        - { name: cursor, in: query, description: "OPAQUE keyset continuation token. The only accepted value is a prior page's X-Fishhawk-Export-Next-Cursor header value, copied VERBATIM; it is not an offset or an index and cannot be constructed by hand. A malformed value is rejected with 400 `cursor_invalid`, never silently reset to the first page.", schema: { type: string } }
       responses:
         '200':
           description: One page of the agent-changes report.
@@ -8491,7 +8531,7 @@ paths:
         - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+        - { name: cursor, in: query, description: "OPAQUE keyset continuation token. The only accepted value is a prior page's X-Fishhawk-Export-Next-Cursor header value, copied VERBATIM; it is not an offset or an index and cannot be constructed by hand. A malformed value is rejected with 400 `cursor_invalid`, never silently reset to the first page.", schema: { type: string } }
       responses:
         '200':
           description: One page of the agent-changes report as markdown.
@@ -8777,7 +8817,15 @@ paths:
         - { name: repo, in: query, schema: { type: string } }
         - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
-        - { name: cursor, in: query, schema: { type: string } }
+        - name: cursor
+          in: query
+          description: |
+            OPAQUE pagination token. The only accepted value is the
+            `next_cursor` field of a prior response for this endpoint,
+            copied VERBATIM. It is not an offset or an index and cannot
+            be constructed by hand; a malformed value is rejected with
+            400 `cursor_invalid`, never silently reset to the first page.
+          schema: { type: string }
       responses:
         '200':
           description: Page of campaigns.

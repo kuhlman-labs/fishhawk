@@ -155,6 +155,13 @@ type auditFake struct {
 	// injects that error path so a test can assert the upload still
 	// succeeds and the cost_recorded append is never unwound.
 	listAllErr error
+	// listAllErrCategory, when set, makes ListAll fail ONLY for that
+	// category, leaving every other category reading normally. #2494 added a
+	// SECOND alert-stream read inside checkUnpricedModel
+	// (agent_request_failed_alert), and the blanket listAllErr cannot
+	// distinguish "the cost read failed" from "the second alert read failed" —
+	// this injects the latter branch in isolation.
+	listAllErrCategory string
 	// appendErrCategory, when set, makes AppendChained fail ONLY for
 	// entries of that category (leaving other categories, e.g.
 	// cost_recorded, appending normally). Used to inject the
@@ -215,6 +222,9 @@ func (a *auditFake) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*aud
 func (a *auditFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
 	if a.listAllErr != nil {
 		return nil, a.listAllErr
+	}
+	if a.listAllErrCategory != "" && p.Category != nil && *p.Category == a.listAllErrCategory {
+		return nil, errors.New("auditFake: injected ListAll error for " + a.listAllErrCategory)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -3013,6 +3023,407 @@ func TestShipTrace_UnpricedModel_AppendErrorDoesNotBlockUpload(t *testing.T) {
 	}
 	if !sawCost {
 		t.Error("cost_recorded append was unwound by the alert-append error — it must be preserved")
+	}
+}
+
+// syntheticModelID is the placeholder model id Claude Code stamps on a
+// message it synthesized locally because the API request failed before any
+// model ran (#2494). It is deliberately NOT a model identifier, so a cost
+// row carrying it must alert as a FAILED REQUEST, never as an unpriced model.
+const syntheticModelID = "<synthetic>"
+
+// appendedOfCategory returns every entry the audit fake recorded under one
+// category. Tests read COMMITTED audit state after the call returns, because
+// these checks return nothing — an error-identity assertion would be blind to
+// whether the entry actually landed.
+func appendedOfCategory(au *auditFake, category string) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == category {
+			out = append(out, au.appended[i])
+		}
+	}
+	return out
+}
+
+// seedFailedRequestCostEntry builds a cost_recorded audit entry carrying the
+// model plus the four token buckets the failed-request evidence sums.
+func seedFailedRequestCostEntry(t *testing.T, ts time.Time, model string, in, cacheRead, cacheWrite, out int) *audit.Entry {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"model":                    model,
+		"known_model":              false,
+		"known_usage":              in > 0 || cacheRead > 0 || cacheWrite > 0 || out > 0,
+		"input_tokens":             in,
+		"cache_read_input_tokens":  cacheRead,
+		"cache_write_input_tokens": cacheWrite,
+		"output_tokens":            out,
+		"usd":                      0,
+	})
+	if err != nil {
+		t.Fatalf("marshal failed-request cost seed payload: %v", err)
+	}
+	return &audit.Entry{Timestamp: ts, Category: "cost_recorded", Payload: payload}
+}
+
+// TestCheckUnpricedModel_SyntheticEmitsAgentRequestFailedAlert is the
+// CROSS-BOUNDARY test for item 1 of #2494: it drives the REAL recordCost path
+// (bundle manifest in -> cost_recorded payload -> detector -> audit entry out)
+// rather than calling unpricedmodel.Evaluate directly, because the change
+// spans manifest -> ledger payload -> detector -> audit category and a
+// per-layer unit would pass while any one of those hops silently dropped the
+// token counts or the classification.
+//
+// The placeholder case asserts the appended category is
+// agent_request_failed_alert and NOT unpriced_model_alert, and that the
+// payload carries the token-ratio evidence; the converse subtest asserts a
+// real unpriced model still takes the unpriced path and emits no
+// failed-request alert.
+func TestCheckUnpricedModel_SyntheticEmitsAgentRequestFailedAlert(t *testing.T) {
+	t.Run("placeholder_model", func(t *testing.T) {
+		s, sf, _, au := newTraceServer(t)
+		rr := newApprovalRunRepo()
+		stage := rr.seedStage(run.StageStateDispatched)
+		rr.seedRun(&run.Run{ID: stage.RunID})
+		s.cfg.RunRepo = rr
+		s.nowFunc = func() time.Time { return spendTestNow }
+
+		bundleBytes := packManifestBundle(t, bundle.Manifest{
+			BundleSchema:          "trace-bundle-v0",
+			RunID:                 stage.RunID.String(),
+			StageID:               stage.ID.String(),
+			Agent:                 "claude-code",
+			Model:                 syntheticModelID,
+			InputTokens:           4,
+			CacheReadInputTokens:  1200,
+			CacheWriteInputTokens: 796,
+			OutputTokens:          7,
+		})
+
+		priv, _ := sf.issue(t, stage.RunID)
+		w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (warn-only must not gate):\n%s", w.Code, w.Body.String())
+		}
+
+		if got := appendedOfCategory(au, "unpriced_model_alert"); len(got) != 0 {
+			t.Errorf("unpriced_model_alert entries = %d, want 0 — a failed request is not an unpriced model: %s",
+				len(got), got[0].Payload)
+		}
+		alerts := appendedOfCategory(au, "agent_request_failed_alert")
+		if len(alerts) != 1 {
+			t.Fatalf("agent_request_failed_alert entries = %d, want exactly 1", len(alerts))
+		}
+		if alerts[0].RunID != stage.RunID {
+			t.Errorf("alert RunID = %s, want %s", alerts[0].RunID, stage.RunID)
+		}
+		var ap struct {
+			FailedRequestModels   []string `json:"failed_request_models"`
+			ModelCount            int      `json:"model_count"`
+			TriggeringModel       string   `json:"triggering_model"`
+			InputTokens           int      `json:"input_tokens"`
+			CacheReadInputTokens  int      `json:"cache_read_input_tokens"`
+			CacheWriteInputTokens int      `json:"cache_write_input_tokens"`
+			OutputTokens          int      `json:"output_tokens"`
+			CacheReadRatio        float64  `json:"cache_read_ratio"`
+		}
+		if err := json.Unmarshal(alerts[0].Payload, &ap); err != nil {
+			t.Fatalf("decode agent_request_failed_alert payload: %v", err)
+		}
+		if !reflect.DeepEqual(ap.FailedRequestModels, []string{syntheticModelID}) {
+			t.Errorf("failed_request_models = %v, want [%s]", ap.FailedRequestModels, syntheticModelID)
+		}
+		if ap.ModelCount != 1 || ap.TriggeringModel != syntheticModelID {
+			t.Errorf("model_count/triggering_model = %d/%q, want 1/%q", ap.ModelCount, ap.TriggeringModel, syntheticModelID)
+		}
+		// The evidence must survive the whole manifest -> payload -> detector
+		// hop; these are the counts the bundle declared.
+		if ap.InputTokens != 4 || ap.CacheReadInputTokens != 1200 ||
+			ap.CacheWriteInputTokens != 796 || ap.OutputTokens != 7 {
+			t.Errorf("token evidence = %d/%d/%d/%d, want 4/1200/796/7",
+				ap.InputTokens, ap.CacheReadInputTokens, ap.CacheWriteInputTokens, ap.OutputTokens)
+		}
+		// 1200 / (4 + 1200 + 796) = 0.6
+		if ap.CacheReadRatio != 0.6 {
+			t.Errorf("cache_read_ratio = %v, want 0.6", ap.CacheReadRatio)
+		}
+	})
+
+	t.Run("real_unpriced_model_takes_the_other_path", func(t *testing.T) {
+		s, sf, _, au := newTraceServer(t)
+		rr := newApprovalRunRepo()
+		stage := rr.seedStage(run.StageStateDispatched)
+		rr.seedRun(&run.Run{ID: stage.RunID})
+		s.cfg.RunRepo = rr
+		s.nowFunc = func() time.Time { return spendTestNow }
+
+		bundleBytes := packManifestBundle(t, bundle.Manifest{
+			BundleSchema: "trace-bundle-v0",
+			RunID:        stage.RunID.String(),
+			StageID:      stage.ID.String(),
+			Agent:        "claude-code",
+			Model:        unpricedModelID,
+			InputTokens:  100,
+			OutputTokens: 200,
+		})
+
+		priv, _ := sf.issue(t, stage.RunID)
+		if w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+
+		if got := appendedOfCategory(au, "unpriced_model_alert"); len(got) != 1 {
+			t.Errorf("unpriced_model_alert entries = %d, want 1", len(got))
+		}
+		if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 0 {
+			t.Errorf("agent_request_failed_alert entries = %d, want 0 for a real unpriced model: %s",
+				len(got), got[0].Payload)
+		}
+	})
+}
+
+// TestCheckUnpricedModel_NoCrossSuppressionAtUpgradeBoundary pins the #2494
+// approval-condition-2 decision at the SERVER layer, on the exact case the
+// reviewer named: historical placeholder occurrences live under
+// unpriced_model_alert, so the first window after deploy has a prior
+// unpriced_model_alert whose model list contains "<synthetic>" AND a fresh
+// in-window "<synthetic>" cost row. Option (a) — strict independence — was
+// chosen, so that prior UNPRICED-class alert must NOT suppress the first
+// agent_request_failed_alert. One duplicate report at one upgrade boundary is
+// the accepted cost.
+func TestCheckUnpricedModel_NoCrossSuppressionAtUpgradeBoundary(t *testing.T) {
+	au := newAuditFake()
+	now := spendTestNow
+	au.seeded = []*audit.Entry{
+		seedFailedRequestCostEntry(t, now.Add(-1*time.Hour), syntheticModelID, 10, 90, 0, 1),
+		// The historical mislabel: "<synthetic>" recorded on the UNPRICED stream.
+		seedUnpricedAlertEntry(t, now.Add(-30*time.Minute), []string{syntheticModelID}, nil),
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	s.nowFunc = func() time.Time { return spendTestNow }
+
+	s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+
+	if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 1 {
+		t.Fatalf("agent_request_failed_alert entries = %d, want 1 — a prior UNPRICED-class alert must not cross-suppress", len(got))
+	}
+
+	// The reciprocal within the SAME class still dedups: a prior in-window
+	// agent_request_failed_alert naming the id suppresses the re-alarm.
+	au2 := newAuditFake()
+	priorFailed, err := json.Marshal(map[string]any{"failed_request_models": []string{syntheticModelID}})
+	if err != nil {
+		t.Fatalf("marshal prior failed-request alert: %v", err)
+	}
+	au2.seeded = []*audit.Entry{
+		seedFailedRequestCostEntry(t, now.Add(-1*time.Hour), syntheticModelID, 10, 90, 0, 1),
+		{Timestamp: now.Add(-30 * time.Minute), Category: "agent_request_failed_alert", Payload: priorFailed},
+	}
+	s2 := New(Config{Addr: "127.0.0.1:0", AuditRepo: au2})
+	s2.nowFunc = func() time.Time { return spendTestNow }
+
+	s2.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+
+	if got := appendedOfCategory(au2, "agent_request_failed_alert"); len(got) != 0 {
+		t.Errorf("agent_request_failed_alert entries = %d, want 0 — the same-class dedup must still apply", len(got))
+	}
+}
+
+// TestShipTrace_FailedRequest_NoUsageManifestRatioIsZero is failure mode (d),
+// driven through the REAL recordCost path rather than a pre-built ledger row.
+//
+// The boundary this case exists to cover is manifest -> cost ledger: an
+// all-zero manifest is exactly the input where recordCost takes its
+// knownUsage=false branch, so a version that dropped the bracketed model id or
+// the zero token split on that branch would still satisfy a test that
+// hand-seeded a cost_recorded row and called checkUnpricedModel directly. So
+// the manifest goes in over the wire, and the assertions read the committed
+// ledger row AND the resulting alert: the placeholder still classifies as a
+// FAILED REQUEST (not an unpriced model), and cache_read_ratio is exactly 0 —
+// never a NaN, which would make the payload unmarshalable JSON.
+func TestShipTrace_FailedRequest_NoUsageManifestRatioIsZero(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+
+	// Every token bucket zero: the manifest reported no usage at all.
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        syntheticModelID,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (warn-only must not gate):\n%s", w.Code, w.Body.String())
+	}
+
+	// The manifest -> ledger hop: recordCost must preserve the bracketed model
+	// id and the zero split on its knownUsage=false branch, or the detector
+	// downstream can never classify the row.
+	costRows := appendedOfCategory(au, "cost_recorded")
+	if len(costRows) != 1 {
+		t.Fatalf("cost_recorded entries = %d, want 1", len(costRows))
+	}
+	var cp struct {
+		Model                 string `json:"model"`
+		KnownUsage            bool   `json:"known_usage"`
+		InputTokens           int    `json:"input_tokens"`
+		CacheReadInputTokens  int    `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens int    `json:"cache_write_input_tokens"`
+		OutputTokens          int    `json:"output_tokens"`
+	}
+	if err := json.Unmarshal(costRows[0].Payload, &cp); err != nil {
+		t.Fatalf("decode cost_recorded payload: %v", err)
+	}
+	if cp.Model != syntheticModelID {
+		t.Errorf("cost_recorded model = %q, want the bracketed placeholder %q preserved verbatim",
+			cp.Model, syntheticModelID)
+	}
+	if cp.KnownUsage {
+		t.Errorf("cost_recorded known_usage = true, want false for an all-zero manifest")
+	}
+	if cp.InputTokens != 0 || cp.CacheReadInputTokens != 0 ||
+		cp.CacheWriteInputTokens != 0 || cp.OutputTokens != 0 {
+		t.Errorf("cost_recorded token split = %d/%d/%d/%d, want all zero",
+			cp.InputTokens, cp.CacheReadInputTokens, cp.CacheWriteInputTokens, cp.OutputTokens)
+	}
+
+	// The ledger -> detector -> audit hop.
+	if got := appendedOfCategory(au, "unpriced_model_alert"); len(got) != 0 {
+		t.Errorf("unpriced_model_alert entries = %d, want 0 — a zero-usage failed request is not an unpriced model: %s",
+			len(got), got[0].Payload)
+	}
+	alerts := appendedOfCategory(au, "agent_request_failed_alert")
+	if len(alerts) != 1 {
+		t.Fatalf("agent_request_failed_alert entries = %d, want 1", len(alerts))
+	}
+	var ap struct {
+		FailedRequestModels   []string `json:"failed_request_models"`
+		InputTokens           int      `json:"input_tokens"`
+		CacheReadInputTokens  int      `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens int      `json:"cache_write_input_tokens"`
+		OutputTokens          int      `json:"output_tokens"`
+		CacheReadRatio        float64  `json:"cache_read_ratio"`
+	}
+	if err := json.Unmarshal(alerts[0].Payload, &ap); err != nil {
+		t.Fatalf("decode payload (a NaN ratio would fail to marshal): %v", err)
+	}
+	if !reflect.DeepEqual(ap.FailedRequestModels, []string{syntheticModelID}) {
+		t.Errorf("failed_request_models = %v, want [%s]", ap.FailedRequestModels, syntheticModelID)
+	}
+	if ap.InputTokens != 0 || ap.CacheReadInputTokens != 0 ||
+		ap.CacheWriteInputTokens != 0 || ap.OutputTokens != 0 {
+		t.Errorf("token evidence = %d/%d/%d/%d, want all zero",
+			ap.InputTokens, ap.CacheReadInputTokens, ap.CacheWriteInputTokens, ap.OutputTokens)
+	}
+	if ap.CacheReadRatio != 0 {
+		t.Errorf("cache_read_ratio = %v, want exactly 0 for a zero denominator", ap.CacheReadRatio)
+	}
+}
+
+// TestCheckUnpricedModel_FailedRequest_ReadFailuresAreWarnOnly covers the two
+// READ error branches independently — failure modes (a) and (b). Both log at
+// WARN and return without emitting anything; neither unwinds the upload.
+func TestCheckUnpricedModel_FailedRequest_ReadFailuresAreWarnOnly(t *testing.T) {
+	seed := func() []*audit.Entry {
+		return []*audit.Entry{
+			seedFailedRequestCostEntry(t, spendTestNow.Add(-1*time.Hour), syntheticModelID, 10, 90, 0, 1),
+		}
+	}
+
+	t.Run("cost_recorded_read_fails", func(t *testing.T) {
+		au := newAuditFake()
+		au.seeded = seed()
+		au.listAllErrCategory = "cost_recorded"
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		s.nowFunc = func() time.Time { return spendTestNow }
+
+		s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+
+		if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 0 {
+			t.Errorf("emitted %d alerts despite the cost_recorded read failing", len(got))
+		}
+	})
+
+	t.Run("prior_failed_request_alert_read_fails", func(t *testing.T) {
+		// The SECOND alert-stream read (#2494). Only that category errors, so
+		// the cost read and the unpriced-alert read both succeed — this
+		// isolates the new branch from the pre-existing one.
+		au := newAuditFake()
+		au.seeded = seed()
+		au.listAllErrCategory = "agent_request_failed_alert"
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		s.nowFunc = func() time.Time { return spendTestNow }
+
+		s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+
+		if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 0 {
+			t.Errorf("emitted %d alerts despite the prior-alert read failing", len(got))
+		}
+	})
+
+	t.Run("prior_unpriced_alert_read_fails", func(t *testing.T) {
+		// The pre-existing first alert-stream read still short-circuits BOTH
+		// classes: the prior-alert history is read once for both.
+		au := newAuditFake()
+		au.seeded = seed()
+		au.listAllErrCategory = "unpriced_model_alert"
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		s.nowFunc = func() time.Time { return spendTestNow }
+
+		s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), syntheticModelID)
+
+		if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 0 {
+			t.Errorf("emitted %d alerts despite the unpriced-alert read failing", len(got))
+		}
+	})
+}
+
+// TestShipTrace_FailedRequestAlert_AppendErrorDoesNotBlockUpload is failure
+// mode (c) for the NEW category: the agent_request_failed_alert write fails,
+// the error is swallowed (WARN, not propagated), the upload still returns 202
+// and the earlier cost_recorded append stands.
+func TestShipTrace_FailedRequestAlert_AppendErrorDoesNotBlockUpload(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+	au.appendErrCategory = "agent_request_failed_alert"
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema:         "trace-bundle-v0",
+		RunID:                stage.RunID.String(),
+		StageID:              stage.ID.String(),
+		Agent:                "claude-code",
+		Model:                syntheticModelID,
+		InputTokens:          4,
+		CacheReadInputTokens: 1200,
+		OutputTokens:         7,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 — an alert-append failure must not unwind the upload:\n%s",
+			w.Code, w.Body.String())
+	}
+
+	if got := appendedOfCategory(au, "cost_recorded"); len(got) == 0 {
+		t.Error("cost_recorded append was unwound by the alert-append error — it must be preserved")
+	}
+	if got := appendedOfCategory(au, "agent_request_failed_alert"); len(got) != 0 {
+		t.Error("agent_request_failed_alert should have failed to append (injected error), yet one is recorded")
 	}
 }
 

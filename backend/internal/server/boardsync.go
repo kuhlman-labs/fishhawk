@@ -83,8 +83,10 @@ func (s *Server) NotifyBoardTransition(ctx context.Context, runID uuid.UUID, eve
 //     unconfigured states map => silent no-op (nothing to move).
 //   - a provider that does not implement the Transitioner capability => no-op.
 //   - a genuine provider error => WARN log, no audit, no unwind.
-//   - a move OR a deliberate skip => a work_item_transitioned audit entry on
-//     the run (condition (4): audit every move AND every skip).
+//   - a move OR a deliberate DECISION skip => a work_item_transitioned audit
+//     entry on the run (condition (4): audit every move AND every skip).
+//   - a NotApplicable result (no project configured / issue not on the board,
+//     #2494) => INFO log, NO audit entry: nothing was there to transition.
 //
 // The never-fight-the-human guard lives in the provider (it only advances a
 // card whose current status is in ExpectedSourceStates); this hook supplies the
@@ -189,9 +191,11 @@ func (s *Server) boardTransitionForRun(ctx context.Context, rn *run.Run, event s
 //   - a provider that does not implement Transitioner => no-op.
 //   - a nil GitHub client / installation-resolution failure => WARN log, no move.
 //   - a genuine provider error => WARN log, no audit, no unwind.
-//   - a move OR a deliberate skip => a work_item_transitioned audit on the
-//     global chain (audit every move AND every skip, including the
+//   - a move OR a deliberate DECISION skip => a work_item_transitioned audit on
+//     the global chain (audit every move AND every skip, including the
 //     projects-token-absent skip #1107/#1114).
+//   - a NotApplicable result (no project configured / issue not on the board,
+//     #2494) => INFO log, NO audit entry: nothing was there to transition.
 func (s *Server) boardTransitionForCampaignItem(ctx context.Context, c *campaign.Campaign, issueNumber int, event string) {
 	if c == nil || issueNumber <= 0 {
 		return
@@ -276,10 +280,22 @@ func (s *Server) boardTransitionForCampaignItem(ctx context.Context, c *campaign
 // what a campaign-scoped board move did — a landed move or a deliberate skip — on
 // the GLOBAL audit chain (a campaign is not a run; the campaign id + issue number
 // travel in the payload). Best-effort: a missing audit repo or an append error
-// logs and returns. Audits BOTH a move and every skip (the never-fight-the-human
-// skip and the projects-token-absent skip), matching the run-scoped hook.
+// logs and returns. Audits BOTH a move and every DECISION skip (the
+// never-fight-the-human skip and the projects-token-absent skip), matching the
+// run-scoped hook — but NOT a NotApplicable result (#2494), which is logged at
+// INFO and appends nothing: a transition that touched no work item has no
+// work-item transition to record.
 func (s *Server) auditCampaignBoardTransition(ctx context.Context, c *campaign.Campaign, event string, issueNumber int, canonical string, res *workmgmt.TransitionResult) {
 	if s.cfg.AuditRepo == nil || c == nil || res == nil {
+		return
+	}
+	if res.NotApplicable {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "campaign board transition: no work item to act on",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("repo", c.Repo),
+			slog.Int("issue_number", issueNumber),
+			slog.String("skip_reason", res.SkipReason))
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{
@@ -354,8 +370,24 @@ func (s *Server) campaignAccountIDForAudit(ctx context.Context, campaignID uuid.
 // work_item_filed, this is NOT gated on the run being non-terminal: run_merged
 // and run_failed fire exactly as the run reaches a terminal state, so gating
 // them out would silence the two most meaningful board moves.
+//
+// The one carve-out on the #1012 "audit every move AND every skip" contract is
+// a NotApplicable result (#2494) — no project configured, or the issue not on
+// the board. There is no work item those transitions could have moved, so the
+// entry is noise by construction: on a repo with no board every lifecycle edge
+// of every run wrote one, and the flood dominated the audit tail. Those are
+// logged at INFO and append nothing; every DECISION skip still audits.
 func (s *Server) auditBoardTransition(ctx context.Context, rn *run.Run, event string, issueNum int, canonical string, res *workmgmt.TransitionResult) {
 	if s.cfg.AuditRepo == nil || rn == nil || res == nil {
+		return
+	}
+	if res.NotApplicable {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "board transition: no work item to act on",
+			slog.String("event", event),
+			slog.String("run_id", rn.ID.String()),
+			slog.String("repo", rn.Repo),
+			slog.Int("issue_number", issueNum),
+			slog.String("skip_reason", res.SkipReason))
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{

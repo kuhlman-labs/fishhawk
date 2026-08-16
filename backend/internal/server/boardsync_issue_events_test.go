@@ -134,6 +134,38 @@ func TestHandleIssueLifecycle_ClosedAlreadyDone_AuditedSkip(t *testing.T) {
 	}
 }
 
+// TestHandleIssueLifecycle_NotApplicableAppendsNothing is the issue-scoped
+// arm of the #2494 flood suppression: a NotApplicable result — no project
+// configured, or the issue not on the board — appends ZERO
+// work_item_transitioned entries, while the never-fight-the-human DECISION
+// skip beside it (TestHandleIssueLifecycle_ClosedAlreadyDone_AuditedSkip)
+// still appends one.
+//
+// The result is seeded BY CONSTRUCTION rather than by calling the provider, so
+// deleting the res.NotApplicable guard in auditIssueBoardTransition reddens the
+// zero-entries assertion and not a fixture. The assertion reads COMMITTED
+// audit state after the call returns — the function returns nothing.
+func TestHandleIssueLifecycle_NotApplicableAppendsNothing(t *testing.T) {
+	for _, reason := range []string{"no project configured", "issue is not on the project board"} {
+		t.Run(reason, func(t *testing.T) {
+			fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{
+				Skipped: true, NotApplicable: true, To: "Done", SkipReason: reason,
+			}}
+			registerTransitionProvider(t, fp)
+			s, au := issueEventServer(t)
+
+			s.handleIssueLifecycleBoardSync(context.Background(), issuesEvent("closed", 2494, "completed"))
+
+			if len(fp.calls) != 1 {
+				t.Fatalf("Transition calls = %d, want 1 — the move is still attempted", len(fp.calls))
+			}
+			if got := campaignTransitionAudits(au); len(got) != 0 {
+				t.Errorf("work_item_transitioned audits = %d, want 0: %v", len(got), got)
+			}
+		})
+	}
+}
+
 // (c) closed as not_planned leaves the card — the provider is NOT called — and
 // audits the deliberate leave-in-place skip naming the state_reason.
 func TestHandleIssueLifecycle_ClosedNotPlanned_LeftInPlace(t *testing.T) {

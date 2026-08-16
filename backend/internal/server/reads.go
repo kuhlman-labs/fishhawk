@@ -693,20 +693,36 @@ func encodeOffsetCursor(offset int) string {
 	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("offset:%d", offset)))
 }
 
+// cursorAcceptedInput names what a `cursor` query parameter actually
+// accepts, appended to EVERY malformed-cursor message on both decoders
+// (#2494). The bare "cursor is not in expected shape" told the operator
+// their value was wrong but not what a right one looks like, and the
+// natural guess — a page offset or a row index — is precisely the wrong
+// one, so the message has to say all three things: the token is opaque,
+// the only source is a prior response's next_cursor, and it is not a
+// positional number.
+//
+// It is deliberately a shared const rather than per-branch prose: a
+// message that drifts between the four offset branches and the export
+// decoder is how the original vagueness crept in.
+const cursorAcceptedInput = "cursor is an opaque token — the only accepted value is the next_cursor " +
+	"field of a prior response for this endpoint, copied verbatim; it is not an offset or an index " +
+	"and cannot be constructed by hand"
+
 func decodeOffsetCursor(cursor string) (int, error) {
 	if cursor == "" {
 		return 0, nil
 	}
 	raw, err := base64.URLEncoding.DecodeString(cursor)
 	if err != nil {
-		return 0, fmt.Errorf("cursor is not valid base64")
+		return 0, fmt.Errorf("cursor is not valid base64: %s", cursorAcceptedInput)
 	}
 	var offset int
 	if _, err := fmt.Sscanf(string(raw), "offset:%d", &offset); err != nil {
-		return 0, fmt.Errorf("cursor is not in expected shape")
+		return 0, fmt.Errorf("cursor is not in expected shape: %s", cursorAcceptedInput)
 	}
 	if offset < 0 {
-		return 0, fmt.Errorf("cursor offset must be non-negative")
+		return 0, fmt.Errorf("cursor offset must be non-negative: %s", cursorAcceptedInput)
 	}
 	return offset, nil
 }

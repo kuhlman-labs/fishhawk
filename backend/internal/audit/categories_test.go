@@ -171,6 +171,21 @@ func TestKnownCategories_StagePermissionsDeclared(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_AgentRequestFailedAlert pins the E48.66 / #2494
+// category: the cost-ledger check writes it when an in-window cost row
+// carried a placeholder model id (a request that never reached a model)
+// rather than an unpriced real model. An unregistered category is
+// un-awaitable — an operator could not arm fishhawk_await_audit on the new
+// alert, so a failed request would be as undiagnosable as the
+// unpriced_model_alert mislabel it replaces — and
+// categories_completeness_test.go's AST sweep would fail the build on the
+// emit site in trace.go.
+func TestKnownCategories_AgentRequestFailedAlert(t *testing.T) {
+	if !IsKnownCategory("agent_request_failed_alert") {
+		t.Fatal("agent_request_failed_alert is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_AcceptanceTriageArbitrated pins the E66.37 / #2474
 // category: the operator-only arbitration endpoint writes it to discharge a
 // paged acceptance triage, and an unregistered category is un-awaitable — an

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
@@ -204,6 +205,74 @@ func TestClassifyStageWaitStatus(t *testing.T) {
 		if got.PollIntervalSeconds != tc.wantInterval {
 			t.Errorf("[%s] PollIntervalSeconds = %d, want %d", tc.stageState, got.PollIntervalSeconds, tc.wantInterval)
 		}
+	}
+}
+
+// documentedStageWaitMapping is the ONE in-test statement of the #2494
+// backend-state -> wait-status bucket mapping, keyed by the run.StageState
+// CONSTANTS rather than by string literals: a renamed or removed backend state
+// then breaks this build instead of silently leaving a stale row behind. It is
+// shared with tools_test.go's wire-description assertion, so the code
+// behaviour and the agent-visible documentation are checked against the same
+// table.
+//
+// It covers every run.StageState declared in backend/internal/run/run.go —
+// including the four park states (awaiting_input, awaiting_scope_decision,
+// awaiting_deploy_approval, awaiting_deployment) the first #2494 draft's
+// "eight-value"/nine-row tables omitted.
+var documentedStageWaitMapping = []struct {
+	State  runpkg.StageState
+	Bucket string
+}{
+	{runpkg.StageStatePending, "pending"},
+	{runpkg.StageStateAwaitingHostDispatch, "pending"},
+	{runpkg.StageStateDispatched, "pending"},
+	{runpkg.StageStateAwaitingApproval, "pending"},
+	{runpkg.StageStateAwaitingChildren, "pending"},
+	{runpkg.StageStateAwaitingInput, "pending"},
+	{runpkg.StageStateAwaitingScopeDecision, "pending"},
+	{runpkg.StageStateAwaitingDeployApproval, "pending"},
+	{runpkg.StageStateAwaitingDeployment, "pending"},
+	{runpkg.StageStateRunning, "running"},
+	{runpkg.StageStateSucceeded, "succeeded"},
+	{runpkg.StageStateFailed, "failed"},
+	{runpkg.StageStateCancelled, "cancelled"},
+}
+
+// TestClassifyStageWaitStatus_MappingTable pins the documented backend-state
+// -> wait-status bucket mapping (#2494) over EVERY backend stage state.
+//
+// It verifies the CODE side of the contract — classifyStageWaitStatus agrees
+// with the documented table for each run.StageState constant, and an
+// unrecognized state falls to the conservative `pending` (keep-polling)
+// default rather than a terminal status a caller would stop on. The DOC side
+// (the agent-visible wire descriptions) is asserted from the same table by
+// tools_test.go's TestToolDescriptions_CursorAndStageVocabulary; the prose
+// surfaces that no test can reach (the README table, the two API docs) are
+// stated as the same rule and are not claimed to be machine-checked here.
+func TestClassifyStageWaitStatus_MappingTable(t *testing.T) {
+	buckets := map[string]struct{}{}
+	for _, m := range documentedStageWaitMapping {
+		got := classifyStageWaitStatus("implement", string(m.State), "", nil, 0, waitBase)
+		if got.Status != m.Bucket {
+			t.Errorf("backend state %q -> %q, want %q (the documented mapping)", m.State, got.Status, m.Bucket)
+		}
+		buckets[m.Bucket] = struct{}{}
+	}
+	// The bucket vocabulary is genuinely coarser than the state vocabulary
+	// rather than 1:1 — that is the whole reason the mapping has to be
+	// written down.
+	if len(buckets) >= len(documentedStageWaitMapping) {
+		t.Errorf("%d distinct buckets over %d states — the bucket vocabulary must be strictly coarser",
+			len(buckets), len(documentedStageWaitMapping))
+	}
+	if len(buckets) != 5 {
+		t.Errorf("distinct wait-status buckets = %d, want 5", len(buckets))
+	}
+
+	// An unrecognized backend state falls to the keep-polling default.
+	if got := classifyStageWaitStatus("implement", "some_future_state", "", nil, 0, waitBase); got.Status != "pending" {
+		t.Errorf("unrecognized state -> %q, want the conservative pending default", got.Status)
 	}
 }
 

@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // fakeTransitionProvider is a workmgmt.Provider + Transitioner test double
@@ -405,6 +409,262 @@ func TestNotifyBoardTransition_AuditsSkip(t *testing.T) {
 	if audits[0]["skipped"] != true || audits[0]["moved"] != false {
 		t.Errorf("audit = %v, want skipped=true moved=false", audits[0])
 	}
+}
+
+// notApplicableResult is a TransitionResult in the shape the provider returns
+// for a skip with NO work item to act on. It is built BY CONSTRUCTION here,
+// not by calling the provider, so deleting the res.NotApplicable guard in the
+// audit call sites reddens the behavioral assertion (zero entries landed) and
+// not a fixture. The real-provider propagation is covered separately by
+// TestBoardTransition_RealProviderNotApplicable_SuppressesAudit.
+func notApplicableResult(reason string) *workmgmt.TransitionResult {
+	return &workmgmt.TransitionResult{Skipped: true, NotApplicable: true, To: "In Progress", SkipReason: reason}
+}
+
+// TestAuditBoardTransition_NotApplicableAppendsNothing is the #2494 flood
+// suppression, asserted at ALL THREE audit call sites: a result with no work
+// item to act on appends ZERO work_item_transitioned entries, while a
+// never-fight-the-human DECISION skip and a landed move each still append
+// exactly one.
+//
+// The control's effect is COMMITTED AUDIT STATE and these functions return
+// nothing, so each case reads the fake audit repo's recorded entries AFTER the
+// call returns rather than asserting on a return value.
+func TestAuditBoardTransition_NotApplicableAppendsNothing(t *testing.T) {
+	skipReasons := []string{"no project configured", "issue is not on the project board"}
+
+	t.Run("run scoped", func(t *testing.T) {
+		for _, reason := range skipReasons {
+			t.Run(reason, func(t *testing.T) {
+				fp := &fakeTransitionProvider{result: notApplicableResult(reason)}
+				registerTransitionProvider(t, fp)
+				rn := issueRun("issue:2494")
+				s, _, au := boardSyncServer(t, rn)
+
+				s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+				if len(fp.calls) != 1 {
+					t.Fatalf("Transition calls = %d, want 1 — the move is still attempted", len(fp.calls))
+				}
+				if got := transitionAudits(au); len(got) != 0 {
+					t.Errorf("work_item_transitioned audits = %d, want 0: %v", len(got), got)
+				}
+			})
+		}
+	})
+
+	t.Run("campaign scoped", func(t *testing.T) {
+		for _, reason := range skipReasons {
+			t.Run(reason, func(t *testing.T) {
+				fp := &fakeTransitionProvider{result: notApplicableResult(reason)}
+				registerTransitionProvider(t, fp)
+				s, au := campaignBoardServer(t)
+				c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+				s.boardTransitionForCampaignItem(context.Background(), c, 2494, lifecycleCampaignStarted)
+
+				if len(fp.calls) != 1 {
+					t.Fatalf("Transition calls = %d, want 1", len(fp.calls))
+				}
+				if got := campaignTransitionAudits(au); len(got) != 0 {
+					t.Errorf("work_item_transitioned audits = %d, want 0: %v", len(got), got)
+				}
+			})
+		}
+	})
+
+	// The issue-scoped call site is covered by its sibling,
+	// TestHandleIssueLifecycle_NotApplicableAppendsNothing in
+	// boardsync_issue_events_test.go, next to the rest of that hook's cases.
+
+	// The contrast that keeps the carve-out narrow: a DECISION skip and a
+	// landed move each still append exactly one entry at every call site.
+	t.Run("decision skip and move still audit", func(t *testing.T) {
+		cases := []struct {
+			name string
+			res  *workmgmt.TransitionResult
+		}{
+			{"never-fight-the-human decision skip", &workmgmt.TransitionResult{
+				Skipped: true, From: "Blocked", To: "In Progress",
+				SkipReason: `current status "Blocked" is not in the expected source set`}},
+			{"unreachable user board decision skip", &workmgmt.TransitionResult{
+				Skipped: true, To: "In Progress",
+				SkipReason: "user-owned project board unreachable: no projects token configured"}},
+			{"landed move", &workmgmt.TransitionResult{Moved: true, From: "Backlog", To: "In Progress"}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				fp := &fakeTransitionProvider{result: tc.res}
+				registerTransitionProvider(t, fp)
+				rn := issueRun("issue:2494")
+				s, _, au := boardSyncServer(t, rn)
+
+				s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+				if got := transitionAudits(au); len(got) != 1 {
+					t.Fatalf("work_item_transitioned audits = %d, want 1: %v", len(got), got)
+				}
+			})
+		}
+	})
+}
+
+// boardSyncGHAPI is a minimal workmgmt/github.API for driving the REAL GitHub
+// provider through the lifecycle hook. Only the four calls Transition makes
+// are meaningful; the filing-side methods are unreachable on this path and
+// return zero values.
+type boardSyncGHAPI struct {
+	onBoard bool
+	status  string
+	setCall bool
+}
+
+func (f *boardSyncGHAPI) CreateIssue(context.Context, forge.CredentialScope, githubclient.RepoRef, githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	return nil, errors.New("boardSyncGHAPI: CreateIssue not used")
+}
+
+func (f *boardSyncGHAPI) IssueNodeID(context.Context, forge.CredentialScope, githubclient.RepoRef, int) (string, error) {
+	return "ISSUE_NODE", nil
+}
+
+func (f *boardSyncGHAPI) ProjectFields(context.Context, forge.CredentialScope, githubclient.ProjectCoord, string) (*githubclient.ProjectMeta, error) {
+	return &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{
+		"Backlog": "OPT_BACKLOG", "Up Next": "OPT_UP_NEXT", "In Progress": "OPT_IP",
+		"In Review": "OPT_IR", "Blocked": "OPT_BLOCKED", "Done": "OPT_DONE",
+	}}, nil
+}
+
+func (f *boardSyncGHAPI) ProjectItemStatus(context.Context, forge.CredentialScope, string, string, string) (*githubclient.ProjectItemStatus, error) {
+	return &githubclient.ProjectItemStatus{OnBoard: f.onBoard, ItemID: "ITEM", Status: f.status}, nil
+}
+
+func (f *boardSyncGHAPI) AddProjectItem(context.Context, forge.CredentialScope, string, string) (string, error) {
+	return "ITEM", nil
+}
+
+func (f *boardSyncGHAPI) SetProjectItemSingleSelect(context.Context, forge.CredentialScope, string, string, string, string) error {
+	f.setCall = true
+	return nil
+}
+
+func (f *boardSyncGHAPI) AddSubIssue(context.Context, forge.CredentialScope, string, string) error {
+	return nil
+}
+
+func (f *boardSyncGHAPI) ListSubIssues(context.Context, forge.CredentialScope, string) ([]githubclient.SubIssue, error) {
+	return nil, nil
+}
+
+func (f *boardSyncGHAPI) SearchIssuesByTitle(context.Context, forge.CredentialScope, string) ([]githubclient.IssueTitleResult, error) {
+	return nil, nil
+}
+
+func (f *boardSyncGHAPI) GetIssue(context.Context, forge.CredentialScope, githubclient.RepoRef, int) (*githubclient.Issue, error) {
+	return nil, errors.New("boardSyncGHAPI: GetIssue not used")
+}
+
+func (f *boardSyncGHAPI) ProjectsTokenConfigured() bool { return true }
+
+// TestBoardTransition_RealProviderNotApplicable_SuppressesAudit is the
+// CROSS-BOUNDARY test #2494 approval condition 3 requires: the
+// TransitionResult is produced by the REAL workmgmt/github provider — not a
+// preconstructed fixture handed back by a fake Transitioner — and flows
+// through the lifecycle hook into the audit repository, so the assertion is
+// on provider-to-hook propagation of the typed flag rather than on the test's
+// own fixture. The fake-Transitioner cases above remain the right tool for
+// branch coverage; they do not discharge this.
+func TestBoardTransition_RealProviderNotApplicable_SuppressesAudit(t *testing.T) {
+	// registerRealProvider swaps the REAL github provider (backed by the
+	// in-memory API above) into the registry under the default conventions'
+	// provider id, then restores a fake for the tests that follow.
+	registerRealProvider := func(t *testing.T, api *boardSyncGHAPI) {
+		t.Helper()
+		workmgmt.Register(workmgmtgithub.New(api))
+		t.Cleanup(func() { registerTransitionProvider(t, &fakeTransitionProvider{}) })
+	}
+	// The default conventions carry the user-owned Project #7 coordinates; a
+	// nil Project is what the no-project skip needs.
+	projectlessConventions := func() workmgmt.Conventions {
+		conv := workmgmt.Default()
+		conv.Project = nil
+		return conv
+	}
+
+	t.Run("issue not on the board suppresses the audit", func(t *testing.T) {
+		api := &boardSyncGHAPI{onBoard: false}
+		registerRealProvider(t, api)
+		rn := issueRun("issue:2494")
+		s, _, au := boardSyncServer(t, rn)
+
+		s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+		if api.setCall {
+			t.Error("the provider mutated the board for an off-board issue")
+		}
+		if got := transitionAudits(au); len(got) != 0 {
+			t.Errorf("work_item_transitioned audits = %d, want 0: %v", len(got), got)
+		}
+	})
+
+	t.Run("no project configured suppresses the audit", func(t *testing.T) {
+		registerRealProvider(t, &boardSyncGHAPI{onBoard: true, status: "Backlog"})
+		prev := conventionsLoader
+		conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+			return projectlessConventions(), nil
+		}
+		t.Cleanup(func() { conventionsLoader = prev })
+		rn := issueRun("issue:2494")
+		s, _, au := boardSyncServer(t, rn)
+
+		s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+		if got := transitionAudits(au); len(got) != 0 {
+			t.Errorf("work_item_transitioned audits = %d, want 0: %v", len(got), got)
+		}
+	})
+
+	t.Run("real provider decision skip still audits", func(t *testing.T) {
+		// A card a human parked in Blocked: the provider's
+		// never-fight-the-human guard skips it, and that DECISION must still
+		// reach the audit chain. This is what proves the suppression is keyed
+		// to the typed flag and not to "the provider skipped".
+		registerRealProvider(t, &boardSyncGHAPI{onBoard: true, status: "Blocked"})
+		rn := issueRun("issue:2494")
+		s, _, au := boardSyncServer(t, rn)
+
+		s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+		audits := transitionAudits(au)
+		if len(audits) != 1 {
+			t.Fatalf("work_item_transitioned audits = %d, want 1: %v", len(audits), audits)
+		}
+		if audits[0]["skipped"] != true || audits[0]["moved"] != false {
+			t.Errorf("audit = %v, want skipped=true moved=false", audits[0])
+		}
+		if reason, _ := audits[0]["skip_reason"].(string); !strings.Contains(reason, "expected source set") {
+			t.Errorf("skip_reason = %q, want the never-fight-the-human reason", reason)
+		}
+	})
+
+	t.Run("real provider landed move audits", func(t *testing.T) {
+		api := &boardSyncGHAPI{onBoard: true, status: "Backlog"}
+		registerRealProvider(t, api)
+		rn := issueRun("issue:2494")
+		s, _, au := boardSyncServer(t, rn)
+
+		s.notifyBoardTransition(context.Background(), rn.ID, lifecycleRunStarted)
+
+		if !api.setCall {
+			t.Error("the real provider did not set the Status field for an expected-source card")
+		}
+		audits := transitionAudits(au)
+		if len(audits) != 1 {
+			t.Fatalf("work_item_transitioned audits = %d, want 1: %v", len(audits), audits)
+		}
+		if audits[0]["moved"] != true || audits[0]["to"] != "In Progress" {
+			t.Errorf("audit = %v, want moved=true to=In Progress", audits[0])
+		}
+	})
 }
 
 // TestNotifyBoardTransition_NonIssueTrigger_NoOp asserts an ad-hoc/CLI run

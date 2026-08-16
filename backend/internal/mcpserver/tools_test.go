@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -3281,6 +3282,195 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 	if got := strings.Count(dispatchDesc, "MCP Tasks"); got != 1 {
 		t.Errorf("fishhawk_dispatch_stage: description contains %d occurrences of %q, want exactly 1 (the Tasks note must stay one sentence):\n%s", got, "MCP Tasks", dispatchDesc)
 	}
+}
+
+// cursorDescriptionClaims are the SUBSTANTIVE claims the `cursor` guidance has
+// to make on the wire, asserted POSITIVELY rather than as the tokens they are
+// worded with. A bare `strings.Contains(desc, "opaque")` stays green when the
+// description is reworded to say the cursor is NOT opaque, which makes it a
+// control that cannot fail for the reason it exists (#2494).
+//
+// So each claim carries an `assert` pattern for its AFFIRMATIVE form — the
+// terms must stand in the right relation, not merely appear — plus, where an
+// affirmative form survives a negation intact ("need not be copied verbatim"
+// still contains "copied verbatim"), a `reject` pattern for the claim's
+// negation that must NOT match. The reviewer's reversal — "next_cursor is not
+// accepted; the cursor is not opaque and need not be copied verbatim; it is
+// not an offset or an index" — fails four of these six claims.
+//
+// Every gap is bounded and clause-bounded (`[^.;:]`), leaving the wording
+// between the terms free so an accurate rewording still passes. Mirrors
+// assertCursorMessageNamesAcceptedInput in the server package, which pins the
+// same claims on the REST 400 message.
+var cursorDescriptionClaims = []struct {
+	name   string
+	assert *regexp.Regexp
+	reject *regexp.Regexp
+}{
+	{
+		name:   "say that next_cursor is the ONLY accepted value",
+		assert: regexp.MustCompile(`\b(only|sole|solely|exclusively)\b[^.;:]{0,60}\bnext_cursor\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bnext_cursor\b`),
+	},
+	{
+		name:   "attribute that next_cursor to a PRIOR response",
+		assert: regexp.MustCompile(`\bprior\b[^.;:]{0,40}\bnext_cursor\b|\bnext_cursor\b[^.;:]{0,40}\bprior\b`),
+	},
+	{
+		name:   "say the token IS opaque",
+		assert: regexp.MustCompile(`\bopaque\b[^.;:]{0,40}\b(token|cursor|value|string)\b|\bis\s+opaque\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bopaque\b|\bopaque\b[^.;:]{0,30}\b(not|never)\b`),
+	},
+	{
+		// "verbatim" is the one claim with no stable affirmative verb to
+		// anchor on — copied / taken / reused / pasted verbatim are all
+		// accurate wordings — so requiring a particular one would fail an
+		// honest rewrite. Here the reject half carries the weight: the term
+		// must appear AND must not be negated, which is what rules out the
+		// "need not be copied verbatim" reversal.
+		name:   "require the value be reproduced VERBATIM",
+		assert: regexp.MustCompile(`\bverbatim\b`),
+		reject: regexp.MustCompile(`\b(not|never)\b[^.;:]{0,30}\bverbatim\b`),
+	},
+	{
+		name:   "say it is NOT an offset",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\boffset\b`),
+	},
+	{
+		name:   "say it is NOT an index",
+		assert: regexp.MustCompile(`\bnot\b[^.;]{0,40}\bindex\b`),
+	},
+}
+
+// normalizeDescription lower-cases and collapses whitespace runs: the
+// descriptions are hard-wrapped prose, so a claim spanning a line break would
+// otherwise be pinned to the current wrap column rather than to the claim.
+func normalizeDescription(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+}
+
+// TestToolDescriptions_CursorAndStageVocabulary is the #2494 wire-visibility
+// test for the two documentation-shaped items: the audit-listing tool's
+// `cursor` guidance and the get_run_status stage-vocabulary mapping must
+// actually reach the agent through ListTools, not merely exist in a source
+// comment. A comment-only touch of either site leaves the wire description
+// unchanged and fails here.
+//
+// It adds NO tool, so the wantToolCount surface-sweep invariant above is
+// deliberately untouched.
+func TestToolDescriptions_CursorAndStageVocabulary(t *testing.T) {
+	descByName := listToolDescriptions(t)
+
+	// Item 2: the cursor guidance the operator actually hit, asserted on BOTH
+	// wire surfaces — the tool description prose AND the `cursor` INPUT-SCHEMA
+	// property, which is what an agent filling the argument reads. Asserting
+	// only the prose leaves the schema free to keep the old vague text.
+	auditDesc := descByName["fishhawk_list_audit"]
+	if auditDesc == "" {
+		t.Fatal("fishhawk_list_audit is not registered/visible over ListTools")
+	}
+	schemaCursorDesc := toolInputPropertyDescription(t, "fishhawk_list_audit", "cursor")
+	for _, surface := range []struct{ where, text string }{
+		{"fishhawk_list_audit cursor INPUT SCHEMA", schemaCursorDesc},
+		{"fishhawk_list_audit description", auditDesc},
+	} {
+		norm := normalizeDescription(surface.text)
+		for _, claim := range cursorDescriptionClaims {
+			if !claim.assert.MatchString(norm) {
+				t.Errorf("%s does not %s (no match for %s) (#2494):\n%s",
+					surface.where, claim.name, claim.assert, surface.text)
+			}
+			if claim.reject != nil && claim.reject.MatchString(norm) {
+				t.Errorf("%s REVERSES the claim it must %s (matched the negation %s) (#2494):\n%s",
+					surface.where, claim.name, claim.reject, surface.text)
+			}
+		}
+	}
+
+	// Item 4: the two-vocabulary mapping on the surface that reports both.
+	// EVERY documented state -> bucket pair must be on the wire, not a sample
+	// of three: a spot-check of awaiting_host_dispatch/awaiting_children stays
+	// green while the rest of the mapping disappears from the description. The
+	// pairs come from the same documentedStageWaitMapping the classification
+	// test pins the code against, so code and documentation cannot disagree.
+	statusDesc := descByName["fishhawk_get_run_status"]
+	if statusDesc == "" {
+		t.Fatal("fishhawk_get_run_status is not registered/visible over ListTools")
+	}
+	statusNorm := normalizeDescription(statusDesc)
+	for _, m := range documentedStageWaitMapping {
+		pair := string(m.State) + " -> " + m.Bucket
+		if !strings.Contains(statusNorm, pair) {
+			t.Errorf("fishhawk_get_run_status description must document the stage-vocabulary mapping %q (#2494):\n%s",
+				pair, statusDesc)
+		}
+	}
+	if !strings.Contains(statusNorm, "bucket") {
+		t.Errorf("fishhawk_get_run_status description must name the wait status a BUCKET (#2494):\n%s", statusDesc)
+	}
+	// The reviews[] one-shape contract rides the same description.
+	if !strings.Contains(statusNorm, "always present") {
+		t.Errorf("fishhawk_get_run_status description must state reviews[] is always present (#2494):\n%s", statusDesc)
+	}
+}
+
+// toolInputPropertyDescription returns one tool input property's wire-visible
+// jsonschema description, the surface an agent reads when filling an argument
+// (distinct from the tool's own prose description).
+func toolInputPropertyDescription(t *testing.T, toolName, property string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != toolName {
+			continue
+		}
+		if tool.InputSchema == nil {
+			t.Fatalf("%s: no input schema on the wire", toolName)
+		}
+		// InputSchema is `any` on the wire type, so round-trip it through JSON
+		// rather than type-asserting a concrete schema implementation.
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("%s: marshal input schema: %v", toolName, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s: decode input schema: %v", toolName, err)
+		}
+		prop, ok := schema.Properties[property]
+		if !ok {
+			t.Fatalf("%s: input schema has no %q property", toolName, property)
+		}
+		return prop.Description
+	}
+	t.Fatalf("%s is not registered/visible over ListTools", toolName)
+	return ""
 }
 
 // listToolDescriptions connects an in-memory MCP session, registers the full
