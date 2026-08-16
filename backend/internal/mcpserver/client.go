@@ -2333,8 +2333,15 @@ type Campaign struct {
 	// field documents. Omitted on a campaign with no override (the byte-identical
 	// default — each issue-run inherits its workflow contract).
 	OperatorAgent map[string]any `json:"operator_agent,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	// WorkingDir is the campaign-level checkout binding (E48.87 / #2527): the
+	// absolute path every item run minted from this campaign inherits when
+	// fishhawk_start_campaign_item_run passes no per-item working_dir. Omitted
+	// on an unbound campaign (the unchanged default — each item run then needs
+	// its own working_dir, and a local one without either is refused). Mirrors
+	// Run.WorkingDir.
+	WorkingDir string    `json:"working_dir,omitempty" jsonschema:"the absolute checkout path bound to this campaign; every item run minted from it inherits this unless the per-item call overrides it. Absent when the campaign carries no binding"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
@@ -2426,6 +2433,11 @@ type campaignCreateRequest struct {
 	// of the epic's children to scope the campaign to. Empty/nil omits the field
 	// so the backend sweeps every child (the backward-compatible default).
 	Items []string `json:"items,omitempty"`
+	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527) every item run minted from the campaign inherits. omitempty drops
+	// an empty value so a campaign without a binding sends no working_dir key.
+	// The backend validates it is absolute (400 validation_failed otherwise).
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // CreateCampaign assembles a campaign via `POST /v0/campaigns` (E25.4) and
@@ -2443,8 +2455,8 @@ type campaignCreateRequest struct {
 // write:campaigns scope. 4xx/5xx surfaces as *apiError; the tool layer reads the
 // code:
 //   - 400 validation_failed (repo not owner/name, neither epic_ref nor items,
-//     bad pause_policy, a malformed/unknown-field operator_agent, or a dependency
-//     cycle)
+//     bad pause_policy, a malformed/unknown-field operator_agent, a non-absolute
+//     working_dir, or a dependency cycle)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
 //   - 422 campaign_dangling_dependency (a depends_on target is outside the assembled set)
@@ -2456,8 +2468,13 @@ type campaignCreateRequest struct {
 // items is the OPTIONAL subset filter (#2003) WITH epicRef (issue refs naming the
 // subset of the epic's children; empty/nil sweeps every child) or the
 // AUTHORITATIVE issue set WITHOUT epicRef (the no-epic variant, #2051).
-func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string) (*Campaign, error) {
-	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items})
+//
+// workingDir is the OPTIONAL campaign-level checkout binding (E48.87 / #2527)
+// every item run minted from the campaign inherits; empty omits the field (no
+// binding). It is the LAST parameter, appended after items []string, so it
+// cannot be transposed with another string argument at a call site.
+func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string, workingDir string) (*Campaign, error) {
+	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items, WorkingDir: workingDir})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}
@@ -2563,7 +2580,11 @@ type StartCampaignItemRunResult struct {
 //   - 409 item_not_eligible (the item is blocked on a dependency, already
 //     running, or terminal — the detail names the blocker)
 //   - 400 validation_failed (a non-absolute working_dir; E48.69 / #2498 — the
-//     backend refuses a relative binding the same way POST /v0/runs does)
+//     backend refuses a relative binding the same way POST /v0/runs does — or a
+//     non-absolute binding INHERITED from the campaign row, E48.87 / #2527)
+//   - 400 working_dir_required (a local item whose campaign carries no
+//     working_dir binding and whose call passed none; E48.87 / #2527 — bind it
+//     once at start_campaign, or pass it for this item)
 //   - 502 campaign_run_start_failed (the installation/spec could not be resolved)
 //   - 503 campaign_repo_unconfigured
 func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind, workingDir string) (*StartCampaignItemRunResult, error) {

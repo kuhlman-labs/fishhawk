@@ -105,7 +105,7 @@ func TestCreateCampaign_OperatorAgentBytes_OmittedWhenNil(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
-	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil)
+	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil, "")
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "",
-		json.RawMessage(`{"may_waive":"solo_low"}`), nil)
+		json.RawMessage(`{"may_waive":"solo_low"}`), nil, "")
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -142,6 +142,44 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 	}
 	if got.OperatorAgent["may_waive"] != "solo_low" {
 		t.Errorf("decoded Campaign.OperatorAgent = %+v", got.OperatorAgent)
+	}
+}
+
+// TestCreateCampaign_WorkingDir_BodyAndDecode pins the apiClient wire contract
+// for the campaign-level checkout binding (E48.87 / #2527) at the HTTP-body
+// layer, below the tool handler: a non-empty workingDir argument reaches the
+// POST body, an empty one omits the key entirely (omitempty — an unbound
+// campaign sends no working_dir), and a Campaign response carrying working_dir
+// decodes onto the struct so the binding is visible in every campaign-returning
+// tool result.
+func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
+	const wd = "/Users/op/checkouts/fishhawk"
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignResp = Campaign{
+		ID: uuid.NewString(), Repo: "x/y", EpicRef: "#25", State: "pending",
+		PausePolicy: "pause_campaign", WorkingDir: wd,
+	}
+	r := newResolver(srv, nil)
+
+	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, wd)
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	if fb.createCampaignBody.WorkingDir != wd {
+		t.Errorf("POST body working_dir = %q, want %q", fb.createCampaignBody.WorkingDir, wd)
+	}
+	if got.WorkingDir != wd {
+		t.Errorf("decoded Campaign.WorkingDir = %q, want %q", got.WorkingDir, wd)
+	}
+
+	// Empty binding → no working_dir key on the wire at all.
+	fb2, srv2 := newFakeBackend(t)
+	r2 := newResolver(srv2, nil)
+	if _, err := r2.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, ""); err != nil {
+		t.Fatalf("CreateCampaign (unbound): %v", err)
+	}
+	if fb2.createCampaignBody.WorkingDir != "" {
+		t.Errorf("unbound POST body working_dir = %q, want empty", fb2.createCampaignBody.WorkingDir)
 	}
 }
 

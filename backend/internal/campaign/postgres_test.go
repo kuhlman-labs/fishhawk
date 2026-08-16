@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	campaigndb "github.com/kuhlman-labs/fishhawk/backend/internal/campaign/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -815,6 +816,116 @@ func TestPostgres_CreateCampaign_PausePolicy(t *testing.T) {
 	}
 	if got.PausePolicy != campaign.PausePolicyPauseItem {
 		t.Errorf("read-back PausePolicy = %q, want pause_item", got.PausePolicy)
+	}
+}
+
+// TestPostgres_CreateCampaign_WorkingDir_RoundTripsEveryReadPath covers the
+// campaigns.working_dir column added by 0071 (E48.87 / #2527) against the shared
+// pgtest Postgres. The generated sqlc file is HAND-EDITED here (a local `sqlc
+// generate` rewrites every package), and the failure mode of a hand edit is a
+// column list updated in SOME statements but not all — invisible to inspection.
+// So this asserts the binding comes back from EVERY campaign read path, each of
+// which has its OWN embedded column list and its OWN row.Scan:
+//
+//   - CreateCampaign (the INSERT ... RETURNING list)
+//   - GetCampaign
+//   - GetCampaignByIdempotencyKey
+//   - ListCampaigns (the :many scan)
+//   - LockCampaignForUpdate — asserted on the generated query's OWN returned
+//     row, driven DIRECTLY through campaigndb rather than indirectly through
+//     TransitionCampaign (which returns UpdateCampaignState's row, not the
+//     locked one, so an assertion there would not exercise this read path at all)
+//   - UpdateCampaignState (via TransitionCampaign's returned row)
+//
+// A statement whose list or Scan call was missed fails here with a scan-arity
+// error or an empty value rather than in production. The unbound default is
+// pinned too: a campaign created with no binding reads back "" everywhere.
+func TestPostgres_CreateCampaign_WorkingDir_RoundTripsEveryReadPath(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// No binding → "" on create AND read-back (the unchanged-behavior path for
+	// every pre-#2527 row).
+	def := makeCampaign(t, repo)
+	if def.WorkingDir != "" {
+		t.Errorf("default WorkingDir = %q, want \"\" (no binding)", def.WorkingDir)
+	}
+	gotDef, err := repo.GetCampaign(ctx, def.ID)
+	if err != nil {
+		t.Fatalf("get campaign (no binding): %v", err)
+	}
+	if gotDef.WorkingDir != "" {
+		t.Errorf("read-back WorkingDir = %q, want \"\" (no binding)", gotDef.WorkingDir)
+	}
+
+	// An explicit binding survives create + every read path.
+	const wd = "/Users/op/checkouts/fishhawk"
+	key := "idem-workdir-" + uuid.NewString()
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		EpicRef:        "issue:2527",
+		WorkingDir:     wd,
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("create campaign with working_dir: %v", err)
+	}
+	if c.WorkingDir != wd {
+		t.Errorf("CreateCampaign returned WorkingDir = %q, want %q", c.WorkingDir, wd)
+	}
+
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if got.WorkingDir != wd {
+		t.Errorf("GetCampaign WorkingDir = %q, want %q", got.WorkingDir, wd)
+	}
+
+	byKey, err := repo.GetCampaignByIdempotencyKey(ctx, "kuhlman-labs/fishhawk", key)
+	if err != nil {
+		t.Fatalf("get campaign by idempotency key: %v", err)
+	}
+	if byKey.WorkingDir != wd {
+		t.Errorf("GetCampaignByIdempotencyKey WorkingDir = %q, want %q", byKey.WorkingDir, wd)
+	}
+
+	listed, err := repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{Repo: "kuhlman-labs/fishhawk", Limit: 100})
+	if err != nil {
+		t.Fatalf("list campaigns: %v", err)
+	}
+	var found *campaign.Campaign
+	for _, row := range listed {
+		if row.ID == c.ID {
+			found = row
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("campaign %s absent from ListCampaigns", c.ID)
+	}
+	if found.WorkingDir != wd {
+		t.Errorf("ListCampaigns WorkingDir = %q, want %q", found.WorkingDir, wd)
+	}
+
+	// LockCampaignForUpdate, driven DIRECTLY so the assertion is on the row THAT
+	// query returned — the load-bearing check for its own column list + Scan.
+	locked, err := campaigndb.New(pool).LockCampaignForUpdate(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("lock campaign for update: %v", err)
+	}
+	if locked.WorkingDir != wd {
+		t.Errorf("LockCampaignForUpdate WorkingDir = %q, want %q", locked.WorkingDir, wd)
+	}
+
+	// UpdateCampaignState's RETURNING list, via the transition primitive.
+	transitioned, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning)
+	if err != nil {
+		t.Fatalf("transition campaign: %v", err)
+	}
+	if transitioned.WorkingDir != wd {
+		t.Errorf("TransitionCampaign WorkingDir = %q, want %q", transitioned.WorkingDir, wd)
 	}
 }
 

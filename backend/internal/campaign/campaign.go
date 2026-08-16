@@ -167,8 +167,18 @@ type Campaign struct {
 	// default — and the partial unique index excludes NULLs so keyless
 	// campaigns never collide. Mirrors run.Run.IdempotencyKey.
 	IdempotencyKey *string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// WorkingDir is the campaign-level checkout binding (E48.87 / #2527): the
+	// absolute path every item run minted from this campaign inherits when the
+	// per-item call passes none, so the operator binds it ONCE at
+	// fishhawk_start_campaign instead of re-typing it per item. Empty means NO
+	// binding — the unchanged-behavior default for every pre-#2527 row, which
+	// leaves each item run on #2498's explicit per-item working_dir. Validation
+	// (absolute path) lives above this package, in the REST handler and the MCP
+	// tool: it is transport- and runner-kind-conditional, so the column carries
+	// the value verbatim.
+	WorkingDir string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // Item is one issue within a campaign.

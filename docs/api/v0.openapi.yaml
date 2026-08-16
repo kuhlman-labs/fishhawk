@@ -2032,6 +2032,17 @@ components:
             issue-run's effective delegation contract. Omitted when the
             campaign carries no override: every issue-run then inherits its
             workflow's contract, byte-identical to pre-E25.12 behavior.
+        working_dir:
+          type: string
+          description: |
+            OPTIONAL campaign-level checkout binding (E48.87 / #2527): the
+            absolute path every item run minted from this campaign inherits
+            when `POST /v0/campaigns/{campaign_id}/runs` passes no per-item
+            `working_dir`. Bound ONCE at create so the operator does not repeat
+            an identical path per item. Omitted when the campaign carries no
+            binding — each item run then needs its own `working_dir`, and a
+            `local` one with neither is refused `working_dir_required`.
+          example: /Users/op/checkouts/fishhawk
         idempotent:
           type: boolean
           description: |
@@ -2236,11 +2247,20 @@ components:
           type: string
           description: >-
             OPTIONAL absolute path to the checkout this campaign item's run
-            executes in (E48.69 / #2498). When set it binds the minted run so
-            every later runner-spawning verb inherits it. A non-empty
-            non-absolute value is refused with 400 `validation_failed`
-            (`details.field` = `working_dir`), the same guard POST /v0/runs
-            applies. Empty leaves the run unbound (the github_actions path).
+            executes in (E48.69 / #2498), and an OVERRIDE of the campaign's own
+            `working_dir` binding (E48.87 / #2527). The minted run's checkout is
+            resolved through a three-rung ladder: (1) this explicit value wins —
+            including when it DIFFERS from the campaign binding, which is
+            accepted as a deliberate override (a campaign is a batch; an item
+            legitimately executing in another checkout is conceivable) and
+            logged; (2) otherwise the campaign's `working_dir` is inherited,
+            re-validated through the same absolute-path gate so a relative value
+            smuggled onto the campaign row is still refused 400
+            `validation_failed`; (3) otherwise a `runner_kind: local` item is
+            refused 400 `working_dir_required`. A non-empty non-absolute value
+            here is refused with 400 `validation_failed` (`details.field` =
+            `working_dir`), the same guard POST /v0/runs applies. Omit it when
+            the campaign carries a binding.
 
     StartCampaignItemRunResult:
       type: object
@@ -9088,6 +9108,21 @@ paths:
                     out-of-set target — it does not apply the #2120
                     completion-satisfied refinement.
                   example: ["issue:1440", "issue:1441"]
+                working_dir:
+                  type: string
+                  description: >-
+                    OPTIONAL campaign-level checkout binding (E48.87 / #2527):
+                    the absolute path every item run minted from this campaign
+                    inherits when `POST /v0/campaigns/{campaign_id}/runs` passes
+                    no per-item `working_dir`. Bind it ONCE here instead of
+                    repeating an identical path on every item start. A non-empty
+                    non-absolute value is refused 400 `validation_failed`
+                    (`details.field` = `working_dir`) BEFORE any forge
+                    round-trip — a relative binding would resolve against the
+                    daemon host's cwd and, being inherited, would poison every
+                    run in the batch. Omit it for no binding (the unchanged
+                    default).
+                  example: /Users/op/checkouts/fishhawk
       responses:
         '200':
           description: |
@@ -9107,7 +9142,8 @@ paths:
             `validation_failed` — `repo` not in owner/name form, NEITHER
             `epic_ref` NOR `items` provided, `pause_policy` not a recognized
             value, `operator_agent` not a valid operator-agent block (malformed
-            or an unknown knob), body malformed / unknown field, or a dependency
+            or an unknown knob), `working_dir` non-empty but not absolute
+            (E48.87 / #2527), body malformed / unknown field, or a dependency
             cycle among the assembled items (the cycle case is determinately
             `400`, never `422`, in both the epic and no-epic branches).
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -9294,8 +9330,17 @@ paths:
         '400':
           description: |
             `validation_failed` — `campaign_id` is not a valid UUID, `issue_ref`
-            or `workflow_id` is empty, `runner_kind` is unrecognized, or the
-            body carries unknown fields.
+            or `workflow_id` is empty, `runner_kind` is unrecognized, the
+            body carries unknown fields, `working_dir` is non-empty but not
+            absolute, or the campaign's own `working_dir` binding is not
+            absolute and so cannot be inherited (E48.87 / #2527 — the inherited
+            value is re-validated through the same gate an explicit one passes,
+            so a binding written straight to the campaign row cannot bypass it);
+            `working_dir_required` — a `runner_kind: local` item whose campaign
+            carries NO `working_dir` binding and whose body passed none, so the
+            run has no checkout to execute in. Bind `working_dir` once at
+            campaign create (every item run inherits it) or pass it for this
+            item. Nothing is written on either refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."

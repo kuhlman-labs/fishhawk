@@ -52,6 +52,11 @@ type CreateCampaignParams struct {
 	// #1455). Nil = no key (the unchanged default); mirrors
 	// run.CreateRunParams.IdempotencyKey.
 	IdempotencyKey *string
+	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527) every item run minted from the campaign inherits. Empty persists as
+	// the '' no-binding default. Carried verbatim: absolute-path validation is
+	// the caller's (the REST handler / MCP tool), not this package's.
+	WorkingDir string
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign

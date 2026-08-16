@@ -104,6 +104,12 @@ type Assembly struct {
 	// straight through Persist onto the campaign. Nil = no key (the unchanged
 	// default). The server sets it from a non-empty Idempotency-Key header.
 	IdempotencyKey *string
+	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+	// #2527), threaded straight through Persist onto the campaign. Empty = no
+	// binding (the unchanged default: each item run falls back to #2498's
+	// explicit per-item working_dir). The server sets it from the validated
+	// create request.
+	WorkingDir string
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -265,6 +271,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// Thread the optional create idempotency key straight through (E25.13):
 		// nil = no key.
 		IdempotencyKey: a.IdempotencyKey,
+		// Thread the optional campaign-level checkout binding straight through
+		// (E48.87 / #2527): empty = no binding.
+		WorkingDir: a.WorkingDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)

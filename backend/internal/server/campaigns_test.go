@@ -131,8 +131,13 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 		PausePolicy:    p.PausePolicy,
 		OperatorAgent:  p.OperatorAgent,
 		IdempotencyKey: p.IdempotencyKey,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		// The campaign-level checkout binding (E48.87 / #2527) is carried
+		// verbatim, mirroring the Postgres adapter — so a handler that fails to
+		// thread it onto the assembly is caught here rather than masked by a fake
+		// that drops the field.
+		WorkingDir: p.WorkingDir,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
@@ -465,17 +470,31 @@ func (f *fakeCampaignRepo) ListCampaignItemsForCampaign(_ context.Context, id uu
 
 // seedCampaignWithItems stores a campaign and its items directly, bypassing
 // the assemble path, for the read-handler tests.
+// seededCampaignWorkingDir is the absolute checkout seedCampaignWithItems binds
+// on every campaign it creates (E48.87 / #2527). Absolute so it passes the
+// inherit rung's re-validation; never touched on disk.
+const seededCampaignWorkingDir = "/fishhawk/test-checkout"
+
 func (f *fakeCampaignRepo) seedCampaignWithItems(repo, epicRef string, items []*campaign.Item) *campaign.Campaign {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := time.Now().UTC()
 	c := &campaign.Campaign{
-		ID:        uuid.New(),
-		Repo:      repo,
-		EpicRef:   epicRef,
-		State:     campaign.StateRunning,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:      uuid.New(),
+		Repo:    repo,
+		EpicRef: epicRef,
+		State:   campaign.StateRunning,
+		// Seeded campaigns carry a working_dir binding by default (E48.87 /
+		// #2527), because that is what a post-#2527 campaign looks like: an item
+		// run started with runner_kind local and NO per-item working_dir inherits
+		// this, which is the whole point of the feature. Before #2527 those
+		// starts left the minted run unbound; now an unbound LOCAL start is
+		// refused working_dir_required, so a test that wants an unbound campaign
+		// clears this explicitly (TestStartCampaignItemRun_LocalUnboundCampaign_Refused,
+		// TestStartCampaignItemRun_UnboundCampaign_NonLocal_Allowed).
+		WorkingDir: seededCampaignWorkingDir,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	f.campaigns[c.ID] = c
 	for _, it := range items {
@@ -3265,6 +3284,344 @@ func TestStartCampaignItemRun_BindsWorkingDirOnMintedRun(t *testing.T) {
 	}
 }
 
+// twoIndependentDAG is a two-item fixture whose items BOTH sit in wave 0 (no
+// edges), so a single campaign can mint TWO item runs without waiting on a
+// dependency — the shape the #2527 done-means needs.
+func twoIndependentDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 100, Title: "first"}, {Number: 101, Title: "second"}},
+	}
+}
+
+// TestStartCampaignItemRun_InheritsCampaignWorkingDir_E2E is the #2527
+// done-means, verbatim: "minting two item runs from one campaign and asserting
+// both rows carry the value with no per-item parameter passed."
+//
+// NOTHING is seeded. The value starts as a REQUEST FIELD on POST /v0/campaigns,
+// crosses the create handler → campaign.Assemble → assembly.WorkingDir →
+// campaign.Persist → CreateCampaignParams → the REAL Postgres adapter and its
+// hand-edited sqlc column list, is read back by the item-run handler through
+// GetCampaign, resolved by the inheritance ladder, and must land on BOTH minted
+// run rows — re-read from the run repository, not merely echoed in the 201
+// bodies. Splitting this at the persistence boundary (create-but-mint-nothing +
+// seed-an-already-bound-row) would assert the ladder while assuming away the
+// half most likely to break, so this one test spans the whole path.
+//
+// Counterfactual: drop `assembly.WorkingDir = req.WorkingDir` in
+// handleCreateCampaign, or `WorkingDir: a.WorkingDir` in campaign.Persist, or
+// `WorkingDir: p.WorkingDir` in the Postgres adapter, or the `case
+// c.WorkingDir != "":` inherit rung, or `WorkingDir` from the createCampaign
+// INSERT column list → the binding is lost somewhere on that path and both
+// persisted-row assertions go RED.
+func TestStartCampaignItemRun_InheritsCampaignWorkingDir_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	crepo := campaign.NewPostgresRepository(pool)
+	registerEpicProvider(t, &fakeEpicProvider{result: twoIndependentDAG()})
+
+	// A REAL Postgres run repository too, so the minted run rows are read back
+	// from the database the campaign item links to (and the campaign_items.run_id
+	// FK is satisfied) — the persistence half this test exists to cover.
+	rrepo := run.NewPostgresRepository(pool)
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+
+	// 1. Bind the checkout ONCE, at campaign create.
+	wd := t.TempDir() // absolute
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","working_dir":`+strconv.Quote(wd)+`}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create campaign status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	// The 201 body echoes the binding...
+	if created.WorkingDir != wd {
+		t.Errorf("201 body campaign.working_dir = %q, want %q", created.WorkingDir, wd)
+	}
+	// ...and it genuinely PERSISTED (read back through the real repository, so a
+	// handler that only echoed the request field fails here).
+	persistedCampaign, err := crepo.GetCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign: %v", err)
+	}
+	if persistedCampaign.WorkingDir != wd {
+		t.Fatalf("persisted campaign working_dir = %q, want %q", persistedCampaign.WorkingDir, wd)
+	}
+
+	// 2. Mint TWO item runs passing NO per-item working_dir.
+	runIDs := make([]uuid.UUID, 0, 2)
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		rw := postStartItemRun(t, s, created.ID,
+			`{"issue_ref":`+strconv.Quote(ref)+`,"workflow_id":"feature_change","runner_kind":"local"}`)
+		if rw.Code != http.StatusCreated {
+			t.Fatalf("start item run %s status = %d, want 201 (body=%s)", ref, rw.Code, rw.Body.String())
+		}
+		var body startItemRunBody
+		if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode item-run body for %s: %v", ref, err)
+		}
+		runIDs = append(runIDs, body.Run.ID)
+	}
+	if len(runIDs) != 2 {
+		t.Fatalf("minted %d runs, want 2", len(runIDs))
+	}
+
+	// 3. BOTH persisted run rows carry the campaign's binding.
+	for i, rid := range runIDs {
+		persisted, err := rrepo.GetRun(context.Background(), rid)
+		if err != nil {
+			t.Fatalf("re-read run %d (%s): %v", i, rid, err)
+		}
+		if persisted.WorkingDir != wd {
+			t.Errorf("persisted run %d working_dir = %q, want the campaign binding %q (no per-item value was passed)",
+				i, persisted.WorkingDir, wd)
+		}
+	}
+}
+
+// TestCreateCampaign_PersistsAndEchoesWorkingDir pins the create half on its own
+// (branch coverage beside the E2E above): a POST with an absolute working_dir
+// persists it on the campaign row and echoes it in the 201 body, and a campaign
+// created WITHOUT one carries no working_dir key at all (the omitempty
+// unbound-default convention).
+func TestCreateCampaign_PersistsAndEchoesWorkingDir(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: crepo, GitHub: gh})
+
+	wd := t.TempDir()
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","working_dir":`+strconv.Quote(wd)+`}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	if created.WorkingDir != wd {
+		t.Errorf("201 body working_dir = %q, want %q", created.WorkingDir, wd)
+	}
+	if got := crepo.campaigns[created.ID].WorkingDir; got != wd {
+		t.Errorf("persisted campaign working_dir = %q, want %q", got, wd)
+	}
+
+	// An unbound campaign carries NO working_dir key (not an empty string).
+	w2 := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("unbound create status = %d, want 201 (body=%s)", w2.Code, w2.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode unbound campaign: %v", err)
+	}
+	if _, present := raw["working_dir"]; present {
+		t.Errorf("unbound campaign body carries a working_dir key: %s", w2.Body.String())
+	}
+}
+
+// TestCreateCampaign_RelativeWorkingDir_Rejected is counterfactual C1: the
+// create-handler absolute-path guard. A relative binding would be inherited by
+// every item run and resolve against the daemon host's cwd, so it is refused 400
+// validation_failed naming the field — and, because the control's real effect is
+// COMMITTED STATE, the test also asserts NO campaign row was created and the
+// forge was never queried (the guard fires before the epic-children round-trip).
+//
+// Counterfactual: delete the `!filepath.IsAbs(req.WorkingDir)` guard in
+// handleCreateCampaign → the request proceeds to assemble and persist → RED on
+// the status, the code, and the no-campaign-created assertion.
+func TestCreateCampaign_RelativeWorkingDir_Rejected(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: crepo, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","working_dir":"./sub"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if details["field"] != "working_dir" {
+		t.Errorf("details.field = %v, want working_dir", details["field"])
+	}
+	// State after the call: nothing was created and no forge work was done.
+	if n := len(crepo.campaigns); n != 0 {
+		t.Errorf("campaigns created = %d, want 0 (the guard must refuse before persisting)", n)
+	}
+	if fp.called {
+		t.Error("the epic-children query ran; the guard must refuse before any forge round-trip")
+	}
+}
+
+// TestStartCampaignItemRun_RelativeCampaignBinding_Refused is counterfactual C2:
+// INHERITED-binding re-validation. The campaign row is seeded with a RELATIVE
+// working_dir DIRECTLY through the fake repo — BY CONSTRUCTION, bypassing the
+// create-time guard — so the fixture cannot fail as "setup rejected" from the
+// control under test. This is the different-door case the re-validation exists
+// for: a value that never passed the create guard (a direct DB write, a row
+// predating it) must still be refused at mint time rather than trusted.
+//
+// Counterfactual: delete the `!filepath.IsAbs(c.WorkingDir)` check in the
+// inherit rung → the relative path flows to StartRunForCampaignIssue, a run is
+// minted carrying it, and the item leaves pending → RED on the status, the code,
+// and both committed-state assertions.
+func TestStartCampaignItemRun_RelativeCampaignBinding_Refused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	// Seed the bad binding by construction — never through the create handler.
+	c.WorkingDir = "./relative-checkout"
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if details["field"] != "working_dir" {
+		t.Errorf("details.field = %v, want working_dir", details["field"])
+	}
+	// Committed state after the refusal: no run minted, item untouched.
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	items := crepo.itemsByCmp[c.ID]
+	if len(items) != 1 || items[0].State != campaign.ItemStatePending || items[0].RunID != nil {
+		t.Errorf("item = %+v, want still pending with a nil run_id", items[0])
+	}
+}
+
+// TestStartCampaignItemRun_LocalUnboundCampaign_Refused is counterfactual C3:
+// rung 3, #2498's "a local item needs a resolvable checkout" refusal relocated
+// server-side. A campaign with NO binding plus an item run with no working_dir
+// leaves the local run with no checkout to execute in, so it is refused 400
+// working_dir_required — a DISTINCT code the MCP tool maps to the two remedies.
+// Because a control that fires must leave no committed state, the test reads
+// state after the call.
+//
+// Counterfactual: delete the `case req.RunnerKind == string(run.RunnerKindLocal):`
+// rung → an unbound local run is minted and the item goes running → RED on the
+// status, the code, and both state assertions.
+func TestStartCampaignItemRun_LocalUnboundCampaign_Refused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	// No campaign binding, and the POST below passes no per-item value. Cleared
+	// explicitly: the seeder binds one by default (#2527's normal shape).
+	c.WorkingDir = ""
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "working_dir_required" {
+		t.Errorf("code = %q, want working_dir_required", code)
+	}
+	if details["field"] != "working_dir" {
+		t.Errorf("details.field = %v, want working_dir", details["field"])
+	}
+	// Committed state after the refusal: nothing minted, item untouched.
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	items := crepo.itemsByCmp[c.ID]
+	if len(items) != 1 || items[0].State != campaign.ItemStatePending || items[0].RunID != nil {
+		t.Errorf("item = %+v, want still pending with a nil run_id", items[0])
+	}
+}
+
+// TestStartCampaignItemRun_UnboundCampaign_NonLocal_Allowed pins the rung-3
+// guard's NARROWNESS: the refusal is keyed to runner_kind local. A
+// github_actions item has no local checkout at all, so an unbound campaign must
+// still mint it — the run is simply unbound, exactly as before #2527.
+func TestStartCampaignItemRun_UnboundCampaign_NonLocal_Allowed(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.WorkingDir = "" // unbound, so the run has nothing to inherit
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	persisted, ok := rrepo.runs[body.Run.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", body.Run.ID)
+	}
+	if persisted.WorkingDir != "" {
+		t.Errorf("persisted run working_dir = %q, want \"\" (unbound campaign, non-local item)", persisted.WorkingDir)
+	}
+}
+
+// TestStartCampaignItemRun_ExplicitWorkingDirOverridesCampaignBinding pins the
+// operator-ratified conflict policy: an explicit per-item working_dir that
+// DIFFERS from the campaign binding is ACCEPTED as a deliberate override, not
+// refused the way resolveWorkingDirForRun refuses a conflict against a RUN
+// binding. The resolution that actually applied is asserted on the PERSISTED run
+// row — so it is observable from the minted row rather than inferred, and a
+// later silent flip to refusal (or to letting the campaign binding win) turns
+// this RED.
+func TestStartCampaignItemRun_ExplicitWorkingDirOverridesCampaignBinding(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	bound := t.TempDir()
+	c.WorkingDir = bound
+
+	override := t.TempDir() // a DIFFERENT absolute checkout
+	if override == bound {
+		t.Fatal("fixture: the override and the binding must differ")
+	}
+	w := postStartItemRun(t, s, c.ID,
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","working_dir":`+strconv.Quote(override)+`}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a conflicting per-item value is a deliberate override, not a refusal (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	persisted, ok := rrepo.runs[body.Run.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", body.Run.ID)
+	}
+	if persisted.WorkingDir != override {
+		t.Errorf("persisted run working_dir = %q, want the override %q (not the campaign binding %q)",
+			persisted.WorkingDir, override, bound)
+	}
+}
+
 // TestStartCampaignItemRun_RelativeWorkingDir_Rejected is the M4 REST refusal
 // (E48.69 / #2498): a POST with a relative working_dir returns 400
 // validation_failed naming the field. Because this control's real effect is
@@ -3596,7 +3953,10 @@ func TestStartCampaignItemRun_RestartCancelled_CrossBoundary_E2E(t *testing.T) {
 	s, campaigns, runs, aud := newCampaignStartServerPG(t)
 
 	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
-		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99",
+		// The campaign carries a working_dir binding (E48.87 / #2527) so the
+		// restart below — a runner_kind:local start with no per-item value —
+		// inherits it instead of being refused working_dir_required.
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", WorkingDir: seededCampaignWorkingDir,
 	})
 	if err != nil {
 		t.Fatalf("create campaign: %v", err)

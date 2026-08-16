@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,107 @@ func TestStartCampaign_HappyPath_PostsBodyReturnsCampaign(t *testing.T) {
 	}
 	if out.Campaign.PausePolicy != "pause_item" {
 		t.Errorf("Campaign.PausePolicy = %q, want pause_item", out.Campaign.PausePolicy)
+	}
+}
+
+// TestStartCampaign_ThreadsWorkingDirThroughRealClient drives the PRODUCTION
+// path — the tool handler → the real apiClient → the wire — and asserts the
+// campaign-level binding (E48.87 / #2527) arrives in the POST body. It is
+// deliberately NOT a body the test constructed and handed to the client: a test
+// that marshals campaignCreateRequest itself cannot detect
+// StartCampaignInput.WorkingDir never being threaded into the CreateCampaign
+// call, which is exactly the seam that breaks. An un-cleaned absolute value is
+// used so the Clean is pinned too, and the omitted case proves an unbound
+// campaign sends no working_dir key at all.
+//
+// Counterfactual: drop `workingDir` from the r.api.CreateCampaign argument list
+// (pass "") → the POST body carries no binding → RED.
+func TestStartCampaign_ThreadsWorkingDirThroughRealClient(t *testing.T) {
+	t.Run("bound", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		base := t.TempDir()
+		uncleaned := base + "/./" // absolute but not cleaned
+		_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo:       "kuhlman-labs/fishhawk",
+			EpicRef:    "#25",
+			WorkingDir: uncleaned,
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if got := fb.createCampaignBody.WorkingDir; got != filepath.Clean(uncleaned) {
+			t.Errorf("POST body working_dir = %q, want the cleaned %q — the tool must thread StartCampaignInput.WorkingDir into the client call", got, filepath.Clean(uncleaned))
+		}
+	})
+
+	t.Run("omitted_sends_no_key", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo: "kuhlman-labs/fishhawk", EpicRef: "#25",
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if got := fb.createCampaignBody.WorkingDir; got != "" {
+			t.Errorf("POST body working_dir = %q, want empty (an unbound campaign sends no binding)", got)
+		}
+	})
+}
+
+// TestStartCampaign_RelativeWorkingDir_Refused is counterfactual C5: the MCP
+// start_campaign syntactic guard (E48.87 / #2527). A relative binding would be
+// inherited by every item run in the batch, so it is refused BEFORE the backend
+// is dialed — asserted through the explicit never-dialed seam
+// (createCampaignCalls == 0) against a REACHABLE in-test server, which
+// distinguishes a local refusal from a backend rejection or a connection error.
+// Refused for any campaign, exactly as the per-item guard is refused for any
+// runner_kind: a relative path is unresolvable no matter who consumes it.
+//
+// Counterfactual: delete the `!filepath.IsAbs(workingDir)` guard in startCampaign
+// → the tool dials the backend and returns no error → RED on both the error
+// assertion and the zero-request assertion.
+func TestStartCampaign_RelativeWorkingDir_Refused(t *testing.T) {
+	// A REACHABLE in-test server that counts every request it receives. Pointing
+	// at an unreachable address instead would make a connection error
+	// indistinguishable from the guard firing.
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"kuhlman-labs/fishhawk","epic_ref":"#25","state":"pending","pause_policy":"pause_campaign"}`))
+	}))
+	t.Cleanup(srv.Close)
+	r := &runResolver{api: newAPIClient(config{backendURL: srv.URL, apiToken: "fhk_test"})}
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:       "kuhlman-labs/fishhawk",
+		EpicRef:    "#25",
+		WorkingDir: "./sub", // relative
+	})
+	if err == nil || !strings.Contains(err.Error(), "working_dir") || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("err = %v, want a refusal naming working_dir and absolute", err)
+	}
+	if n := atomic.LoadInt32(&requests); n != 0 {
+		t.Errorf("backend saw %d requests; a relative-path refusal must never dial the backend", n)
+	}
+
+	// Negative control: the SAME server, an ABSOLUTE working_dir → the guard does
+	// not fire and the request goes through. Without this the guard could pass by
+	// refusing every campaign.
+	if _, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:       "kuhlman-labs/fishhawk",
+		EpicRef:    "#25",
+		WorkingDir: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("absolute working_dir must be accepted, got %v", err)
+	}
+	if n := atomic.LoadInt32(&requests); n != 1 {
+		t.Errorf("backend saw %d requests after the absolute call, want exactly 1", n)
 	}
 }
 
@@ -872,18 +974,22 @@ func TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty(t *testing.T
 	}
 }
 
-// TestStartCampaignItemRun_LocalRequiresWorkingDir pins the M1 refusal and its
-// M2 negative control (E48.69 / #2498). local + omitted working_dir is refused
-// naming working_dir, and the backend is NEVER dialed (the explicit never-dialed
-// seam, startCampaignItemRunCalls == 0, distinguishes a local refusal from a
-// backend rejection). github_actions + omitted working_dir SUCCEEDS — without
-// this control the M1 guard could pass by refusing everything.
+// TestStartCampaignItemRun_LocalOmittedWorkingDirReachesBackend pins the E48.87
+// / #2527 RELOCATION of #2498's M1 refusal. local + omitted working_dir is no
+// longer refused in the MCP tool, because an omitted value is no longer
+// necessarily missing: the CAMPAIGN may carry a binding this run inherits, and
+// only the backend can see it. So the call must now REACH the backend (exactly
+// once) rather than being refused locally — the backend decides, and refuses
+// working_dir_required when the campaign is unbound too
+// (TestStartCampaignItemRun_WorkingDirRequired_MapsRemedy asserts that mapping,
+// TestStartCampaignItemRun_LocalUnboundCampaign_Refused in the server package
+// asserts the refusal itself). github_actions + omitted still succeeds, the
+// unchanged negative control.
 //
-// Counterfactual: deleting the empty+local guard in startCampaignItemRun dials
-// the backend and returns no error on the local subtest → RED on both the error
-// assertion and the never-dialed assertion.
-func TestStartCampaignItemRun_LocalRequiresWorkingDir(t *testing.T) {
-	t.Run("local_no_working_dir_refused_never_dialed", func(t *testing.T) {
+// Counterfactual: restoring the removed local+omitted guard refuses locally and
+// dials nothing → RED on the reached-the-backend assertion.
+func TestStartCampaignItemRun_LocalOmittedWorkingDirReachesBackend(t *testing.T) {
+	t.Run("local_no_working_dir_reaches_backend", func(t *testing.T) {
 		fb, srv := newFakeBackend(t)
 		r := newResolver(srv, nil)
 
@@ -893,11 +999,16 @@ func TestStartCampaignItemRun_LocalRequiresWorkingDir(t *testing.T) {
 			WorkflowID: "feature_change",
 			RunnerKind: "local",
 		})
-		if err == nil || !strings.Contains(err.Error(), "working_dir") {
-			t.Fatalf("err = %v, want a refusal naming working_dir", err)
+		if err != nil {
+			t.Fatalf("local with no working_dir must reach the backend (the campaign may bind it), got %v", err)
 		}
-		if fb.startCampaignItemRunCalls != 0 {
-			t.Errorf("backend was dialed %d times; a local refusal must never dial the backend", fb.startCampaignItemRunCalls)
+		if fb.startCampaignItemRunCalls != 1 {
+			t.Errorf("backend dialed %d times, want exactly 1 — the local+omitted refusal moved server-side (#2527), so the MCP tool must not short-circuit it", fb.startCampaignItemRunCalls)
+		}
+		// Nothing is invented on the way: an omitted value stays omitted, so the
+		// backend sees "no per-item override" and applies the campaign binding.
+		if fb.startCampaignItemRunBody.WorkingDir != "" {
+			t.Errorf("POST body working_dir = %q, want empty (an omitted per-item value must not be back-filled by the tool)", fb.startCampaignItemRunBody.WorkingDir)
 		}
 	})
 
@@ -981,9 +1092,14 @@ func TestStartCampaignItemRun_RefusalIsTransportIndependent(t *testing.T) {
 		name string
 		in   StartCampaignItemRunInput
 	}
-	// The M1 (local + omitted) and M3 (relative) refusal inputs.
+	// The M3 (relative) refusal inputs. The M1 (local + omitted) case is NO
+	// LONGER an MCP-layer refusal as of E48.87 / #2527 — it moved server-side,
+	// where the campaign's binding is visible — so it is pinned by
+	// TestStartCampaignItemRun_LocalOmittedWorkingDirReachesBackend and the
+	// server package's TestStartCampaignItemRun_LocalUnboundCampaign_Refused
+	// instead. The relative refusal, which needs no I/O, stays here and stays
+	// transport-independent.
 	cases := []refusalCase{
-		{"local_omitted", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "local"}},
 		{"relative_local", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "local", WorkingDir: "./sub"}},
 		{"relative_gha", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "github_actions", WorkingDir: "./sub"}},
 	}
@@ -1099,6 +1215,47 @@ func TestStartCampaignItemRun_MissingWorkflowID_FailsLocally(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "workflow_id is required") {
 		t.Fatalf("err = %v, want local workflow_id-required validation", err)
+	}
+}
+
+// TestStartCampaignItemRun_WorkingDirRequired_MapsRemedy pins the MCP rendering
+// of the RELOCATED rung-3 refusal (E48.87 / #2527). The backend owns the
+// decision — only it can see whether the campaign carries a binding — so the
+// tool's job is to turn the working_dir_required code into an operator-actionable
+// remedy. It must name BOTH ways out (bind it once at start_campaign, or pass it
+// for this item); naming only one would send the operator back into the per-item
+// repetition this issue removes.
+//
+// The stub's backend message is deliberately TERSE and carries NONE of the
+// remedy wording. Without that, the generic `start campaign item run: %w`
+// fallback renders the code AND the backend message, so a rich server message
+// would satisfy every substring assertion with the mapping deleted — the test
+// would be green against a control that is not there (observed: this exact test
+// passed under the deletion until the fixture was made terse). Every assertion
+// below is therefore on wording the TOOL adds.
+func TestStartCampaignItemRun_WorkingDirRequired_MapsRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = http.StatusBadRequest
+	fb.startCampaignItemRunErr = `{"error":{"code":"working_dir_required","message":"no checkout bound"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:100", WorkflowID: "feature_change", RunnerKind: "local",
+	})
+	if err == nil {
+		t.Fatal("err = nil, want a working_dir_required mapping")
+	}
+	// Remedy 1 (bind once at the campaign), remedy 2 (pass it for this item),
+	// and the resolve-your-own-checkout instruction — none of which appear in
+	// the backend message above.
+	for _, want := range []string{
+		"bind working_dir ONCE on the campaign at fishhawk_start_campaign",
+		"pass an absolute working_dir for this item",
+		"resolve your own checkout",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q — the remedy must name both ways out", err.Error(), want)
+		}
 	}
 }
 

@@ -398,6 +398,35 @@ func TestPersist_ThreadsIdempotencyKey(t *testing.T) {
 	}
 }
 
+// TestPersist_ThreadsWorkingDir pins the campaign-level checkout binding
+// (E48.87 / #2527) crossing Assembly → CreateCampaignParams: an empty binding
+// stays empty (the unchanged default, so every existing call site that never
+// sets it persists an empty string), and a bound value passes through verbatim — Persist
+// neither normalizes nor validates it (absolute-path validation is the REST
+// handler's).
+func TestPersist_ThreadsWorkingDir(t *testing.T) {
+	// Empty binding → empty params (the unchanged-behavior default).
+	fEmpty := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), fEmpty, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:2527"}); err != nil {
+		t.Fatalf("Persist (no binding): %v", err)
+	}
+	if fEmpty.got.WorkingDir != "" {
+		t.Errorf("unbound campaign persisted WorkingDir %q, want \"\"", fEmpty.got.WorkingDir)
+	}
+
+	// A bound value passes through verbatim.
+	const wd = "/Users/op/checkouts/fishhawk"
+	f := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:2527", WorkingDir: wd}); err != nil {
+		t.Fatalf("Persist (binding): %v", err)
+	}
+	if f.got.WorkingDir != wd {
+		t.Errorf("WorkingDir persisted as %q, want %q", f.got.WorkingDir, wd)
+	}
+}
+
 // persistItemErrFake creates a campaign successfully but fails every item
 // insert, so Persist reaches the create-item error branch.
 type persistItemErrFake struct{ campaign.BaseFake }
