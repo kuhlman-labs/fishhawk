@@ -281,8 +281,11 @@ type fakeUploader struct {
 	// the Nth FetchInstallationToken call returns the Nth entry (the last
 	// repeats), so a test can model a re-mint handing back a FRESH token after
 	// the held one expired. instTokenCalls counts every call, sequence or not.
-	instTokenSeq      []string
-	instTokenCalls    int
+	instTokenSeq   []string
+	instTokenCalls int
+	// instTokenHook, when non-nil, runs on every FetchInstallationToken call
+	// (see the method for what that position buys).
+	instTokenHook     func()
 	gotMCPTokenArgs   *upload.FetchMCPTokenArgs
 	gotRetryArgs      []upload.RetryStageArgs
 	gotAcceptanceArgs *upload.ShipAcceptanceArgs
@@ -312,6 +315,15 @@ type fakeUploader struct {
 	// amendmentCalls counts every call, sequence or not.
 	amendmentsSeq  [][]upload.ScopeAmendment
 	amendmentCalls int
+
+	// amendmentsHook, when non-nil, runs at the top of every
+	// FetchScopeAmendments call with that call's context and args; a non-nil
+	// return short-circuits the call with that error. The #2748
+	// parent-cancellation test uses it to HOLD inside the park's long-poll the
+	// way the backend's `?wait` hold does, so the stage context can be
+	// cancelled while the request is genuinely in flight rather than between
+	// requests.
+	amendmentsHook func(context.Context, upload.FetchScopeAmendmentsArgs) error
 
 	// Scope-amendment REQUEST seam (#2748). gotRequestAmendmentArgs records
 	// every POST — the gate-not-widened safety tests assert it stays EMPTY.
@@ -526,6 +538,14 @@ func (f *fakeUploader) FetchInstallationToken(_ context.Context, args upload.Fet
 	a := args
 	f.gotInstTokenArgs = &a
 	f.instTokenCalls++
+	// instTokenHook fires at the first PR-egress client call — immediately
+	// before the commit+push chain. The #2748 parent-cancellation test's
+	// UN-PARKED control cancels the runner context here, which is the same
+	// position the cancellation reaches when it lands inside the park's
+	// long-poll instead.
+	if f.instTokenHook != nil {
+		f.instTokenHook()
+	}
 	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
 		return nil, err
 	}
@@ -566,11 +586,16 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 // FetchScopeAmendments stubs the #961 mid-stage refresh endpoint.
 // Returns f.amendments verbatim; records the args so tests can assert
 // the runner reused the run-bound fhm_ bearer.
-func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error) {
+func (f *fakeUploader) FetchScopeAmendments(ctx context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error) {
 	a := args
 	f.gotAmendmentArgs = &a
 	idx := f.amendmentCalls
 	f.amendmentCalls++
+	if f.amendmentsHook != nil {
+		if err := f.amendmentsHook(ctx, a); err != nil {
+			return nil, err
+		}
+	}
 	if f.amendmentsErr != nil {
 		return nil, f.amendmentsErr
 	}
@@ -22057,10 +22082,35 @@ func TestRun_MigrationRenumber_AmendmentApproved_CommitLandsWithCreatedPaths(t *
 }
 
 // TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged is C7's
-// behavioural vehicle. The operator DENIES: nothing changes, the
-// created-out-of-scope gate fires exactly as it does today, and — the assertion
-// that reddens when the driver stops honouring the denial — NO run branch ref
-// appears on the bare origin.
+// behavioural vehicle. The operator DENIES: nothing changes and the
+// created-out-of-scope gate fires exactly as it does today.
+//
+// WHICH MUTATION REDDENS WHICH ASSERTION (all three run, none reasoned about).
+// A denied decision is consumed at TWO points, and the assertions are split to
+// match, because a single-point mutation of the driver does NOT move the
+// pushed state:
+//
+//   - Driver, single point — delete the `decision != "approved"` early return
+//     in parkForMigrationRenumberAmendment. The stage falls through to the fold
+//     and claims approval. The origin stays untouched (refreshScopeAmendments
+//     folds only APPROVED rows, so the denied created paths never enter
+//     cfg.scopeFiles and the gate still fires), so the ref assertion CANNOT
+//     redden here. The `"decision":"denied"` and no-`"approved"` assertions do:
+//     observed `missing the denied decision event`, with the log carrying
+//     `"decision":"approved"` instead.
+//
+//   - Full decision-consumption chain — the same deletion PLUS dropping
+//     refreshScopeAmendments' `a.Status != "approved"` filter, i.e. the denial
+//     is ignored everywhere it is read. The denied paths fold, the gate passes,
+//     and the push lands: observed `origin must be untouched on the denial, but
+//     branch fishhawk/run-aaaa1111/stage-eeee5555 exists`. That is what makes
+//     the ref assertion load-bearing, and it names the real invariant — a
+//     denied path never reaches origin, by whichever route the denial is lost.
+//
+// The no-fold assertion sits between the two: it reddens on the compound
+// mutation strictly before the push does, and pins the runner's fold as
+// BACKEND-AUTHORITATIVE (the runner never folds a path on its own say-so),
+// which is exactly why the single-point driver mutation is harmless.
 func TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged(t *testing.T) {
 	pinRenumberBudget(t, 2*time.Second)
 	repo, bare, branch := migrationRenumberRepo(t)
@@ -22077,10 +22127,17 @@ func TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged(t *testing.T) 
 
 	var stderr strings.Builder
 	code := run(renumberRunArgs(t, repo), &stderr)
-	// COMMITTED STATE, not error identity: a fold that happened anyway would
-	// return no different error here, but it WOULD put a ref on the remote.
+	// COMMITTED STATE, not error identity: a denial lost anywhere in the
+	// consumption chain returns no different error here, but it WOULD put a ref
+	// on the remote.
 	if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
 		t.Errorf("origin must be untouched on the denial, but branch %s exists (tip %s)", branch, strings.TrimSpace(string(out)))
+	}
+	// Upstream of the push: a denied amendment must fold NOTHING into
+	// cfg.scopeFiles. This is the assertion that catches a lost denial before it
+	// can reach git at all.
+	if strings.Contains(stderr.String(), `"event":"scope_amendments_folded"`) {
+		t.Errorf("a denied amendment must fold no path into scope.files:\n%s", stderr.String())
 	}
 	if code != exitFailure {
 		t.Fatalf("run = %d, want exitFailure on the denial:\n%s", code, stderr.String())
@@ -22093,6 +22150,9 @@ func TestRun_MigrationRenumber_AmendmentDenied_CategoryBUnchanged(t *testing.T) 
 	}
 	if !strings.Contains(stderr.String(), `"decision":"denied"`) {
 		t.Errorf("missing the denied decision event:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"decision":"approved"`) {
+		t.Errorf("the stage must not report the denied amendment as approved:\n%s", stderr.String())
 	}
 	if fpr.gotArgs != nil {
 		t.Error("no PR may be opened on the denial")
@@ -22464,11 +22524,12 @@ func failureClassification(t *testing.T, log string) string {
 // whose amendment stays `pending` until the decision budget expires. Both
 // classification records must be byte-identical apart from timing-free content.
 //
-// This also covers the deadline-during-park shape on the runner side: the only
-// runner-observable form of "the stage deadline expired while parked" is the
-// process context being cancelled, and the driver's ctx branch returns
-// (false, nil) exactly as the budget branch does — pinned by the
-// ctx_cancelled case in TestParkForMigrationRenumber_FailOpenBranches.
+// This test covers ONLY the DECISION-BUDGET expiry, whose parent context stays
+// healthy throughout. The other deadline-during-park shape — the stage/process
+// context itself expiring while the long-poll is held, which leaves that same
+// context cancelled for everything run() does afterwards — is a different code
+// path and gets its own behavioural vehicle in
+// TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged.
 func TestRun_MigrationRenumber_ParkExpiry_ClassificationMatchesUnparked(t *testing.T) {
 	classify := func(t *testing.T, expire bool) string {
 		t.Helper()
@@ -22510,5 +22571,109 @@ func TestRun_MigrationRenumber_ParkExpiry_ClassificationMatchesUnparked(t *testi
 	}
 	if !strings.Contains(parked, `"category":"B"`) {
 		t.Errorf("both paths must stay category-B, got %s", parked)
+	}
+}
+
+// TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged is
+// the OTHER deadline-during-park shape, and the one no driver-scoped test can
+// reach: the stage/process context expires WHILE the park's long-poll is held,
+// so awaitMigrationRenumberDecision returns with that context ALREADY cancelled
+// and every subsequent run() call — the whole openPRAndShipArtifact chain —
+// receives it cancelled too. What the RUN then reports is the question, and a
+// driver-scoped test stops before classification ever happens.
+//
+// SUBJECT: the fake holds inside FetchScopeAmendments exactly as the backend's
+// `?wait` hold does (keyed on WaitSeconds, so the #961 fold's own no-wait fetch
+// is not intercepted) and cancels the runner context while that request is in
+// flight. The decision budget is left long, so the park is ended by the
+// CANCELLATION and not by the budget — the distinction the budget-expiry test
+// above cannot make.
+//
+// CONTROL: the identical fixture and identical work tree with the amendment
+// POST refused, so the driver returns immediately and the park never blocks;
+// the same cancellation is delivered from the first PR-egress client call
+// instead, which is the position run() had reached when the subject's
+// cancellation landed. The two runs differ ONLY in whether the cancellation
+// arrived during a blocked park.
+//
+// RESOLVED CLASSIFICATION (observed, not reasoned): both are category-C with a
+// `context canceled` detail, exitCancelled, and a `runner_cancelled` record —
+// the standard #435 cancellation contract. The park contributes no failure
+// class of its own. Category-C is also the CORRECT class here and category-B
+// would be wrong: the commit chain never ran, so no gate reached a verdict on
+// this tree, and an interrupted stage is retryable infra rather than a
+// park-for-re-scope. Nothing reaches origin either way.
+func TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged(t *testing.T) {
+	// classify runs the fixture and returns (classification record, exit code,
+	// whole log). parked=true cancels inside the held long-poll; parked=false
+	// cancels at the post-park egress boundary with no park ever blocking.
+	classify := func(t *testing.T, parked bool) (string, int, string) {
+		t.Helper()
+		repo, bare, branch := migrationRenumberRepo(t)
+		withFakeInvoker(t, &fakeInvoker{
+			mirrorWorkingTreeFrom: repo,
+			canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			onInvoke:              func(_ int, _ agent.Invocation) { writeRenumbered(t, repo) },
+		})
+		implementEnv(t, "test-owner/test-repo", "main")
+		cancel := withCancelableRunnerContext(t)
+		fu := renumberUploader(t, "pending")
+		held := false
+		if parked {
+			// A long budget: the cancellation, not the clock, must end the park.
+			pinRenumberBudget(t, 10*time.Minute)
+			fu.amendmentsHook = func(ctx context.Context, args upload.FetchScopeAmendmentsArgs) error {
+				if args.WaitSeconds <= 0 {
+					return nil // the #961 fold's fetch, not the park's long-poll
+				}
+				held = true
+				cancel()     // the stage context expires WHILE the request is held
+				<-ctx.Done() // a real client returns only once the hold ends
+				return ctx.Err()
+			}
+		} else {
+			pinRenumberBudget(t, 2*time.Second)
+			fu.requestAmendmentErr = upload.ErrAmendmentBudgetExhausted
+			fu.instTokenHook = func() { held = true; cancel() }
+		}
+		withFakeUploader(t, fu)
+
+		var stderr strings.Builder
+		code := run(renumberRunArgs(t, repo), &stderr)
+		if !held {
+			t.Fatalf("the cancellation seam never fired (parked=%v):\n%s", parked, stderr.String())
+		}
+		// Neither path may reach origin: a cancelled park folds nothing, so the
+		// created pair is still out of scope and nothing is pushed.
+		if out, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
+			t.Errorf("origin must be untouched (parked=%v), but %s exists (tip %s)", parked, branch, strings.TrimSpace(string(out)))
+		}
+		got := failureClassification(t, stderr.String())
+		if got == "" {
+			t.Fatalf("no classification record (parked=%v) in:\n%s", parked, stderr.String())
+		}
+		return got, code, stderr.String()
+	}
+
+	parked, parkedCode, parkedLog := classify(t, true)
+	unparked, unparkedCode, _ := classify(t, false)
+
+	if parked != unparked {
+		t.Errorf("a park cancelled by the stage context must not surface a different failure class:\nparked   = %s\nunparked = %s", parked, unparked)
+	}
+	if !strings.Contains(parked, `"category":"C"`) {
+		t.Errorf("a cancelled stage is retryable infra, want category C, got %s", parked)
+	}
+	// The driver fell OPEN on the cancellation — it did not consume it as a
+	// decision — and said so.
+	if !strings.Contains(parkedLog, `"decision":"unavailable"`) || !strings.Contains(parkedLog, "context canceled") {
+		t.Errorf("the park must report the cancellation as unavailable, not as a decision:\n%s", parkedLog)
+	}
+	// The cancellation surfaces through the standard #435 contract on BOTH.
+	if parkedCode != exitCancelled || unparkedCode != exitCancelled {
+		t.Errorf("exit codes = parked %d / unparked %d, want exitCancelled (%d) for both:\n%s", parkedCode, unparkedCode, exitCancelled, parkedLog)
+	}
+	if !strings.Contains(parkedLog, `"event":"runner_cancelled"`) {
+		t.Errorf("missing the standard runner_cancelled record:\n%s", parkedLog)
 	}
 }
