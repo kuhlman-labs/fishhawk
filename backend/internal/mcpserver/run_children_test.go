@@ -1077,6 +1077,14 @@ func TestRunChildren_SpawnErrorDoesNotStrandStage(t *testing.T) {
 	if w := warningContaining(c.Warnings, "fishhawk_retry_stage"); w == "" {
 		t.Errorf("warnings = %v, want a retry_stage recovery pointer", c.Warnings)
 	}
+	// (3b) #2695 item 4: on a SUCCEEDING report, exactly ONE warning is appended
+	// and it carries the success claim (report-before-claim ordering).
+	if len(c.Warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one (the single success-claim warning)", c.Warnings)
+	}
+	if !strings.Contains(c.Warnings[0], "Reported it as a category-C stage failure") {
+		t.Errorf("success warning missing the report claim: %v", c.Warnings)
+	}
 	// (4) The loop CONTINUED to the next child.
 	if !childByID(out)[other.String()].Dispatched {
 		t.Error("the loop did not continue to the next child after a spawn error")
@@ -1188,12 +1196,21 @@ func TestRunChildren_FailedCompensationDisclosesStrand(t *testing.T) {
 		t.Errorf("stage = %q, want the disclosed 'dispatched' strand", got)
 	}
 	c := childByID(out)[child.String()]
-	if len(c.Warnings) < 2 {
-		t.Fatalf("warnings = %v, want two (the spawn error AND the strand disclosure)", c.Warnings)
+	// #2695 item 4: on a FAILED report, exactly ONE warning is appended — the
+	// self-contained strand disclosure — with NO preceding success claim to
+	// contradict.
+	if len(c.Warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one (the single strand disclosure)", c.Warnings)
 	}
 	strand := warningContaining(c.Warnings, "STRANDED")
 	if strand == "" {
 		t.Fatalf("warnings = %v, want an explicit strand disclosure", c.Warnings)
+	}
+	// IDENTITY assertion (not just a count): the strand must NOT claim a
+	// successful report. A reworded duplicate that still asserted the report
+	// succeeded would pass a count-only check but fails here.
+	if strings.Contains(strand, "Reported it as a category-C stage failure") {
+		t.Errorf("strand disclosure falsely claims the report succeeded: %s", strand)
 	}
 	if !strings.Contains(strand, "reap-failure") {
 		t.Errorf("strand warning does not name the reap-failure endpoint (the fallback for a client without the verb): %s", strand)

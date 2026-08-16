@@ -17,7 +17,7 @@ import (
 // / #2363). run_id is the DECOMPOSED PARENT whose fan-out is being watched.
 type AwaitChildrenInput struct {
 	RunID          string `json:"run_id" jsonschema:"the DECOMPOSED PARENT run UUID whose children this call watches"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360). Cap is 600 by default, raised to 7200 when long_wait=true OR your MCP client supplied a progressToken. On timeout, re-call to resume — the wait holds no server state"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 600). Cap is 600 by default, raised to 7200 when long_wait=true OR your MCP client supplied a progressToken. So an omitted value with neither opt-in waits the full 600s cap. On timeout, re-call to resume — the wait holds no server state"`
 	LongWait       bool   `json:"long_wait,omitempty" jsonschema:"unlock the 7200s timeout cap WITHOUT a progressToken (default false = 600s cap). The wait holds no state and is resumable, so a client-cut-short call is a safe no-op to re-issue"`
 }
 
@@ -125,8 +125,9 @@ exists to create.
 Inputs:
   - run_id          (required) — the DECOMPOSED PARENT run UUID.
   - long_wait       — unlock the 7200s cap from a tool call (default false).
-  - timeout_seconds — default 360; cap 600, or 7200 when long_wait=true OR a
-                      progressToken is present.
+  - timeout_seconds — default 600; cap 600, or 7200 when long_wait=true OR a
+                      progressToken is present (so an omitted value with neither
+                      opt-in waits the full 600s cap).
 `),
 	}, resolver.awaitChildren)
 }
@@ -148,7 +149,12 @@ func (r *runResolver) awaitChildren(ctx context.Context, req *mcp.CallToolReques
 	}
 	heartbeat := progToken != nil
 	capSeconds := effectiveAwaitCap(heartbeat, in.LongWait)
-	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, heartbeat, in.LongWait)
+	// #2695 item 2: await_children reconciles with #2363's approved 600s default
+	// via its OWN default (clampAwaitChildrenTimeout), NOT the shared 360s
+	// clampAwaitTimeoutHeartbeat. With neither long_wait nor a progressToken the
+	// default now equals the 600s cap BY CONSTRUCTION, which is the approved
+	// contract.
+	timeout := clampAwaitChildrenTimeout(in.TimeoutSeconds, heartbeat, in.LongWait)
 	start := time.Now()
 
 	// Fast path: evaluate the absolute predicate BEFORE the first tick. This is
@@ -301,9 +307,13 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 // so the integration phase, the consolidated branch and (E50.13 / #2363) the
 // integrated child run ids are decoded from the same entries.
 func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uuid.UUID) (*ChildrenStatus, error) {
-	entries, _, err := r.api.ListRunAudit(ctx, parentUUID, ListRunAuditFilter{Limit: awaitChildrenAuditLimit})
+	entries, err := r.latestFanInAudit(ctx, parentUUID)
 	if err != nil {
-		return nil, fmt.Errorf("read parent audit: %w", err)
+		// latestFanInAudit already wraps as "read parent audit: …" — the
+		// UNCHANGED contract awaitChildrenEvaluate reads, so a read failure
+		// (including cap exhaustion / a non-progressing cursor) surfaces as an
+		// error rather than a silently stale snapshot.
+		return nil, err
 	}
 	cs, err := r.childrenStatusFor(ctx, parentUUID, entries)
 	if err != nil || cs == nil {
@@ -328,12 +338,120 @@ func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uui
 	return cs, nil
 }
 
-// awaitChildrenAuditLimit bounds the parent-audit window the snapshot decodes
-// the fan-in markers from. The fan-in kinds (slices_integrated /
-// slice_integration_conflict) land late in a decomposed parent's audit, and the
-// endpoint returns the window ASCENDING with a per-request cap of 500, so this
-// takes the endpoint's cap.
+// awaitChildrenAuditLimit is the PER-PAGE size for the category-filtered fan-in
+// reads (#2695). It takes the endpoint's per-request cap of 500. A SINGLE window
+// no longer suffices and the old comment claiming it did was the bug: the fan-in
+// kinds (slices_integrated / slice_integration_conflict) land LATE in a
+// decomposed parent's audit, so on a parent with a longer history the newest
+// marker sits beyond the first 500-entry page — an unfiltered single read then
+// silently omits it and every await times out. latestFanInAudit instead
+// category-filters each kind and walks it to its LAST page (the endpoint returns
+// entries ASCENDING, so the max-Sequence entry childrenStatusFor keeps is always
+// on the last page).
 const awaitChildrenAuditLimit = 500
+
+// awaitChildrenAuditMaxPages bounds the per-category pagination walk so a
+// pathological or looping cursor cannot spin forever (binding condition 1). At
+// 500 entries/page this admits a fan-in history far larger than any real
+// decomposition — a parent emits at most one fan-in entry per wave — so a walk
+// that reaches it is either a genuinely pathological history or a broken cursor;
+// either way exhaustion is a READ FAILURE, never a silently-truncated snapshot.
+const awaitChildrenAuditMaxPages = 256
+
+// fanInCategories is the EXACTLY-TWO audit categories childrenStatusFor consumes
+// from the window it is handed (children_status.go switches on only these two and
+// keeps the max-Sequence entry per kind). Feeding it category-filtered pages of
+// just these is semantically identical to the old unfiltered window on a short
+// history and strictly correct on a long one.
+var fanInCategories = []string{"slices_integrated", "slice_integration_conflict"}
+
+// latestFanInAudit assembles the fan-in markers for the await snapshot by
+// paginating EACH fan-in category to its last page and concatenating those final
+// pages (#2695). It replaces childrenStatusForAwait's old single unfiltered
+// 500-entry read, which dropped the newest marker on any parent with a longer
+// audit history and timed out every await. A read error is wrapped as
+// "read parent audit: …" — the UNCHANGED contract awaitChildrenEvaluate reads.
+func (r *runResolver) latestFanInAudit(ctx context.Context, parentUUID uuid.UUID) ([]AuditEntry, error) {
+	var out []AuditEntry
+	for _, cat := range fanInCategories {
+		page, err := r.lastFanInAuditPage(ctx, parentUUID, cat)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	return out, nil
+}
+
+// lastFanInAuditPage walks one category's audit pages to the LAST page, mirroring
+// verify_run.go's cursor loop, and returns that final page's entries. Because the
+// endpoint returns entries sequence-ASCENDING, the newest entry of the kind — the
+// only one childrenStatusFor keeps — is on the last page.
+//
+// Two DISTINCT terminating faults each surface as their OWN wrapped
+// "read parent audit" error (binding condition 1), so awaitChildrenEvaluate sees a
+// read FAILURE rather than a silently stale last-fetched page — and the diagnosis
+// is not collapsed:
+//
+//   - CAP EXHAUSTION — the walk reached awaitChildrenAuditMaxPages without the
+//     endpoint reporting the end. A legitimately long (or pathological) history:
+//     failing loud is strictly better than confidently returning a possibly-stale
+//     page, which would reintroduce the exact stale-marker miss this change fixes.
+//   - NON-PROGRESSING CURSOR — the endpoint handed back the SAME cursor it was
+//     given, which would otherwise spin forever. A different fault (a looping or
+//     broken cursor, not merely a long history), named as its own cause.
+func (r *runResolver) lastFanInAuditPage(ctx context.Context, parentUUID uuid.UUID, category string) ([]AuditEntry, error) {
+	cursor := ""
+	var last []AuditEntry
+	for page := 0; page < awaitChildrenAuditMaxPages; page++ {
+		items, next, err := r.api.ListRunAudit(ctx, parentUUID, ListRunAuditFilter{
+			Category: category,
+			Limit:    awaitChildrenAuditLimit,
+			Cursor:   cursor,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("read parent audit: %w", err)
+		}
+		last = items
+		if next == "" {
+			return last, nil
+		}
+		if next == cursor {
+			return nil, fmt.Errorf(
+				"read parent audit: %s pagination cursor did not advance (stuck at %q) — aborting the walk rather than spinning on a looping cursor", category, next)
+		}
+		cursor = next
+	}
+	return nil, fmt.Errorf(
+		"read parent audit: %s fan-in history exceeds the %d-page walk cap (%d entries/page) — refusing to use a possibly-stale page, so the fan-in snapshot could not be determined",
+		category, awaitChildrenAuditMaxPages, awaitChildrenAuditLimit)
+}
+
+// awaitChildrenTimeoutDefault is the omitted-timeout default for
+// fishhawk_await_children (#2695 item 2). It reconciles with #2363's approved
+// 600s contract: the shared clampAwaitTimeoutHeartbeat delegates a non-positive
+// input to the 360s review default, which CONTRADICTS that contract. So
+// await_children carries its own 600s default while leaving the cap ladder
+// (effectiveAwaitCap: 600s, raised to 7200s under long_wait or a progressToken)
+// untouched — and no other await verb is affected.
+const awaitChildrenTimeoutDefault = 600
+
+// clampAwaitChildrenTimeout is await_children's timeout clamp. A non-positive
+// input returns the 600s default (NOT the shared 360s review default); a positive
+// input clamps against the SHARED effectiveAwaitCap, so long_wait / a
+// progressToken still unlock the 7200s cap exactly as elsewhere. By construction,
+// an omitted timeout with neither opt-in resolves to 600 — equal to the cap — so
+// one call waits the full approved window.
+func clampAwaitChildrenTimeout(n int, heartbeat, longWait bool) int {
+	if n <= 0 {
+		return awaitChildrenTimeoutDefault
+	}
+	capSeconds := effectiveAwaitCap(heartbeat, longWait)
+	if n > capSeconds {
+		return capSeconds
+	}
+	return n
+}
 
 // awaitChildrenPendingAmendment finds the ONE amendment to surface, applying
 // the deterministic selection rule the tool description and the README both

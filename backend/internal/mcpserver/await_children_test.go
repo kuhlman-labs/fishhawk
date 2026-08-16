@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,23 @@ func seedSlicesIntegrated(t *testing.T, fb *fakeBackend, parent uuid.UUID, branc
 		Category: "slices_integrated",
 		Payload:  payload,
 	})
+}
+
+// seedFillerAudit appends n benign audit entries (category "stage_advanced",
+// none of the fan-in kinds) to the parent so a subsequent fan-in marker lands
+// BEYOND the endpoint's first 500-entry page — the #2695 long-history situation.
+func seedFillerAudit(fb *fakeBackend, parent uuid.UUID, n int) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for i := 0; i < n; i++ {
+		seq := int64(len(fb.perRunAuditByRun[parent]) + 1)
+		fb.perRunAuditByRun[parent] = append(fb.perRunAuditByRun[parent], AuditEntry{
+			ID:       uuid.NewString(),
+			Sequence: seq,
+			RunID:    parent.String(),
+			Category: "stage_advanced",
+		})
+	}
 }
 
 func newAwaitResolver(t *testing.T) (*fakeBackend, *runResolver) {
@@ -336,6 +354,161 @@ func TestAwaitChildren_TwoPendingAmendments_DeterministicSelectionAndReArm(t *te
 	if third.Status == "amendment_pending" {
 		t.Fatalf("third await still released amendment_pending (%s) — the decisions did not clear the queue",
 			third.PendingAmendmentChildRunID)
+	}
+}
+
+// --- item 2 (#2695): the omitted-timeout 600s default ---
+
+// TestClampAwaitChildrenTimeout pins the boundary set: a non-positive input
+// resolves to the 600s default (NOT the shared 360s review default), a positive
+// input clamps against effectiveAwaitCap, and long_wait unlocks 7200s.
+func TestClampAwaitChildrenTimeout(t *testing.T) {
+	cases := []struct {
+		n         int
+		heartbeat bool
+		longWait  bool
+		want      int
+	}{
+		{0, false, false, 600},    // omitted → the 600s default
+		{-5, false, false, 600},   // negative → the 600s default
+		{1, false, false, 1},      // small positive passes through
+		{600, false, false, 600},  // at the default cap
+		{601, false, false, 600},  // over the 600s cap with no opt-in → clamped down
+		{601, false, true, 601},   // long_wait raises the cap → passes through
+		{7201, false, true, 7200}, // over the raised cap → clamped to 7200
+		{7201, true, false, 7200}, // progressToken raises the cap likewise
+	}
+	for _, c := range cases {
+		if got := clampAwaitChildrenTimeout(c.n, c.heartbeat, c.longWait); got != c.want {
+			t.Errorf("clampAwaitChildrenTimeout(%d, heartbeat=%v, longWait=%v) = %d, want %d",
+				c.n, c.heartbeat, c.longWait, got, c.want)
+		}
+	}
+}
+
+// TestAwaitChildren_OmittedTimeoutDefaultsTo600s is the BEHAVIORAL wiring test:
+// with timeout_seconds OMITTED against a parent that can never release, the
+// resolved timeout the message interpolates must be the 600s default. A wiring
+// regression that left the shared 360s clampAwaitTimeoutHeartbeat in place would
+// interpolate 360 and redden here — the done-means test for a default-VALUE change
+// compilation cannot enforce. The caller ctx is cancelled after a few poll
+// intervals to force the timeout path deterministically.
+func TestAwaitChildren_OmittedTimeoutDefaultsTo600s(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	// running: not dispatchable, not terminal, no amendment → never releases.
+	seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	in := AwaitChildrenInput{RunID: parent.String()} // timeout_seconds OMITTED
+	_, out, err := r.awaitChildren(ctx, nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout", out.Status)
+	}
+	if !strings.Contains(out.Message, "600s") {
+		t.Errorf("timeout message = %q, want it to name the 600s default (a 360s-clamp wiring regression reddens here)", out.Message)
+	}
+	if out.TimeoutCapSeconds != 600 {
+		t.Errorf("timeout_cap_seconds = %d, want 600", out.TimeoutCapSeconds)
+	}
+}
+
+// --- item 1 (#2695): the fan-in marker beyond the first audit page ---
+
+// TestAwaitChildren_IntegrationMarkerBeyondFirstAuditPage is the item-1 control.
+// The slices_integrated marker that covers slice 0 sits AFTER 600 filler entries,
+// i.e. beyond the endpoint's first 500-entry page. The old single unfiltered
+// ListRunAudit{Limit:500} read never saw it and every await timed out; the
+// category-filtered, paginated fan-in read finds it regardless of history length,
+// so the dependent child releases children_dispatchable. The counterfactual
+// (restore the single read, observe status "timeout") is recorded in the PR body.
+func TestAwaitChildren_IntegrationMarkerBeyondFirstAuditPage(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	// Wave-0 child a succeeded; dependent child b parked at awaiting_host_dispatch
+	// (run 'running', #1237) depending on slice 0.
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	// Bury the fan-in marker beyond the first 500-entry page.
+	seedFillerAudit(fb, parent, 600)
+	// THEN the slices_integrated entry that covers slice 0 (the newest entry).
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/consolidated", []string{a.String()})
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_dispatchable" {
+		t.Fatalf("status = %q, want children_dispatchable — the integration marker beyond page one must still be found", out.Status)
+	}
+	if len(out.DispatchableChildRunIDs) != 1 || out.DispatchableChildRunIDs[0] != b.String() {
+		t.Errorf("dispatchable = %v, want [%s]", out.DispatchableChildRunIDs, b)
+	}
+}
+
+// TestAwaitChildren_FanInHistoryExceedsPageCapFailsLoud pins binding condition 1's
+// CAP-EXHAUSTION fault: an unbounded/pathological fan-in history (the endpoint
+// keeps returning an advancing cursor) is a READ FAILURE naming its own cause —
+// never a silently stale last-fetched page. Deleting the page-cap return reddens
+// this (the walk would spin forever / hang the test).
+func TestAwaitChildren_FanInHistoryExceedsPageCapFailsLoud(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	fb.mu.Lock()
+	fb.perRunAuditNeverEndByRun[parent] = true // advancing cursor that never terminates
+	fb.mu.Unlock()
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err == nil {
+		t.Fatalf("expected a loud read error on cap exhaustion, got status %q", out.Status)
+	}
+	if !strings.Contains(err.Error(), "read parent audit") || !strings.Contains(err.Error(), "page walk cap") {
+		t.Errorf("error = %v, want a wrapped 'read parent audit' cap-exhaustion failure", err)
+	}
+	// It must be DISTINCT from the non-progressing-cursor diagnosis.
+	if strings.Contains(err.Error(), "did not advance") {
+		t.Errorf("cap-exhaustion error collapsed into the non-progressing-cursor message: %v", err)
+	}
+}
+
+// TestAwaitChildren_FanInCursorNonProgressingFailsLoud pins binding condition 1's
+// NON-PROGRESSING-CURSOR fault, kept DISTINCT from cap exhaustion: the endpoint
+// hands back the SAME cursor it was given, which is detected as its own fault
+// rather than spun on. Deleting the next==cursor guard reddens this (the walk
+// would run to the cap and report the wrong cause).
+func TestAwaitChildren_FanInCursorNonProgressingFailsLoud(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	fb.mu.Lock()
+	// A FIXED (non-advancing) next cursor on every page — the back-compat literal
+	// branch returns it verbatim, so the walk sees next == the cursor it just sent.
+	fb.perRunAuditNextByRun[parent] = "stuck-cursor"
+	fb.mu.Unlock()
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err == nil {
+		t.Fatalf("expected a loud read error on a non-progressing cursor, got status %q", out.Status)
+	}
+	if !strings.Contains(err.Error(), "read parent audit") || !strings.Contains(err.Error(), "did not advance") {
+		t.Errorf("error = %v, want a wrapped 'read parent audit' non-progressing-cursor failure", err)
+	}
+	// It must be DISTINCT from the cap-exhaustion diagnosis.
+	if strings.Contains(err.Error(), "page walk cap") {
+		t.Errorf("non-progressing error collapsed into the cap-exhaustion message: %v", err)
 	}
 }
 

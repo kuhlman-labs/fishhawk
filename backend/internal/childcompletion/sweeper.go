@@ -366,6 +366,12 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 				}
 				s.emitSliceIntegrationFailed(ctx, parentRunID, parentStage.ID, attempts, err)
 				s.clearIntegrationError(parentRunID)
+				// Settling exit (#2695 item 5): the bounded-retry give-up settles
+				// the parent, so drop the between-wave conflict dedup key too — it
+				// is keyed by parent run id, so this is bookkeeping/memory hygiene
+				// only (a long-lived sweeper must not accumulate one entry per
+				// ever-conflicted parent).
+				s.clearWaveConflict(parentRunID)
 				s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: parent failed after bounded slice-integration retries",
 					slog.String("parent_run_id", parentRunID.String()),
 					slog.String("parent_stage_id", parentStage.ID.String()),
@@ -386,6 +392,10 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			// A slice conflict is terminal for this epoch — reset the
 			// non-conflict-error counter so a later re-drive starts fresh.
 			s.clearIntegrationError(parentRunID)
+			// Settling exit (#2695 item 5): the slice-conflict transition settles
+			// the parent, so clear the between-wave conflict dedup key too
+			// (bookkeeping/memory hygiene, keyed by parent run id).
+			s.clearWaveConflict(parentRunID)
 			cat := run.FailureB
 			reason := conflict.Detail
 			if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
@@ -409,6 +419,14 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 	if _, err := s.Runs.TransitionStage(ctx, parentStage.ID, target, completion); err != nil {
 		return fmt.Errorf("transition parent stage to %s: %w", target, err)
 	}
+	// Settling exit (#2695 item 5): this shared transition is reached by EVERY
+	// remaining all-terminal settle — the anyFailed settle, the clean-integration
+	// settle, AND the nil-Integrate clean settle (which skips the counter-clear
+	// above) — so clearing the between-wave conflict dedup key here covers all
+	// three in one place. Keyed by parent run id, so this is bookkeeping/memory
+	// hygiene only: no all-terminal exit leaves the key set (the give-up and
+	// slice-conflict early returns clear it on their own paths).
+	s.clearWaveConflict(parentRunID)
 
 	s.emitChildrenSettled(ctx, parentRunID, parentStage.ID, children, target)
 

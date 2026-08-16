@@ -1816,6 +1816,46 @@ func TestIntegrateCompletedWave_AbsentInputDegrades(t *testing.T) {
 	})
 }
 
+// TestIntegrateCompletedWave_MixedValidAndMalformedFailsClosed is the item-3
+// control (#2695). Unlike the AbsentInputDegrades subtests — which make the
+// malformed child the ONLY dependent candidate, so they pass whether or not the
+// degrade fails closed — this builds the MIXED population that discriminates: a
+// valid non-terminal dependent (slice 1, depends [0], slice 0 succeeded and NOT
+// yet covered) ALONGSIDE a malformed sibling (slice 2 with a nil / out-of-range
+// index). Under the pre-fix per-child skip the valid dependent alone drives
+// needsIntegration=true and a merge runs; the whole-call fail-closed degrade must
+// instead integrate NOTHING. The counterfactual (delete the malformed guard,
+// observe integrated=true / mergeCount==1) is recorded in the PR body.
+func TestIntegrateCompletedWave_MixedValidAndMalformedFailsClosed(t *testing.T) {
+	specs := []subPlanSpec{{title: "A"}, {title: "B", dependsOn: []int{0}}, {title: "C"}}
+	states := []run.State{run.StateSucceeded, run.StatePending, run.StatePending}
+
+	t.Run("malformed sibling has a nil slice index", func(t *testing.T) {
+		f := newWaveFixture(t, specs, states)
+		f.children[2].SliceIndex = nil // the malformed sibling, alongside the valid dependent slice 1
+		integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil) — a malformed sibling must fail the whole call closed", integrated, conflict, err)
+		}
+		if got := f.mergeCount(); got != 0 {
+			t.Errorf("MergeBranch calls = %d, want 0 (no merge while a sibling's metadata is malformed)", got)
+		}
+	})
+
+	t.Run("malformed sibling has an out-of-range slice index", func(t *testing.T) {
+		f := newWaveFixture(t, specs, states)
+		out := 9 // len(sub_plans) == 3
+		f.children[2].SliceIndex = &out
+		integrated, conflict, err := f.o.IntegrateCompletedWave(context.Background(), f.parent.ID)
+		if integrated || conflict != nil || err != nil {
+			t.Errorf("got (%v, %+v, %v), want (false, nil, nil) — an out-of-range sibling must fail the whole call closed", integrated, conflict, err)
+		}
+		if got := f.mergeCount(); got != 0 {
+			t.Errorf("MergeBranch calls = %d, want 0 (no merge while a sibling's metadata is malformed)", got)
+		}
+	})
+}
+
 // TestIntegrateCompletedWave_ConflictSurfaces asserts a slice that cannot merge
 // is returned as a *SliceConflict rather than swallowed, so the sweeper can
 // surface it and the dependent child stays refused at the host-dispatch 409.

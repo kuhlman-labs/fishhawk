@@ -2182,9 +2182,13 @@ func (o *Orchestrator) DispatchDecomposedChildren(ctx context.Context, parentRun
 // child_run_ids of the newest slices_integrated entry.
 //
 // Degrades (false, nil, nil) with a WARN and NEVER an error on ABSENT input: a
-// nil plan, a nil Decomposition, a slice index out of range for sub_plans, or a
-// child with a nil SliceIndex — the same defensive degrade
-// server.resolveSliceDependencies takes. A plan-LOAD error or a child-listing
+// nil plan or a nil Decomposition. Malformed CHILD metadata — ANY child with a
+// nil SliceIndex, or a SliceIndex out of range for sub_plans — is now a
+// WHOLE-CALL fail-closed degrade (#2695 item 3), NOT a per-child skip: the slice
+// map is provably incomplete, so the call integrates nothing this tick rather
+// than let a valid sibling drive a merge against a map missing a child. It stays
+// a no-op (never an error), so the sweeper keeps the parent parked and the next
+// tick re-enters once the metadata is fixed. A plan-LOAD error or a child-listing
 // error propagates as err (retryable). An AUDIT-READ failure degrades to
 // NOT-covered, i.e. it integrates: the merge is idempotent, so a spurious extra
 // pass costs one round trip whereas a spuriously skipped integration would
@@ -2216,32 +2220,28 @@ func (o *Orchestrator) IntegrateCompletedWave(ctx context.Context, parentRunID u
 	}
 
 	// slice index → child run id, plus the set of slices whose child has
-	// succeeded. A child with no slice index has no derivable slice branch and
-	// cannot participate in either map — WARN rather than guess an index.
+	// succeeded. Malformed child metadata — a nil slice index, or one out of
+	// range for sub_plans — FAILS THE WHOLE CALL CLOSED (#2695 item 3), it is NOT
+	// a per-child skip. The classification is hoisted into this FIRST pass, which
+	// walks EVERY child (terminal or not), so the check is TOTAL rather than
+	// reachable only for a non-terminal dependent below. Skipping a malformed
+	// child while a VALID sibling still drove an integration would merge against a
+	// slice map provably missing a child; the safe direction is to integrate
+	// NOTHING this call. The per-child WARN keeps its original message/keys as the
+	// diagnostic pointer; a summarising WARN records the fail-closed decision. The
+	// degrade stays a no-op (never an error): the sweeper reads a no-op as
+	// non-failing, so the parent stays parked and the next tick re-enters once the
+	// metadata is fixed.
 	sliceRunID := make(map[int]string, len(children))
 	succeededSlice := make(map[int]bool, len(children))
 	anySucceeded := false
+	malformed := false
 	for _, c := range children {
 		if c.SliceIndex == nil {
 			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed child missing slice_index; excluded from wave-integration predicate",
 				slog.String("parent_run_id", parentRunID.String()),
 				slog.String("child_run_id", c.ID.String()))
-			continue
-		}
-		sliceRunID[*c.SliceIndex] = c.ID.String()
-		if c.State == run.StateSucceeded {
-			succeededSlice[*c.SliceIndex] = true
-			anySucceeded = true
-		}
-	}
-	if !anySucceeded {
-		return false, nil, nil
-	}
-
-	integratedIDs := o.integratedChildRunIDs(ctx, parentRunID)
-	needsIntegration := false
-	for _, c := range children {
-		if c.State.IsTerminal() || c.SliceIndex == nil {
+			malformed = true
 			continue
 		}
 		idx := *c.SliceIndex
@@ -2251,8 +2251,36 @@ func (o *Orchestrator) IntegrateCompletedWave(ctx context.Context, parentRunID u
 				slog.String("child_run_id", c.ID.String()),
 				slog.Int("slice_index", idx),
 				slog.Int("sub_plans", len(p.Decomposition.SubPlans)))
+			malformed = true
 			continue
 		}
+		sliceRunID[idx] = c.ID.String()
+		if c.State == run.StateSucceeded {
+			succeededSlice[idx] = true
+			anySucceeded = true
+		}
+	}
+	if malformed {
+		// One or more children carry malformed metadata: the slice map is provably
+		// incomplete, so wavecoverage.Covered cannot be trusted. Fail the whole
+		// call closed rather than let a valid sibling drive a merge.
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: malformed decomposed child metadata; failing between-wave integration closed for the whole call (no merge this tick)",
+			slog.String("parent_run_id", parentRunID.String()))
+		return false, nil, nil
+	}
+	if !anySucceeded {
+		return false, nil, nil
+	}
+
+	integratedIDs := o.integratedChildRunIDs(ctx, parentRunID)
+	needsIntegration := false
+	for _, c := range children {
+		if c.State.IsTerminal() {
+			continue
+		}
+		// SliceIndex is non-nil and in range here: the first pass returned closed
+		// on any malformed child, so every child reaching this loop is well-formed.
+		idx := *c.SliceIndex
 		deps := p.Decomposition.SubPlans[idx].DependsOn
 		if len(deps) == 0 {
 			continue
