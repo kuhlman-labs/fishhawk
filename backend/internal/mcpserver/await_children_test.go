@@ -69,6 +69,30 @@ func seedFillerAudit(fb *fakeBackend, parent uuid.UUID, n int) {
 	}
 }
 
+// seedFillerFanIn appends n slices_integrated markers that cover NOTHING
+// relevant (each a throwaway child run id), so a later covering marker of the
+// SAME category lands beyond the endpoint's first 500-entry page. This is the
+// situation seedFillerAudit + a single fan-in marker cannot create: there the
+// fillers are a DIFFERENT category (stage_advanced), so the category-filtered
+// fan-in read collapses to one page and the paginate-to-last-page walk never
+// runs to a second page. Here the fan-in category itself spans multiple pages.
+func seedFillerFanIn(t *testing.T, fb *fakeBackend, parent uuid.UUID, n int) {
+	t.Helper()
+	payload := slicesIntegratedPayloadMap(t, "fishhawk/filler", []string{uuid.NewString()})
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for i := 0; i < n; i++ {
+		seq := int64(len(fb.perRunAuditByRun[parent]) + 1)
+		fb.perRunAuditByRun[parent] = append(fb.perRunAuditByRun[parent], AuditEntry{
+			ID:       uuid.NewString(),
+			Sequence: seq,
+			RunID:    parent.String(),
+			Category: "slices_integrated",
+			Payload:  payload,
+		})
+	}
+}
+
 func newAwaitResolver(t *testing.T) (*fakeBackend, *runResolver) {
 	t.Helper()
 	fb, srv := newFakeBackend(t)
@@ -450,6 +474,42 @@ func TestAwaitChildren_IntegrationMarkerBeyondFirstAuditPage(t *testing.T) {
 	}
 	if out.Status != "children_dispatchable" {
 		t.Fatalf("status = %q, want children_dispatchable — the integration marker beyond page one must still be found", out.Status)
+	}
+	if len(out.DispatchableChildRunIDs) != 1 || out.DispatchableChildRunIDs[0] != b.String() {
+		t.Errorf("dispatchable = %v, want [%s]", out.DispatchableChildRunIDs, b)
+	}
+}
+
+// TestAwaitChildren_MultiPageFanInWalkKeepsLastPage is the item-1 SUCCESS-branch
+// control (#2695). TestAwaitChildren_IntegrationMarkerBeyondFirstAuditPage buries
+// the marker after 600 stage_advanced fillers, but those are a DIFFERENT category:
+// the category-filtered fan-in read of slices_integrated returns the single marker
+// on page one, so lastFanInAuditPage's cursor-follow-and-keep-last-page loop never
+// runs to a second page and its success branch is never exercised green. Here the
+// fan-in CATEGORY itself has 501 entries: page one holds 500 markers covering
+// nothing, page two holds the ONE covering marker (the newest). The walk must keep
+// the LAST page, so dependent child b releases children_dispatchable. A regression
+// returning the FIRST page instead (assigning `last` once, or breaking out early)
+// would keep marker #500 — which covers nothing — and b would never release
+// (status "timeout"). That counterfactual (return page one instead of the last
+// page → observed "timeout") is recorded in the PR body.
+func TestAwaitChildren_MultiPageFanInWalkKeepsLastPage(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	// 500 slices_integrated markers covering nothing relevant fill page one...
+	seedFillerFanIn(t, fb, parent, 500)
+	// ...and the 501st — newest, on page two — covers slice 0's child a.
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/consolidated", []string{a.String()})
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_dispatchable" {
+		t.Fatalf("status = %q, want children_dispatchable — the covering marker on the LAST fan-in page must be kept, not page one's stale one", out.Status)
 	}
 	if len(out.DispatchableChildRunIDs) != 1 || out.DispatchableChildRunIDs[0] != b.String() {
 		t.Errorf("dispatchable = %v, want [%s]", out.DispatchableChildRunIDs, b)
