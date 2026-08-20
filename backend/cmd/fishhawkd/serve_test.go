@@ -2969,6 +2969,68 @@ func TestServeRejectsInvalidMCPRoute(t *testing.T) {
 	}
 }
 
+// TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot pins the #2744
+// CONDITION 3 fail-closed startup refusal THROUGH runServe: enabling the
+// dispatch watchdog on a RunRepo that cannot supply the dispatch-liveness signal
+// must refuse to boot and say why, not silently run a heartbeat-defeatable or
+// never-firing watchdog. With no -db configured cfg.RunRepo is nil, which does
+// not satisfy run.DispatchLivenessLister — the same absence a non-Postgres repo
+// would present. Asserts the observable outcome (exitFailure) plus the naming of
+// the missing capability, not an error string alone. Deleting the serve.go guard
+// leaves the process booting (exitOK/hang) and reddens this test.
+func TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_DISPATCH_WATCHDOG", "")
+	var log bytes.Buffer
+	code := runServe([]string{"-enable-dispatch-watchdog"}, &log)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d — --enable-dispatch-watchdog with no capable RunRepo must refuse to boot; log:\n%s", code, exitFailure, log.String())
+	}
+	if !strings.Contains(log.String(), "dispatch-liveness capability") {
+		t.Errorf("refusal log did not name the missing dispatch-liveness capability; log:\n%s", log.String())
+	}
+}
+
+// TestDispatchWatchdogCapabilityError pins BOTH directions of the #2744
+// boot-time dispatch-liveness pre-check that TestServe_DispatchWatchdogWithout...
+// only exercises negatively. The runServe negative path cannot reach the POSITIVE
+// case: it would need a live database-backed RunRepo. Driving the pure helper
+// closes that gap — runpkg.NewPostgresRepository(nil) carries
+// run.DispatchLivenessLister (the compile-time assertion in
+// run/dispatchliveness.go guarantees it) and must boot clean, so a decorator or
+// wiring change that hid the capability from a valid deployment would redden this
+// test rather than only misfire in production. runpkg.BaseFake and a nil repo are
+// the no-capability vehicles that must refuse startup.
+func TestDispatchWatchdogCapabilityError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		repo    runpkg.Repository
+		wantErr bool
+	}{
+		{"nil repo refuses (DB-less, watchdog enabled)", nil, true},
+		{"non-liveness repo refuses startup", runpkg.BaseFake{}, true},
+		{"postgres repo boots (positive path)", runpkg.NewPostgresRepository(nil), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fail fast if the no-capability vehicle silently regained the
+			// capability — a vacuous pass otherwise.
+			if _, ok := tc.repo.(runpkg.DispatchLivenessLister); ok && tc.wantErr {
+				t.Fatalf("vehicle %T unexpectedly implements DispatchLivenessLister", tc.repo)
+			}
+			err := dispatchWatchdogCapabilityError(tc.repo)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("dispatchWatchdogCapabilityError(%T) = nil, want an error", tc.repo)
+				}
+				if !strings.Contains(err.Error(), "dispatch-liveness capability") {
+					t.Errorf("error does not name the missing capability: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("dispatchWatchdogCapabilityError(%T) = %v, want nil (positive path)", tc.repo, err)
+			}
+		})
+	}
+}
+
 // TestResolveOAuthIssuer covers the AS issuer validation (ADR-076 slice 3,
 // #2436), including CONDITION 4: a path-bearing issuer is refused at startup
 // because the fixed /.well-known route does not serve its RFC 8414 discovery

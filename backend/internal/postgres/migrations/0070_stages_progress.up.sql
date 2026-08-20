@@ -26,22 +26,15 @@
 -- 'dispatched' stages and fails infra-stuck ones (category C). A stage stays
 -- 'dispatched' DURING agent execution (trace.go transitions dispatched->running
 -- ->terminal only at trace-upload time), so heartbeats DO bump a dispatched
--- stage's updated_at. This is a genuine SEMANTIC CHANGE the reviewer must weigh
--- (a design question, surfaced not absorbed): the watchdog now measures "time
--- since last heartbeat" rather than "time since dispatch". Its PRIMARY purpose
--- is preserved — a truly infra-stuck stage has no runner, emits no heartbeat, so
--- updated_at stays at dispatch time and it still fires — but a legitimately
--- long-running agent that heartbeats no longer trips it. See the run README +
--- the PR body's condition-4 note.
+-- stage's updated_at. This bump is BY DESIGN and remains — every ~15s the
+-- heartbeat writes the progress column and the 0001 trigger stamps updated_at.
 --
--- OPERATOR SIGN-OFF (condition 4). The operator SIGNED OFF on the updated_at
--- tradeoff above; this is no longer an open merge gate. Reasoning: the dispatch
--- watchdog is OFF BY DEFAULT (--enable-dispatch-watchdog, serve.go), and even
--- when enabled its default --dispatch-watchdog-timeout is 1h — which EQUALS the
--- 3600s agent wall clock the runner enforces. So the only residual case — a
--- genuinely wedged stage that is somehow still heartbeating — is already bounded
--- by that wall clock: the runner SIGKILLs the stage at 3600s regardless of
--- updated_at. A follow-up is filed to give the watchdog a dedicated heartbeat
--- timestamp (rather than the generic stages_set_updated_at trigger) BEFORE the
--- watchdog is enabled by default. Decided by the operator at the gate.
+-- RESOLVED (#2744). The dispatch watchdog NO LONGER reads updated_at, so the
+-- heartbeat can no longer suppress it. Migration 0072 (stages.dispatched_at)
+-- adds a DEDICATED dispatch timestamp stamped only on the transition INTO
+-- 'dispatched' by a transition-keyed trigger; the watchdog measures its deadline
+-- from that column, which a progress-only UPDATE cannot advance. What was an
+-- accepted tradeoff at #2541 (the watchdog measuring time-since-last-heartbeat)
+-- is therefore closed, not merely bounded by the runner's 3600s wall clock. See
+-- migration 0072, backend/internal/dispatchwatchdog, and the run README.
 ALTER TABLE stages ADD COLUMN progress JSONB;
