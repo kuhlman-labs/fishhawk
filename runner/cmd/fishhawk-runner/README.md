@@ -432,7 +432,30 @@ is empty (`empty_id`), its status is not exactly `met` or `declined`
 (`met_without_record`), or it is `declined` with an empty/whitespace `reason`
 (`declined_without_reason`). Dropping is the SAFE direction: a dropped `met`
 leaves the obligation undelivered and the backend's advisory signal fires.
-Retained text is capped at `maxFixupObligationTextBytes`.
+
+Retained free text is **untrusted at this boundary**. The fix-up agent executes
+arbitrary repository commands, so it controls every byte of a `record`/`reason`,
+and that text leaves the repository over the trace bundle and lands in the
+reviewer's prompt *without ever appearing in the committed diff* — an
+instruction-injection channel into the reviewer and a structure-bearing egress
+path around the diff. Bounding it would not make it trusted, so
+`sanitizeFixupObligationText` **flattens its structure first and bounds second**:
+`flattenFixupObligationText` collapses every control rune (newline, CR, tab,
+NUL, the ANSI escape introducer), every format rune (bidi overrides,
+zero-width joiners), and the Unicode line/paragraph separators to a single
+space, collapses whitespace runs and trims — so what crosses the boundary is one
+line of words, never a multi-line document with fenced blocks or impersonated
+headers. The words survive: this is a structure control, not censorship, so an
+honest one-line decline reason is returned byte-identical. Size is then capped
+at `maxFixupObligationTextBytes`. Pinned by
+`TestLoadFixupSelfReport_ObligationTextFlattenedAtUpload` (adversarial) and
+`TestFlattenFixupObligationText` (per-case table).
+
+This is the **upload half** of a two-layer treatment; the reviewer-rendering
+half (`backend/internal/prompt`'s `writeFixupObligationDeclineReasons`)
+quarantines the surviving text in a BEGIN/END untrusted-DATA envelope. Neither
+layer relies on the other — the runner cannot assume a backend version, and the
+backend must hold for a bundle a compromised runner composed.
 
 Survivors ride a `fixup_reporting_obligations` event that `composeGateEvidence`
 folds into `gate_evidence.fixup_reporting_obligations`. The json tags MUST stay

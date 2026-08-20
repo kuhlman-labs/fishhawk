@@ -298,6 +298,24 @@ reports and is never rendered — the backend joins against it and renders only
 the remainder, so a fully-met pass keeps the reviewer prompt byte-identical
 (prompt-hash replay stability).
 
+That block's fields are **split by trust**. `ID`/`Source`/`Status`/`Text` are
+backend- or operator-authored and render inline. `Record` — the agent's stated
+decline reason — is **agent-authored and untrusted**: a fix-up agent running
+arbitrary repository commands controls every byte, and the text reaches the
+reviewer without ever appearing in the committed diff. So it renders ONLY
+through `writeFixupObligationDeclineReasons`, which quarantines it exactly like
+an acceptance-derived fix-up concern (ADR-050 / #1613): every line routed
+through `sanitizeUntrustedComment` (`| ` quote-prefix, ATX-header strip,
+fence-break, trusted-marker tagging, horizontal-rule collapse) inside a
+`<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` envelope, with the
+Fishhawk-authored instruction kept OUTSIDE so it stays binding while the agent's
+text cannot be. The block is capped at `maxFixupObligationReasonBytes` and is
+omitted entirely when no undelivered obligation carries a reason (every
+`unreported` finding), keeping the byte-identity pin above intact. Pinned by
+`TestBuild_ImplementReview_GateEvidence_FixupObligationReason_Quarantined`
+(adversarial) and `..._NoEnvelopeWhenNoReason`. The upload half of the same
+treatment lives in the runner (`sanitizeFixupObligationText`).
+
 Both blocks are absent by default: an ordinary fix-up and an unaffected review
 render byte-identically to before the fields existed. Honesty framing is
 preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,

@@ -109,6 +109,29 @@ Dropping is the **safe direction**: a dropped `met` leaves the obligation
 undelivered and the signal fires. Admitting a malformed `met` would falsely
 satisfy the obligation and silence the very signal this exists to raise.
 
+## Trust boundary on the agent's free text
+
+An obligation's operator-authored excerpt (`Text`) and the backend-minted `ob-N`
+id are trusted. The agent's `record`/`reason` is **not**. The fix-up agent
+executes arbitrary repository commands, so it controls every byte it writes
+there, and that text leaves the repository over the trace bundle and lands in
+the implement reviewer's prompt *without ever appearing in the committed diff* —
+i.e. an instruction-injection path into the reviewer and a structure-bearing
+egress path around the diff. Bounding the field does not make it trusted, so it
+is treated as untrusted at **both** ends, with neither end relying on the other:
+
+| Layer | Control | Pinned by |
+|---|---|---|
+| Upload (runner) | `sanitizeFixupObligationText` = `flattenFixupObligationText` (control / format / line-separator runes → one space, whitespace runs collapsed, trimmed) then bound to `maxFixupObligationTextBytes` | `TestLoadFixupSelfReport_ObligationTextFlattenedAtUpload`, `TestFlattenFixupObligationText` |
+| Reviewer render (backend) | `writeFixupObligationDeclineReasons` — every line through `sanitizeUntrustedComment` inside a `<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` envelope, Fishhawk's own instruction kept OUTSIDE it, block capped at `maxFixupObligationReasonBytes` | `TestBuild_ImplementReview_GateEvidence_FixupObligationReason_Quarantined`, `TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined` |
+
+Both are **structure** controls, not censorship: the agent's words survive so the
+reviewer still sees what it claimed, but they can no longer impersonate a prompt
+section, open a fenced block, or carry a multi-line document. The audit payload
+does not carry the agent's text at all — only `{id, source, status,
+text_excerpt}`, where the excerpt is the *operator's* instruction — so the
+advisory audit entry is not an egress path either.
+
 ## Evidence-only posture
 
 The signal **never fails, re-opens, or re-budgets a pass**. The runner branch

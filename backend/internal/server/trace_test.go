@@ -7122,8 +7122,21 @@ func TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined(t *
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
-	if !strings.Contains(reviewer.calls[0], "agent's stated reason: the sandbox refused the deletion") {
-		t.Errorf("reviewer prompt lost the decline reason:\n%s", reviewer.calls[0])
+	// The agent's reason survives to the reviewer, but ONLY inside the
+	// untrusted-DATA quarantine envelope (the #2737 security fix-up): the text
+	// is agent-authored, so it may never render inline beside the
+	// operator-authored fields where it could read as an instruction.
+	prompt := reviewer.calls[0]
+	begin := strings.Index(prompt, "<<<BEGIN UNTRUSTED AGENT DECLINE REASON>>>")
+	end := strings.Index(prompt, "<<<END UNTRUSTED AGENT DECLINE REASON>>>")
+	if begin < 0 || end < begin {
+		t.Fatalf("reviewer prompt lost the decline-reason quarantine envelope:\n%s", prompt)
+	}
+	if !strings.Contains(prompt[begin:end], "| the sandbox refused the deletion") {
+		t.Errorf("reviewer prompt lost the decline reason:\n%s", prompt)
+	}
+	if strings.Contains(prompt[:begin]+prompt[end:], "the sandbox refused the deletion") {
+		t.Errorf("the agent-authored reason leaked outside the quarantine envelope:\n%s", prompt)
 	}
 }
 
@@ -7155,12 +7168,30 @@ func TestImplementReview_NoReportingObligationRouted_NoSignal(t *testing.T) {
 		return reviewer.calls[0], n
 	}
 
-	withRoutine, n := render(t, true)
-	if n != 0 {
-		t.Errorf("entries = %d, want 0 for a routine fix-up carrying no reporting obligation", n)
+	withRoutine, routineEntries := render(t, true)
+	if routineEntries != 0 {
+		t.Errorf("entries = %d, want 0 for a routine fix-up carrying no reporting obligation", routineEntries)
 	}
 	if strings.Contains(withRoutine, "### Routed reporting obligation NOT carried out") {
 		t.Errorf("a routine fix-up must render no undelivered block:\n%s", withRoutine)
+	}
+
+	// The seed=false arm — a FIRST, non-fix-up implement review, with no
+	// stage_fixup_triggered entry at all. The plan's no-noise pins name it
+	// explicitly, so run it rather than leaving the parameter as a dropped
+	// assertion: it must emit no entry, render no block, and produce a prompt
+	// BYTE-IDENTICAL to the routine fix-up's above — the signal is the only
+	// variable between the two arms.
+	firstReview, firstEntries := render(t, false)
+	if firstEntries != 0 {
+		t.Errorf("entries = %d, want 0 for a first (non-fix-up) implement review", firstEntries)
+	}
+	if strings.Contains(firstReview, "### Routed reporting obligation NOT carried out") {
+		t.Errorf("a first (non-fix-up) implement review must render no undelivered block:\n%s", firstReview)
+	}
+	if firstReview != withRoutine {
+		t.Errorf("a routine fix-up review prompt must be byte-identical to a non-fix-up review's; diff:\n"+
+			"non-fix-up:\n%s\nroutine fix-up:\n%s", firstReview, withRoutine)
 	}
 }
 

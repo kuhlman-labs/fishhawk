@@ -36,6 +36,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
@@ -8680,6 +8681,54 @@ func boundFixupObligationText(text string) string {
 	return text[:cut] + "… (truncated)"
 }
 
+// flattenFixupObligationText destroys the STRUCTURE of agent-authored
+// obligation text at the upload boundary (#2737 security fix-up). The fix-up
+// agent executes arbitrary repository commands, so it controls every byte it
+// puts in a `record`/`reason`; that text leaves the repository over the trace
+// bundle and lands in the reviewer's prompt WITHOUT ever appearing in the
+// committed diff. Bounding it does not make it trusted, so the runner strips
+// what makes it a payload rather than a note: every C0/C1 control character —
+// newlines and carriage returns included, so it can no longer be a multi-line
+// document; ANSI escapes and NUL; and the Unicode line/paragraph separators —
+// each becomes a single space, and runs of whitespace collapse. What survives
+// is one line of words, which is all an honest decline reason ever needs.
+//
+// This is the upload half of a two-layer treatment. The reviewer-rendering half
+// (backend/internal/prompt's writeFixupObligationDeclineReasons) quarantines the
+// surviving text inside a BEGIN/END untrusted-DATA envelope, and neither layer
+// relies on the other: the runner cannot assume a given backend version, and
+// the backend must hold even for a bundle a compromised runner composed.
+func flattenFixupObligationText(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	lastSpace := false
+	for _, r := range text {
+		// Control (C0/C1, so newline, carriage return, tab, NUL and the ANSI
+		// escape introducer), format (bidi overrides, zero-width joiners), and
+		// line/paragraph separators all collapse to a single space; runs of
+		// whitespace collapse with them.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) ||
+			unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || unicode.IsSpace(r) {
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		lastSpace = false
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// sanitizeFixupObligationText is the runner's full upload-boundary treatment for
+// one agent-authored record/reason: flatten the structure, then bound the size.
+// Order matters — flattening first means the cap applies to the text a reviewer
+// will actually see rather than to bytes that were about to be discarded.
+func sanitizeFixupObligationText(text string) string {
+	return boundFixupObligationText(flattenFixupObligationText(text))
+}
+
 // validateFixupObligationReports applies the fail-closed PER-ENTRY rules to the
 // sidecar's `obligations` array (#2737). An entry is DROPPED — with a named log
 // event carrying the id and the reason — when its id is empty, its status is
@@ -8690,6 +8739,13 @@ func boundFixupObligationText(text string) string {
 // undelivered and the backend's advisory signal fires. The complementary
 // direction — admitting a malformed `met` — would falsely satisfy an obligation
 // and silence the very signal this exists to raise.
+//
+// Every surviving entry's free text is run through sanitizeFixupObligationText
+// before it is retained: the text is AGENT-authored and crosses the upload
+// boundary into the reviewer's prompt without ever appearing in the committed
+// diff, so its structure is flattened to one line and its size bounded. The
+// validation above decides WHETHER an entry is carried; the sanitizer decides
+// what SHAPE it may take once carried.
 //
 // These rules NEVER widen the existing whole-sidecar rules: malformed JSON, a
 // run/stage id mismatch, and an unknown verify_status keep today's exact
@@ -8715,7 +8771,7 @@ func validateFixupObligationReports(cfg config, in []fixupObligationReport, logS
 			out = append(out, fixupObligationReport{
 				ID:     strings.TrimSpace(e.ID),
 				Status: e.Status,
-				Record: boundFixupObligationText(strings.TrimSpace(e.Record)),
+				Record: sanitizeFixupObligationText(e.Record),
 			})
 		case "declined":
 			if strings.TrimSpace(e.Reason) == "" {
@@ -8725,7 +8781,7 @@ func validateFixupObligationReports(cfg config, in []fixupObligationReport, logS
 			out = append(out, fixupObligationReport{
 				ID:     strings.TrimSpace(e.ID),
 				Status: e.Status,
-				Reason: boundFixupObligationText(strings.TrimSpace(e.Reason)),
+				Reason: sanitizeFixupObligationText(e.Reason),
 			})
 		default:
 			drop("unknown_status")
