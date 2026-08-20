@@ -9280,6 +9280,70 @@ func TestSliceMoveScopeFiles_RefusesContainmentOnlyOverlap(t *testing.T) {
 	}
 }
 
+// (10b)/(c') move_requires_exact_owned_path on a TRAILING-SLASH ALIAS —
+// COUNTERFACTUAL for the byte-exact ownership requirement. Slice 0 owns a
+// DIRECTORY backend/pkg/foo/; the move names the SAME directory WITHOUT the
+// trailing slash (backend/pkg/foo). normalizeOwnershipPath makes the two equal,
+// so the owner scan MATCHES — but the accepted spelling folds VERBATIM into the
+// destination, so admitting the alias would drop the trailing slash and narrow
+// the destination to a file path while the source directory is removed. Deleting
+// the `owner >= 0 && ownerPath != p` refusal turns this into a valid move (200,
+// destination gains the narrowed "backend/pkg/foo"), so the
+// 400/move_requires_exact_owned_path assertion goes RED. Seeded BY CONSTRUCTION
+// (the source keeps backend/keep.go so this is not the empty-source refusal).
+func TestSliceMoveScopeFiles_RefusesTrailingSlashAlias(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dir owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foo/", "backend/keep.go"), sliceScope("backend/other.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/pkg/foo"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "move_requires_exact_owned_path")
+	if got, _ := details["declared_path"].(string); got != "backend/pkg/foo/" {
+		t.Errorf("details.declared_path = %q, want backend/pkg/foo/ (the exact spelling to retry with)", got)
+	}
+	if got, _ := details["owner_slice"].(float64); int(got) != 0 {
+		t.Errorf("details.owner_slice = %v, want 0", details["owner_slice"])
+	}
+}
+
+// (10c) LOAD-BEARING directory move: the EXACT declared spelling (trailing slash
+// intact) is accepted and the destination fold PRESERVES the trailing slash — the
+// recorded canonical map and resolved list both carry "backend/pkg/foo/", not the
+// narrowed "backend/pkg/foo". This is the positive control that the byte-exact
+// refusal above does not simply forbid directory moves outright.
+func TestSliceMoveScopeFiles_DirectoryMovePreservesTrailingSlash(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dir owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foo/", "backend/keep.go"), sliceScope("backend/other.go")},
+	)
+	_, stage := seedBudgetRun(t, rr, art, p)
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/pkg/foo/"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (an EXACT directory spelling is a valid move):\n%s", w.Code, w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	rawMap, _ := json.Marshal(payload["move_scope_files_to_slice"])
+	if want := `{"1":["backend/pkg/foo/"]}`; string(rawMap) != want {
+		t.Errorf("move_scope_files_to_slice = %s, want %s (trailing slash PRESERVED)", rawMap, want)
+	}
+	var gotResolved []movedPath
+	rawResolved, _ := json.Marshal(payload["move_scope_files_resolved"])
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	wantResolved := []movedPath{{Path: "backend/pkg/foo/", FromSlice: 0, ToSlice: 1}}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v, want %+v (trailing slash PRESERVED on the destination)", gotResolved, wantResolved)
+	}
+}
+
 // (11) path_already_owned_by_destination — a no-op move to the owning slice.
 func TestSliceMoveScopeFiles_AlreadyOwnedByDestination_Returns400(t *testing.T) {
 	w, app, au, stage := moveRefusal(t, twoScopedSlices(),

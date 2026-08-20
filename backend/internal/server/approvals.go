@@ -3211,7 +3211,11 @@ type movedPath struct {
 //	    add_scope_files_to_slice (the fields compose in ONE call but must name
 //	    disjoint paths);
 //	(c) locate the owner by EXACT ownership identity (normalizeOwnershipPath
-//	    equality, not containment);
+//	    equality, not containment); a normalized-equal but NON-byte-exact
+//	    request (a trailing-slash alias of a declared directory, e.g. "pkg/dir"
+//	    for a declared "pkg/dir/") is refused move_requires_exact_owned_path so
+//	    the verbatim destination fold cannot drop the trailing slash and narrow
+//	    a directory to a file path;
 //	(d) no exact owner but a containment overlap -> move_requires_exact_owned_path
 //	    (a directory-valued scope entry must be re-planned, not split by a move);
 //	(e) no owner and no overlap -> path_not_in_declared_scope, pointing at
@@ -3319,6 +3323,31 @@ func validateSliceMoveScopeFiles(m map[string][]string, subPlans []plan.SubPlanS
 				}
 				if owner >= 0 {
 					break
+				}
+			}
+			if owner >= 0 && ownerPath != p {
+				// (c') Normalized-equal but NOT byte-exact: the request is a
+				// trailing-slash alias of the declared entry (normalizeOwnershipPath
+				// trims "/"), e.g. "pkg/dir" for a declared directory "pkg/dir/".
+				// The accepted spelling is folded VERBATIM into the destination
+				// slice (out[dest] -> resolveApprovalSliceMoves -> the gained fold in
+				// resolveDecomposedScopeConstraint), so admitting the alias would drop
+				// the trailing slash that the scope format uses to mark a directory,
+				// narrowing the destination to a FILE path while the source directory
+				// is removed. A move names the owned path byte-for-byte; point the
+				// operator at the exact declared spelling so a directory move keeps
+				// its trailing slash.
+				return nil, nil, &sliceScopeChannelError{
+					msg: fmt.Sprintf("move_scope_files_to_slice path %q is not the EXACT declared spelling of slice %d (%q)'s owned entry %q — it matches only after trailing-slash normalization. A move folds the path verbatim into the destination, so an alias would drop the trailing slash that marks a directory. Retry naming the owned path exactly as %q",
+						p, owner, subPlans[owner].Title, ownerPath, ownerPath),
+					details: map[string]any{
+						"field":         moveFieldName,
+						"path":          p,
+						"declared_path": ownerPath,
+						"owner_slice":   owner,
+						"reason":        "move_requires_exact_owned_path",
+						"slices":        sliceIndexTitles(subPlans),
+					},
 				}
 			}
 			if owner < 0 {
