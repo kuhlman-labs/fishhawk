@@ -843,6 +843,13 @@ type approvalRequest struct {
 	// decoder on the backend requires the field be declared here too; reject and
 	// flat-plan approve callers pass nil (omitempty).
 	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty"`
+	// MoveScopeFilesToSlice is the per-slice scope MOVE for a DECOMPOSED plan
+	// (#2596): a map of DESTINATION sub-plan title (or 0-based index) to the
+	// already-declared repo-relative paths relocated into THAT slice; the source is
+	// derived from ownership. The DisallowUnknownFields decoder on the backend
+	// requires the field be declared here too; reject and no-move approve callers
+	// pass nil (omitempty), so a no-move approve posts a byte-identical body.
+	MoveScopeFilesToSlice map[string][]string `json:"move_scope_files_to_slice,omitempty"`
 	// BindingAssertions is the operator-declared binding-assertion list (#1171)
 	// the backend validates pre-Submit and records on the approval audit
 	// payload. The DisallowUnknownFields decoder requires the field be declared
@@ -971,6 +978,26 @@ type approvalResult struct {
 //     declared scope.files — this channel ADDS and does not MOVE, so re-plan
 //     the decomposition — an invalid path, or an empty path list. details
 //     carry the offending key/path plus the ordered {index,title} slice list)
+//   - 400 validation_failed with details.field = move_scope_files_to_slice
+//     (#2596 move shape/ownership refusals, details.reason one of:
+//     slice_key_ambiguous / slice_key_unresolvable / duplicate_slice_key /
+//     empty_path / path_not_repo_relative / empty_path_list /
+//     path_under_two_slices / path_in_both_scope_channels (also in
+//     add_scope_files_to_slice) / path_not_in_declared_scope (nothing to move —
+//     use add_scope_files_to_slice) / move_requires_exact_owned_path
+//     (containment-only overlap of a directory entry — re-plan) /
+//     path_already_owned_by_destination (no-op) / move_would_empty_source_slice)
+//   - 422 plan_slice_move_scope_files_requires_decomposed_plan (#2596:
+//     move_scope_files_to_slice was supplied but the plan is positively FLAT
+//     (details.reason plan_not_decomposed — no slices to move between) or could
+//     not be confirmed decomposed (details.reason plan_indeterminate,
+//     fail-closed). Pre-insert, no override)
+//   - 409 plan_slice_move_after_dispatch (#2596: a source/destination fan-out
+//     child has already left run state 'pending' (details.reason
+//     slice_already_started, with path/from_slice/to_slice/child_run_id/
+//     child_state) so re-scoping its slice is refused; or the sibling listing
+//     failed (details.reason dispatch_state_indeterminate, fail-closed). Revise
+//     the plan or start a fresh run)
 //   - 400 validation_failed with details.field = amend_acceptance_criteria
 //     (#2581: the acceptance-criteria amendment refusals, each naming the
 //     offending entry under details.id and the specific refusal under
@@ -994,7 +1021,7 @@ type approvalResult struct {
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice, moveScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:                decision,
 		Comment:                 comment,
@@ -1002,6 +1029,7 @@ func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decis
 		AddScopeFiles:           addScopeFiles,
 		RemoveScopeFiles:        removeScopeFiles,
 		AddScopeFilesToSlice:    addScopeFilesToSlice,
+		MoveScopeFilesToSlice:   moveScopeFilesToSlice,
 		BindingAssertions:       bindingAssertions,
 		ClaimsConcernIDs:        claimsConcernIDs,
 		AmendAcceptanceCriteria: amendAcceptanceCriteria,

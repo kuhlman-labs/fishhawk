@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -326,6 +327,22 @@ type promptResponse struct {
 	// convention as the four fields above.
 	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
 	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
+	// ScopeConstraint is the decomposed child's agent-facing narrowing (#1669,
+	// slice-move gained/lost fold #2596), served ONLY for a fan-out slice child
+	// whose sub-plan resolved (trigger.ScopeConstraint != nil). Its ScopeFiles
+	// mirror the child's enforced scope after any approved slice-boundary move,
+	// so a moved-away source path is absent and a moved-in destination path is
+	// present on BOTH the enforced scope_files and this agent-facing narrowing.
+	// omitempty, so every non-decomposed response is byte-identical to today.
+	ScopeConstraint *promptScopeConstraint `json:"scope_constraint,omitempty"`
+}
+
+// promptScopeConstraint is the serialized view of prompt.ScopeConstraint for a
+// decomposed child's prompt-render response (#2596). Only the agent-facing
+// scope_files narrowing is surfaced today; the SPA reads it to show the slice
+// the child was constrained to.
+type promptScopeConstraint struct {
+	ScopeFiles []string `json:"scope_files,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -1332,6 +1349,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
 	}
+	if trigger.ScopeConstraint != nil {
+		resp.ScopeConstraint = &promptScopeConstraint{ScopeFiles: trigger.ScopeConstraint.ScopeFiles}
+	}
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
@@ -1871,6 +1891,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if runRow.SliceIndex != nil {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
+	}
+	if trigger.ScopeConstraint != nil {
+		resp.ScopeConstraint = &promptScopeConstraint{ScopeFiles: trigger.ScopeConstraint.ScopeFiles}
 	}
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
@@ -3744,7 +3767,29 @@ func (s *Server) requireDecomposedScope(ctx context.Context, runRow *run.Run, pa
 			reason:      "no sub-plan linked to the child's slice index",
 		}
 	}
-	files := s.resolveDecomposedScopeFiles(ctx, runRow, parentPlan)
+	// Per-slice MOVE channel (#2596). `lost` is every path moved AWAY from this
+	// child's slice; `gained` is every path moved INTO it. `lost` is subtracted
+	// from BOTH halves requireDecomposedScope returns — the enforced scope.files
+	// AND the agent-facing ScopeConstraint.ScopeFiles — so a moved-away source
+	// file no longer appears in either. `gained` is folded into the agent-facing
+	// ScopeConstraint (resolveDecomposedScopeConstraint) so the destination
+	// slice's constraint MATCHES its enforced scope: the enforced scope.files
+	// already gain the moved-in path via resolveApprovalAddScopeFiles at the call
+	// site (the SOLE add fold), but that fold does not reach this constraint, so
+	// without the gained fold the moved-in file would be enforced-in-scope yet
+	// ABSENT from the narrowing the agent reads. The gate's
+	// move_would_empty_source_slice refusal keeps the empty-scope 409 below
+	// unreachable via this channel.
+	gained, lost := s.resolveApprovalSliceMoves(ctx, runRow)
+	if len(lost) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: subtracted moved-away paths from decomposed child slice",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.Int("slice_index", matchIdx),
+			slog.Int("count", len(lost)),
+		)
+	}
+	files := s.resolveDecomposedScopeFiles(ctx, runRow, parentPlan, lost)
 	if len(files) == 0 {
 		return nil, nil, &decomposedScopeError{
 			childRunID:  runRow.ID.String(),
@@ -3753,7 +3798,24 @@ func (s *Server) requireDecomposedScope(ctx context.Context, runRow *run.Run, pa
 			reason:      "linked sub-plan declares no scope files",
 		}
 	}
-	return files, s.resolveDecomposedScopeConstraint(ctx, runRow, parentPlan), nil
+	return files, s.resolveDecomposedScopeConstraint(ctx, runRow, parentPlan, gained, lost), nil
+}
+
+// pathIsLost reports whether path was moved away from this slice — i.e. it
+// matches one of the `lost` paths under normalizeOwnershipPath equality, the
+// same exact-identity comparison the #2596 gate enforces when it resolves a
+// move's source. A nil/empty lost set never matches.
+func pathIsLost(path string, lost []string) bool {
+	if len(lost) == 0 {
+		return false
+	}
+	np := normalizeOwnershipPath(path)
+	for _, l := range lost {
+		if normalizeOwnershipPath(l) == np {
+			return true
+		}
+	}
+	return false
 }
 
 // writeDecomposedScopeUnresolved renders a requireDecomposedScope failure as a
@@ -3783,7 +3845,10 @@ func (s *Server) writeDecomposedScopeUnresolved(w http.ResponseWriter, r *http.R
 // letting the caller degrade to the parent's full scope (#1721). parentPlan
 // is the caller's already-loaded approved plan — for a decomposed child this
 // is the parent's decomposed plan — so no additional artifact read happens.
-func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) *prompt.ScopeConstraint {
+// `lost`/`gained` are this slice's moved-away/moved-in paths (#2596): `lost` is
+// subtracted from and `gained` is folded into the returned constraint so it
+// matches the child's enforced scope on both sides of a slice-boundary move.
+func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan, gained, lost []string) *prompt.ScopeConstraint {
 	matched, matchIdx := matchDecomposedSubPlan(runRow, parentPlan)
 	if matched == nil {
 		return nil
@@ -3798,12 +3863,33 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 	// Narrow the child to its slice via the matched sub-plan's own scope.files
 	// (#1669). The plan gate now requires per-slice scope, so a matched child
 	// always carries these paths — the nil guard is defensive for an
-	// out-of-band plan constructed without the gate.
+	// out-of-band plan constructed without the gate. A path moved AWAY from this
+	// slice by an approved move (#2596) is subtracted here so the agent-facing
+	// constraint matches the enforced scope exactly.
 	var scopeFiles []string
+	seen := make(map[string]struct{})
 	if matched.Scope != nil {
 		for _, f := range matched.Scope.Files {
+			if pathIsLost(f.Path, lost) {
+				continue
+			}
 			scopeFiles = append(scopeFiles, f.Path)
+			seen[normalizeOwnershipPath(f.Path)] = struct{}{}
 		}
+	}
+	// Destination side of the per-slice MOVE channel (#2596): a path moved INTO
+	// this slice is folded into the agent-facing constraint so it matches the
+	// enforced scope, which gains the same path via resolveApprovalAddScopeFiles
+	// at the call site. Without this the moved-in file is enforced-in-scope yet
+	// absent from the narrowing the agent reads, so a defensive agent would treat
+	// it as out of scope and decline to touch it. A gained path is declared in a
+	// DIFFERENT slice's scope (never this one), so the dedup guard is defensive.
+	for _, g := range gained {
+		if _, ok := seen[normalizeOwnershipPath(g)]; ok {
+			continue
+		}
+		scopeFiles = append(scopeFiles, g)
+		seen[normalizeOwnershipPath(g)] = struct{}{}
 	}
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 		"prompt: injected scope constraint for decomposed child",
@@ -3828,12 +3914,27 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 // a fail-closed condition and the caller returns 409
 // decomposed_scope_unresolved (#1721). parentPlan is the caller's already-
 // loaded approved plan, reused here rather than re-read.
-func (s *Server) resolveDecomposedScopeFiles(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) []scopeFile {
+func (s *Server) resolveDecomposedScopeFiles(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan, lost []string) []scopeFile {
 	matched, _ := matchDecomposedSubPlan(runRow, parentPlan)
 	if matched == nil || matched.Scope == nil {
 		return nil
 	}
 	files := scopeFilesFromScope(matched.Scope)
+	// Subtract the paths moved AWAY from this slice by an approved move (#2596)
+	// BEFORE the coupled-test-sibling fold below — ordering is load-bearing: a
+	// moved-away foo.go must not drag its foo_test.go stem sibling back into the
+	// slice it just left. The exact-identity comparison (pathIsLost) matches the
+	// gate's rule.
+	if len(lost) > 0 {
+		kept := files[:0:0]
+		for _, f := range files {
+			if pathIsLost(f.Path, lost) {
+				continue
+			}
+			kept = append(kept, f)
+		}
+		files = kept
+	}
 	if len(files) == 0 {
 		return nil
 	}
@@ -4479,25 +4580,30 @@ func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID)
 func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
 	flat := s.resolveApprovalFlatAddScopeFiles(ctx, runRow)
 	slicePaths := s.resolveApprovalSliceAddScopeFiles(ctx, runRow)
-	if len(slicePaths) == 0 {
+	// Destination side of the per-slice MOVE channel (#2596): the paths moved
+	// INTO this child's own slice. Routing them through THIS sole fold source is
+	// what makes every consumer — enforced scope, shown set, reviewer drift
+	// baseline, trace provenance — inherit the move's destination side with no new
+	// call site. gained is empty for a child that is not the destination of any
+	// recorded move, so a no-move run returns the identical result as before.
+	gained, _ := s.resolveApprovalSliceMoves(ctx, runRow)
+	if len(slicePaths) == 0 && len(gained) == 0 {
 		return flat
 	}
-	seen := make(map[string]struct{}, len(flat)+len(slicePaths))
-	out := make([]string, 0, len(flat)+len(slicePaths))
-	for _, p := range flat {
-		if _, dup := seen[p]; dup {
-			continue
+	seen := make(map[string]struct{}, len(flat)+len(slicePaths)+len(gained))
+	out := make([]string, 0, len(flat)+len(slicePaths)+len(gained))
+	add := func(paths []string) {
+		for _, p := range paths {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
 		}
-		seen[p] = struct{}{}
-		out = append(out, p)
 	}
-	for _, p := range slicePaths {
-		if _, dup := seen[p]; dup {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
+	add(flat)
+	add(slicePaths)
+	add(gained)
 	return out
 }
 
@@ -4630,6 +4736,101 @@ func (s *Server) resolveApprovalSliceAddScopeFiles(ctx context.Context, runRow *
 		slog.Int("count", len(paths)),
 	)
 	return paths
+}
+
+// loadApprovalSliceMoveScopeFiles scans the run's approval_submitted audit
+// entries (newest-first) for the first approve carrying a non-empty
+// move_scope_files_to_slice map and returns it (#2596). The per-slice MOVE
+// mirror of loadApprovalSliceAddScopeFiles; the map is CANONICAL index-keyed
+// DESTINATION form (the gate canonicalises before recording), so the key is
+// strconv.Itoa(destination_slice_index). Best-effort: WARN-logs and returns nil
+// on any error. A second approve carrying a non-empty map SUPERSEDES an earlier
+// one (newest-first, first-wins), matching every sibling channel.
+//
+// A candidate row recorded off a PLAN stage is skipped (#2598,
+// approvalEntryStageIsPlan) and the scan continues to an older legitimate row.
+func (s *Server) loadApprovalSliceMoveScopeFiles(ctx context.Context, runID uuid.UUID) map[string][]string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for move_scope_files_to_slice failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision              string              `json:"decision"`
+			MoveScopeFilesToSlice map[string][]string `json:"move_scope_files_to_slice"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.MoveScopeFilesToSlice) > 0 {
+			if !s.approvalEntryStageIsPlan(ctx, entries[i]) {
+				continue
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded per-slice move_scope_files for implement scope",
+				slog.String("run_id", runID.String()),
+				slog.Int("slice_count", len(payload.MoveScopeFilesToSlice)),
+			)
+			return payload.MoveScopeFilesToSlice
+		}
+	}
+	return nil
+}
+
+// resolveApprovalSliceMoves returns the two sides of the per-slice MOVE channel
+// for THIS run (#2596): `gained` is every path moved INTO this child's own slice,
+// `lost` is every path moved AWAY from it. Both are nil unless this is a
+// decomposition fan-out child (DecomposedFrom AND SliceIndex both non-nil) — the
+// same guard resolveApprovalSliceAddScopeFiles uses, because a nil-SliceIndex
+// recovery child inherits the parent's FULL declared scope and must fold nothing.
+//
+// It reads the run's own approval_submitted rows first, then falls back one level
+// to the decomposition parent's — the gate that records the map lives on the
+// PARENT's plan stage, so that fallback is the one that matters in practice.
+//
+// gained is m[strconv.Itoa(*SliceIndex)]; lost is every path under EVERY OTHER
+// key. lost is deliberately NOT filtered against this slice's declared scope:
+// subtracting a path this slice never owned is a harmless no-op on a set
+// difference, so no plan re-read is needed to compute it.
+func (s *Server) resolveApprovalSliceMoves(ctx context.Context, runRow *run.Run) (gained, lost []string) {
+	if runRow.DecomposedFrom == nil || runRow.SliceIndex == nil {
+		return nil, nil
+	}
+	m := s.loadApprovalSliceMoveScopeFiles(ctx, runRow.ID)
+	if len(m) == 0 {
+		m = s.loadApprovalSliceMoveScopeFiles(ctx, *runRow.DecomposedFrom)
+	}
+	if len(m) == 0 {
+		return nil, nil
+	}
+	ownKey := strconv.Itoa(*runRow.SliceIndex)
+	gained = m[ownKey]
+	for k, paths := range m {
+		if k == ownKey {
+			continue
+		}
+		lost = append(lost, paths...)
+	}
+	// Deterministic order despite Go's randomized map iteration, so the enforced
+	// scope and prompt-hash stay byte-stable across builds.
+	sort.Strings(lost)
+	if len(gained) > 0 || len(lost) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: resolved per-slice move for this child's own slice",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.Int("slice_index", *runRow.SliceIndex),
+			slog.Int("gained", len(gained)),
+			slog.Int("lost", len(lost)),
+		)
+	}
+	return gained, lost
 }
 
 // loadApprovalRemoveScopeFiles scans the run's approval_submitted audit

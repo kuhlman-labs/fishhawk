@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -444,4 +446,115 @@ func TestEffectiveScopePathSetWithOps_FailOpenLegs(t *testing.T) {
 			t.Errorf("want (nil,nil,_,false) on missing run; got paths=%v ops=%v ok=%v", paths, ops, ok)
 		}
 	})
+}
+
+// TestEffectiveScopeHeadroom_IgnoresSliceMoves pins the #2596 cap-neutrality
+// property at the headroom-computation level: a recorded move_scope_files_to_slice
+// entry does NOT change the effective scope count. A move relocates an
+// already-declared path between slices — the total file count is unchanged — so
+// it must consume zero headroom. The count is asserted byte-identical to the
+// no-move control.
+//
+// Honest limit of this counterfactual: because a valid move's paths are ALREADY
+// in the plan's declared scope, folding them into a DEDUPLICATING effective set
+// can never change the count — so a future edit that threaded the move into the
+// (deduping) effective set would leave this test GREEN. What it actually
+// discriminates is a NON-deduplicating additive-count regression (a move counted
+// as a fresh add). The cap-neutrality property it pins (an at-cap plan tolerates a
+// move) is real and worth keeping regardless.
+func TestEffectiveScopeHeadroom_IgnoresSliceMoves(t *testing.T) {
+	scopeFiles := []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	}
+
+	control := func(t *testing.T) int {
+		t.Helper()
+		s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+		count, _, ok := s.effectiveScopeHeadroom(context.Background(), runRow.ID, nil)
+		if !ok {
+			t.Fatal("control ok = false, want true")
+		}
+		return count
+	}
+	want := control(t)
+
+	s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+	au := s.cfg.AuditRepo.(*auditFake)
+	rid := runRow.ID
+	payload, err := json.Marshal(map[string]any{
+		"decision": "approve",
+		"move_scope_files_to_slice": map[string][]string{
+			"1": {"backend/a.go"},
+		},
+		"move_scope_files_resolved": []map[string]any{
+			{"path": "backend/a.go", "from_slice": 0, "to_slice": 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	au.seeded = append(au.seeded, &audit.Entry{
+		ID: uuid.New(), RunID: &rid, Category: "approval_submitted", Payload: payload,
+	})
+
+	count, _, ok := s.effectiveScopeHeadroom(context.Background(), runRow.ID, nil)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if count != want {
+		t.Errorf("effective scope count = %d, want %d (a recorded move consumes no headroom)", count, want)
+	}
+}
+
+// TestCheckPlanScopeCap_MoveConsumesNoHeadroom is the gate-level cap-neutrality
+// pin (#2596): approving a move on a decomposed plan whose union scope is already
+// EXACTLY at max_files_changed returns 200. A move is deliberately NOT threaded
+// into unionScopeAdds, so the cap gate sees the unchanged plan-scope count.
+//
+// Honest limit of this counterfactual: the moved path is already in the union
+// scope, so a DEDUPLICATING fold of the move into the cap arithmetic would also
+// leave the count unchanged and this test GREEN. What it discriminates is a
+// NON-deduplicating additive-count regression (the move counted as a fresh add).
+// The property it pins (an at-cap plan accepts a move) is real and worth keeping.
+func TestCheckPlanScopeCap_MoveConsumesNoHeadroom(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementPathConstraints // implement max_files_changed: 3
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+
+	// Decomposed plan: slice 0 owns a.go + a_test.go, slice 1 owns b.go — union of
+	// 3, exactly the cap (the _test.go satisfies the spec's required-tests gate).
+	// Moving a.go to slice 1 leaves slice 0 with a_test.go and the union count
+	// unchanged at 3.
+	p := decomposedPlanWithScopedSlices(
+		[]string{"slice-a", "slice-b"},
+		[]*plan.Scope{sliceScope("backend/a.go", "backend/a_test.go"), sliceScope("backend/b.go")},
+	)
+	p.Scope = plan.Scope{Files: []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/a_test.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	}}
+	seedBudgetPlanArtifact(t, art, stage.ID, p)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: art,
+	})
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"slice-b":["backend/a.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a move on an at-cap plan consumes no headroom):\n%s", w.Code, w.Body.String())
+	}
 }

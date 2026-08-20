@@ -472,6 +472,377 @@ func TestE2E_SliceScopeAdd_AtPlanGate(t *testing.T) {
 	}
 }
 
+// promptRenderScope captures both the enforced scope_files and the agent-facing
+// scope_constraint.scope_files of a prompt-render response.
+type promptRenderScope struct {
+	ScopeFiles []struct {
+		Path string `json:"path"`
+	} `json:"scope_files"`
+	ScopeConstraint struct {
+		ScopeFiles []string `json:"scope_files"`
+	} `json:"scope_constraint"`
+}
+
+func (p promptRenderScope) scopePaths() []string {
+	out := make([]string, 0, len(p.ScopeFiles))
+	for _, f := range p.ScopeFiles {
+		out = append(out, f.Path)
+	}
+	return out
+}
+
+func getPromptRenderScope(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID) promptRenderScope {
+	t.Helper()
+	var out promptRenderScope
+	getPromptRenderJSON(t, ctx, baseURL, stageID, &out)
+	return out
+}
+
+// TestE2E_SliceScopeMove_AtPlanGate is the #2596 cross-component done-means. It
+// drives fishhawk_approve_plan carrying move_scope_files_to_slice through the
+// REAL fishhawk-mcp binary → the backend approval handler → the approval_submitted
+// audit entry in Postgres → the derived implement prompt-response of the SOURCE
+// and DESTINATION fan-out children. It asserts the audit carries the CANONICAL
+// index-keyed map + the resolved [{path,from_slice,to_slice}] list, that the
+// SOURCE child's scope_files AND scope_constraint.scope_files both DROP the moved
+// path, and that the DESTINATION child's enforced scope_files GAINS it — both
+// sides of the move, across the real wire. A second approve exercises the
+// composition decision: add + move over disjoint paths in ONE audited call.
+func TestE2E_SliceScopeMove_AtPlanGate(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// Source slice 0 owns movedFile + srcKeepFile; destination slice 1 owns
+	// destOwnFile. Moving movedFile from 0 to 1 leaves slice 0 with srcKeepFile.
+	const movedFile = "backend/internal/server/prompt.go"
+	const srcKeepFile = "backend/internal/server/reads.go"
+	const destOwnFile = "backend/internal/mcpserver/tools.go"
+	titles := []string{"server slice", "tools slice"}
+
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec:  scopeEditWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun(parent): %v", err)
+	}
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            parent.ID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       decomposedPlanJSON("decomposed plan", titles, [][]string{{movedFile, srcKeepFile}, {destOwnFile}}),
+		ContentHash:   "slicemove" + parent.ID.String()[:8],
+	}); err != nil {
+		t.Fatalf("seed decomposed plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	childStage := make([]uuid.UUID, 2)
+	for i := 0; i < 2; i++ {
+		idx := i
+		child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:           "kuhlman-labs/fishhawk",
+			WorkflowID:     "feature_change",
+			WorkflowSHA:    "deadbeef",
+			TriggerSource:  runpkg.TriggerCLI,
+			WorkflowSpec:   scopeEditWorkflowSpec,
+			ParentRunID:    &parent.ID,
+			DecomposedFrom: &parent.ID,
+			SliceIndex:     &idx,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun(child %d): %v", i, err)
+		}
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:        child.ID,
+			Sequence:     1,
+			Type:         runpkg.StageTypeImplement,
+			ExecutorKind: runpkg.ExecutorAgent,
+			ExecutorRef:  "fishhawk/runner@v1",
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(child %d implement): %v", i, err)
+		}
+		childStage[i] = st.ID
+	}
+
+	// Approve keying the DESTINATION by TITLE — the canonicalisation the audit
+	// must show as index-keyed.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_approve_plan",
+		Arguments: map[string]any{
+			"run_id": parent.ID.String(),
+			"reason": "relocate prompt.go into the tools slice --override-budget",
+			"move_scope_files_to_slice": map[string]any{
+				"tools slice": []string{movedFile},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool approve (slice move): %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("approve (slice move) returned error: %s", toolContentString(t, result))
+	}
+
+	// Audit: the CANONICAL index-keyed move map + resolved list.
+	entries, err := auditRepo.ListForRunByCategory(ctx, parent.ID, "approval_submitted")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(approval_submitted): %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		MoveScopeFilesToSlice  map[string][]string `json:"move_scope_files_to_slice"`
+		MoveScopeFilesResolved []struct {
+			Path      string `json:"path"`
+			FromSlice int    `json:"from_slice"`
+			ToSlice   int    `json:"to_slice"`
+		} `json:"move_scope_files_resolved"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal approval_submitted payload: %v", err)
+	}
+	if !equalStringSets(payload.MoveScopeFilesToSlice["1"], []string{movedFile}) {
+		t.Errorf("move_scope_files_to_slice[\"1\"] = %v, want [%s] (canonical index-keyed)", payload.MoveScopeFilesToSlice, movedFile)
+	}
+	if len(payload.MoveScopeFilesResolved) != 1 ||
+		payload.MoveScopeFilesResolved[0].Path != movedFile ||
+		payload.MoveScopeFilesResolved[0].FromSlice != 0 ||
+		payload.MoveScopeFilesResolved[0].ToSlice != 1 {
+		t.Errorf("move_scope_files_resolved = %+v, want one {%s, from 0, to 1}", payload.MoveScopeFilesResolved, movedFile)
+	}
+
+	// SOURCE child (slice 0): both scope_files AND scope_constraint.scope_files
+	// DROP the moved path but keep srcKeepFile.
+	src := getPromptRenderScope(t, ctx, httpSrv.URL, childStage[0])
+	if containsPath(src.scopePaths(), movedFile) {
+		t.Errorf("source slice-0 scope_files still contains the moved path %q: %v", movedFile, src.scopePaths())
+	}
+	if containsPath(src.ScopeConstraint.ScopeFiles, movedFile) {
+		t.Errorf("source slice-0 scope_constraint.scope_files still contains the moved path %q: %v", movedFile, src.ScopeConstraint.ScopeFiles)
+	}
+	if !containsPath(src.scopePaths(), srcKeepFile) {
+		t.Errorf("source slice-0 scope_files dropped its retained path %q: %v", srcKeepFile, src.scopePaths())
+	}
+
+	// DESTINATION child (slice 1): the moved-in path GAINS on BOTH surfaces the
+	// blocking acceptance criterion names — the enforced scope_files (via the
+	// resolveApprovalAddScopeFiles fold) AND the agent-facing
+	// scope_constraint.scope_files (via the resolveDecomposedScopeConstraint gained
+	// fold, #2596), alongside its own file. Asserting only scopePaths() would leave
+	// the constraint surface unpinned — the exact gap that let the moved-in file be
+	// enforced-in-scope yet absent from the narrowing the agent reads.
+	dst := getPromptRenderScope(t, ctx, httpSrv.URL, childStage[1])
+	if !containsPath(dst.scopePaths(), movedFile) {
+		t.Errorf("destination slice-1 scope_files missing the moved-in path %q: %v", movedFile, dst.scopePaths())
+	}
+	if !containsPath(dst.ScopeConstraint.ScopeFiles, movedFile) {
+		t.Errorf("destination slice-1 scope_constraint.scope_files missing the moved-in path %q: %v", movedFile, dst.ScopeConstraint.ScopeFiles)
+	}
+	if !containsPath(dst.scopePaths(), destOwnFile) {
+		t.Errorf("destination slice-1 scope_files missing its own planned file %q: %v", destOwnFile, dst.scopePaths())
+	}
+}
+
+// TestE2E_SliceScopeMoveAndAdd_ComposeInOneApprove asserts the #2596 composition
+// decision: one fishhawk_approve_plan carrying BOTH add_scope_files_to_slice and
+// move_scope_files_to_slice over DISJOINT paths lands both edits in one audited
+// call, and both fold into the destination children's scopes.
+func TestE2E_SliceScopeMoveAndAdd_ComposeInOneApprove(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	const movedFile = "backend/internal/server/prompt.go"
+	const srcKeepFile = "backend/internal/server/reads.go"
+	const destOwnFile = "backend/internal/mcpserver/tools.go"
+	const addedFile = "backend/internal/mcpserver/README_extra.md"
+	titles := []string{"server slice", "tools slice"}
+
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec:  scopeEditWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun(parent): %v", err)
+	}
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            parent.ID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       decomposedPlanJSON("decomposed plan", titles, [][]string{{movedFile, srcKeepFile}, {destOwnFile}}),
+		ContentHash:   "slicemix" + parent.ID.String()[:8],
+	}); err != nil {
+		t.Fatalf("seed decomposed plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	childStage := make([]uuid.UUID, 2)
+	for i := 0; i < 2; i++ {
+		idx := i
+		child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:           "kuhlman-labs/fishhawk",
+			WorkflowID:     "feature_change",
+			WorkflowSHA:    "deadbeef",
+			TriggerSource:  runpkg.TriggerCLI,
+			WorkflowSpec:   scopeEditWorkflowSpec,
+			ParentRunID:    &parent.ID,
+			DecomposedFrom: &parent.ID,
+			SliceIndex:     &idx,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun(child %d): %v", i, err)
+		}
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:        child.ID,
+			Sequence:     1,
+			Type:         runpkg.StageTypeImplement,
+			ExecutorKind: runpkg.ExecutorAgent,
+			ExecutorRef:  "fishhawk/runner@v1",
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(child %d implement): %v", i, err)
+		}
+		childStage[i] = st.ID
+	}
+
+	// One approve: MOVE prompt.go -> tools slice AND ADD a net-new doc to tools
+	// slice, over DISJOINT paths.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_approve_plan",
+		Arguments: map[string]any{
+			"run_id": parent.ID.String(),
+			"reason": "relocate prompt.go and add a doc --override-budget",
+			"move_scope_files_to_slice": map[string]any{
+				"tools slice": []string{movedFile},
+			},
+			"add_scope_files_to_slice": map[string]any{
+				"tools slice": []string{addedFile},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool approve (move+add): %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("approve (move+add) returned error: %s", toolContentString(t, result))
+	}
+
+	entries, err := auditRepo.ListForRunByCategory(ctx, parent.ID, "approval_submitted")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		MoveScopeFilesToSlice map[string][]string `json:"move_scope_files_to_slice"`
+		AddScopeFilesToSlice  map[string][]string `json:"add_scope_files_to_slice"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if !equalStringSets(payload.MoveScopeFilesToSlice["1"], []string{movedFile}) {
+		t.Errorf("move map = %v, want {1:[%s]}", payload.MoveScopeFilesToSlice, movedFile)
+	}
+	if !equalStringSets(payload.AddScopeFilesToSlice["1"], []string{addedFile}) {
+		t.Errorf("add map = %v, want {1:[%s]}", payload.AddScopeFilesToSlice, addedFile)
+	}
+
+	// Destination slice 1 gains BOTH the moved and the added path; source slice 0
+	// drops the moved one.
+	dst := getPromptRenderScope(t, ctx, httpSrv.URL, childStage[1])
+	for _, want := range []string{movedFile, addedFile, destOwnFile} {
+		if !containsPath(dst.scopePaths(), want) {
+			t.Errorf("destination scope_files missing %q: %v", want, dst.scopePaths())
+		}
+	}
+	src := getPromptRenderScope(t, ctx, httpSrv.URL, childStage[0])
+	if containsPath(src.scopePaths(), movedFile) {
+		t.Errorf("source scope_files still contains the moved path %q: %v", movedFile, src.scopePaths())
+	}
+}
+
+func containsPath(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
 // scopeCapOverrideSpec is a feature_change spec whose implement stage caps
 // max_files_changed at 3 — the tight cap the #2415 override cases drive against.
 var scopeCapOverrideSpec = []byte(`version: "0.3"

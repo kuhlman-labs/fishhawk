@@ -746,6 +746,32 @@ type orchestratorRepo struct {
 	// failed to satisfy runPredictionRecorder (the same #647-fixture trap
 	// addRunCostDeltas guards).
 	predictedRuntimeCalls []int
+	// listRunsErr, when non-nil, makes ListRuns fail — driving the #2596 move
+	// gate's fail-closed dispatch_state_indeterminate leg.
+	listRunsErr error
+}
+
+// seedDecomposedChild inserts a fan-out child run of parentID carrying the given
+// 0-based slice_index and run state, so the #2596 dispatched-sibling guard can be
+// exercised BY CONSTRUCTION (a child row built directly in a non-pending state is
+// definitionally past 'pending').
+func (r *orchestratorRepo) seedDecomposedChild(parentID uuid.UUID, sliceIdx int, state run.State) *run.Run {
+	id := uuid.New()
+	parent := parentID
+	idx := sliceIdx
+	rr := &run.Run{
+		ID: id, Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource:  run.TriggerCLI,
+		State:          state,
+		DecomposedFrom: &parent,
+		ParentRunID:    &parent,
+		SliceIndex:     &idx,
+		CreatedAt:      time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.runs[id] = rr
+	r.mu.Unlock()
+	return rr
 }
 
 func newOrchestratorRepo() *orchestratorRepo {
@@ -1002,6 +1028,9 @@ func (r *orchestratorRepo) CreateRun(context.Context, run.CreateRunParams) (*run
 func (r *orchestratorRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.listRunsErr != nil {
+		return nil, r.listRunsErr
+	}
 	out := make([]*run.Run, 0, len(r.runs))
 	for _, rr := range r.runs {
 		if f.Repo != "" && rr.Repo != f.Repo {
@@ -1647,7 +1676,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, nil, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -9073,5 +9102,697 @@ func TestApprovalAudit_NoAmendments_PayloadByteIdentical(t *testing.T) {
 	// regenerated from post-change output would otherwise pass silently.
 	if strings.Contains(wantPreChangeAmendlessApprovalPayload, "amend_acceptance_criteria") {
 		t.Error("the frozen pre-change golden carries amend_acceptance_criteria; it was regenerated from post-change code")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-slice MOVE channel (#2596) — validation, gate, audit, and counterfactuals.
+// ---------------------------------------------------------------------------
+
+// moveRefusal drives one move_scope_files_to_slice approve against a decomposed
+// plan and returns the recorder + fakes, asserting nothing itself. Mirrors
+// sliceAddRefusal.
+func moveRefusal(t *testing.T, p *plan.Plan, body string) (*httptest.ResponseRecorder, *fakeApprovalRepo, *approvalAuditFake, *run.Stage) {
+	t.Helper()
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, p)
+	return submitApproval(t, s, stage.ID, body), app, au, stage
+}
+
+// assertSliceMoveValidationFailed asserts a 400 validation_failed carrying the
+// move_scope_files_to_slice field and the given details.reason, plus the two
+// pre-Submit invariants: NO approval row inserted and NO approval_submitted
+// audit entry. Mirrors assertSliceAddValidationFailed.
+func assertSliceMoveValidationFailed(t *testing.T, w *httptest.ResponseRecorder, app *fakeApprovalRepo, au *approvalAuditFake, stage *run.Stage, wantReason string) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["field"].(string); got != "move_scope_files_to_slice" {
+		t.Errorf("details.field = %q, want move_scope_files_to_slice", got)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != wantReason {
+		t.Errorf("details.reason = %q, want %q\nmessage: %s", got, wantReason, env.Error.Message)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 400 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
+	}
+	assertNoApprovalSubmittedAudit(t, au)
+	return env.Error.Details
+}
+
+// twoScopedSlices is the canonical two-slice fixture the move tests reuse: slice
+// 0 ("slice-a") owns backend/a.go + backend/a2.go, slice 1 ("slice-b") owns
+// backend/b.go. Moving a.go from a to b leaves a still non-empty (a2.go).
+func twoScopedSlices() *plan.Plan {
+	return decomposedPlanWithScopedSlices(
+		[]string{"slice-a", "slice-b"},
+		[]*plan.Scope{sliceScope("backend/a.go", "backend/a2.go"), sliceScope("backend/b.go")},
+	)
+}
+
+// (1) slice_key_ambiguous
+func TestSliceMoveScopeFiles_AmbiguousKey_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dup", "dup"},
+		[]*plan.Scope{sliceScope("backend/a.go"), sliceScope("backend/b.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"dup":["backend/a.go"]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "slice_key_ambiguous")
+}
+
+// (2) slice_key_unresolvable
+func TestSliceMoveScopeFiles_UnresolvableKey_Returns400(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"no-such":["backend/a.go"]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "slice_key_unresolvable")
+}
+
+// (3) duplicate_slice_key
+func TestSliceMoveScopeFiles_DuplicateKey_Returns400(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"],"slice-b":["backend/a2.go"]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "duplicate_slice_key")
+}
+
+// (4) empty_path
+func TestSliceMoveScopeFiles_EmptyPath_Returns400(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["   "]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "empty_path")
+}
+
+// (5) path_not_repo_relative
+func TestSliceMoveScopeFiles_InvalidPath_Returns400(t *testing.T) {
+	for name, body := range map[string]string{
+		"leading slash": `{"decision":"approve","move_scope_files_to_slice":{"1":["/etc/passwd"]}}`,
+		"dot dot":       `{"decision":"approve","move_scope_files_to_slice":{"1":["../outside.go"]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w, app, au, stage := moveRefusal(t, twoScopedSlices(), body)
+			assertSliceMoveValidationFailed(t, w, app, au, stage, "path_not_repo_relative")
+		})
+	}
+}
+
+// (6) empty_path_list
+func TestSliceMoveScopeFiles_EmptyPathList_Returns400(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"1":[]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "empty_path_list")
+}
+
+// (7) path_under_two_slices — the same path listed under two destination keys.
+func TestSliceMoveScopeFiles_PathUnderTwoSlices_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"slice-a", "slice-b", "slice-c"},
+		[]*plan.Scope{sliceScope("backend/a.go", "backend/a2.go"), sliceScope("backend/b.go"), sliceScope("backend/c.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"],"2":["backend/a.go"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "path_under_two_slices")
+	if got, _ := details["path"].(string); got != "backend/a.go" {
+		t.Errorf("details.path = %q, want backend/a.go", got)
+	}
+}
+
+// (8)/(d) path_in_both_scope_channels — COUNTERFACTUAL for the cross-channel
+// disjointness branch. add is a VALID net-new add to slice-a; the move names the
+// SAME path targeting slice-b. Deleting the disjointness branch would let the
+// move fall through to ownership resolution — a.go IS owned by slice-a, so the
+// move would SUCCEED (200) — so the assertion on 400/path_in_both_scope_channels
+// goes RED. Bad state seeded BY CONSTRUCTION (one map naming the path in each).
+func TestSliceMoveScopeFiles_RefusesPathInBothChannels(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/a.go"]},"move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "path_in_both_scope_channels")
+	if got, _ := details["path"].(string); got != "backend/a.go" {
+		t.Errorf("details.path = %q, want backend/a.go", got)
+	}
+}
+
+// (9)/(a) path_not_in_declared_scope — COUNTERFACTUAL. A path declared in NO
+// slice has nothing to move; the refusal must NAME add_scope_files_to_slice as
+// the channel that adds a net-new path. Deleting the branch lets the move return
+// a nil resolved list and record an empty move → the 400 assertion goes RED.
+func TestSliceMoveScopeFiles_RefusesPathNotInDeclaredScope(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/nowhere.go"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "path_not_in_declared_scope")
+	if got, _ := details["add_channel"].(string); got != "add_scope_files_to_slice" {
+		t.Errorf("details.add_channel = %q, want add_scope_files_to_slice", got)
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if !strings.Contains(env.Error.Message, "add_scope_files_to_slice") {
+		t.Errorf("message must name the add channel as the remedy: %q", env.Error.Message)
+	}
+}
+
+// (10)/(b) move_requires_exact_owned_path — COUNTERFACTUAL for the exact-identity
+// requirement. Slice 0 owns a DIRECTORY backend/pkg/foo/; the move names a FILE
+// inside it, which is only a containment overlap, not an exact owned path.
+// Widening the owner scan to scopePathsOverlap would MATCH the directory and turn
+// this into a valid move (200), so the 400/move_requires_exact_owned_path
+// assertion goes RED. overlap_kind must be reported.
+func TestSliceMoveScopeFiles_RefusesContainmentOnlyOverlap(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dir owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foo/", "backend/keep.go"), sliceScope("backend/other.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/pkg/foo/inner.go"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "move_requires_exact_owned_path")
+	if got, _ := details["overlap_kind"].(string); got == "" {
+		t.Errorf("details.overlap_kind must be reported, got empty")
+	}
+	if got, _ := details["overlap_path"].(string); got != "backend/pkg/foo/" {
+		t.Errorf("details.overlap_path = %q, want backend/pkg/foo/", got)
+	}
+}
+
+// (10b)/(c') move_requires_exact_owned_path on a TRAILING-SLASH ALIAS —
+// COUNTERFACTUAL for the byte-exact ownership requirement. Slice 0 owns a
+// DIRECTORY backend/pkg/foo/; the move names the SAME directory WITHOUT the
+// trailing slash (backend/pkg/foo). normalizeOwnershipPath makes the two equal,
+// so the owner scan MATCHES — but the accepted spelling folds VERBATIM into the
+// destination, so admitting the alias would drop the trailing slash and narrow
+// the destination to a file path while the source directory is removed. Deleting
+// the `owner >= 0 && ownerPath != p` refusal turns this into a valid move (200,
+// destination gains the narrowed "backend/pkg/foo"), so the
+// 400/move_requires_exact_owned_path assertion goes RED. Seeded BY CONSTRUCTION
+// (the source keeps backend/keep.go so this is not the empty-source refusal).
+func TestSliceMoveScopeFiles_RefusesTrailingSlashAlias(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dir owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foo/", "backend/keep.go"), sliceScope("backend/other.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/pkg/foo"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "move_requires_exact_owned_path")
+	if got, _ := details["declared_path"].(string); got != "backend/pkg/foo/" {
+		t.Errorf("details.declared_path = %q, want backend/pkg/foo/ (the exact spelling to retry with)", got)
+	}
+	if got, _ := details["owner_slice"].(float64); int(got) != 0 {
+		t.Errorf("details.owner_slice = %v, want 0", details["owner_slice"])
+	}
+}
+
+// (10c) LOAD-BEARING directory move: the EXACT declared spelling (trailing slash
+// intact) is accepted and the destination fold PRESERVES the trailing slash — the
+// recorded canonical map and resolved list both carry "backend/pkg/foo/", not the
+// narrowed "backend/pkg/foo". This is the positive control that the byte-exact
+// refusal above does not simply forbid directory moves outright.
+func TestSliceMoveScopeFiles_DirectoryMovePreservesTrailingSlash(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices(
+		[]string{"dir owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foo/", "backend/keep.go"), sliceScope("backend/other.go")},
+	)
+	_, stage := seedBudgetRun(t, rr, art, p)
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/pkg/foo/"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (an EXACT directory spelling is a valid move):\n%s", w.Code, w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	rawMap, _ := json.Marshal(payload["move_scope_files_to_slice"])
+	if want := `{"1":["backend/pkg/foo/"]}`; string(rawMap) != want {
+		t.Errorf("move_scope_files_to_slice = %s, want %s (trailing slash PRESERVED)", rawMap, want)
+	}
+	var gotResolved []movedPath
+	rawResolved, _ := json.Marshal(payload["move_scope_files_resolved"])
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	wantResolved := []movedPath{{Path: "backend/pkg/foo/", FromSlice: 0, ToSlice: 1}}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v, want %+v (trailing slash PRESERVED on the destination)", gotResolved, wantResolved)
+	}
+}
+
+// (11) path_already_owned_by_destination — a no-op move to the owning slice.
+func TestSliceMoveScopeFiles_AlreadyOwnedByDestination_Returns400(t *testing.T) {
+	w, app, au, stage := moveRefusal(t, twoScopedSlices(),
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/b.go"]}}`)
+	assertSliceMoveValidationFailed(t, w, app, au, stage, "path_already_owned_by_destination")
+}
+
+// (12)/(c) move_would_empty_source_slice — COUNTERFACTUAL. Slice 0 owns ONLY
+// a.go; moving it away empties the source. Deleting the branch lets the move
+// succeed (200), stranding the source child at dispatch, so the 400 assertion
+// goes RED. Seeded BY CONSTRUCTION (a single-path source slice).
+func TestSliceMoveScopeFiles_RefusesEmptyingSourceSlice(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"slice-a", "slice-b"},
+		[]*plan.Scope{sliceScope("backend/a.go"), sliceScope("backend/b.go")},
+	)
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	details := assertSliceMoveValidationFailed(t, w, app, au, stage, "move_would_empty_source_slice")
+	if got, _ := details["source_slice"].(float64); int(got) != 0 {
+		t.Errorf("details.source_slice = %v, want 0", details["source_slice"])
+	}
+}
+
+// (13) 422 plan_not_decomposed on a positively FLAT plan.
+func TestSliceMoveScopeFiles_FlatPlan_Returns422(t *testing.T) {
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5}
+	w, app, au, stage := moveRefusal(t, p,
+		`{"decision":"approve","move_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Error.Code != "plan_slice_move_scope_files_requires_decomposed_plan" {
+		t.Fatalf("code = %q, want plan_slice_move_scope_files_requires_decomposed_plan", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != "plan_not_decomposed" {
+		t.Errorf("details.reason = %q, want plan_not_decomposed", got)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
+	}
+	assertNoApprovalSubmittedAudit(t, au)
+}
+
+// assertMoveRequiresDecomposed422 asserts a 422
+// plan_slice_move_scope_files_requires_decomposed_plan with plan_indeterminate,
+// plus the two pre-Submit invariants.
+func assertMoveRequiresDecomposed422Indeterminate(t *testing.T, w *httptest.ResponseRecorder, app *fakeApprovalRepo, au *approvalAuditFake, stage *run.Stage) {
+	t.Helper()
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Error.Code != "plan_slice_move_scope_files_requires_decomposed_plan" {
+		t.Errorf("code = %q, want plan_slice_move_scope_files_requires_decomposed_plan", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", got)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
+	}
+	assertNoApprovalSubmittedAudit(t, au)
+}
+
+// (14a) 422 plan_indeterminate on a run with no plan artifact.
+func TestSliceMoveScopeFiles_NoPlanArtifact_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+	assertMoveRequiresDecomposed422Indeterminate(t, w, app, au, stage)
+}
+
+// (14b) 422 plan_indeterminate on a plan READ failure.
+func TestSliceMoveScopeFiles_PlanLoadError_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, twoScopedSlices())
+	art.listErr = errors.New("artifact store unavailable")
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	assertMoveRequiresDecomposed422Indeterminate(t, w, app, au, stage)
+}
+
+// (14c) 422 plan_indeterminate on an UNWIRED ArtifactRepo — proving the
+// fail-closed posture has NO config-absence carve-out. loadApprovedPlanForRun
+// returns (nil, nil) with no ArtifactRepo, treated as indeterminate.
+func TestSliceMoveScopeFiles_UnwiredArtifactRepo_FailsClosed(t *testing.T) {
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		// ArtifactRepo deliberately UNWIRED.
+	})
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+	assertMoveRequiresDecomposed422Indeterminate(t, w, app, au, stage)
+}
+
+// moveDispatchGuardFixture seeds a decomposed plan run and returns the server +
+// fakes so a test can seed sibling children before approving a move.
+func moveDispatchGuardFixture(t *testing.T, p *plan.Plan) (*Server, *orchestratorRepo, *approvalAuditFake, *fakeApprovalRepo, *run.Run, *run.Stage) {
+	t.Helper()
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	parent, stage := seedBudgetRun(t, rr, art, p)
+	return s, rr, au, app, parent, stage
+}
+
+// assertMoveAfterDispatch409 asserts a 409 plan_slice_move_after_dispatch with
+// the given reason + the two pre-Submit invariants.
+func assertMoveAfterDispatch409(t *testing.T, w *httptest.ResponseRecorder, app *fakeApprovalRepo, au *approvalAuditFake, stage *run.Stage, wantReason string) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if env.Error.Code != "plan_slice_move_after_dispatch" {
+		t.Errorf("code = %q, want plan_slice_move_after_dispatch", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != wantReason {
+		t.Errorf("details.reason = %q, want %q", got, wantReason)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
+	}
+	assertNoApprovalSubmittedAudit(t, au)
+	return env.Error.Details
+}
+
+// (15)/(e) 409 slice_already_started with a SOURCE-slice child in running —
+// COUNTERFACTUAL for the dispatched-sibling guard. The child is built directly in
+// StateRunning (definitionally past pending). Deleting the guard lets the move
+// succeed (200), so the 409 assertion goes RED.
+func TestCheckSliceMoveScopeFiles_RefusesAfterSourceSliceDispatched(t *testing.T) {
+	s, rr, au, app, parent, stage := moveDispatchGuardFixture(t, twoScopedSlices())
+	rr.seedDecomposedChild(parent.ID, 0, run.StateRunning) // source slice a
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	details := assertMoveAfterDispatch409(t, w, app, au, stage, "slice_already_started")
+	if got, _ := details["child_state"].(string); got != "running" {
+		t.Errorf("details.child_state = %q, want running", got)
+	}
+	if got, _ := details["slice_index"].(float64); int(got) != 0 {
+		t.Errorf("details.slice_index = %v, want 0 (the source slice)", details["slice_index"])
+	}
+}
+
+// (16) 409 slice_already_started with a DESTINATION-slice child in running.
+func TestCheckSliceMoveScopeFiles_RefusesAfterDestSliceDispatched(t *testing.T) {
+	s, rr, au, app, parent, stage := moveDispatchGuardFixture(t, twoScopedSlices())
+	rr.seedDecomposedChild(parent.ID, 1, run.StateRunning) // destination slice b
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	details := assertMoveAfterDispatch409(t, w, app, au, stage, "slice_already_started")
+	if got, _ := details["slice_index"].(float64); int(got) != 1 {
+		t.Errorf("details.slice_index = %v, want 1 (the destination slice)", details["slice_index"])
+	}
+}
+
+// (17)/(f) 409 dispatch_state_indeterminate on a ListRuns error — COUNTERFACTUAL
+// for the guard's fail-closed leg. Deleting the error->refuse leg (degrade to
+// admit) lets the move succeed (200), so the 409 assertion goes RED.
+func TestCheckSliceMoveScopeFiles_FailsClosedOnListRunsError(t *testing.T) {
+	s, rr, au, app, _, stage := moveDispatchGuardFixture(t, twoScopedSlices())
+	rr.listRunsErr = errors.New("db unavailable")
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	assertMoveAfterDispatch409(t, w, app, au, stage, "dispatch_state_indeterminate")
+}
+
+// A pending source/dest child does NOT block the move — the guard only refuses a
+// child past 'pending'. This is the non-conflict control for the guard.
+func TestCheckSliceMoveScopeFiles_PendingSiblingDoesNotBlock(t *testing.T) {
+	s, rr, _, app, parent, stage := moveDispatchGuardFixture(t, twoScopedSlices())
+	rr.seedDecomposedChild(parent.ID, 0, run.StatePending)
+	rr.seedDecomposedChild(parent.ID, 1, run.StatePending)
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]} }`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (pending siblings do not block a move):\n%s", w.Code, w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+}
+
+// (CONDITION 3) Walk the repeat-approve sequence the guard exists for: a REAL
+// first approve carrying a move, then — after the destination child has left
+// pending — a SECOND approve carrying a DIFFERENT move map must 409. Only the
+// FIRST approve is real; the running destination child is still seeded DIRECTLY
+// (seedDecomposedChild in StateRunning), not reached through an actual dispatch,
+// so this pins the second-approve-after-a-real-first-approved-move path and the
+// ADR-036 no-second-row property, not the pending->running transition itself.
+func TestCheckSliceMoveScopeFiles_RefusesRepeatApproveWithDifferentMoveAfterDispatch(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"slice-a", "slice-b"},
+		[]*plan.Scope{sliceScope("backend/a.go", "backend/a2.go"), sliceScope("backend/b.go")},
+	)
+	art := newFakeArtifactRepo()
+	s, rr, _, app := newBudgetCheckServer(t, art)
+	parent, stage := seedBudgetRun(t, rr, art, p)
+
+	// First approve carrying a move: a.go -> slice b. Succeeds (no children yet).
+	w1 := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first move approve status = %d, want 200:\n%s", w1.Code, w1.Body.String())
+	}
+
+	// The plan stage advances off the gate on approve; re-open it so a second
+	// approve reaches the gate (the operator-hit repeat-approve path), and mint
+	// the destination slice's fan-out child in a NON-pending state — the state a
+	// real dispatch would drive it to.
+	stage.State = run.StageStateAwaitingApproval
+	rr.seedDecomposedChild(parent.ID, 1, run.StateRunning)
+
+	// Second approve carrying a DIFFERENT move map (a2.go -> slice b). The
+	// destination slice 1 now has a started child, so the guard 409s.
+	w2 := submitApprovalAs(t, s, stage.ID, "op2",
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a2.go"]}}`)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("second move approve status = %d, want 409 (dest child started):\n%s", w2.Code, w2.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w2.Body.Bytes(), &env)
+	if env.Error.Code != "plan_slice_move_after_dispatch" {
+		t.Errorf("code = %q, want plan_slice_move_after_dispatch", env.Error.Code)
+	}
+	// The second (refused) approve records no new row beyond the first approve's.
+	rows, err := app.ListForStage(context.Background(), stage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("approval rows = %d, want 1 (the refused repeat approve inserts none)", len(rows))
+	}
+}
+
+// DONE-MEANS: a title-keyed request and the equivalent index-keyed request record
+// BYTE-IDENTICAL move_scope_files_to_slice audit payloads (index-keyed, sorted,
+// deduped) — the prompt-hash replay-stability property.
+func TestSliceMoveScopeFiles_CanonicalFormIsIndexKeyedSortedDeduped(t *testing.T) {
+	newPlan := func() *plan.Plan {
+		return decomposedPlanWithScopedSlices(
+			[]string{"first slice", "second slice"},
+			[]*plan.Scope{sliceScope("backend/a.go", "backend/a2.go", "backend/a3.go"), sliceScope("backend/b.go")},
+		)
+	}
+	record := func(t *testing.T, body string) string {
+		t.Helper()
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newBudgetCheckServer(t, art)
+		_, stage := seedBudgetRun(t, rr, art, newPlan())
+		w := submitApproval(t, s, stage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payload := findApprovalSubmittedPayload(t, au.appended)
+		raw, err := json.Marshal(payload["move_scope_files_to_slice"])
+		if err != nil {
+			t.Fatalf("marshal move_scope_files_to_slice: %v", err)
+		}
+		return string(raw)
+	}
+	// Title-keyed, paths in reverse order; and index-keyed, paths in order.
+	byTitle := record(t, `{"decision":"approve","move_scope_files_to_slice":{"second slice":["backend/a2.go","backend/a.go","backend/a.go"]}}`)
+	byIndex := record(t, `{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go","backend/a2.go"]}}`)
+	if byTitle != byIndex {
+		t.Errorf("canonical recording differs by keying:\n title = %s\n index = %s", byTitle, byIndex)
+	}
+	if want := `{"1":["backend/a.go","backend/a2.go"]}`; byIndex != want {
+		t.Errorf("canonical move payload = %s, want %s (index-keyed, sorted, deduped)", byIndex, want)
+	}
+}
+
+// DONE-MEANS: move_scope_files_resolved is recorded as an ordered
+// [{path,from_slice,to_slice}] list, and BOTH move keys are ABSENT on a no-move
+// approve. Drives writeApprovalAudit directly.
+func TestWriteApprovalAudit_RecordsMoveResolved(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newApprovalAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	r := rr.seedRun()
+	planStage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	app := &approval.Approval{
+		StageID:         planStage.ID,
+		ApproverSubject: "op",
+		Decision:        approval.DecisionApprove,
+		Surface:         approval.SurfaceAPI,
+	}
+	moveMap := map[string][]string{"1": {"backend/a.go"}}
+	resolved := []movedPath{
+		{Path: "backend/a.go", FromSlice: 0, ToSlice: 1},
+		{Path: "backend/b.go", FromSlice: 2, ToSlice: 1},
+	}
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, moveMap, resolved, nil, nil, nil, "", "", "", "", nil)
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	rawMap, err := json.Marshal(payload["move_scope_files_to_slice"])
+	if err != nil {
+		t.Fatalf("marshal move map: %v", err)
+	}
+	if want := `{"1":["backend/a.go"]}`; string(rawMap) != want {
+		t.Errorf("move_scope_files_to_slice = %s, want %s", rawMap, want)
+	}
+	var gotResolved []movedPath
+	rawResolved, err := json.Marshal(payload["move_scope_files_resolved"])
+	if err != nil {
+		t.Fatalf("marshal resolved: %v", err)
+	}
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved into []movedPath: %v", err)
+	}
+	wantResolved := []movedPath{
+		{Path: "backend/a.go", FromSlice: 0, ToSlice: 1},
+		{Path: "backend/b.go", FromSlice: 2, ToSlice: 1},
+	}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v, want %+v (sorted by to_slice then path)", gotResolved, wantResolved)
+	}
+
+	// No-move approve: both keys ABSENT.
+	au2 := newApprovalAuditFake()
+	s2 := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au2})
+	s2.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", "", nil)
+	payload2 := findApprovalSubmittedPayload(t, au2.appended)
+	if _, ok := payload2["move_scope_files_to_slice"]; ok {
+		t.Errorf("move_scope_files_to_slice present on a no-move approve payload: %#v", payload2)
+	}
+	if _, ok := payload2["move_scope_files_resolved"]; ok {
+		t.Errorf("move_scope_files_resolved present on a no-move approve payload: %#v", payload2)
+	}
+}
+
+// (j) COUNTERFACTUAL for the plan-block-local discipline: a NON-plan-stage approve
+// carrying move_scope_files_to_slice records NOTHING. Threading the move off req
+// instead of the plan-block local would let this ungated map reach the payload,
+// so the assertion goes RED. Reads the COMMITTED payload, not the status code
+// (the field is ignored off the plan stage, not refused).
+func TestSubmitApproval_NonPlanStageDoesNotRecordSliceMove(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeImplement // a NON-plan stage on the same run
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ignored off the plan stage, not refused):\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got, ok := payload["move_scope_files_to_slice"]; ok {
+		t.Errorf("a NON-plan-stage approve recorded move_scope_files_to_slice = %#v; the gate runs on the plan stage alone, so an ungated map must never reach the payload", got)
+	}
+	if _, ok := payload["move_scope_files_resolved"]; ok {
+		t.Errorf("a NON-plan-stage approve recorded move_scope_files_resolved; the gate runs on the plan stage alone")
+	}
+}
+
+// Happy path: a valid move on a plan with no started children records the
+// canonical map and the resolved list, and advances (200).
+func TestSliceMoveScopeFiles_Success_RecordsMoveAndResolved(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, twoScopedSlices())
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"slice-b":["backend/a.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	rawMap, _ := json.Marshal(payload["move_scope_files_to_slice"])
+	if want := `{"1":["backend/a.go"]}`; string(rawMap) != want {
+		t.Errorf("move_scope_files_to_slice = %s, want %s", rawMap, want)
+	}
+	var gotResolved []movedPath
+	rawResolved, _ := json.Marshal(payload["move_scope_files_resolved"])
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	wantResolved := []movedPath{{Path: "backend/a.go", FromSlice: 0, ToSlice: 1}}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v, want %+v", gotResolved, wantResolved)
+	}
+}
+
+// test_vacuity fix: submit a move whose DESTINATION keys AND the paths within one
+// destination are given in NON-canonical order, and assert the RECORDED
+// move_scope_files_resolved is ordered by (to_slice, path). The sibling
+// TestWriteApprovalAudit_RecordsMoveResolved supplies an ALREADY-sorted resolved
+// slice straight to writeApprovalAudit, so it never exercises the ordering at all;
+// this drives the real submit + validation path from a scrambled input. NOTE: the
+// canonical ordering is REDUNDANTLY defended — validateSliceMoveScopeFiles's
+// trailing sort.Slice(resolved) AND the upstream resolveSliceKeys target-sort +
+// canonicalizeSlicePaths within-destination path-sort each independently produce
+// it — so deleting any ONE keeps this GREEN; it pins the OBSERVABLE end-to-end
+// contract the audit consumer depends on (see PR Notes for the counterfactual).
+func TestSliceMoveScopeFiles_ResolvedSortedByToSliceThenPath(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices(
+		[]string{"s0", "s1", "s2"},
+		[]*plan.Scope{
+			sliceScope("backend/s0keep.go", "backend/alpha.go"),
+			sliceScope("backend/s1keep.go", "backend/zeta.go", "backend/mid.go"),
+			sliceScope("backend/s2keep.go", "backend/s2extra.go"),
+		},
+	)
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	// Scrambled input: destination 2 listed before 0, and within destination 0
+	// zeta before mid. Canonical output must be (to_slice, path)-ordered.
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"2":["backend/alpha.go"],"0":["backend/zeta.go","backend/mid.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	var gotResolved []movedPath
+	rawResolved, _ := json.Marshal(payload["move_scope_files_resolved"])
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	wantResolved := []movedPath{
+		{Path: "backend/mid.go", FromSlice: 1, ToSlice: 0},
+		{Path: "backend/zeta.go", FromSlice: 1, ToSlice: 0},
+		{Path: "backend/alpha.go", FromSlice: 0, ToSlice: 2},
+	}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v,\nwant %+v (ordered by (to_slice, path) despite scrambled input)", gotResolved, wantResolved)
 	}
 }

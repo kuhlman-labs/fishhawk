@@ -5356,7 +5356,7 @@ func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
 		child := childFor(sl.title, i)
 
 		// (a) resolveDecomposedScopeFiles narrows to the slice + its coupled test.
-		gotFiles := scopePathsList(s.resolveDecomposedScopeFiles(ctx, child, parentPlan))
+		gotFiles := scopePathsList(s.resolveDecomposedScopeFiles(ctx, child, parentPlan, nil))
 		wantFiles := []string{sl.wantFile, coupledTestPath(sl.wantFile)}
 		if !reflect.DeepEqual(gotFiles, wantFiles) {
 			t.Errorf("%s: resolveDecomposedScopeFiles = %v, want its slice + coupled test %v", sl.title, gotFiles, wantFiles)
@@ -5364,7 +5364,7 @@ func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
 		narrowedSets = append(narrowedSets, gotFiles)
 
 		// (c) resolveDecomposedScopeConstraint carries the declared slice files.
-		sc := s.resolveDecomposedScopeConstraint(ctx, child, parentPlan)
+		sc := s.resolveDecomposedScopeConstraint(ctx, child, parentPlan, nil, nil)
 		if sc == nil {
 			t.Fatalf("%s: resolveDecomposedScopeConstraint returned nil", sl.title)
 		}
@@ -11221,5 +11221,360 @@ func TestPromptHeldCommitPRText_NoResumeNoText(t *testing.T) {
 		if raw, ok := keys[k]; ok {
 			t.Errorf("an ordinary implement dispatch must not carry %s, got %s", k, raw)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-slice MOVE channel (#2596) — prompt-side two-sided fold + loader.
+// ---------------------------------------------------------------------------
+
+// makeApproveWithSliceMoveScopeFilesEntry builds an approval_submitted audit
+// entry carrying the CANONICAL index-keyed DESTINATION move map (#2596) — the
+// exact shape writeApprovalAudit records. It omits stage_id, so the #2598
+// stage-type filter fails OPEN and folds, matching every hand-built fold fixture.
+func makeApproveWithSliceMoveScopeFilesEntry(runID uuid.UUID, m map[string][]string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":                  "approve",
+		"move_scope_files_to_slice": m,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
+// moveFoldParentPlan is the shared decomposed fixture for the move-fold tests:
+// slice 0 ("Part A") owns pkg/a/foo.go + pkg/a/keep.go, slice 1 ("Part B") owns
+// pkg/b/b.go, slice 2 ("Part C") owns pkg/c/c.go. The top-level scope.files is
+// the UNION of all three (the reviewer's drift baseline).
+func moveFoldParentPlan() *plan.Plan {
+	return &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "parent plan",
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "pkg/a/foo.go", Operation: plan.FileOpModify},
+			{Path: "pkg/a/keep.go", Operation: plan.FileOpModify},
+			{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+			{Path: "pkg/c/c.go", Operation: plan.FileOpModify},
+		}},
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A", ScopeHint: "A.", Scope: &plan.Scope{Files: []plan.ScopeFile{
+					{Path: "pkg/a/foo.go", Operation: plan.FileOpModify},
+					{Path: "pkg/a/keep.go", Operation: plan.FileOpModify},
+				}}},
+				{Title: "Part B", ScopeHint: "B.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part C", ScopeHint: "C.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/c/c.go", Operation: plan.FileOpModify}}}},
+			},
+		},
+	}
+}
+
+// moveFoldServer wires a Server whose AuditRepo carries the given move map on the
+// parent run, and returns the server + a child run row for the given slice.
+func moveFoldServer(t *testing.T, parentRunID uuid.UUID, sliceIdx int, move map[string][]string) (*Server, *run.Run) {
+	t.Helper()
+	auditByRun := map[uuid.UUID][]*audit.Entry{}
+	if move != nil {
+		auditByRun[parentRunID] = []*audit.Entry{makeApproveWithSliceMoveScopeFilesEntry(parentRunID, move)}
+	}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   newPromptRunRepo(),
+		AuditRepo: &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	idx := sliceIdx
+	child := &run.Run{ID: uuid.New(), Repo: "o/r", DecomposedFrom: &parentRunID, ParentRunID: &parentRunID, SliceIndex: &idx}
+	return s, child
+}
+
+// (h) COUNTERFACTUAL: the SOURCE slice loses the moved-away path from its
+// enforced scope.files. Deleting the subtraction in resolveDecomposedScopeFiles
+// leaves foo.go in the source child's scope → the "must not contain" assertion
+// goes RED. Seeded BY CONSTRUCTION (foo.go is declared in slice 0 and named under
+// the move's other key). Asserts the RETURNED SCOPE SET, not an error.
+func TestRequireDecomposedScope_SourceSliceLosesMovedPath(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	// Move foo.go from slice 0 (source) to slice 1 (destination).
+	s, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
+
+	files, _, err := s.requireDecomposedScope(context.Background(), srcChild, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope(source child): %v", err)
+	}
+	got := scopePathsList(files)
+	for _, p := range got {
+		if p == "pkg/a/foo.go" {
+			t.Errorf("source slice scope still contains the moved-away path pkg/a/foo.go: %v", got)
+		}
+	}
+	// The retained path stays.
+	if !containsString(got, "pkg/a/keep.go") {
+		t.Errorf("source slice scope dropped its retained path pkg/a/keep.go: %v", got)
+	}
+}
+
+// (i) COUNTERFACTUAL: the SOURCE slice's agent-facing ScopeConstraint.ScopeFiles
+// drops the moved-away path. Deleting the subtraction in
+// resolveDecomposedScopeConstraint leaves foo.go in the constraint → RED.
+func TestRequireDecomposedScope_ConstraintDropsMovedPath(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	s, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
+
+	_, sc, err := s.requireDecomposedScope(context.Background(), srcChild, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope(source child): %v", err)
+	}
+	if sc == nil {
+		t.Fatalf("resolveDecomposedScopeConstraint returned nil")
+	}
+	if containsString(sc.ScopeFiles, "pkg/a/foo.go") {
+		t.Errorf("constraint ScopeFiles still contains the moved-away path pkg/a/foo.go: %v", sc.ScopeFiles)
+	}
+	if !containsString(sc.ScopeFiles, "pkg/a/keep.go") {
+		t.Errorf("constraint ScopeFiles dropped its retained path pkg/a/keep.go: %v", sc.ScopeFiles)
+	}
+}
+
+// (j) COUNTERFACTUAL: the DESTINATION slice's agent-facing ScopeConstraint.ScopeFiles
+// GAINS the moved-in path, so it matches the enforced scope (which gains the same
+// path via resolveApprovalAddScopeFiles). Deleting the `gained` fold in
+// resolveDecomposedScopeConstraint drops foo.go from the destination constraint →
+// the "must contain" assertion goes RED. The destination child is slice 1, into
+// which foo.go was moved; its own declared file pkg/b/b.go stays.
+func TestRequireDecomposedScope_ConstraintGainsMovedInPath(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	// Move foo.go from slice 0 (source) to slice 1 (destination); resolve the
+	// DESTINATION child (slice 1).
+	s, dstChild := moveFoldServer(t, parentRunID, 1, map[string][]string{"1": {"pkg/a/foo.go"}})
+
+	_, sc, err := s.requireDecomposedScope(context.Background(), dstChild, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope(destination child): %v", err)
+	}
+	if sc == nil {
+		t.Fatalf("resolveDecomposedScopeConstraint returned nil")
+	}
+	if !containsString(sc.ScopeFiles, "pkg/a/foo.go") {
+		t.Errorf("destination constraint ScopeFiles missing the moved-in path pkg/a/foo.go: %v", sc.ScopeFiles)
+	}
+	// The destination slice's own declared file stays.
+	if !containsString(sc.ScopeFiles, "pkg/b/b.go") {
+		t.Errorf("destination constraint ScopeFiles dropped its own declared file pkg/b/b.go: %v", sc.ScopeFiles)
+	}
+}
+
+// DONE-MEANS / ordering: the subtraction runs BEFORE coupledTestSiblings folds
+// the stem-sibling *_test.go, so moving foo.go out of a slice does NOT drag
+// foo_test.go back into it. If the order were reversed, foo_test.go would be
+// folded from the still-present foo.go.
+func TestRequireDecomposedScope_MovedAwaySourceDoesNotFoldTestSibling(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	s, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
+
+	files, _, err := s.requireDecomposedScope(context.Background(), srcChild, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope: %v", err)
+	}
+	got := scopePathsList(files)
+	if containsString(got, "pkg/a/foo_test.go") {
+		t.Errorf("moved-away foo.go dragged its test sibling foo_test.go back into the source slice: %v", got)
+	}
+	// The retained file's coupled sibling IS folded (control: the fold still runs).
+	if !containsString(got, "pkg/a/keep_test.go") {
+		t.Errorf("retained keep.go's coupled test sibling keep_test.go was not folded: %v", got)
+	}
+}
+
+// A THIRD slice uninvolved in the move is UNAFFECTED: resolveApprovalSliceMoves
+// reports foo.go as `lost` for slice 2 too (every path under a non-own key), but
+// slice 2 never declared foo.go, so subtracting it is a no-op.
+func TestResolveApprovalSliceMoves_UnownedLostPathIsNoOp(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+
+	// Control: no move recorded.
+	ctrl, ctrlChild := moveFoldServer(t, parentRunID, 2, nil)
+	ctrlFiles, _, err := ctrl.requireDecomposedScope(context.Background(), ctrlChild, parentPlan)
+	if err != nil {
+		t.Fatalf("control requireDecomposedScope: %v", err)
+	}
+
+	// With a move between slices 0 and 1, slice 2's resolved scope is unchanged.
+	s, child2 := moveFoldServer(t, parentRunID, 2, map[string][]string{"1": {"pkg/a/foo.go"}})
+	got, _, err := s.requireDecomposedScope(context.Background(), child2, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope(slice 2): %v", err)
+	}
+	if !reflect.DeepEqual(scopePathsList(got), scopePathsList(ctrlFiles)) {
+		t.Errorf("slice-2 scope = %v, want byte-identical to the no-move control %v (an unowned lost path is a no-op)",
+			scopePathsList(got), scopePathsList(ctrlFiles))
+	}
+}
+
+// (g) COUNTERFACTUAL: the move loader skips a candidate row recorded off a
+// non-plan stage and continues to the older plan-stage row. Deleting the
+// approvalEntryStageIsPlan call in loadApprovalSliceMoveScopeFiles returns the
+// newer implement-stage map → the assertion on the plan-stage map goes RED.
+func TestLoadApprovalSliceMoveScopeFiles_SkipsNonPlanStageRow(t *testing.T) {
+	runID := uuid.New()
+	planStage, implStage := stageFilterFixture(runID)
+	planMap := map[string][]string{"1": {"pkg/a/foo.go"}}
+
+	s := newStageFilterServer([]*audit.Entry{
+		withApprovalStageID(t, makeApproveWithSliceMoveScopeFilesEntry(runID, planMap), planStage.ID),
+		withApprovalStageID(t, makeApproveWithSliceMoveScopeFilesEntry(runID, map[string][]string{"1": {"pkg/evil.go"}}), implStage.ID),
+	}, runID, planStage, implStage)
+
+	got := s.loadApprovalSliceMoveScopeFiles(context.Background(), runID)
+	if !reflect.DeepEqual(got, planMap) {
+		t.Errorf("loadApprovalSliceMoveScopeFiles = %v, want %v — the newer IMPLEMENT-stage row must be skipped and the older plan-stage row must fold", got, planMap)
+	}
+}
+
+// Supersession: a second approve carrying a non-empty move map SUPERSEDES an
+// earlier one (newest-first, first-wins), matching every sibling channel.
+func TestLoadApprovalSliceMoveScopeFiles_NewestApproveWins(t *testing.T) {
+	runID := uuid.New()
+	older := makeApproveWithSliceMoveScopeFilesEntry(runID, map[string][]string{"1": {"pkg/a/foo.go"}})
+	newer := makeApproveWithSliceMoveScopeFilesEntry(runID, map[string][]string{"2": {"pkg/a/keep.go"}})
+	s := New(Config{
+		Addr:    "127.0.0.1:0",
+		RunRepo: newPromptRunRepo(),
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {older, newer}, // ListForRunByCategory serves in append (oldest-first) order
+		}},
+	})
+	got := s.loadApprovalSliceMoveScopeFiles(context.Background(), runID)
+	want := map[string][]string{"2": {"pkg/a/keep.go"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("loadApprovalSliceMoveScopeFiles = %v, want the NEWEST approve's map %v", got, want)
+	}
+}
+
+// CONDITION 1: the reviewer's drift baseline for a fan-out child is the
+// WHOLE-plan scope.files (the union of all slices), which a move leaves
+// unchanged. amendedScopeFilesForReview keys on approvedPlan.Scope.Files and
+// excludes anything already in it, so a moved path — declared in the union both
+// before AND after — is a NO-OP on the review/trace surface. Pinned on BOTH the
+// source and destination children, not only the prompt response.
+func TestAmendedScopeFilesForReview_MoveIsNoOp(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	move := map[string][]string{"1": {"pkg/a/foo.go"}}
+
+	// Control children (no move recorded), by slice.
+	ctrlSrc, ctrlSrcChild := moveFoldServer(t, parentRunID, 0, nil)
+	ctrlDst, ctrlDstChild := moveFoldServer(t, parentRunID, 1, nil)
+	wantSrc := ctrlSrc.amendedScopeFilesForReview(context.Background(), ctrlSrcChild, parentPlan)
+	wantDst := ctrlDst.amendedScopeFilesForReview(context.Background(), ctrlDstChild, parentPlan)
+
+	// With the move recorded, the reviewer baseline is UNCHANGED on both sides.
+	sSrc, srcChild := moveFoldServer(t, parentRunID, 0, move)
+	gotSrc := sSrc.amendedScopeFilesForReview(context.Background(), srcChild, parentPlan)
+	if !reflect.DeepEqual(gotSrc, wantSrc) {
+		t.Errorf("source-child amended review scope = %v, want unchanged by the move (%v)", gotSrc, wantSrc)
+	}
+
+	sDst, dstChild := moveFoldServer(t, parentRunID, 1, move)
+	gotDst := sDst.amendedScopeFilesForReview(context.Background(), dstChild, parentPlan)
+	if !reflect.DeepEqual(gotDst, wantDst) {
+		t.Errorf("dest-child amended review scope = %v, want unchanged by the move (%v)", gotDst, wantDst)
+	}
+	// Concretely: the moved-in path is NOT surfaced as an amendment on the dest
+	// side — it was already in the whole-plan baseline, so the reviewer already
+	// sees it via writePlanForReview.
+	if containsString(gotDst, "pkg/a/foo.go") {
+		t.Errorf("dest-child amended review scope surfaced the moved-in path pkg/a/foo.go as an amendment; it is already in the whole-plan baseline: %v", gotDst)
+	}
+}
+
+// CONDITION 1 (trace surface): pin the SOURCE child's reviewer trace-provenance
+// baseline after a move on the ACTUAL surface (scopeProvenanceForReview), not
+// only the prompt response. The reviewer's drift baseline for a fan-out child is
+// the WHOLE-plan scope.files: loadApprovedPlanForRun walks a decomposed child to
+// its PARENT and returns the un-narrowed plan, and both buildTriggerForReview and
+// scopeProvenanceForReview read approvedPlan.Scope.Files verbatim — neither
+// narrows per-slice. So a path moved AWAY from the source slice is STILL in the
+// reviewer baseline, and the reviewer keeps measuring drift on it against the
+// whole plan rather than silently tolerating drift on a file the slice "no longer
+// owns". This is the load-bearing assertion MoveIsNoOp lacks: MoveIsNoOp's source
+// comparison is trivially equal because a source child GAINS no paths, whereas
+// this observes the provenance surface and asserts the moved-away path is PRESENT
+// in the source child's whole-plan baseline — a review-side subtraction or a
+// slice-narrowing would drop it and turn this RED.
+func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	move := map[string][]string{"1": {"pkg/a/foo.go"}}
+
+	// Source child (slice 0) with pkg/a/foo.go moved AWAY (→ slice 1) recorded.
+	s, srcChild := moveFoldServer(t, parentRunID, 0, move)
+
+	// A diff that touches NONE of the plan files, so every whole-plan path lands
+	// in PlanUntouched IF it is still in the reviewer's baseline.
+	diff := provenanceDiff("pkg/unrelated.go")
+	prov := s.scopeProvenanceForReview(context.Background(), srcChild.ID, uuid.New(),
+		parentPlan, prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("scopeProvenanceForReview = nil, want non-nil (every whole-plan path untouched)")
+	}
+	// The whole-plan union (4 files) is the reviewer baseline, unchanged by the move.
+	if prov.PlanFiles != 4 {
+		t.Errorf("PlanFiles = %d, want 4 (whole-plan union is the reviewer baseline, unchanged by the move)", prov.PlanFiles)
+	}
+	// LOAD-BEARING: the moved-away path is STILL in the source child's reviewer
+	// baseline. A slice-narrowing / lost-subtraction on the review side would drop
+	// it — that is exactly the drift the reviewer must keep measuring.
+	if !containsString(prov.PlanUntouched, "pkg/a/foo.go") {
+		t.Errorf("PlanUntouched = %v, want the moved-away path pkg/a/foo.go present — the review baseline is whole-plan and a move must not subtract it", prov.PlanUntouched)
+	}
+	// The rest of the whole-plan union is present too (the baseline is not slice-scoped).
+	for _, p := range []string{"pkg/a/keep.go", "pkg/b/b.go", "pkg/c/c.go"} {
+		if !containsString(prov.PlanUntouched, p) {
+			t.Errorf("PlanUntouched = %v, want to contain whole-plan path %q", prov.PlanUntouched, p)
+		}
+	}
+}
+
+// BACKWARD COMPAT: resolveApprovalAddScopeFiles for a fan-out child with NO
+// recorded move returns the identical result as before #2596 — the move union is
+// inert.
+func TestResolveApprovalAddScopeFiles_NoMove_ByteIdentical(t *testing.T) {
+	parentRunID := uuid.New()
+	flat := map[string][]string{"1": {"pkg/b/added.go"}}
+	s := New(Config{
+		Addr:    "127.0.0.1:0",
+		RunRepo: newPromptRunRepo(),
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			parentRunID: {makeApproveWithSliceAddScopeFilesEntry(parentRunID, flat)},
+		}},
+	})
+	idx := 1
+	child := &run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, ParentRunID: &parentRunID, SliceIndex: &idx}
+	got := s.resolveApprovalAddScopeFiles(context.Background(), child)
+	want := []string{"pkg/b/added.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("resolveApprovalAddScopeFiles = %v, want %v (move union must be inert with no move recorded)", got, want)
+	}
+}
+
+// DESTINATION side: a recorded move folds the moved-in path into the destination
+// child's enforced scope via the resolveApprovalAddScopeFiles union.
+func TestResolveApprovalAddScopeFiles_DestinationInheritsMovedPath(t *testing.T) {
+	parentRunID := uuid.New()
+	s, dstChild := moveFoldServer(t, parentRunID, 1, map[string][]string{"1": {"pkg/a/foo.go"}})
+	got := s.resolveApprovalAddScopeFiles(context.Background(), dstChild)
+	if !containsString(got, "pkg/a/foo.go") {
+		t.Errorf("destination child resolveApprovalAddScopeFiles = %v, want it to contain the moved-in path pkg/a/foo.go", got)
+	}
+	// The source child does NOT gain it via this channel.
+	sSrc, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
+	if gotSrc := sSrc.resolveApprovalAddScopeFiles(context.Background(), srcChild); containsString(gotSrc, "pkg/a/foo.go") {
+		t.Errorf("source child resolveApprovalAddScopeFiles gained the moved-away path pkg/a/foo.go: %v", gotSrc)
 	}
 }

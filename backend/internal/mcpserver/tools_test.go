@@ -12908,3 +12908,52 @@ func TestApprovePlan_NoAddScopeFilesToSlice_OmitsFieldOnTheWire(t *testing.T) {
 		t.Errorf("add_scope_files_to_slice = %v, want nil when no slice targeting declared", fb.approvalsBody.AddScopeFilesToSlice)
 	}
 }
+
+// TestApprovePlan_MoveScopeFilesToSlice_PlumbedToSubmitApproval pins the #2596
+// plumbing: fishhawk_approve_plan's MoveScopeFilesToSlice input reaches the
+// backend request body verbatim through SubmitApproval.
+func TestApprovePlan_MoveScopeFilesToSlice_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	move := map[string][]string{
+		"tools slice": {"backend/internal/mcpserver/tools.go"},
+		"1":           {"docs/extra.md"},
+	}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:                 runID.String(),
+		Reason:                "relocate the file into the tools slice",
+		MoveScopeFilesToSlice: move,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.MoveScopeFilesToSlice, move) {
+		t.Errorf("move_scope_files_to_slice = %v, want %v", fb.approvalsBody.MoveScopeFilesToSlice, move)
+	}
+}
+
+// TestApprovePlan_NoMoveScopeFilesToSlice_OmitsFieldOnTheWire confirms the
+// byte-identical no-move path: an approve without move_scope_files_to_slice
+// leaves the field nil on the decoded request body (omitempty).
+func TestApprovePlan_NoMoveScopeFilesToSlice_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.MoveScopeFilesToSlice != nil {
+		t.Errorf("move_scope_files_to_slice = %v, want nil when no move declared", fb.approvalsBody.MoveScopeFilesToSlice)
+	}
+}
