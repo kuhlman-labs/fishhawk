@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -2021,12 +2023,33 @@ func (r *feedbackRunRepo) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*
 type feedbackAuditRepo struct {
 	byRunID map[uuid.UUID][]*audit.Entry
 	listErr error
+	// mu/appended capture AppendChained calls so a test can assert on entries
+	// the handler WRITES (e.g. the #2737 fixup_report_obligations_declared
+	// anchor), not only on what it reads.
+	mu       sync.Mutex
+	appended []audit.ChainAppendParams
+}
+
+// appendedByCategory returns the captured appends of one category.
+func (f *feedbackAuditRepo) appendedByCategory(category string) []audit.ChainAppendParams {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, p := range f.appended {
+		if p.Category == category {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (f *feedbackAuditRepo) Append(_ context.Context, _ audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
 func (f *feedbackAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	f.mu.Lock()
+	f.appended = append(f.appended, p)
+	f.mu.Unlock()
 	rid := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
 }
@@ -11541,6 +11564,309 @@ func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.
 	}
 }
 
+// makeFixupEntryWithReporting builds a stage_fixup_triggered entry carrying the
+// three operator-authored channels #2737's classifier reads: routed concern
+// notes, the free-text operator_concern, and the operator's reason.
+func makeFixupEntryWithReporting(runID, stageID uuid.UUID, concerns []planreview.Concern, operatorConcern, reason string) *audit.Entry {
+	return makeFixupEntryWithReportingSeq(runID, stageID, 1, concerns, operatorConcern, reason)
+}
+
+// makeFixupEntryWithReportingSeq is makeFixupEntryWithReporting with an explicit
+// audit Sequence — the identity the #2737 anchor pins a served prompt to.
+func makeFixupEntryWithReportingSeq(runID, stageID uuid.UUID, seq int64, concerns []planreview.Concern, operatorConcern, reason string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":         stageID.String(),
+		"selected_indices": []int{0},
+		"concerns":         concerns,
+		"operator_concern": operatorConcern,
+		"reason":           reason,
+		"pass_ordinal":     1,
+	})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Sequence: seq, Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+// TestResolveFixupReportObligations_Channels covers the #2737 audit-payload
+// reader directly across the three routed channels plus the dedupe and the
+// no-obligation default.
+func TestResolveFixupReportObligations_Channels(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("routine concerns declare nothing", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+				"", "route the correctness concern")}},
+		}})
+		if got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0); got != nil {
+			t.Errorf("a routine fix-up must declare nothing, got %+v", got)
+		}
+	})
+
+	t.Run("concern note carrying a reporting obligation is declared as ob-1", func(t *testing.T) {
+		const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "process", Note: note}},
+				"", "route it")}},
+		}})
+		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want one obligation", got)
+		}
+		if got[0].ID != "ob-1" || got[0].Source != fixupobligation.SourceConcern || got[0].Text != note {
+			t.Errorf("obligation = %+v, want ob-1/concern carrying the RAW note", got[0])
+		}
+	})
+
+	t.Run("operator_concern deduped against its minted concern note", func(t *testing.T) {
+		// Since #2623 the free-text operator_concern is ALSO minted as a durable
+		// concern, so it arrives on both channels; one instruction, one id.
+		const text = "Document each dropped branch in the pull request description."
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "operator", Note: text}},
+				text, "")}},
+		}})
+		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want exactly one obligation (the duplicate must be deduped)", got)
+		}
+	})
+
+	t.Run("reason carrying a reporting obligation is declared", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+				"", "Record the observed RED output in the PR body's ## Notes.")}},
+		}})
+		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+		if len(got) != 1 || got[0].Source != fixupobligation.SourceReason {
+			t.Fatalf("got %+v, want one reason-sourced obligation", got)
+		}
+	})
+}
+
+// TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted pins the
+// #2737 security fix-up at the resolver: the obligation mirror must carry the
+// SAME trust provenance resolveFixupConcerns puts on
+// prompt.FixupConcern.AcceptanceDerived. An acceptance-synthesized concern's
+// note is attacker-influenceable validator free-text (ADR-050 / E31.8 / #1613);
+// dropping the marker here would hand both render sites an obligation they
+// cannot tell from operator instruction, and the quarantine writeFixupConcerns
+// applies to that very note would be bypassed by its own mirror.
+//
+// The two arms are SELF-PAIRED — byte-identical note text, differing ONLY in
+// planreview.Concern.Provenance — so the assertion isolates provenance rather
+// than passing on a text comparison.
+//
+// Counterfactual: drop the Untrusted field from the Source built in
+// resolveFixupReportObligations and the acceptance arm goes RED.
+func TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	resolve := func(t *testing.T, provenance string) fixupobligation.Obligation {
+		t.Helper()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{
+					Severity: planreview.SeverityMedium, Category: "process",
+					Note: note, Provenance: provenance,
+				}}, "", "route it")}},
+		}})
+		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want exactly one obligation", got)
+		}
+		return got[0]
+	}
+
+	acceptance := resolve(t, planreview.ConcernProvenanceAcceptance)
+	if !acceptance.Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted true for an acceptance-derived concern note", acceptance)
+	}
+	operator := resolve(t, "")
+	if operator.Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted false for an operator/reviewer-authored concern note", operator)
+	}
+	// Discrimination: only the flag differs between the two arms.
+	if acceptance.ID != operator.ID || acceptance.Text != operator.Text {
+		t.Fatalf("the arms differ in more than the provenance flag (%+v vs %+v)", acceptance, operator)
+	}
+
+	// The operator's own channels are trusted by construction: the fix-up
+	// trigger records exactly what the operator typed.
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+		byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+			[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+			"", "Record the observed RED output in the PR body's ## Notes.")}},
+	}})
+	got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+	if len(got) != 1 || got[0].Source != fixupobligation.SourceReason || got[0].Untrusted {
+		t.Errorf("got %+v, want one trusted reason-sourced obligation", got)
+	}
+}
+
+// servedFixupPromptWithConcernNote drives the REAL prompt endpoint for an
+// implement stage re-opened for a fix-up whose sole routed concern carries the
+// given note, and returns the served prompt text. It exercises the handler
+// wiring (resolver -> Trigger -> renderer), not the resolver in isolation.
+func servedFixupPromptWithConcernNote(t *testing.T, note string) string {
+	t.Helper()
+	got, _ := servedFixupPromptAndAudit(t, note, false)
+	return got
+}
+
+// servedFixupPromptAndAudit is servedFixupPromptWithConcernNote plus the audit
+// fake, so a test can assert on what the handler WROTE. When render is true it
+// drives the SPA prompt-render preview instead of the runner-facing serve.
+func servedFixupPromptAndAudit(t *testing.T, note string, render bool) (string, *feedbackAuditRepo) {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	planBytes, err := json.Marshal(&plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {
+		{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+		{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+	}}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "process", Note: note}}
+	priv, _ := sf.issue(t, runID)
+	au := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {makeFixupEntryWithReporting(runID, implStageID, concerns, "", "route it")},
+	}}
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: au,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	var w *httptest.ResponseRecorder
+	if render {
+		w = httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+implStageID.String()+"/prompt-render", nil)
+		req.SetPathValue("stage_id", implStageID.String())
+		s.handleGetStagePromptRender(w, req)
+	} else {
+		w = promptRequest(t, s, runID, implStageID, priv, "")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Fixup {
+		t.Fatalf("fixup = false; the slim fork did not engage, so this asserts nothing")
+	}
+	return resp.Prompt, au
+}
+
+// TestGetStagePrompt_Implement_FixupReportObligations_ServeAnchorsTheTriggerEntry
+// pins the #2737 concurrency fix-up at the SERVE seam: the runner-facing prompt
+// fetch records a fixup_report_obligations_declared anchor naming, by audit
+// Sequence, the exact stage_fixup_triggered entry the prompt was rendered from.
+// Without that anchor the implement review has nothing to join against and emits
+// no signal, so this is the write that makes the whole surface work.
+//
+// The SPA prompt-render preview must NOT write one — it is a read, and a preview
+// fetch must never re-pin what a live pass is joined to.
+//
+// Counterfactual: delete the recordFixupReportObligationsDeclared call in
+// handleGetStagePrompt and the first arm goes RED on the append count.
+func TestGetStagePrompt_Implement_FixupReportObligations_ServeAnchorsTheTriggerEntry(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+
+	got, au := servedFixupPromptAndAudit(t, note, false)
+	if !strings.Contains(got, "### Reporting obligations routed with this fix-up") {
+		t.Fatalf("the obligation block did not render, so the anchor assertion is moot:\n%s", got)
+	}
+	anchors := au.appendedByCategory(CategoryFixupReportObligationsDeclared)
+	if len(anchors) != 1 {
+		t.Fatalf("anchor appends = %d, want exactly 1", len(anchors))
+	}
+	var payload fixupReportObligationsDeclaredPayload
+	if err := json.Unmarshal(anchors[0].Payload, &payload); err != nil {
+		t.Fatalf("decode anchor payload: %v", err)
+	}
+	// makeFixupEntryWithReporting stamps Sequence 1.
+	if payload.TriggerSequence != 1 {
+		t.Errorf("anchor trigger_sequence = %d, want 1 (the served trigger entry)", payload.TriggerSequence)
+	}
+	if len(payload.ObligationIDs) != 1 || payload.ObligationIDs[0] != "ob-1" {
+		t.Errorf("anchor obligation_ids = %v, want [ob-1]", payload.ObligationIDs)
+	}
+	if anchors[0].StageID == nil {
+		t.Error("the anchor must be stage-bound, or the review's stage filter cannot find it")
+	}
+
+	// The SPA preview renders the same block but writes nothing.
+	preview, previewAudit := servedFixupPromptAndAudit(t, note, true)
+	if !strings.Contains(preview, "### Reporting obligations routed with this fix-up") {
+		t.Errorf("the preview must render the same block:\n%s", preview)
+	}
+	if n := len(previewAudit.appendedByCategory(CategoryFixupReportObligationsDeclared)); n != 0 {
+		t.Errorf("prompt-render anchor appends = %d, want 0 — a preview must never re-pin a live pass", n)
+	}
+}
+
+// TestGetStagePrompt_Implement_NoObligation_WritesNoAnchor: an ordinary fix-up
+// declares nothing, so the serve stays byte-identical AND writes no anchor.
+func TestGetStagePrompt_Implement_NoObligation_WritesNoAnchor(t *testing.T) {
+	_, au := servedFixupPromptAndAudit(t, "Guard the nil pool in the retry path.", false)
+	if n := len(au.appendedByCategory(CategoryFixupReportObligationsDeclared)); n != 0 {
+		t.Errorf("anchor appends = %d, want 0 for a routine fix-up", n)
+	}
+}
+
+// TestGetStagePrompt_Implement_FixupReportObligations_ThreadedOntoTrigger is the
+// prompt-fetch seam pin (#2737): a served fix-up prompt for a stage whose
+// trigger entry carries a reporting obligation renders the binding block. This
+// exercises the REAL handler wiring, not the resolver in isolation.
+func TestGetStagePrompt_Implement_FixupReportObligations_ThreadedOntoTrigger(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	got := servedFixupPromptWithConcernNote(t, note)
+	for _, w := range []string{
+		"### Reporting obligations routed with this fix-up",
+		"`ob-1` (from the routed concern): " + note,
+		"This pass CANNOT write the pull-request description",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("served fix-up prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
 // BACKWARD COMPAT: resolveApprovalAddScopeFiles for a fan-out child with NO
 // recorded move returns the identical result as before #2596 — the move union is
 // inert.
@@ -11576,5 +11902,41 @@ func TestResolveApprovalAddScopeFiles_DestinationInheritsMovedPath(t *testing.T)
 	sSrc, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
 	if gotSrc := sSrc.resolveApprovalAddScopeFiles(context.Background(), srcChild); containsString(gotSrc, "pkg/a/foo.go") {
 		t.Errorf("source child resolveApprovalAddScopeFiles gained the moved-away path pkg/a/foo.go: %v", gotSrc)
+	}
+}
+
+// TestGetStagePrompt_Implement_FixupReportObligations_AbsentForRoutineConcern is
+// the served-prompt anti-noise pin: a routine routed concern renders no block.
+func TestGetStagePrompt_Implement_FixupReportObligations_AbsentForRoutineConcern(t *testing.T) {
+	got := servedFixupPromptWithConcernNote(t, "Guard the nil pool in the retry path.")
+	if strings.Contains(got, "### Reporting obligations routed with this fix-up") {
+		t.Errorf("a routine fix-up's served prompt must render no obligation block:\n%s", got)
+	}
+}
+
+// TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible pins the
+// plan's near-deterministic-apply assumption (#1165 × #2737): a reporting
+// obligation carries no suggested_patch, and the apply path is all-or-nothing,
+// so an obligation-bearing pass falls to the AGENT path — which is the path that
+// writes the self-report sidecar. Were it apply-eligible, no agent would run and
+// every declared obligation would be reported unreported.
+func TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool", SuggestedPatch: "--- a\n+++ b\n"},
+		{Severity: planreview.SeverityMedium, Category: "process",
+			Note: "Record the per-deletion counterfactual results in the PR body's ## Notes."},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+		byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID, concerns, "", "route both")}},
+	}})
+	if got := s.resolveFixupApplyPatches(context.Background(), runID, stageID); got != nil {
+		t.Errorf("a patch-less reporting obligation must make the pass apply-INELIGIBLE, got %+v", got)
+	}
+	// And the same entry does declare the obligation, so the agent pass is the
+	// one that will be asked to report it.
+	if got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0); len(got) != 1 {
+		t.Errorf("resolveFixupReportObligations = %+v, want the one obligation", got)
 	}
 }

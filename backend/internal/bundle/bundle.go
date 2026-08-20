@@ -310,6 +310,20 @@ type GateEvidence struct {
 	// identical default) when there was no fix-up pass, no claim, or claim and
 	// reality agreed. The json tag MUST stay identical to the composer.
 	FixupSelfReportDivergence *FixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+	// FixupReportingObligations carries the agent's VALIDATED per-obligation
+	// self-reports for a fix-up pass (#2737): one {id, status} entry per routed
+	// REPORTING obligation the agent answered, each already fail-closed-validated
+	// by the runner (shape-constrained `ob-N` id, known status literal, `met`
+	// requires a record and `declined` requires a reason — the required text is
+	// checked on the runner and NOT transmitted). The backend subtracts the `met` entries from the
+	// declared obligation set it re-derives at implement-review time; the
+	// remainder becomes the advisory fixup_reporting_obligation_undelivered
+	// signal. Absent (the byte-identical default) when there was no fix-up
+	// pass, no obligation was routed, or no entry survived validation. The json
+	// tag MUST stay identical to the runner's composer — a one-sided edit
+	// silently DISABLES the signal, which is why the pair is pinned from BOTH
+	// modules against one shared literal JSON fixture.
+	FixupReportingObligations []FixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
 	// DiffCoverage carries the workflow-v1.6 `diff_coverage` measurement
 	// (ADR-059 / #1888): the customer coverage command, its exit code, and
 	// how much of the stage's added-line set the report showed as
@@ -346,6 +360,22 @@ type DiffCoverageEvidence struct {
 type FixupSelfReportDivergenceEvidence struct {
 	ClaimedVerifyStatus string `json:"claimed_verify_status"`
 	ActualVerifyStatus  string `json:"actual_verify_status"`
+}
+
+// FixupReportingObligationEvidence is one validated per-obligation self-report
+// (#2737): the obligation id the agent answered and the status literal it
+// claimed (`met` | `declined`).
+//
+// There is deliberately NO free-text field — the agent's attestation and
+// decline reason are validated on the runner and never transmitted, because a
+// fix-up agent running arbitrary repository commands controls every byte of
+// that text and it would otherwise reach the reviewer's prompt without ever
+// appearing in the committed diff. Mirrors the runner's
+// fixupReportingObligationEvidence — the json tags MUST stay identical to the
+// composer, same lockstep wire contract as the parent payload.
+type FixupReportingObligationEvidence struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
 // ScopeExemptionEvidence is one validated scope self-exemption (#1153): a

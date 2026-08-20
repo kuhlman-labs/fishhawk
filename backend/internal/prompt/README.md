@@ -276,3 +276,61 @@ Caveat worth stating plainly: this half is a prompt INSTRUCTION to an LLM
 validator. The tests prove the instruction renders, not that a validator obeys
 it. The failure direction is safe — a non-compliant validator produces at worst
 today's spurious failure, never a silent pass.
+
+## Fix-up reporting obligations (#2737)
+
+`writeFixupReportObligations` renders the binding "### Reporting obligations
+routed with this fix-up" block on the slim fix-up path only, immediately before
+`writeFixupSelfReport`, and only when `Trigger.FixupReportObligations` is
+non-empty AND the run/stage ids are populated. It names each routed REPORTING
+obligation by its stable `ob-N` id, states plainly that this pass CANNOT write
+the pull-request description (the PR already exists — the same contract
+`writeFixupCommitMessage` states), and routes the record into the fix-up
+self-report sidecar, whose documented rules `writeFixupSelfReport` extends with
+the per-id `obligations` array (`met` requires a non-empty `record`, `declined`
+requires a non-empty `reason`, anything else is DROPPED).
+
+The reviewer-facing half is `GateEvidence.FixupReportingObligations`, rendered
+by `writeGateEvidence` as a DISTINCT high-priority block worded so it cannot be
+confused with a generic "unverifiable in a diff-only review" concern.
+`GateEvidence.FixupObligationReports` is a data CARRIER for the runner-validated
+reports and is never rendered — the backend joins against it and renders only
+the remainder, so a fully-met pass keeps the reviewer prompt byte-identical
+(prompt-hash replay stability).
+
+That block's fields are **split by trust**. `ID`/`Source`/`Status` are
+backend-authored and always render inline. `Text` — the routed instruction
+excerpt — is trusted only when `Untrusted` is false: an obligation detected
+inside an ACCEPTANCE-derived concern note carries attacker-influenceable
+validator free-text (ADR-050 / #1613), which `writeFixupConcerns` already
+quarantines, so its obligation MIRROR must not become a second inline path for
+the same bytes. Both render sites — `writeFixupReportObligations` (agent) and
+`writeGateEvidence`'s undelivered block (reviewer) — therefore partition on the
+flag: the id/source line still names the obligation, while the excerpt goes
+through the shared `writeUntrustedObligationExcerpts` helper
+(`sanitizeUntrustedComment` per line inside a `<<<BEGIN/END UNTRUSTED OBLIGATION
+TEXT>>>` envelope, the caller's binding instruction kept OUTSIDE it, capped at
+`maxFixupObligationTextBytes`). An operator-authored obligation renders inline
+byte-identically to before. Pinned adversarially by
+`TestBuild_ImplementFixup_ReportObligations_UntrustedTextQuarantined`,
+`TestBuild_ImplementReview_GateEvidence_UntrustedObligationTextQuarantined`,
+their `_TrustedTextStillInline` counterparts, and end to end by
+`TestImplementReview_AcceptanceDerivedObligation_TextQuarantined`.
+
+There is **no agent-authored field on this block at all**. An earlier shape of
+this change carried the agent's stated `declined` reason to the reviewer inside a
+`<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` quarantine envelope. That was
+the wrong control: quarantining bounds what agent text can *impersonate*, not
+what it can *carry*, so the field stayed an arbitrary channel for repository
+content from a command-running agent to the reviewer, around the committed diff.
+`GateFixupReportingObligation` therefore carries no agent text, the runner never
+transmits it (`validateFixupObligationReports` validates it and discards it), and
+the block states plainly that the agent's own reason is not carried so its
+absence does not read as a render bug. Pinned by
+`TestBuild_ImplementReview_GateEvidence_FixupObligation_NoAgentTextChannel`.
+
+Both blocks are absent by default: an ordinary fix-up and an unaffected review
+render byte-identically to before the fields existed. Honesty framing is
+preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,
+never fails, re-opens, or re-budgets the pass. Long-form contract:
+`backend/internal/fixupobligation/README.md`.

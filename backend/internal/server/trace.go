@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -2817,6 +2818,40 @@ type operatorScopeUndeliveredPayload struct {
 	Indeterminate bool `json:"indeterminate,omitempty"`
 }
 
+// fixupReportingObligationUndeliveredCategory is the audit-log category for the
+// advisory pre-review signal (#2737) emitted when a fix-up pass leaves a routed
+// REPORTING obligation — an operator instruction to RECORD something on a
+// report surface — without a valid `met` self-report. It is an internal
+// advisory audit kind written by the trace handler before the reviewer verdict
+// — NOT an issue-comment surface (nothing in issuecomment emits it). EVIDENCE
+// ONLY: it never fails, re-opens, or re-budgets the pass.
+const fixupReportingObligationUndeliveredCategory = "fixup_reporting_obligation_undelivered"
+
+// fixupReportingObligationUndeliveredPayload is the audit payload for a
+// fixup_reporting_obligation_undelivered entry (#2737).
+type fixupReportingObligationUndeliveredPayload struct {
+	DeclaredCount    int                              `json:"declared_count"`
+	UndeliveredCount int                              `json:"undelivered_count"`
+	Obligations      []fixupReportingObligationDetail `json:"obligations"`
+}
+
+// fixupReportingObligationDetail is one undelivered obligation on the audit
+// payload: its stable id, the routed channel it arrived on, whether the agent
+// left it `unreported` or honestly `declined`, and the bounded excerpt of the
+// operator's instruction.
+type fixupReportingObligationDetail struct {
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	Status      string `json:"status"`
+	TextExcerpt string `json:"text_excerpt"`
+	// Untrusted marks an excerpt that came from an acceptance-derived concern
+	// note rather than from operator-authored text, so an operator reading the
+	// audit row knows the excerpt is quoted validator output and not their own
+	// instruction. omitempty keeps the operator-authored (common) payload
+	// byte-identical to before the field existed.
+	Untrusted bool `json:"untrusted,omitempty"`
+}
+
 // concernRelitigationSuppressedCategory is the audit-log category for the
 // deterministic re-litigation guard (#1913): a reviewer concern whose
 // settled_ref resolves to a same-run/same-stage WAIVED or DEFERRED concern and
@@ -3540,6 +3575,97 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", aerr.Error()),
 				)
+			}
+		}
+	}
+
+	// Routed-reporting-obligation undelivered pre-review signal (#2737). A
+	// fix-up pass can be routed an instruction that asks the agent to RECORD
+	// something on a report surface, and the slim fix-up prompt renders NO
+	// PR-description block (the PR already exists), so such an instruction can
+	// be declined with nothing marking the omission: the verify gate certifies
+	// only the tree and the implement review is diff-only. Re-derive the
+	// DECLARED obligation set from the same stage_fixup_triggered audit entry
+	// the fix-up prompt rendered from (shared resolver — same entry, same ids),
+	// subtract the agent's runner-validated `met` reports carried on
+	// gate_evidence, and signal any remainder. Adjacent to the #1407 block and
+	// using the same allocate-if-nil gateEvidence pattern.
+	//
+	// EVIDENCE ONLY, byte-for-byte the #1407 posture: this branch appends an
+	// advisory audit entry and sets a prompt field. It NEVER touches the review
+	// outcome, the stage result, or the fix-up budget — pinned by
+	// TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome.
+	// A stage with no fix-up trigger derives no obligations and never enters it.
+	//
+	// The declared set is re-derived from the EXACT stage_fixup_triggered entry
+	// the served fix-up prompt pinned (its fixup_report_obligations_declared
+	// anchor), NOT from whichever entry is newest now: a second fix-up triggered
+	// for this stage between the serve and this review would otherwise make the
+	// review report ids the agent never saw. No anchor (no fix-up prompt for this
+	// stage ever rendered an obligation block, or the anchor append failed) means
+	// no signal — the fail-safe direction for an evidence-only surface.
+	var declared []fixupobligation.Obligation
+	if anchorSeq := s.resolveFixupReportObligationAnchor(ctx, runID, stageID); anchorSeq > 0 {
+		declared, _ = s.resolveFixupReportObligations(ctx, runID, stageID, anchorSeq)
+	}
+	if len(declared) > 0 {
+		var reports []fixupobligation.Report
+		if gateEvidence != nil {
+			for _, r := range gateEvidence.FixupObligationReports {
+				reports = append(reports, fixupobligation.Report{ID: r.ID, Status: r.Status})
+			}
+		}
+		if undelivered := fixupobligation.Undelivered(declared, reports); len(undelivered) > 0 {
+			if gateEvidence == nil {
+				gateEvidence = &prompt.GateEvidence{}
+				trig.GateEvidence = gateEvidence
+			}
+			details := make([]fixupReportingObligationDetail, 0, len(undelivered))
+			for _, f := range undelivered {
+				gateEvidence.FixupReportingObligations = append(gateEvidence.FixupReportingObligations,
+					prompt.GateFixupReportingObligation{
+						ID:     f.ID,
+						Source: string(f.Source),
+						Status: f.Status,
+						Text:   f.Text,
+						// Trust provenance rides through from the resolver so
+						// an acceptance-derived excerpt reaches the reviewer
+						// prompt quarantined rather than inline (#2737 fix-up).
+						Untrusted: f.Untrusted,
+					})
+				details = append(details, fixupReportingObligationDetail{
+					ID:          f.ID,
+					Source:      string(f.Source),
+					Status:      f.Status,
+					TextExcerpt: f.Text,
+					Untrusted:   f.Untrusted,
+				})
+			}
+			// Best-effort advisory append with a WARN on failure; a nil
+			// AuditRepo skips the entry (mirrors the #1407 guard). The resolver
+			// above already returned nil under a nil AuditRepo, so this guard is
+			// belt-and-braces rather than the sole defense.
+			if s.cfg.AuditRepo != nil {
+				payload, _ := json.Marshal(fixupReportingObligationUndeliveredPayload{
+					DeclaredCount:    len(declared),
+					UndeliveredCount: len(undelivered),
+					Obligations:      details,
+				})
+				systemKind := audit.ActorKind("system")
+				if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+					RunID:     runID,
+					StageID:   &stageID,
+					Timestamp: time.Now().UTC(),
+					Category:  fixupReportingObligationUndeliveredCategory,
+					ActorKind: &systemKind,
+					Payload:   payload,
+				}); aerr != nil {
+					s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append fixup_reporting_obligation_undelivered audit entry failed",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", aerr.Error()),
+					)
+				}
 			}
 		}
 	}
@@ -5588,6 +5714,16 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 			ClaimedVerifyStatus: ev.FixupSelfReportDivergence.ClaimedVerifyStatus,
 			ActualVerifyStatus:  ev.FixupSelfReportDivergence.ActualVerifyStatus,
 		}
+	}
+	// Fix-up per-obligation self-reports (#2737). Carrier only — the prompt
+	// never renders these; runImplementReviews subtracts the `met` entries from
+	// the declared set it re-derives and renders only the remainder. The wire
+	// shape carries no agent-authored free text, by design.
+	for _, r := range ev.FixupReportingObligations {
+		out.FixupObligationReports = append(out.FixupObligationReports, prompt.GateFixupObligationReport{
+			ID:     r.ID,
+			Status: r.Status,
+		})
 	}
 	return out
 }

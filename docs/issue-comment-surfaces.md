@@ -600,6 +600,41 @@ Notes:
   pre-review surface for the partial / operator-added case. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The routed-reporting-obligation audit kind —
+  `fixup_reporting_obligation_undelivered` (#2737), written by the
+  implement-review assembly path (`trace.go::runImplementReviews`) before any
+  reviewer verdict — is an **internal, advisory audit kind, not an
+  issue-comment surface**. Nothing in `issuecomment` posts it to the issue
+  thread. It fires when a fix-up pass leaves a routed REPORTING obligation — an
+  operator instruction to RECORD something on a report surface, e.g. "record the
+  per-deletion counterfactual results in the PR body's `## Notes`" — without a
+  valid `met` entry in the fix-up self-report sidecar. Payload
+  `{declared_count, undelivered_count, obligations:[{id, source, status,
+  text_excerpt}]}`, where `status` is `unreported` (the agent said nothing, or
+  its report failed the runner's fail-closed validation) or `declined` (it
+  answered and honestly declined). Advisory + best-effort — a nil `AuditRepo`, a
+  list error, or a malformed trigger payload contributes nothing and never
+  blocks the review, and the entry is written only when the undelivered set is
+  non-empty (a pass whose every obligation carries a `met` report keeps the
+  prompt byte-identical and emits no entry). The same set is rendered into the
+  implement-review prompt's gate-evidence section as a distinct high-priority
+  block. EVIDENCE ONLY: it never fails, re-opens, or re-budgets the pass. Listed
+  here only so a future reader grepping the audit categories doesn't mistake it
+  for a comment surface.
+- The paired anchor kind — `fixup_report_obligations_declared` (#2737), written
+  by the runner-facing fix-up prompt SERVE (`prompt.go::handleGetStagePrompt` →
+  `recordFixupReportObligationsDeclared`) — is likewise an **internal audit kind,
+  not an issue-comment surface**. It records WHICH `stage_fixup_triggered` entry
+  the served prompt derived its reporting-obligation block from, by audit
+  sequence: payload `{trigger_sequence, obligation_ids}`. The implement review
+  resolves that exact entry rather than re-selecting the newest one, so a second
+  fix-up triggered for the same stage between the serve and the review cannot
+  make the review report obligation ids the agent's prompt never named. Written
+  only when the served prompt actually renders the block, and never by the SPA
+  `prompt-render` preview (a preview must not re-pin a live pass). Best-effort —
+  an append failure WARNs, and the consequence is simply that the review emits no
+  signal, the fail-safe direction. Listed here only so a future reader grepping
+  the audit categories doesn't mistake it for a comment surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,

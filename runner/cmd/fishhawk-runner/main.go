@@ -2118,10 +2118,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// NEVER touches res.OK / res.FailureCategory / budget (that would reintroduce
 	// the #1150 budget-wedge family).
 	if stageType == "implement" && cfg.fixup {
-		claimed := loadFixupSelfReport(cfg, logSink)
+		selfReport := loadFixupSelfReport(cfg, logSink)
+		claimed := selfReport.verifyStatus
 		actual := terminalVerifyOutcome(res.Events)
 		if fixupSelfReportDiverges(claimed, actual) {
 			res.Events = append(res.Events, fixupSelfReportDivergenceEvent(cfg, claimed, actual))
+		}
+		// Routed reporting obligations (#2737): carry the surviving per-obligation
+		// reports to the backend beside the divergence flag, so the implement
+		// review can subtract the `met` ones from the obligation set it
+		// re-derives. EVIDENCE ONLY, same as the divergence above — this block
+		// NEVER touches res.OK / res.FailureCategory / budget.
+		if len(selfReport.obligations) > 0 {
+			res.Events = append(res.Events, fixupReportingObligationsEvent(cfg, selfReport.obligations))
 		}
 	}
 
@@ -8627,6 +8636,143 @@ type fixupSelfReport struct {
 	RunID        string `json:"run_id"`
 	StageID      string `json:"stage_id"`
 	VerifyStatus string `json:"verify_status"`
+	// Obligations is the OPTIONAL per-obligation report array (#2737): one
+	// entry per routed REPORTING obligation the fix-up prompt named by id.
+	Obligations []fixupObligationReport `json:"obligations"`
+}
+
+// fixupObligationReport is one agent entry in the sidecar's `obligations`
+// array (#2737): the obligation id, the claimed status (`met` | `declined`),
+// the attestation text for a `met`, and the reason for a `declined`.
+type fixupObligationReport struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Record string `json:"record"`
+	Reason string `json:"reason"`
+}
+
+// fixupSelfReportResult is the validated content of a fix-up self-report
+// sidecar (#1210 + #2737): the claimed committed-tree verify status (empty when
+// absent/invalid, exactly as before) and the per-obligation reports that
+// survived fail-closed validation, already reduced to the transmissible
+// {id, status} shape.
+type fixupSelfReportResult struct {
+	verifyStatus string
+	obligations  []fixupReportingObligationEvidence
+}
+
+// maxFixupObligationIDDigits bounds the numeric suffix a valid obligation id may
+// carry. Detect never mints more than a handful of ids per pass, so four digits
+// is far above any real set while keeping the accepted id space finite.
+const maxFixupObligationIDDigits = 4
+
+// validFixupObligationID reports whether id is EXACTLY the `ob-N` shape
+// backend/internal/fixupobligation mints (N a positive decimal integer, no
+// leading zero, at most maxFixupObligationIDDigits digits).
+//
+// The id is AGENT-authored — it is read out of the sidecar the fix-up agent
+// writes — and it is the one obligation field that must still cross the upload
+// boundary, because the backend's join has nothing to key on without it. So it
+// is constrained to a closed, non-content-bearing shape rather than merely
+// checked non-empty: an unconstrained id string would reinstate exactly the
+// free-text egress channel the record/reason fields were removed to close.
+// An id outside the shape can match no declared obligation anyway, so dropping
+// it costs nothing and leaves its obligation undelivered — the safe direction.
+func validFixupObligationID(id string) bool {
+	const prefix = "ob-"
+	if !strings.HasPrefix(id, prefix) {
+		return false
+	}
+	digits := id[len(prefix):]
+	if len(digits) == 0 || len(digits) > maxFixupObligationIDDigits || digits[0] == '0' {
+		return false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// safeFixupObligationStatus returns status when it is one of the two literals
+// the sidecar may carry and "<invalid>" otherwise, so a drop log never echoes an
+// arbitrary agent-authored string back into the runner log.
+func safeFixupObligationStatus(status string) string {
+	if status == "met" || status == "declined" {
+		return status
+	}
+	return "<invalid>"
+}
+
+// safeFixupObligationID returns id when it is a valid `ob-N` and "<invalid>"
+// otherwise, for the same reason as safeFixupObligationStatus.
+func safeFixupObligationID(id string) string {
+	if validFixupObligationID(id) {
+		return id
+	}
+	return "<invalid>"
+}
+
+// validateFixupObligationReports applies the fail-closed PER-ENTRY rules to the
+// sidecar's `obligations` array (#2737). An entry is DROPPED — with a named log
+// event carrying the id and the reason — when its id is not the exact `ob-N`
+// shape, its status is not exactly `met` or `declined`, its status is `met`
+// with an empty/whitespace `record`, or its status is `declined` with an
+// empty/whitespace `reason`.
+//
+// Dropping is the SAFE direction: a dropped `met` leaves its obligation
+// undelivered and the backend's advisory signal fires. The complementary
+// direction — admitting a malformed `met` — would falsely satisfy an obligation
+// and silence the very signal this exists to raise.
+//
+// The agent's `record`/`reason` TEXT is required but NOT retained (#2737
+// security fix-up). The fix-up agent runs arbitrary repository commands, so it
+// controls every byte of that text; carrying it over the trace bundle into the
+// reviewer's prompt would be an egress path for repository content that never
+// appears in the committed diff, and no amount of flattening or quarantining at
+// the render site changes WHAT it can carry — only how much authority it has.
+// So the text is validated here, on the runner, and discarded: what crosses the
+// upload boundary is the shape-constrained id and the status literal, which is
+// everything the backend's join needs and nothing an agent can smuggle content
+// through.
+//
+// These rules NEVER widen the existing whole-sidecar rules: malformed JSON, a
+// run/stage id mismatch, and an unknown verify_status keep today's exact
+// behavior and logs, and are handled by the caller before this runs.
+func validateFixupObligationReports(cfg config, in []fixupObligationReport, logSink io.Writer) []fixupReportingObligationEvidence {
+	var out []fixupReportingObligationEvidence
+	for _, e := range in {
+		drop := func(reason string) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_obligation_report_dropped","run_id":%q,"stage_id":%q,"obligation_id":%q,"status":%q,"reason":%q}`+"\n",
+				cfg.runID, cfg.stageID,
+				safeFixupObligationID(e.ID), safeFixupObligationStatus(e.Status), reason)
+		}
+		if !validFixupObligationID(e.ID) {
+			drop("invalid_id")
+			continue
+		}
+		switch e.Status {
+		case "met":
+			if strings.TrimSpace(e.Record) == "" {
+				drop("met_without_record")
+				continue
+			}
+		case "declined":
+			if strings.TrimSpace(e.Reason) == "" {
+				drop("declined_without_reason")
+				continue
+			}
+		default:
+			drop("unknown_status")
+			continue
+		}
+		// Only the join key and the status literal are retained; the
+		// agent-authored text is deliberately dropped on the floor here.
+		out = append(out, fixupReportingObligationEvidence{ID: e.ID, Status: e.Status})
+	}
+	return out
 }
 
 // sweepStaleFixupSelfReport deletes any leftover fix-up self-report sidecar at
@@ -8655,15 +8801,26 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 //   - fails closed ("") when verify_status is not in {"passed","failed"}
 //     (including absent/empty), logging fixup_selfreport_status_ignored.
 //
-// Returns the validated claimed verify status ("passed" | "failed") or "".
-func loadFixupSelfReport(cfg config, logSink io.Writer) string {
+// Since #2737 it ALSO parses the optional `obligations` array and validates it
+// fail-closed PER ENTRY (validateFixupObligationReports). The whole-sidecar
+// rules above are unchanged and still dominate: malformed JSON or a stale
+// run/stage id discards the ENTIRE sidecar including its obligation reports, so
+// a foreign run's reports can never satisfy this stage's obligations. An
+// unknown verify_status is the one non-fatal case — it zeroes the claim exactly
+// as before while the obligation reports are still parsed, because the two
+// signals are independent and a bad verify claim should not erase an honest
+// obligation record.
+//
+// Returns the validated claimed verify status ("passed" | "failed", or "") plus
+// the surviving obligation reports.
+func loadFixupSelfReport(cfg config, logSink io.Writer) fixupSelfReportResult {
 	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		// Absent sidecar is the common no-op (the agent reported nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can claim anything, so no log on the not-exist path.
-		return ""
+		return fixupSelfReportResult{}
 	}
 	// A present sidecar is consumed regardless of outcome: remove it on every
 	// return path so a malformed/stale/parsed sidecar is never left behind.
@@ -8674,21 +8831,24 @@ func loadFixupSelfReport(cfg config, logSink io.Writer) string {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_selfreport_invalid","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			cfg.runID, cfg.stageID, path)
-		return ""
+		return fixupSelfReportResult{}
 	}
 	if doc.RunID != cfg.runID || doc.StageID != cfg.stageID {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_selfreport_stale","run_id":%q,"stage_id":%q,"sidecar_run_id":%q,"sidecar_stage_id":%q}`+"\n",
 			cfg.runID, cfg.stageID, doc.RunID, doc.StageID)
-		return ""
+		return fixupSelfReportResult{}
 	}
+	out := fixupSelfReportResult{}
 	if doc.VerifyStatus != "passed" && doc.VerifyStatus != "failed" {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_selfreport_status_ignored","run_id":%q,"stage_id":%q,"verify_status":%q}`+"\n",
 			cfg.runID, cfg.stageID, doc.VerifyStatus)
-		return ""
+	} else {
+		out.verifyStatus = doc.VerifyStatus
 	}
-	return doc.VerifyStatus
+	out.obligations = validateFixupObligationReports(cfg, doc.Obligations, logSink)
+	return out
 }
 
 // fixupCommitMessageDir is the directory the run/stage-keyed fix-up commit-
@@ -9021,6 +9181,27 @@ func fixupSelfReportDivergenceEvent(cfg config, claimed, actual string) agent.Ev
 			"stage_id":              cfg.stageID,
 			"claimed_verify_status": claimed,
 			"actual_verify_status":  actual,
+		}),
+	}
+}
+
+// fixupReportingObligationsEvent carries the VALIDATED per-obligation
+// self-reports (#2737) into the trace bundle so composeGateEvidence folds them
+// into gate_evidence for the implement review's join.
+//
+// Each entry is {id, status} and NOTHING else, matching the backend's
+// bundle.FixupReportingObligationEvidence mirror. The agent's attestation and
+// decline-reason text is validated on the runner and discarded there
+// (validateFixupObligationReports) rather than transmitted: it is
+// agent-controlled free text that would otherwise reach the reviewer's prompt
+// without ever appearing in the committed diff.
+func fixupReportingObligationsEvent(cfg config, entries []fixupReportingObligationEvidence) agent.Event {
+	return agent.Event{
+		Kind: "fixup_reporting_obligations",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":      cfg.runID,
+			"stage_id":    cfg.stageID,
+			"obligations": entries,
 		}),
 	}
 }
