@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
@@ -2936,5 +2938,339 @@ func TestNextActions_AwaitingScopeDecision_OffersAmend(t *testing.T) {
 	}
 	if !strings.Contains(dec.Precondition, "build_required_paths") {
 		t.Errorf("precondition must point the operator at the build_required_paths payload key; got %q", dec.Precondition)
+	}
+}
+
+// --- failure-signature block (#1703) ---------------------------------------
+
+// naFailedStageWithProgress builds a failed stage carrying a stage_progress
+// heartbeat, so the counter-anchored signature can be driven.
+func naFailedStageWithProgress(category, reason string, turns, tokens int) Stage {
+	s := naFailedImplement(category, reason)
+	s.Progress = &StageProgress{LastEvent: "assistant", TurnsThisAttempt: turns, TokensThisAttempt: tokens}
+	return s
+}
+
+// TestNextActions_SignatureAttachedOnMatch is the CROSS-BOUNDARY test: a
+// persistence-shaped failed Stage row travels failureSignatureFor's Evidence
+// adapter, through failuresig.Match, into the rendered NextActions block. The
+// fixture's reason is the literal the runner emits
+// (runner/cmd/fishhawk-runner/main.go:779's runner_failed reason, relayed
+// verbatim into failure_reason by the reap-failure endpoint), so a change in
+// that relay breaks the fixture's realism.
+//
+// Per-layer units alone would pass while the adapter dropped a field; this
+// pins the whole seam.
+func TestNextActions_SignatureAttachedOnMatch(t *testing.T) {
+	run := naRun("failed")
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naFailedImplement("C", `lineage_lock: another runner holds the lineage lock (detail: "run 8f3a")`),
+	}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil {
+		t.Fatal("nextActionsFor returned nil")
+	}
+	if na.Signature == nil {
+		t.Fatal("Signature is nil, want lineage_lock_contention")
+	}
+	if na.Signature.ID != "lineage_lock_contention" {
+		t.Fatalf("Signature.ID = %q, want lineage_lock_contention", na.Signature.ID)
+	}
+	if na.Signature.RegistryVersion != failuresig.RegistryVersion {
+		t.Errorf("Signature.RegistryVersion = %q, want %q", na.Signature.RegistryVersion, failuresig.RegistryVersion)
+	}
+	if len(na.Signature.Playbook) == 0 {
+		t.Error("Signature.Playbook is empty — the hint carries no recovery")
+	}
+	if na.Signature.Means == "" || na.Signature.Title == "" {
+		t.Errorf("Signature is incomplete: %+v", na.Signature)
+	}
+}
+
+// TestNextActions_SignatureCounterAnchoredSeam pins the OTHER adapter arm: the
+// counter-anchored signature reads stage.Progress and run.RetryAttempt, so
+// this fails if the adapter drops either.
+func TestNextActions_SignatureCounterAnchoredSeam(t *testing.T) {
+	run := naRun("failed")
+	run.RetryAttempt = 2
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naFailedStageWithProgress("A", "agent exited with exit status 1", 0, 0),
+	}
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.Signature == nil {
+		t.Fatalf("Signature is nil, want agent_no_progress_repeat (na=%+v)", na)
+	}
+	if na.Signature.ID != "agent_no_progress_repeat" {
+		t.Fatalf("Signature.ID = %q, want agent_no_progress_repeat", na.Signature.ID)
+	}
+}
+
+// naGenericCategoryAReason is the classifier's generic category-A retry reason
+// — the exact prose an unrecognized category-A failure has always produced.
+// Asserting the LITERAL (rather than diffing two calls of the same function,
+// which would run the fold on both sides and hide a mutation) is what makes
+// "behaves exactly as today" a real pin.
+const naGenericCategoryAReason = "category-A (agent) failure — fishhawk_retry_stage retries it in place; read the trace first for transient harness errors"
+
+// TestNextActions_UnmatchedFailureBehavesExactlyAsToday is the fail-open
+// assertion: a failed stage whose reason matches no anchor carries NO
+// signature, and its state / action names / retry reason are the values the
+// classifier produced before the registry existed.
+func TestNextActions_UnmatchedFailureBehavesExactlyAsToday(t *testing.T) {
+	run := naRun("failed")
+	impl := naFailedImplement("A", "the agent could not satisfy the binding assertion in step 4")
+	stages := []Stage{naStage("plan", "succeeded"), impl}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil {
+		t.Fatal("nextActionsFor returned nil")
+	}
+	if na.Signature != nil {
+		t.Fatalf("Signature = %+v, want nil on an unrecognized reason", na.Signature)
+	}
+	if na.State != "implement_failed_category_a" {
+		t.Errorf("State = %q, want implement_failed_category_a", na.State)
+	}
+	wantActions := []string{"fishhawk_retry_stage", "fishhawk_revive_run"}
+	if got := actionNames(na); !reflect.DeepEqual(got, wantActions) {
+		t.Errorf("actions = %v, want %v", got, wantActions)
+	}
+	if got := findAction(t, na, "fishhawk_retry_stage").Reason; got != naGenericCategoryAReason {
+		t.Errorf("retry reason = %q, want the pre-registry generic reason %q", got, naGenericCategoryAReason)
+	}
+}
+
+// TestNextActions_MatchedFailureKeepsTodaysActions is the other half of the
+// same claim: a MATCHED failure keeps the identical state / action names /
+// retry reason. Only the additive signature block appears.
+func TestNextActions_MatchedFailureKeepsTodaysActions(t *testing.T) {
+	run := naRun("failed")
+	run.RetryAttempt = 1
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naFailedStageWithProgress("A", "agent exited with exit status 1", 0, 0),
+	}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.Signature == nil {
+		t.Fatalf("want a matched signature, got %+v", na)
+	}
+	if na.State != "implement_failed_category_a" {
+		t.Errorf("State = %q, want implement_failed_category_a", na.State)
+	}
+	wantActions := []string{"fishhawk_retry_stage", "fishhawk_revive_run"}
+	if got := actionNames(na); !reflect.DeepEqual(got, wantActions) {
+		t.Errorf("actions = %v, want %v — a match must not change the legal next moves", got, wantActions)
+	}
+	if got := findAction(t, na, "fishhawk_retry_stage").Reason; got != naGenericCategoryAReason {
+		t.Errorf("retry reason = %q, want the unchanged generic reason %q", got, naGenericCategoryAReason)
+	}
+}
+
+// naSignatureFixture is one evidence shape per catalog entry.
+type naSignatureFixture struct {
+	id     string
+	run    *Run
+	stages []Stage
+}
+
+func naSignatureFixtures() []naSignatureFixture {
+	noProgressRun := naRun("failed")
+	noProgressRun.RetryAttempt = 1
+	return []naSignatureFixture{
+		{id: "external_api_incident", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "terminal external API error 529 (retries exhausted): exit status 1")}},
+		{id: "model_quota_exhausted", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "could not obtain model quota (likely a usage/rate cap): 0 tokens")}},
+		{id: "slice_integration_conflict", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "slice integration conflict: slice 2 could not merge")}},
+		{id: "lineage_lock_contention", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("C", "lineage_lock: another runner holds the lineage lock")}},
+		{id: "zero_exit_strand", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("D", "runner exited 0 without settling the stage (state=running)")}},
+		{id: "runner_died_before_reporting", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("D", "runner exited 5 before reporting a terminal state")}},
+		{id: "infra_flake_recurred", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "verify gate failed after verify_infra_flake_retry absorbed one flake")}},
+		{id: "agent_no_progress_repeat", run: noProgressRun,
+			stages: []Stage{naStage("plan", "succeeded"), naFailedStageWithProgress("A", "agent exited with exit status 1", 0, 0)}},
+	}
+}
+
+// TestNextActions_SignatureNeverMutatesActions is the counterfactual vehicle
+// for the never-mutates-actions invariant, driven through foldFailureSignature
+// DIRECTLY against a pristine sentinel action list.
+//
+// Going direct is deliberate: diffing two nextActionsFor calls would run the
+// fold on BOTH sides, so a fold that prepended the playbook would appear in
+// the baseline too and the test would stay green. The sentinel list is built
+// in the test and never passes through the fold's producer, so the only thing
+// that can change it is the fold itself.
+//
+// Every catalog entry is driven, so a new signature cannot ship without this
+// assertion.
+func TestNextActions_SignatureNeverMutatesActions(t *testing.T) {
+	sentinel := []SuggestedAction{
+		{Action: "fishhawk_retry_stage", Params: map[string]string{"stage_id": "s1"}, Precondition: "p1", Consumes: consumesRetryBudget, Reason: "r1"},
+		{Action: "fishhawk_revive_run", Params: map[string]string{"run_id": "r1"}, Precondition: "p2", Consumes: consumesRetryBudget, Reason: "r2"},
+	}
+
+	covered := map[string]struct{}{}
+	for _, f := range naSignatureFixtures() {
+		t.Run(f.id, func(t *testing.T) {
+			want := append([]SuggestedAction(nil), sentinel...)
+			na := &NextActions{State: "sentinel_state", Actions: append([]SuggestedAction(nil), sentinel...)}
+
+			foldFailureSignature(f.run, f.stages, na)
+
+			if na.Signature == nil {
+				t.Fatalf("fixture did not match a signature (want %s)", f.id)
+			}
+			if na.Signature.ID != f.id {
+				t.Fatalf("Signature.ID = %q, want %q", na.Signature.ID, f.id)
+			}
+			covered[f.id] = struct{}{}
+
+			if !reflect.DeepEqual(na.Actions, want) {
+				t.Fatalf("the signature fold mutated the actions list:\n got %+v\nwant %+v", na.Actions, want)
+			}
+			if na.State != "sentinel_state" {
+				t.Fatalf("the signature fold changed the state: %q", na.State)
+			}
+		})
+	}
+
+	for _, sig := range failuresig.Registry() {
+		if _, ok := covered[sig.ID]; !ok {
+			t.Errorf("catalog entry %q has no never-mutates-actions fixture", sig.ID)
+		}
+	}
+}
+
+// TestNextActions_SignatureFoldIsAdditiveEndToEnd complements the direct fold
+// test: through the REAL classifier, every catalog fixture keeps a non-empty
+// action list and gains only the block.
+func TestNextActions_SignatureFoldIsAdditiveEndToEnd(t *testing.T) {
+	for _, f := range naSignatureFixtures() {
+		t.Run(f.id, func(t *testing.T) {
+			na := nextActionsFor(f.run, f.stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+			if na == nil || na.Signature == nil {
+				t.Fatalf("want a matched signature for %s, got %+v", f.id, na)
+			}
+			if na.Signature.ID != f.id {
+				t.Fatalf("Signature.ID = %q, want %q", na.Signature.ID, f.id)
+			}
+			if len(na.Actions) == 0 {
+				t.Fatal("the action list is empty — the block must never replace the actions")
+			}
+			for _, a := range na.Actions {
+				if strings.Contains(a.Reason, na.Signature.Playbook[0]) {
+					t.Fatalf("a playbook step leaked into action %q's reason", a.Action)
+				}
+			}
+		})
+	}
+}
+
+// TestNextActions_SignatureOnCIFailedPath pins that the ci_failed EARLY RETURN
+// also carries the block — the fold is on both return paths.
+func TestNextActions_SignatureOnCIFailedPath(t *testing.T) {
+	run := naRun("running")
+	prURL := "https://github.com/x/y/pull/42"
+	run.PullRequestURL = &prURL
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naFailedImplement("A", "terminal external API error 529 (retries exhausted): exit status 1"),
+	}
+	drv := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, drv, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.Signature == nil {
+		t.Fatalf("ci_failed path carried no signature (na=%+v)", na)
+	}
+	if na.Signature.ID != "external_api_incident" {
+		t.Fatalf("Signature.ID = %q, want external_api_incident", na.Signature.ID)
+	}
+}
+
+// TestNextActions_NoFailedStageNoSignature is a counterfactual vehicle for the
+// nil-safety guard in failureSignatureFor: a healthy run must carry no
+// signature, and an empty stage slice must not panic.
+func TestNextActions_NoFailedStageNoSignature(t *testing.T) {
+	t.Run("healthy run", func(t *testing.T) {
+		run := naRun("running")
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "running")}
+		na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil {
+			t.Fatal("nextActionsFor returned nil")
+		}
+		if na.Signature != nil {
+			t.Fatalf("Signature = %+v, want nil on a run with no failed stage", na.Signature)
+		}
+	})
+	t.Run("no stages at all", func(t *testing.T) {
+		run := naRun("pending")
+		na := nextActionsFor(run, nil, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil {
+			t.Fatal("nextActionsFor returned nil")
+		}
+		if na.Signature != nil {
+			t.Fatalf("Signature = %+v, want nil with no stages", na.Signature)
+		}
+	})
+}
+
+// TestNextActions_NilRunSafe pins the nil-run guards on BOTH surfaces. The
+// direct failureSignatureFor call is deliberate: nextActionsFor returns early
+// on a nil run, so only a direct call reaches that guard — deleting it turns
+// this RED on a nil deref rather than leaving it vacuously green.
+func TestNextActions_NilRunSafe(t *testing.T) {
+	if na := nextActionsFor(nil, nil, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{}); na != nil {
+		t.Fatalf("nextActionsFor(nil run) = %+v, want nil", na)
+	}
+	stages := []Stage{naFailedImplement("A", "terminal external API error 529 (retries exhausted)")}
+	if got := failureSignatureFor(nil, stages); got != nil {
+		t.Fatalf("failureSignatureFor(nil run) = %+v, want nil", got)
+	}
+	// foldFailureSignature tolerates a nil block (the nil-run early return
+	// upstream is the only producer, but the guard is the contract).
+	foldFailureSignature(nil, stages, nil)
+}
+
+// TestNextActions_SignatureUsesFirstFailedStage pins the diagnosis-stage
+// choice: stages are sequence-ordered, so the EARLIEST failure explains the
+// run.
+func TestNextActions_SignatureUsesFirstFailedStage(t *testing.T) {
+	run := naRun("failed")
+	stages := []Stage{
+		naFailedImplement("A", "terminal external API error 529 (retries exhausted)"),
+		naFailedImplement("A", "verify_infra_flake_retry recurred"),
+	}
+	got := failureSignatureFor(run, stages)
+	if got == nil || got.ID != "external_api_incident" {
+		t.Fatalf("failureSignatureFor = %+v, want external_api_incident from the FIRST failed stage", got)
+	}
+}
+
+// TestFailureSignatureAnchorsMatchNextActionsPhrases pins that the classifier's
+// failure-reason literals are SOURCED FROM the registry, not re-declared
+// locally. A future local copy that drifts fails here loudly, rather than
+// silently presenting as "no signature matched" while the surrounding action
+// still fires.
+func TestFailureSignatureAnchorsMatchNextActionsPhrases(t *testing.T) {
+	if externalAPIReasonPhrase != failuresig.AnchorExternalAPIError {
+		t.Errorf("externalAPIReasonPhrase = %q, registry anchor = %q", externalAPIReasonPhrase, failuresig.AnchorExternalAPIError)
+	}
+	if quotaUnavailableReasonPhrase != failuresig.AnchorQuotaUnavailable {
+		t.Errorf("quotaUnavailableReasonPhrase = %q, registry anchor = %q", quotaUnavailableReasonPhrase, failuresig.AnchorQuotaUnavailable)
+	}
+	if sliceIntegrationConflictReasonPrefix != failuresig.AnchorSliceIntegrationConflict {
+		t.Errorf("sliceIntegrationConflictReasonPrefix = %q, registry anchor = %q", sliceIntegrationConflictReasonPrefix, failuresig.AnchorSliceIntegrationConflict)
+	}
+	if len(flakeTraceEvents) != 1 || flakeTraceEvents[0] != failuresig.AnchorVerifyInfraFlake {
+		t.Errorf("flakeTraceEvents = %v, registry anchor = %q", flakeTraceEvents, failuresig.AnchorVerifyInfraFlake)
 	}
 }

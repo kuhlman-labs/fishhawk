@@ -649,6 +649,18 @@ var runStatusPathTable = []pathClassification{
 	// --- next_actions.* --------------------------------------------------
 	{Path: "next_actions.state", Tier: tierNever},
 	{Path: "next_actions.actions", Tier: "T9", Class: classComputed},
+	// signature (#1703) is the failure-signature registry's display-only
+	// recovery hint. It is CONSTANT-SIZE by construction — failuresig.Hint
+	// carries only registry-owned strings and echoes no run data, pinned by
+	// failuresig's TestMatchBlockIsConstantSize / TestMatchBlockNeverEchoesEvidence
+	// against a named cap — so it can ride the budget untiered exactly like the
+	// adjacent next_actions.state leaf, without an elision entry to itemise.
+	// Because failuresig.Hint is NOT in retainedCompositeTypes(),
+	// classifiedResponsePaths emits it as ONE leaf, so this single row satisfies
+	// the reflection pin. The diagnosis skeleton rebuilds NextActions from State
+	// alone and the floor rebuilds it as a presence marker, so neither carries
+	// the block and both stay constant-size.
+	{Path: "next_actions.signature", Tier: tierNever},
 }
 
 // pathClassificationFor looks a path up in the table.

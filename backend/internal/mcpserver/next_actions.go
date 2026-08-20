@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 )
 
 // next_actions (#1024) generalizes the review_action_hint pattern
@@ -40,7 +42,14 @@ const (
 // no backend contract). When one appears in the implement stage's
 // failure reason, the retry_stage action's reason names it so the
 // operator knows a retry is the cheapest next step.
-var flakeTraceEvents = []string{"verify_infra_flake_retry"}
+//
+// SOURCED FROM the failure-signature registry (#1703), not declared here: the
+// registry is the ONE place the backend module declares these literals, so the
+// signature hint and the surrounding action can never disagree about what a
+// failure is. A local re-declaration would drift silently — the hint stops
+// matching while the action still fires, which reads as "no signature
+// matched". TestFailureSignatureAnchorsMatchNextActionsPhrases pins it.
+var flakeTraceEvents = []string{failuresig.AnchorVerifyInfraFlake}
 
 // SuggestedAction is one legal next move for the run's current state.
 // Action is a tool name (fishhawk_resume_run, fishhawk_merge_run) or a
@@ -62,6 +71,13 @@ type SuggestedAction struct {
 type NextActions struct {
 	State   string            `json:"state" jsonschema:"the classified run lifecycle state, e.g. plan_gate_parked, plan_awaiting_input, implement_failed_category_b, succeeded_pr_open, terminal states by run state name, or unclassified when no table arm matched"`
 	Actions []SuggestedAction `json:"actions,omitempty" jsonschema:"the legal next moves, ordered (first is the suggested default). Nil only on a terminal run state; every non-terminal state carries at least one entry. Display-only — never gates the run"`
+	// Signature is the failure-signature registry's match on the run's failed
+	// stage (#1703): what the failure MEANS plus the recommended recovery
+	// sequence. ADDITIVE and DISPLAY-ONLY — it never gates a run and never
+	// alters Actions. Absent when no stage failed or when no catalog entry
+	// matched (the fail-open contract), in which case every other field is
+	// byte-identical to what it would be without the registry.
+	Signature *failuresig.Hint `json:"signature,omitempty" jsonschema:"a display-only recovery hint for the run's failed stage: the matched failure-signature id, what the failure means, and the recommended recovery steps. Advisory — it never gates the run and never changes the actions list. Omitted when nothing matched. Catalog: docs/architecture/failure-signatures.md"`
 }
 
 // nextActionsFor classifies the run's lifecycle state and returns the
@@ -85,6 +101,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		}
 		foldLiveValidationAdvisory(run, na)
 		foldWorkingDirParams(run, na)
+		foldFailureSignature(run, stages, na)
 		return na
 	}
 
@@ -106,7 +123,75 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	}
 	foldLiveValidationAdvisory(run, na)
 	foldWorkingDirParams(run, na)
+	foldFailureSignature(run, stages, na)
 	return na
+}
+
+// failureSignatureFor adapts the run's failed stage into failuresig.Evidence
+// and returns the registry's match, or nil (#1703).
+//
+// The diagnosis stage is the FIRST stage in state "failed" — a run's stages
+// are ordered by sequence, so the earliest failure is the one that explains
+// the run. Nil-safe throughout: a nil run, an empty stage slice, or a run with
+// no failed stage all return nil, which is also the fail-open answer.
+func failureSignatureFor(run *Run, stages []Stage) *failuresig.Hint {
+	if run == nil {
+		return nil
+	}
+	var failed *Stage
+	for i := range stages {
+		if stages[i].State == "failed" {
+			failed = &stages[i]
+			break
+		}
+	}
+	if failed == nil {
+		return nil
+	}
+	ev := failuresig.Evidence{
+		StageType:    failed.Type,
+		StageState:   failed.State,
+		RetryAttempt: run.RetryAttempt,
+		RunnerKind:   run.RunnerKind,
+		// The orchestrator's minted-child shape: a parent_run_id plus an
+		// implement stage but NO plan or review stage of its own — the same
+		// in-band signal the category-B decomposition-child arm reads.
+		IsDecompositionChild: run.ParentRunID != nil && stageByType(stages, "plan") == nil && stageByType(stages, "review") == nil,
+	}
+	if failed.FailureCategory != nil {
+		ev.FailureCategory = *failed.FailureCategory
+	}
+	if failed.FailureReason != nil {
+		ev.FailureReason = *failed.FailureReason
+	}
+	// ProgressReported distinguishes "the heartbeat reported zero activity"
+	// from "no heartbeat arrived": an absent Progress block leaves the counters
+	// at zero, which must never be read as observed inactivity.
+	if p := failed.Progress; p != nil {
+		ev.ProgressReported = true
+		ev.TurnsThisAttempt = p.TurnsThisAttempt
+		ev.TokensThisAttempt = p.TokensThisAttempt
+	}
+	return failuresig.Match(ev)
+}
+
+// foldFailureSignature attaches the failure-signature hint to na (#1703).
+//
+// It ONLY sets na.Signature. It never appends to, reorders, or rewrites
+// na.Actions — which is what makes both "an unmatched failure behaves exactly
+// as today" and "a matched failure keeps today's actions" trivially true and
+// directly testable. The block is an advisory surface; a hint that changed the
+// operator's legal next moves would be a bug.
+//
+// Folded AFTER the structural empty-actions guard so that guard keeps measuring
+// the classifier's OWN actions, exactly as the live-validation fold requires.
+// na is mutated in place; a nil na (only the nil-run early return upstream) is
+// a no-op.
+func foldFailureSignature(run *Run, stages []Stage, na *NextActions) {
+	if na == nil {
+		return
+	}
+	na.Signature = failureSignatureFor(run, stages)
 }
 
 // workingDirInheritingActions is the closed set of next-action verbs that take
@@ -1564,8 +1649,12 @@ func stageByType(stages []Stage, stageType string) *Stage {
 // #1142). The next_actions arm keys on it to recognize the conflict
 // state; the machine resume target is sourced from the structured
 // slice_integration_conflict audit payload, not parsed from this string.
-// MUST match orchestrator.sliceIntegrationConflictReasonPrefix.
-const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
+// MUST match orchestrator.sliceIntegrationConflictReasonPrefix
+// (backend/internal/orchestrator/orchestrator.go:1855).
+//
+// SOURCED FROM the failure-signature registry (#1703) rather than declared
+// locally, for the same single-source reason as flakeTraceEvents above.
+const sliceIntegrationConflictReasonPrefix = failuresig.AnchorSliceIntegrationConflict
 
 // Acceptance audit categories + verdict/disposition vocabulary (E31.9 /
 // ADR-049). These strings are the cross-module seam between the backend, which
@@ -1719,7 +1808,9 @@ func acceptancePayloadString(payload any, field string) string {
 // parses the integer that follows it to name the status code in the retry
 // hint. It is a best-effort string contract — no backend Stage-field
 // plumbing — mirroring the citedFlakeEvent discipline (see flakeTraceEvents).
-const externalAPIReasonPhrase = "terminal external API error "
+// SOURCED FROM the failure-signature registry (#1703), the single backend-side
+// declaration of these literals.
+const externalAPIReasonPhrase = failuresig.AnchorExternalAPIError
 
 // citedExternalAPIStatus best-effort parses the status code following the
 // stable externalAPIReasonPhrase in the stage's failure reason, returning
@@ -1761,7 +1852,9 @@ func citedExternalAPIStatus(s *Stage) (int, bool) {
 // externalAPIReasonPhrase / citedFlakeEvent discipline. The runner and backend
 // are separate go.work modules and cannot share the constant, so the runner
 // emits this exact prefix and the backend reads it (same #1548 limitation).
-const quotaUnavailableReasonPhrase = "could not obtain model quota"
+// SOURCED FROM the failure-signature registry (#1703), the single backend-side
+// declaration of these literals.
+const quotaUnavailableReasonPhrase = failuresig.AnchorQuotaUnavailable
 
 // citedQuotaUnavailable reports whether the stage's failure reason cites the
 // runner's model-quota-exhaustion phrase. Nil-safe and fail-soft: a nil stage

@@ -17,6 +17,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 )
 
 // ---------------------------------------------------------------------------
@@ -73,8 +75,20 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 		Latency:                  &RunLatency{TotalWaitOnHumanSeconds: 900},
 		ReviewActionHint:         &ReviewActionHint{Concerns: 3, Message: "route the concerns back with fishhawk_fixup_stage"},
 		DriveStatus:              &DriveStatus{Drive: true, DerivedStatus: "ci_failed"},
-		NextActions:              &NextActions{State: "implement_failed_category_a"},
-		ChildrenStatus:           &ChildrenStatus{IntegrationPhase: "running_children", Total: 4},
+		NextActions: &NextActions{
+			State: "implement_failed_category_a",
+			// The failure-signature block (#1703) travels the full marshal /
+			// bound ladder with the fixture, so the byte-budget assertions are
+			// exercised with it present. It is classified tierNever, so no tier
+			// elides it — which is only safe because it is constant-size.
+			Signature: failuresig.Match(failuresig.Evidence{
+				StageType:       "implement",
+				StageState:      "failed",
+				FailureCategory: "A",
+				FailureReason:   "terminal external API error 529 (retries exhausted): exit status 1",
+			}),
+		},
+		ChildrenStatus: &ChildrenStatus{IntegrationPhase: "running_children", Total: 4},
 	}
 	for i := 0; i < 12; i++ {
 		out.Run.Concerns.Items = append(out.Run.Concerns.Items, RunConcernItem{
@@ -1440,5 +1454,61 @@ func TestFloorSurfaceUnion_IsSortedAndDeduplicated(t *testing.T) {
 			t.Errorf("floor union carries duplicate surface %q", s)
 		}
 		seen[s] = true
+	}
+}
+
+// TestNextActionsSignature_RidesTheLadderConstantSize pins the byte-budget
+// coupling of the failure-signature block (#1703).
+//
+// The block is classified tierNever, so no tier elides it — which is safe only
+// because it cannot grow with run data. Three assertions:
+//
+//   - the maximal fixture really carries a block (otherwise every other
+//     assertion here is vacuous);
+//   - the DIAGNOSIS SKELETON and the CONSTANT-SIZE FLOOR both rebuild
+//     next_actions without it, so neither is enlarged by it;
+//   - the floor stays under its existing cap with the block present upstream.
+func TestNextActionsSignature_RidesTheLadderConstantSize(t *testing.T) {
+	runID := uuid.NewString()
+	in := maximalRunStatusOutput(runID)
+	if in.NextActions == nil || in.NextActions.Signature == nil {
+		t.Fatal("the maximal fixture carries no signature block — the ladder assertions below would be vacuous")
+	}
+
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(1))
+	if err != nil {
+		t.Fatalf("skeletonRunStatus: %v", err)
+	}
+	if sk.NextActions == nil {
+		t.Fatal("the skeleton dropped the next_actions presence marker")
+	}
+	if sk.NextActions.Signature != nil {
+		t.Fatalf("the skeleton retained the signature block: %+v", sk.NextActions.Signature)
+	}
+
+	floor, err := minimalRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(minimalRunStatusMaxBytes))
+	if err != nil {
+		t.Fatalf("minimalRunStatus: %v", err)
+	}
+	if floor.NextActions != nil && floor.NextActions.Signature != nil {
+		t.Fatalf("the floor retained the signature block: %+v", floor.NextActions.Signature)
+	}
+	if n := len(mustMarshal(t, floor)); n > minimalRunStatusMaxBytes {
+		t.Fatalf("floor is %d bytes with a signature present upstream, cap is %d", n, minimalRunStatusMaxBytes)
+	}
+}
+
+// TestNextActionsSignature_SurvivesEveryTier pins that no tier elides the
+// block: it is tierNever, exactly like next_actions.state.
+func TestNextActionsSignature_SurvivesEveryTier(t *testing.T) {
+	runID := uuid.NewString()
+	out := maximalRunStatusOutput(runID)
+	led := &elisionLedger{budget: 1}
+	for _, tier := range runStatusTiers {
+		led.tier = tier.name
+		tier.apply(&out, runID, led)
+		if out.NextActions == nil || out.NextActions.Signature == nil {
+			t.Fatalf("tier %s elided the signature block", tier.name)
+		}
 	}
 }
