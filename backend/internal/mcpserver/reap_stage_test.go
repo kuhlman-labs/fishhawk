@@ -1067,54 +1067,131 @@ func TestReapStage_DescriptionStatesClosedRaceHonestly(t *testing.T) {
 	}
 }
 
-// (G) TestReapStage_NonAnchorObservationSendsNoPin is the fix-up control for the
-// verb-side pin restriction. Only 'pending' is refused LOCALLY, so a stage
-// observed in a protected park (awaiting_approval here) reaches the POST by
-// design — and pinning that state would make the SERVER answer 400
-// validation_failed naming expected_state instead of its own park refusal, which
-// this verb then renders as a "rebuild fishhawkd" VERSION SKEW when nothing is
-// skewed. So the pin is restricted to the endpoint's own anchor set: the POST
-// goes out UNPINNED, the server's verbatim answer for the park reaches the
-// operator, and a warning names the observed state so the drop is not silent.
+// (G) TestReapStage_NonAnchorObservationRefusedBeforePost is the UNRACED half of
+// the non-anchor contract. A stage observed in a state outside the endpoint's
+// anchor set — a protected park, or an already-terminal state — can neither be
+// PINNED (the endpoint 400s a precondition it could never honour, which this verb
+// then has to tell apart from the version skew) nor be sent UNPINNED (see the
+// raced test below). So it is refused LOCALLY, with NO HTTP hop at all, and the
+// refusal names the observed state and the gate that owns it.
 //
-// COUNTERFACTUAL: delete the reapStageConditionalAnchors branch in reapStage (pin
-// whatever was observed) and the "no pin" assertion goes RED.
-func TestReapStage_NonAnchorObservationSendsNoPin(t *testing.T) {
+// One subtest per protected park plus a terminal state, so the contract is
+// proved for the whole class rather than one representative.
+//
+// COUNTERFACTUAL: replace the `default:` refusal arm in reapStage with the old
+// warning-and-continue and every row goes RED on the hop count (a POST is made).
+func TestReapStage_NonAnchorObservationRefusedBeforePost(t *testing.T) {
+	for _, observed := range []string{
+		"awaiting_children",
+		"awaiting_approval",
+		"awaiting_input",
+		"awaiting_scope_decision",
+		"awaiting_host_dispatch",
+		"succeeded",
+	} {
+		t.Run(observed, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			seedLocalRun(fb, runID)
+			seedStrandedStage(fb, runID, stageID.String(), observed)
+			r, _ := reapResolver(t, srv, runnerDead)
+
+			_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+				RunID: runID.String(), StageID: stageID.String(),
+			})
+			if err == nil {
+				t.Fatalf("a stage observed in %q must be refused: it can be neither pinned nor safely "+
+					"reaped unpinned", observed)
+			}
+			if !strings.Contains(err.Error(), observed) {
+				t.Errorf("the refusal must name the observed state %q: %v", observed, err)
+			}
+			if !strings.Contains(err.Error(), "fishhawk_get_run_status") {
+				t.Errorf("the refusal must point at the re-read verb: %v", err)
+			}
+			// The refusal must be THIS one, not the state-moved detector's.
+			if !strings.Contains(err.Error(), "conditional anchor set") {
+				t.Errorf("the refusal must be the non-anchor one: %v", err)
+			}
+			if got := reapHops(fb); got != 0 {
+				t.Errorf("reap-failure POSTs = %d, want 0 (the refusal short-circuits BEFORE the HTTP hop)", got)
+			}
+		})
+	}
+}
+
+// (G) TestReapStage_NonAnchorParkResolvedBeforePostNotReaped is the RACED half —
+// the interleaving the earlier unpinned-POST design could not survive, and which
+// the unraced test above cannot detect on its own.
+//
+// The stage is observed 'awaiting_approval'. Between that final observation and
+// whatever the verb does next, the park is RESOLVED and the stage advances to
+// 'running' — a live runner now owns it. The injection is deterministic: the
+// fake flips fb.stagesByRun the instant the confirming read (call 2) has been
+// ANSWERED, so the verb's observation is the park and the world's state is
+// 'running'.
+//
+// Under the old design the verb dropped the pin and POSTed anyway; the server's
+// UNCONDITIONAL absorbing path would then have failed the newly live stage —
+// exactly the check/use race #2699 exists to close, relocated from the anchors to
+// the parks. The refusal makes it structurally impossible: zero POSTs, so no
+// reap of any state.
+//
+// The fake is deliberately armed to REAP: reapFailureRespBody reports
+// transitioned:true / failed, so a POST that does go out asserts loudly rather
+// than looking benign.
+//
+// COUNTERFACTUAL: replace the `default:` refusal arm with the old
+// warning-and-continue and this goes RED — one POST, carrying no pin, against a
+// stage that is now 'running'.
+func TestReapStage_NonAnchorParkResolvedBeforePostNotReaped(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID, stageID := uuid.New(), uuid.New()
 	seedLocalRun(fb, runID)
 	seedStrandedStage(fb, runID, stageID.String(), "awaiting_approval")
-	// What the REAL server answers for a protected park: the benign no-op, not a
-	// transition. Modelled so the assertion below reads the server's own verdict
-	// rather than the fake's default success.
 	fb.mu.Lock()
-	fb.reapFailureRespBody = `{"transitioned":false,"stage_state":"awaiting_approval"}`
+	// A POST that lands would reap the LIVE stage, not no-op on the park.
+	fb.reapFailureRespBody = `{"transitioned":true,"stage_state":"failed"}`
+	// reapStage reads the run's stages EXACTLY twice: the pre-classification read
+	// and confirmStrandBeforeReap's re-read. Resolve the park right after the
+	// SECOND — the window between the observation and the POST.
+	fb.stagesFlip = func(id uuid.UUID, callNum int) {
+		if id != runID || callNum != 2 {
+			return
+		}
+		for i := range fb.stagesByRun[id] {
+			fb.stagesByRun[id][i].State = "running"
+		}
+	}
 	fb.mu.Unlock()
 	r, _ := reapResolver(t, srv, runnerDead)
 
-	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
 		RunID: runID.String(), StageID: stageID.String(),
 	})
-	if err != nil {
-		t.Fatalf("a parked stage must still reach the server (its refusal is the authoritative answer): %v", err)
+	if err == nil {
+		t.Fatal("the reap must be refused: the observation was a park, so the POST could only go out unpinned")
 	}
-	if got, pinned := recordedReapExpectedState(fb, stageID); pinned {
-		t.Errorf("expected_state = %q on a NON-ANCHOR observation: the endpoint could never honour that pin, "+
-			"and sending it replaces the server's own refusal with a 400 the verb misreads as a version skew", got)
+	if !strings.Contains(err.Error(), "awaiting_approval") {
+		t.Errorf("the refusal must name the observed state: %v", err)
 	}
-	if out.Transitioned || out.StageState != "awaiting_approval" {
-		t.Errorf("transitioned=%v stage_state=%q, want false/awaiting_approval (the server's verdict, verbatim)",
-			out.Transitioned, out.StageState)
+	// The refusal is the NON-ANCHOR one, not confirmStrandBeforeReap's
+	// state-moved detector — that detector cannot see this interleaving, since
+	// both its reads returned the park.
+	if !strings.Contains(err.Error(), "conditional anchor set") {
+		t.Errorf("the refusal must be the non-anchor one: %v", err)
 	}
-	// The drop is DISCLOSED, not silent.
-	var found bool
-	for _, w := range out.Warnings {
-		if strings.Contains(w, "awaiting_approval") && strings.Contains(w, "expected_state") {
-			found = true
-		}
+	if got := reapHops(fb); got != 0 {
+		t.Errorf("reap-failure POSTs = %d, want 0: the park was resolved and the stage advanced to 'running' "+
+			"before the POST, so an unpinned reap would have failed a LIVE stage", got)
 	}
-	if !found {
-		t.Errorf("dropping the pin must be disclosed in warnings naming the observed state; got %v", out.Warnings)
+	// The advance really did land — otherwise this test would pass for the wrong
+	// reason (no race to lose).
+	fb.mu.Lock()
+	state := fb.stagesByRun[runID][0].State
+	fb.mu.Unlock()
+	if state != "running" {
+		t.Fatalf("fixture: the injected advance did not land (stage state = %q, want running)", state)
 	}
 }
 

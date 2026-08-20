@@ -7581,9 +7581,11 @@ paths:
         OMITTING the field is the UNCONDITIONAL request and preserves the
         absorbing, idempotent behaviour described above byte-for-byte, which is
         what the detached reaper and `run_children`'s spawn-error compensation
-        rely on. ABSENCE and EMPTINESS are distinguished at the decode layer:
-        an omitted field is unconditional, a field present carrying `""` is a
-        400 — so an empty pin can never silently downgrade to an unpinned reap.
+        rely on. ABSENCE is distinguished from EVERY PRESENT value at the
+        decode layer: only an OMITTED field is unconditional, while a field
+        present carrying `""`, an explicit JSON `null`, or any non-string
+        (number, object, array) is a 400 — so a malformed pin can never
+        silently downgrade to an unpinned reap.
 
         A conditional report also DIVERGES from the idempotent no-op: against
         an already-terminal or parked stage it answers 409, not 200
@@ -7648,12 +7650,14 @@ paths:
                   description: |
                     OPTIONAL compare-and-set precondition (#2699): reap ONLY if
                     the stage is in this state. Must name one of the three
-                    states this endpoint can reap; any other value — including
-                    an explicitly empty string — is 400 `validation_failed`.
-                    OMIT the field for the unconditional report (the detached
-                    reaper's contract, unchanged). When supplied, the CAS walk
-                    does not re-anchor, so a concurrent advance makes the reap
-                    lose with 409 rather than being absorbed.
+                    states this endpoint can reap; any other value — an
+                    explicitly empty string, an explicit JSON `null`, or a
+                    non-string — is 400 `validation_failed`. OMIT the field for
+                    the unconditional report (the detached reaper's contract,
+                    unchanged); `null` is a PRESENT value and is rejected, not
+                    read as omission. When supplied, the CAS walk does not
+                    re-anchor, so a concurrent advance makes the reap lose with
+                    409 rather than being absorbed.
       responses:
         '200':
           description: |
@@ -7678,10 +7682,12 @@ paths:
             Malformed body, an unknown field, a `category` other than
             `B`/`C`, an empty `reason`, or an `expected_state` outside
             {`pending`, `dispatched`, `running`} — including a present but
-            EMPTY value, which is a validation failure rather than an
-            unconditional request (#2699). Body's `error` is
-            `validation_failed`; for `expected_state` the `details` carry
-            `field`, `got` and the `accepted` set.
+            EMPTY value, an explicit JSON `null`, or a non-string, each of
+            which is a validation failure rather than an unconditional request
+            (#2699). Body's `error` is `validation_failed`; for
+            `expected_state` the `details` carry `field`, `got` (the value as
+            supplied, echoed as raw JSON text when it is not a string) and the
+            `accepted` set.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

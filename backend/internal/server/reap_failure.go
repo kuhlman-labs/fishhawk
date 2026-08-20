@@ -125,21 +125,55 @@ func reapConditionalAnchorList() []string {
 // process exit code.
 //
 // ExpectedState is the OPTIONAL compare-and-set precondition (E67.51 / #2699).
-// It is a *string, NOT a string, and that is load-bearing: the contract
-// distinguishes ABSENCE from EMPTINESS at the DECODE layer. A field OMITTED
-// entirely (nil) is the UNCONDITIONAL request — today's absorbing, idempotent
-// behaviour, byte-for-byte, for the detached reaper and run_children's
-// spawn-error compensation. A field PRESENT carrying an empty string (or any
-// value outside reapConditionalAnchors) is a 400 validation_failed. Comparing a
-// decoded string to "" would instead silently DOWNGRADE a caller that meant to
-// pin a state but emitted "" into an UNPINNED reap — precisely the silent
-// downgrade this change exists to make impossible.
+// It is a json.RawMessage, NOT a string and NOT a *string, and that is
+// load-bearing: the contract distinguishes ABSENCE from every PRESENT value at
+// the DECODE layer. A field OMITTED entirely (nil raw) is the UNCONDITIONAL
+// request — today's absorbing, idempotent behaviour, byte-for-byte, for the
+// detached reaper and run_children's spawn-error compensation. A field PRESENT
+// carrying ANYTHING that is not a string naming a reapConditionalAnchors state —
+// an empty string, an explicit JSON null, a number, an object — is a 400
+// validation_failed.
+//
+// A *string is NOT sufficient (E67.51 fix-up, review concern): encoding/json
+// decodes an explicit `"expected_state": null` to a NIL pointer, which is
+// byte-identical to omission, so a malformed conditional request would silently
+// lose its pin and take the UNCONDITIONAL absorbing path — reaping a stage a
+// concurrent dispatch may have just brought to life. The raw bytes are the only
+// decode-layer representation that keeps `null` distinguishable from absence, so
+// the presence check reads them directly (validateReapExpectedState).
 type reapFailureRequest struct {
-	Category      string  `json:"category"`
-	Reason        string  `json:"reason"`
-	Detail        string  `json:"detail,omitempty"`
-	ExitCode      int     `json:"exit_code,omitempty"`
-	ExpectedState *string `json:"expected_state,omitempty"`
+	Category      string          `json:"category"`
+	Reason        string          `json:"reason"`
+	Detail        string          `json:"detail,omitempty"`
+	ExitCode      int             `json:"exit_code,omitempty"`
+	ExpectedState json.RawMessage `json:"expected_state,omitempty"`
+}
+
+// validateReapExpectedState resolves the raw expected_state bytes into the
+// (conditional, expected) pair the handler acts on, plus the rendering of the
+// supplied value for a 400's details.
+//
+// PRESENCE is decided by the raw bytes being nil (absent) or not; a present
+// value must decode to a JSON STRING naming a reapConditionalAnchors state.
+// `null`, `""`, `7`, `{}` and `"awaiting_children"` are all PRESENT-and-invalid
+// and yield ok=false — never the unconditional path.
+func validateReapExpectedState(raw json.RawMessage) (conditional bool, expected run.StageState, got string, ok bool) {
+	if raw == nil {
+		return false, "", "", true
+	}
+	trimmed := bytes.TrimSpace(raw)
+	var decoded string
+	// json.Unmarshal of the `null` literal into a string is a NO-OP that reports
+	// no error, so the literal is rejected explicitly rather than by decode error.
+	if !bytes.Equal(trimmed, []byte("null")) && json.Unmarshal(trimmed, &decoded) == nil {
+		if reapConditionalAnchors[run.StageState(decoded)] {
+			return true, run.StageState(decoded), decoded, true
+		}
+		return true, "", decoded, false
+	}
+	// A non-string (or the null literal) has no string rendering — echo the raw
+	// JSON text so the caller can see exactly what it sent.
+	return true, "", string(trimmed), false
 }
 
 // reapFailureResponse is the 200 body. Transitioned is false on the idempotent
@@ -256,25 +290,22 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// OPTIONAL compare-and-set precondition (E67.51 / #2699). PRESENCE, not
-	// emptiness, is what makes the call conditional: req.ExpectedState == nil is
-	// the unconditional request, and a PRESENT value — including "" — must name
-	// one of the endpoint's three reapable anchors or the request is a 400. See
-	// reapFailureRequest's doc comment for why an empty-string-means-unconditional
-	// reading would be a silent downgrade rather than a nit.
-	conditional := req.ExpectedState != nil
-	var expected run.StageState
-	if conditional {
-		expected = run.StageState(*req.ExpectedState)
-		if !reapConditionalAnchors[expected] {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"expected_state must name one of the reapable stage states this endpoint can honour",
-				map[string]any{
-					"field":    "expected_state",
-					"got":      *req.ExpectedState,
-					"accepted": reapConditionalAnchorList(),
-				})
-			return
-		}
+	// emptiness and not decodability, is what makes the call conditional: only an
+	// OMITTED field is the unconditional request, and any PRESENT value —
+	// including "", an explicit null, or a non-string — must name one of the
+	// endpoint's three reapable anchors or the request is a 400. See
+	// reapFailureRequest's doc comment for why treating "" or null as
+	// unconditional would be a silent downgrade rather than a nit.
+	conditional, expected, gotExpected, ok := validateReapExpectedState(req.ExpectedState)
+	if !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"expected_state must name one of the reapable stage states this endpoint can honour",
+			map[string]any{
+				"field":    "expected_state",
+				"got":      gotExpected,
+				"accepted": reapConditionalAnchorList(),
+			})
+		return
 	}
 
 	// Load the stage and validate the (run_id, stage_id) handle: a stage whose

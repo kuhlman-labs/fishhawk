@@ -1139,7 +1139,15 @@ func TestReapStageFailure_Unconfigured(t *testing.T) {
 // *string is the point: the presence of the pointer is what makes the call
 // conditional, so a test can express "explicitly empty" as ptr("").
 func condReq(category, reason string, expected *string) reapFailureRequest {
-	return reapFailureRequest{Category: category, Reason: reason, ExpectedState: expected}
+	req := reapFailureRequest{Category: category, Reason: reason}
+	if expected != nil {
+		raw, err := json.Marshal(*expected)
+		if err != nil {
+			panic(err)
+		}
+		req.ExpectedState = json.RawMessage(raw)
+	}
+	return req
 }
 
 func strptr(s string) *string { return &s }
@@ -1500,16 +1508,26 @@ func TestReapStageFailure_ConditionalTerminalIs409(t *testing.T) {
 	}
 }
 
-// (n8) CONDITIONAL against EACH protected park → 409 with the park intact. One
-// subtest per park, so a sixth park added later fails here too.
+// (n8) CONDITIONAL against EACH protected park → 409 with the park intact. The
+// subtest set is DERIVED from reapProtectedParkStates itself rather than
+// hardcoded (E67.51 fix-up, review concern): a hardcoded list cannot deliver the
+// "a sixth park added later fails here too" claim it used to make, and it can
+// drift out of agreement with the map it is supposed to mirror. This test lives
+// in the map's own package, so iterating it makes the claim TRUE — adding a park
+// to reapProtectedParkStates adds a subtest here automatically.
+//
+// Sorted so the subtest order is stable (Go randomizes map iteration).
 func TestReapStageFailure_ConditionalParkIs409(t *testing.T) {
-	for _, park := range []run.StageState{
-		run.StageStateAwaitingChildren,
-		run.StageStateAwaitingApproval,
-		run.StageStateAwaitingInput,
-		run.StageStateAwaitingScopeDecision,
-		run.StageStateAwaitingHostDispatch,
-	} {
+	parks := make([]string, 0, len(reapProtectedParkStates))
+	for park := range reapProtectedParkStates {
+		parks = append(parks, string(park))
+	}
+	sort.Strings(parks)
+	if len(parks) == 0 {
+		t.Fatal("reapProtectedParkStates is empty: this test would silently assert nothing")
+	}
+	for _, parkName := range parks {
+		park := run.StageState(parkName)
 		t.Run(string(park), func(t *testing.T) {
 			s, rr, au, runID, stageID := reapServer(t, park)
 			w := postReapFailure(t, s, runID, stageID,
@@ -1614,6 +1632,141 @@ func TestReapStageFailure_OmittedExpectedStateIsUnconditional(t *testing.T) {
 	}
 	if got := reapAudit(au); len(got) != 1 {
 		t.Errorf("dispatch_reaper_failed entries = %d, want 1", len(got))
+	}
+}
+
+// (n10b) The THIRD arm CONDITION 1's *string could not express, and the one the
+// E67.51 fix-up review named as a safety regression: the field PRESENT carrying
+// values that are not a JSON string. encoding/json decodes an explicit
+// `"expected_state": null` into a NIL *string — byte-identical to omission — so
+// a *string presence check silently DOWNGRADED that malformed conditional
+// request to an UNPINNED reap and would fail a concurrently advanced stage. The
+// raw-bytes presence check rejects it, along with every other non-string.
+//
+// Each row is a RAW body (a typed struct cannot express `null` vs absent), the
+// stage is seeded 'dispatched' so an unvalidated handler would happily reap it,
+// and the assertions read COMMITTED STATE — not just the error code.
+//
+// COUNTERFACTUAL: revert reapFailureRequest.ExpectedState to a *string (and the
+// handler to a nil check) and the explicit_null row goes RED with a 200
+// transitioned:true and the stage 'failed'.
+func TestReapStageFailure_PresentNonStringExpectedStateIs400(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		got  string
+	}{
+		{"explicit_null", `{"category":"C","reason":"x","expected_state":null}`, "null"},
+		{"number", `{"category":"C","reason":"x","expected_state":7}`, "7"},
+		{"object", `{"category":"C","reason":"x","expected_state":{"state":"running"}}`, `{"state":"running"}`},
+		{"array", `{"category":"C","reason":"x","expected_state":["running"]}`, `["running"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runID, stageID := reapServer(t, run.StageStateDispatched)
+
+			w := postReapFailureRaw(t, s, runID, stageID, []byte(tc.body), withReapOperator)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for %s (a PRESENT expected_state that is not an anchor "+
+					"string must never take the unconditional path):\n%s", w.Code, tc.body, w.Body.String())
+			}
+			code, details := decodeReapError(t, w)
+			if code != "validation_failed" {
+				t.Errorf("error code = %q, want validation_failed", code)
+			}
+			if details["field"] != "expected_state" {
+				t.Errorf("details field = %v, want expected_state", details["field"])
+			}
+			if details["got"] != tc.got {
+				t.Errorf("details got = %v, want %q (the raw value echoed back)", details["got"], tc.got)
+			}
+			// NOTHING transitioned, no audit entry, no advance.
+			cur, _ := rr.GetStage(context.Background(), stageID)
+			if cur.State != run.StageStateDispatched {
+				t.Errorf("stage state = %q, want dispatched (a rejected precondition transitions NOTHING)", cur.State)
+			}
+			if got := reapAudit(au); len(got) != 0 {
+				t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
+			}
+			curRun, _ := rr.GetRun(context.Background(), runID)
+			if curRun.State == run.StateFailed {
+				t.Error("run state = failed: a rejected precondition must not advance the run")
+			}
+		})
+	}
+}
+
+// (n10c) The THIRD anchor's conditional happy path. n1/n2 cover 'dispatched' and
+// 'running'; without this row a regression that drops 'pending' from
+// reapConditionalAnchors — or breaks its conditional CAS — stays green, since
+// every other pending assertion in this file is UNCONDITIONAL
+// (TestReapStageFailure_PendingAnchorSingleCAS). 'pending' is the endpoint's
+// escape-hatch anchor: the MCP verb refuses a stable pending stage client-side,
+// but a direct operator POST may pin it.
+func TestReapStageFailure_ConditionalHappyPathPending(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStatePending)
+
+	w := postReapFailure(t, s, runID, stageID,
+		condReq("C", "pinned reap of a stranded pending stage", strptr("pending")),
+		withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Transitioned || resp.StageState != string(run.StageStateFailed) {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", resp.Transitioned, resp.StageState)
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	entries := reapAudit(au)
+	if len(entries) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload["expected_state"] != "pending" {
+		t.Errorf("audit payload expected_state = %v, want pending (a pinned reap must be recorded as pinned)",
+			payload["expected_state"])
+	}
+	curRun, _ := rr.GetRun(context.Background(), runID)
+	if curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance invoked)", curRun.State)
+	}
+}
+
+// (n10d) The paired REFUSAL for the pending anchor: a stage that advanced out of
+// 'pending' before the POST landed is refused 409 with nothing transitioned. n1
+// and n2 have their mismatch pairs (n3, n5, n6); without this one the pending
+// arm would be proved only by its happy path, which a handler that never
+// evaluates the pending precondition would also pass.
+func TestReapStageFailure_ConditionalPendingMismatchIs409(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateDispatched)
+
+	w := postReapFailure(t, s, runID, stageID,
+		condReq("C", "pinned pending, but a dispatch already advanced it", strptr("pending")),
+		withReapOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeReapError(t, w)
+	if code != "stage_state_precondition_failed" {
+		t.Errorf("error code = %q, want stage_state_precondition_failed", code)
+	}
+	if details["expected_state"] != "pending" || details["actual_state"] != "dispatched" {
+		t.Errorf("details = %v, want expected_state=pending actual_state=dispatched", details)
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (unchanged — a lost precondition transitions NOTHING)", cur.State)
+	}
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
 	}
 }
 
