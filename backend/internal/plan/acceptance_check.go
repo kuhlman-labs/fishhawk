@@ -32,6 +32,15 @@ const (
 	RuleMissingRationale    = "missing_rationale"
 	RuleEmptyID             = "empty_id"
 	RuleDuplicateID         = "duplicate_id"
+	// RuleUndecidableCriterion flags a criterion whose STATEMENT requires a
+	// capability the sandboxed acceptance executor does not have (#2512,
+	// layer 3). It is ADVISORY: it never refuses a plan, because a criterion
+	// may legitimately name a capability in prose while still being drivable.
+	// Its purpose is preventive — an author who sees it up front marks the
+	// criterion skip_expected + expectation_basis (or
+	// requires_live_validation) instead of shipping it to an executor that
+	// can only report it undecidable.
+	RuleUndecidableCriterion = "undecidable_criterion"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -49,6 +58,11 @@ const (
 //     (defense-in-depth: the schema conditional normally rejects this
 //     upstream, but the pre-check stays order-independent).
 //   - empty_id / duplicate_id — id integrity for the join key.
+//   - undecidable_criterion — a criterion whose statement requires a capability
+//     the sandboxed acceptance executor lacks (a live MCP client, a real
+//     operator session, a running external instance, a live forge round-trip, a
+//     real webhook delivery), and which is NOT already marked skip_expected
+//     with a basis or requires_live_validation. Advisory only.
 func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	findings := []AcceptanceFinding{}
 
@@ -94,6 +108,12 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 			Detail: "no blocking acceptance criterion and no verification.out_of_scope justification (a plan must carry at least one blocking criterion or declare what is deliberately out of scope)",
 		})
 	}
+
+	// Layer 3 (#2512): the undecidable-criterion matcher rides THIS call so
+	// both consumers of the shared rule set (the server plan gate and
+	// refinement.EvaluateDraftCriteria) get it from one place, per this file's
+	// single-source contract.
+	findings = append(findings, UnevaluableCriteria(v)...)
 
 	return findings
 }
@@ -261,4 +281,175 @@ func LiveValidationCriteria(v Verification) []AcceptanceCriterion {
 		}
 	}
 	return out
+}
+
+// Undecidable acceptance vocabulary (#2512, E48.78 layer 4). These three
+// constants name the third acceptance disposition, and they exist here — in the
+// plan package, which imports no project packages and is already imported by
+// server, orchestrator and auditcomplete — so a producer/consumer drift is a
+// COMPILE error rather than a silent runtime miss, exactly as #2347 did for
+// not_validated.
+//
+// THE PARTITION. Three names share ONE contract (merge-eligible, never a pass,
+// a distinct state string, operator acknowledgement in the merge verdict) and
+// are partitioned by a single total question — was there evidence, and what did
+// it say?
+//
+//   - NO EVIDENCE WAS POSSIBLE: the orchestrator's PRE-SPAWN short-circuit
+//     settles from the PLAN alone (zero criteria, or every criterion
+//     skip_expected-with-basis). No runner, no preview, no observation. That is
+//     AcceptanceVerdictNotValidated, and it is unchanged.
+//   - EVIDENCE SAYS A CRITERION FAILED: a real defect. `failed` ->
+//     acceptance_triage, unchanged, discharged only by the #2474 arbitration
+//     verb.
+//   - EVIDENCE SAYS A CRITERION COULD NOT BE DECIDED: the stage RAN, drove the
+//     preview, and reported per-criterion rows of which at least one is
+//     undecidable. That is the new `undecidable`.
+//
+// The three are MUTUALLY EXCLUSIVE BY CONSTRUCTION, not by convention:
+// not_validated skips dispatch entirely so no criteria rows can exist, and the
+// precedence ladder puts failed strictly above undecidable so a single failed
+// row keeps the run in triage exactly as today.
+//
+// SERVER-DERIVED AND UNFORGEABLE. Only the PER-CRITERION row value
+// (AcceptanceResultUndecidable) may cross the wire: the acceptance ship
+// endpoint's top-level verdict enum keeps admitting nothing but passed/failed,
+// so AcceptanceVerdictUndecidable can ONLY originate server-side from the
+// aggregation ladder over the rows.
+const (
+	// AcceptanceResultUndecidable is the PER-CRITERION `result` value — the
+	// only one of these three a wire producer may ship. It says the acceptance
+	// agent drove the target and genuinely could not decide this criterion; it
+	// is NOT a defect (a defect is `failed`) and NOT a pass. It travels with a
+	// non-empty undecidable_reason.
+	AcceptanceResultUndecidable = "undecidable"
+	// AcceptanceVerdictUndecidable is the SERVER-DERIVED
+	// acceptance_outcome_recorded `verdict` value: at least one non-retired row
+	// is undecidable and no row failed. Merge-eligible under operator
+	// acknowledgement, never a silent pass.
+	AcceptanceVerdictUndecidable = "undecidable"
+	// AcceptanceOutcomeUndecidable is the render-vocabulary twin — the
+	// `outcome` field the issue-comment and PR-comment status templates read,
+	// mirroring AcceptanceOutcomeNotValidated.
+	AcceptanceOutcomeUndecidable = "undecidable"
+)
+
+// unevaluableCapability is one capability the sandboxed acceptance executor
+// does not have, plus the lowercase statement phrases that name it. The phrases
+// are deliberately MULTI-WORD: a bare "github" or "webhook" appears in ordinary
+// drivable prose, and an advisory rule that fires on ordinary prose trains the
+// operator to ignore it.
+type unevaluableCapability struct {
+	capability string
+	phrases    []string
+}
+
+// unevaluableCapabilities is the deterministic term corpus behind
+// UnevaluableCriteria. Order is fixed so the findings a given plan produces are
+// stable across runs (the pre-check payload is compared byte-for-byte in the
+// audit log).
+var unevaluableCapabilities = []unevaluableCapability{
+	{
+		capability: "a live MCP client / MCP tool call",
+		phrases: []string{
+			"mcp client", "mcp tool call", "mcp tool invocation", "mcp tool from",
+			"via the mcp server", "live mcp", "through the mcp",
+		},
+	},
+	{
+		capability: "a real operator session",
+		phrases: []string{
+			"operator session", "real operator", "interactive operator",
+			"a human operator", "operator drives",
+		},
+	},
+	{
+		capability: "a running external instance / deployed environment",
+		phrases: []string{
+			"deployed environment", "live deployment", "production environment",
+			"staging environment", "external instance", "running cluster",
+			"deployed instance",
+		},
+	},
+	{
+		capability: "a live forge round-trip",
+		phrases: []string{
+			"live github", "real github", "github api", "live gitlab", "real gitlab",
+			"gitlab api", "live forge", "real forge", "against github.com",
+		},
+	},
+	{
+		capability: "a real webhook delivery",
+		phrases: []string{
+			"real webhook", "live webhook", "webhook delivery", "actual webhook",
+		},
+	},
+}
+
+// UnevaluableCriteria flags every acceptance criterion whose STATEMENT requires
+// a capability the sandboxed acceptance executor lacks (#2512, layer 3) and
+// that is not already marked as such. It is the DETECTIVE half of layer 3; the
+// preventive half is the planner prompt's authoring guardrail, which tells the
+// author to mark such a criterion up front.
+//
+// Matching is deterministic and case-insensitive over the statement against the
+// fixed unevaluableCapabilities corpus. A criterion matching more than one
+// capability yields exactly ONE finding, naming the first capability matched in
+// corpus order — one criterion, one finding, so a downstream count is a count
+// of criteria.
+//
+// EXEMPTIONS. A criterion already carrying SkipExpected with a non-whitespace
+// ExpectationBasis, or RequiresLiveValidation, is NOT flagged: those are the
+// SANCTIONED declarations of exactly this condition. Re-flagging a criterion
+// whose author already did the right thing trains the operator to ignore the
+// rule, which is how an advisory rule dies.
+//
+// ADVISORY ONLY. The finding never refuses a plan — a criterion may
+// legitimately name a capability in prose while being perfectly drivable.
+// Returns a non-nil empty slice when nothing is flagged.
+func UnevaluableCriteria(v Verification) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	for _, c := range v.AcceptanceCriteria {
+		if criterionDeclaresUnevaluable(c) {
+			continue
+		}
+		statement := strings.ToLower(c.Statement)
+		for _, uc := range unevaluableCapabilities {
+			if !containsAnyPhrase(statement, uc.phrases) {
+				continue
+			}
+			findings = append(findings, AcceptanceFinding{
+				Rule:        RuleUndecidableCriterion,
+				CriterionID: c.ID,
+				Detail: "criterion statement requires " + uc.capability +
+					", which the sandboxed acceptance executor does not have; mark it skip_expected with an expectation_basis (or requires_live_validation) so it is declared up front rather than reported undecidable at acceptance",
+			})
+			break
+		}
+	}
+	return findings
+}
+
+// criterionDeclaresUnevaluable reports whether a criterion already carries the
+// sanctioned declaration that it cannot be validated in the sandbox — either
+// skip_expected with a non-whitespace expectation_basis, or
+// requires_live_validation. It is the exemption predicate for
+// UnevaluableCriteria, kept separate so the exemption is one named idea rather
+// than an inline negation.
+func criterionDeclaresUnevaluable(c AcceptanceCriterion) bool {
+	if c.RequiresLiveValidation {
+		return true
+	}
+	return c.SkipExpected && strings.TrimSpace(c.ExpectationBasis) != ""
+}
+
+// containsAnyPhrase reports whether lowered contains any of phrases. The caller
+// lowercases once; the phrases in the corpus are already lowercase.
+func containsAnyPhrase(lowered string, phrases []string) bool {
+	for _, p := range phrases {
+		if strings.Contains(lowered, p) {
+			return true
+		}
+	}
+	return false
 }

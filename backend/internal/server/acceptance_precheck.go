@@ -32,6 +32,12 @@ const categoryPlanAcceptancePrecheck = "plan_acceptance_precheck"
 // downstream surface can render coverage headroom even when Findings is
 // empty. Findings marshals as [] (not null) on a clean-and-checked plan,
 // matching ScopePrecheckPayload's contract.
+//
+// UndecidableCount (#2512, layer 3) counts the criteria the shared rule set
+// flagged undecidable_criterion — one per criterion, never per phrase hit — so
+// a reader gets the headline number without re-walking Findings. It is
+// ADVISORY like every other field here: the pre-check writes an entry and
+// never refuses a plan.
 type AcceptancePrecheckPayload struct {
 	WorkflowID        string              `json:"workflow_id"`
 	AcceptanceStageID string              `json:"acceptance_stage_id"`
@@ -39,6 +45,7 @@ type AcceptancePrecheckPayload struct {
 	CriteriaCount     int                 `json:"criteria_count"`
 	BlockingCount     int                 `json:"blocking_count"`
 	OutOfScopeCount   int                 `json:"out_of_scope_count"`
+	UndecidableCount  int                 `json:"undecidable_count"`
 }
 
 // AcceptanceFinding is one deterministic defect the acceptance pre-check
@@ -55,9 +62,10 @@ type AcceptanceFinding = plan.AcceptanceFinding
 // exactly one place. The remaining rules (missing_rationale, empty_id) are
 // referenced only through plan.Rule* directly.
 const (
-	acceptanceRuleNoBlockingCriterion = plan.RuleNoBlockingCriterion
-	acceptanceRuleMissingSourceRef    = plan.RuleMissingSourceRef
-	acceptanceRuleDuplicateID         = plan.RuleDuplicateID
+	acceptanceRuleNoBlockingCriterion  = plan.RuleNoBlockingCriterion
+	acceptanceRuleMissingSourceRef     = plan.RuleMissingSourceRef
+	acceptanceRuleDuplicateID          = plan.RuleDuplicateID
+	acceptanceRuleUndecidableCriterion = plan.RuleUndecidableCriterion
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -68,7 +76,11 @@ const (
 // gap left to the plan gate: a plan with no blocking criterion (and no
 // out_of_scope justification), an explicit criterion missing its
 // source_ref, an inferred criterion missing its rationale, or a
-// duplicate/empty id is flagged before the human approves.
+// duplicate/empty id is flagged before the human approves. Since #2512 it
+// also surfaces the advisory undecidable_criterion rule: a criterion whose
+// statement requires a capability the sandboxed acceptance executor lacks and
+// which is not already marked skip_expected-with-basis or
+// requires_live_validation.
 //
 // Stage-conditional: the pre-check runs ONLY when the run's workflow
 // configures an acceptance stage (resolveAcceptanceStage returns ok). A
@@ -142,6 +154,17 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 		}
 	}
 
+	// The undecidable_criterion rule rides the SAME
+	// plan.EvaluateAcceptanceCriteria call above (#2512, layer 3) — there is no
+	// second evaluation — so the count is read back off the findings the shared
+	// rule set already returned.
+	undecidableCount := 0
+	for _, f := range findings {
+		if f.Rule == acceptanceRuleUndecidableCriterion {
+			undecidableCount++
+		}
+	}
+
 	result := &AcceptancePrecheckPayload{
 		WorkflowID:        runRow.WorkflowID,
 		AcceptanceStageID: acceptanceStageID,
@@ -149,6 +172,7 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 		CriteriaCount:     len(v.AcceptanceCriteria),
 		BlockingCount:     blockingCount,
 		OutOfScopeCount:   len(v.OutOfScope),
+		UndecidableCount:  undecidableCount,
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")
