@@ -327,6 +327,22 @@ type promptResponse struct {
 	// convention as the four fields above.
 	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
 	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
+	// ScopeConstraint is the decomposed child's agent-facing narrowing (#1669,
+	// slice-move gained/lost fold #2596), served ONLY for a fan-out slice child
+	// whose sub-plan resolved (trigger.ScopeConstraint != nil). Its ScopeFiles
+	// mirror the child's enforced scope after any approved slice-boundary move,
+	// so a moved-away source path is absent and a moved-in destination path is
+	// present on BOTH the enforced scope_files and this agent-facing narrowing.
+	// omitempty, so every non-decomposed response is byte-identical to today.
+	ScopeConstraint *promptScopeConstraint `json:"scope_constraint,omitempty"`
+}
+
+// promptScopeConstraint is the serialized view of prompt.ScopeConstraint for a
+// decomposed child's prompt-render response (#2596). Only the agent-facing
+// scope_files narrowing is surfaced today; the SPA reads it to show the slice
+// the child was constrained to.
+type promptScopeConstraint struct {
+	ScopeFiles []string `json:"scope_files,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -1333,6 +1349,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
 	}
+	if trigger.ScopeConstraint != nil {
+		resp.ScopeConstraint = &promptScopeConstraint{ScopeFiles: trigger.ScopeConstraint.ScopeFiles}
+	}
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
@@ -1872,6 +1891,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if runRow.SliceIndex != nil {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
+	}
+	if trigger.ScopeConstraint != nil {
+		resp.ScopeConstraint = &promptScopeConstraint{ScopeFiles: trigger.ScopeConstraint.ScopeFiles}
 	}
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
@@ -3745,13 +3767,20 @@ func (s *Server) requireDecomposedScope(ctx context.Context, runRow *run.Run, pa
 			reason:      "no sub-plan linked to the child's slice index",
 		}
 	}
-	// Source side of the per-slice MOVE channel (#2596): the paths moved AWAY
-	// from this child's slice. Resolved ONCE here and subtracted from BOTH halves
-	// requireDecomposedScope returns — the enforced scope.files AND the
-	// agent-facing ScopeConstraint.ScopeFiles — so a moved-away source file no
-	// longer appears in either. The gate's move_would_empty_source_slice refusal
-	// keeps the empty-scope 409 below unreachable via this channel.
-	_, lost := s.resolveApprovalSliceMoves(ctx, runRow)
+	// Per-slice MOVE channel (#2596). `lost` is every path moved AWAY from this
+	// child's slice; `gained` is every path moved INTO it. `lost` is subtracted
+	// from BOTH halves requireDecomposedScope returns — the enforced scope.files
+	// AND the agent-facing ScopeConstraint.ScopeFiles — so a moved-away source
+	// file no longer appears in either. `gained` is folded into the agent-facing
+	// ScopeConstraint (resolveDecomposedScopeConstraint) so the destination
+	// slice's constraint MATCHES its enforced scope: the enforced scope.files
+	// already gain the moved-in path via resolveApprovalAddScopeFiles at the call
+	// site (the SOLE add fold), but that fold does not reach this constraint, so
+	// without the gained fold the moved-in file would be enforced-in-scope yet
+	// ABSENT from the narrowing the agent reads. The gate's
+	// move_would_empty_source_slice refusal keeps the empty-scope 409 below
+	// unreachable via this channel.
+	gained, lost := s.resolveApprovalSliceMoves(ctx, runRow)
 	if len(lost) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: subtracted moved-away paths from decomposed child slice",
@@ -3769,7 +3798,7 @@ func (s *Server) requireDecomposedScope(ctx context.Context, runRow *run.Run, pa
 			reason:      "linked sub-plan declares no scope files",
 		}
 	}
-	return files, s.resolveDecomposedScopeConstraint(ctx, runRow, parentPlan, lost), nil
+	return files, s.resolveDecomposedScopeConstraint(ctx, runRow, parentPlan, gained, lost), nil
 }
 
 // pathIsLost reports whether path was moved away from this slice — i.e. it
@@ -3816,7 +3845,10 @@ func (s *Server) writeDecomposedScopeUnresolved(w http.ResponseWriter, r *http.R
 // letting the caller degrade to the parent's full scope (#1721). parentPlan
 // is the caller's already-loaded approved plan — for a decomposed child this
 // is the parent's decomposed plan — so no additional artifact read happens.
-func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan, lost []string) *prompt.ScopeConstraint {
+// `lost`/`gained` are this slice's moved-away/moved-in paths (#2596): `lost` is
+// subtracted from and `gained` is folded into the returned constraint so it
+// matches the child's enforced scope on both sides of a slice-boundary move.
+func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan, gained, lost []string) *prompt.ScopeConstraint {
 	matched, matchIdx := matchDecomposedSubPlan(runRow, parentPlan)
 	if matched == nil {
 		return nil
@@ -3835,13 +3867,29 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 	// slice by an approved move (#2596) is subtracted here so the agent-facing
 	// constraint matches the enforced scope exactly.
 	var scopeFiles []string
+	seen := make(map[string]struct{})
 	if matched.Scope != nil {
 		for _, f := range matched.Scope.Files {
 			if pathIsLost(f.Path, lost) {
 				continue
 			}
 			scopeFiles = append(scopeFiles, f.Path)
+			seen[normalizeOwnershipPath(f.Path)] = struct{}{}
 		}
+	}
+	// Destination side of the per-slice MOVE channel (#2596): a path moved INTO
+	// this slice is folded into the agent-facing constraint so it matches the
+	// enforced scope, which gains the same path via resolveApprovalAddScopeFiles
+	// at the call site. Without this the moved-in file is enforced-in-scope yet
+	// absent from the narrowing the agent reads, so a defensive agent would treat
+	// it as out of scope and decline to touch it. A gained path is declared in a
+	// DIFFERENT slice's scope (never this one), so the dedup guard is defensive.
+	for _, g := range gained {
+		if _, ok := seen[normalizeOwnershipPath(g)]; ok {
+			continue
+		}
+		scopeFiles = append(scopeFiles, g)
+		seen[normalizeOwnershipPath(g)] = struct{}{}
 	}
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 		"prompt: injected scope constraint for decomposed child",

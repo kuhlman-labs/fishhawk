@@ -5364,7 +5364,7 @@ func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
 		narrowedSets = append(narrowedSets, gotFiles)
 
 		// (c) resolveDecomposedScopeConstraint carries the declared slice files.
-		sc := s.resolveDecomposedScopeConstraint(ctx, child, parentPlan, nil)
+		sc := s.resolveDecomposedScopeConstraint(ctx, child, parentPlan, nil, nil)
 		if sc == nil {
 			t.Fatalf("%s: resolveDecomposedScopeConstraint returned nil", sl.title)
 		}
@@ -11335,6 +11335,35 @@ func TestRequireDecomposedScope_ConstraintDropsMovedPath(t *testing.T) {
 	}
 	if !containsString(sc.ScopeFiles, "pkg/a/keep.go") {
 		t.Errorf("constraint ScopeFiles dropped its retained path pkg/a/keep.go: %v", sc.ScopeFiles)
+	}
+}
+
+// (j) COUNTERFACTUAL: the DESTINATION slice's agent-facing ScopeConstraint.ScopeFiles
+// GAINS the moved-in path, so it matches the enforced scope (which gains the same
+// path via resolveApprovalAddScopeFiles). Deleting the `gained` fold in
+// resolveDecomposedScopeConstraint drops foo.go from the destination constraint →
+// the "must contain" assertion goes RED. The destination child is slice 1, into
+// which foo.go was moved; its own declared file pkg/b/b.go stays.
+func TestRequireDecomposedScope_ConstraintGainsMovedInPath(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	// Move foo.go from slice 0 (source) to slice 1 (destination); resolve the
+	// DESTINATION child (slice 1).
+	s, dstChild := moveFoldServer(t, parentRunID, 1, map[string][]string{"1": {"pkg/a/foo.go"}})
+
+	_, sc, err := s.requireDecomposedScope(context.Background(), dstChild, parentPlan)
+	if err != nil {
+		t.Fatalf("requireDecomposedScope(destination child): %v", err)
+	}
+	if sc == nil {
+		t.Fatalf("resolveDecomposedScopeConstraint returned nil")
+	}
+	if !containsString(sc.ScopeFiles, "pkg/a/foo.go") {
+		t.Errorf("destination constraint ScopeFiles missing the moved-in path pkg/a/foo.go: %v", sc.ScopeFiles)
+	}
+	// The destination slice's own declared file stays.
+	if !containsString(sc.ScopeFiles, "pkg/b/b.go") {
+		t.Errorf("destination constraint ScopeFiles dropped its own declared file pkg/b/b.go: %v", sc.ScopeFiles)
 	}
 }
 

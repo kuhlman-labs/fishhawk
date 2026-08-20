@@ -453,8 +453,15 @@ func TestEffectiveScopePathSetWithOps_FailOpenLegs(t *testing.T) {
 // entry does NOT change the effective scope count. A move relocates an
 // already-declared path between slices — the total file count is unchanged — so
 // it must consume zero headroom. The count is asserted byte-identical to the
-// no-move control; a regression that threaded the move into the effective set
-// (as an add would) turns this red.
+// no-move control.
+//
+// Honest limit of this counterfactual: because a valid move's paths are ALREADY
+// in the plan's declared scope, folding them into a DEDUPLICATING effective set
+// can never change the count — so a future edit that threaded the move into the
+// (deduping) effective set would leave this test GREEN. What it actually
+// discriminates is a NON-deduplicating additive-count regression (a move counted
+// as a fresh add). The cap-neutrality property it pins (an at-cap plan tolerates a
+// move) is real and worth keeping regardless.
 func TestEffectiveScopeHeadroom_IgnoresSliceMoves(t *testing.T) {
 	scopeFiles := []plan.ScopeFile{
 		{Path: "backend/a.go", Operation: plan.FileOpModify},
@@ -503,9 +510,13 @@ func TestEffectiveScopeHeadroom_IgnoresSliceMoves(t *testing.T) {
 // TestCheckPlanScopeCap_MoveConsumesNoHeadroom is the gate-level cap-neutrality
 // pin (#2596): approving a move on a decomposed plan whose union scope is already
 // EXACTLY at max_files_changed returns 200. A move is deliberately NOT threaded
-// into unionScopeAdds, so the cap gate sees the unchanged plan-scope count. The
-// regression this guards is a future edit that folded the move into the cap
-// arithmetic — that would 422 an at-cap move.
+// into unionScopeAdds, so the cap gate sees the unchanged plan-scope count.
+//
+// Honest limit of this counterfactual: the moved path is already in the union
+// scope, so a DEDUPLICATING fold of the move into the cap arithmetic would also
+// leave the count unchanged and this test GREEN. What it discriminates is a
+// NON-deduplicating additive-count regression (the move counted as a fresh add).
+// The property it pins (an at-cap plan accepts a move) is real and worth keeping.
 func TestCheckPlanScopeCap_MoveConsumesNoHeadroom(t *testing.T) {
 	rr := newOrchestratorRepo()
 	art := newFakeArtifactRepo()

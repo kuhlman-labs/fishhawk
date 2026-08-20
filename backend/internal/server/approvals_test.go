@@ -9482,10 +9482,13 @@ func TestCheckSliceMoveScopeFiles_PendingSiblingDoesNotBlock(t *testing.T) {
 	}
 }
 
-// (CONDITION 3) Walk the REAL repeat-approve sequence the guard exists for:
-// approve a move, "dispatch" the destination child (it leaves pending), then a
-// SECOND approve carrying a DIFFERENT move map must 409. Constructs the running
-// child THROUGH a prior approved move rather than directly.
+// (CONDITION 3) Walk the repeat-approve sequence the guard exists for: a REAL
+// first approve carrying a move, then — after the destination child has left
+// pending — a SECOND approve carrying a DIFFERENT move map must 409. Only the
+// FIRST approve is real; the running destination child is still seeded DIRECTLY
+// (seedDecomposedChild in StateRunning), not reached through an actual dispatch,
+// so this pins the second-approve-after-a-real-first-approved-move path and the
+// ADR-036 no-second-row property, not the pending->running transition itself.
 func TestCheckSliceMoveScopeFiles_RefusesRepeatApproveWithDifferentMoveAfterDispatch(t *testing.T) {
 	p := decomposedPlanWithScopedSlices(
 		[]string{"slice-a", "slice-b"},

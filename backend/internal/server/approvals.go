@@ -3516,6 +3516,14 @@ func (s *Server) checkSliceMoveScopeFiles(w http.ResponseWriter, r *http.Request
 	// destination slices; if a fan-out child of either has already left 'pending'
 	// its work has begun and un-scoping it retroactively is the harm. FAIL CLOSED
 	// on a ListRuns error.
+	//
+	// ACCEPTED TOCTOU WINDOW: this is a non-atomic check-then-act — a sibling that
+	// transitions pending->running BETWEEN this listing and the approval Submit
+	// below is admitted, the exact retroactive un-scoping the guard refuses. The
+	// window is narrow and mostly unreachable on the normal flow (dispatch happens
+	// only AFTER this approval), so it matters only on a repeat approve racing a
+	// concurrent dispatch. The plan did not require a transactional guard; a
+	// stronger guarantee (advisory-locked read-then-insert) is left as follow-up.
 	affected := make(map[int]struct{}, len(resolved)*2)
 	for _, mp := range resolved {
 		affected[mp.FromSlice] = struct{}{}

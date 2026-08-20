@@ -662,11 +662,19 @@ func TestE2E_SliceScopeMove_AtPlanGate(t *testing.T) {
 		t.Errorf("source slice-0 scope_files dropped its retained path %q: %v", srcKeepFile, src.scopePaths())
 	}
 
-	// DESTINATION child (slice 1): enforced scope_files GAINS the moved-in path
-	// (via the resolveApprovalAddScopeFiles fold) alongside its own file.
+	// DESTINATION child (slice 1): the moved-in path GAINS on BOTH surfaces the
+	// blocking acceptance criterion names — the enforced scope_files (via the
+	// resolveApprovalAddScopeFiles fold) AND the agent-facing
+	// scope_constraint.scope_files (via the resolveDecomposedScopeConstraint gained
+	// fold, #2596), alongside its own file. Asserting only scopePaths() would leave
+	// the constraint surface unpinned — the exact gap that let the moved-in file be
+	// enforced-in-scope yet absent from the narrowing the agent reads.
 	dst := getPromptRenderScope(t, ctx, httpSrv.URL, childStage[1])
 	if !containsPath(dst.scopePaths(), movedFile) {
 		t.Errorf("destination slice-1 scope_files missing the moved-in path %q: %v", movedFile, dst.scopePaths())
+	}
+	if !containsPath(dst.ScopeConstraint.ScopeFiles, movedFile) {
+		t.Errorf("destination slice-1 scope_constraint.scope_files missing the moved-in path %q: %v", movedFile, dst.ScopeConstraint.ScopeFiles)
 	}
 	if !containsPath(dst.scopePaths(), destOwnFile) {
 		t.Errorf("destination slice-1 scope_files missing its own planned file %q: %v", destOwnFile, dst.scopePaths())
