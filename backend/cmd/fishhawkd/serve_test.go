@@ -2969,6 +2969,27 @@ func TestServeRejectsInvalidMCPRoute(t *testing.T) {
 	}
 }
 
+// TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot pins the #2744
+// CONDITION 3 fail-closed startup refusal THROUGH runServe: enabling the
+// dispatch watchdog on a RunRepo that cannot supply the dispatch-liveness signal
+// must refuse to boot and say why, not silently run a heartbeat-defeatable or
+// never-firing watchdog. With no -db configured cfg.RunRepo is nil, which does
+// not satisfy run.DispatchLivenessLister — the same absence a non-Postgres repo
+// would present. Asserts the observable outcome (exitFailure) plus the naming of
+// the missing capability, not an error string alone. Deleting the serve.go guard
+// leaves the process booting (exitOK/hang) and reddens this test.
+func TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot(t *testing.T) {
+	t.Setenv("FISHHAWKD_ENABLE_DISPATCH_WATCHDOG", "")
+	var log bytes.Buffer
+	code := runServe([]string{"-enable-dispatch-watchdog"}, &log)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d — --enable-dispatch-watchdog with no capable RunRepo must refuse to boot; log:\n%s", code, exitFailure, log.String())
+	}
+	if !strings.Contains(log.String(), "dispatch-liveness capability") {
+		t.Errorf("refusal log did not name the missing dispatch-liveness capability; log:\n%s", log.String())
+	}
+}
+
 // TestResolveOAuthIssuer covers the AS issuer validation (ADR-076 slice 3,
 // #2436), including CONDITION 4: a path-bearing issuer is refused at startup
 // because the fixed /.well-known route does not serve its RFC 8414 discovery

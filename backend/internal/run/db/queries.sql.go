@@ -865,6 +865,54 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 	return items, nil
 }
 
+const listDispatchedStageLiveness = `-- name: ListDispatchedStageLiveness :many
+SELECT id, run_id, dispatched_at, updated_at, progress FROM stages
+ WHERE state = 'dispatched'
+ ORDER BY COALESCE(dispatched_at, updated_at) ASC
+`
+
+type ListDispatchedStageLivenessRow struct {
+	ID           uuid.UUID          `json:"id"`
+	RunID        uuid.UUID          `json:"run_id"`
+	DispatchedAt pgtype.Timestamptz `json:"dispatched_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Progress     []byte             `json:"progress"`
+}
+
+// The dispatch watchdog's liveness source (#2744). Per dispatched stage it
+// returns the dedicated dispatch clock (dispatched_at, migration 0072), the
+// generic updated_at, and the raw progress JSONB so the caller can decode the
+// last heartbeat. Deliberately NARROW — an explicit column list, not SELECT * —
+// so it expands no existing stages SELECT and changes no sqlc Stage model (the
+// 0070 precedent). Ordered by the COALESCED dispatch clock so the oldest
+// dispatch is processed first, preserving ListStagesDispatched's oldest-first
+// contract under the new signal even for a row still on the updated_at fallback.
+func (q *Queries) ListDispatchedStageLiveness(ctx context.Context) ([]ListDispatchedStageLivenessRow, error) {
+	rows, err := q.db.Query(ctx, listDispatchedStageLiveness)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDispatchedStageLivenessRow
+	for rows.Next() {
+		var i ListDispatchedStageLivenessRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.DispatchedAt,
+			&i.UpdatedAt,
+			&i.Progress,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesForRun = `-- name: ListStagesForRun :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `

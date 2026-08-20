@@ -1253,7 +1253,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"start the dispatch watchdog ticker (E8.4); fails category-C any stage stuck in 'dispatched' past --dispatch-watchdog-timeout. Off by default for the same dev-loop reason as --enable-sla-timer")
 	dispatchWatchdogTimeout := fs.Duration("dispatch-watchdog-timeout",
 		1*time.Hour,
-		"how long a stage may stay in 'dispatched' before the watchdog fails it as infrastructure failure; 1h default covers GitHub Actions dispatch + queue + first checkin")
+		"how long a stage may stay in 'dispatched' before the watchdog fails it as infrastructure failure. Measured from DISPATCH (stages.dispatched_at, migration 0072) — NOT from the last progress heartbeat and NOT from the last row write — so a heartbeating-but-wedged stage is still failed on its dispatch-relative deadline (#2744). SIZING: the 1h default sits at the same boundary as the runner's 3600s agent wall clock, and a healthy implement pass has been observed at 59m49s, so the false-positive margin is thin at the default — settle this before enabling. Covers GitHub Actions dispatch + queue + first checkin")
 	dispatchWatchdogInterval := fs.Duration("dispatch-watchdog-interval",
 		60*time.Second,
 		"dispatch watchdog scan interval")
@@ -1757,6 +1757,21 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
+	}
+
+	// Dispatch watchdog capability pre-check (#2744). The watchdog measures its
+	// deadline from stages.dispatched_at through the narrow
+	// run.DispatchLivenessLister capability; the heartbeat-defeatable
+	// Stage.UpdatedAt fallback is deliberately gone. FAIL CLOSED at startup when
+	// the watchdog is enabled but the configured RunRepo cannot supply that
+	// signal (a nil repo, or a non-Postgres one that lacks the capability):
+	// refuse to boot rather than run a silently-degraded or never-firing
+	// watchdog. This is the machine-enforced form of the #2744 sign-off.
+	if *enableDispatchWatchdog {
+		if _, ok := cfg.RunRepo.(runpkg.DispatchLivenessLister); !ok {
+			logger.Error("--enable-dispatch-watchdog set but the configured RunRepo does not carry the dispatch-liveness capability (run.DispatchLivenessLister); refusing to start rather than run a heartbeat-defeatable or never-firing watchdog")
+			return exitFailure
+		}
 	}
 
 	// Single-tenant profile bootstrap (ADR-057 Mode 1, E44.9 / #1833). Runs
@@ -2497,6 +2512,9 @@ func runServe(args []string, logSink io.Writer) int {
 		if cfg.RunRepo == nil || cfg.AuditRepo == nil {
 			logger.Warn("--enable-dispatch-watchdog set but RunRepo or AuditRepo unconfigured; ticker not started")
 		} else {
+			// The startup pre-check above already refused to boot if RunRepo
+			// lacks the dispatch-liveness capability, so the ticker's own
+			// Repo-type-assert resolves it — no explicit Liveness needed here.
 			ticker := &dispatchwatchdog.Ticker{
 				Repo:     cfg.RunRepo,
 				Audit:    cfg.AuditRepo,

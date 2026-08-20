@@ -217,6 +217,19 @@ SELECT * FROM stages
  WHERE state = 'dispatched'
  ORDER BY updated_at ASC;
 
+-- name: ListDispatchedStageLiveness :many
+-- The dispatch watchdog's liveness source (#2744). Per dispatched stage it
+-- returns the dedicated dispatch clock (dispatched_at, migration 0072), the
+-- generic updated_at, and the raw progress JSONB so the caller can decode the
+-- last heartbeat. Deliberately NARROW — an explicit column list, not SELECT * —
+-- so it expands no existing stages SELECT and changes no sqlc Stage model (the
+-- 0070 precedent). Ordered by the COALESCED dispatch clock so the oldest
+-- dispatch is processed first, preserving ListStagesDispatched's oldest-first
+-- contract under the new signal even for a row still on the updated_at fallback.
+SELECT id, run_id, dispatched_at, updated_at, progress FROM stages
+ WHERE state = 'dispatched'
+ ORDER BY COALESCE(dispatched_at, updated_at) ASC;
+
 -- name: ListStagesAwaitingChildren :many
 -- Used by the child-completion sweeper (#455) to find parent
 -- implement stages whose decomposed child runs may have reached
