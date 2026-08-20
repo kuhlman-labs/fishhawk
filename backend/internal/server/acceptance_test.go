@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -1252,7 +1254,7 @@ func TestAcceptanceBody_ValidateSanctionedContractShapes(t *testing.T) {
 		if err := a.validate(context.Background(), nil); err != nil {
 			t.Fatalf("validate skipped-with-basis: %v", err)
 		}
-		if _, _, skipped, total := acceptanceCriteriaTally(a.normalizedCriteria); skipped != 1 || total != 1 {
+		if _, _, skipped, _, total := acceptanceCriteriaTally(a.normalizedCriteria); skipped != 1 || total != 1 {
 			t.Errorf("tally skipped=%d total=%d, want 1/1", skipped, total)
 		}
 	})
@@ -1276,9 +1278,9 @@ func TestAcceptanceBody_ValidateSanctionedContractShapes(t *testing.T) {
 		if err := a.validate(context.Background(), nil); err != nil {
 			t.Fatalf("validate trivial 0-criteria pass: %v", err)
 		}
-		passed, failed, skipped, total := acceptanceCriteriaTally(a.normalizedCriteria)
-		if passed != 0 || failed != 0 || skipped != 0 || total != 0 {
-			t.Errorf("tally = %d/%d/%d/%d, want 0/0/0/0", passed, failed, skipped, total)
+		passed, failed, skipped, undecidable, total := acceptanceCriteriaTally(a.normalizedCriteria)
+		if passed != 0 || failed != 0 || skipped != 0 || undecidable != 0 || total != 0 {
+			t.Errorf("tally = %d/%d/%d/%d/%d, want 0/0/0/0/0", passed, failed, skipped, undecidable, total)
 		}
 		if got := acceptanceOutcomeLabel(a.Verdict); got != "accepted" {
 			t.Errorf("acceptanceOutcomeLabel = %q, want accepted", got)
@@ -3117,5 +3119,303 @@ func TestAcceptanceCriteriaIDs_SupersetIncludesRetired(t *testing.T) {
 	ids := acceptanceCriteriaIDsFromPlan(p)
 	if want := []string{"crit-1", "crit-2", "crit-3"}; !reflect.DeepEqual(ids, want) {
 		t.Fatalf("acceptance_criteria_ids = %v, want %v (every plan id, retired ones included)", ids, want)
+	}
+}
+
+// --- #2512 / E48.78: the undecidable vocabulary and the precedence ladder ---
+
+// acceptanceVerdictCorpus is the shared docs/spec/acceptance-verdict-fixtures.json
+// corpus, mirrored into this package's testdata by scripts/sync-schemas.
+type acceptanceVerdictCorpus struct {
+	Rows []struct {
+		Name     string          `json:"name"`
+		Body     json.RawMessage `json:"body"`
+		Admitted bool            `json:"admitted"`
+		Reason   string          `json:"reason"`
+	} `json:"rows"`
+}
+
+func loadAcceptanceVerdictCorpus(t *testing.T) acceptanceVerdictCorpus {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "acceptance-verdict-fixtures.json"))
+	if err != nil {
+		t.Fatalf("read acceptance verdict corpus (run scripts/sync-schemas): %v", err)
+	}
+	var c acceptanceVerdictCorpus
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("acceptance verdict corpus does not parse: %v", err)
+	}
+	if len(c.Rows) == 0 {
+		t.Fatal("acceptance verdict corpus is empty")
+	}
+	return c
+}
+
+// TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner is the backend half
+// of the CORPUS AGREEMENT claim (#2512). It runs the SAME rows the runner's
+// TestValidateAcceptanceVerdict_Corpus runs through acceptanceBody.validate and
+// asserts the SAME admit/reject partition, then POSTs every admitted body
+// VERBATIM to the real ship endpoint and asserts it is accepted — so the
+// partition is proved at the wire, not just at the decoder.
+//
+// HONEST SCOPE: this is corpus agreement between two hand-maintained validators,
+// NOT byte-carrying. No test can carry bytes returned by the runner's
+// validateAcceptanceVerdict into this package: it is unexported in package main
+// of runner/cmd/fishhawk-runner and the runner module does not require the
+// backend module. scripts/sync-schemas plus CI's schema-sync gate is what keeps
+// the two row sets identical; a validator drift fails whichever side drifted.
+func TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner(t *testing.T) {
+	for _, row := range loadAcceptanceVerdictCorpus(t).Rows {
+		t.Run(row.Name, func(t *testing.T) {
+			var a acceptanceBody
+			dec := json.NewDecoder(bytes.NewReader(row.Body))
+			dec.DisallowUnknownFields()
+			decErr := dec.Decode(&a)
+			err := decErr
+			if err == nil {
+				err = a.validate(context.Background(), nil)
+			}
+			switch {
+			case row.Admitted && err != nil:
+				t.Fatalf("corpus row %q must be ADMITTED (%s) but was rejected: %v", row.Name, row.Reason, err)
+			case !row.Admitted && err == nil:
+				t.Fatalf("corpus row %q must be REJECTED (%s) but was admitted", row.Name, row.Reason)
+			}
+			if !row.Admitted {
+				return
+			}
+			// Every admitted body must also survive the REAL ship endpoint
+			// verbatim — the decoder partition and the wire must not diverge.
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, _, _, _ := newAcceptanceServer(t, runID, stageID)
+			priv, _ := sf.issue(t, runID)
+			w := shipAcceptanceRequest(t, s, runID, stageID, priv, row.Body, "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("admitted corpus row %q POSTed verbatim: status = %d, want 201:\n%s",
+					row.Name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestAcceptanceBody_UndecidableReasonPresence pins BINDING CONDITION 1 at the
+// backend validator: undecidable_reason is decided on field PRESENCE, never on
+// emptiness. The present-and-EMPTY case is the one a plain-string decode
+// silently admits — Go's encoding/json cannot distinguish it from an absent
+// field — so it is the case that goes RED under a mutation collapsing presence
+// back to a string compare.
+func TestAcceptanceBody_UndecidableReasonPresence(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"absent-on-passed-row-accepted",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`, false},
+		{"present-and-EMPTY-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":""}]}`, true},
+		{"present-and-non-empty-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":"why"}]}`, true},
+		{"present-and-EMPTY-on-failed-row-rejected",
+			`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[{"id":"AC1","result":"failed","undecidable_reason":""}]}`, true},
+		{"present-on-skipped-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var a acceptanceBody
+			if err := json.Unmarshal([]byte(tc.raw), &a); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			err := a.validate(context.Background(), nil)
+			if tc.wantErr && err == nil {
+				t.Fatal("want rejection, got admitted")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want admitted, got %v", err)
+			}
+		})
+	}
+}
+
+// TestAcceptanceBody_UndecidableReasonRequired pins the other half of the rule:
+// an undecidable row REQUIRES a non-whitespace reason. The whitespace-only case
+// is the named twin-divergence risk — a validator that compared against "" would
+// admit it, stranding a completed acceptance stage while both suites stay green.
+func TestAcceptanceBody_UndecidableReasonRequired(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"absent-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true},
+		{"empty-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":""}]}`, true},
+		{"whitespace-only-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, true},
+		{"non-empty-accepted",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var a acceptanceBody
+			if err := json.Unmarshal([]byte(tc.raw), &a); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			err := a.validate(context.Background(), nil)
+			if tc.wantErr && err == nil {
+				t.Fatal("want rejection, got admitted")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want admitted, got %v", err)
+			}
+		})
+	}
+}
+
+// TestAcceptanceBody_TopLevelUndecidableVerdictRejected is the WIRE-FORGERY
+// control (#2512). undecidable is SERVER-DERIVED: the top-level verdict switch
+// stays deliberately INCOMPLETE with respect to the acceptanceVerdict* constant
+// set, so a producer cannot ship a merge-eligible non-pass it never itemized.
+//
+// The counterfactual for this control is COMPLETION, not deletion: adding a
+// `case acceptanceVerdictUndecidable` to that switch makes this test go RED.
+func TestAcceptanceBody_TopLevelUndecidableVerdictRejected(t *testing.T) {
+	for _, verdict := range []string{acceptanceVerdictUndecidable, acceptanceVerdictNotValidated} {
+		t.Run(verdict, func(t *testing.T) {
+			a := acceptanceBody{Verdict: verdict}
+			err := a.validate(context.Background(), nil)
+			if err == nil {
+				t.Fatalf("top-level verdict %q must be rejected on the wire (server-derived only)", verdict)
+			}
+			if !strings.Contains(err.Error(), "verdict must be passed or failed") {
+				t.Errorf("error = %v, want the passed-or-failed rejection", err)
+			}
+		})
+	}
+	// The full HTTP path refuses it too, not just the decoder.
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv,
+		[]byte(`{"verdict":"undecidable"}`), "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("ship top-level undecidable: status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestAggregateAcceptanceResults covers every ladder arm, including the EMPTY
+// row set — the documented hazard. The function is TOTAL and answers an empty
+// set with `passed`; this test pins that answer explicitly so the caller-side
+// len(rows) > 0 guard is understood to be what makes it safe. The guard itself
+// is pinned at the seam by
+// TestShipAcceptance_NoCriteriaRows_ShippedVerdictRecordedUnchanged.
+func TestAggregateAcceptanceResults(t *testing.T) {
+	reason := "no seam"
+	u := func(id string) acceptanceCriterionResult {
+		return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+	}
+	cases := []struct {
+		name string
+		rows []acceptanceCriterionResult
+		want string
+	}{
+		{"all-passed", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultPassed}, {ID: "b", Result: acceptanceResultPassed},
+		}, acceptanceVerdictPassed},
+		{"passed-and-skipped", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultPassed}, {ID: "b", Result: acceptanceResultSkipped},
+		}, acceptanceVerdictPassed},
+		{"any-failed-outranks-undecidable", []acceptanceCriterionResult{
+			u("a"), {ID: "b", Result: acceptanceResultFailed},
+		}, acceptanceVerdictFailed},
+		{"any-undecidable-outranks-passed", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultPassed}, u("b"),
+		}, acceptanceVerdictUndecidable},
+		{"all-undecidable-nothing-verified", []acceptanceCriterionResult{
+			u("a"), u("b"),
+		}, acceptanceVerdictUndecidable},
+		// THE HAZARD, pinned rather than hidden: an empty row set answers
+		// `passed`. Safe ONLY behind the caller's len(rows) > 0 guard.
+		{"EMPTY-row-set-answers-passed-the-documented-hazard", nil, acceptanceVerdictPassed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := aggregateAcceptanceResults(tc.rows); got != tc.want {
+				t.Errorf("aggregateAcceptanceResults = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAcceptanceVerdictAtLeast pins the severity-monotone max() on the total
+// order passed < undecidable < failed. Nothing is ever softened below what
+// either source claims.
+func TestAcceptanceVerdictAtLeast(t *testing.T) {
+	cases := []struct{ a, b, want string }{
+		{acceptanceVerdictPassed, acceptanceVerdictPassed, acceptanceVerdictPassed},
+		{acceptanceVerdictPassed, acceptanceVerdictUndecidable, acceptanceVerdictUndecidable},
+		{acceptanceVerdictUndecidable, acceptanceVerdictPassed, acceptanceVerdictUndecidable},
+		{acceptanceVerdictPassed, acceptanceVerdictFailed, acceptanceVerdictFailed},
+		{acceptanceVerdictFailed, acceptanceVerdictPassed, acceptanceVerdictFailed},
+		// The shipped-failed floor: a derived undecidable never softens it.
+		{acceptanceVerdictFailed, acceptanceVerdictUndecidable, acceptanceVerdictFailed},
+		{acceptanceVerdictUndecidable, acceptanceVerdictFailed, acceptanceVerdictFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.a+"+"+tc.b, func(t *testing.T) {
+			if got := acceptanceVerdictAtLeast(tc.a, tc.b); got != tc.want {
+				t.Errorf("acceptanceVerdictAtLeast(%q,%q) = %q, want %q", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAcceptanceOutcomeLabel_Undecidable pins the render-vocabulary twin: an
+// undecidable verdict renders as its own outcome, never as accepted (a green
+// light over an unevaluated criterion) and never as rejected (which would send a
+// correct change into triage).
+func TestAcceptanceOutcomeLabel_Undecidable(t *testing.T) {
+	if got := acceptanceOutcomeLabel(acceptanceVerdictUndecidable); got != plan.AcceptanceOutcomeUndecidable {
+		t.Errorf("acceptanceOutcomeLabel(undecidable) = %q, want %q", got, plan.AcceptanceOutcomeUndecidable)
+	}
+	if acceptanceOutcomeLabel(acceptanceVerdictUndecidable) == "accepted" ||
+		acceptanceOutcomeLabel(acceptanceVerdictUndecidable) == "rejected" {
+		t.Error("undecidable must not collapse into accepted or rejected")
+	}
+}
+
+// TestAcceptanceGateAdmitsMerge_Undecidable pins the SINGLE shared merge
+// predicate (#2474) admitting the new state — the one edit that makes all three
+// merge consumers admit it at once — alongside the states that stay refused.
+func TestAcceptanceGateAdmitsMerge_Undecidable(t *testing.T) {
+	if !acceptanceGateAdmitsMerge(acceptanceGateUndecidable) {
+		t.Error("acceptanceGateAdmitsMerge(acceptance_undecidable) = false, want true (merge-eligible)")
+	}
+	if acceptanceGateUndecidable == acceptanceGatePassed || acceptanceGateUndecidable == acceptanceGateNotValidated {
+		t.Error("acceptance_undecidable must be a DISTINCT state string, not an alias")
+	}
+	for _, refused := range []string{acceptanceGatePending, acceptanceGateTriage, acceptanceGateOutcomeUnknown} {
+		if acceptanceGateAdmitsMerge(refused) {
+			t.Errorf("acceptanceGateAdmitsMerge(%q) = true, want false", refused)
+		}
+	}
+}
+
+// TestAcceptanceCriteriaTally_CountsUndecidable pins the new tally arm that
+// feeds the criteria_undecidable payload field.
+func TestAcceptanceCriteriaTally_CountsUndecidable(t *testing.T) {
+	reason := "no seam"
+	passed, failed, skipped, undecidable, total := acceptanceCriteriaTally([]acceptanceCriterionResult{
+		{ID: "a", Result: acceptanceResultPassed},
+		{ID: "b", Result: acceptanceResultFailed},
+		{ID: "c", Result: acceptanceResultSkipped},
+		{ID: "d", Result: acceptanceResultUndecidable, UndecidableReason: &reason},
+		{ID: "e", Result: acceptanceResultUndecidable, UndecidableReason: &reason},
+	})
+	if passed != 1 || failed != 1 || skipped != 1 || undecidable != 2 || total != 5 {
+		t.Errorf("tally = %d/%d/%d/%d of %d, want 1/1/1/2 of 5",
+			passed, failed, skipped, undecidable, total)
 	}
 }

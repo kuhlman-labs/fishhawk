@@ -610,3 +610,97 @@ func TestAmendCriteria_OversizedText_Capped(t *testing.T) {
 		t.Errorf("recorded reason is not the capped form: ...%q", reason[max(0, len(reason)-40):])
 	}
 }
+
+// --- #2512: the D4 arm's undecidable extension, and the ordering it depends on ---
+
+// undecidableResult builds an undecidable per-criterion row. The reason is a
+// pointer because the wire rule is decided on field PRESENCE, not emptiness.
+func undecidableResult(id, reason string) acceptanceCriterionResult {
+	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+}
+
+// TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded is the #2512
+// extension of D4, and the coupling the earlier design predates: a SURVIVING
+// BLOCKING criterion the validator could not DECIDE was never evaluated, so it
+// must not ride out on someone else's retirement downgrade. Without it, a
+// retirement plus an unevaluated blocking criterion silently produces `passed` —
+// a green light over unevaluated evidence.
+//
+// COMMITTED-STATE control (rule 3): both the guarded and unguarded paths return
+// HTTP 201, so assertNoDowngrade READS the acceptance_outcome_recorded entry
+// after the POST returns and asserts verdict==failed with no downgrade keys. A
+// status-code assertion would pass either way. The bad state is seeded BY
+// CONSTRUCTION (crit-2 retired by a real approve call in seedRetirementFixture;
+// crit-1's undecidable row written literally), so the RED lands on the
+// behavioral assertion and never on fixture setup.
+//
+// Counterfactual: delete acceptanceResultUndecidable from acceptanceDowngrade's
+// D4 arm and this test goes RED (the verdict is recorded passed).
+func TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		undecidableResult("crit-1", "the preview returns the same body for both branches, so the criterion cannot be decided"),
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun pins the
+// load-bearing ORDER at the ingest seam: the #2581 downgrade runs FIRST over the
+// retired-id set, and the #2512 ladder then runs over the NON-RETIRED rows only.
+// If the ladder ran over ALL rows, a retired criterion's undecidable row would
+// pin the run to undecidable forever and the operator's retirement would have no
+// effect at all.
+//
+// Fixture: crit-2 is RETIRED and reported undecidable; every surviving row
+// passed. The derived verdict over the surviving partition is `passed`, so the
+// recorded verdict is `passed`. Delete the retired-row exclusion and the run
+// records `undecidable` instead — RED.
+func TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		undecidableResult("crit-2", "the retired criterion's target no longer exists"),
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed — a RETIRED criterion's undecidable row must not pin the run",
+			payload["verdict"])
+	}
+	// The raw tally still reports the agent's evidence unrewritten.
+	if payload["criteria_undecidable"] != float64(1) {
+		t.Errorf("criteria_undecidable = %v, want 1 (the agent's evidence is never rewritten)",
+			payload["criteria_undecidable"])
+	}
+}
+
+// TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable is the
+// paired positive for the ordering above: when NO retirement is in play, a
+// surviving undecidable row DOES reach the ladder and records undecidable. It
+// discriminates the exclusion from a blanket "ignore undecidable rows".
+func TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		undecidableResult("crit-3", "the assertion needs an instrument the sandbox lacks"),
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictUndecidable {
+		t.Errorf("recorded verdict = %v, want undecidable (a SURVIVING undecidable row reaches the ladder)",
+			payload["verdict"])
+	}
+}

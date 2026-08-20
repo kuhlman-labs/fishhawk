@@ -444,13 +444,17 @@ const acceptanceDowngradeBasisRetiredOnly = "retired_criteria_only"
 //	D3 the surviving partition is non-empty: at least one reported criterion
 //	   result whose id is NOT retired. A verdict that reports only retired
 //	   criteria evidences nothing about the live contract.
-//	D4 no surviving blocking skip: no non-retired criterion REPORTED `skipped`
-//	   whose plan `blocking` value (nil defaults to true) is true. A blocking
-//	   criterion the validator reported as un-exercised must not ride out on a
-//	   downgrade. D4 keys on what the verdict REPORTS: a blocking live criterion
-//	   the verdict OMITS entirely does not block the downgrade — the same trust
-//	   model that already lets a validator omit criteria from a passed verdict
-//	   (pinned by TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades).
+//	D4 no surviving blocking UN-EVALUATED criterion: no non-retired criterion
+//	   REPORTED `skipped` OR `undecidable` whose plan `blocking` value (nil
+//	   defaults to true) is true. A blocking criterion the validator reported as
+//	   un-exercised must not ride out on a downgrade. #2512 adds `undecidable`
+//	   with IDENTICAL semantics: without it, a retirement plus a surviving
+//	   blocking criterion the validator could not decide would silently produce
+//	   `passed` — a green light over unevaluated evidence, the exact hazard #2512
+//	   exists to remove. D4 keys on what the verdict REPORTS: a blocking live
+//	   criterion the verdict OMITS entirely does not block the downgrade — the
+//	   same trust model that already lets a validator omit criteria from a passed
+//	   verdict (pinned by TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades).
 //
 // Returns the retired ids that were reported failed (plan order, via the
 // effective set's ordering) and the downgrade basis.
@@ -483,10 +487,10 @@ func acceptanceDowngrade(acc acceptanceBody, eff effectiveAcceptanceCriteria) (b
 				return false, nil, ""
 			}
 			failedRetired[res.ID] = struct{}{}
-		case acceptanceResultSkipped:
-			// D4: a surviving BLOCKING criterion reported skipped blocks the
-			// downgrade. An id absent from the live set is treated as blocking
-			// (fail closed).
+		case acceptanceResultSkipped, acceptanceResultUndecidable:
+			// D4: a surviving BLOCKING criterion the validator did not evaluate —
+			// reported `skipped` or (#2512) `undecidable` — blocks the downgrade.
+			// An id absent from the live set is treated as blocking (fail closed).
 			if isRetired {
 				continue
 			}
