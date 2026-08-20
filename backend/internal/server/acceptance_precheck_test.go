@@ -460,3 +460,118 @@ func TestAcceptancePrecheck_ReturnsComputedPayload(t *testing.T) {
 		t.Errorf("returned result diverges from the recorded payload:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
 	}
 }
+
+// (#2512 layer 3) A criterion whose statement requires a capability the
+// sandboxed acceptance executor lacks is flagged undecidable_criterion and
+// counted in undecidable_count — surfaced through the EXISTING
+// plan_acceptance_precheck entry, with no second evaluation call.
+func TestAcceptancePrecheck_UndecidableCriterion_FlaggedAndCounted(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":         "live-forge",
+			"statement":  "a live GitHub round-trip closes the originating issue",
+			"source":     "explicit",
+			"source_ref": "#2512",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when an acceptance stage is configured")
+	}
+	if got.UndecidableCount != 1 {
+		t.Errorf("UndecidableCount = %d, want 1", got.UndecidableCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleUndecidableCriterion)
+	if f == nil {
+		t.Fatalf("want an undecidable_criterion finding in the persisted entry; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "live-forge" {
+		t.Errorf("CriterionID = %q, want live-forge", f.CriterionID)
+	}
+	if entry.UndecidableCount != 1 {
+		t.Errorf("persisted undecidable_count = %d, want 1", entry.UndecidableCount)
+	}
+}
+
+// (#2512 layer 3, advisory) The finding NEVER refuses the plan: the pre-check
+// returns a non-nil result and the entry is written exactly as on a clean
+// plan. Advisory-only is the whole posture — a criterion may legitimately name
+// a capability in prose while being drivable.
+func TestAcceptancePrecheck_UndecidableCriterion_IsAdvisoryNotARefusal(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":         "live-forge",
+			"statement":  "a live GitHub round-trip closes the originating issue",
+			"source":     "explicit",
+			"source_ref": "#2512",
+		},
+	}, nil)
+
+	if got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body); got == nil {
+		t.Fatal("the undecidable_criterion rule must never suppress the result (advisory only)")
+	}
+	if n := countAcceptancePrecheckEntries(au); n != 1 {
+		t.Fatalf("want exactly 1 entry; got %d", n)
+	}
+}
+
+// (#2512 layer 3, exemption) A criterion already marked skip_expected with an
+// expectation_basis is the sanctioned declaration of the same condition — no
+// finding and undecidable_count stays 0.
+func TestAcceptancePrecheck_UndecidableCriterion_ExemptWhenDeclared(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":                "live-forge",
+			"statement":         "a live GitHub round-trip closes the originating issue",
+			"source":            "explicit",
+			"source_ref":        "#2512",
+			"skip_expected":     true,
+			"expectation_basis": "pinned by the fake-forge integration test",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.UndecidableCount != 0 {
+		t.Errorf("UndecidableCount = %d, want 0 (declared criteria are exempt)", got.UndecidableCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if f := hasAcceptanceFinding(entry, acceptanceRuleUndecidableCriterion); f != nil {
+		t.Fatalf("a declared criterion must not be flagged; got %+v", *f)
+	}
+	if entry.UndecidableCount != 0 {
+		t.Errorf("persisted undecidable_count = %d, want 0", entry.UndecidableCount)
+	}
+}
+
+// (#2512 layer 3) An ordinary drivable criteria set leaves undecidable_count at
+// zero, so the field is a real signal rather than a constant.
+func TestAcceptancePrecheck_DrivableCriteria_ZeroUndecidableCount(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":         "records-undecidable",
+			"statement":  "posting a verdict carrying an undecidable row records verdict=undecidable",
+			"source":     "explicit",
+			"source_ref": "#2512",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.UndecidableCount != 0 {
+		t.Errorf("UndecidableCount = %d, want 0", got.UndecidableCount)
+	}
+	if entry := lastAcceptancePrecheckEntry(t, au); entry.UndecidableCount != 0 {
+		t.Errorf("persisted undecidable_count = %d, want 0", entry.UndecidableCount)
+	}
+}

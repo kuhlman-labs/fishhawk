@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // ptrBool is a small helper for building explicit *bool blocking values.
 func ptrBool(b bool) *bool { return &b }
@@ -407,5 +410,203 @@ func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("want zero findings on a clean set; got %+v", findings)
+	}
+}
+
+// findingsFor returns every finding matching rule.
+func findingsFor(findings []AcceptanceFinding, rule string) []AcceptanceFinding {
+	out := []AcceptanceFinding{}
+	for _, f := range findings {
+		if f.Rule == rule {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// (#2512 vocabulary) The three undecidable constants carry the exact strings
+// the wire, the audit payload, and the render templates key on. They are
+// deliberately equal in VALUE but distinct in MEANING (row result vs derived
+// verdict vs render outcome), so each is pinned by name — a rename that
+// collapses one into another is caught here rather than at a surface that
+// silently renders the wrong word.
+func TestUndecidableVocabulary_Values(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"result", AcceptanceResultUndecidable, "undecidable"},
+		{"verdict", AcceptanceVerdictUndecidable, "undecidable"},
+		{"outcome", AcceptanceOutcomeUndecidable, "undecidable"},
+		{"rule", RuleUndecidableCriterion, "undecidable_criterion"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+	// The partition's load-bearing disjointness: undecidable is NOT the
+	// pre-spawn not_validated verdict. They are different dispositions and a
+	// merge surface must be able to tell them apart.
+	if AcceptanceVerdictUndecidable == AcceptanceVerdictNotValidated {
+		t.Error("undecidable and not_validated must be distinct verdict strings")
+	}
+	if AcceptanceOutcomeUndecidable == AcceptanceOutcomeNotValidated {
+		t.Error("undecidable and not_validated must be distinct outcome strings")
+	}
+}
+
+// (rule: undecidable_criterion) A criterion naming a capability the sandbox
+// lacks is flagged, naming the criterion id and the capability.
+func TestUnevaluableCriteria_FlagsCapabilityStatements(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statement  string
+		wantDetail string
+	}{
+		{"mcp", "an operator making an MCP tool call sees the new state", "a live MCP client"},
+		{"operator session", "a real operator session shows the merge banner", "a real operator session"},
+		{"deployed", "the deployed environment serves the new endpoint", "a running external instance"},
+		{"forge", "a live GitHub round-trip closes the issue", "a live forge round-trip"},
+		{"webhook", "a real webhook delivery from the forge reopens the run", "a real webhook delivery"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2512"},
+				},
+			}
+			f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion)
+			if f == nil {
+				t.Fatalf("want undecidable_criterion for %q", tc.statement)
+			}
+			if f.CriterionID != "a1" {
+				t.Errorf("CriterionID = %q, want a1", f.CriterionID)
+			}
+			if !strings.Contains(f.Detail, tc.wantDetail) {
+				t.Errorf("Detail = %q, want it to name %q", f.Detail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+// (exemption) A criterion already marked skip_expected with a non-whitespace
+// expectation_basis is the SANCTIONED declaration of the same condition — it is
+// NOT re-flagged. This is the control the plan calls out: re-flagging a
+// correctly-marked criterion trains the operator to ignore the rule.
+func TestUnevaluableCriteria_ExemptsSkipExpectedWithBasis(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "a1", Statement: "a live GitHub round-trip closes the issue",
+				Source: CriterionSourceExplicit, SourceRef: "#2512",
+				SkipExpected: true, ExpectationBasis: "pinned by the fake-forge integration test",
+			},
+		},
+	}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); f != nil {
+		t.Fatalf("a skip_expected criterion with a basis must not be flagged; got %+v", *f)
+	}
+}
+
+// (exemption) requires_live_validation is the second sanctioned declaration and
+// exempts on its own.
+func TestUnevaluableCriteria_ExemptsRequiresLiveValidation(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "a1", Statement: "a live GitHub round-trip closes the issue",
+				Source: CriterionSourceExplicit, SourceRef: "#2512",
+				RequiresLiveValidation: true,
+			},
+		},
+	}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); f != nil {
+		t.Fatalf("a requires_live_validation criterion must not be flagged; got %+v", *f)
+	}
+}
+
+// (exemption boundary) skip_expected with a WHITESPACE-ONLY expectation_basis
+// is NOT a sanctioned declaration — the basis is what makes the marking
+// meaningful — so the criterion is still flagged. Pairs with the
+// AcceptanceSkippableAllSkipWithBasis whitespace rule so the two predicates
+// treat a blank basis identically.
+func TestUnevaluableCriteria_WhitespaceBasisIsNotAnExemption(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "a1", Statement: "a live GitHub round-trip closes the issue",
+				Source: CriterionSourceExplicit, SourceRef: "#2512",
+				SkipExpected: true, ExpectationBasis: "   ",
+			},
+		},
+	}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); f == nil {
+		t.Fatal("a whitespace-only expectation_basis must not exempt the criterion")
+	}
+}
+
+// (no false positive) An ordinary drivable criterion — including one that
+// mentions the forge in passing without naming a live round-trip — is not
+// flagged. An advisory rule that fires on ordinary prose is an ignored rule.
+func TestUnevaluableCriteria_DrivableCriterionNotFlagged(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "posting a verdict with an undecidable row records verdict=undecidable", Source: CriterionSourceExplicit, SourceRef: "#2512"},
+			{ID: "a2", Statement: "the github issue number is rendered in the status comment", Source: CriterionSourceExplicit, SourceRef: "#2512"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); len(got) != 0 {
+		t.Fatalf("want no undecidable_criterion findings; got %+v", got)
+	}
+}
+
+// (one criterion, one finding) A statement naming TWO lacked capabilities
+// yields exactly one finding, so a downstream count of findings is a count of
+// criteria rather than of phrase hits.
+func TestUnevaluableCriteria_OneFindingPerCriterion(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a real operator session drives a live GitHub round-trip through the MCP client", Source: CriterionSourceExplicit, SourceRef: "#2512"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); len(got) != 1 {
+		t.Fatalf("want exactly 1 finding; got %d: %+v", len(got), got)
+	}
+}
+
+// (case-insensitivity) Matching is case-insensitive over the statement.
+func TestUnevaluableCriteria_CaseInsensitive(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "A LIVE GITHUB ROUND-TRIP CLOSES THE ISSUE", Source: CriterionSourceExplicit, SourceRef: "#2512"},
+		},
+	}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); f == nil {
+		t.Fatal("matching must be case-insensitive")
+	}
+}
+
+// (shared rule set) The matcher rides EvaluateAcceptanceCriteria, so both
+// consumers of the shared set get it from one place. Calling the matcher
+// directly and calling the evaluator must agree on what fires.
+func TestEvaluateAcceptanceCriteria_IncludesUnevaluableFindings(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a live GitHub round-trip closes the issue", Source: CriterionSourceExplicit, SourceRef: "#2512"},
+		},
+	}
+	direct := UnevaluableCriteria(v)
+	viaSet := findingsFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion)
+	if len(direct) != 1 || len(viaSet) != 1 || direct[0] != viaSet[0] {
+		t.Fatalf("evaluator and matcher disagree: direct=%+v viaSet=%+v", direct, viaSet)
+	}
+}
+
+// (non-nil contract) The matcher returns [] not nil on a clean plan, matching
+// EvaluateAcceptanceCriteria's payload contract.
+func TestUnevaluableCriteria_NonNilOnCleanPlan(t *testing.T) {
+	if got := UnevaluableCriteria(Verification{}); got == nil {
+		t.Fatal("UnevaluableCriteria must return a non-nil slice")
 	}
 }

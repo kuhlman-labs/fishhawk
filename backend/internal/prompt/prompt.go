@@ -2481,16 +2481,21 @@ func buildAcceptance(t Trigger) string {
 	// runner scope; the prompt states the shape the agent must produce).
 	b.WriteString("### Output contract\n\n")
 	b.WriteString("Emit a structured acceptance verdict:\n\n")
-	b.WriteString("- `verdict`: `passed` or `failed`.\n")
+	b.WriteString("- `verdict`: `passed` or `failed`. There is NO third top-level value — an " +
+		"undecidable criterion is reported on its ROW, not at the top level (see the " +
+		"undecidable rule below), and Fishhawk derives the run's undecidable disposition from " +
+		"the rows itself.\n")
 	b.WriteString("- `failure_mode` (REQUIRED when verdict is `failed`): `error` when the " +
 		"instance crashed / returned a 500 / threw an exception; `assertion_fail` when it " +
 		"behaved without erroring but produced an unexpected result. Omit on a pass.\n")
 	b.WriteString("- `criteria`: a flat JSON array of per-criterion result objects, one per " +
 		"acceptance criterion above, each carrying its criterion `id` and a `result` " +
-		"(`passed`/`failed`/`skipped`) and, where useful, `steps_taken` / `observed` / " +
+		"(`passed`/`failed`/`skipped`/`undecidable`) and, where useful, `steps_taken` / `observed` / " +
 		"`expected`, plus `expectation_basis` (where the expectation came from — the criterion " +
 		"statement, the issue text, a spec section) and `repro_handle` (the command or request " +
-		"a human can re-run to reproduce the observation); for example " +
+		"a human can re-run to reproduce the observation), plus `undecidable_reason` " +
+		"(REQUIRED and non-empty when `result` is `undecidable`; OMIT the field entirely on " +
+		"every other result — do not send it empty); for example " +
 		"`[{\"id\":\"crit-1\",\"result\":\"passed\"},{\"id\":\"crit-2\",\"result\":\"failed\"}]` " +
 		"— never an id-keyed object like `{\"crit-1\":{...},\"crit-2\":{...}}`.\n\n")
 	b.WriteString("- `target_url` (OPTIONAL): a full http(s) URL of the running instance you " +
@@ -2546,6 +2551,43 @@ func buildAcceptance(t Trigger) string {
 		"artifacts by content hash in `evidence_hashes`; and (iii) name exactly what was " +
 		"validated against what in that criterion's `steps_taken` / `observed` / " +
 		"`expectation_basis`.\n")
+
+	// The undecidable vocabulary (#2512, E48.78 layer 4). Rendered AFTER the
+	// closed-field-set region so its backtick tokens fall outside the region the
+	// count guard measures, and it adds no TOP-LEVEL verdict field: it names
+	// only the per-criterion `undecidable` result and its `undecidable_reason`.
+	//
+	// The top-level mapping is stated EXPLICITLY and is load-bearing: without
+	// it a validator following the natural "anything not fully passed is
+	// failed" rule ships `failed` for an all-undecidable run, which lands the
+	// run in acceptance triage and makes the entire undecidable disposition
+	// inert. The server derives `undecidable` from the rows, so the producer's
+	// only job is to not flatten honest uncertainty into a defect signal.
+	b.WriteString("\n### When you cannot DECIDE a criterion\n\n")
+	b.WriteString("A criterion you attempted and genuinely could not decide is `undecidable` — " +
+		"NOT `failed` and NOT `passed`. `failed` means the change is defective: reporting an " +
+		"undecided criterion as `failed` flattens honest uncertainty into a defect signal and " +
+		"sends a correct change into triage. `passed` over a criterion you did not actually " +
+		"verify is worse: it is a green light nobody will look behind.\n\n")
+	b.WriteString("- Mark a criterion `result`=`undecidable` and give a non-empty " +
+		"`undecidable_reason` naming WHAT you could not determine and WHY (the evidence was " +
+		"ambiguous, the observation does not distinguish the criterion's two outcomes, the " +
+		"instrument you would need is unavailable). Set `undecidable_reason` on that row ONLY: " +
+		"omit the field entirely on a `passed` / `failed` / `skipped` row — the validator " +
+		"rejects it even when empty, so do not send `\"undecidable_reason\": \"\"`.\n")
+	b.WriteString("- Prefer `skipped` when the criterion was never in play for this run — its " +
+		"trigger needs an external event the sandbox cannot produce, a precondition is " +
+		"unmeetable, or an approval condition superseded it (the postures above). Reach for " +
+		"`undecidable` when the criterion IS in the contract, you drove the target, and the " +
+		"evidence does not settle it either way.\n")
+	b.WriteString("- TOP-LEVEL VERDICT MAPPING (required): an `undecidable` row does NOT make " +
+		"the top-level `verdict` `failed`. Ship `verdict`=`passed` when NO criterion row " +
+		"`failed`, even if some rows are `undecidable` and even if EVERY row is `undecidable`. " +
+		"Ship `verdict`=`failed` only when at least one row genuinely `failed`. Fishhawk reads " +
+		"the rows and records the run's own disposition — a run carrying an undecidable row is " +
+		"recorded as undecidable, never as a pass — so a top-level `failed` you ship over " +
+		"merely-undecided evidence is not caution, it is a wrong verdict that sends a correct " +
+		"change into triage.\n")
 
 	return b.String()
 }
@@ -3053,7 +3095,7 @@ func buildPlan(t Trigger) string {
 		"`skip_expected` to `true` on a criterion the sandboxed acceptance agent cannot validate against the localhost preview, and " +
 		"then `expectation_basis` (REQUIRED when `skip_expected` is `true`) MUST cite where the behavior is actually validated (the " +
 		"integration/e2e test with a fake). Omit both on a drivable criterion — a legacy criterion without `skip_expected` is " +
-		"unaffected.\n")
+		"unaffected. See the Undecidable-criteria rule below for the plan-gate rule that flags an unmarked one.\n")
 	b.WriteString("- `requires_live_validation` is OPTIONAL (see the Live-validation criteria rule below): set it to `true` on a " +
 		"criterion whose TRUE verification needs a LIVE forge/deploy/external target the default-deny sandbox lacks (not merely an " +
 		"external trigger event, which `skip_expected` already covers). A criterion you mark `requires_live_validation` you MUST ALSO " +
@@ -3086,6 +3128,18 @@ func buildPlan(t Trigger) string {
 		"(#2347), and the recorded count of `requires_live_validation` criteria is what tells the operator the skip carries a tracked " +
 		"live check rather than none. On plan approval the system auto-files-or-links an operator-validation walk for every " +
 		"`requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated.\n")
+	b.WriteString("Undecidable-criteria rule: the acceptance executor is a SANDBOXED agent driving a localhost preview. It has no live " +
+		"MCP client, no real operator session, no running external instance or deployed environment, no live GitHub/GitLab " +
+		"round-trip, and no real webhook delivery. Author a criterion that needs one of those UP FRONT as an explicit skip: set " +
+		"`skip_expected: true` with an `expectation_basis` citing where the behavior is actually validated (or, for a live " +
+		"forge/deploy target, `requires_live_validation: true` paired with that same marking). Do NOT ship it unmarked and hope: " +
+		"the executor cannot decide it, so it will report that criterion `result`=`undecidable` and the run is recorded UNDECIDABLE " +
+		"— merge-eligible, but explicitly not a validated pass, and the operator has to acknowledge it at the merge gate. The plan " +
+		"gate runs a deterministic `undecidable_criterion` check over your criteria statements and reports each unmarked one as an " +
+		"ADVISORY finding on the plan-review gate evidence; it does not reject the plan (a criterion may name a capability in prose " +
+		"and still be drivable), but a finding you left unaddressed is a question the approver will ask. A criterion you already " +
+		"marked `skip_expected` with a basis, or `requires_live_validation`, is exempt from the check — the marking IS the " +
+		"declaration.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

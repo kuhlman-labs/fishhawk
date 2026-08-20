@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -801,8 +802,12 @@ func TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator(t *testing.T) {
 		"verdict", "failure_mode", "criteria", "target_url", "evidence_hashes", "notes",
 	}
 	// Authoritative criterion-result property set (server.acceptanceCriterionResult).
+	// undecidable_reason joined it in #2512 (E48.78 layer 4); it is a CRITERION
+	// sub-field, not a top-level verdict field, so it is deliberately absent
+	// from wantVerdictProps and from the count-guard region below.
 	wantCriterionResultProps := []string{
 		"id", "result", "observed", "expected", "steps_taken", "expectation_basis", "repro_handle",
+		"undecidable_reason",
 	}
 	for _, f := range append(append([]string{}, wantVerdictProps...), wantCriterionResultProps...) {
 		tok := "`" + f + "`"
@@ -8861,5 +8866,168 @@ func TestBuild_ImplementReview_GateEvidence_TrustedObligationTextStillInline(t *
 	}
 	if strings.Contains(got, "<<<BEGIN UNTRUSTED OBLIGATION TEXT>>>") {
 		t.Errorf("no obligation quarantine envelope may render for operator-authored text:\n%s", got)
+	}
+}
+
+// TestBuild_Acceptance_UndecidableVocabulary pins the #2512 (E48.78 layer 4)
+// per-criterion vocabulary in the SHIPPED acceptance prompt: the executor must
+// learn that a criterion it cannot decide is reported `undecidable` with a
+// non-empty `undecidable_reason`, never as `failed` and never as `passed`.
+// The prompt is the only contract the acceptance agent actually reads — no
+// compile step enforces it — so this is a done-means behavioral assertion on
+// the rendered text (#1169).
+func TestBuild_Acceptance_UndecidableVocabulary(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"### When you cannot DECIDE a criterion",
+		"`undecidable`",
+		"`undecidable_reason`",
+		"NOT `failed` and NOT `passed`",
+		"(`passed`/`failed`/`skipped`/`undecidable`)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing undecidable vocabulary %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_UndecidableReasonPresenceRule pins the PRODUCER half of
+// the absence-is-not-emptiness rule (#2512 condition 1): the validator decides
+// on field PRESENCE, so the prompt must tell the agent to OMIT
+// undecidable_reason on a non-undecidable row rather than send it empty. An
+// agent that ships `"undecidable_reason": ""` on a passed row has its verdict
+// rejected and the stage fails, so this instruction is load-bearing.
+func TestBuild_Acceptance_UndecidableReasonPresenceRule(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"OMIT the field entirely on " +
+			"every other result — do not send it empty",
+		"rejects it even when empty",
+		"do not send `\"undecidable_reason\": \"\"`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing undecidable_reason presence rule %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_UndecidableTopLevelVerdictMapping is the PRODUCER-side
+// control for #2512 condition 2. The wire verdict enum stays passed|failed and
+// the server derives `undecidable` from the rows — but if the acceptance agent
+// follows the natural "anything not fully passed is failed" rule, an
+// all-undecidable run still ships `failed`, still enters acceptance triage, and
+// the entire layer-4 change is INERT. Nothing in the backend can catch that: a
+// hand-authored fixture bypasses the producer entirely.
+//
+// The prompt is the seam where the producer's choice is actually determined —
+// it is the instruction text the acceptance agent reads — so this test asserts
+// the rendered contract states the mapping explicitly in BOTH directions: an
+// undecidable row does not make the top-level verdict failed, ship passed when
+// no row failed (including when EVERY row is undecidable), and ship failed only
+// on a genuinely failed row.
+func TestBuild_Acceptance_UndecidableTopLevelVerdictMapping(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"TOP-LEVEL VERDICT MAPPING (required)",
+		"an `undecidable` row does NOT make " +
+			"the top-level `verdict` `failed`",
+		"Ship `verdict`=`passed` when NO criterion row " +
+			"`failed`",
+		"even if EVERY row is `undecidable`",
+		"Ship `verdict`=`failed` only when at least one row genuinely `failed`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing top-level verdict mapping %q:\n%s", want, got)
+		}
+	}
+	// The top-level enum itself is unchanged: the prompt must still state that
+	// `verdict` is passed|failed and say so with no third value, or the agent
+	// may try to ship `verdict: "undecidable"` and be rejected by the wire
+	// validator.
+	if !strings.Contains(got, "There is NO third top-level value") {
+		t.Errorf("acceptance prompt must state the top-level enum is unchanged:\n%s", got)
+	}
+}
+
+// TestBuild_Acceptance_DoesNotMutateApprovedPlan pins the guardrail carried
+// forward from the prior design: the acceptance-prompt paths read the approved
+// plan's verification (criteria, out_of_scope) and an in-place mutation of the
+// caller's already-built trigger.ApprovedPlan would corrupt the plan every
+// later consumer reads. Rendering must be pure with respect to the trigger.
+func TestBuild_Acceptance_DoesNotMutateApprovedPlan(t *testing.T) {
+	p := acceptanceFixturePlan()
+	before, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal before: %v", err)
+	}
+	retired := []RetiredAcceptanceCriterion{{ID: "ac-list", Reason: "superseded at the gate"}}
+	conditions := "condition one"
+	effective := []plan.AcceptanceCriterion{
+		{ID: "ac-create", Statement: "POST /widgets returns 201", Source: plan.CriterionSourceExplicit, SourceRef: "#1534"},
+	}
+	for _, tc := range []struct {
+		name string
+		trig Trigger
+	}{
+		{"plain", Trigger{Repo: "x/y", ApprovedPlan: p}},
+		{"retired", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceCriteriaRetired: retired}},
+		{"conditions", Trigger{Repo: "x/y", ApprovedPlan: p, ApprovalConditions: &conditions}},
+		{"effective", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceCriteriaEffective: effective}},
+		{"dropped-paths", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceDroppedScopePaths: []string{"a/b.go"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Build("acceptance", tc.trig); err != nil {
+				t.Fatalf("Build(acceptance): %v", err)
+			}
+			after, err := json.Marshal(p)
+			if err != nil {
+				t.Fatalf("marshal after: %v", err)
+			}
+			if string(before) != string(after) {
+				t.Errorf("acceptance prompt mutated the caller's ApprovedPlan\nbefore: %s\nafter:  %s", before, after)
+			}
+		})
+	}
+}
+
+// TestBuild_Plan_UndecidableCriteriaGuardrail pins the PREVENTIVE half of
+// #2512 layer 3 in the shipped PLANNER prompt: an author whose criterion needs
+// a capability the sandboxed acceptance executor lacks must mark it
+// skip_expected + expectation_basis (or requires_live_validation) up front, and
+// the prompt must name `undecidable_criterion` as the plan-gate rule that will
+// otherwise flag it. Prevention is the point — the detective rule fires after
+// the plan is already written.
+func TestBuild_Plan_UndecidableCriteriaGuardrail(t *testing.T) {
+	got, err := Build("plan", Trigger{IssueNumber: 2512, IssueTitle: "Add an undecidable outcome", Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	for _, want := range []string{
+		"Undecidable-criteria rule:",
+		"no live " +
+			"MCP client, no real operator session, no running external instance or deployed environment",
+		"`undecidable_criterion`",
+		"`skip_expected: true` with an `expectation_basis`",
+		"ADVISORY finding",
+		"is exempt from the check",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt missing undecidable-criteria guardrail %q:\n%s", want, got)
+		}
+	}
+	// Advisory, not a refusal: the prompt must not tell the author the plan
+	// gate rejects such a criterion — it does not, and saying so would push
+	// authors to mark drivable criteria as skips to dodge a phantom gate.
+	if !strings.Contains(got, "it does not reject the plan") {
+		t.Errorf("plan prompt must state the undecidable_criterion rule is advisory:\n%s", got)
 	}
 }
