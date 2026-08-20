@@ -3181,6 +3181,63 @@ func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
 	}
 }
 
+// TestStagesDispatchedAt_InsertDirectlyDispatched exercises 0072's trigger
+// TG_OP = 'INSERT' arm (#2744 fix-up) — the load-bearing branch the other tests
+// miss. The backfill test seeds its dispatched row BEFORE 0072 exists (no
+// trigger fires), and the run-package liveness tests create pending stages and
+// transition them into 'dispatched' through UPDATE (the TG_OP = 'UPDATE' arm).
+// Neither performs an INSERT that lands directly in 'dispatched' with the
+// trigger installed. That path must (a) NOT dereference the unassigned OLD —
+// OLD is unassigned inside an INSERT-fired trigger, so an unconditional
+// OLD.state read would raise — and (b) stamp dispatched_at from the transition.
+// The dispatched_at == created_at assertion is skew-free: both are the same
+// server-side now() at insert (created_at via its DEFAULT, dispatched_at via the
+// trigger), so a NULL or stale stamp fails without depending on the test host's
+// clock. Uses the postgres_test raw-un-migrated-database exemption.
+func TestStagesDispatchedAt_InsertDirectlyDispatched(t *testing.T) {
+	ctx := context.Background()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	// INSERT a stage that lands DIRECTLY in 'dispatched' with the trigger live.
+	// A regression that drops the TG_OP = 'INSERT' guard and reads OLD.state
+	// unconditionally raises HERE (SQLSTATE, "record \"old\" is not assigned yet").
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID,
+	); err != nil {
+		t.Fatalf("INSERT stage directly in 'dispatched' raised (INSERT trigger arm dereferenced the unassigned OLD?): %v", err)
+	}
+
+	var dispatchedAt, createdAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT dispatched_at, created_at FROM stages WHERE id = $1`, stageID,
+	).Scan(&dispatchedAt, &createdAt); err != nil {
+		t.Fatalf("read dispatched_at/created_at: %v", err)
+	}
+	if dispatchedAt == nil {
+		t.Fatal("dispatched_at is NULL after an INSERT directly into 'dispatched'; the TG_OP = 'INSERT' arm did not stamp the transition")
+	}
+	if !dispatchedAt.Equal(*createdAt) {
+		t.Errorf("dispatched_at %v != created_at %v after a direct-dispatched INSERT; the trigger did not stamp now() at insert time", dispatchedAt, createdAt)
+	}
+}
+
 // TestMigrateDown_ConcernNewEvidenceReversal pins 0069 (#2353, E60.8) in BOTH
 // directions: review_concerns.new_evidence AND review_concerns.settled_ref
 // EXIST after MigrateUp and are BOTH gone after exactly one MigrateDown, with
