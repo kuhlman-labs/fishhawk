@@ -70,38 +70,98 @@ func TestRegistryCoversAtLeastFiveSignatures(t *testing.T) {
 	}
 }
 
-// TestRegistryVersionStamped pins that every producible hint carries the
-// catalog revision.
+// TestRegistryVersionStamped pins that Match STAMPS the catalog revision onto
+// production output, and that the revision is non-empty.
+//
+// Both halves are load-bearing and neither is covered by
+// TestMatch_EverySignature, which compares the hint's field against the same
+// constant and so would stay green if RegistryVersion were blanked. This test
+// drives real evidence through Match — never a hand-built Hint — so deleting
+// the stamp in Match turns it RED.
 func TestRegistryVersionStamped(t *testing.T) {
 	if RegistryVersion == "" {
-		t.Fatal("RegistryVersion is empty")
+		t.Fatal("RegistryVersion is empty — an unstamped hint names no catalog revision")
 	}
-	for _, sig := range Registry() {
-		h := Hint{RegistryVersion: RegistryVersion, ID: sig.ID}
-		if h.RegistryVersion != RegistryVersion {
-			t.Fatalf("%s: hint carries %q", sig.ID, h.RegistryVersion)
+	for _, tc := range matchFixtures() {
+		got := Match(tc.ev)
+		if got == nil {
+			t.Fatalf("%s: Match returned nil, want %s", tc.name, tc.want)
+		}
+		if got.RegistryVersion == "" {
+			t.Fatalf("%s: Match produced a hint with no registry_version", tc.want)
+		}
+		if got.RegistryVersion != RegistryVersion {
+			t.Fatalf("%s: Match stamped %q, want %q", tc.want, got.RegistryVersion, RegistryVersion)
 		}
 	}
 }
 
-// TestMatchBlockIsConstantSize marshals a Hint for EVERY catalog entry and
-// asserts each stays under the named cap. This is the control that licenses
-// classifying next_actions.signature tierNever in the response byte ladder.
+// TestRegistryReturnsFreshPlaybooksPerCall is the counterfactual vehicle for
+// Registry()'s per-call reconstruction — the control that actually defends
+// catalog immutability today (see TestMatch_ReturnsIndependentPlaybookCopies,
+// which asserts the same property one layer up but cannot discriminate it).
+// Change Registry() to hand out a shared package-level catalog and this goes
+// RED.
+func TestRegistryReturnsFreshPlaybooksPerCall(t *testing.T) {
+	first := Registry()
+	if len(first) == 0 || len(first[0].Playbook) == 0 {
+		t.Fatal("catalog is empty")
+	}
+	original := first[0].Playbook[0]
+	first[0].Playbook[0] = "MUTATED"
+
+	second := Registry()
+	if second[0].Playbook[0] != original {
+		t.Fatalf("a mutation of one Registry() result reached the next: %q — the catalog must be rebuilt per call", second[0].Playbook[0])
+	}
+}
+
+// TestMatchBlockIsConstantSize drives EVERY catalog entry through the
+// PRODUCTION path — Match, on evidence a caller could really supply — and
+// asserts the marshalled hint stays under the named cap AND does not grow when
+// the same evidence carries a 200 KB failure reason. This is the control that
+// licenses classifying next_actions.signature tierNever in the response byte
+// ladder.
+//
+// Driving Match rather than a hand-built Hint is what makes the counterfactual
+// attainable: the named regression — adding a caller-derived field to Hint and
+// populating it in Match — leaves a hand-built Hint's new field empty and the
+// assertion green. Padding the reason per fixture is what turns that same
+// regression RED here rather than only in
+// TestMatchBlockNeverEchoesEvidence.
 func TestMatchBlockIsConstantSize(t *testing.T) {
-	for _, sig := range Registry() {
-		h := Hint{
-			RegistryVersion: RegistryVersion,
-			ID:              sig.ID,
-			Title:           sig.Title,
-			Means:           sig.Means,
-			Playbook:        sig.Playbook,
+	const pad = 200_000
+	for _, tc := range matchFixtures() {
+		got := Match(tc.ev)
+		if got == nil {
+			t.Fatalf("%s: Match returned nil, want %s", tc.name, tc.want)
 		}
-		b, err := json.Marshal(h)
+		b, err := json.Marshal(got)
 		if err != nil {
-			t.Fatalf("%s: marshal: %v", sig.ID, err)
+			t.Fatalf("%s: marshal: %v", tc.want, err)
 		}
 		if len(b) > hintMaxBytes {
-			t.Errorf("%s: marshalled hint is %d bytes, cap is %d — the block must stay constant-size to ride the response budget untiered", sig.ID, len(b), hintMaxBytes)
+			t.Errorf("%s: marshalled hint is %d bytes, cap is %d — the block must stay constant-size to ride the response budget untiered", tc.want, len(b), hintMaxBytes)
+		}
+
+		// The same evidence, with the reason padded far past the cap. The
+		// anchors are substring contracts, so appended padding cannot change
+		// which signature fires.
+		padded := tc.ev
+		padded.FailureReason += " " + strings.Repeat("x", pad)
+		gotPadded := Match(padded)
+		if gotPadded == nil {
+			t.Fatalf("%s: Match on a padded reason returned nil", tc.want)
+		}
+		if gotPadded.ID != got.ID {
+			t.Fatalf("%s: padding the reason changed the match to %q", tc.want, gotPadded.ID)
+		}
+		bPadded, err := json.Marshal(gotPadded)
+		if err != nil {
+			t.Fatalf("%s: marshal padded: %v", tc.want, err)
+		}
+		if len(bPadded) != len(b) {
+			t.Errorf("%s: hint grew with the failure reason: %d bytes vs %d — the block must echo no caller text", tc.want, len(bPadded), len(b))
 		}
 	}
 }

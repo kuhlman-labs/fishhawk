@@ -16,15 +16,23 @@ func failedEvidence(category, reason string) Evidence {
 	}
 }
 
-// TestMatch_EverySignature drives one REALISTIC evidence per catalog entry —
-// each reason is the literal shape its emitting site renders, not the bare
-// anchor — and asserts the matched id by identity.
-func TestMatch_EverySignature(t *testing.T) {
-	cases := []struct {
-		name string
-		ev   Evidence
-		want string
-	}{
+// matchFixture is one REALISTIC evidence per catalog entry — each reason is
+// the literal shape its emitting site renders, not the bare anchor — paired
+// with the id it must classify as.
+type matchFixture struct {
+	name string
+	ev   Evidence
+	want string
+}
+
+// matchFixtures is the shared production-path corpus. It is deliberately a
+// helper rather than a table local to one test: every assertion about a
+// PRODUCIBLE hint (the id, the version stamp, the marshalled size) must drive
+// Match with evidence a caller could really supply, not with a hand-built
+// Hint. TestMatch_EverySignature pins that it covers every catalog entry, so a
+// new signature cannot land without one.
+func matchFixtures() []matchFixture {
+	return []matchFixture{
 		{
 			name: "external api incident",
 			ev:   failedEvidence("A", "terminal external API error 529 (retries exhausted): exit status 1"),
@@ -73,7 +81,21 @@ func TestMatch_EverySignature(t *testing.T) {
 			want: "agent_no_progress_repeat",
 		},
 	}
-	for _, tc := range cases {
+}
+
+// TestMatch_EverySignature drives every fixture through Match and asserts the
+// matched id by identity, and pins that the corpus covers the whole catalog.
+func TestMatch_EverySignature(t *testing.T) {
+	covered := map[string]struct{}{}
+	for _, tc := range matchFixtures() {
+		covered[tc.want] = struct{}{}
+	}
+	for _, sig := range Registry() {
+		if _, ok := covered[sig.ID]; !ok {
+			t.Errorf("no fixture drives %s through Match — every catalog entry needs one (README: Adding a signature, step 2)", sig.ID)
+		}
+	}
+	for _, tc := range matchFixtures() {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Match(tc.ev)
 			if got == nil {
@@ -278,8 +300,18 @@ func TestMatch_LineageLockRequiresCategoryC(t *testing.T) {
 	}
 }
 
-// TestMatch_ReturnsIndependentPlaybookCopies pins that a caller mutating a
-// returned playbook cannot corrupt the catalog for the next caller.
+// TestMatch_ReturnsIndependentPlaybookCopies pins the BEHAVIOUR that a caller
+// mutating a returned playbook cannot corrupt the catalog for the next caller.
+//
+// It does NOT discriminate the defensive copy in Match. The control that
+// defends this property TODAY is Registry()'s per-call reconstruction — it
+// rebuilds every Playbook from a fresh slice literal, so the second Match
+// reads a brand-new backing array whether or not Match copies, and deleting
+// the copy leaves this test green (observed, #1703 fix-up pass).
+// TestRegistryReturnsFreshPlaybooksPerCall is the counterfactual vehicle for
+// that reconstruction. Match's copy becomes load-bearing only if Registry() is
+// ever changed to hand out a shared package-level catalog; this test is what
+// would then hold the line, which is why it is kept rather than folded away.
 func TestMatch_ReturnsIndependentPlaybookCopies(t *testing.T) {
 	ev := failedEvidence("A", "terminal external API error 529 (retries exhausted)")
 	first := Match(ev)
