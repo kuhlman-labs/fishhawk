@@ -1066,3 +1066,140 @@ func TestReapStage_DescriptionStatesClosedRaceHonestly(t *testing.T) {
 		}
 	}
 }
+
+// (G) TestReapStage_NonAnchorObservationSendsNoPin is the fix-up control for the
+// verb-side pin restriction. Only 'pending' is refused LOCALLY, so a stage
+// observed in a protected park (awaiting_approval here) reaches the POST by
+// design — and pinning that state would make the SERVER answer 400
+// validation_failed naming expected_state instead of its own park refusal, which
+// this verb then renders as a "rebuild fishhawkd" VERSION SKEW when nothing is
+// skewed. So the pin is restricted to the endpoint's own anchor set: the POST
+// goes out UNPINNED, the server's verbatim answer for the park reaches the
+// operator, and a warning names the observed state so the drop is not silent.
+//
+// COUNTERFACTUAL: delete the reapStageConditionalAnchors branch in reapStage (pin
+// whatever was observed) and the "no pin" assertion goes RED.
+func TestReapStage_NonAnchorObservationSendsNoPin(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "awaiting_approval")
+	// What the REAL server answers for a protected park: the benign no-op, not a
+	// transition. Modelled so the assertion below reads the server's own verdict
+	// rather than the fake's default success.
+	fb.mu.Lock()
+	fb.reapFailureRespBody = `{"transitioned":false,"stage_state":"awaiting_approval"}`
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("a parked stage must still reach the server (its refusal is the authoritative answer): %v", err)
+	}
+	if got, pinned := recordedReapExpectedState(fb, stageID); pinned {
+		t.Errorf("expected_state = %q on a NON-ANCHOR observation: the endpoint could never honour that pin, "+
+			"and sending it replaces the server's own refusal with a 400 the verb misreads as a version skew", got)
+	}
+	if out.Transitioned || out.StageState != "awaiting_approval" {
+		t.Errorf("transitioned=%v stage_state=%q, want false/awaiting_approval (the server's verdict, verbatim)",
+			out.Transitioned, out.StageState)
+	}
+	// The drop is DISCLOSED, not silent.
+	var found bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "awaiting_approval") && strings.Contains(w, "expected_state") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("dropping the pin must be disclosed in warnings naming the observed state; got %v", out.Warnings)
+	}
+}
+
+// (G) TestReapStage_OutOfSetPreconditionIsNotMisreadAsSkew is the classifier's
+// second paired control: a 400 whose DETAILS carry field=expected_state plus the
+// accepted list is a CURRENT fishhawkd refusing an out-of-set pin, not an OLD one
+// rejecting an unknown field at its decoder. Telling that operator to rebuild
+// fishhawkd sends them at the wrong repair, so the out-of-set arm must be
+// classified ahead of the skew arm and must name the accepted set instead.
+//
+// COUNTERFACTUAL: delete the isReapExpectedStateOutOfSet branch in
+// classifyReapPreconditionError and the "must not say VERSION SKEW" assertion
+// goes RED (the skew branch below it matches every 400 naming the field).
+func TestReapStage_OutOfSetPreconditionIsNotMisreadAsSkew(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusBadRequest
+	fb.reapFailureErrBody = `{"error":{"code":"validation_failed",` +
+		`"message":"expected_state must name one of the reapable stage states this endpoint can honour",` +
+		`"details":{"field":"expected_state","got":"awaiting_approval",` +
+		`"accepted":["pending","dispatched","running"]}}}`
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("an out-of-set expected_state 400 must surface as a tool error")
+	}
+	if strings.Contains(err.Error(), "VERSION SKEW") {
+		t.Errorf("a same-version out-of-set refusal was misclassified as a version skew, "+
+			"sending the operator at a fishhawkd rebuild that fixes nothing: %v", err)
+	}
+	for _, want := range []string{"NOT a version skew", "dispatched", "fishhawk_get_run_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name %q: %v", want, err)
+		}
+	}
+	// Same no-retry contract as the other two conditional 4xx surfaces.
+	if got := reapHops(fb); got != 1 {
+		t.Errorf("reap-failure POSTs = %d, want exactly 1 (an out-of-set 400 must never be retried unpinned)", got)
+	}
+}
+
+// (G) TestReapStage_StaleBeforeObservationPinsAnyway covers the fail-open arm the
+// review flagged as asymmetric: the PRE-classification read succeeded but the
+// final re-read failed. Sending no pin there would let one transient read error
+// downgrade a conditional reap to an UNPINNED one — the outcome the whole change
+// forbids — so the staler 'before' observation is pinned instead. It is safe
+// because the server evaluates the pin against LIVE state under its row lock, so
+// a stale pin can only refuse more, never fail a stage that moved.
+//
+// COUNTERFACTUAL: delete the `if !afterKnown && beforeKnown` fallback in
+// confirmStrandBeforeReap and this test goes RED (the POST carries no pin).
+func TestReapStage_StaleBeforeObservationPinsAnyway(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "dispatched")
+	// reapStage lists the run's stages EXACTLY twice: the pre-classification read
+	// and confirmStrandBeforeReap's re-read. Fail only the second.
+	fb.mu.Lock()
+	fb.stagesFailOnCall = 2
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("a failed re-read must not refuse the reap (fail-open is about refusing LOCALLY): %v", err)
+	}
+	if !out.Transitioned {
+		t.Errorf("transitioned = false, want true")
+	}
+	got, pinned := recordedReapExpectedState(fb, stageID)
+	if !pinned {
+		t.Fatal("the POST carried NO expected_state: one transient re-read error silently downgraded a " +
+			"conditional reap to an unpinned one, even though the earlier observation was usable")
+	}
+	if got != "dispatched" {
+		t.Errorf("expected_state = %q, want %q (the earlier observation, pinned rather than dropped)", got, "dispatched")
+	}
+}

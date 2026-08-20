@@ -1304,6 +1304,27 @@ func isReapExpectedStateRejected(ae *apiError) bool {
 	return ae != nil && ae.StatusCode == http.StatusBadRequest && strings.Contains(ae.Error(), "expected_state")
 }
 
+// isReapExpectedStateOutOfSet narrows isReapExpectedStateRejected to the
+// SAME-VERSION half of it: a current fishhawkd refusing a precondition that
+// names a state outside its conditional anchor set. That 400 carries a
+// STRUCTURED details map — field=expected_state plus the accepted list — which
+// the version-skew 400 cannot, because an OLD fishhawkd rejects the field at the
+// DECODER (DisallowUnknownFields) and never reaches the handler's validation.
+// The two are otherwise indistinguishable, and telling an operator to rebuild
+// fishhawkd when nothing is skewed sends them at the wrong repair (E67.51
+// fix-up). Keyed on the details map, never on message text: the accepted list is
+// what only the validating handler can produce.
+func isReapExpectedStateOutOfSet(ae *apiError) bool {
+	if ae == nil || ae.StatusCode != http.StatusBadRequest || ae.Details == nil {
+		return false
+	}
+	if field, _ := ae.Details["field"].(string); field != "expected_state" {
+		return false
+	}
+	_, hasAccepted := ae.Details["accepted"]
+	return hasAccepted
+}
+
 // ReportStageFailure reports a spawn-phase runner failure — a detached runner
 // that exited non-zero BEFORE reporting a terminal stage state — to the backend
 // via `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` (#1747). The

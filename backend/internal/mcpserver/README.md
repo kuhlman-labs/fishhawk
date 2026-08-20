@@ -907,9 +907,12 @@ narrowed.
 | surface | behaviour |
 |---|---|
 | observation succeeded | `expected_state` = that state; a mismatch is a tool error naming BOTH the pinned and the actual state and pointing at `fishhawk_get_run_status` + re-invoke |
-| stage row unreadable / absent | NO `expected_state` sent — the fail-open posture verbatim, since refusing a recovery verb on a transient read error would re-strand the stage |
+| final re-read failed, EARLIER read succeeded | the STALER `before` observation is pinned rather than dropped — a pin is evaluated against LIVE state under the server's row lock, so a stale pin can only refuse MORE, never fail a stage that moved; dropping it would let one transient read error downgrade a conditional reap to an unpinned one |
+| observation outside `{pending, dispatched, running}` (a protected park, an already-terminal stage) | NO `expected_state` sent, plus a WARNING naming the observed state. Only `pending` is refused locally, so a parked stage reaches the POST by design and the SERVER's own refusal is the authoritative answer; a pin the endpoint could never honour would replace that refusal with a `400` the verb would then have to tell apart from the version skew. `reapStageConditionalAnchors` mirrors the server's `reapConditionalAnchors` (deliberate duplication — the server package is not importable here) |
+| stage row unreadable / absent on BOTH reads | NO `expected_state` sent — the fail-open posture verbatim, since refusing a recovery verb on a transient read error would re-strand the stage |
 | `409 stage_state_precondition_failed` | surfaced to the operator; **never retried unpinned** (the client's `#1791` aggressive 4xx retry is skipped for this response on a conditional call) |
-| `400` naming `expected_state` | a **VERSION SKEW** message (this `fishhawk-mcp` is newer than the `fishhawkd` it talks to; the endpoint decodes with `DisallowUnknownFields`, so it 400s the field rather than ignoring it) — also never retried unpinned, because a silent unconditional retry would hand back the exact guarantee the pin buys |
+| `400` whose DETAILS carry `field=expected_state` + `accepted` | a SAME-VERSION out-of-set refusal, classified AHEAD of the skew arm and rendered as such (it names the accepted set and says it is **not** a version skew). Only the validating handler can produce that details map — an OLD `fishhawkd` rejects the field at its DECODER and never reaches validation — so the details, never message text, are the discriminator. Telling that operator to rebuild `fishhawkd` would send them at a repair that fixes nothing |
+| any other `400` naming `expected_state` | a **VERSION SKEW** message (this `fishhawk-mcp` is newer than the `fishhawkd` it talks to; the endpoint decodes with `DisallowUnknownFields`, so it 400s the field rather than ignoring it) — also never retried unpinned, because a silent unconditional retry would hand back the exact guarantee the pin buys |
 
 **The remaining residual, stated rather than papered over:** a runner that has been spawned but whose state advance has
 not COMMITTED yet is still reapable, because the stage state is the only thing the server can compare against —
@@ -917,9 +920,13 @@ detector (2), the re-probe, remains the (best-effort) client-side detector for t
 never driven to `failed`; for a `dispatched`-pinned reap the server's walk is `dispatched → running → failed`, so a
 refusal on the SECOND leg leaves that intermediate hop committed. Pinned by
 `TestReapStage_SendsObservedStateAsPrecondition` (both anchors), `TestReapStage_UnreadableStageSendsNoPrecondition`
-(fail-open), `TestReapStage_PreconditionLostSurfacesToOperator` and `TestReapStage_UnknownFieldSurfacesVersionSkew`
-(each asserting EXACTLY ONE POST), `TestReapStage_UnrelatedBadRequestIsNotMisreadAsSkew` (the paired control that an
-ordinary 400 is not mislabelled), `TestReportStageFailureFrom_413RetryKeepsPrecondition`, and the server-side
+(fail-open, BOTH reads failing), `TestReapStage_StaleBeforeObservationPinsAnyway` (the asymmetric arm — the earlier
+observation is pinned, not dropped), `TestReapStage_NonAnchorObservationSendsNoPin` (a parked observation reaches the
+server unpinned, with the drop disclosed in `warnings`), `TestReapStage_PreconditionLostSurfacesToOperator` and
+`TestReapStage_UnknownFieldSurfacesVersionSkew` (each asserting EXACTLY ONE POST),
+`TestReapStage_UnrelatedBadRequestIsNotMisreadAsSkew` and `TestReapStage_OutOfSetPreconditionIsNotMisreadAsSkew` (the
+two paired controls that a 400 is not mislabelled a skew — one not naming the field, one naming it for a
+same-version reason), `TestReportStageFailureFrom_413RetryKeepsPrecondition`, and the server-side
 `TestReapStageFailure_Conditional*` set.
 
 `guardSiblingStageInFlight`'s target-`running` arm reuses the same classification, **message-only**: the refusal stays
