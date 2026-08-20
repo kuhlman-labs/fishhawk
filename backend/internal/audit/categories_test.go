@@ -245,3 +245,17 @@ func TestKnownCategories_FixupReportingObligationUndelivered(t *testing.T) {
 		t.Fatal("fixup_reporting_obligation_undelivered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_FixupReportObligationsDeclared pins the #2737 concurrency
+// fix-up's anchor category: the fix-up prompt-serve path appends it to record
+// WHICH stage_fixup_triggered entry the served prompt derived its
+// reporting-obligation block from, and the implement review resolves that exact
+// entry rather than re-selecting the newest one. An unregistered category is
+// un-awaitable and unfilterable via GET /v0/runs/{run_id}/audit?category=, and
+// categories_completeness_test.go's AST sweep fails the build on a category
+// backend code emits but the registry omits.
+func TestKnownCategories_FixupReportObligationsDeclared(t *testing.T) {
+	if !IsKnownCategory("fixup_report_obligations_declared") {
+		t.Fatal("fixup_report_obligations_declared is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

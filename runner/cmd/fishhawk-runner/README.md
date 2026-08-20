@@ -427,35 +427,39 @@ obligation reports are still parsed, because the two signals are independent.
 
 Within a valid sidecar, `validateFixupObligationReports` drops an entry — with a
 `fixup_obligation_report_dropped` log naming the id and the reason — when its id
-is empty (`empty_id`), its status is not exactly `met` or `declined`
+is not exactly the `ob-N` shape `validFixupObligationID` accepts
+(`invalid_id`), its status is not exactly `met` or `declined`
 (`unknown_status`), it is `met` with an empty/whitespace `record`
 (`met_without_record`), or it is `declined` with an empty/whitespace `reason`
 (`declined_without_reason`). Dropping is the SAFE direction: a dropped `met`
 leaves the obligation undelivered and the backend's advisory signal fires.
 
-Retained free text is **untrusted at this boundary**. The fix-up agent executes
-arbitrary repository commands, so it controls every byte of a `record`/`reason`,
-and that text leaves the repository over the trace bundle and lands in the
-reviewer's prompt *without ever appearing in the committed diff* — an
-instruction-injection channel into the reviewer and a structure-bearing egress
-path around the diff. Bounding it would not make it trusted, so
-`sanitizeFixupObligationText` **flattens its structure first and bounds second**:
-`flattenFixupObligationText` collapses every control rune (newline, CR, tab,
-NUL, the ANSI escape introducer), every format rune (bidi overrides,
-zero-width joiners), and the Unicode line/paragraph separators to a single
-space, collapses whitespace runs and trims — so what crosses the boundary is one
-line of words, never a multi-line document with fenced blocks or impersonated
-headers. The words survive: this is a structure control, not censorship, so an
-honest one-line decline reason is returned byte-identical. Size is then capped
-at `maxFixupObligationTextBytes`. Pinned by
-`TestLoadFixupSelfReport_ObligationTextFlattenedAtUpload` (adversarial) and
-`TestFlattenFixupObligationText` (per-case table).
+**The agent's free text never leaves the runner.** The fix-up agent executes
+arbitrary repository commands, so it controls every byte of a `record`/`reason`.
+An earlier shape of this change flattened that text's structure and shipped it
+over the trace bundle into the reviewer's prompt, quarantined. That was the
+wrong control: flattening and quarantining bound what the text can *impersonate*,
+not what it can *carry*, so the field remained an arbitrary channel for
+repository content — a secret, a private file — from the agent to the reviewer
+*without ever appearing in the committed diff*. So the text is required (a `met`
+must carry a record, a `declined` must carry a reason — that is what makes the
+self-report an honest one) and then **discarded**: what a surviving entry carries
+is `{id, status}` and nothing else.
 
-This is the **upload half** of a two-layer treatment; the reviewer-rendering
-half (`backend/internal/prompt`'s `writeFixupObligationDeclineReasons`)
-quarantines the surviving text in a BEGIN/END untrusted-DATA envelope. Neither
-layer relies on the other — the runner cannot assume a backend version, and the
-backend must hold for a bundle a compromised runner composed.
+The id is the one agent-authored value that must still cross, because the
+backend's join has nothing else to key on. It is therefore constrained to a
+closed, non-content-bearing shape — `validFixupObligationID`: `ob-` followed by a
+positive decimal integer with no leading zero and at most four digits — rather
+than merely checked non-empty, since an unconstrained id string would reinstate
+exactly the channel the text fields were removed to close. An out-of-shape id can
+match no declared obligation anyway, so dropping it costs nothing.
+
+The drop log does not echo agent-authored strings either: an out-of-shape id or
+status logs `<invalid>`. Pinned by
+`TestLoadFixupSelfReport_ObligationTextNeverLeavesTheRunner` (adversarial, driven
+end to end through `composeGateEvidence`),
+`TestLoadFixupSelfReport_InvalidObligationIDDropped`, and
+`TestValidFixupObligationID` (per-case table).
 
 Survivors ride a `fixup_reporting_obligations` event that `composeGateEvidence`
 folds into `gate_evidence.fixup_reporting_obligations`. The json tags MUST stay

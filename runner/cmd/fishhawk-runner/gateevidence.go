@@ -76,10 +76,10 @@ type gateEvidencePayload struct {
 	// the backend's bundle.FixupSelfReportDivergenceEvidence mirror.
 	FixupSelfReportDivergence *fixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
 	// FixupReportingObligations digests the agent's VALIDATED per-obligation
-	// self-reports for a fix-up pass (#2737): one entry per routed REPORTING
-	// obligation the agent answered, already fail-closed-validated by
-	// validateFixupObligationReports. Folded from the fixup_reporting_obligations
-	// event. Absent (the byte-identical default) when there was no fix-up pass,
+	// self-reports for a fix-up pass (#2737): one {id, status} entry per routed
+	// REPORTING obligation the agent answered, already fail-closed-validated by
+	// validateFixupObligationReports, which retains NO agent-authored free text.
+	// Folded from the fixup_reporting_obligations event. Absent (the byte-identical default) when there was no fix-up pass,
 	// no obligation was routed, or no entry survived validation. The json tag
 	// MUST stay identical to the backend's
 	// bundle.FixupReportingObligationEvidence mirror — a one-sided edit silently
@@ -132,15 +132,23 @@ type fixupSelfReportDivergenceEvidence struct {
 }
 
 // fixupReportingObligationEvidence is one validated per-obligation self-report
-// (#2737): the obligation id the agent answered, the status literal it claimed
-// (`met` | `declined`), and the bounded free text it supplied — the attestation
-// when met, the decline reason when declined. The json tags MUST stay identical
-// to the backend's bundle.FixupReportingObligationEvidence mirror — the same
-// lockstep runner↔backend wire contract as the parent payload.
+// (#2737): the obligation id the agent answered and the status literal it
+// claimed (`met` | `declined`).
+//
+// There is deliberately NO free-text field. The agent's attestation and decline
+// reason are validated on the runner and discarded there
+// (validateFixupObligationReports): the fix-up agent runs arbitrary repository
+// commands, so that text is agent-controlled and would cross this upload
+// boundary into the reviewer's prompt without ever appearing in the committed
+// diff. Only the shape-constrained join key and the status literal are
+// transmitted.
+//
+// The json tags MUST stay identical to the backend's
+// bundle.FixupReportingObligationEvidence mirror — the same lockstep
+// runner↔backend wire contract as the parent payload.
 type fixupReportingObligationEvidence struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
-	Record string `json:"record,omitempty"`
 }
 
 // scopeExemptionEvidence is one validated scope self-exemption (#1153): a

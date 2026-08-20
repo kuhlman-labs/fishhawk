@@ -1168,9 +1168,13 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
-			// from the SAME newest stage-bound trigger entry.
-			trigger.FixupReportObligations = fixupReportObligationsForPrompt(
-				s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID))
+			// from the SAME newest stage-bound trigger entry — and this serve PINS
+			// that entry by audit Sequence so the implement review joins against
+			// the exact entry the agent's prompt named, not against whatever is
+			// newest when the review runs.
+			obligations, triggerSeq := s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID, 0)
+			trigger.FixupReportObligations = fixupReportObligationsForPrompt(obligations)
+			s.recordFixupReportObligationsDeclared(r.Context(), runRow.ID, stage.ID, triggerSeq, obligations)
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
@@ -1716,9 +1720,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
-			// from the SAME newest stage-bound trigger entry.
-			trigger.FixupReportObligations = fixupReportObligationsForPrompt(
-				s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID))
+			// from the SAME newest stage-bound trigger entry. This is the
+			// SPA-readable preview, so it renders the block but writes NO anchor —
+			// only the runner-facing serve pins the entry a review joins against.
+			obligations, _ := s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID, 0)
+			trigger.FixupReportObligations = fixupReportObligationsForPrompt(obligations)
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
@@ -2971,29 +2977,61 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 	return nil
 }
 
-// resolveFixupReportObligations returns the REPORTING obligations routed with
-// this stage's fix-up pass (#2737): the routed instructions that ask the agent
-// to RECORD something on a report surface rather than to change code.
+// CategoryFixupReportObligationsDeclared is the audit category the fix-up
+// PROMPT-SERVE path appends when it renders a reporting-obligation block
+// (#2737). Its payload pins WHICH stage_fixup_triggered entry the served prompt
+// derived that block from, by audit Sequence.
 //
-// It reads the SAME stage_fixup_triggered audit entry resolveFixupConcerns
-// selects — newest-first, the first entry bound to this stage with a non-empty
-// concern set — and feeds that entry's `concerns` notes, `operator_concern`,
-// and `reason` to fixupobligation.Detect. That shared selection predicate is
-// load-bearing and is asserted directly (not argued from sequencing) by
-// TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest:
-// the fix-up prompt renderer and the implement-review re-derivation call THIS
-// function, so both derive their declared set — and therefore the same `ob-N`
-// ids — from one entry. If they diverged, the review could report ids the agent
-// never saw, which would discredit the signal.
+// It exists because the two derivation sites are separated in time. The prompt
+// site resolves the NEWEST stage-bound trigger entry; the implement review
+// re-derives later. If a second fix-up were triggered for the same stage in
+// between, a newest-first review-time read would derive its declared set from an
+// entry the agent's prompt never named — reporting ids the agent never saw, or
+// missing ones it did report. Either outcome discredits the signal. So the
+// review does NOT re-select: it reads this anchor and resolves the trigger entry
+// by its exact Sequence.
+const CategoryFixupReportObligationsDeclared = "fixup_report_obligations_declared"
+
+// fixupReportObligationsDeclaredPayload is the anchor payload: the audit
+// Sequence of the stage_fixup_triggered entry the served prompt derived its
+// obligation block from, plus the ids it named (observability only — the review
+// re-derives the authoritative set from the pinned entry rather than trusting
+// this list, so there is no persisted duplicate that can drift).
+type fixupReportObligationsDeclaredPayload struct {
+	TriggerSequence int64    `json:"trigger_sequence"`
+	ObligationIDs   []string `json:"obligation_ids"`
+}
+
+// resolveFixupReportObligations returns the REPORTING obligations routed with
+// this stage's fix-up pass (#2737) — the routed instructions that ask the agent
+// to RECORD something on a report surface rather than to change code — together
+// with the audit Sequence of the stage_fixup_triggered entry they came from.
+//
+// atTriggerSequence selects that entry:
+//
+//   - <= 0 — the PROMPT-SERVE mode: the same predicate resolveFixupConcerns
+//     uses, newest-first, the first entry bound to this stage with a non-empty
+//     concern set. This is the entry the agent's prompt is rendered from.
+//   - > 0 — the REVIEW mode: ONLY the stage-bound entry whose audit Sequence is
+//     exactly that value, i.e. the entry the served prompt pinned via its
+//     CategoryFixupReportObligationsDeclared anchor. A newer trigger entry
+//     appended after the prompt was served is therefore invisible here, which is
+//     the whole point: the review joins against the exact entry the agent saw,
+//     not against whatever is newest when the review happens to run.
+//
+// The selected entry's `concerns` notes, `operator_concern`, and `reason` are
+// fed to fixupobligation.Detect, so the same entry always mints the same `ob-N`
+// ids.
 //
 // Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
 // trigger (the common, non-fix-up case), no routed instruction carries a
-// reporting obligation (the common fix-up case), or on any error — best-effort,
-// the same WARN-and-proceed posture as the other fix-up resolvers. A nil return
-// keeps the fix-up prompt byte-identical and emits no signal.
-func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stageID uuid.UUID) []fixupobligation.Obligation {
+// reporting obligation (the common fix-up case), the pinned Sequence matches no
+// entry, or on any error — best-effort, the same WARN-and-proceed posture as the
+// other fix-up resolvers. A nil return keeps the fix-up prompt byte-identical
+// and emits no signal.
+func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stageID uuid.UUID, atTriggerSequence int64) ([]fixupobligation.Obligation, int64) {
 	if s.cfg.AuditRepo == nil {
-		return nil
+		return nil, 0
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
 	if err != nil {
@@ -3002,11 +3040,16 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		return nil
+		return nil, 0
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		// Review mode: skip every entry but the pinned one. A newer round's
+		// entry is passed over rather than silently preferred.
+		if atTriggerSequence > 0 && e.Sequence != atTriggerSequence {
 			continue
 		}
 		var payload struct {
@@ -3049,17 +3092,106 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		)
 		obligations := fixupobligation.Detect(sources)
 		if len(obligations) == 0 {
-			return nil
+			return nil, 0
 		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: detected routed reporting obligations on fix-up pass",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.Int("obligation_count", len(obligations)),
+			slog.Int64("trigger_sequence", e.Sequence),
 		)
-		return obligations
+		return obligations, e.Sequence
 	}
-	return nil
+	return nil, 0
+}
+
+// recordFixupReportObligationsDeclared appends the CategoryFixupReportObligations
+// Declared anchor pinning which stage_fixup_triggered entry the prompt just
+// served derived its obligation block from (#2737 concurrency fix-up). Called
+// ONLY from the runner-facing prompt-serve path — never from the SPA
+// prompt-render preview, which must stay a read.
+//
+// Best-effort with a WARN, and it refuses to write a non-positive sequence: a
+// missing anchor makes the implement-review join resolve nothing and emit no
+// signal, which is the fail-SAFE direction for an evidence-only surface. The
+// alternative — falling back to a newest-first review-time read — is exactly the
+// divergence the anchor exists to prevent.
+func (s *Server) recordFixupReportObligationsDeclared(ctx context.Context, runID, stageID uuid.UUID, triggerSequence int64, obligations []fixupobligation.Obligation) {
+	if s.cfg.AuditRepo == nil || len(obligations) == 0 {
+		return
+	}
+	if triggerSequence <= 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: fix-up trigger entry carries no audit sequence — skipping the report-obligation anchor",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return
+	}
+	ids := make([]string, 0, len(obligations))
+	for _, ob := range obligations {
+		ids = append(ids, ob.ID)
+	}
+	payload, err := json.Marshal(fixupReportObligationsDeclaredPayload{
+		TriggerSequence: triggerSequence,
+		ObligationIDs:   ids,
+	})
+	if err != nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryFixupReportObligationsDeclared,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: append fixup_report_obligations_declared anchor failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
+// resolveFixupReportObligationAnchor returns the stage_fixup_triggered audit
+// Sequence the most recently SERVED fix-up prompt derived its obligation block
+// from (#2737), or 0 when no prompt for this stage ever rendered one.
+//
+// The implement review passes this to resolveFixupReportObligations so the join
+// is against the exact entry the agent's prompt named. A trigger entry appended
+// after that serve has no anchor of its own until ITS prompt is served, so it
+// cannot capture an in-flight review.
+func (s *Server) resolveFixupReportObligationAnchor(ctx context.Context, runID, stageID uuid.UUID) int64 {
+	if s.cfg.AuditRepo == nil {
+		return 0
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryFixupReportObligationsDeclared)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list fixup_report_obligations_declared anchor failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return 0
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload fixupReportObligationsDeclaredPayload
+		if json.Unmarshal(e.Payload, &payload) != nil {
+			continue
+		}
+		if payload.TriggerSequence > 0 {
+			return payload.TriggerSequence
+		}
+	}
+	return 0
 }
 
 // fixupReportObligationsForPrompt maps the detected obligations into the prompt

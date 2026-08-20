@@ -3596,11 +3596,23 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// outcome, the stage result, or the fix-up budget — pinned by
 	// TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome.
 	// A stage with no fix-up trigger derives no obligations and never enters it.
-	if declared := s.resolveFixupReportObligations(ctx, runID, stageID); len(declared) > 0 {
+	//
+	// The declared set is re-derived from the EXACT stage_fixup_triggered entry
+	// the served fix-up prompt pinned (its fixup_report_obligations_declared
+	// anchor), NOT from whichever entry is newest now: a second fix-up triggered
+	// for this stage between the serve and this review would otherwise make the
+	// review report ids the agent never saw. No anchor (no fix-up prompt for this
+	// stage ever rendered an obligation block, or the anchor append failed) means
+	// no signal — the fail-safe direction for an evidence-only surface.
+	var declared []fixupobligation.Obligation
+	if anchorSeq := s.resolveFixupReportObligationAnchor(ctx, runID, stageID); anchorSeq > 0 {
+		declared, _ = s.resolveFixupReportObligations(ctx, runID, stageID, anchorSeq)
+	}
+	if len(declared) > 0 {
 		var reports []fixupobligation.Report
 		if gateEvidence != nil {
 			for _, r := range gateEvidence.FixupObligationReports {
-				reports = append(reports, fixupobligation.Report{ID: r.ID, Status: r.Status, Record: r.Record})
+				reports = append(reports, fixupobligation.Report{ID: r.ID, Status: r.Status})
 			}
 		}
 		if undelivered := fixupobligation.Undelivered(declared, reports); len(undelivered) > 0 {
@@ -3620,7 +3632,6 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 						// an acceptance-derived excerpt reaches the reviewer
 						// prompt quarantined rather than inline (#2737 fix-up).
 						Untrusted: f.Untrusted,
-						Record:    f.Detail,
 					})
 				details = append(details, fixupReportingObligationDetail{
 					ID:          f.ID,
@@ -5706,12 +5717,12 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 	}
 	// Fix-up per-obligation self-reports (#2737). Carrier only — the prompt
 	// never renders these; runImplementReviews subtracts the `met` entries from
-	// the declared set it re-derives and renders only the remainder.
+	// the declared set it re-derives and renders only the remainder. The wire
+	// shape carries no agent-authored free text, by design.
 	for _, r := range ev.FixupReportingObligations {
 		out.FixupObligationReports = append(out.FixupObligationReports, prompt.GateFixupObligationReport{
 			ID:     r.ID,
 			Status: r.Status,
-			Record: r.Record,
 		})
 	}
 	return out

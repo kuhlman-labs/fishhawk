@@ -641,17 +641,17 @@ func TestComposeGateEvidence_NoDiffCoverageField(t *testing.T) {
 // the same lockstep defense this file already applies to
 // fixup_selfreport_divergence.
 const fixupReportingObligationsWireFixture = `"fixup_reporting_obligations":[` +
-	`{"id":"ob-1","status":"met","record":"recorded the deletion table in the PR body Notes"},` +
-	`{"id":"ob-2","status":"declined","record":"the sandbox refused the deletion"}]`
+	`{"id":"ob-1","status":"met"},` +
+	`{"id":"ob-2","status":"declined"}]`
 
 // TestComposeGateEvidence_FixupReportingObligationsWireShape is the runner half
 // of the lockstep pair: the composer emits the shared literal byte-for-byte.
 func TestComposeGateEvidence_FixupReportingObligationsWireShape(t *testing.T) {
 	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
 	events := []agent.Event{
-		fixupReportingObligationsEvent(cfg, []fixupObligationReport{
-			{ID: "ob-1", Status: "met", Record: "recorded the deletion table in the PR body Notes"},
-			{ID: "ob-2", Status: "declined", Reason: "the sandbox refused the deletion"},
+		fixupReportingObligationsEvent(cfg, []fixupReportingObligationEvidence{
+			{ID: "ob-1", Status: "met"},
+			{ID: "ob-2", Status: "declined"},
 		}),
 	}
 	ev := composeGateEvidence(events, 0)
@@ -667,9 +667,14 @@ func TestComposeGateEvidence_FixupReportingObligationsWireShape(t *testing.T) {
 	if len(p.FixupReportingObligations) != 2 {
 		t.Fatalf("FixupReportingObligations = %+v, want 2 entries", p.FixupReportingObligations)
 	}
-	if p.FixupReportingObligations[1].Record != "the sandbox refused the deletion" {
-		t.Errorf("a declined entry must carry its REASON in the single record field, got %+v",
-			p.FixupReportingObligations[1])
+	// The wire shape carries the join key and the status literal and NOTHING
+	// else (#2737 security fix-up), so an agent-authored attestation or decline
+	// reason has no field to ride out on.
+	for _, k := range []string{"record", "reason", "detail", "text"} {
+		if strings.Contains(raw, `"`+k+`":`) {
+			t.Errorf("gate_evidence payload carries a %q member — agent-authored text must not cross the "+
+				"upload boundary:\n%s", k, raw)
+		}
 	}
 }
 

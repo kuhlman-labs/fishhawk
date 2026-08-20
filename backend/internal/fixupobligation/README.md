@@ -39,13 +39,47 @@ persisted duplicate to drift:
 | Fix-up prompt render | `backend/internal/server/prompt.go::resolveFixupReportObligations` → `prompt.writeFixupReportObligations` | names each obligation to the agent by id, routes the record into the self-report sidecar |
 | Implement-review re-derivation | `backend/internal/server/trace.go::runImplementReviews` (adjacent to the #1407 block) | re-derives the declared set, subtracts the agent's `met` reports, signals the remainder |
 
-Entry selection is `resolveFixupConcerns`'s predicate verbatim: scan
-newest-first, take the first entry bound to this stage with a **non-empty
-concern set**. That identity is asserted directly rather than argued from
-sequencing — `TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest`
-seeds two stage-bound trigger entries and pins which one both sites resolve, so
-a later fork of the two sites fails loudly instead of reporting ids the agent's
-prompt never named.
+### Entry identity: the serve-time anchor
+
+"Same entry" cannot rest on a shared *predicate*, because the two sites are
+separated in time. The prompt site selects `resolveFixupConcerns`'s predicate
+verbatim — scan newest-first, take the first entry bound to this stage with a
+**non-empty concern set**. If the review re-ran that predicate and a **second
+fix-up were triggered for the same stage in between**, the review would derive
+its declared set from an entry the agent's prompt never named: `ob-N` ids bound
+to different text, so a spurious "unreported", or a real one missed. Either
+outcome discredits the signal, which is worse than not having it.
+
+So the serve **pins** its entry and the review **resolves that exact entry**:
+
+1. `handleGetStagePrompt` (the runner-facing serve — *not* the SPA
+   `prompt-render` preview, which stays a pure read) resolves the newest entry,
+   renders the block, then appends a `fixup_report_obligations_declared` audit
+   entry via `recordFixupReportObligationsDeclared`, carrying that entry's audit
+   `Sequence` (`{trigger_sequence, obligation_ids}`).
+2. `runImplementReviews` reads the newest stage-bound anchor
+   (`resolveFixupReportObligationAnchor`) and passes its `trigger_sequence` to
+   `resolveFixupReportObligations`, which then matches **only** the entry with
+   that exact `Sequence`.
+
+A trigger entry appended after the serve has no anchor of its own until *its*
+prompt is served, so it cannot capture an in-flight review. The anchor stores
+only the pointer plus the ids for observability — the review re-derives the
+authoritative set from the pinned entry, so there is still no persisted duplicate
+that can drift.
+
+**No anchor → no signal.** A stage that never served an obligation-bearing fix-up
+prompt, or whose anchor append failed, emits nothing rather than falling back to
+a newest-first read. That is the fail-safe direction for an evidence-only
+surface.
+
+Pinned by `TestResolveFixupReportObligations_NewerTriggerAppendedAfterServe_ReviewJoinsTheServedEntry`
+(the intervening-append path, driven in real order: serve → append → review),
+`TestResolveFixupReportObligations_SecondServeRepinsTheAnchor` (the anchor tracks
+the serve rather than freezing on the oldest entry),
+`TestRunImplementReviews_FixupObligationWithoutAnchor_NoSignal`, and
+`TestGetStagePrompt_Implement_FixupReportObligations_ServeAnchorsTheTriggerEntry`
+(the serve writes it; the preview does not).
 
 ## Classifier grammar
 
@@ -100,7 +134,7 @@ Then, **per entry** (`validateFixupObligationReports`):
 
 | Condition | Result | `reason` on `fixup_obligation_report_dropped` |
 |---|---|---|
-| Empty / whitespace `id` | dropped | `empty_id` |
+| `id` not exactly the `ob-N` shape (`validFixupObligationID`) | dropped | `invalid_id` |
 | `status` not exactly `met` or `declined` | dropped | `unknown_status` |
 | `met` with empty/whitespace `record` | dropped | `met_without_record` |
 | `declined` with empty/whitespace `reason` | dropped | `declined_without_reason` |
@@ -108,6 +142,10 @@ Then, **per entry** (`validateFixupObligationReports`):
 Dropping is the **safe direction**: a dropped `met` leaves the obligation
 undelivered and the signal fires. Admitting a malformed `met` would falsely
 satisfy the obligation and silence the very signal this exists to raise.
+
+The surviving entry is reduced to `{id, status}`. The `record`/`reason` text is
+**required but not retained** — see the trust boundary below. The drop log
+echoes neither field verbatim: an out-of-shape id or status logs `<invalid>`.
 
 ## Trust boundary on the routed instruction excerpt
 
@@ -140,29 +178,36 @@ construction and are never marked.
 An operator-authored obligation renders **byte-identically to before** at both
 sites: the partition is on the flag alone.
 
-## Trust boundary on the agent's free text
+## The agent's free text does not cross the upload boundary
 
-The backend-minted `ob-N` id is trusted. The agent's `record`/`reason` is
-**not**. The fix-up agent
-executes arbitrary repository commands, so it controls every byte it writes
-there, and that text leaves the repository over the trace bundle and lands in
-the implement reviewer's prompt *without ever appearing in the committed diff* —
-i.e. an instruction-injection path into the reviewer and a structure-bearing
-egress path around the diff. Bounding the field does not make it trusted, so it
-is treated as untrusted at **both** ends, with neither end relying on the other:
+The fix-up agent executes arbitrary repository commands, so it controls every
+byte of the `record`/`reason` it writes. An earlier shape of this change carried
+that text over the trace bundle into the implement reviewer's prompt, quarantined
+inside a `<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` envelope with its
+structure flattened at upload.
 
-| Layer | Control | Pinned by |
+**That was the wrong control.** Quarantining and flattening bound what the text
+can *impersonate*; they do nothing about what it can *carry*. The field remained
+an arbitrary channel for repository content — a secret, a private file — from the
+command-running agent to the reviewer, *without ever appearing in the committed
+diff*. The channel is therefore removed rather than hardened:
+
+| Layer | What crosses | Pinned by |
 |---|---|---|
-| Upload (runner) | `sanitizeFixupObligationText` = `flattenFixupObligationText` (control / format / line-separator runes → one space, whitespace runs collapsed, trimmed) then bound to `maxFixupObligationTextBytes` | `TestLoadFixupSelfReport_ObligationTextFlattenedAtUpload`, `TestFlattenFixupObligationText` |
-| Reviewer render (backend) | `writeFixupObligationDeclineReasons` — every line through `sanitizeUntrustedComment` inside a `<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` envelope, Fishhawk's own instruction kept OUTSIDE it, block capped at `maxFixupObligationReasonBytes` | `TestBuild_ImplementReview_GateEvidence_FixupObligationReason_Quarantined`, `TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined` |
+| Sidecar → runner | `{id, status, record, reason}`; text is validated (`met` needs a record, `declined` needs a reason) and then **discarded** | `TestLoadFixupSelfReport_ObligationTextNeverLeavesTheRunner`, `TestLoadFixupSelfReport_ObligationsHappyPath` |
+| Runner → backend (gate evidence) | `{id, status}` only — `fixupReportingObligationEvidence` / `bundle.FixupReportingObligationEvidence` have no text field | `TestComposeGateEvidence_FixupReportingObligationsWireShape`, `TestExtractGateEvidence_FixupReportingObligationCarriesNoAgentText` |
+| Backend → reviewer prompt | the *operator's* instruction excerpt only; the block states plainly that the agent's stated reason is not carried | `TestBuild_ImplementReview_GateEvidence_FixupObligation_NoAgentTextChannel` |
+| Audit payload | `{id, source, status, text_excerpt, untrusted}` — the excerpt is the operator's instruction | `TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAndRendersEvidence` |
 
-Both are **structure** controls, not censorship: the agent's words survive so the
-reviewer still sees what it claimed, but they can no longer impersonate a prompt
-section, open a fenced block, or carry a multi-line document. The audit payload
-does not carry the agent's text at all — only `{id, source, status,
-text_excerpt}`, where the excerpt is the *operator's* instruction — so the
-advisory audit entry is not an egress path either — and the excerpt itself is
-marked `untrusted` when it is not the operator's own words.
+The one agent-authored value that must still cross is the **join key**, and it is
+constrained to a closed shape (`validFixupObligationID`: `ob-N`, no leading zero,
+≤ 4 digits) rather than merely checked non-empty — an unconstrained id string
+would reinstate exactly the channel the text fields were removed to close.
+
+What is lost: an operator reading the gate no longer sees *why* the agent
+declined. What is kept: they see *that* it declined, against which operator
+instruction. That is the trade the evidence-only posture can afford; an egress
+channel is not.
 
 ## Evidence-only posture
 

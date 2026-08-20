@@ -181,8 +181,8 @@ func declaredPair() []Obligation {
 // 3's no-noise control: every declared id carries a `met` report → no finding.
 func TestUndelivered_AllMetReturnsNothing(t *testing.T) {
 	got := Undelivered(declaredPair(), []Report{
-		{ID: "ob-1", Status: StatusMet, Record: "table in Notes"},
-		{ID: "ob-2", Status: StatusMet, Record: "table in Notes"},
+		{ID: "ob-1", Status: StatusMet},
+		{ID: "ob-2", Status: StatusMet},
 	})
 	if len(got) != 0 {
 		t.Fatalf("Undelivered = %+v, want none when every obligation is met", got)
@@ -200,22 +200,21 @@ func TestUndelivered_NoReportsReturnsEveryDeclaredAsUnreported(t *testing.T) {
 		if f.Status != StatusUnreported {
 			t.Errorf("finding %d status = %q, want %q", i, f.Status, StatusUnreported)
 		}
-		if f.Detail != "" {
-			t.Errorf("finding %d detail = %q, want empty for an unreported obligation", i, f.Detail)
-		}
 	}
 	if got[0].ID != "ob-1" || got[1].ID != "ob-2" {
 		t.Errorf("Undelivered did not preserve declared order: %+v", got)
 	}
 }
 
-// TestUndelivered_DeclinedCarriesStatusAndReason: an honest decline is still
-// undelivered, but it is reported as a decline with the agent's reason so the
-// operator can tell a refusal from a silence.
-func TestUndelivered_DeclinedCarriesStatusAndReason(t *testing.T) {
+// TestUndelivered_DeclinedCarriesStatus: an honest decline is still undelivered,
+// but it is reported as a decline rather than a silence so the operator can tell
+// a refusal from nothing at all. The agent's stated REASON is deliberately not
+// part of the finding — it is validated on the runner and never transmitted
+// (#2737 security fix-up), so a Finding carries only backend-derived text.
+func TestUndelivered_DeclinedCarriesStatus(t *testing.T) {
 	got := Undelivered(declaredPair(), []Report{
-		{ID: "ob-1", Status: StatusMet, Record: "table in Notes"},
-		{ID: "ob-2", Status: StatusDeclined, Record: "the deletion could not be performed in this sandbox"},
+		{ID: "ob-1", Status: StatusMet},
+		{ID: "ob-2", Status: StatusDeclined},
 	})
 	if len(got) != 1 {
 		t.Fatalf("Undelivered = %+v, want only the declined obligation", got)
@@ -223,8 +222,10 @@ func TestUndelivered_DeclinedCarriesStatusAndReason(t *testing.T) {
 	if got[0].ID != "ob-2" || got[0].Status != StatusDeclined {
 		t.Errorf("finding = %+v, want ob-2 declined", got[0])
 	}
-	if !strings.Contains(got[0].Detail, "could not be performed") {
-		t.Errorf("declined finding lost the agent's reason: %q", got[0].Detail)
+	// The instruction excerpt on the finding is the OPERATOR's, carried from the
+	// declared obligation — never anything the agent wrote.
+	if got[0].Text != "Record counterfactual B in the PR body." {
+		t.Errorf("declined finding lost the operator's instruction excerpt: %q", got[0].Text)
 	}
 }
 
@@ -232,8 +233,8 @@ func TestUndelivered_DeclinedCarriesStatusAndReason(t *testing.T) {
 // declared satisfies nothing and produces no finding of its own.
 func TestUndelivered_UnknownReportIDIgnored(t *testing.T) {
 	got := Undelivered(declaredPair(), []Report{
-		{ID: "ob-9", Status: StatusMet, Record: "for an obligation that does not exist"},
-		{ID: "ob-1", Status: StatusMet, Record: "real"},
+		{ID: "ob-9", Status: StatusMet},
+		{ID: "ob-1", Status: StatusMet},
 	})
 	if len(got) != 1 || got[0].ID != "ob-2" {
 		t.Fatalf("Undelivered = %+v, want only ob-2 (ob-9 ignored, ob-1 met)", got)
@@ -243,7 +244,7 @@ func TestUndelivered_UnknownReportIDIgnored(t *testing.T) {
 // TestUndelivered_NothingDeclaredReturnsNothing: the no-obligation fix-up — the
 // common case — can never produce a finding, whatever the agent reported.
 func TestUndelivered_NothingDeclaredReturnsNothing(t *testing.T) {
-	if got := Undelivered(nil, []Report{{ID: "ob-1", Status: StatusDeclined, Record: "why"}}); len(got) != 0 {
+	if got := Undelivered(nil, []Report{{ID: "ob-1", Status: StatusDeclined}}); len(got) != 0 {
 		t.Fatalf("Undelivered = %+v, want none when nothing was declared", got)
 	}
 }
@@ -253,8 +254,8 @@ func TestUndelivered_NothingDeclaredReturnsNothing(t *testing.T) {
 func TestUndelivered_DuplicateReportCannotUpgradeADecline(t *testing.T) {
 	got := Undelivered([]Obligation{{ID: "ob-1", Source: SourceConcern, Text: "Record it in the PR body."}},
 		[]Report{
-			{ID: "ob-1", Status: StatusDeclined, Record: "declined first"},
-			{ID: "ob-1", Status: StatusMet, Record: "then claimed met"},
+			{ID: "ob-1", Status: StatusDeclined},
+			{ID: "ob-1", Status: StatusMet},
 		})
 	if len(got) != 1 || got[0].Status != StatusDeclined {
 		t.Fatalf("Undelivered = %+v, want the first (declined) report to stand", got)

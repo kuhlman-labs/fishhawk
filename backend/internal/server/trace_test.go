@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -6961,20 +6962,59 @@ const obligationConcernNote = "Record the per-deletion counterfactual results in
 // operator reason. This is the SAME entry shape server/fixup.go::writeFixupAudit
 // writes, and it is the sole input both the fix-up prompt renderer and the
 // review-time re-derivation read.
-func seedFixupTriggerWithConcern(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) {
+func seedFixupTriggerWithConcern(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) int64 {
+	t.Helper()
+	return seedFixupTriggerConcernWithProvenance(t, au, runID, stageID, note, reason, "")
+}
+
+// seedFixupTriggerConcernWithProvenance seeds a stage_fixup_triggered entry with
+// the given concern provenance and returns the audit Sequence it was stamped
+// with — the identity the #2737 anchor pins a served prompt to. Sequences are
+// allocated monotonically per fake, mirroring the append-only audit chain.
+func seedFixupTriggerConcernWithProvenance(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason, provenance string) int64 {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"stage_id": stageID.String(),
-		"concerns": []planreview.Concern{{Severity: "medium", Category: "process", Note: note}},
-		"reason":   reason,
+		"concerns": []planreview.Concern{{
+			Severity: "medium", Category: "process", Note: note, Provenance: provenance,
+		}},
+		"reason": reason,
 	})
 	if err != nil {
 		t.Fatalf("marshal fixup trigger payload: %v", err)
 	}
+	seq := int64(len(au.seeded) + 1)
 	au.seeded = append(au.seeded, &audit.Entry{
-		RunID: &runID, StageID: &stageID,
+		Sequence: seq, RunID: &runID, StageID: &stageID,
 		Category: CategoryStageFixupTriggered, Payload: payload,
 	})
+	return seq
+}
+
+// seedFixupObligationAnchor seeds the fixup_report_obligations_declared entry
+// the fix-up PROMPT-SERVE path writes (#2737 concurrency fix-up), pinning which
+// stage_fixup_triggered entry the served prompt derived its obligation block
+// from. The implement review resolves that exact entry, so without this anchor
+// no signal fires at all — the review never re-selects on its own.
+func seedFixupObligationAnchor(t *testing.T, au *auditFake, runID, stageID uuid.UUID, triggerSeq int64) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"trigger_sequence": triggerSeq, "obligation_ids": []string{"ob-1"}})
+	if err != nil {
+		t.Fatalf("marshal anchor payload: %v", err)
+	}
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: int64(len(au.seeded) + 1), RunID: &runID, StageID: &stageID,
+		Category: CategoryFixupReportObligationsDeclared, Payload: payload,
+	})
+}
+
+// seedServedFixupObligation is the common two-step the #2737 review tests need:
+// seed the trigger entry AND the anchor the served prompt would have written.
+func seedServedFixupObligation(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) int64 {
+	t.Helper()
+	seq := seedFixupTriggerWithConcern(t, au, runID, stageID, note, reason)
+	seedFixupObligationAnchor(t, au, runID, stageID, seq)
+	return seq
 }
 
 // seedFixupTriggerWithAcceptanceConcern seeds the same stage_fixup_triggered
@@ -6983,21 +7023,9 @@ func seedFixupTriggerWithConcern(t *testing.T, au *auditFake, runID, stageID uui
 // E31.8 / #1613) rather than operator-authored instruction.
 func seedFixupTriggerWithAcceptanceConcern(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{
-		"stage_id": stageID.String(),
-		"concerns": []planreview.Concern{{
-			Severity: "medium", Category: "acceptance", Note: note,
-			Provenance: planreview.ConcernProvenanceAcceptance,
-		}},
-		"reason": reason,
-	})
-	if err != nil {
-		t.Fatalf("marshal fixup trigger payload: %v", err)
-	}
-	au.seeded = append(au.seeded, &audit.Entry{
-		RunID: &runID, StageID: &stageID,
-		Category: CategoryStageFixupTriggered, Payload: payload,
-	})
+	seq := seedFixupTriggerConcernWithProvenance(t, au, runID, stageID, note, reason,
+		planreview.ConcernProvenanceAcceptance)
+	seedFixupObligationAnchor(t, au, runID, stageID, seq)
 }
 
 // fixupObligationUndeliveredPayloads returns the decoded payloads of every
@@ -7025,7 +7053,7 @@ func fixupObligationUndeliveredPayloads(t *testing.T, au *auditFake) []fixupRepo
 func metReportEvidence(id string) *prompt.GateEvidence {
 	return &prompt.GateEvidence{
 		FixupObligationReports: []prompt.GateFixupObligationReport{
-			{ID: id, Status: "met", Record: "recorded the deletion table in the PR body Notes"},
+			{ID: id, Status: "met"},
 		},
 	}
 }
@@ -7043,7 +7071,7 @@ func TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAn
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
 
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -7096,7 +7124,7 @@ func TestImplementReview_FixupReportingObligationMet_NoAuditEntry(t *testing.T) 
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
 
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -7124,10 +7152,10 @@ func TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined(t *
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
 
 	ev := &prompt.GateEvidence{FixupObligationReports: []prompt.GateFixupObligationReport{
-		{ID: "ob-1", Status: "declined", Record: "the sandbox refused the deletion"},
+		{ID: "ob-1", Status: "declined"},
 	}}
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -7145,21 +7173,21 @@ func TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined(t *
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
-	// The agent's reason survives to the reviewer, but ONLY inside the
-	// untrusted-DATA quarantine envelope (the #2737 security fix-up): the text
-	// is agent-authored, so it may never render inline beside the
-	// operator-authored fields where it could read as an instruction.
-	prompt := reviewer.calls[0]
-	begin := strings.Index(prompt, "<<<BEGIN UNTRUSTED AGENT DECLINE REASON>>>")
-	end := strings.Index(prompt, "<<<END UNTRUSTED AGENT DECLINE REASON>>>")
-	if begin < 0 || end < begin {
-		t.Fatalf("reviewer prompt lost the decline-reason quarantine envelope:\n%s", prompt)
+	// The reviewer is told the obligation was DECLINED and is told plainly that
+	// the agent's own stated reason is not carried — that text is validated on
+	// the runner and discarded there (#2737 security fix-up), so there is no
+	// agent-authored channel into this prompt at all.
+	rp := reviewer.calls[0]
+	for _, w := range []string{
+		"`ob-1` (routed as concern) — declined: " + obligationConcernNote,
+		"stated reason for a decline is deliberately NOT carried here",
+	} {
+		if !strings.Contains(rp, w) {
+			t.Errorf("reviewer prompt missing %q:\n%s", w, rp)
+		}
 	}
-	if !strings.Contains(prompt[begin:end], "| the sandbox refused the deletion") {
-		t.Errorf("reviewer prompt lost the decline reason:\n%s", prompt)
-	}
-	if strings.Contains(prompt[:begin]+prompt[end:], "the sandbox refused the deletion") {
-		t.Errorf("the agent-authored reason leaked outside the quarantine envelope:\n%s", prompt)
+	if strings.Contains(rp, "UNTRUSTED AGENT DECLINE REASON") {
+		t.Errorf("the decline-reason channel must be gone, not quarantined:\n%s", rp)
 	}
 }
 
@@ -7178,6 +7206,8 @@ func TestImplementReview_NoReportingObligationRouted_NoSignal(t *testing.T) {
 		if seed {
 			seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID,
 				"Guard the nil pool in the retry path.", "route the correctness concern")
+			// No anchor: a routine fix-up's served prompt renders no obligation
+			// block, so it pins nothing for the review to join against.
 		}
 		diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -7241,7 +7271,7 @@ func TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome(
 			model:   "claude-opus-4-7",
 		}
 		s, _, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-		seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+		seedServedFixupObligation(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
 
 		diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -7292,14 +7322,31 @@ func TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome(
 	}
 }
 
-// TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest is
-// APPROVAL CONDITION 2's pin. The "byte-identical at both sites by construction"
-// claim holds only if the prompt-render site and the review-time re-derivation
-// resolve the SAME stage_fixup_triggered entry. Rather than argue that the
-// sequencing precludes interleaving, this seeds TWO stage-bound trigger entries
-// and asserts which one BOTH sites resolve — so the determinism rests on a
-// pinned identity, not on shared code that could later be forked.
-func TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest(t *testing.T) {
+// TestResolveFixupReportObligations_NewerTriggerAppendedAfterServe_ReviewJoinsTheServedEntry
+// is APPROVAL CONDITION 2's pin, tightened by the implement review's
+// high/concurrency concern.
+//
+// The "byte-identical at both sites by construction" claim holds only if the
+// prompt-render site and the review-time re-derivation resolve the SAME
+// stage_fixup_triggered entry. Seeding both entries before either read only
+// covers same-snapshot ordering. This drives the INTERVENING-APPEND path
+// instead, in the real order:
+//
+//	serve prompt (entry A) -> append entry B for the same stage -> run review
+//
+// and asserts the review's declared set came from A. A newest-first review-time
+// read would derive from B and report an id bound to text the agent's prompt
+// never named — the outcome that discredits the signal.
+//
+// The mechanism is the fixup_report_obligations_declared ANCHOR the serve
+// writes: it pins A by audit Sequence, and the review resolves that exact
+// entry rather than re-selecting. This test exercises the REAL writer
+// (recordFixupReportObligationsDeclared) and the REAL reader
+// (resolveFixupReportObligationAnchor), not a hand-seeded stand-in.
+//
+// Counterfactual: pass 0 instead of the anchor sequence at the review site (the
+// pre-fix-up newest-first behavior) and this goes RED on the newerNote excerpt.
+func TestResolveFixupReportObligations_NewerTriggerAppendedAfterServe_ReviewJoinsTheServedEntry(t *testing.T) {
 	const olderNote = "Record the FIRST round's counterfactual table in the PR body's ## Notes."
 	const newerNote = "Record the SECOND round's counterfactual table in the PR body's ## Notes."
 
@@ -7308,21 +7355,33 @@ func TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest(
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	// ListForRunByCategory returns entries ASC by ts, and both resolvers scan
-	// newest-FIRST, so the second seeded entry is the newer round.
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, olderNote, "first round")
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, newerNote, "second round")
 
-	// SITE 1 — the prompt-render resolver (what the agent's fix-up prompt names).
-	declared := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID)
-	if len(declared) != 1 {
-		t.Fatalf("prompt-site resolver returned %+v, want exactly one obligation", declared)
+	// (1) Round one is triggered and its fix-up prompt is SERVED.
+	seqA := seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, olderNote, "first round")
+	declared, servedSeq := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID, 0)
+	if len(declared) != 1 || declared[0].Text != olderNote {
+		t.Fatalf("prompt-site resolver returned %+v, want the round-one obligation", declared)
 	}
-	if declared[0].ID != "ob-1" || declared[0].Text != newerNote {
-		t.Errorf("prompt site resolved %+v, want ob-1 bound to the NEWEST entry (%q)", declared[0], newerNote)
+	if servedSeq != seqA {
+		t.Fatalf("served trigger sequence = %d, want %d", servedSeq, seqA)
+	}
+	s.recordFixupReportObligationsDeclared(t.Context(), runRow.ID, implStage.ID, servedSeq, declared)
+
+	// (2) A SECOND fix-up is triggered for the same stage BEFORE the round-one
+	// review runs — the intervening append the concern names. Its prompt has
+	// not been served, so it pins nothing.
+	seqB := seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, newerNote, "second round")
+	if seqB <= seqA {
+		t.Fatalf("the second trigger must sequence after the first (%d vs %d)", seqB, seqA)
+	}
+	// DISCRIMINATION: an unanchored, newest-first read now resolves round TWO,
+	// so the assertion below is not vacuous.
+	if newest, _ := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID, 0); len(newest) != 1 ||
+		newest[0].Text != newerNote {
+		t.Fatalf("an unanchored read = %+v, want the round-two obligation — the test is not discriminating", newest)
 	}
 
-	// SITE 2 — the review-time re-derivation, driven through the real dispatch.
+	// (3) The round-one review runs and must join against round ONE's entry.
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
 	}}
@@ -7334,19 +7393,167 @@ func TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest(
 		t.Fatalf("payloads = %+v, want one entry naming one obligation", payloads)
 	}
 	got := payloads[0].Obligations[0]
-	if got.ID != declared[0].ID || got.TextExcerpt != declared[0].Text {
-		t.Errorf("the two sites resolved DIFFERENT entries: prompt %+v vs review %+v — the ids the "+
-			"review reports would not be the ids the agent's prompt named", declared[0], got)
+	if got.TextExcerpt != olderNote {
+		t.Errorf("review resolved %q, want the SERVED entry's text (%q) — the review derived its declared set "+
+			"from a trigger entry the agent's prompt never named", got.TextExcerpt, olderNote)
 	}
-	if got.TextExcerpt != newerNote {
-		t.Errorf("review site resolved %q, want the NEWEST entry (%q)", got.TextExcerpt, newerNote)
+	if got.ID != declared[0].ID {
+		t.Errorf("the two sites minted different ids: prompt %q vs review %q", declared[0].ID, got.ID)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], newerNote) {
+		t.Errorf("the reviewer prompt names round TWO's instruction, which the agent never saw:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestResolveFixupReportObligations_SecondServeRepinsTheAnchor is the
+// complementary direction of the pin above: once round TWO's prompt is served,
+// its serve writes a newer anchor and round two's review joins against round
+// two's entry. Without this the anchor could satisfy the first test by simply
+// freezing on the oldest entry forever.
+func TestResolveFixupReportObligations_SecondServeRepinsTheAnchor(t *testing.T) {
+	const olderNote = "Record the FIRST round's counterfactual table in the PR body's ## Notes."
+	const newerNote = "Record the SECOND round's counterfactual table in the PR body's ## Notes."
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	seqA := seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, olderNote, "first round")
+	firstDeclared, _ := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID, 0)
+	s.recordFixupReportObligationsDeclared(t.Context(), runRow.ID, implStage.ID, seqA, firstDeclared)
+
+	// Round two is triggered AND its prompt is served.
+	seqB := seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, newerNote, "second round")
+	secondDeclared, servedSeq := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID, 0)
+	if servedSeq != seqB {
+		t.Fatalf("the second serve resolved sequence %d, want %d", servedSeq, seqB)
+	}
+	s.recordFixupReportObligationsDeclared(t.Context(), runRow.ID, implStage.ID, servedSeq, secondDeclared)
+
+	if anchor := s.resolveFixupReportObligationAnchor(t.Context(), runRow.ID, implStage.ID); anchor != seqB {
+		t.Fatalf("anchor = %d, want the newest SERVED trigger %d", anchor, seqB)
+	}
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	payloads := fixupObligationUndeliveredPayloads(t, au)
+	if len(payloads) != 1 || len(payloads[0].Obligations) != 1 {
+		t.Fatalf("payloads = %+v, want one entry naming one obligation", payloads)
+	}
+	if got := payloads[0].Obligations[0].TextExcerpt; got != newerNote {
+		t.Errorf("review resolved %q, want round two's instruction (%q)", got, newerNote)
+	}
+}
+
+// TestRunImplementReviews_FixupObligationWithoutAnchor_NoSignal is the fail-SAFE
+// half of the anchor contract (#2737 concurrency fix-up): a stage carrying a
+// trigger entry with a reporting obligation but NO
+// fixup_report_obligations_declared anchor — no fix-up prompt for it was ever
+// served, or the anchor append failed — emits no signal at all rather than
+// falling back to a newest-first read the agent may never have seen.
+//
+// Counterfactual: drop the `anchorSeq > 0` guard in runImplementReviews and this
+// goes RED (an entry is appended).
+func TestRunImplementReviews_FixupObligationWithoutAnchor_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	if n := countAppendedByCategory(au, fixupReportingObligationUndeliveredCategory); n != 0 {
+		t.Errorf("entries = %d, want 0 when no served prompt anchored a trigger entry", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+		t.Errorf("an unanchored obligation must render no block:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestRecordFixupReportObligationsDeclared_NonPositiveSequenceWritesNothing: the
+// anchor refuses to record a trigger entry with no audit Sequence, because a
+// zero anchor would read back as "unanchored" and, worse, a zero passed to the
+// resolver means newest-first. Writing nothing keeps the fail-safe direction.
+func TestRecordFixupReportObligationsDeclared_NonPositiveSequenceWritesNothing(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+	obligations := []fixupobligation.Obligation{{ID: "ob-1", Source: fixupobligation.SourceConcern, Text: "x"}}
+	for _, seq := range []int64{0, -1} {
+		s.recordFixupReportObligationsDeclared(t.Context(), runID, stageID, seq, obligations)
+	}
+	// And an empty obligation set never anchors either.
+	s.recordFixupReportObligationsDeclared(t.Context(), runID, stageID, 7, nil)
+	if n := countAppendedByCategory(au, CategoryFixupReportObligationsDeclared); n != 0 {
+		t.Errorf("anchor entries = %d, want 0", n)
+	}
+	if got := s.resolveFixupReportObligationAnchor(t.Context(), runID, stageID); got != 0 {
+		t.Errorf("anchor = %d, want 0", got)
+	}
+}
+
+// TestResolveFixupReportObligationAnchor_Degradations: a nil repo, a list error,
+// and a malformed anchor payload all resolve to 0 (no signal), never a panic.
+func TestResolveFixupReportObligationAnchor_Degradations(t *testing.T) {
+	if got := New(Config{Addr: "127.0.0.1:0"}).resolveFixupReportObligationAnchor(
+		t.Context(), uuid.New(), uuid.New()); got != 0 {
+		t.Errorf("nil AuditRepo anchor = %d, want 0", got)
+	}
+
+	errFake := newAuditFake()
+	errFake.listByCategoryErr = errors.New("boom")
+	if got := New(Config{Addr: "127.0.0.1:0", AuditRepo: errFake}).resolveFixupReportObligationAnchor(
+		t.Context(), uuid.New(), uuid.New()); got != 0 {
+		t.Errorf("list-error anchor = %d, want 0", got)
+	}
+
+	au := newAuditFake()
+	runID, stageID := uuid.New(), uuid.New()
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: 1, RunID: &runID, StageID: &stageID,
+		Category: CategoryFixupReportObligationsDeclared, Payload: []byte(`{not json`),
+	})
+	if got := New(Config{Addr: "127.0.0.1:0", AuditRepo: au}).resolveFixupReportObligationAnchor(
+		t.Context(), runID, stageID); got != 0 {
+		t.Errorf("malformed-payload anchor = %d, want 0", got)
+	}
+}
+
+// TestResolveFixupReportObligations_PinnedSequenceMatchesNoEntry: an anchor
+// naming a sequence no stage-bound trigger entry carries resolves nothing rather
+// than falling back to the newest entry.
+func TestResolveFixupReportObligations_PinnedSequenceMatchesNoEntry(t *testing.T) {
+	au := newAuditFake()
+	runID, stageID := uuid.New(), uuid.New()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	seq := seedFixupTriggerWithConcern(t, au, runID, stageID, obligationConcernNote, "route it")
+	if got, _ := s.resolveFixupReportObligations(t.Context(), runID, stageID, seq); len(got) != 1 {
+		t.Fatalf("the pinned entry must resolve, got %+v", got)
+	}
+	if got, _ := s.resolveFixupReportObligations(t.Context(), runID, stageID, seq+100); got != nil {
+		t.Errorf("an unmatched pin must resolve nothing, got %+v", got)
 	}
 }
 
 // TestResolveFixupReportObligations_NilAuditRepo: no repo → nil, no panic.
 func TestResolveFixupReportObligations_NilAuditRepo(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
-	if got := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New()); got != nil {
+	if got, _ := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New(), 0); got != nil {
 		t.Errorf("nil AuditRepo must yield nil, got %+v", got)
 	}
 }
@@ -7357,7 +7564,7 @@ func TestResolveFixupReportObligations_ListError(t *testing.T) {
 	au := newAuditFake()
 	au.listByCategoryErr = errors.New("boom")
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
-	if got := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New()); got != nil {
+	if got, _ := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New(), 0); got != nil {
 		t.Errorf("a list error must yield nil, got %+v", got)
 	}
 }
@@ -7372,7 +7579,7 @@ func TestResolveFixupReportObligations_MalformedPayloadSkipped(t *testing.T) {
 		Category: CategoryStageFixupTriggered, Payload: []byte(`{not json`),
 	})
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
-	if got := s.resolveFixupReportObligations(t.Context(), runID, stageID); got != nil {
+	if got, _ := s.resolveFixupReportObligations(t.Context(), runID, stageID, 0); got != nil {
 		t.Errorf("a malformed payload must yield nil, got %+v", got)
 	}
 }
@@ -7386,7 +7593,7 @@ func TestImplementReview_FixupReportingObligation_AuditAppendFailureWarnsAndProc
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
 	au.appendErrCategory = fixupReportingObligationUndeliveredCategory
 
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
@@ -7411,16 +7618,16 @@ func TestImplementReview_FixupReportingObligation_AuditAppendFailureWarnsAndProc
 // emit) decodes through bundle.GateEvidence into the prompt carrier field.
 func TestGateEvidenceForReview_DecodesFixupReportingObligations(t *testing.T) {
 	const wireFixture = `{"fixup_reporting_obligations":[` +
-		`{"id":"ob-1","status":"met","record":"recorded the deletion table in the PR body Notes"},` +
-		`{"id":"ob-2","status":"declined","record":"the sandbox refused the deletion"}]}`
+		`{"id":"ob-1","status":"met"},` +
+		`{"id":"ob-2","status":"declined"}]}`
 	var ev bundle.GateEvidence
 	if err := json.Unmarshal([]byte(wireFixture), &ev); err != nil {
 		t.Fatalf("decode shared wire fixture: %v", err)
 	}
 	got := gateEvidenceForReview(ev, nil)
 	want := []prompt.GateFixupObligationReport{
-		{ID: "ob-1", Status: "met", Record: "recorded the deletion table in the PR body Notes"},
-		{ID: "ob-2", Status: "declined", Record: "the sandbox refused the deletion"},
+		{ID: "ob-1", Status: "met"},
+		{ID: "ob-2", Status: "declined"},
 	}
 	if len(got.FixupObligationReports) != len(want) {
 		t.Fatalf("FixupObligationReports = %+v, want %+v", got.FixupObligationReports, want)

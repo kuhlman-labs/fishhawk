@@ -36,8 +36,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
@@ -8656,110 +8654,103 @@ type fixupObligationReport struct {
 // fixupSelfReportResult is the validated content of a fix-up self-report
 // sidecar (#1210 + #2737): the claimed committed-tree verify status (empty when
 // absent/invalid, exactly as before) and the per-obligation reports that
-// survived fail-closed validation.
+// survived fail-closed validation, already reduced to the transmissible
+// {id, status} shape.
 type fixupSelfReportResult struct {
 	verifyStatus string
-	obligations  []fixupObligationReport
+	obligations  []fixupReportingObligationEvidence
 }
 
-// maxFixupObligationTextBytes bounds each retained record/reason. The text is
-// agent-authored and reaches the gate-evidence payload, the reviewer prompt,
-// and the audit entry, so it is capped exactly like every other evidence
-// free-text field.
-const maxFixupObligationTextBytes = 400
+// maxFixupObligationIDDigits bounds the numeric suffix a valid obligation id may
+// carry. Detect never mints more than a handful of ids per pass, so four digits
+// is far above any real set while keeping the accepted id space finite.
+const maxFixupObligationIDDigits = 4
 
-// boundFixupObligationText caps agent-authored obligation text, cutting on a
-// rune boundary so the result stays valid UTF-8.
-func boundFixupObligationText(text string) string {
-	if len(text) <= maxFixupObligationTextBytes {
-		return text
-	}
-	cut := maxFixupObligationTextBytes
-	for cut > 0 && !utf8.RuneStart(text[cut]) {
-		cut--
-	}
-	return text[:cut] + "… (truncated)"
-}
-
-// flattenFixupObligationText destroys the STRUCTURE of agent-authored
-// obligation text at the upload boundary (#2737 security fix-up). The fix-up
-// agent executes arbitrary repository commands, so it controls every byte it
-// puts in a `record`/`reason`; that text leaves the repository over the trace
-// bundle and lands in the reviewer's prompt WITHOUT ever appearing in the
-// committed diff. Bounding it does not make it trusted, so the runner strips
-// what makes it a payload rather than a note: every C0/C1 control character —
-// newlines and carriage returns included, so it can no longer be a multi-line
-// document; ANSI escapes and NUL; and the Unicode line/paragraph separators —
-// each becomes a single space, and runs of whitespace collapse. What survives
-// is one line of words, which is all an honest decline reason ever needs.
+// validFixupObligationID reports whether id is EXACTLY the `ob-N` shape
+// backend/internal/fixupobligation mints (N a positive decimal integer, no
+// leading zero, at most maxFixupObligationIDDigits digits).
 //
-// This is the upload half of a two-layer treatment. The reviewer-rendering half
-// (backend/internal/prompt's writeFixupObligationDeclineReasons) quarantines the
-// surviving text inside a BEGIN/END untrusted-DATA envelope, and neither layer
-// relies on the other: the runner cannot assume a given backend version, and
-// the backend must hold even for a bundle a compromised runner composed.
-func flattenFixupObligationText(text string) string {
-	var b strings.Builder
-	b.Grow(len(text))
-	lastSpace := false
-	for _, r := range text {
-		// Control (C0/C1, so newline, carriage return, tab, NUL and the ANSI
-		// escape introducer), format (bidi overrides, zero-width joiners), and
-		// line/paragraph separators all collapse to a single space; runs of
-		// whitespace collapse with them.
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) ||
-			unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || unicode.IsSpace(r) {
-			if !lastSpace {
-				b.WriteByte(' ')
-				lastSpace = true
-			}
-			continue
-		}
-		b.WriteRune(r)
-		lastSpace = false
+// The id is AGENT-authored — it is read out of the sidecar the fix-up agent
+// writes — and it is the one obligation field that must still cross the upload
+// boundary, because the backend's join has nothing to key on without it. So it
+// is constrained to a closed, non-content-bearing shape rather than merely
+// checked non-empty: an unconstrained id string would reinstate exactly the
+// free-text egress channel the record/reason fields were removed to close.
+// An id outside the shape can match no declared obligation anyway, so dropping
+// it costs nothing and leaves its obligation undelivered — the safe direction.
+func validFixupObligationID(id string) bool {
+	const prefix = "ob-"
+	if !strings.HasPrefix(id, prefix) {
+		return false
 	}
-	return strings.TrimSpace(b.String())
+	digits := id[len(prefix):]
+	if len(digits) == 0 || len(digits) > maxFixupObligationIDDigits || digits[0] == '0' {
+		return false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
-// sanitizeFixupObligationText is the runner's full upload-boundary treatment for
-// one agent-authored record/reason: flatten the structure, then bound the size.
-// Order matters — flattening first means the cap applies to the text a reviewer
-// will actually see rather than to bytes that were about to be discarded.
-func sanitizeFixupObligationText(text string) string {
-	return boundFixupObligationText(flattenFixupObligationText(text))
+// safeFixupObligationStatus returns status when it is one of the two literals
+// the sidecar may carry and "<invalid>" otherwise, so a drop log never echoes an
+// arbitrary agent-authored string back into the runner log.
+func safeFixupObligationStatus(status string) string {
+	if status == "met" || status == "declined" {
+		return status
+	}
+	return "<invalid>"
+}
+
+// safeFixupObligationID returns id when it is a valid `ob-N` and "<invalid>"
+// otherwise, for the same reason as safeFixupObligationStatus.
+func safeFixupObligationID(id string) string {
+	if validFixupObligationID(id) {
+		return id
+	}
+	return "<invalid>"
 }
 
 // validateFixupObligationReports applies the fail-closed PER-ENTRY rules to the
 // sidecar's `obligations` array (#2737). An entry is DROPPED — with a named log
-// event carrying the id and the reason — when its id is empty, its status is
-// not exactly `met` or `declined`, its status is `met` with an empty/whitespace
-// `record`, or its status is `declined` with an empty/whitespace `reason`.
+// event carrying the id and the reason — when its id is not the exact `ob-N`
+// shape, its status is not exactly `met` or `declined`, its status is `met`
+// with an empty/whitespace `record`, or its status is `declined` with an
+// empty/whitespace `reason`.
 //
 // Dropping is the SAFE direction: a dropped `met` leaves its obligation
 // undelivered and the backend's advisory signal fires. The complementary
 // direction — admitting a malformed `met` — would falsely satisfy an obligation
 // and silence the very signal this exists to raise.
 //
-// Every surviving entry's free text is run through sanitizeFixupObligationText
-// before it is retained: the text is AGENT-authored and crosses the upload
-// boundary into the reviewer's prompt without ever appearing in the committed
-// diff, so its structure is flattened to one line and its size bounded. The
-// validation above decides WHETHER an entry is carried; the sanitizer decides
-// what SHAPE it may take once carried.
+// The agent's `record`/`reason` TEXT is required but NOT retained (#2737
+// security fix-up). The fix-up agent runs arbitrary repository commands, so it
+// controls every byte of that text; carrying it over the trace bundle into the
+// reviewer's prompt would be an egress path for repository content that never
+// appears in the committed diff, and no amount of flattening or quarantining at
+// the render site changes WHAT it can carry — only how much authority it has.
+// So the text is validated here, on the runner, and discarded: what crosses the
+// upload boundary is the shape-constrained id and the status literal, which is
+// everything the backend's join needs and nothing an agent can smuggle content
+// through.
 //
 // These rules NEVER widen the existing whole-sidecar rules: malformed JSON, a
 // run/stage id mismatch, and an unknown verify_status keep today's exact
 // behavior and logs, and are handled by the caller before this runs.
-func validateFixupObligationReports(cfg config, in []fixupObligationReport, logSink io.Writer) []fixupObligationReport {
-	var out []fixupObligationReport
+func validateFixupObligationReports(cfg config, in []fixupObligationReport, logSink io.Writer) []fixupReportingObligationEvidence {
+	var out []fixupReportingObligationEvidence
 	for _, e := range in {
 		drop := func(reason string) {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_obligation_report_dropped","run_id":%q,"stage_id":%q,"obligation_id":%q,"status":%q,"reason":%q}`+"\n",
-				cfg.runID, cfg.stageID, e.ID, e.Status, reason)
+				cfg.runID, cfg.stageID,
+				safeFixupObligationID(e.ID), safeFixupObligationStatus(e.Status), reason)
 		}
-		if strings.TrimSpace(e.ID) == "" {
-			drop("empty_id")
+		if !validFixupObligationID(e.ID) {
+			drop("invalid_id")
 			continue
 		}
 		switch e.Status {
@@ -8768,24 +8759,18 @@ func validateFixupObligationReports(cfg config, in []fixupObligationReport, logS
 				drop("met_without_record")
 				continue
 			}
-			out = append(out, fixupObligationReport{
-				ID:     strings.TrimSpace(e.ID),
-				Status: e.Status,
-				Record: sanitizeFixupObligationText(e.Record),
-			})
 		case "declined":
 			if strings.TrimSpace(e.Reason) == "" {
 				drop("declined_without_reason")
 				continue
 			}
-			out = append(out, fixupObligationReport{
-				ID:     strings.TrimSpace(e.ID),
-				Status: e.Status,
-				Reason: sanitizeFixupObligationText(e.Reason),
-			})
 		default:
 			drop("unknown_status")
+			continue
 		}
+		// Only the join key and the status literal are retained; the
+		// agent-authored text is deliberately dropped on the floor here.
+		out = append(out, fixupReportingObligationEvidence{ID: e.ID, Status: e.Status})
 	}
 	return out
 }
@@ -9202,19 +9187,15 @@ func fixupSelfReportDivergenceEvent(cfg config, claimed, actual string) agent.Ev
 
 // fixupReportingObligationsEvent carries the VALIDATED per-obligation
 // self-reports (#2737) into the trace bundle so composeGateEvidence folds them
-// into gate_evidence for the implement review's join. The evidence entries use
-// ONE free-text field: `record` holds the attestation for a `met` and the
-// reason for a `declined`, matching the backend's
-// bundle.FixupReportingObligationEvidence mirror.
-func fixupReportingObligationsEvent(cfg config, reports []fixupObligationReport) agent.Event {
-	entries := make([]fixupReportingObligationEvidence, 0, len(reports))
-	for _, r := range reports {
-		text := r.Record
-		if r.Status == "declined" {
-			text = r.Reason
-		}
-		entries = append(entries, fixupReportingObligationEvidence{ID: r.ID, Status: r.Status, Record: text})
-	}
+// into gate_evidence for the implement review's join.
+//
+// Each entry is {id, status} and NOTHING else, matching the backend's
+// bundle.FixupReportingObligationEvidence mirror. The agent's attestation and
+// decline-reason text is validated on the runner and discarded there
+// (validateFixupObligationReports) rather than transmitted: it is
+// agent-controlled free text that would otherwise reach the reviewer's prompt
+// without ever appearing in the committed diff.
+func fixupReportingObligationsEvent(cfg config, entries []fixupReportingObligationEvidence) agent.Event {
 	return agent.Event{
 		Kind: "fixup_reporting_obligations",
 		Payload: agent.MakePayload(map[string]any{

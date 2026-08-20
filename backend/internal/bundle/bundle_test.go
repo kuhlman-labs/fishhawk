@@ -1433,8 +1433,8 @@ func TestExtractGateEvidence_OlderBundleWithoutDiffCoverage(t *testing.T) {
 // exactly this. No import can cross the module seam, so a one-sided json-tag
 // edit fails on the other side.
 const fixupReportingObligationsWireFixture = `"fixup_reporting_obligations":[` +
-	`{"id":"ob-1","status":"met","record":"recorded the deletion table in the PR body Notes"},` +
-	`{"id":"ob-2","status":"declined","record":"the sandbox refused the deletion"}]`
+	`{"id":"ob-1","status":"met"},` +
+	`{"id":"ob-2","status":"declined"}]`
 
 // TestExtractGateEvidence_DecodesFixupReportingObligations is the backend half
 // of the #2737 lockstep pair: the shared literal decodes field-for-field.
@@ -1450,8 +1450,8 @@ func TestExtractGateEvidence_DecodesFixupReportingObligations(t *testing.T) {
 		t.Fatalf("ExtractGateEvidence: %v", err)
 	}
 	want := []FixupReportingObligationEvidence{
-		{ID: "ob-1", Status: "met", Record: "recorded the deletion table in the PR body Notes"},
-		{ID: "ob-2", Status: "declined", Record: "the sandbox refused the deletion"},
+		{ID: "ob-1", Status: "met"},
+		{ID: "ob-2", Status: "declined"},
 	}
 	if len(got.FixupReportingObligations) != len(want) {
 		t.Fatalf("FixupReportingObligations = %+v, want %+v", got.FixupReportingObligations, want)
@@ -1478,5 +1478,38 @@ func TestExtractGateEvidence_OlderBundleWithoutFixupReportingObligations(t *test
 	}
 	if got.FixupReportingObligations != nil {
 		t.Errorf("FixupReportingObligations = %+v, want nil for an older/non-fix-up bundle", got.FixupReportingObligations)
+	}
+}
+
+// TestExtractGateEvidence_FixupReportingObligationCarriesNoAgentText pins the
+// #2737 security fix-up at the DECODE boundary: the gate-evidence mirror has no
+// free-text field, so agent-authored attestation/decline text on the wire — from
+// an older runner, or a compromised one that composed the payload by hand —
+// cannot reach the backend at all.
+//
+// The assertion is on COMMITTED STATE (the decoded struct compared by value),
+// not on an error: a decoder that silently kept the text would compare unequal.
+// Counterfactual: re-add a `record` field to FixupReportingObligationEvidence
+// and this goes RED, because the extra key then populates it.
+func TestExtractGateEvidence_FixupReportingObligationCarriesNoAgentText(t *testing.T) {
+	const smuggled = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG"
+	payload := json.RawMessage(`{"fixup_reporting_obligations":[` +
+		`{"id":"ob-1","status":"declined","record":"` + smuggled + `","reason":"` + smuggled + `"}]}`)
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: payload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if len(got.FixupReportingObligations) != 1 {
+		t.Fatalf("FixupReportingObligations = %+v, want exactly one entry", got.FixupReportingObligations)
+	}
+	want := FixupReportingObligationEvidence{ID: "ob-1", Status: "declined"}
+	if got.FixupReportingObligations[0] != want {
+		t.Errorf("FixupReportingObligations[0] = %+v, want %+v — agent-authored text crossed the decode boundary",
+			got.FixupReportingObligations[0], want)
 	}
 }

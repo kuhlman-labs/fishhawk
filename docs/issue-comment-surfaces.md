@@ -621,6 +621,20 @@ Notes:
   block. EVIDENCE ONLY: it never fails, re-opens, or re-budgets the pass. Listed
   here only so a future reader grepping the audit categories doesn't mistake it
   for a comment surface.
+- The paired anchor kind — `fixup_report_obligations_declared` (#2737), written
+  by the runner-facing fix-up prompt SERVE (`prompt.go::handleGetStagePrompt` →
+  `recordFixupReportObligationsDeclared`) — is likewise an **internal audit kind,
+  not an issue-comment surface**. It records WHICH `stage_fixup_triggered` entry
+  the served prompt derived its reporting-obligation block from, by audit
+  sequence: payload `{trigger_sequence, obligation_ids}`. The implement review
+  resolves that exact entry rather than re-selecting the newest one, so a second
+  fix-up triggered for the same stage between the serve and the review cannot
+  make the review report obligation ids the agent's prompt never named. Written
+  only when the served prompt actually renders the block, and never by the SPA
+  `prompt-render` preview (a preview must not re-pin a live pass). Best-effort —
+  an append failure WARNs, and the consequence is simply that the review emits no
+  signal, the fail-safe direction. Listed here only so a future reader grepping
+  the audit categories doesn't mistake it for a comment surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,

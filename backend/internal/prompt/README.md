@@ -317,22 +317,17 @@ byte-identically to before. Pinned adversarially by
 their `_TrustedTextStillInline` counterparts, and end to end by
 `TestImplementReview_AcceptanceDerivedObligation_TextQuarantined`.
 
-`Record` — the agent's stated
-decline reason — is **agent-authored and untrusted**: a fix-up agent running
-arbitrary repository commands controls every byte, and the text reaches the
-reviewer without ever appearing in the committed diff. So it renders ONLY
-through `writeFixupObligationDeclineReasons`, which quarantines it exactly like
-an acceptance-derived fix-up concern (ADR-050 / #1613): every line routed
-through `sanitizeUntrustedComment` (`| ` quote-prefix, ATX-header strip,
-fence-break, trusted-marker tagging, horizontal-rule collapse) inside a
-`<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` envelope, with the
-Fishhawk-authored instruction kept OUTSIDE so it stays binding while the agent's
-text cannot be. The block is capped at `maxFixupObligationReasonBytes` and is
-omitted entirely when no undelivered obligation carries a reason (every
-`unreported` finding), keeping the byte-identity pin above intact. Pinned by
-`TestBuild_ImplementReview_GateEvidence_FixupObligationReason_Quarantined`
-(adversarial) and `..._NoEnvelopeWhenNoReason`. The upload half of the same
-treatment lives in the runner (`sanitizeFixupObligationText`).
+There is **no agent-authored field on this block at all**. An earlier shape of
+this change carried the agent's stated `declined` reason to the reviewer inside a
+`<<<BEGIN/END UNTRUSTED AGENT DECLINE REASON>>>` quarantine envelope. That was
+the wrong control: quarantining bounds what agent text can *impersonate*, not
+what it can *carry*, so the field stayed an arbitrary channel for repository
+content from a command-running agent to the reviewer, around the committed diff.
+`GateFixupReportingObligation` therefore carries no agent text, the runner never
+transmits it (`validateFixupObligationReports` validates it and discards it), and
+the block states plainly that the agent's own reason is not carried so its
+absence does not read as a render bug. Pinned by
+`TestBuild_ImplementReview_GateEvidence_FixupObligation_NoAgentTextChannel`.
 
 Both blocks are absent by default: an ordinary fix-up and an unaffected review
 render byte-identically to before the fields existed. Honesty framing is

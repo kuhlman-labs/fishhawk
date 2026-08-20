@@ -15,8 +15,14 @@
 // prompt renderer (which names each obligation to the agent) and the
 // implement-review re-derivation (which subtracts the agent's `met` reports and
 // signals the remainder) call Detect on the SAME stage_fixup_triggered audit
-// payload, so the declared set is identical at both sites by construction with
-// no persisted duplicate to drift.
+// payload, so the declared set is identical at both sites. Sameness rests on a
+// pinned IDENTITY, not on a shared predicate: the prompt serve records which
+// entry it rendered from (a fixup_report_obligations_declared anchor carrying
+// that entry's audit sequence) and the review resolves that exact entry, so a
+// second fix-up triggered for the same stage in between cannot make the review
+// report ids the agent never saw. The anchor stores a pointer, not the derived
+// set, so there is still no persisted duplicate to drift. See
+// backend/internal/server/prompt.go::resolveFixupReportObligations.
 //
 // The signal this package feeds is EVIDENCE ONLY: it never fails, re-opens, or
 // re-budgets a pass. Long-form contract: backend/internal/fixupobligation/README.md.
@@ -46,11 +52,12 @@ const (
 
 // Status literals for an agent's per-obligation self-report.
 const (
-	// StatusMet claims the obligation was carried out; the report must carry a
-	// non-empty record holding the attestation text.
+	// StatusMet claims the obligation was carried out. The runner requires the
+	// sidecar entry to carry a non-empty record holding the attestation text —
+	// and then discards that text rather than transmitting it (see Report).
 	StatusMet = "met"
-	// StatusDeclined honestly declines the obligation; the report must carry a
-	// non-empty reason.
+	// StatusDeclined honestly declines the obligation. The runner requires a
+	// non-empty reason on the same terms.
 	StatusDeclined = "declined"
 )
 
@@ -63,8 +70,9 @@ const (
 	StatusUnreported = "unreported"
 )
 
-// MaxExcerptBytes bounds every stored obligation excerpt and every retained
-// report text. Operator-authored text can be up to maxOperatorConcernBytes
+// MaxExcerptBytes bounds every stored obligation excerpt (the operator's own
+// instruction text — an agent's report carries no text at all, see Report).
+// Operator-authored text can be up to maxOperatorConcernBytes
 // (4000) and a routed concern note is unbounded in practice; without a cap a
 // single instruction could swamp the fix-up prompt, the gate-evidence payload,
 // and the audit entry.
@@ -110,26 +118,34 @@ type Obligation struct {
 
 // Report is one agent self-report entry for a declared obligation, as
 // validated by the runner and carried through gate_evidence.
+//
+// It carries NO agent-authored free text, deliberately. The fix-up agent runs
+// arbitrary repository commands, so every byte of an attestation or decline
+// reason it writes is agent-controlled; carrying that text over the trace
+// bundle into the reviewer's prompt would be an egress path for repository
+// content that never appears in the committed diff, and quarantining it at the
+// render site limits its AUTHORITY without limiting what it can carry. So the
+// runner validates the text locally (a `met` needs a non-empty record, a
+// `declined` needs a non-empty reason) and transmits only the two fields the
+// join needs: the id and the status literal.
 type Report struct {
 	// ID must match a declared Obligation.ID; an unknown id is ignored.
 	ID string
 	// Status is StatusMet or StatusDeclined (the runner drops anything else).
 	Status string
-	// Record is the entry's free text: the attestation when Status is
-	// StatusMet, the decline reason when Status is StatusDeclined.
-	Record string
 }
 
 // Finding is one UNDELIVERED declared obligation: the obligation itself plus
 // why it is undelivered.
+//
+// There is no decline-reason field: the agent's stated reason is validated on
+// the runner and never crosses the upload boundary (see Report), so a Finding
+// carries only backend-derived text — the operator's own instruction excerpt.
 type Finding struct {
 	Obligation
 	// Status is StatusUnreported (nothing valid came back for this id) or
 	// StatusDeclined (the agent reported it and honestly declined).
 	Status string
-	// Detail is the agent's decline reason when Status is StatusDeclined, and
-	// empty when Status is StatusUnreported.
-	Detail string
 }
 
 // recordingVerbs is the first half of the deliberately CONJUNCTIVE classifier.
@@ -275,9 +291,10 @@ func Bound(text string) string {
 // reports and returns, in DECLARED order, every obligation that carries no
 // report whose Status is StatusMet. A report whose id is not in the declared
 // set is ignored (it can satisfy nothing), and a declared obligation with a
-// StatusDeclined report is returned with StatusDeclined and the agent's reason
-// — an honest decline is still an undelivered obligation the operator should
-// see, it is simply not a silent one.
+// StatusDeclined report is returned with StatusDeclined — an honest decline is
+// still an undelivered obligation the operator should see, it is simply not a
+// silent one. The agent's stated REASON is not part of the finding: it is
+// validated on the runner and never transmitted (see Report).
 //
 // Returns nil when every declared obligation carries a `met` report, or when
 // nothing was declared. That nil is acceptance criterion 3's no-noise control:
@@ -299,7 +316,6 @@ func Undelivered(declared []Obligation, reports []Report) []Finding {
 		f := Finding{Obligation: ob, Status: StatusUnreported}
 		if ok && rep.Status == StatusDeclined {
 			f.Status = StatusDeclined
-			f.Detail = Bound(strings.TrimSpace(rep.Record))
 		}
 		out = append(out, f)
 	}
