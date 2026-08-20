@@ -11063,6 +11063,56 @@ paths:
                     approve of any other stage type IGNORES the field (still
                     `200`) rather than recording an ungated map. Ignored on
                     `reject`. Omitting the field is byte-identical to today.
+                move_scope_files_to_slice:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: string
+                  description: |
+                    Optional PER-SLICE scope MOVE for a DECOMPOSED plan (#2596) —
+                    the complement of `add_scope_files_to_slice`, which REFUSES a
+                    path already owned by another slice. Each key names the
+                    DESTINATION sub-plan (exact `decomposition.sub_plans[].title`
+                    match wins, otherwise a 0-based decimal index in range) and
+                    its value lists repo-relative paths that MUST already be
+                    declared in the plan's decomposition scope; the SOURCE slice
+                    is DERIVED from ownership (single-owner-file guarantees
+                    exactly one owner), so you do not name it. A move keeps the
+                    plan's total file count unchanged, so it consumes NO
+                    `max_files_changed` headroom. Canonicalised before recording
+                    identically to `add_scope_files_to_slice` (index-keyed,
+                    trimmed, deduped, SORTED). At implement-prompt-build time the
+                    destination child gains the moved-in path in its effective
+                    `scope.files`, and the source child loses it from both its
+                    scope and its scope constraint. Recorded alongside
+                    `move_scope_files_resolved` (`[{path, from_slice, to_slice}]`)
+                    on `approval_submitted`. Composes with
+                    `add_scope_files_to_slice` in ONE approve but must name
+                    DISJOINT paths. Refused BEFORE any approval row is recorded:
+                    `422 plan_slice_move_scope_files_requires_decomposed_plan`
+                    when the plan is flat (`details.reason` `plan_not_decomposed`
+                    — there are no slices to move between) or cannot be confirmed
+                    decomposed (`plan_indeterminate`, fail-closed); `409
+                    plan_slice_move_after_dispatch` when a source or destination
+                    fan-out child has left run state `pending`
+                    (`slice_already_started`) or the sibling listing failed
+                    (`dispatch_state_indeterminate`, fail-closed); `400
+                    validation_failed` (field `move_scope_files_to_slice`) for an
+                    unresolvable/ambiguous/duplicate key, a path under two
+                    destination keys, a path also in `add_scope_files_to_slice`
+                    (`path_in_both_scope_channels`), a path not declared in any
+                    slice (`path_not_in_declared_scope` — use
+                    `add_scope_files_to_slice` for a net-new path), a
+                    containment-only overlap of a directory entry
+                    (`move_requires_exact_owned_path` — re-plan), a no-op move to
+                    the owning slice (`path_already_owned_by_destination`), a move
+                    that would empty the source slice
+                    (`move_would_empty_source_slice`), a non-repo-relative path,
+                    or an empty path list. Honored only on `approve` AND only on a
+                    PLAN stage: an approve of any other stage type IGNORES the
+                    field (still `200`). Ignored on `reject`. Omitting the field
+                    is byte-identical to today.
                 binding_assertions:
                   type: array
                   items:
@@ -11621,6 +11671,42 @@ paths:
               in another slice needs a re-plan of the decomposition, not
               this field), a non-repo-relative path, or an empty path
               list.
+            - `plan_slice_move_scope_files_requires_decomposed_plan` —
+              #2596: the request supplied `move_scope_files_to_slice` but
+              the plan is positively FLAT (`details.reason`
+              `plan_not_decomposed` — there are no slices to move between)
+              or its decomposition status could not be positively confirmed
+              (`details.reason` `plan_indeterminate` — a load failure, an
+              absent plan, or an unwired artifact subsystem). FAILS CLOSED,
+              like its add sibling. `details` includes `stage_id` and
+              `reason`. There is no override. Refused BEFORE any approval
+              row is recorded. This and `plan_slice_move_after_dispatch`
+              are the two new error codes the per-slice MOVE channel
+              introduces; its shape and ownership refusals reuse `400
+              validation_failed` with `details.field` =
+              `move_scope_files_to_slice` (`details.reason` one of
+              `slice_key_ambiguous`, `slice_key_unresolvable`,
+              `duplicate_slice_key`, `empty_path`,
+              `path_not_repo_relative`, `empty_path_list`,
+              `path_under_two_slices`, `path_in_both_scope_channels` — also
+              in `add_scope_files_to_slice`, `path_not_in_declared_scope` —
+              nothing to move, use `add_scope_files_to_slice` for a net-new
+              path, `move_requires_exact_owned_path` — a containment-only
+              overlap of a directory entry that must be re-planned,
+              `path_already_owned_by_destination` — a no-op move, or
+              `move_would_empty_source_slice`).
+            - `plan_slice_move_after_dispatch` — #2596: a
+              `move_scope_files_to_slice` approve was refused `409` because
+              a SOURCE or DESTINATION fan-out child of the move has already
+              left run state `pending` (`details.reason`
+              `slice_already_started`, with `path`, `from_slice`,
+              `to_slice`, `child_run_id`, `child_state`, `slice_index`) — its
+              work has begun and re-scoping it retroactively is the harm —
+              or the minted-children listing failed (`details.reason`
+              `dispatch_state_indeterminate`, fail-closed — the move is
+              refused rather than admitted against unknown dispatch state).
+              There is no override; revise the plan or start a fresh run.
+              Refused BEFORE any approval row is recorded.
             - `plan_invalid_model` — #1013: the RESOLVED implement model
               (the ladder of deployment default < spec `executor.model` <
               plan `model_recommendation` < the `implement_model` override)

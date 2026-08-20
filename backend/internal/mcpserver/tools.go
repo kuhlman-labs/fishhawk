@@ -3334,6 +3334,14 @@ type ApprovePlanInput struct {
 	// instead of a full revise pass. It ADDS a path to a slice — it does NOT
 	// MOVE a path already owned by another slice.
 	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty" jsonschema:"optional per-slice scope add for a DECOMPOSED plan — the counterpart of add_scope_files, which is refused outright there (422 plan_add_scope_files_fans_into_slices) because a flat add fans into EVERY slice. Keys are the sub-plan TITLE (exact match wins) or its 0-based decimal index; values are repo-relative paths folded into THAT slice's scope.files only (a trailing slash marks a directory). One owner per path: the approve is refused 400 when a path overlaps in ownership — identical OR an ancestor/descendant directory containment — with another key in the same request or with a DIFFERENT slice's declared scope.files, and 422 plan_slice_add_scope_files_requires_decomposed_plan when the plan is flat (use add_scope_files) or cannot be confirmed decomposed. This channel ADDS and does NOT MOVE: a path already declared in another slice's scope needs a re-plan, not this field"`
+	// MoveScopeFilesToSlice is the slice-boundary MOVE complement of
+	// AddScopeFilesToSlice for a DECOMPOSED plan (#2596) — the narrower cut the add
+	// channel refuses (path_owned_by_another_slice). Keys name the DESTINATION
+	// slice (title or index, exactly like the add) and each value must ALREADY be
+	// declared in the plan's decomposition scope; the SOURCE slice is derived from
+	// ownership. A move keeps the plan's total file count unchanged, so it consumes
+	// NO max_files_changed headroom.
+	MoveScopeFilesToSlice map[string][]string `json:"move_scope_files_to_slice,omitempty" jsonschema:"optional per-slice scope MOVE for a DECOMPOSED plan — the complement of add_scope_files_to_slice, which REFUSES a path already owned by another slice. Keys are the DESTINATION sub-plan TITLE (exact match wins) or its 0-based decimal index; values are repo-relative paths that MUST already be declared in the decomposition's scope (the SOURCE slice is derived from ownership, so you do not name it). The move keeps the plan's total file count unchanged and consumes NO max_files_changed headroom. Refused 400 validation_failed (details.field=move_scope_files_to_slice) for a path listed under two destination keys, a path also in add_scope_files_to_slice (the two channels compose in one approve but must name DISJOINT paths), a path not declared in ANY slice (use add_scope_files_to_slice for a net-new path), a directory-containment-only overlap of a declared entry (move_requires_exact_owned_path — re-plan rather than split a directory entry), a no-op move to the owning slice, or a move that would empty the source slice; 422 plan_slice_move_scope_files_requires_decomposed_plan when the plan is flat or cannot be confirmed decomposed; and 409 plan_slice_move_after_dispatch when a source/destination fan-out child has already left 'pending'. Composes with add_scope_files_to_slice in ONE approve over disjoint paths"`
 	// BindingAssertions is the OPTIONAL list of operator-declared,
 	// deterministic binding-assertion checks (#1171) — the machine-checkable
 	// half of an approval condition. Each is evaluated by the runner
@@ -3708,7 +3716,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.AmendAcceptanceCriteria, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.MoveScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.AmendAcceptanceCriteria, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -3771,7 +3779,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// so this NEVER refuses the submit: warn-on-reject / refuse-on-approve is a
 	// deliberate asymmetry, not an inconsistency.
 	warn = mergeRejectWarnings(warn, rejectReasonOverBudgetWarning(in.Reason))
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -3880,7 +3888,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -3911,7 +3919,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

@@ -1792,7 +1792,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "restore the dropped file",
-		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -1809,7 +1809,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no slice map): %v", err)
 	}
 	if _, present := gotRaw["add_scope_files_to_slice"]; present {
@@ -1838,7 +1838,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "narrowed the design",
-		"kuhlman-labs", nil, nil, nil, nil, nil, amendments, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, amendments, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	raw, err := json.Marshal(gotRaw["amend_acceptance_criteria"])
@@ -1856,7 +1856,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no amendments): %v", err)
 	}
 	if _, present := gotRaw["amend_acceptance_criteria"]; present {
@@ -2142,5 +2142,48 @@ func TestReportStageFailureFrom_413RetryKeepsPrecondition(t *testing.T) {
 	}
 	if len(bodies[1]) >= len(bodies[0]) {
 		t.Errorf("aggressive body %d not smaller than first %d", len(bodies[1]), len(bodies[0]))
+	}
+}
+
+// TestSubmitApproval_SendsSliceMoveScopeFilesBody pins the apiClient half of the
+// #2596 wire contract against a real HTTP server: SubmitApproval must POST
+// move_scope_files_to_slice when supplied, and OMIT the key entirely when nil
+// (omitempty) so a no-move approve body is byte-identical to today.
+func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
+	stageID := uuid.New()
+	move := map[string][]string{"tools slice": {"backend/internal/mcpserver/tools.go"}}
+
+	var gotMethod, gotPath string
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+uuid.NewString()+`","state":"succeeded"}`)
+	})
+
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "relocate the file",
+		"kuhlman-labs", nil, nil, nil, move, nil, nil, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
+		t.Errorf("request = %s %s, want POST /v0/stages/%s/approvals", gotMethod, gotPath, stageID)
+	}
+	raw, err := json.Marshal(gotRaw["move_scope_files_to_slice"])
+	if err != nil {
+		t.Fatalf("marshal decoded field: %v", err)
+	}
+	if want := `{"tools slice":["backend/internal/mcpserver/tools.go"]}`; string(raw) != want {
+		t.Errorf("move_scope_files_to_slice on the wire = %s, want %s", raw, want)
+	}
+
+	// nil → the key must be absent, not present-and-null.
+	gotRaw = nil
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval (no move map): %v", err)
+	}
+	if _, present := gotRaw["move_scope_files_to_slice"]; present {
+		t.Errorf("move_scope_files_to_slice present on a no-move approve body: %#v", gotRaw)
 	}
 }
