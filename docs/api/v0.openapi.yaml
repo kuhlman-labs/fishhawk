@@ -10215,6 +10215,24 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  scope_constraint:
+                    type: object
+                    description: |
+                      The decomposed child's agent-facing scope narrowing
+                      (#1669), served ONLY for a fan-out slice child whose
+                      sub-plan resolved. Absent (omitted) on every
+                      non-decomposed response. `scope_files` mirrors the
+                      child's enforced `scope_files` after any approved
+                      slice-boundary move (`move_scope_files_to_slice`, #2596):
+                      a moved-away source path is absent from it and a moved-in
+                      destination path is present, so the narrowing the agent
+                      reads matches the enforced scope on both sides of a move.
+                    properties:
+                      scope_files:
+                        type: array
+                        description: Repo-relative paths the child's scope is narrowed to.
+                        items:
+                          type: string
                   diff_coverage:
                     type: object
                     required: [command, report_path, min_new_line_coverage]
@@ -10578,6 +10596,24 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  scope_constraint:
+                    type: object
+                    description: |
+                      The decomposed child's agent-facing scope narrowing
+                      (#1669), served ONLY for a fan-out slice child whose
+                      sub-plan resolved. Absent (omitted) on every
+                      non-decomposed response. `scope_files` mirrors the
+                      child's enforced `scope_files` after any approved
+                      slice-boundary move (`move_scope_files_to_slice`, #2596):
+                      a moved-away source path is absent from it and a moved-in
+                      destination path is present, so the narrowing the agent
+                      reads matches the enforced scope on both sides of a move.
+                    properties:
+                      scope_files:
+                        type: array
+                        description: Repo-relative paths the child's scope is narrowed to.
+                        items:
+                          type: string
                   diff_coverage:
                     type: object
                     required: [command, report_path, min_new_line_coverage]

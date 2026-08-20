@@ -11493,6 +11493,54 @@ func TestAmendedScopeFilesForReview_MoveIsNoOp(t *testing.T) {
 	}
 }
 
+// CONDITION 1 (trace surface): pin the SOURCE child's reviewer trace-provenance
+// baseline after a move on the ACTUAL surface (scopeProvenanceForReview), not
+// only the prompt response. The reviewer's drift baseline for a fan-out child is
+// the WHOLE-plan scope.files: loadApprovedPlanForRun walks a decomposed child to
+// its PARENT and returns the un-narrowed plan, and both buildTriggerForReview and
+// scopeProvenanceForReview read approvedPlan.Scope.Files verbatim — neither
+// narrows per-slice. So a path moved AWAY from the source slice is STILL in the
+// reviewer baseline, and the reviewer keeps measuring drift on it against the
+// whole plan rather than silently tolerating drift on a file the slice "no longer
+// owns". This is the load-bearing assertion MoveIsNoOp lacks: MoveIsNoOp's source
+// comparison is trivially equal because a source child GAINS no paths, whereas
+// this observes the provenance surface and asserts the moved-away path is PRESENT
+// in the source child's whole-plan baseline — a review-side subtraction or a
+// slice-narrowing would drop it and turn this RED.
+func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := moveFoldParentPlan()
+	move := map[string][]string{"1": {"pkg/a/foo.go"}}
+
+	// Source child (slice 0) with pkg/a/foo.go moved AWAY (→ slice 1) recorded.
+	s, srcChild := moveFoldServer(t, parentRunID, 0, move)
+
+	// A diff that touches NONE of the plan files, so every whole-plan path lands
+	// in PlanUntouched IF it is still in the reviewer's baseline.
+	diff := provenanceDiff("pkg/unrelated.go")
+	prov := s.scopeProvenanceForReview(context.Background(), srcChild.ID, uuid.New(),
+		parentPlan, prompt.Trigger{}, diff, nil)
+	if prov == nil {
+		t.Fatal("scopeProvenanceForReview = nil, want non-nil (every whole-plan path untouched)")
+	}
+	// The whole-plan union (4 files) is the reviewer baseline, unchanged by the move.
+	if prov.PlanFiles != 4 {
+		t.Errorf("PlanFiles = %d, want 4 (whole-plan union is the reviewer baseline, unchanged by the move)", prov.PlanFiles)
+	}
+	// LOAD-BEARING: the moved-away path is STILL in the source child's reviewer
+	// baseline. A slice-narrowing / lost-subtraction on the review side would drop
+	// it — that is exactly the drift the reviewer must keep measuring.
+	if !containsString(prov.PlanUntouched, "pkg/a/foo.go") {
+		t.Errorf("PlanUntouched = %v, want the moved-away path pkg/a/foo.go present — the review baseline is whole-plan and a move must not subtract it", prov.PlanUntouched)
+	}
+	// The rest of the whole-plan union is present too (the baseline is not slice-scoped).
+	for _, p := range []string{"pkg/a/keep.go", "pkg/b/b.go", "pkg/c/c.go"} {
+		if !containsString(prov.PlanUntouched, p) {
+			t.Errorf("PlanUntouched = %v, want to contain whole-plan path %q", prov.PlanUntouched, p)
+		}
+	}
+}
+
 // BACKWARD COMPAT: resolveApprovalAddScopeFiles for a fan-out child with NO
 // recorded move returns the identical result as before #2596 — the move union is
 // inert.

@@ -9685,3 +9685,50 @@ func TestSliceMoveScopeFiles_Success_RecordsMoveAndResolved(t *testing.T) {
 		t.Errorf("move_scope_files_resolved = %+v, want %+v", gotResolved, wantResolved)
 	}
 }
+
+// test_vacuity fix: submit a move whose DESTINATION keys AND the paths within one
+// destination are given in NON-canonical order, and assert the RECORDED
+// move_scope_files_resolved is ordered by (to_slice, path). The sibling
+// TestWriteApprovalAudit_RecordsMoveResolved supplies an ALREADY-sorted resolved
+// slice straight to writeApprovalAudit, so it never exercises the ordering at all;
+// this drives the real submit + validation path from a scrambled input. NOTE: the
+// canonical ordering is REDUNDANTLY defended — validateSliceMoveScopeFiles's
+// trailing sort.Slice(resolved) AND the upstream resolveSliceKeys target-sort +
+// canonicalizeSlicePaths within-destination path-sort each independently produce
+// it — so deleting any ONE keeps this GREEN; it pins the OBSERVABLE end-to-end
+// contract the audit consumer depends on (see PR Notes for the counterfactual).
+func TestSliceMoveScopeFiles_ResolvedSortedByToSliceThenPath(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices(
+		[]string{"s0", "s1", "s2"},
+		[]*plan.Scope{
+			sliceScope("backend/s0keep.go", "backend/alpha.go"),
+			sliceScope("backend/s1keep.go", "backend/zeta.go", "backend/mid.go"),
+			sliceScope("backend/s2keep.go", "backend/s2extra.go"),
+		},
+	)
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	// Scrambled input: destination 2 listed before 0, and within destination 0
+	// zeta before mid. Canonical output must be (to_slice, path)-ordered.
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","move_scope_files_to_slice":{"2":["backend/alpha.go"],"0":["backend/zeta.go","backend/mid.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	var gotResolved []movedPath
+	rawResolved, _ := json.Marshal(payload["move_scope_files_resolved"])
+	if err := json.Unmarshal(rawResolved, &gotResolved); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	wantResolved := []movedPath{
+		{Path: "backend/mid.go", FromSlice: 1, ToSlice: 0},
+		{Path: "backend/zeta.go", FromSlice: 1, ToSlice: 0},
+		{Path: "backend/alpha.go", FromSlice: 0, ToSlice: 2},
+	}
+	if !reflect.DeepEqual(gotResolved, wantResolved) {
+		t.Errorf("move_scope_files_resolved = %+v,\nwant %+v (ordered by (to_slice, path) despite scrambled input)", gotResolved, wantResolved)
+	}
+}
