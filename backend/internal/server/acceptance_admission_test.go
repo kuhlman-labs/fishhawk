@@ -920,3 +920,65 @@ func TestAcceptanceAdmission_HostDispatch_SingleWriter(t *testing.T) {
 		t.Errorf("acceptance stage = %q, want succeeded (the single winning writer)", got)
 	}
 }
+
+// TestAcceptanceAdmission_ShortCircuitIsDisjointFromUndecidable pins the
+// PARTITION #2512 settles by construction rather than by convention: the
+// pre-spawn short-circuit and the post-run undecidable disposition can never
+// name the same run.
+//
+// not_validated is decided PRE-SPAWN from the PLAN alone — no runner, no
+// preview, no observation — so the outcome it records carries ZERO criteria
+// rows and the ladder that derives `undecidable` has nothing to read. undecidable
+// is decided POST-RUN from the agent's own evidence rows, which only exist once
+// the stage actually ran. The two are mutually exclusive because the
+// short-circuit skips dispatch entirely, not because a rule says so.
+//
+// This asserts the disjointness on the SHIPPED bytes: an all-skip-with-basis
+// plan short-circuits to not_validated, records no criteria at all, and the gate
+// resolves acceptance_not_validated — never acceptance_undecidable.
+func TestAcceptanceAdmission_ShortCircuitIsDisjointFromUndecidable(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+
+	w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	outcome := findAppendedByCategory(t, seam.au, CategoryAcceptanceOutcomeRecorded)
+	var payload map[string]any
+	if err := json.Unmarshal(outcome.Payload, &payload); err != nil {
+		t.Fatalf("decode outcome payload: %v", err)
+	}
+	if payload["verdict"] != plan.AcceptanceVerdictNotValidated {
+		t.Fatalf("verdict = %v, want %q", payload["verdict"], plan.AcceptanceVerdictNotValidated)
+	}
+	if payload["verdict"] == plan.AcceptanceVerdictUndecidable || payload["outcome"] == plan.AcceptanceOutcomeUndecidable {
+		t.Error("a PRE-SPAWN short-circuit must never record undecidable: it observed nothing at all")
+	}
+	// The structural reason the two cannot collide: no criteria rows exist for
+	// the ladder to read. criteria_undecidable is absent or zero, and the total
+	// is zero.
+	if n, ok := payload["criteria_undecidable"]; ok && n != float64(0) {
+		t.Errorf("criteria_undecidable = %v on a short-circuit, want absent or 0", n)
+	}
+
+	// The gate is stage-conditional on the workflow spec, so the run row carries
+	// the same acceptance-declaring spec the gate unit tests use.
+	gateRun := seam.rr.runs[seam.runID]
+	gateRun.WorkflowSpec = specWithAcceptanceStage
+	state, gerr := seam.s.acceptanceGateState(context.Background(),
+		gateRun, seam.rr.stagesByRunID[seam.runID])
+	if gerr != nil {
+		t.Fatalf("acceptanceGateState: %v", gerr)
+	}
+	if state != acceptanceGateNotValidated {
+		t.Fatalf("gate state = %q, want %q", state, acceptanceGateNotValidated)
+	}
+	if state == acceptanceGateUndecidable {
+		t.Error("gate resolved acceptance_undecidable for a pre-spawn short-circuit")
+	}
+	// Both ARE merge-eligible, through the one shared predicate — the partition
+	// is about honest reporting, not about admission.
+	if !acceptanceGateAdmitsMerge(acceptanceGateNotValidated) || !acceptanceGateAdmitsMerge(acceptanceGateUndecidable) {
+		t.Error("both dispositions must be merge-eligible through acceptanceGateAdmitsMerge")
+	}
+}

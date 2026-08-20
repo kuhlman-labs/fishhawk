@@ -64,4 +64,19 @@ cp "$REPO_ROOT/docs/spec/predicate-fixtures.json" \
 cp "$REPO_ROOT/docs/spec/predicate-fixtures.json" \
   "$REPO_ROOT/cli/internal/spec/testdata/predicate-fixtures.json"
 
+# The shared acceptance-verdict fixture corpus (#2512 / E48.78) is the proof
+# surface for the two hand-maintained verdict validators that CANNOT import each
+# other -- validateAcceptanceVerdict in package main of runner/cmd/fishhawk-runner
+# (the runner module does not require the backend module) and
+# acceptanceBody.validate in backend/internal/server. Mirroring it into both
+# testdata dirs makes the two suites run the SAME rows, so a twin divergence
+# (sharply, a whitespace-only undecidable_reason admitted by one side) fails
+# whichever side drifted; CI's schema-sync gate red-lines a mirror that itself
+# drifts. Same predicate-fixtures.json idiom: named *-fixtures.json (NOT
+# *.schema.json) so the docs/spec/*.schema.json loop above never globs it.
+cp "$REPO_ROOT/docs/spec/acceptance-verdict-fixtures.json" \
+  "$REPO_ROOT/backend/internal/server/testdata/acceptance-verdict-fixtures.json"
+cp "$REPO_ROOT/docs/spec/acceptance-verdict-fixtures.json" \
+  "$REPO_ROOT/runner/cmd/fishhawk-runner/testdata/acceptance-verdict-fixtures.json"
+
 echo "schemas synced from docs/spec/"

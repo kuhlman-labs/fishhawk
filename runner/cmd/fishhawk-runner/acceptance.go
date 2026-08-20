@@ -101,7 +101,8 @@ const acceptanceVerdictJSONSchema = `{
         "required": ["id", "result"],
         "properties": {
           "id": {"type": "string"},
-          "result": {"type": "string", "enum": ["passed", "failed", "skipped"]},
+          "result": {"type": "string", "enum": ["passed", "failed", "skipped", "undecidable"]},
+          "undecidable_reason": {"type": "string"},
           "observed": {"type": "string"},
           "expected": {"type": "string"},
           "steps_taken": {"type": "string"},
@@ -126,13 +127,22 @@ var errAcceptanceVerdictMissing = errors.New(
 // by json tag (the runner↔backend wire-contract convention, same as
 // upload.ScopeExemption / #1229).
 type acceptanceCriterionResult struct {
-	ID               string `json:"id"`
-	Result           string `json:"result"`
-	Observed         string `json:"observed,omitempty"`
-	Expected         string `json:"expected,omitempty"`
-	StepsTaken       string `json:"steps_taken,omitempty"`
-	ExpectationBasis string `json:"expectation_basis,omitempty"`
-	ReproHandle      string `json:"repro_handle,omitempty"`
+	ID     string `json:"id"`
+	Result string `json:"result"`
+	// UndecidableReason is a POINTER so the decoder preserves field PRESENCE
+	// (#2512, E48.78 binding condition 1). Go's encoding/json makes an ABSENT
+	// field indistinguishable from a PRESENT empty string when the target is a
+	// plain string, so `{"result":"passed","undecidable_reason":""}` would be
+	// silently admitted while violating the rule that the field belongs ONLY on
+	// an undecidable row. Every check below therefore tests the POINTER, never
+	// the value's emptiness. A literal JSON `null` decodes to nil and is treated
+	// as absent (the standard Go/JSON convention).
+	UndecidableReason *string `json:"undecidable_reason,omitempty"`
+	Observed          string  `json:"observed,omitempty"`
+	Expected          string  `json:"expected,omitempty"`
+	StepsTaken        string  `json:"steps_taken,omitempty"`
+	ExpectationBasis  string  `json:"expectation_basis,omitempty"`
+	ReproHandle       string  `json:"repro_handle,omitempty"`
 }
 
 // acceptanceVerdict mirrors the backend's acceptanceBody by json tag.
@@ -273,10 +283,27 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func
 			return nil, fmt.Errorf("criteria[%d].id is required (the plan-criterion join key)", i)
 		}
 		switch c.Result {
+		case "undecidable":
+			// #2512: a criterion the validator attempted but genuinely could not
+			// decide. The reason is REQUIRED and must carry non-whitespace text —
+			// an undecidable row with no reason is indistinguishable from a
+			// silently dropped criterion. Mirrors the backend twin exactly; the
+			// shared docs/spec/acceptance-verdict-fixtures.json corpus pins the
+			// agreement (sharply, the whitespace-only row).
+			if c.UndecidableReason == nil || strings.TrimSpace(*c.UndecidableReason) == "" {
+				return nil, fmt.Errorf(
+					"criteria[%d].undecidable_reason is required and must be non-whitespace when result is undecidable", i)
+			}
 		case "passed", "failed", "skipped":
-			// ok
+			// The field is rejected on PRESENCE, not on emptiness (binding
+			// condition 1): `"undecidable_reason": ""` on a passed row is a
+			// producer error exactly as a non-empty one is.
+			if c.UndecidableReason != nil {
+				return nil, fmt.Errorf(
+					"criteria[%d].undecidable_reason must be omitted when result is %q", i, c.Result)
+			}
 		default:
-			return nil, fmt.Errorf("criteria[%d].result must be passed/failed/skipped, got %q", i, c.Result)
+			return nil, fmt.Errorf("criteria[%d].result must be passed/failed/skipped/undecidable, got %q", i, c.Result)
 		}
 		if len(served) > 0 {
 			if _, ok := served[c.ID]; !ok {

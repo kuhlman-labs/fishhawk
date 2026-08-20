@@ -532,7 +532,8 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 	if err := json.Unmarshal(schema.Properties["criteria"], &critProp); err != nil {
 		t.Fatalf("criteria property does not parse: %v", err)
 	}
-	wantCritProps := []string{"id", "result", "observed", "expected", "steps_taken", "expectation_basis", "repro_handle"}
+	wantCritProps := []string{"id", "result", "undecidable_reason", "observed", "expected",
+		"steps_taken", "expectation_basis", "repro_handle"}
 	if len(critProp.Items.Properties) != len(wantCritProps) {
 		t.Errorf("criteria item has %d properties, want %d (%v)",
 			len(critProp.Items.Properties), len(wantCritProps), wantCritProps)
@@ -544,6 +545,19 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 	}
 	if len(critProp.Items.Required) != 2 || critProp.Items.Required[0] != "id" || critProp.Items.Required[1] != "result" {
 		t.Errorf("criteria item required = %v, want [id result]", critProp.Items.Required)
+	}
+	// #2512: the per-criterion result enum carries undecidable; the TOP-LEVEL
+	// verdict enum (asserted above) deliberately does NOT. The enum is a
+	// config-shaped string constant no compiler checks, so this is the
+	// done-means behavioral assertion for it.
+	var resultProp struct {
+		Enum []string `json:"enum"`
+	}
+	if err := json.Unmarshal(critProp.Items.Properties["result"], &resultProp); err != nil {
+		t.Fatalf("criteria item result property does not parse: %v", err)
+	}
+	if want := []string{"passed", "failed", "skipped", "undecidable"}; !equalStringSlices(resultProp.Enum, want) {
+		t.Errorf("criteria result enum = %v, want %v", resultProp.Enum, want)
 	}
 
 	// A maximal verdict exercising every schema property (top-level and
@@ -566,6 +580,132 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 	}`
 	if _, err := validateAcceptanceVerdict([]byte(maximal), []string{"AC1"}, nil); err != nil {
 		t.Errorf("maximal schema-shaped verdict rejected by validator: %v", err)
+	}
+
+	// #2512 lockstep: a row the SCHEMA admits (result=undecidable with an
+	// undecidable_reason, under a top-level passed verdict) must also pass the
+	// validator — the schema and the validator agree on the new vocabulary.
+	undecidable := `{
+		"verdict": "passed",
+		"criteria": [{
+			"id": "AC1",
+			"result": "undecidable",
+			"undecidable_reason": "the preview exposes no seam that distinguishes the two outcomes",
+			"steps_taken": "drove POST /orders twice"
+		}]
+	}`
+	if _, err := validateAcceptanceVerdict([]byte(undecidable), []string{"AC1"}, nil); err != nil {
+		t.Errorf("schema-admitted undecidable row rejected by validator: %v", err)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- #2512 undecidable vocabulary -----------------------------------------
+
+// acceptanceVerdictCorpus is the shared docs/spec/acceptance-verdict-fixtures.json
+// corpus, mirrored into this module's testdata by scripts/sync-schemas.
+type acceptanceVerdictCorpus struct {
+	Rows []struct {
+		Name     string          `json:"name"`
+		Body     json.RawMessage `json:"body"`
+		Admitted bool            `json:"admitted"`
+		Reason   string          `json:"reason"`
+	} `json:"rows"`
+}
+
+func loadAcceptanceVerdictCorpus(t *testing.T) acceptanceVerdictCorpus {
+	t.Helper()
+	// Anchored to THIS package's SOURCE dir via packageSourceDir (runtime.Caller),
+	// not the cwd: TestMain chdirs the whole package into a temp git repo, so a
+	// cwd-relative testdata path would not resolve.
+	raw, err := os.ReadFile(filepath.Join(packageSourceDir(t), "testdata", "acceptance-verdict-fixtures.json"))
+	if err != nil {
+		t.Fatalf("read acceptance verdict corpus (run scripts/sync-schemas): %v", err)
+	}
+	var c acceptanceVerdictCorpus
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("acceptance verdict corpus does not parse: %v", err)
+	}
+	if len(c.Rows) == 0 {
+		t.Fatal("acceptance verdict corpus is empty")
+	}
+	return c
+}
+
+// TestValidateAcceptanceVerdict_Corpus runs the SHARED corpus through the
+// runner's validator and asserts it admits exactly the rows marked admitted.
+// Its backend twin (TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner)
+// runs the SAME rows through acceptanceBody.validate. The claim the pair
+// establishes is CORPUS AGREEMENT between two hand-maintained validators that
+// cannot import each other — not byte-carrying, which is unimplementable across
+// the module boundary (the runner module does not require the backend module,
+// and validateAcceptanceVerdict is unexported in package main).
+//
+// The served-ids set is left EMPTY so the E31.7 membership check does not
+// second-guess the corpus ids: the corpus pins the SHARED rules, and membership
+// is a runner-only rule with no backend twin.
+func TestValidateAcceptanceVerdict_Corpus(t *testing.T) {
+	for _, row := range loadAcceptanceVerdictCorpus(t).Rows {
+		t.Run(row.Name, func(t *testing.T) {
+			_, err := validateAcceptanceVerdict(row.Body, nil, nil)
+			if row.Admitted && err != nil {
+				t.Fatalf("corpus row %q must be ADMITTED (%s) but was rejected: %v", row.Name, row.Reason, err)
+			}
+			if !row.Admitted && err == nil {
+				t.Fatalf("corpus row %q must be REJECTED (%s) but was admitted", row.Name, row.Reason)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptanceVerdict_UndecidableReasonPresence pins BINDING
+// CONDITION 1 directly at the runner validator: undecidable_reason is decided on
+// field PRESENCE, never on emptiness. The middle case is the one a plain-string
+// decode silently admits, because Go's encoding/json cannot distinguish an
+// absent field from a present empty one.
+func TestValidateAcceptanceVerdict_UndecidableReasonPresence(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"absent-on-passed-row-accepted",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`, false},
+		{"present-and-EMPTY-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":""}]}`, true},
+		{"present-and-non-empty-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":"why"}]}`, true},
+		{"present-on-skipped-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true},
+		{"absent-on-undecidable-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true},
+		{"whitespace-only-on-undecidable-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  	
+ "}]}`, true},
+		{"non-empty-on-undecidable-row-accepted",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateAcceptanceVerdict([]byte(tc.raw), nil, nil)
+			if tc.wantErr && err == nil {
+				t.Fatal("want rejection, got admitted")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want admitted, got %v", err)
+			}
+		})
 	}
 }
 
