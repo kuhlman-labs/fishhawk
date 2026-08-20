@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -1256,11 +1257,21 @@ func truncateReason(s string, max int) string {
 // (`backend/internal/server/reap_failure.go::reapFailureRequest`). Both
 // category and reason are required; detail and exit_code are optional
 // diagnostics.
+//
+// ExpectedState is the OPTIONAL compare-and-set precondition (E67.51 / #2699).
+// It is a *string so ABSENCE (an unconditional report — the detached reaper and
+// run_children's spawn-error compensation) is distinguishable on the wire from a
+// PRESENT value: with omitempty a nil pointer emits NO key at all, keeping those
+// callers' request bytes identical to what they were before #2699, while a
+// non-nil pointer always emits the key. The server rejects a present-but-empty
+// value 400 rather than reading it as unconditional, so an empty pin can never
+// silently downgrade to an unpinned reap.
 type reapFailureRequest struct {
-	Category string `json:"category"`
-	Reason   string `json:"reason"`
-	Detail   string `json:"detail,omitempty"`
-	ExitCode int    `json:"exit_code,omitempty"`
+	Category      string  `json:"category"`
+	Reason        string  `json:"reason"`
+	Detail        string  `json:"detail,omitempty"`
+	ExitCode      int     `json:"exit_code,omitempty"`
+	ExpectedState *string `json:"expected_state,omitempty"`
 }
 
 // ReapFailureResult mirrors the backend's reap-failure 200 body: whether this
@@ -1269,6 +1280,49 @@ type reapFailureRequest struct {
 type ReapFailureResult struct {
 	Transitioned bool   `json:"transitioned"`
 	StageState   string `json:"stage_state"`
+}
+
+// reapPreconditionCode is the backend error code for a LOST expected_state
+// precondition (E67.51 / #2699; backend/internal/server/reap_failure.go). One
+// literal shared by the no-retry guard here and fishhawk_reap_stage's operator
+// classifier.
+const reapPreconditionCode = "stage_state_precondition_failed"
+
+// isReapPreconditionLost reports whether ae is the server's 409 refusal of a
+// pinned reap.
+func isReapPreconditionLost(ae *apiError) bool {
+	return ae != nil && ae.StatusCode == http.StatusConflict && ae.Code == reapPreconditionCode
+}
+
+// isReapExpectedStateRejected reports whether ae is a 400 attributable to the
+// expected_state field — either an out-of-set value, or (the VERSION-SKEW case)
+// an OLD fishhawkd rejecting the unknown field outright, since the reap-failure
+// endpoint decodes with DisallowUnknownFields. Matching on the rendered error
+// covers both, because the skew's message names the field while its details map
+// does not.
+func isReapExpectedStateRejected(ae *apiError) bool {
+	return ae != nil && ae.StatusCode == http.StatusBadRequest && strings.Contains(ae.Error(), "expected_state")
+}
+
+// isReapExpectedStateOutOfSet narrows isReapExpectedStateRejected to the
+// SAME-VERSION half of it: a current fishhawkd refusing a precondition that
+// names a state outside its conditional anchor set. That 400 carries a
+// STRUCTURED details map — field=expected_state plus the accepted list — which
+// the version-skew 400 cannot, because an OLD fishhawkd rejects the field at the
+// DECODER (DisallowUnknownFields) and never reaches the handler's validation.
+// The two are otherwise indistinguishable, and telling an operator to rebuild
+// fishhawkd when nothing is skewed sends them at the wrong repair (E67.51
+// fix-up). Keyed on the details map, never on message text: the accepted list is
+// what only the validating handler can produce.
+func isReapExpectedStateOutOfSet(ae *apiError) bool {
+	if ae == nil || ae.StatusCode != http.StatusBadRequest || ae.Details == nil {
+		return false
+	}
+	if field, _ := ae.Details["field"].(string); field != "expected_state" {
+		return false
+	}
+	_, hasAccepted := ae.Details["accepted"]
+	return hasAccepted
 }
 
 // ReportStageFailure reports a spawn-phase runner failure — a detached runner
@@ -1284,12 +1338,42 @@ type ReapFailureResult struct {
 //   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
 //   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
 func (c *apiClient) ReportStageFailure(ctx context.Context, runID, stageID uuid.UUID, category, reason, detail string, exitCode int) (*ReapFailureResult, error) {
+	return c.ReportStageFailureFrom(ctx, runID, stageID, "", category, reason, detail, exitCode)
+}
+
+// ReportStageFailureFrom is ReportStageFailure with the OPTIONAL compare-and-set
+// precondition (E67.51 / #2699). An expectedState of "" sends NO expected_state
+// key — the unconditional report, byte-identical to the pre-#2699 body — and a
+// non-empty value PINS the reap: the server refuses with 409
+// stage_state_precondition_failed, atomically at its row-locked CAS, if the stage
+// is not (or no longer) in that state. fishhawk_reap_stage passes the state IT
+// last observed, which is what turns its client-side re-probe from a narrowing
+// into a server-enforced compare-and-set.
+//
+// The empty-string-means-unconditional convention lives HERE, at the Go call
+// boundary, and never reaches the wire: an empty expectedState omits the field,
+// so the server's presence check (which rejects a present-but-empty value 400)
+// is not weakened by it.
+//
+// Additional 4xx surfaces beyond ReportStageFailure's:
+//   - 400 validation_failed — expected_state outside {pending, dispatched,
+//     running}; ALSO what an OLD fishhawkd answers for the unknown field, since
+//     the endpoint decodes with DisallowUnknownFields (the version-skew case
+//     reapStage classifies).
+//   - 409 stage_state_precondition_failed — the precondition lost.
+func (c *apiClient) ReportStageFailureFrom(ctx context.Context, runID, stageID uuid.UUID, expectedState, category, reason, detail string, exitCode int) (*ReapFailureResult, error) {
 	// Truncate both fields so the marshalled body fits the endpoint's 32*1024
 	// cap (#1791) — otherwise this backstop 413s for the very oversized detail
 	// that stranded the stage in the first place.
 	reason = truncateReason(reason, maxReapFailureReasonBytes)
 	detail = truncateReason(detail, maxReapFailureDetailBytes)
-	body, err := json.Marshal(reapFailureRequest{Category: category, Reason: reason, Detail: detail, ExitCode: exitCode})
+	var expected *string
+	if expectedState != "" {
+		expected = &expectedState
+	}
+	body, err := json.Marshal(reapFailureRequest{
+		Category: category, Reason: reason, Detail: detail, ExitCode: exitCode, ExpectedState: expected,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal reap-failure: %w", err)
 	}
@@ -1305,11 +1389,27 @@ func (c *apiClient) ReportStageFailure(ctx context.Context, runID, stageID uuid.
 	// unchanged — no loop.
 	var ae *apiError
 	if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 {
+		// ...EXCEPT for the two responses a CONDITIONAL reap must not re-POST
+		// (E67.51 / #2699). The aggressive retry exists for ONE reason — a 413
+		// body_too_large caused by an oversized diagnostic — and re-sending the
+		// same pinned body cannot change either of these answers: a lost
+		// precondition is a fact about the STAGE, and an unknown-field 400 is a
+		// fact about the SERVER's build. Re-POSTing them would also contradict what
+		// the verb tells the operator ("the stage was NOT failed; re-read and
+		// re-invoke") by taking a second reap attempt behind their back. Gated on
+		// expected != nil so unconditional callers keep the retry arm verbatim.
+		if expected != nil && (isReapPreconditionLost(ae) || isReapExpectedStateRejected(ae)) {
+			return nil, err
+		}
+		// The aggressive re-marshal MUST carry the pin: dropping it here would
+		// turn a 413-retried conditional reap into an UNPINNED one — the silent
+		// downgrade this feature exists to make impossible.
 		aggBody, mErr := json.Marshal(reapFailureRequest{
-			Category: category,
-			Reason:   truncateReason(reason, aggressiveReapFailureBytes),
-			Detail:   truncateReason(detail, aggressiveReapFailureBytes),
-			ExitCode: exitCode,
+			Category:      category,
+			Reason:        truncateReason(reason, aggressiveReapFailureBytes),
+			Detail:        truncateReason(detail, aggressiveReapFailureBytes),
+			ExitCode:      exitCode,
+			ExpectedState: expected,
 		})
 		if mErr != nil {
 			return nil, fmt.Errorf("marshal aggressive reap-failure: %w", mErr)

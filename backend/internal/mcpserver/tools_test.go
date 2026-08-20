@@ -108,6 +108,14 @@ type fakeBackend struct {
 	// the slot fan-out issues exactly one read per candidate run, so the
 	// per-run-id override is the natural way to degrade one specific item.
 	stagesStatusByRun map[uuid.UUID]int
+	// stagesFlip, when set, is invoked under fb.mu on every
+	// GET /v0/runs/{run_id}/stages call AFTER the response snapshot is taken,
+	// with the run id and the 1-based per-run call ordinal. It lets a test mutate
+	// fb.stagesByRun the instant a specific read has been ANSWERED — i.e. inject a
+	// concurrent advance into the window between an observation and whatever the
+	// caller does next (E67.51: the park-resolved-before-the-POST race). Mirrors
+	// stageWaitFlip's contract for the per-stage wait endpoint.
+	stagesFlip        func(runID uuid.UUID, callNum int)
 	artifactsStatus   int
 	stagesCalledByID  map[uuid.UUID]int
 	artifactsCalledID map[uuid.UUID]int
@@ -567,6 +575,27 @@ type fakeBackend struct {
 	// refusal tests can assert an explicit never-dialed seam rather than
 	// inferring it from a zero-value response.
 	startCampaignItemRunCalls int
+}
+
+// recordedReapExpectedState reads the expected_state precondition the fake
+// recorded for the LAST accepted reap-failure POST against stageID (E67.51 /
+// #2699). The second return distinguishes a body that carried NO expected_state
+// key (an UNCONDITIONAL report — the detached reaper and run_children's
+// spawn-error compensation) from one that pinned a state, which is the
+// distinction the whole feature turns on: the fake decodes into the client's own
+// reapFailureRequest, whose *string field is nil exactly when the key was absent.
+func recordedReapExpectedState(fb *fakeBackend, stageID uuid.UUID) (string, bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	bodies := fb.reapFailureByStage[stageID]
+	if len(bodies) == 0 {
+		return "", false
+	}
+	last := bodies[len(bodies)-1]
+	if last.ExpectedState == nil {
+		return "", false
+	}
+	return *last.ExpectedState, true
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -1534,6 +1563,11 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		// Per-run-id status override (#2503): fail exactly this run's stage read.
 		if s, ok := fb.stagesStatusByRun[id]; ok {
 			status = s
+		}
+		// The response is already snapshotted, so a flip here lands strictly
+		// AFTER this read is answered — the concurrent-advance injection point.
+		if fb.stagesFlip != nil {
+			fb.stagesFlip(id, callNum)
 		}
 		fb.mu.Unlock()
 		w.WriteHeader(status)
