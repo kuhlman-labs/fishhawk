@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -103,6 +104,44 @@ func reapStagePendingRefusal(stageID, runID string) error {
 		stageID, runID, reapStagePendingState, runID, stageID)
 }
 
+// classifyReapPreconditionError turns the TWO conditional-reap 4xx surfaces into
+// operator-facing messages, and returns nil for everything else (so the caller
+// falls through to relaying the backend's refusal verbatim).
+//
+// NEITHER branch retries unconditionally. Re-POSTing without the pin would give
+// back exactly the guarantee the precondition buys — an unpinned reap that can
+// fail a stage a concurrent dispatch just brought to life — so a lost
+// precondition and a version skew both surface to the operator to act on.
+//
+//	409 stage_state_precondition_failed -> the stage is not in the state this
+//	    verb observed; something else moved it. Name both states and point at
+//	    fishhawk_get_run_status + re-invoke.
+//	400 naming expected_state           -> a VERSION SKEW, not a caller bug: the
+//	    endpoint decodes with DisallowUnknownFields, so an OLD fishhawkd answers
+//	    400 validation_failed for the field a NEW fishhawk-mcp sent. Without this
+//	    branch the skew reads as an unexplained validation failure.
+func classifyReapPreconditionError(err error, stageID, runID, expectedState string) error {
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		return nil
+	}
+	if isReapPreconditionLost(ae) {
+		actual, _ := ae.Details["actual_state"].(string)
+		if actual == "" {
+			actual = "(not reported)"
+		}
+		return fmt.Errorf(
+			"refusing to reap stage %s of run %s: the reap was PINNED to the state this verb last observed (%q) and the server found %q instead, so something else is driving the stage — a concurrent dispatch that spawned a runner has exactly this signature. The server refused atomically: the stage was NOT failed. Re-read the stage (fishhawk_get_run_status) and re-invoke only if it is still stranded",
+			stageID, runID, expectedState, actual)
+	}
+	if isReapExpectedStateRejected(ae) {
+		return fmt.Errorf(
+			"reap stage %s of run %s: the backend rejected the expected_state precondition (%v). This is a VERSION SKEW — this fishhawk-mcp is newer than the fishhawkd it is talking to, and that endpoint decodes with DisallowUnknownFields, so it 400s the field rather than ignoring it. Rebuild and restart fishhawkd (scripts/dev reload), or POST /v0/runs/%s/stages/%s/reap-failure directly. The reap was NOT retried without the precondition: an unpinned reap can fail a stage a concurrent dispatch just brought to life, which is the whole reason the pin exists",
+			stageID, runID, ae, runID, stageID)
+	}
+	return nil
+}
+
 // runnerLivenessLabel renders a runnerLivenessVerdict as the operator-facing
 // string carried on ReapStageOutput.runner_liveness. Kept separate from the
 // verdict type (drive_run.go) so the wire vocabulary is owned by the verb that
@@ -194,14 +233,23 @@ invocation plus the server-side protected-park allow-list, with a warning saying
 liveness is unverifiable from this host.
 
 That classification and the POST are two round-trips, not one atomic operation,
-and the endpoint's authority spans BOTH 'dispatched' and 'running' — so a
-concurrent dispatch could spawn a runner for a stage just classified 'dead' and
-the POST would fail a LIVE stage. The verb NARROWS that window: immediately
-before the POST it re-reads the stage state and re-probes, and refuses if the
-state moved or a runner appeared. It does not CLOSE it — only a server-side
-compare-and-set on the observed state could — so the honest guarantee is
-"reaping a live stage this host spawned is refused on every observation this
-verb can take", not "never".
+and the endpoint's authority spans BOTH 'dispatched' and 'running'. The verb
+narrows that window client-side — immediately before the POST it re-reads the
+stage state and re-probes, and refuses if the state moved or a runner appeared —
+and then PINS the reap to that last observation: the POST carries expected_state,
+and the server compares it under its row lock and refuses with 409
+stage_state_precondition_failed if the stage is not, or no longer, in it. So the
+state-advance mechanism is CLOSED, not merely narrowed: a concurrent dispatch
+that advances the stage into 'running' makes the server's compare-and-swap LOSE,
+and the reap is refused atomically rather than absorbed.
+
+The REMAINING residual, stated rather than papered over: a runner that has been
+spawned but whose state advance has not committed yet is still reapable, because
+the stage state is the only thing the server can compare against. The client-side
+re-probe above is the (best-effort) detector for exactly that case. And for a
+stage pinned at 'dispatched' the server's walk is dispatched -> running -> failed,
+so a 409 raised on the SECOND leg can leave that intermediate hop committed — a
+409 means the stage was never FAILED, not that nothing at all moved.
 
 Input:
   - run_id, stage_id : the stranded stage (both required).
@@ -217,6 +265,13 @@ Input:
 
 Tool errors:
   - invalid UUID, or a category outside {B, C} (both caught before the HTTP hop)
+  - 409 stage_state_precondition_failed — the stage left the state this verb
+    observed before the server committed the reap; nothing was failed. Re-read
+    with fishhawk_get_run_status and re-invoke only if it is still stranded. It
+    is never retried without the pin.
+  - a 400 naming expected_state — a VERSION SKEW (this fishhawk-mcp is newer than
+    the fishhawkd it is talking to). Rebuild/restart fishhawkd, or POST the
+    endpoint directly.
   - a stable 'pending' stage (refused locally: pending is not a strand — dispatch
     it instead; no HTTP hop)
   - a LIVE runner for a runner_kind=local run (refused; no HTTP hop)
@@ -304,14 +359,27 @@ func (r *runResolver) reapStage(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 
 	// LAST observation before the hop: the classification above is already stale
-	// by the time the POST is written.
-	if err := r.confirmStrandBeforeReap(ctx, runUUID, in.StageID, before, beforeKnown, probed); err != nil {
+	// by the time the POST is written. That observation is ALSO what the reap is
+	// PINNED to (E67.51 / #2699) — the server compares it under its row lock, so
+	// a concurrent advance landing after this read makes the compare-and-swap
+	// LOSE instead of being absorbed.
+	lastObserved, observedKnown, err := r.confirmStrandBeforeReap(ctx, runUUID, in.StageID, before, beforeKnown, probed)
+	if err != nil {
 		return nil, ReapStageOutput{}, err
 	}
+	// FAIL OPEN, unchanged: an unreadable or absent stage row sends NO
+	// precondition rather than refusing the recovery verb.
+	expectedState := ""
+	if observedKnown {
+		expectedState = lastObserved
+	}
 
-	res, err := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, in.Detail, in.ExitCode)
+	res, err := r.api.ReportStageFailureFrom(ctx, runUUID, stageUUID, expectedState, category, reason, in.Detail, in.ExitCode)
 	if err != nil {
-		// The backend's refusals — 404 stage_not_found, the protected-park
+		if classified := classifyReapPreconditionError(err, in.StageID, in.RunID, expectedState); classified != nil {
+			return nil, ReapStageOutput{}, classified
+		}
+		// The backend's other refusals — 404 stage_not_found, the protected-park
 		// refusal, 403 insufficient_scope — reach the operator verbatim.
 		return nil, ReapStageOutput{}, fmt.Errorf("reap stage: %w", err)
 	}
@@ -437,21 +505,29 @@ func (r *runResolver) observeStageState(ctx context.Context, runUUID uuid.UUID, 
 // narrowing layer on top of the server's protected-park allow-list, and
 // refusing a recovery verb on a transient read error would re-strand the very
 // stage it exists to clear.
-func (r *runResolver) confirmStrandBeforeReap(ctx context.Context, runUUID uuid.UUID, stageID, before string, beforeKnown, probed bool) error {
-	if after, afterKnown := r.observeStageState(ctx, runUUID, stageID); beforeKnown && afterKnown && after != before {
-		return fmt.Errorf(
+// It returns the state it LAST observed (and whether that observation
+// succeeded), which reapStage sends as the reap's expected_state precondition —
+// so the pin the server compares against is this verb's OWN final observation.
+// An unreadable or absent row returns ("", false) and the reap is sent
+// UNCONDITIONALLY, preserving the fail-open posture verbatim: refusing a
+// recovery verb on a transient read error would re-strand the very stage it
+// exists to clear.
+func (r *runResolver) confirmStrandBeforeReap(ctx context.Context, runUUID uuid.UUID, stageID, before string, beforeKnown, probed bool) (string, bool, error) {
+	after, afterKnown := r.observeStageState(ctx, runUUID, stageID)
+	if beforeKnown && afterKnown && after != before {
+		return "", false, fmt.Errorf(
 			"refusing to reap stage %s of run %s: it moved from %q to %q while its runner liveness was being classified, so something else is driving it — a concurrent dispatch spawns a runner and advances the stage into 'running', and reaping now would fail a LIVE runner's stage. Re-read the stage (fishhawk_get_run_status) and re-invoke only if it is still stranded",
 			stageID, runUUID, before, after)
 	}
 	if !probed {
 		// A non-local runner_kind was never probed in the first place; re-probing
 		// here would fabricate the host verdict the gate exists to withhold.
-		return nil
+		return after, afterKnown, nil
 	}
 	if r.livenessProbe()(ctx, stageID) == runnerLive {
-		return fmt.Errorf(
+		return "", false, fmt.Errorf(
 			"refusing to reap stage %s of run %s: a process on this host picked up this stage id between the liveness classification and the reap — a concurrent dispatch spawned a runner, so the stage is executing, not stranded. Wait for it to settle before reaping",
 			stageID, runUUID)
 	}
-	return nil
+	return after, afterKnown, nil
 }

@@ -93,16 +93,53 @@ func isReapProtectedPark(state run.StageState) bool {
 	return reapProtectedParkStates[state]
 }
 
+// reapConditionalAnchors is the CLOSED set of states an OPTIONAL expected_state
+// precondition may name (E67.51 / #2699) — exactly the ENDPOINT's reap authority
+// {pending, dispatched, running}, i.e. the complement of the terminal states and
+// reapProtectedParkStates. A precondition naming anything outside it could never
+// be honoured (the handler would refuse that stage regardless), so the endpoint
+// answers 400 up front: a precondition the endpoint can never satisfy is a
+// CALLER bug, and a 400 naming the accepted set is more actionable than a 409
+// the caller cannot act on.
+var reapConditionalAnchors = map[run.StageState]bool{
+	run.StageStatePending:    true,
+	run.StageStateDispatched: true,
+	run.StageStateRunning:    true,
+}
+
+// reapConditionalAnchorList renders reapConditionalAnchors for an error body, in
+// a STABLE order (map iteration is randomized, and a 400's details must not
+// shuffle between identical requests).
+func reapConditionalAnchorList() []string {
+	return []string{
+		string(run.StageStatePending),
+		string(run.StageStateDispatched),
+		string(run.StageStateRunning),
+	}
+}
+
 // reapFailureRequest is the wire shape the MCP host's detached reaper POSTs
 // (#1747). category is exactly "B" or "C" (mirroring pullrequest.go's
 // failed-outcome validation); reason is required; detail and exit_code are
 // optional diagnostics carrying the parsed runner_failed line and the child's
 // process exit code.
+//
+// ExpectedState is the OPTIONAL compare-and-set precondition (E67.51 / #2699).
+// It is a *string, NOT a string, and that is load-bearing: the contract
+// distinguishes ABSENCE from EMPTINESS at the DECODE layer. A field OMITTED
+// entirely (nil) is the UNCONDITIONAL request — today's absorbing, idempotent
+// behaviour, byte-for-byte, for the detached reaper and run_children's
+// spawn-error compensation. A field PRESENT carrying an empty string (or any
+// value outside reapConditionalAnchors) is a 400 validation_failed. Comparing a
+// decoded string to "" would instead silently DOWNGRADE a caller that meant to
+// pin a state but emitted "" into an UNPINNED reap — precisely the silent
+// downgrade this change exists to make impossible.
 type reapFailureRequest struct {
-	Category string `json:"category"`
-	Reason   string `json:"reason"`
-	Detail   string `json:"detail,omitempty"`
-	ExitCode int    `json:"exit_code,omitempty"`
+	Category      string  `json:"category"`
+	Reason        string  `json:"reason"`
+	Detail        string  `json:"detail,omitempty"`
+	ExitCode      int     `json:"exit_code,omitempty"`
+	ExpectedState *string `json:"expected_state,omitempty"`
 }
 
 // reapFailureResponse is the 200 body. Transitioned is false on the idempotent
@@ -218,6 +255,28 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// OPTIONAL compare-and-set precondition (E67.51 / #2699). PRESENCE, not
+	// emptiness, is what makes the call conditional: req.ExpectedState == nil is
+	// the unconditional request, and a PRESENT value — including "" — must name
+	// one of the endpoint's three reapable anchors or the request is a 400. See
+	// reapFailureRequest's doc comment for why an empty-string-means-unconditional
+	// reading would be a silent downgrade rather than a nit.
+	conditional := req.ExpectedState != nil
+	var expected run.StageState
+	if conditional {
+		expected = run.StageState(*req.ExpectedState)
+		if !reapConditionalAnchors[expected] {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"expected_state must name one of the reapable stage states this endpoint can honour",
+				map[string]any{
+					"field":    "expected_state",
+					"got":      *req.ExpectedState,
+					"accepted": reapConditionalAnchorList(),
+				})
+			return
+		}
+	}
+
 	// Load the stage and validate the (run_id, stage_id) handle: a stage whose
 	// run_id differs from the path does not exist AT THIS PATH → 404.
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
@@ -230,6 +289,28 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, r, http.StatusNotFound, "stage_not_found",
 			"stage does not belong to the supplied run",
 			map[string]any{"stage_id": stageID.String(), "run_id": runID.String()})
+		return
+	}
+
+	// LOAD-TIME PRECONDITION (E67.51 / #2699) — checked AHEAD of the terminal
+	// no-op and the protected-park fast path, so a conditional caller learns its
+	// precondition lost rather than reading a success-shaped body. The DELIBERATE
+	// divergence: a CONDITIONAL report against an already-terminal or parked stage
+	// is a 409, NOT the 200 {transitioned:false} no-op the unconditional path
+	// returns. A caller that pinned a state wants the refusal; the idempotent no-op
+	// stays the contract for the (unconditional) detached reaper, whose bounded
+	// backoff retry loop depends on a duplicate being benign.
+	//
+	// Nothing transitions on this path: no CAS, no dispatch_reaper_failed audit
+	// entry, no orchestrator advance.
+	if conditional && stage.State != expected {
+		s.writeError(w, r, http.StatusConflict, "stage_state_precondition_failed",
+			"the stage is not in the state the reap was pinned to",
+			map[string]any{
+				"stage_id":       stageID.String(),
+				"expected_state": string(expected),
+				"actual_state":   string(stage.State),
+			})
 		return
 	}
 
@@ -286,7 +367,7 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// dispatched → running → failed), so the spawn-phase 'dispatched' case is
 	// handled — but, UNLIKE run.FailStage, it refuses to re-anchor into any
 	// protected park that lands mid-transition (GUARD 2, #2630).
-	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason); err != nil {
+	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason, conditional); err != nil {
 		// (d) WIRING FAULT — the run repository does not implement
 		// run.StageCASTransitioner (#2672). This is classified FIRST, ahead of
 		// the re-load below, and is load-bearing: the re-load's terminal-or-park
@@ -340,7 +421,45 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		//
 		// The re-load's terminal-or-park check is exactly the benign set (a)+(b),
 		// using the same shared isReapProtectedPark predicate GUARD 2 refuses on.
-		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
+		//
+		// (e) CONDITIONAL CALLER, precondition LOST mid-flight (E67.51 / #2699).
+		// Classified AFTER the errReapRepoNotCAS wiring fault (a misconfiguration
+		// must never be reported as a lost precondition) and INSTEAD OF the re-load
+		// below: a conditional mismatch must never surface as the benign 200. The
+		// actual state is taken from the row-locked sce.Actual — the authoritative
+		// mid-flight value the CAS itself observed — rather than from a second,
+		// already-stale read. A NON-typed repo error still falls through to the
+		// documented retryable 500.
+		//
+		// WHAT THE 409 GUARANTEES, stated at the strength the code delivers: this
+		// call never drove the stage to FAILED, and no dispatch_reaper_failed audit
+		// entry and no orchestrator advance were written. It does NOT guarantee that
+		// nothing at all was committed. For a DISPATCHED anchor the walk is
+		// dispatched → running → failed (unchanged from the unconditional walk), so
+		// the reap itself commits the intermediate dispatched → running hop before
+		// attempting the second leg; a concurrent transition landing BETWEEN the
+		// legs yields this 409 with that hop already committed and the stage left in
+		// (or moved on from) 'running'. Exit from 'running' mid-walk is REACHABLE —
+		// backend/internal/run/transition.go's StageStateRunning row admits
+		// awaiting_approval / awaiting_input / awaiting_scope_decision /
+		// awaiting_deployment / succeeded / failed / cancelled — so this is a real
+		// interleaving, not a theoretical one, and it is pinned by
+		// TestReapStageFailure_ConditionalSecondLegFlipIs409. "Nothing transitioned"
+		// is exact for the load-time refusal and for a pending- or running-anchored
+		// first-CAS refusal.
+		if conditional {
+			var sce run.StageStateChangedError
+			if errors.As(err, &sce) {
+				s.writeError(w, r, http.StatusConflict, "stage_state_precondition_failed",
+					"the stage left the state the reap was pinned to before the transition committed",
+					map[string]any{
+						"stage_id":       stageID.String(),
+						"expected_state": string(expected),
+						"actual_state":   string(sce.Actual),
+					})
+				return
+			}
+		} else if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
 			(cur.State.IsTerminal() || isReapProtectedPark(cur.State)) {
 			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
 				Transitioned: false,
@@ -356,7 +475,7 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 
 	stageIDCopy := stageID
 	systemKind := audit.ActorSystem
-	auditPayload, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"run_id":           runID.String(),
 		"stage_id":         stageID.String(),
 		"failure_category": string(cat),
@@ -365,7 +484,17 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		"exit_code":        req.ExitCode,
 		"reported_at":      time.Now().UTC().Format(time.RFC3339Nano),
 		"auth_method":      "bearer",
-	})
+	}
+	// expected_state is added ONLY for a conditional call, so the UNCONDITIONAL
+	// payload's key set is byte-for-byte what it was before #2699 — "unconditional
+	// callers are unaffected" stays a fact rather than an assertion. An
+	// unconditionally-present "expected_state":"" would silently change an existing
+	// observable payload; TestReapStageFailure_UnconditionalAuditPayloadKeySet pins
+	// the key set against the recorded pre-change list.
+	if conditional {
+		payload["expected_state"] = string(expected)
+	}
+	auditPayload, _ := json.Marshal(payload)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageIDCopy,
@@ -454,12 +583,23 @@ const reapFailMaxAttempts = 4
 // assertion in run/postgres.go plus serve.go's boot check (runRepoCASWiringError)
 // make this refusal unreachable in a deployed daemon: production (postgresRepo)
 // always has the capability.
-func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string) (*run.Stage, error) {
+//
+// CONDITIONAL MODE (E67.51 / #2699). When conditional is true the caller pinned
+// `from` as an expected_state precondition, and the walk runs with RE-ANCHORING
+// DISABLED: any CAS refusal is returned UNCHANGED instead of being absorbed. The
+// #1907 benign dispatched → running absorption is precisely the interleaving
+// #2699 names (a concurrent dispatch spawns a runner and advances the stage
+// while the reap is in flight), so a conditional caller must LOSE it rather than
+// absorb it — that is what turns the verb's best-effort narrowing into a
+// server-side compare-and-set. Unconditional callers (the detached reaper,
+// run_children's spawn-error compensation) pass false and keep the absorbing
+// loop verbatim.
+func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string, conditional bool) (*run.Stage, error) {
 	cas, ok := repo.(run.StageCASTransitioner)
 	if !ok {
 		return nil, fmt.Errorf("%w (repo type %T)", errReapRepoNotCAS, repo)
 	}
-	return reapFailCAS(ctx, cas, stageID, from, cat, reason)
+	return reapFailCAS(ctx, cas, stageID, from, cat, reason, conditional)
 }
 
 // reapFailCAS is failStageForReap's bounded re-anchor loop, mirroring run's
@@ -468,12 +608,17 @@ func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUI
 // The dispatched → running → failed walk matches FailStage's so the spawn-phase
 // 'dispatched' case and the #1907 benign dispatched → running absorption both
 // hold; only the park-refusal diverges.
-func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string) (*run.Stage, error) {
+func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string, conditional bool) (*run.Stage, error) {
 	var lastErr error
 	for attempt := 0; attempt < reapFailMaxAttempts; attempt++ {
 		if from == run.StageStateDispatched {
 			running, err := cas.TransitionStageFrom(ctx, stageID, run.StageStateDispatched, run.StageStateRunning, nil)
 			if err != nil {
+				// CONDITIONAL: no re-anchor, no second attempt — the caller pinned a
+				// state and a mid-flight change means the precondition LOST.
+				if conditional {
+					return nil, err
+				}
 				next, retry := reapReanchor(err)
 				if !retry {
 					return nil, err
@@ -488,6 +633,9 @@ func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid
 			FailureReason:   &reason,
 		})
 		if err != nil {
+			if conditional {
+				return nil, err
+			}
 			next, retry := reapReanchor(err)
 			if !retry {
 				return nil, err

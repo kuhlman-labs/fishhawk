@@ -569,6 +569,27 @@ type fakeBackend struct {
 	startCampaignItemRunCalls int
 }
 
+// recordedReapExpectedState reads the expected_state precondition the fake
+// recorded for the LAST accepted reap-failure POST against stageID (E67.51 /
+// #2699). The second return distinguishes a body that carried NO expected_state
+// key (an UNCONDITIONAL report — the detached reaper and run_children's
+// spawn-error compensation) from one that pinned a state, which is the
+// distinction the whole feature turns on: the fake decodes into the client's own
+// reapFailureRequest, whose *string field is nil exactly when the key was absent.
+func recordedReapExpectedState(fb *fakeBackend, stageID uuid.UUID) (string, bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	bodies := fb.reapFailureByStage[stageID]
+	if len(bodies) == 0 {
+		return "", false
+	}
+	last := bodies[len(bodies)-1]
+	if last.ExpectedState == nil {
+		return "", false
+	}
+	return *last.ExpectedState, true
+}
+
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{

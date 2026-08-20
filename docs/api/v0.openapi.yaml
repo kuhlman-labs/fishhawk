@@ -7565,6 +7565,41 @@ paths:
         `awaiting_children` after the pre-check but before the fail transition
         lands.
 
+        **Optional `expected_state` precondition (#2699).** Supplying
+        `expected_state` makes the reap a COMPARE-AND-SET: the value must name
+        one of the three states this endpoint can reap (`pending`,
+        `dispatched`, `running` — anything else, including an explicitly EMPTY
+        string, is 400 `validation_failed`), and the reap is refused 409
+        `stage_state_precondition_failed` when the stage is not in it. In
+        conditional mode the CAS walk runs with RE-ANCHORING DISABLED: a state
+        change landing between the handler's load and its row-locked
+        compare-and-swap makes the swap LOSE rather than being absorbed. That
+        is what closes the check/use race in `fishhawk_reap_stage`'s live-runner
+        guard — a concurrent dispatch that advances the stage to `running`
+        makes the pinned reap fail instead of reaping a live stage.
+
+        OMITTING the field is the UNCONDITIONAL request and preserves the
+        absorbing, idempotent behaviour described above byte-for-byte, which is
+        what the detached reaper and `run_children`'s spawn-error compensation
+        rely on. ABSENCE and EMPTINESS are distinguished at the decode layer:
+        an omitted field is unconditional, a field present carrying `""` is a
+        400 — so an empty pin can never silently downgrade to an unpinned reap.
+
+        A conditional report also DIVERGES from the idempotent no-op: against
+        an already-terminal or parked stage it answers 409, not 200
+        `transitioned: false`, because a caller that pinned a state wants to
+        learn its precondition lost rather than read a success-shaped body.
+
+        **What a 409 guarantees, precisely.** The stage was never driven to
+        `failed`, no `dispatch_reaper_failed` audit entry was written, and no
+        orchestrator advance ran. It does NOT guarantee that nothing at all was
+        committed: a reap pinned at `dispatched` walks
+        `dispatched → running → failed` (the same walk the unconditional path
+        takes), so a concurrent transition landing BETWEEN the two legs yields
+        this 409 with the intermediate `dispatched → running` hop already
+        committed. "Nothing transitioned" is exact for the load-time refusal
+        and for a `pending`- or `running`-anchored first-CAS refusal.
+
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
         operator/MCP token that drives dispatch already carries it.
@@ -7575,9 +7610,9 @@ paths:
       requestBody:
         required: true
         description: |
-          The failure category, a required reason, and optional diagnostics
-          (the parsed `runner_failed` detail and the child's process exit
-          code).
+          The failure category, a required reason, optional diagnostics (the
+          parsed `runner_failed` detail and the child's process exit code), and
+          the optional `expected_state` compare-and-set precondition.
         content:
           application/json:
             schema:
@@ -7607,6 +7642,18 @@ paths:
                 exit_code:
                   type: integer
                   description: The runner's process exit code.
+                expected_state:
+                  type: string
+                  enum: [pending, dispatched, running]
+                  description: |
+                    OPTIONAL compare-and-set precondition (#2699): reap ONLY if
+                    the stage is in this state. Must name one of the three
+                    states this endpoint can reap; any other value — including
+                    an explicitly empty string — is 400 `validation_failed`.
+                    OMIT the field for the unconditional report (the detached
+                    reaper's contract, unchanged). When supplied, the CAS walk
+                    does not re-anchor, so a concurrent advance makes the reap
+                    lose with 409 rather than being absorbed.
       responses:
         '200':
           description: |
@@ -7629,8 +7676,12 @@ paths:
         '400':
           description: |
             Malformed body, an unknown field, a `category` other than
-            `B`/`C`, or an empty `reason`. Body's `error` is
-            `validation_failed`.
+            `B`/`C`, an empty `reason`, or an `expected_state` outside
+            {`pending`, `dispatched`, `running`} — including a present but
+            EMPTY value, which is a validation failure rather than an
+            unconditional request (#2699). Body's `error` is
+            `validation_failed`; for `expected_state` the `details` carry
+            `field`, `got` and the `accepted` set.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -7645,6 +7696,21 @@ paths:
           description: |
             `stage_not_found` — no stage with that id, or the stage's
             `run_id` does not match the path `run_id` (inconsistent handle).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `stage_state_precondition_failed` — a CONDITIONAL report (one
+            carrying `expected_state`) whose precondition lost, either at the
+            handler's load or at its row-locked compare-and-swap (#2699).
+            `details` carry `stage_id`, `expected_state`, and `actual_state`
+            (taken from the row-locked value the CAS observed when the refusal
+            happened mid-flight). The stage was NOT driven to `failed`, no
+            audit entry was written, and no advance ran — but see "What a 409
+            guarantees, precisely" above for the `dispatched`-anchored walk's
+            committed intermediate hop. Unreachable for an unconditional
+            report.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

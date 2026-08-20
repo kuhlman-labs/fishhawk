@@ -877,9 +877,10 @@ selector back to one constant reddens it whatever the wording).
 So the guarantee is: **it prevents reaping a live stage THIS HOST SPAWNED**. For a remote runner it rests on the
 operator's explicit invocation plus the server-side protected-park allow-list, and says so in `warnings`.
 
-**The classification and the POST are not atomic, so that guarantee is NARROWED, not absolute.** The endpoint's reap
-authority spans BOTH `dispatched` and `running`, so a stage probed `dead` while merely `dispatched` can be dispatched
-concurrently — spawning a runner and advancing to `running` — and the POST would then fail a genuinely live stage.
+**The classification and the POST are not atomic — so the verb NARROWS client-side and then PINS server-side
+([E67.51 / #2699](https://github.com/kuhlman-labs/fishhawk/issues/2699)).** The endpoint's reap authority spans BOTH
+`dispatched` and `running`, so a stage probed `dead` while merely `dispatched` can be dispatched concurrently — spawning
+a runner and advancing to `running` — and an unpinned POST would then fail a genuinely live stage.
 `confirmStrandBeforeReap` re-observes IMMEDIATELY before the POST and refuses on either of two independent detectors:
 
 | detector | fires when | misses |
@@ -889,13 +890,37 @@ concurrently — spawning a runner and advancing to `running` — and the POST w
 
 Both **fail OPEN** on an unreadable or absent stage row: this is a narrowing layer over the server's protected-park
 allow-list, and refusing a recovery verb on a transient read error would re-strand the stage it exists to clear. Neither
-detector CLOSES the window — nothing on the client side can, because the observation and the POST are two round-trips.
-Closing it needs a **server-side compare-and-set** (reap only from the state the caller observed) on an endpoint this
-verb deliberately does not change; until that exists the honest claim is "refused on every observation this verb can
-take", not "never". `TestReapStage_RaceStageAdvancedUnderProbeRefused` and
-`TestReapStage_RaceRunnerAppearedBeforePostRefused` drive one interleaving each (each with the OTHER detector unarmed,
-so the refusal can only come from the one under test), `TestReapStage_UnracedStrandStillReaped` is the paired control
-that an unraced strand is still reaped, and `TestReapStage_ReconfirmNeverProbesANonLocalRun` pins the re-probe's gate.
+detector CLOSES the window on its own — nothing on the client side can, because the observation and the POST are two
+round-trips. `TestReapStage_RaceStageAdvancedUnderProbeRefused` and `TestReapStage_RaceRunnerAppearedBeforePostRefused`
+drive one interleaving each (each with the OTHER detector unarmed, so the refusal can only come from the one under
+test), `TestReapStage_UnracedStrandStillReaped` is the paired control that an unraced strand is still reaped, and
+`TestReapStage_ReconfirmNeverProbesANonLocalRun` pins the re-probe's gate.
+
+**The window is now CLOSED at the server, which is the only place it can be closed (#2699).** The verb sends the state
+it LAST observed (detector (1)'s `after` read) as the reap-failure endpoint's `expected_state` precondition, and the
+server compares it under its row lock with the CAS walk's **re-anchor disabled** — so a concurrent dispatch that
+advances the stage makes the compare-and-swap LOSE and the reap is refused `409 stage_state_precondition_failed`,
+atomically, rather than absorbed. The named mechanism ("probe says dead while `dispatched` → a concurrent dispatch
+advances the stage to `running` → the POST fails a live stage") is therefore structurally impossible, not merely
+narrowed.
+
+| surface | behaviour |
+|---|---|
+| observation succeeded | `expected_state` = that state; a mismatch is a tool error naming BOTH the pinned and the actual state and pointing at `fishhawk_get_run_status` + re-invoke |
+| stage row unreadable / absent | NO `expected_state` sent — the fail-open posture verbatim, since refusing a recovery verb on a transient read error would re-strand the stage |
+| `409 stage_state_precondition_failed` | surfaced to the operator; **never retried unpinned** (the client's `#1791` aggressive 4xx retry is skipped for this response on a conditional call) |
+| `400` naming `expected_state` | a **VERSION SKEW** message (this `fishhawk-mcp` is newer than the `fishhawkd` it talks to; the endpoint decodes with `DisallowUnknownFields`, so it 400s the field rather than ignoring it) — also never retried unpinned, because a silent unconditional retry would hand back the exact guarantee the pin buys |
+
+**The remaining residual, stated rather than papered over:** a runner that has been spawned but whose state advance has
+not COMMITTED yet is still reapable, because the stage state is the only thing the server can compare against —
+detector (2), the re-probe, remains the (best-effort) client-side detector for that case. And a 409 means the stage was
+never driven to `failed`; for a `dispatched`-pinned reap the server's walk is `dispatched → running → failed`, so a
+refusal on the SECOND leg leaves that intermediate hop committed. Pinned by
+`TestReapStage_SendsObservedStateAsPrecondition` (both anchors), `TestReapStage_UnreadableStageSendsNoPrecondition`
+(fail-open), `TestReapStage_PreconditionLostSurfacesToOperator` and `TestReapStage_UnknownFieldSurfacesVersionSkew`
+(each asserting EXACTLY ONE POST), `TestReapStage_UnrelatedBadRequestIsNotMisreadAsSkew` (the paired control that an
+ordinary 400 is not mislabelled), `TestReportStageFailureFrom_413RetryKeepsPrecondition`, and the server-side
+`TestReapStageFailure_Conditional*` set.
 
 `guardSiblingStageInFlight`'s target-`running` arm reuses the same classification, **message-only**: the refusal stays
 UNCONDITIONAL across `live`/`dead`/`unknown` and only the wording changes (`dead`/`unknown` now name

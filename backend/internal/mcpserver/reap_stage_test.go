@@ -873,3 +873,196 @@ func TestReapStage_EndToEndOverHTTP(t *testing.T) {
 		t.Errorf("next_step must name fishhawk_retry_stage: %q", out.NextStep)
 	}
 }
+
+// --- the server-side compare-and-set precondition (E67.51 / #2699) ---
+
+// (F) TestReapStage_SendsObservedStateAsPrecondition is the counterfactual
+// vehicle for the verb's pass-through of its LAST observation: the POST must
+// carry expected_state equal to the state confirmStrandBeforeReap saw
+// immediately before the hop. Send "" instead and the reap goes out UNPINNED —
+// the server can no longer refuse the check/use race atomically, which is the
+// entire point of the change.
+//
+// Both reapable anchors are driven, because they take different walks on the
+// server: 'dispatched' routes through running, 'running' is a single CAS.
+func TestReapStage_SendsObservedStateAsPrecondition(t *testing.T) {
+	for _, state := range []string{"dispatched", "running"} {
+		t.Run(state, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			seedLocalRun(fb, runID)
+			seedStrandedStage(fb, runID, stageID.String(), state)
+			r, _ := reapResolver(t, srv, runnerDead)
+
+			_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+				RunID: runID.String(), StageID: stageID.String(),
+			})
+			if err != nil {
+				t.Fatalf("reapStage: %v", err)
+			}
+			if !out.Transitioned {
+				t.Errorf("transitioned = false, want true")
+			}
+			got, pinned := recordedReapExpectedState(fb, stageID)
+			if !pinned {
+				t.Fatalf("the POST carried NO expected_state: the reap went out UNPINNED, so the "+
+					"server cannot refuse a concurrent advance atomically (stage observed %q)", state)
+			}
+			if got != state {
+				t.Errorf("expected_state = %q, want %q (the state this verb last observed)", got, state)
+			}
+		})
+	}
+}
+
+// (F) TestReapStage_UnreadableStageSendsNoPrecondition is the FAIL-OPEN control,
+// and it is the paired opposite of the test above: when the stage row cannot be
+// read at all, the verb sends NO precondition and still reaps. Refusing a
+// recovery verb on a transient read error would re-strand the very stage it
+// exists to clear, so the pin is best-effort by construction, not a hard
+// requirement of the verb.
+func TestReapStage_UnreadableStageSendsNoPrecondition(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	fb.mu.Lock()
+	fb.stagesStatusByRun[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, out, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("an unreadable stage list must not refuse the reap: %v", err)
+	}
+	if !out.Transitioned || out.StageState != "failed" {
+		t.Errorf("transitioned=%v stage_state=%q, want true/failed", out.Transitioned, out.StageState)
+	}
+	if got, pinned := recordedReapExpectedState(fb, stageID); pinned {
+		t.Errorf("expected_state = %q on an UNOBSERVABLE stage: the verb must not invent a pin", got)
+	}
+}
+
+// (F) TestReapStage_PreconditionLostSurfacesToOperator: the server's 409
+// stage_state_precondition_failed becomes an operator-facing message naming BOTH
+// the pinned and the actual state, and the verb does NOT retry — exactly ONE
+// POST. A silent unconditional retry here would hand back the guarantee the pin
+// buys, so the single-attempt assertion is the load-bearing half.
+func TestReapStage_PreconditionLostSurfacesToOperator(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "dispatched")
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusConflict
+	fb.reapFailureErrBody = `{"error":{"code":"stage_state_precondition_failed",` +
+		`"message":"the stage is not in the state the reap was pinned to",` +
+		`"details":{"expected_state":"dispatched","actual_state":"running"}}}`
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("a lost precondition must surface as a tool error")
+	}
+	for _, want := range []string{"dispatched", "running", "fishhawk_get_run_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name %q: %v", want, err)
+		}
+	}
+	// EXACTLY ONE POST: no unconditional retry behind the operator's back.
+	if got := reapHops(fb); got != 1 {
+		t.Errorf("reap-failure POSTs = %d, want exactly 1 (a 409 must never be retried unpinned)", got)
+	}
+}
+
+// (F) TestReapStage_UnknownFieldSurfacesVersionSkew: an OLD fishhawkd decodes
+// the reap-failure body with DisallowUnknownFields, so a NEW fishhawk-mcp
+// sending expected_state gets 400 validation_failed rather than a silent ignore.
+// That must read as a VERSION SKEW with an actionable fix, not as an unexplained
+// validation failure — and, again, must NOT be retried without the precondition.
+func TestReapStage_UnknownFieldSurfacesVersionSkew(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusBadRequest
+	fb.reapFailureErrBody = `{"error":{"code":"validation_failed",` +
+		`"message":"json: unknown field \"expected_state\""}}`
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("a 400 naming expected_state must surface as a tool error")
+	}
+	for _, want := range []string{"VERSION SKEW", "fishhawkd", "expected_state"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name %q: %v", want, err)
+		}
+	}
+	// NOT retried unconditionally: the whole guarantee would be voided by a
+	// silent unpinned re-POST.
+	if got := reapHops(fb); got != 1 {
+		t.Errorf("reap-failure POSTs = %d, want exactly 1 (the skew must never be retried unpinned)", got)
+	}
+}
+
+// (F) TestReapStage_UnrelatedBadRequestIsNotMisreadAsSkew is the PAIRED CONTROL
+// for the skew classifier: a 400 that does NOT mention expected_state (an
+// ordinary validation failure) must reach the operator VERBATIM, not wearing a
+// misleading "rebuild fishhawkd" instruction. Without it the skew branch could be
+// satisfied by a classifier that labels every 400 a version skew.
+func TestReapStage_UnrelatedBadRequestIsNotMisreadAsSkew(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedLocalRun(fb, runID)
+	seedStrandedStage(fb, runID, stageID.String(), "running")
+	fb.mu.Lock()
+	fb.reapFailureStatus = http.StatusBadRequest
+	fb.reapFailureErrBody = `{"error":{"code":"validation_failed","message":"reason is required"}}`
+	fb.mu.Unlock()
+	r, _ := reapResolver(t, srv, runnerDead)
+
+	_, _, err := r.reapStage(context.Background(), nil, ReapStageInput{
+		RunID: runID.String(), StageID: stageID.String(),
+	})
+	if err == nil {
+		t.Fatal("expected the backend 400 to surface")
+	}
+	if strings.Contains(err.Error(), "VERSION SKEW") {
+		t.Errorf("an unrelated 400 was misclassified as a version skew: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reason is required") {
+		t.Errorf("the backend's own 400 message must surface verbatim: %v", err)
+	}
+}
+
+// (F) TestReapStage_DescriptionStatesClosedRaceHonestly is the prose pin for the
+// tightened wording (step 8): the description must state that the reap is PINNED
+// and that the state-advance mechanism is CLOSED server-side, must still name the
+// residual (a spawned runner whose state advance has not committed), and must NOT
+// upgrade the claim to an absolute "never". Assertions are LOOSE — they pin the
+// CLAIM, not any whole sentence — so an accurate rewording does not redden them.
+func TestReapStage_DescriptionStatesClosedRaceHonestly(t *testing.T) {
+	d := reapStageDescription
+	for _, want := range []string{"expected_state", "compare-and-swap", "residual"} {
+		if !strings.Contains(d, want) {
+			t.Errorf("description must state the pinned-reap claim naming %q", want)
+		}
+	}
+	// The ABSENCE half: the superseded "only a server-side compare-and-set could
+	// close it" concession must not survive alongside the new claim, and the
+	// guarantee must not be upgraded to an absolute one.
+	for _, banned := range []string{"only a server-side compare-and-set could", "is refused, never"} {
+		if strings.Contains(d, banned) {
+			t.Errorf("description still carries the superseded phrasing %q", banned)
+		}
+	}
+}

@@ -2012,3 +2012,135 @@ func TestReconcileRunReviews_ErrorEnvelope(t *testing.T) {
 		t.Fatalf("error = %v, want a typed *apiError run_not_found/404", err)
 	}
 }
+
+// reapConditionalGoldenPath is the ONE shared cross-boundary artifact (the
+// operator's binding CONDITION 3 on E67.51 / #2699). Two duplicated literals,
+// one per package, could drift apart silently while LOOKING like a seam test, so
+// a SINGLE golden request body lives in the server package's testdata and BOTH
+// sides READ IT — reading across package directories by relative path is fine in
+// Go tests. The test below asserts these exact
+// bytes are what apiClient.ReportStageFailureFrom writes on the wire, and
+// server/reap_failure_test.go's TestReapStageFailure_GoldenConditionalBodyTakes-
+// ConditionalPath feeds the SAME bytes through the real handler. Neither side
+// inlines a copy, so editing the file reddens whichever side has drifted.
+//
+// ACCURACY NOTE: backend/internal/server does NOT import this package (the /mcp
+// route is an injected seam, mcproute.go, precisely so that edge does not exist
+// and cannot cycle in THIS package's test binary). The import that works is the
+// one this file already takes — mcpserver's tests importing server — so a full
+// in-process end-to-end test IS possible here (TestStageProgress_CrossBoundary-
+// EndToEnd above drives a real server.Handler over httptest). The golden body is
+// the artifact CONDITION 3 specified, not a substitute for an impossible test.
+const reapConditionalGoldenPath = "../server/testdata/reap_conditional_request.json"
+
+// readReapConditionalGolden reads the shared golden body, trimming only the
+// file's trailing newline.
+func readReapConditionalGolden(t *testing.T) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(reapConditionalGoldenPath)
+	if err != nil {
+		t.Fatalf("read golden body: %v", err)
+	}
+	return bytes.TrimSpace(raw)
+}
+
+// TestReportStageFailureFrom_WritesGoldenConditionalBody is the client half of
+// the cross-boundary seam: the bytes ReportStageFailureFrom puts on the wire for
+// a conditional reap must equal the shared golden body EXACTLY. A JSON-tag
+// rename, a field reorder, or a dropped expected_state on this side reddens it;
+// the same file driven through the real handler on the server side reddens there.
+func TestReportStageFailureFrom_WritesGoldenConditionalBody(t *testing.T) {
+	var got []byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
+	})
+
+	if _, err := c.ReportStageFailureFrom(context.Background(), uuid.New(), uuid.New(),
+		"dispatched", "C", "operator_reap_stranded_stage", "runner exited 7 without settling", 7); err != nil {
+		t.Fatalf("ReportStageFailureFrom: %v", err)
+	}
+	want := readReapConditionalGolden(t)
+	if !bytes.Equal(got, want) {
+		t.Errorf("wire body mismatch\n got: %s\nwant: %s\n(the golden body is the SHARED artifact at %s — "+
+			"do not inline a copy to make this pass)", got, want, reapConditionalGoldenPath)
+	}
+}
+
+// TestReportStageFailureFrom_OmitsExpectedStateWhenUnconditional pins the other
+// half of the presence contract at the CLIENT: an empty expectedState emits NO
+// expected_state key at all, so the detached reaper's and run_children's
+// spawn-error compensation's bodies are byte-identical to what they were before
+// #2699 — and the server's presence check (which 400s a present-but-empty value)
+// is never handed an empty string by this client.
+func TestReportStageFailureFrom_OmitsExpectedStateWhenUnconditional(t *testing.T) {
+	var got []byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
+	})
+
+	// The DELEGATION path — ReportStageFailure, the signature every unconditional
+	// caller still uses — so this is a regression control on those callers too.
+	if _, err := c.ReportStageFailure(context.Background(), uuid.New(), uuid.New(),
+		"C", "runner_failed", "exit 2", 2); err != nil {
+		t.Fatalf("ReportStageFailure: %v", err)
+	}
+	if bytes.Contains(got, []byte("expected_state")) {
+		t.Errorf("unconditional body carries an expected_state key: %s", got)
+	}
+	// A decode into map[string]any is the unambiguous absence check: a present
+	// key with an empty value would fail here even if the substring check above
+	// were loosened.
+	var decoded map[string]any
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if _, present := decoded["expected_state"]; present {
+		t.Errorf("expected_state present in an unconditional body: %s", got)
+	}
+}
+
+// TestReportStageFailureFrom_413RetryKeepsPrecondition is the counterfactual
+// vehicle for the pin surviving the AGGRESSIVE 413 retry. A first POST that 413s
+// re-marshals both text fields with the aggressive cap and re-POSTs once; that
+// retry body MUST still carry expected_state. Dropping it there would turn a
+// 413-retried conditional reap into an UNPINNED one — a silent downgrade at
+// exactly the moment (an oversized diagnostic from a stranded stage) the pin
+// matters most.
+func TestReportStageFailureFrom_413RetryKeepsPrecondition(t *testing.T) {
+	var bodies [][]byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "body_too_large"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
+	})
+
+	if _, err := c.ReportStageFailureFrom(context.Background(), uuid.New(), uuid.New(),
+		"running", "C", "short reason", strings.Repeat("d", 200*1024), 2); err != nil {
+		t.Fatalf("ReportStageFailureFrom: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want exactly 2 (413 then one aggressive retry)", len(bodies))
+	}
+	for i, raw := range bodies {
+		var decoded struct {
+			ExpectedState *string `json:"expected_state"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal body %d: %v", i, err)
+		}
+		if decoded.ExpectedState == nil || *decoded.ExpectedState != "running" {
+			t.Errorf("body %d expected_state = %v, want \"running\" (the 413 retry must NOT downgrade to an unpinned reap)",
+				i, decoded.ExpectedState)
+		}
+	}
+	if len(bodies[1]) >= len(bodies[0]) {
+		t.Errorf("aggressive body %d not smaller than first %d", len(bodies[1]), len(bodies[0]))
+	}
+}
