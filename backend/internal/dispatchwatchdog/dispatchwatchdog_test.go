@@ -274,6 +274,12 @@ func TestTick_WedgedAfterCheckinModeRecorded(t *testing.T) {
 	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, "last heartbeat") {
 		t.Errorf("FailureReason = %v, want it to name the last heartbeat (wedged_after_checkin)", got.FailureReason)
 	}
+	// Pin the reason<->mode coupling to the mode CONSTANT, not just the phrase:
+	// a wording edit that decoupled the reason from the classification would drop
+	// this token (#2744 fix-up).
+	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, string(modeWedgedAfterCheckin)) {
+		t.Errorf("FailureReason = %v, want it to carry the mode token %q", got.FailureReason, modeWedgedAfterCheckin)
+	}
 	if len(au.appended) != 1 {
 		t.Fatalf("audit appended %d, want 1", len(au.appended))
 	}
@@ -312,6 +318,11 @@ func TestTick_NeverCheckedInModeRecorded(t *testing.T) {
 	got := repo.transitionedTo[len(repo.transitionedTo)-1]
 	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, "no runner check-in") {
 		t.Errorf("FailureReason = %v, want it to name the missing check-in (never_checked_in)", got.FailureReason)
+	}
+	// Pin the reason<->mode coupling to the mode CONSTANT (see the
+	// wedged_after_checkin counterpart above).
+	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, string(modeNeverCheckedIn)) {
+		t.Errorf("FailureReason = %v, want it to carry the mode token %q", got.FailureReason, modeNeverCheckedIn)
 	}
 	if len(au.appended) != 1 {
 		t.Fatalf("audit appended %d, want 1", len(au.appended))

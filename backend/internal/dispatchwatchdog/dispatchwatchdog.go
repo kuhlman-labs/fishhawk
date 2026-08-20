@@ -241,13 +241,17 @@ func (t *Ticker) handleStage(ctx context.Context, logger *slog.Logger, now time.
 		lastHeartbeat = l.LastHeartbeatAt.UTC().Format(time.RFC3339Nano)
 	}
 
+	// The reason carries the mode token DERIVED from the mode constant (not a
+	// separately-worded phrase), so the recorded failure_reason and the audit
+	// payload's `mode` key cannot silently decouple: a wording-only edit that
+	// changed the classification would move this token too (#2744 fix-up).
 	var reason string
 	if mode == modeWedgedAfterCheckin {
-		reason = fmt.Sprintf("dispatch_watchdog: %s since dispatch (deadline %s; last heartbeat %s ago)",
-			elapsed.Round(time.Second), t.Timeout, now.Sub(*l.LastHeartbeatAt).Round(time.Second))
+		reason = fmt.Sprintf("dispatch_watchdog[mode=%s]: %s since dispatch (deadline %s; last heartbeat %s ago)",
+			mode, elapsed.Round(time.Second), t.Timeout, now.Sub(*l.LastHeartbeatAt).Round(time.Second))
 	} else {
-		reason = fmt.Sprintf("dispatch_watchdog: %s since dispatch (deadline %s; no runner check-in)",
-			elapsed.Round(time.Second), t.Timeout)
+		reason = fmt.Sprintf("dispatch_watchdog[mode=%s]: %s since dispatch (deadline %s; no runner check-in)",
+			mode, elapsed.Round(time.Second), t.Timeout)
 	}
 
 	if _, err := run.FailStage(ctx, t.Repo, l.StageID, run.FailureC, reason); err != nil {

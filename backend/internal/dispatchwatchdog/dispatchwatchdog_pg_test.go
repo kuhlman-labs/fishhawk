@@ -108,6 +108,10 @@ func TestDispatchWatchdog_FailsWedgedButHeartbeatingStage(t *testing.T) {
 	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, "last heartbeat") {
 		t.Errorf("FailureReason = %v, want the wedged_after_checkin shape", got.FailureReason)
 	}
+	// Pin the reason<->mode coupling to the mode CONSTANT end-to-end (#2744 fix-up).
+	if got.FailureReason == nil || !strings.Contains(*got.FailureReason, string(modeWedgedAfterCheckin)) {
+		t.Errorf("FailureReason = %v, want it to carry the mode token %q", got.FailureReason, modeWedgedAfterCheckin)
+	}
 
 	// The audit payload carries mode=wedged_after_checkin.
 	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, CategoryDispatchWatchdogElapsed)

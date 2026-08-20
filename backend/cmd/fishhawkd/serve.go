@@ -606,6 +606,36 @@ func runRepoCASWiringError(repo runpkg.Repository) error {
 		"degrade to run.FailStage, which can fail a live park. Wire a CAS-capable run repository", repo)
 }
 
+// dispatchWatchdogCapabilityError is the boot-time refusal for a run repository
+// that cannot supply the dispatch-liveness signal the watchdog measures its
+// deadline from (#2744). It is a STARTUP check, gated on
+// --enable-dispatch-watchdog, never per-request; runServe calls it exactly once,
+// after every decorator has been applied to cfg.RunRepo.
+//
+//   - A repo implementing runpkg.DispatchLivenessLister returns nil — the
+//     POSITIVE path (production postgresRepo always does, guaranteed by the
+//     compile-time assertion in run/dispatchliveness.go). A capability-carrying
+//     RunRepo boots even when wrapped, as long as the wrapper forwards the
+//     capability.
+//   - Any other repo — nil (a DB-less boot) or a non-Postgres one lacking the
+//     capability — returns an error naming the missing interface: the watchdog's
+//     only fallback would be the heartbeat-defeatable Stage.UpdatedAt signal
+//     #2744 removes, so this cell refuses to boot rather than run a defeatable or
+//     never-firing watchdog.
+//
+// The error is RETURNED (not logged here) so the runServe call site is the single
+// distinctive point that logs the refusal and returns exitFailure, mirroring the
+// #2107 / #2672 convention. Extracting the type-assertion out of the inline call
+// site makes the POSITIVE path unit-testable without a live database (a pool-free
+// runpkg.NewPostgresRepository(nil) carries the capability), which the runServe
+// negative-path test alone cannot cover.
+func dispatchWatchdogCapabilityError(repo runpkg.Repository) error {
+	if _, ok := repo.(runpkg.DispatchLivenessLister); ok {
+		return nil
+	}
+	return fmt.Errorf("--enable-dispatch-watchdog set but the configured RunRepo %T does not carry the dispatch-liveness capability (run.DispatchLivenessLister); refusing to start rather than run a heartbeat-defeatable or never-firing watchdog", repo)
+}
+
 // regionPinOptions carries the two env values that decide whether this cell
 // participates in regional handoffs (ADR-062, E44.7 / #1831).
 type regionPinOptions struct {
@@ -1768,8 +1798,8 @@ func runServe(args []string, logSink io.Writer) int {
 	// refuse to boot rather than run a silently-degraded or never-firing
 	// watchdog. This is the machine-enforced form of the #2744 sign-off.
 	if *enableDispatchWatchdog {
-		if _, ok := cfg.RunRepo.(runpkg.DispatchLivenessLister); !ok {
-			logger.Error("--enable-dispatch-watchdog set but the configured RunRepo does not carry the dispatch-liveness capability (run.DispatchLivenessLister); refusing to start rather than run a heartbeat-defeatable or never-firing watchdog")
+		if err := dispatchWatchdogCapabilityError(cfg.RunRepo); err != nil {
+			logger.Error("dispatch watchdog capability pre-check refused startup", slog.String("error", err.Error()))
 			return exitFailure
 		}
 	}
