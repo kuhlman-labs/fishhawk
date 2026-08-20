@@ -276,3 +276,30 @@ Caveat worth stating plainly: this half is a prompt INSTRUCTION to an LLM
 validator. The tests prove the instruction renders, not that a validator obeys
 it. The failure direction is safe — a non-compliant validator produces at worst
 today's spurious failure, never a silent pass.
+
+## Fix-up reporting obligations (#2737)
+
+`writeFixupReportObligations` renders the binding "### Reporting obligations
+routed with this fix-up" block on the slim fix-up path only, immediately before
+`writeFixupSelfReport`, and only when `Trigger.FixupReportObligations` is
+non-empty AND the run/stage ids are populated. It names each routed REPORTING
+obligation by its stable `ob-N` id, states plainly that this pass CANNOT write
+the pull-request description (the PR already exists — the same contract
+`writeFixupCommitMessage` states), and routes the record into the fix-up
+self-report sidecar, whose documented rules `writeFixupSelfReport` extends with
+the per-id `obligations` array (`met` requires a non-empty `record`, `declined`
+requires a non-empty `reason`, anything else is DROPPED).
+
+The reviewer-facing half is `GateEvidence.FixupReportingObligations`, rendered
+by `writeGateEvidence` as a DISTINCT high-priority block worded so it cannot be
+confused with a generic "unverifiable in a diff-only review" concern.
+`GateEvidence.FixupObligationReports` is a data CARRIER for the runner-validated
+reports and is never rendered — the backend joins against it and renders only
+the remainder, so a fully-met pass keeps the reviewer prompt byte-identical
+(prompt-hash replay stability).
+
+Both blocks are absent by default: an ordinary fix-up and an unaffected review
+render byte-identically to before the fields existed. Honesty framing is
+preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,
+never fails, re-opens, or re-budgets the pass. Long-form contract:
+`backend/internal/fixupobligation/README.md`.

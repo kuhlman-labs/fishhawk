@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -11541,6 +11542,166 @@ func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.
 	}
 }
 
+// makeFixupEntryWithReporting builds a stage_fixup_triggered entry carrying the
+// three operator-authored channels #2737's classifier reads: routed concern
+// notes, the free-text operator_concern, and the operator's reason.
+func makeFixupEntryWithReporting(runID, stageID uuid.UUID, concerns []planreview.Concern, operatorConcern, reason string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":         stageID.String(),
+		"selected_indices": []int{0},
+		"concerns":         concerns,
+		"operator_concern": operatorConcern,
+		"reason":           reason,
+		"pass_ordinal":     1,
+	})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+// TestResolveFixupReportObligations_Channels covers the #2737 audit-payload
+// reader directly across the three routed channels plus the dedupe and the
+// no-obligation default.
+func TestResolveFixupReportObligations_Channels(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("routine concerns declare nothing", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+				"", "route the correctness concern")}},
+		}})
+		if got := s.resolveFixupReportObligations(context.Background(), runID, stageID); got != nil {
+			t.Errorf("a routine fix-up must declare nothing, got %+v", got)
+		}
+	})
+
+	t.Run("concern note carrying a reporting obligation is declared as ob-1", func(t *testing.T) {
+		const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "process", Note: note}},
+				"", "route it")}},
+		}})
+		got := s.resolveFixupReportObligations(context.Background(), runID, stageID)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want one obligation", got)
+		}
+		if got[0].ID != "ob-1" || got[0].Source != fixupobligation.SourceConcern || got[0].Text != note {
+			t.Errorf("obligation = %+v, want ob-1/concern carrying the RAW note", got[0])
+		}
+	})
+
+	t.Run("operator_concern deduped against its minted concern note", func(t *testing.T) {
+		// Since #2623 the free-text operator_concern is ALSO minted as a durable
+		// concern, so it arrives on both channels; one instruction, one id.
+		const text = "Document each dropped branch in the pull request description."
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "operator", Note: text}},
+				text, "")}},
+		}})
+		got := s.resolveFixupReportObligations(context.Background(), runID, stageID)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want exactly one obligation (the duplicate must be deduped)", got)
+		}
+	})
+
+	t.Run("reason carrying a reporting obligation is declared", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+				"", "Record the observed RED output in the PR body's ## Notes.")}},
+		}})
+		got := s.resolveFixupReportObligations(context.Background(), runID, stageID)
+		if len(got) != 1 || got[0].Source != fixupobligation.SourceReason {
+			t.Fatalf("got %+v, want one reason-sourced obligation", got)
+		}
+	})
+}
+
+// servedFixupPromptWithConcernNote drives the REAL prompt endpoint for an
+// implement stage re-opened for a fix-up whose sole routed concern carries the
+// given note, and returns the served prompt text. It exercises the handler
+// wiring (resolver -> Trigger -> renderer), not the resolver in isolation.
+func servedFixupPromptWithConcernNote(t *testing.T, note string) string {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	planBytes, err := json.Marshal(&plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {
+		{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+		{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+	}}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "process", Note: note}}
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeFixupEntryWithReporting(runID, implStageID, concerns, "", "route it")},
+		}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Fixup {
+		t.Fatalf("fixup = false; the slim fork did not engage, so this asserts nothing")
+	}
+	return resp.Prompt
+}
+
+// TestGetStagePrompt_Implement_FixupReportObligations_ThreadedOntoTrigger is the
+// prompt-fetch seam pin (#2737): a served fix-up prompt for a stage whose
+// trigger entry carries a reporting obligation renders the binding block. This
+// exercises the REAL handler wiring, not the resolver in isolation.
+func TestGetStagePrompt_Implement_FixupReportObligations_ThreadedOntoTrigger(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	got := servedFixupPromptWithConcernNote(t, note)
+	for _, w := range []string{
+		"### Reporting obligations routed with this fix-up",
+		"`ob-1` (from the routed concern): " + note,
+		"This pass CANNOT write the pull-request description",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("served fix-up prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
 // BACKWARD COMPAT: resolveApprovalAddScopeFiles for a fan-out child with NO
 // recorded move returns the identical result as before #2596 — the move union is
 // inert.
@@ -11576,5 +11737,41 @@ func TestResolveApprovalAddScopeFiles_DestinationInheritsMovedPath(t *testing.T)
 	sSrc, srcChild := moveFoldServer(t, parentRunID, 0, map[string][]string{"1": {"pkg/a/foo.go"}})
 	if gotSrc := sSrc.resolveApprovalAddScopeFiles(context.Background(), srcChild); containsString(gotSrc, "pkg/a/foo.go") {
 		t.Errorf("source child resolveApprovalAddScopeFiles gained the moved-away path pkg/a/foo.go: %v", gotSrc)
+	}
+}
+
+// TestGetStagePrompt_Implement_FixupReportObligations_AbsentForRoutineConcern is
+// the served-prompt anti-noise pin: a routine routed concern renders no block.
+func TestGetStagePrompt_Implement_FixupReportObligations_AbsentForRoutineConcern(t *testing.T) {
+	got := servedFixupPromptWithConcernNote(t, "Guard the nil pool in the retry path.")
+	if strings.Contains(got, "### Reporting obligations routed with this fix-up") {
+		t.Errorf("a routine fix-up's served prompt must render no obligation block:\n%s", got)
+	}
+}
+
+// TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible pins the
+// plan's near-deterministic-apply assumption (#1165 × #2737): a reporting
+// obligation carries no suggested_patch, and the apply path is all-or-nothing,
+// so an obligation-bearing pass falls to the AGENT path — which is the path that
+// writes the self-report sidecar. Were it apply-eligible, no agent would run and
+// every declared obligation would be reported unreported.
+func TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool", SuggestedPatch: "--- a\n+++ b\n"},
+		{Severity: planreview.SeverityMedium, Category: "process",
+			Note: "Record the per-deletion counterfactual results in the PR body's ## Notes."},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+		byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID, concerns, "", "route both")}},
+	}})
+	if got := s.resolveFixupApplyPatches(context.Background(), runID, stageID); got != nil {
+		t.Errorf("a patch-less reporting obligation must make the pass apply-INELIGIBLE, got %+v", got)
+	}
+	// And the same entry does declare the obligation, so the agent pass is the
+	// one that will be asked to report it.
+	if got := s.resolveFixupReportObligations(context.Background(), runID, stageID); len(got) != 1 {
+		t.Errorf("resolveFixupReportObligations = %+v, want the one obligation", got)
 	}
 }

@@ -230,3 +230,18 @@ func TestKnownCategories_PlanCommentOnlyOverrideAcknowledged(t *testing.T) {
 		t.Fatal("plan_comment_only_override_acknowledged is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_FixupReportingObligationUndelivered pins the E67.66 /
+// #2737 category: the implement-review assembly path writes it when a fix-up
+// pass leaves a routed REPORTING obligation without a valid `met` self-report.
+// An unregistered category is un-awaitable (fishhawk_await_audit would reject a
+// wait armed on it) AND unfilterable via GET /v0/runs/{run_id}/audit?category=,
+// which would leave the "an operator sees the omission at the gate without
+// reading the PR" half of the acceptance criterion untrue — and
+// categories_completeness_test.go's AST sweep fails the build on a category
+// backend code emits but the registry omits.
+func TestKnownCategories_FixupReportingObligationUndelivered(t *testing.T) {
+	if !IsKnownCategory("fixup_reporting_obligation_undelivered") {
+		t.Fatal("fixup_reporting_obligation_undelivered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

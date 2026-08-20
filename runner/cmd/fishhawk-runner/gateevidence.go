@@ -75,6 +75,17 @@ type gateEvidencePayload struct {
 	// no claim, or claim and reality agreed. The json tag MUST stay identical to
 	// the backend's bundle.FixupSelfReportDivergenceEvidence mirror.
 	FixupSelfReportDivergence *fixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+	// FixupReportingObligations digests the agent's VALIDATED per-obligation
+	// self-reports for a fix-up pass (#2737): one entry per routed REPORTING
+	// obligation the agent answered, already fail-closed-validated by
+	// validateFixupObligationReports. Folded from the fixup_reporting_obligations
+	// event. Absent (the byte-identical default) when there was no fix-up pass,
+	// no obligation was routed, or no entry survived validation. The json tag
+	// MUST stay identical to the backend's
+	// bundle.FixupReportingObligationEvidence mirror — a one-sided edit silently
+	// DISABLES the backend's undelivered signal, which is why the pair is pinned
+	// from BOTH modules against one shared literal JSON fixture.
+	FixupReportingObligations []fixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
 	// DiffCoverage digests the workflow-v1.6 `diff_coverage` measurement
 	// (ADR-059 / #1888): what the customer coverage command was, how it
 	// exited, and how much of the stage's added-line set the resulting
@@ -118,6 +129,18 @@ type diffCoverageEvidence struct {
 type fixupSelfReportDivergenceEvidence struct {
 	ClaimedVerifyStatus string `json:"claimed_verify_status"`
 	ActualVerifyStatus  string `json:"actual_verify_status"`
+}
+
+// fixupReportingObligationEvidence is one validated per-obligation self-report
+// (#2737): the obligation id the agent answered, the status literal it claimed
+// (`met` | `declined`), and the bounded free text it supplied — the attestation
+// when met, the decline reason when declined. The json tags MUST stay identical
+// to the backend's bundle.FixupReportingObligationEvidence mirror — the same
+// lockstep runner↔backend wire contract as the parent payload.
+type fixupReportingObligationEvidence struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Record string `json:"record,omitempty"`
 }
 
 // scopeExemptionEvidence is one validated scope self-exemption (#1153): a
@@ -227,7 +250,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "diff_coverage":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "diff_coverage":
 			gateRan = true
 		}
 	}
@@ -337,6 +360,14 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				ClaimedVerifyStatus: w.ClaimedVerifyStatus,
 				ActualVerifyStatus:  w.ActualVerifyStatus,
 			}
+		case "fixup_reporting_obligations":
+			var w struct {
+				Obligations []fixupReportingObligationEvidence `json:"obligations"`
+			}
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			payload.FixupReportingObligations = append(payload.FixupReportingObligations, w.Obligations...)
 		case "diff_coverage":
 			var w diffCoverageEvidence
 			if json.Unmarshal(e.Payload, &w) != nil {

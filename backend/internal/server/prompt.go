@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -1166,6 +1167,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// #818 gate. No-op for a normal (non-fix-up) implement dispatch.
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
+			// Routed reporting obligations (#2737) ride the same trigger, derived
+			// from the SAME newest stage-bound trigger entry.
+			trigger.FixupReportObligations = fixupReportObligationsForPrompt(
+				s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID))
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
@@ -1710,6 +1715,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// for a normal (non-fix-up) implement dispatch.
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
+			// Routed reporting obligations (#2737) ride the same trigger, derived
+			// from the SAME newest stage-bound trigger entry.
+			trigger.FixupReportObligations = fixupReportObligationsForPrompt(
+				s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID))
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
@@ -2960,6 +2969,95 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered
 	}
 	return nil
+}
+
+// resolveFixupReportObligations returns the REPORTING obligations routed with
+// this stage's fix-up pass (#2737): the routed instructions that ask the agent
+// to RECORD something on a report surface rather than to change code.
+//
+// It reads the SAME stage_fixup_triggered audit entry resolveFixupConcerns
+// selects — newest-first, the first entry bound to this stage with a non-empty
+// concern set — and feeds that entry's `concerns` notes, `operator_concern`,
+// and `reason` to fixupobligation.Detect. That shared selection predicate is
+// load-bearing and is asserted directly (not argued from sequencing) by
+// TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest:
+// the fix-up prompt renderer and the implement-review re-derivation call THIS
+// function, so both derive their declared set — and therefore the same `ob-N`
+// ids — from one entry. If they diverged, the review could report ids the agent
+// never saw, which would discredit the signal.
+//
+// Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
+// trigger (the common, non-fix-up case), no routed instruction carries a
+// reporting obligation (the common fix-up case), or on any error — best-effort,
+// the same WARN-and-proceed posture as the other fix-up resolvers. A nil return
+// keeps the fix-up prompt byte-identical and emits no signal.
+func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stageID uuid.UUID) []fixupobligation.Obligation {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list stage_fixup_triggered audit for report obligations failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Concerns        []planreview.Concern `json:"concerns"`
+			Reason          string               `json:"reason"`
+			OperatorConcern string               `json:"operator_concern"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			// Same tolerance as resolveFixupConcerns: skip a malformed entry.
+			continue
+		}
+		if len(payload.Concerns) == 0 {
+			continue
+		}
+		sources := make([]fixupobligation.Source, 0, len(payload.Concerns)+2)
+		for _, c := range payload.Concerns {
+			// The RAW note, not the "[severity/category] note" render: the
+			// operator_concern dedupe compares against the minted concern's
+			// note text (#2623), so the two channels must be comparable.
+			sources = append(sources, fixupobligation.Source{Kind: fixupobligation.SourceConcern, Text: c.Note})
+		}
+		sources = append(sources,
+			fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: payload.OperatorConcern},
+			fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: payload.Reason},
+		)
+		obligations := fixupobligation.Detect(sources)
+		if len(obligations) == 0 {
+			return nil
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: detected routed reporting obligations on fix-up pass",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("obligation_count", len(obligations)),
+		)
+		return obligations
+	}
+	return nil
+}
+
+// fixupReportObligationsForPrompt maps the detected obligations into the prompt
+// package's mirror, keeping prompt free of a fixupobligation import.
+func fixupReportObligationsForPrompt(obligations []fixupobligation.Obligation) []prompt.FixupReportObligation {
+	if len(obligations) == 0 {
+		return nil
+	}
+	out := make([]prompt.FixupReportObligation, 0, len(obligations))
+	for _, ob := range obligations {
+		out = append(out, prompt.FixupReportObligation{ID: ob.ID, Source: string(ob.Source), Text: ob.Text})
+	}
+	return out
 }
 
 // resolveFixupApplyPatches returns the near-deterministic apply-list (#1165) for

@@ -8374,3 +8374,207 @@ func TestBuild_Acceptance_RestatedCriterion_RendersReplacementStatement(t *testi
 		t.Errorf("a restate rendered a retirement block\n---\n%s", got)
 	}
 }
+
+// TestBuild_ImplementFixup_ReportObligations_RendersBlockAndSidecarRule pins the
+// #2737 agent-facing half: the slim fix-up prompt names each detected reporting
+// obligation by id, states plainly that this pass CANNOT write the PR
+// description, routes the record into the self-report sidecar, and extends the
+// sidecar's documented rules with the per-id `obligations` array.
+func TestBuild_ImplementFixup_ReportObligations_RendersBlockAndSidecarRule(t *testing.T) {
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[medium] record the counterfactual table in the PR body"}},
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+		FixupReportObligations: []FixupReportObligation{
+			{ID: "ob-1", Source: "concern", Text: "Record the per-deletion counterfactual results in the PR body's ## Notes."},
+			{ID: "ob-2", Source: "reason", Text: "Report the observed RED output in the run log."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Reporting obligations routed with this fix-up",
+		"`ob-1` (from the routed concern): Record the per-deletion counterfactual results in the PR body's ## Notes.",
+		"`ob-2` (from the routed reason): Report the observed RED output in the run log.",
+		"This pass CANNOT write the pull-request description",
+		// The sidecar rule extension.
+		"`obligations` MUST carry ONE entry per reporting obligation id",
+		`"status":"met"`,
+		`"status":"declined"`,
+		"MUST carry a non-empty `record`",
+		"MUST carry a non-empty `reason`",
+		"is DROPPED",
+		"recorded as UNREPORTED",
+		// The honesty framing that keeps the agent off a fabricated met.
+		"never fails, re-opens, or re-budgets this pass",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up reporting-obligation prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// The obligation block must precede the sidecar block it routes into.
+	if strings.Index(got, "### Reporting obligations routed with this fix-up") >
+		strings.Index(got, "### Report your verify outcome") {
+		t.Error("the obligation block must render BEFORE the self-report block it routes the record into")
+	}
+}
+
+// TestBuild_ImplementFixup_ReportObligations_ByteIdenticalWhenNoneDetected is
+// the anti-noise pin for the agent-facing half: an ordinary fix-up (no
+// obligation detected) renders a prompt byte-identical to the pre-#2737 output.
+func TestBuild_ImplementFixup_ReportObligations_ByteIdenticalWhenNoneDetected(t *testing.T) {
+	base := Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[medium] guard the nil pool in the retry path"}},
+		ImplementRunID:   "11112222333344445555666677778888",
+		ImplementStageID: "99990000aaaabbbbccccddddeeeeffff",
+	}
+	withNil, err := Build("implement", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	withEmpty := base
+	withEmpty.FixupReportObligations = []FixupReportObligation{}
+	gotEmpty, err := Build("implement", withEmpty)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if withNil != gotEmpty {
+		t.Error("an empty obligation set must render byte-identically to a nil one")
+	}
+	for _, unwanted := range []string{
+		"### Reporting obligations routed with this fix-up",
+		"`obligations` MUST carry ONE entry",
+	} {
+		if strings.Contains(withNil, unwanted) {
+			t.Errorf("an ordinary fix-up must NOT render %q:\n%s", unwanted, withNil)
+		}
+	}
+}
+
+// TestBuild_ImplementFixup_ReportObligations_AbsentWhenIDsUnset: a trigger
+// missing the run/stage ids omits the block rather than naming an unkeyed
+// sidecar path the runner would never read.
+func TestBuild_ImplementFixup_ReportObligations_AbsentWhenIDsUnset(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:                   "o/r",
+		ApprovedPlan:           fixturePlan(),
+		FixupConcerns:          []FixupConcern{{Text: "[medium] record it in the PR body"}},
+		FixupReportObligations: []FixupReportObligation{{ID: "ob-1", Source: "concern", Text: "Record it in the PR body."}},
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Reporting obligations routed with this fix-up") {
+		t.Errorf("obligation block must be absent when run/stage ids are unset:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementFixup_RendersNoPRDescriptionPath is the #2737 premise pin:
+// the slim fix-up prompt offers NO PR-description transport, which is exactly
+// why a routed PR-body reporting obligation needs the sidecar. If this ever goes
+// RED the premise changed and the obligation block's framing must be revisited.
+func TestBuild_ImplementFixup_RendersNoPRDescriptionPath(t *testing.T) {
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[medium] record it in the PR body"}},
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+		FixupReportObligations: []FixupReportObligation{
+			{ID: "ob-1", Source: "concern", Text: "Record it in the PR body's ## Notes."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, PullRequestDescriptionPath(runID, stageID)) {
+		t.Errorf("the fix-up prompt must never name the PR-description sidecar path:\n%s", got)
+	}
+	if strings.Contains(got, "write a pull-request description") {
+		t.Errorf("the fix-up prompt must not instruct a PR-description write:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_RendersFixupReportingObligations pins
+// the #2737 reviewer-facing half: a DISTINCT high-priority block naming the
+// undelivered obligation as an operator instruction that was not carried out,
+// worded so it cannot be read as a diff-only-unverifiable finding.
+func TestBuild_ImplementReview_GateEvidence_RendersFixupReportingObligations(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+			FixupReportingObligations: []GateFixupReportingObligation{
+				{ID: "ob-1", Source: "concern", Status: "unreported",
+					Text: "Record the per-deletion counterfactual results in the PR body's ## Notes."},
+				{ID: "ob-2", Source: "reason", Status: "declined",
+					Text: "Report the observed RED output in the run log.", Record: "the deletion could not be performed"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Routed reporting obligation NOT carried out (operator instruction, high priority)",
+		"This is NOT a \"cannot be verified from the diff\" observation",
+		"`ob-1` (routed as concern) — unreported: Record the per-deletion counterfactual results",
+		"`ob-2` (routed as reason) — declined: Report the observed RED output in the run log.",
+		"agent's stated reason: the deletion could not be performed",
+		"ADVISORY — it did NOT fail, re-open, or re-budget the pass",
+		"rather than as a diff-only-unverifiable finding",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("reporting-obligation gate-evidence render missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_NoFixupReportingObligationsSection is
+// the reviewer-side byte-identity pin (prompt-hash replay stability): an
+// unaffected review renders exactly as before, and the CARRIER field
+// (FixupObligationReports) is never rendered at all.
+func TestBuild_ImplementReview_GateEvidence_NoFixupReportingObligationsSection(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{ScopeFacts: &GateScopeFacts{DeclaredFiles: 1}},
+	}
+	plain, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(plain, "### Routed reporting obligation NOT carried out") {
+		t.Errorf("the block must be absent when nothing is undelivered:\n%s", plain)
+	}
+
+	// A fully-MET pass carries reports on the carrier field but nothing
+	// undelivered — the prompt must stay byte-identical to the plain render.
+	withReports := base
+	withReports.GateEvidence = &GateEvidence{
+		ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+		FixupObligationReports: []GateFixupObligationReport{
+			{ID: "ob-1", Status: "met", Record: "recorded the table in Notes"},
+		},
+	}
+	gotReports, err := Build("implement_review", withReports)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if gotReports != plain {
+		t.Error("the carrier field must never affect the rendered prompt (byte-identity / prompt-hash replay stability)")
+	}
+}

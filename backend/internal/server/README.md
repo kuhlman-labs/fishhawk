@@ -745,6 +745,17 @@ The returned payload threads into the plan-review prompt's gate-evidence section
 
 MCP surface: `fishhawk_get_plan` adds `test_sweep` (`TestSweep{findings[], scanned_files, listed_dirs}`) decoded from the **newest** `plan_test_sweep` entry (`loadTestSweep` in `tools.go`).
 
+## Routed-reporting-obligation undelivered pre-review signal (#2737)
+
+`trace.go::runImplementReviews` — adjacent to the `#1407` block and using the same allocate-if-nil `gateEvidence` pattern. A fix-up pass can be routed an instruction that asks the agent to RECORD something on a report surface ("record the per-deletion counterfactual results in the PR body's `## Notes`"), and the slim fix-up prompt renders NO PR-description block, so before this the instruction could be declined with nothing marking the omission.
+
+- `prompt.go::resolveFixupReportObligations` classifies the routed instructions (`concerns` notes, `operator_concern`, `reason` — all already on the `stage_fixup_triggered` audit payload) via `backend/internal/fixupobligation`, assigning stable `ob-N` ids. The SAME resolver serves both the fix-up prompt render and this review-time re-derivation, and both select the entry `resolveFixupConcerns` selects (newest-first, first stage-bound entry with a non-empty concern set), so the ids the review reports are the ids the agent's prompt named. That identity is pinned by seeding TWO stage-bound trigger entries, not argued from sequencing.
+- The agent records each obligation in the existing `#1210` fix-up self-report sidecar's new `obligations` array; the runner validates each entry fail-closed and carries the survivors on `gate_evidence.fixup_reporting_obligations` → `bundle.FixupReportingObligations` → `prompt.GateEvidence.FixupObligationReports` (a CARRIER field, never rendered).
+- A non-empty remainder after subtracting the `met` reports renders a distinct high-priority block (`prompt.GateEvidence.FixupReportingObligations`), deliberately worded so it cannot be read as a diff-only-unverifiable finding, AND appends ONE advisory `fixup_reporting_obligation_undelivered` audit entry (payload `{declared_count, undelivered_count, obligations:[{id, source, status, text_excerpt}]}`, status `unreported` | `declined`) BEFORE any reviewer verdict.
+- EVIDENCE ONLY: it never fails, re-opens, or re-budgets the pass. Both directions are pinned — no signal when every obligation is met (the anti-noise control), and identical review result / stage status / fix-up budget when the signal DOES fire.
+- Best-effort: nil `AuditRepo`, a list error, or a malformed trigger payload contributes nothing; an append failure WARNs and the review proceeds.
+- Long-form contract (classifier grammar, id ordering, fail-closed drop table, the fabricated-`met` weakness): `backend/internal/fixupobligation/README.md`. Audit-kind note in `docs/issue-comment-surfaces.md`.
+
 ## Operator-scope-undelivered pre-review signal (#1407)
 
 `trace.go::runImplementReviews` — before building the implement-review prompt, unions the run's two operator-add provenance channels (the approval-time `add_scope_files` folds via `amendedScopeFilesForReview`, and approved mid-stage scope amendments via `approvedAmendmentScopePaths` → `ScopeAmendmentRepo.ListByRun`) and computes the subset UNTOUCHED by the committed diff (`operatorScopeUndelivered`, untouched-only: absent from `diff.ChangedFiles`; directory-prefix / non-repo-relative tokens skipped like `MissingScopeFiles`).

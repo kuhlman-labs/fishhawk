@@ -410,3 +410,34 @@ Two concurrent items that both add a database migration are planned against the 
 - **The PROCESS/STAGE context is cancelled while the long-poll is held.** The driver returns `(false, nil)` with `decision:"unavailable"` and `detail:"context canceled"` — the fail-open branch, not a decision — but that same cancelled context then flows into the whole `openPRAndShipArtifact` chain, which fails at its first git call. The terminal classification is therefore **category-C** (`rev-parse HEAD: context canceled`) with `runner_cancelled` and `exitCancelled`, i.e. the standard #435 cancellation contract. Category-C is the CORRECT class here and category-B would be wrong: the commit chain never ran, so no gate reached a verdict on this tree, and an interrupted stage is retryable infra rather than a park-for-re-scope. `TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged` pins it against a control that delivers the SAME cancellation at the post-park egress boundary with no park ever blocking: the two classifications match, so the park contributes no failure class of its own. Nothing reaches origin on either.
 
 **No HTTP-surface change.** The `?wait` query parameter already exists and is already documented; `upload.FetchScopeAmendmentsArgs.WaitSeconds` is additive and omits the parameter entirely when zero or negative, so the #961 pre-commit refresh and the #2601 undecided-detection requests stay byte-identical. No new endpoint, no new audit kind, no new Notifier method: the reused `scope_amendment_requested` / `scope_amendment_decided` rows and the existing `must_page_human` `scope_amendment` ping fire unchanged.
+
+## Fix-up reporting-obligation reports (#2737)
+
+On a fix-up pass the self-report sidecar (`#1210`) may carry an `obligations`
+array: one entry per routed REPORTING obligation the fix-up prompt named by id.
+`loadFixupSelfReport` now returns a validated `fixupSelfReportResult` (claimed
+verify status + surviving obligation reports) instead of a bare string.
+
+The whole-sidecar rules are unchanged and dominate: malformed JSON or a
+`run_id`/`stage_id` mismatch discards the ENTIRE sidecar including its
+obligation reports, so a foreign run's `met` can never satisfy this stage's
+obligations. An unrecognized `verify_status` is the one non-fatal case — it
+zeroes the claim exactly as before (`fixup_selfreport_status_ignored`) while the
+obligation reports are still parsed, because the two signals are independent.
+
+Within a valid sidecar, `validateFixupObligationReports` drops an entry — with a
+`fixup_obligation_report_dropped` log naming the id and the reason — when its id
+is empty (`empty_id`), its status is not exactly `met` or `declined`
+(`unknown_status`), it is `met` with an empty/whitespace `record`
+(`met_without_record`), or it is `declined` with an empty/whitespace `reason`
+(`declined_without_reason`). Dropping is the SAFE direction: a dropped `met`
+leaves the obligation undelivered and the backend's advisory signal fires.
+Retained text is capped at `maxFixupObligationTextBytes`.
+
+Survivors ride a `fixup_reporting_obligations` event that `composeGateEvidence`
+folds into `gate_evidence.fixup_reporting_obligations`. The json tags MUST stay
+identical to `backend/internal/bundle`'s `FixupReportingObligationEvidence` — a
+one-sided edit silently DISABLES the signal, so both sides are pinned against
+one shared literal JSON fixture. EVIDENCE ONLY: this block never touches
+`res.OK`, `res.FailureCategory`, or the budget. Long-form contract:
+`backend/internal/fixupobligation/README.md`.

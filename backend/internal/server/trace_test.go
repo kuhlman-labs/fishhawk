@@ -6946,3 +6946,439 @@ func TestBackstopFixupReReview_ParseRepoError_NoDispatch(t *testing.T) {
 		t.Errorf("reviewer invocations = %d, want 0 (parse-repo error must fail closed)", len(reviewer.calls))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2737: routed reporting obligation undelivered signal.
+// ---------------------------------------------------------------------------
+
+// obligationConcernNote is the routed concern note used across the #2737 tests.
+// It carries BOTH classifier halves (a recording verb and a report surface), so
+// fixupobligation.Detect classifies it as ob-1.
+const obligationConcernNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+
+// seedFixupTriggerWithConcern appends a stage_fixup_triggered audit entry bound
+// to the stage, carrying one routed concern with the given note plus the given
+// operator reason. This is the SAME entry shape server/fixup.go::writeFixupAudit
+// writes, and it is the sole input both the fix-up prompt renderer and the
+// review-time re-derivation read.
+func seedFixupTriggerWithConcern(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"stage_id": stageID.String(),
+		"concerns": []planreview.Concern{{Severity: "medium", Category: "process", Note: note}},
+		"reason":   reason,
+	})
+	if err != nil {
+		t.Fatalf("marshal fixup trigger payload: %v", err)
+	}
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &runID, StageID: &stageID,
+		Category: CategoryStageFixupTriggered, Payload: payload,
+	})
+}
+
+// fixupObligationUndeliveredPayloads returns the decoded payloads of every
+// fixup_reporting_obligation_undelivered entry appended for the run.
+func fixupObligationUndeliveredPayloads(t *testing.T, au *auditFake) []fixupReportingObligationUndeliveredPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []fixupReportingObligationUndeliveredPayload
+	for i := range au.appended {
+		if au.appended[i].Category != fixupReportingObligationUndeliveredCategory {
+			continue
+		}
+		var p fixupReportingObligationUndeliveredPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			t.Fatalf("unmarshal fixup_reporting_obligation_undelivered payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// metReportEvidence builds a gate_evidence carrier holding a valid `met` report
+// for the given obligation id — the runner-validated shape the bundle maps in.
+func metReportEvidence(id string) *prompt.GateEvidence {
+	return &prompt.GateEvidence{
+		FixupObligationReports: []prompt.GateFixupObligationReport{
+			{ID: id, Status: "met", Record: "recorded the deletion table in the PR body Notes"},
+		},
+	}
+}
+
+// TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAndRendersEvidence
+// is the DONE-MEANS behavioral test (#1169) for #2737. It drives the real
+// implement-review path end to end: seed a stage_fixup_triggered audit entry
+// whose routed concern note carries a PR-body reporting obligation, dispatch the
+// review with gate_evidence that carries NO obligation report, then read
+// COMMITTED STATE after the call returns — the audit entries — plus the rendered
+// reviewer prompt.
+func TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAndRendersEvidence(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	payloads := fixupObligationUndeliveredPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("fixup_reporting_obligation_undelivered entries = %d, want exactly 1", len(payloads))
+	}
+	p := payloads[0]
+	if p.DeclaredCount != 1 || p.UndeliveredCount != 1 {
+		t.Errorf("payload counts = declared %d / undelivered %d, want 1/1", p.DeclaredCount, p.UndeliveredCount)
+	}
+	if len(p.Obligations) != 1 {
+		t.Fatalf("payload obligations = %+v, want 1", p.Obligations)
+	}
+	want := fixupReportingObligationDetail{
+		ID: "ob-1", Source: "concern", Status: "unreported", TextExcerpt: obligationConcernNote,
+	}
+	if p.Obligations[0] != want {
+		t.Errorf("payload obligation = %+v, want %+v", p.Obligations[0], want)
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	for _, w := range []string{
+		"### Routed reporting obligation NOT carried out (operator instruction, high priority)",
+		"`ob-1` (routed as concern) — unreported: " + obligationConcernNote,
+	} {
+		if !strings.Contains(reviewer.calls[0], w) {
+			t.Errorf("reviewer prompt missing %q from the undelivered signal:\n%s", w, reviewer.calls[0])
+		}
+	}
+}
+
+// TestImplementReview_FixupReportingObligationMet_NoAuditEntry is acceptance
+// criterion 3's standing ANTI-NOISE control and the named counterfactual vehicle
+// for the met-report suppression in fixupobligation.Undelivered: a pass whose
+// declared obligation carries a valid `met` report emits NO audit entry and
+// renders NO block. Delete the status==met filter and this goes RED.
+func TestImplementReview_FixupReportingObligationMet_NoAuditEntry(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", metReportEvidence("ob-1")) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	if n := countAppendedByCategory(au, fixupReportingObligationUndeliveredCategory); n != 0 {
+		t.Errorf("entries = %d, want 0 when the obligation carries a valid met report", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+		t.Errorf("a satisfied pass must render NO undelivered block:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined: an
+// honest decline is still undelivered, but it is reported as `declined` with the
+// agent's reason so the operator can tell a refusal from a silence.
+func TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+
+	ev := &prompt.GateEvidence{FixupObligationReports: []prompt.GateFixupObligationReport{
+		{ID: "ob-1", Status: "declined", Record: "the sandbox refused the deletion"},
+	}}
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", ev) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	payloads := fixupObligationUndeliveredPayloads(t, au)
+	if len(payloads) != 1 || len(payloads[0].Obligations) != 1 {
+		t.Fatalf("payloads = %+v, want one entry naming one obligation", payloads)
+	}
+	if got := payloads[0].Obligations[0].Status; got != "declined" {
+		t.Errorf("status = %q, want declined", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if !strings.Contains(reviewer.calls[0], "agent's stated reason: the sandbox refused the deletion") {
+		t.Errorf("reviewer prompt lost the decline reason:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestImplementReview_NoReportingObligationRouted_NoSignal is the second
+// no-noise counterfactual: an ORDINARY fix-up — a routed concern that carries
+// neither classifier half — declares nothing, so no entry is appended and the
+// reviewer prompt is byte-identical to a non-fix-up review's.
+func TestImplementReview_NoReportingObligationRouted_NoSignal(t *testing.T) {
+	render := func(t *testing.T, seed bool) (string, int) {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-7",
+		}
+		s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		if seed {
+			seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID,
+				"Guard the nil pool in the retry path.", "route the correctness concern")
+		}
+		diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		}}
+		if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+			t.Fatal("gating approve must not gate")
+		}
+		n := countAppendedByCategory(au, fixupReportingObligationUndeliveredCategory)
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		return reviewer.calls[0], n
+	}
+
+	withRoutine, n := render(t, true)
+	if n != 0 {
+		t.Errorf("entries = %d, want 0 for a routine fix-up carrying no reporting obligation", n)
+	}
+	if strings.Contains(withRoutine, "### Routed reporting obligation NOT carried out") {
+		t.Errorf("a routine fix-up must render no undelivered block:\n%s", withRoutine)
+	}
+}
+
+// TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome is
+// APPROVAL CONDITION 1's pin: the load-bearing evidence-only invariant. When the
+// signal FIRES, the review dispatch result, the stage status, and the remaining
+// fix-up budget must be IDENTICAL to a run where it does not. Both arms are
+// driven with the same seed and diff; only the presence of a valid `met` report
+// differs, so the signal is the sole variable.
+//
+// Counterfactual: make the branch touch the gating verdict (e.g. `return true`
+// when it fires) or transition the stage, and this goes RED.
+func TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome(t *testing.T) {
+	type outcome struct {
+		gated       bool
+		stageState  run.StageState
+		fixupPasses int
+		signalFired int
+	}
+	arm := func(t *testing.T, evidence *prompt.GateEvidence) outcome {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-7",
+		}
+		s, _, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+
+		diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		}}
+		gated := s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", evidence)
+
+		// The remaining fix-up budget is a function of countFixupPasses — the
+		// stage_fixup_triggered count. Read it through the REAL accessor after
+		// the call returns, so an entry written under the wrong category (or a
+		// budget touched by the branch) shows up here.
+		passes, err := s.countFixupPasses(t.Context(), runRow.ID, implStage.ID)
+		if err != nil {
+			t.Fatalf("countFixupPasses: %v", err)
+		}
+		st, err := rr.GetStage(t.Context(), implStage.ID)
+		if err != nil {
+			t.Fatalf("GetStage: %v", err)
+		}
+		return outcome{
+			gated:       gated,
+			stageState:  st.State,
+			fixupPasses: passes,
+			signalFired: countAppendedByCategory(au, fixupReportingObligationUndeliveredCategory),
+		}
+	}
+
+	fired := arm(t, nil)                          // no report → signal fires
+	baseline := arm(t, metReportEvidence("ob-1")) // valid met report → no signal
+
+	// Discrimination: the two arms must genuinely differ in whether the signal
+	// fired, or the equality assertions below would be vacuous.
+	if fired.signalFired != 1 {
+		t.Fatalf("the firing arm emitted %d entries, want 1 — the test is not discriminating", fired.signalFired)
+	}
+	if baseline.signalFired != 0 {
+		t.Fatalf("the baseline arm emitted %d entries, want 0 — the test is not discriminating", baseline.signalFired)
+	}
+
+	if fired.gated != baseline.gated {
+		t.Errorf("review dispatch result changed when the signal fired: %v vs baseline %v", fired.gated, baseline.gated)
+	}
+	if fired.stageState != baseline.stageState {
+		t.Errorf("stage status changed when the signal fired: %q vs baseline %q", fired.stageState, baseline.stageState)
+	}
+	if fired.fixupPasses != baseline.fixupPasses {
+		t.Errorf("fix-up budget input changed when the signal fired: %d passes vs baseline %d",
+			fired.fixupPasses, baseline.fixupPasses)
+	}
+}
+
+// TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest is
+// APPROVAL CONDITION 2's pin. The "byte-identical at both sites by construction"
+// claim holds only if the prompt-render site and the review-time re-derivation
+// resolve the SAME stage_fixup_triggered entry. Rather than argue that the
+// sequencing precludes interleaving, this seeds TWO stage-bound trigger entries
+// and asserts which one BOTH sites resolve — so the determinism rests on a
+// pinned identity, not on shared code that could later be forked.
+func TestResolveFixupReportObligations_TwoTriggerEntries_BothSitesResolveNewest(t *testing.T) {
+	const olderNote = "Record the FIRST round's counterfactual table in the PR body's ## Notes."
+	const newerNote = "Record the SECOND round's counterfactual table in the PR body's ## Notes."
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	// ListForRunByCategory returns entries ASC by ts, and both resolvers scan
+	// newest-FIRST, so the second seeded entry is the newer round.
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, olderNote, "first round")
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, newerNote, "second round")
+
+	// SITE 1 — the prompt-render resolver (what the agent's fix-up prompt names).
+	declared := s.resolveFixupReportObligations(t.Context(), runRow.ID, implStage.ID)
+	if len(declared) != 1 {
+		t.Fatalf("prompt-site resolver returned %+v, want exactly one obligation", declared)
+	}
+	if declared[0].ID != "ob-1" || declared[0].Text != newerNote {
+		t.Errorf("prompt site resolved %+v, want ob-1 bound to the NEWEST entry (%q)", declared[0], newerNote)
+	}
+
+	// SITE 2 — the review-time re-derivation, driven through the real dispatch.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	payloads := fixupObligationUndeliveredPayloads(t, au)
+	if len(payloads) != 1 || len(payloads[0].Obligations) != 1 {
+		t.Fatalf("payloads = %+v, want one entry naming one obligation", payloads)
+	}
+	got := payloads[0].Obligations[0]
+	if got.ID != declared[0].ID || got.TextExcerpt != declared[0].Text {
+		t.Errorf("the two sites resolved DIFFERENT entries: prompt %+v vs review %+v — the ids the "+
+			"review reports would not be the ids the agent's prompt named", declared[0], got)
+	}
+	if got.TextExcerpt != newerNote {
+		t.Errorf("review site resolved %q, want the NEWEST entry (%q)", got.TextExcerpt, newerNote)
+	}
+}
+
+// TestResolveFixupReportObligations_NilAuditRepo: no repo → nil, no panic.
+func TestResolveFixupReportObligations_NilAuditRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	if got := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New()); got != nil {
+		t.Errorf("nil AuditRepo must yield nil, got %+v", got)
+	}
+}
+
+// TestResolveFixupReportObligations_ListError: a list failure is best-effort —
+// WARN and return nil so the prompt renders exactly as today.
+func TestResolveFixupReportObligations_ListError(t *testing.T) {
+	au := newAuditFake()
+	au.listByCategoryErr = errors.New("boom")
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	if got := s.resolveFixupReportObligations(t.Context(), uuid.New(), uuid.New()); got != nil {
+		t.Errorf("a list error must yield nil, got %+v", got)
+	}
+}
+
+// TestResolveFixupReportObligations_MalformedPayloadSkipped: a malformed
+// stage_fixup_triggered payload is skipped, exactly like resolveFixupConcerns.
+func TestResolveFixupReportObligations_MalformedPayloadSkipped(t *testing.T) {
+	au := newAuditFake()
+	runID, stageID := uuid.New(), uuid.New()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &runID, StageID: &stageID,
+		Category: CategoryStageFixupTriggered, Payload: []byte(`{not json`),
+	})
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	if got := s.resolveFixupReportObligations(t.Context(), runID, stageID); got != nil {
+		t.Errorf("a malformed payload must yield nil, got %+v", got)
+	}
+}
+
+// TestImplementReview_FixupReportingObligation_AuditAppendFailureWarnsAndProceeds:
+// the append is best-effort — a failing AppendChained for this category must not
+// break the review, and the reviewer still sees the block.
+func TestImplementReview_FixupReportingObligation_AuditAppendFailureWarnsAndProceeds(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedFixupTriggerWithConcern(t, au, runRow.ID, implStage.ID, obligationConcernNote, "route the reporting concern")
+	au.appendErrCategory = fixupReportingObligationUndeliveredCategory
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("an audit-append failure must not gate the review")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1 — the review must proceed", len(reviewer.calls))
+	}
+	if !strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+		t.Errorf("the prompt signal must survive an audit-append failure:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestGateEvidenceForReview_DecodesFixupReportingObligations is the backend half
+// of the #2737 runner↔backend lockstep pair at the mapping seam: the SHARED
+// literal JSON (byte-identical to the fixture the runner composer is asserted to
+// emit) decodes through bundle.GateEvidence into the prompt carrier field.
+func TestGateEvidenceForReview_DecodesFixupReportingObligations(t *testing.T) {
+	const wireFixture = `{"fixup_reporting_obligations":[` +
+		`{"id":"ob-1","status":"met","record":"recorded the deletion table in the PR body Notes"},` +
+		`{"id":"ob-2","status":"declined","record":"the sandbox refused the deletion"}]}`
+	var ev bundle.GateEvidence
+	if err := json.Unmarshal([]byte(wireFixture), &ev); err != nil {
+		t.Fatalf("decode shared wire fixture: %v", err)
+	}
+	got := gateEvidenceForReview(ev, nil)
+	want := []prompt.GateFixupObligationReport{
+		{ID: "ob-1", Status: "met", Record: "recorded the deletion table in the PR body Notes"},
+		{ID: "ob-2", Status: "declined", Record: "the sandbox refused the deletion"},
+	}
+	if len(got.FixupObligationReports) != len(want) {
+		t.Fatalf("FixupObligationReports = %+v, want %+v", got.FixupObligationReports, want)
+	}
+	for i := range want {
+		if got.FixupObligationReports[i] != want[i] {
+			t.Errorf("FixupObligationReports[%d] = %+v, want %+v — the runner↔backend json tags diverged",
+				i, got.FixupObligationReports[i], want[i])
+		}
+	}
+	// A payload without the key maps to nil, keeping the prompt byte-identical.
+	if plain := gateEvidenceForReview(bundle.GateEvidence{}, nil); plain.FixupObligationReports != nil {
+		t.Errorf("FixupObligationReports = %+v, want nil for a payload without the key", plain.FixupObligationReports)
+	}
+}

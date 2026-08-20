@@ -24,6 +24,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
@@ -16696,8 +16697,8 @@ func TestLoadFixupSelfReport_AbsentSidecar(t *testing.T) {
 	t.Cleanup(func() { fixupSelfReportDir = orig })
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
-		t.Errorf("absent sidecar must yield \"\", got %q", got)
+	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("absent sidecar must yield the zero result, got %+v", got)
 	}
 	if logSink.Len() != 0 {
 		t.Errorf("absent sidecar must not log, got %q", logSink.String())
@@ -16711,8 +16712,8 @@ func TestLoadFixupSelfReport_MalformedJSON(t *testing.T) {
 	path := writeFixupReportSidecar(t, cfg, "{not json")
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
-		t.Errorf("malformed sidecar must FAIL CLOSED (\"\"), got %q", got)
+	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("malformed sidecar must FAIL CLOSED, got %+v", got)
 	}
 	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_invalid"`) {
 		t.Errorf("expected fixup_selfreport_invalid, got %q", logSink.String())
@@ -16730,8 +16731,8 @@ func TestLoadFixupSelfReport_StaleID(t *testing.T) {
 		`{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed"}`)
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got != "" {
-		t.Errorf("stale-id sidecar must FAIL CLOSED (\"\"), got %q", got)
+	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("stale-id sidecar must FAIL CLOSED, got %+v", got)
 	}
 	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_stale"`) {
 		t.Errorf("expected fixup_selfreport_stale, got %q", logSink.String())
@@ -16751,8 +16752,8 @@ func TestLoadFixupSelfReport_StatusIgnored(t *testing.T) {
 	} {
 		path := writeFixupReportSidecar(t, cfg, raw)
 		var logSink strings.Builder
-		if got := loadFixupSelfReport(cfg, &logSink); got != "" {
-			t.Errorf("unrecognized status must FAIL CLOSED (\"\"), got %q for %s", got, raw)
+		if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" {
+			t.Errorf("unrecognized status must FAIL CLOSED, got %+v for %s", got, raw)
 		}
 		if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_status_ignored"`) {
 			t.Errorf("expected fixup_selfreport_status_ignored for %s, got %q", raw, logSink.String())
@@ -16771,12 +16772,213 @@ func TestLoadFixupSelfReport_Valid(t *testing.T) {
 		path := writeFixupReportSidecar(t, cfg,
 			fmt.Sprintf(`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":%q}`, status))
 		var logSink strings.Builder
-		if got := loadFixupSelfReport(cfg, &logSink); got != status {
-			t.Fatalf("valid sidecar must yield %q, got %q", status, got)
+		if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != status {
+			t.Fatalf("valid sidecar must yield %q, got %+v", status, got)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("consumed sidecar must be removed, stat err = %v", err)
 		}
+	}
+}
+
+// obligationsSidecar renders a self-report sidecar for fixupReportCfg carrying
+// a passing verify status plus the given raw `obligations` array text. The
+// array text is written LITERALLY rather than produced by the validator under
+// test, so a fail-closed assertion lands on the behavioral check and never on
+// fixture setup.
+func obligationsSidecar(obligations string) string {
+	return `{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed","obligations":` + obligations + `}`
+}
+
+// TestLoadFixupSelfReport_ObligationsHappyPath: a well-formed met + declined
+// pair survives validation with its text carried on the right field, and the
+// verify status is unaffected (#2737).
+func TestLoadFixupSelfReport_ObligationsHappyPath(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg, obligationsSidecar(
+		`[{"id":"ob-1","status":"met","record":"table in Notes"},`+
+			`{"id":"ob-2","status":"declined","reason":"sandbox refused the deletion"}]`))
+
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if got.verifyStatus != "passed" {
+		t.Errorf("verifyStatus = %q, want passed (obligations must not disturb the claim)", got.verifyStatus)
+	}
+	if len(got.obligations) != 2 {
+		t.Fatalf("obligations = %+v, want 2 surviving entries", got.obligations)
+	}
+	if got.obligations[0] != (fixupObligationReport{ID: "ob-1", Status: "met", Record: "table in Notes"}) {
+		t.Errorf("met entry = %+v", got.obligations[0])
+	}
+	if got.obligations[1] != (fixupObligationReport{ID: "ob-2", Status: "declined", Reason: "sandbox refused the deletion"}) {
+		t.Errorf("declined entry = %+v", got.obligations[1])
+	}
+	if strings.Contains(logSink.String(), "fixup_obligation_report_dropped") {
+		t.Errorf("valid entries must not log a drop: %q", logSink.String())
+	}
+}
+
+// TestLoadFixupSelfReport_MetWithEmptyRecordDropped is the named counterfactual
+// vehicle for the met-requires-record rule: an empty (or whitespace-only)
+// record would otherwise FALSELY SATISFY the obligation and silence the very
+// signal the change exists to raise. Asserts the returned struct's committed
+// values, not an error identity.
+func TestLoadFixupSelfReport_MetWithEmptyRecordDropped(t *testing.T) {
+	cfg := fixupReportCfg()
+	for _, record := range []string{`""`, `"   \t "`} {
+		writeFixupReportSidecar(t, cfg, obligationsSidecar(
+			`[{"id":"ob-1","status":"met","record":`+record+`}]`))
+		var logSink strings.Builder
+		got := loadFixupSelfReport(cfg, &logSink)
+		if len(got.obligations) != 0 {
+			t.Errorf("met with record %s survived validation: %+v", record, got.obligations)
+		}
+		if !strings.Contains(logSink.String(), `"reason":"met_without_record"`) {
+			t.Errorf("expected met_without_record drop log for record %s, got %q", record, logSink.String())
+		}
+	}
+}
+
+// TestLoadFixupSelfReport_DeclinedWithEmptyReasonDropped is the named
+// counterfactual vehicle for the declined-requires-reason rule.
+func TestLoadFixupSelfReport_DeclinedWithEmptyReasonDropped(t *testing.T) {
+	cfg := fixupReportCfg()
+	for _, reason := range []string{`""`, `"  "`} {
+		writeFixupReportSidecar(t, cfg, obligationsSidecar(
+			`[{"id":"ob-1","status":"declined","reason":`+reason+`}]`))
+		var logSink strings.Builder
+		got := loadFixupSelfReport(cfg, &logSink)
+		if len(got.obligations) != 0 {
+			t.Errorf("declined with reason %s survived validation: %+v", reason, got.obligations)
+		}
+		if !strings.Contains(logSink.String(), `"reason":"declined_without_reason"`) {
+			t.Errorf("expected declined_without_reason drop log for %s, got %q", reason, logSink.String())
+		}
+	}
+}
+
+// TestLoadFixupSelfReport_UnknownObligationStatusDropped is the named
+// counterfactual vehicle for the status allow-list: anything outside
+// {met, declined} — including an absent status — is dropped.
+func TestLoadFixupSelfReport_UnknownObligationStatusDropped(t *testing.T) {
+	cfg := fixupReportCfg()
+	for _, entry := range []string{
+		`{"id":"ob-1","status":"partially_met","record":"some of it"}`,
+		`{"id":"ob-1","status":"MET","record":"wrong case"}`,
+		`{"id":"ob-1","record":"no status at all"}`,
+	} {
+		writeFixupReportSidecar(t, cfg, obligationsSidecar(`[`+entry+`]`))
+		var logSink strings.Builder
+		got := loadFixupSelfReport(cfg, &logSink)
+		if len(got.obligations) != 0 {
+			t.Errorf("entry %s survived validation: %+v", entry, got.obligations)
+		}
+		if !strings.Contains(logSink.String(), `"reason":"unknown_status"`) {
+			t.Errorf("expected unknown_status drop log for %s, got %q", entry, logSink.String())
+		}
+	}
+}
+
+// TestLoadFixupSelfReport_EmptyObligationIDDropped: an entry with no id can
+// never join to a declared obligation, so it is dropped rather than retained.
+func TestLoadFixupSelfReport_EmptyObligationIDDropped(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg, obligationsSidecar(
+		`[{"id":"","status":"met","record":"orphan"},{"id":"  ","status":"met","record":"orphan"}]`))
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if len(got.obligations) != 0 {
+		t.Errorf("id-less entries survived validation: %+v", got.obligations)
+	}
+	if !strings.Contains(logSink.String(), `"reason":"empty_id"`) {
+		t.Errorf("expected empty_id drop log, got %q", logSink.String())
+	}
+}
+
+// TestLoadFixupSelfReport_StaleIdsDropObligations re-pins the existing
+// whole-sidecar freshness control now that the return is a struct: a leftover
+// sidecar from ANOTHER run/stage must not have its obligation reports survive,
+// or a foreign run's `met` could satisfy this stage's obligations.
+func TestLoadFixupSelfReport_StaleIdsDropObligations(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg,
+		`{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"a foreign run said so"}]}`)
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if len(got.obligations) != 0 {
+		t.Errorf("a stale sidecar's obligation reports survived: %+v", got.obligations)
+	}
+	if got.verifyStatus != "" {
+		t.Errorf("verifyStatus = %q, want \"\" on a stale sidecar", got.verifyStatus)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_stale"`) {
+		t.Errorf("expected fixup_selfreport_stale, got %q", logSink.String())
+	}
+}
+
+// TestLoadFixupSelfReport_MalformedJSONDropsObligations: the whole-sidecar
+// malformed-JSON rule dominates — nothing is salvaged from an unparseable file.
+func TestLoadFixupSelfReport_MalformedJSONDropsObligations(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","obligations":[{"id":"ob-1","status":"met","record":"x"}] not json`)
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if len(got.obligations) != 0 || got.verifyStatus != "" {
+		t.Errorf("malformed sidecar yielded %+v, want the zero result", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_invalid"`) {
+		t.Errorf("expected fixup_selfreport_invalid, got %q", logSink.String())
+	}
+}
+
+// TestLoadFixupSelfReport_UnknownVerifyStatusStillParsesObligations: the two
+// signals are independent — a bad verify claim zeroes the claim (today's exact
+// behavior and log) but must not erase an honest obligation record.
+func TestLoadFixupSelfReport_UnknownVerifyStatusStillParsesObligations(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"skipped",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"table in Notes"}]}`)
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if got.verifyStatus != "" {
+		t.Errorf("verifyStatus = %q, want \"\" for an unrecognized literal", got.verifyStatus)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_status_ignored"`) {
+		t.Errorf("expected fixup_selfreport_status_ignored, got %q", logSink.String())
+	}
+	if len(got.obligations) != 1 {
+		t.Fatalf("obligations = %+v, want the valid entry to survive", got.obligations)
+	}
+}
+
+// TestLoadFixupSelfReport_AbsentObligationsArray: a sidecar with no
+// `obligations` key is the byte-identical pre-#2737 shape and yields no reports.
+func TestLoadFixupSelfReport_AbsentObligationsArray(t *testing.T) {
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg, `{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"failed"}`)
+	var logSink strings.Builder
+	got := loadFixupSelfReport(cfg, &logSink)
+	if got.verifyStatus != "failed" || len(got.obligations) != 0 {
+		t.Errorf("got %+v, want the claim alone", got)
+	}
+}
+
+// TestBoundFixupObligationText: agent-authored text reaching the reviewer
+// prompt and the audit entry is capped, on a rune boundary.
+func TestBoundFixupObligationText(t *testing.T) {
+	if got := boundFixupObligationText("short"); got != "short" {
+		t.Errorf("Bound(short) = %q, want unchanged", got)
+	}
+	long := strings.Repeat("é", maxFixupObligationTextBytes)
+	got := boundFixupObligationText(long)
+	if !strings.HasSuffix(got, "… (truncated)") {
+		t.Errorf("long text was not marked truncated: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("bounding produced invalid UTF-8: %q", got)
 	}
 }
 
@@ -17350,8 +17552,8 @@ func TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome(t *testing.T) 
 		cfg := fixupReportCfg()
 		writeFixupReportSidecar(t, cfg,
 			fmt.Sprintf(`{"run_id":%q,"stage_id":%q,"verify_status":%q}`, cfg.runID, cfg.stageID, lit))
-		if got := loadFixupSelfReport(cfg, io.Discard); got != lit {
-			t.Fatalf("loadFixupSelfReport rejected production verify literal %q (got %q)", lit, got)
+		if got := loadFixupSelfReport(cfg, io.Discard); got.verifyStatus != lit {
+			t.Fatalf("loadFixupSelfReport rejected production verify literal %q (got %+v)", lit, got)
 		}
 	}
 }

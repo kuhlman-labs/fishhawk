@@ -630,3 +630,75 @@ func TestComposeGateEvidence_NoDiffCoverageField(t *testing.T) {
 		t.Errorf("payload %s carries a diff_coverage member, want it omitted", ev.Payload)
 	}
 }
+
+// fixupReportingObligationsWireFixture is the SHARED literal JSON both modules
+// pin the runner↔backend gate-evidence wire contract against (#2737). The
+// runner asserts composeGateEvidence emits exactly this for a validated report
+// set; the backend asserts bundle.GateEvidence → gateEvidenceForReview decodes
+// exactly this (backend/internal/server/trace_test.go's
+// TestGateEvidenceForReview_DecodesFixupReportingObligations). No import can
+// cross the module seam, so a one-sided json-tag edit fails on the other side —
+// the same lockstep defense this file already applies to
+// fixup_selfreport_divergence.
+const fixupReportingObligationsWireFixture = `"fixup_reporting_obligations":[` +
+	`{"id":"ob-1","status":"met","record":"recorded the deletion table in the PR body Notes"},` +
+	`{"id":"ob-2","status":"declined","record":"the sandbox refused the deletion"}]`
+
+// TestComposeGateEvidence_FixupReportingObligationsWireShape is the runner half
+// of the lockstep pair: the composer emits the shared literal byte-for-byte.
+func TestComposeGateEvidence_FixupReportingObligationsWireShape(t *testing.T) {
+	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
+	events := []agent.Event{
+		fixupReportingObligationsEvent(cfg, []fixupObligationReport{
+			{ID: "ob-1", Status: "met", Record: "recorded the deletion table in the PR body Notes"},
+			{ID: "ob-2", Status: "declined", Reason: "the sandbox refused the deletion"},
+		}),
+	}
+	ev := composeGateEvidence(events, 0)
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil; a fixup_reporting_obligations event must count as a gate")
+	}
+	raw := string(ev.Payload)
+	if !strings.Contains(raw, fixupReportingObligationsWireFixture) {
+		t.Errorf("gate_evidence payload does not carry the shared wire fixture.\ngot:  %s\nwant substring: %s",
+			raw, fixupReportingObligationsWireFixture)
+	}
+	p := decodeEvidence(t, ev)
+	if len(p.FixupReportingObligations) != 2 {
+		t.Fatalf("FixupReportingObligations = %+v, want 2 entries", p.FixupReportingObligations)
+	}
+	if p.FixupReportingObligations[1].Record != "the sandbox refused the deletion" {
+		t.Errorf("a declined entry must carry its REASON in the single record field, got %+v",
+			p.FixupReportingObligations[1])
+	}
+}
+
+// TestComposeGateEvidence_NoFixupReportingObligationsField: without the event
+// the field is absent, so an ordinary stage's gate_evidence stays byte-identical.
+func TestComposeGateEvidence_NoFixupReportingObligationsField(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+	}
+	ev := composeGateEvidence(events, 0)
+	p := decodeEvidence(t, ev)
+	if p.FixupReportingObligations != nil {
+		t.Errorf("FixupReportingObligations = %+v, want nil when no event", p.FixupReportingObligations)
+	}
+	if strings.Contains(string(ev.Payload), "fixup_reporting_obligations") {
+		t.Errorf("omitempty must keep the key off the wire:\n%s", ev.Payload)
+	}
+}
+
+// TestComposeGateEvidence_FixupReportingObligationsMalformedPayloadSkipped: an
+// undecodable event payload is skipped, exactly like every sibling fold.
+func TestComposeGateEvidence_FixupReportingObligationsMalformedPayloadSkipped(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+		{Kind: "fixup_reporting_obligations", Payload: json.RawMessage(`{"obligations":"not-an-array"}`)},
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.FixupReportingObligations != nil {
+		t.Errorf("a malformed fixup_reporting_obligations payload must contribute nothing, got %+v",
+			p.FixupReportingObligations)
+	}
+}

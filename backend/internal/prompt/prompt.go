@@ -313,6 +313,22 @@ type FixupConcern struct {
 	AcceptanceDerived bool
 }
 
+// FixupReportObligation is one operator-routed REPORTING obligation detected on
+// a fix-up pass (#2737): a routed instruction that asks the agent to RECORD
+// something on a report surface (the PR body's `## Notes`, a run log) rather
+// than to change code. ID is the stable `ob-N` join key
+// (backend/internal/fixupobligation), Source names the routed channel the
+// instruction arrived on (`concern` | `operator_concern` | `reason`), and Text
+// is the bounded excerpt. writeFixupReportObligations names each one to the
+// agent and requires a matching entry in the fix-up self-report sidecar —
+// necessary because the slim fix-up prompt renders NO PR-description block, so
+// the PR body is not a writable transport on this pass.
+type FixupReportObligation struct {
+	ID     string
+	Source string
+	Text   string
+}
+
 // ScopeRestoration is the plan gate's refusal notice for a revision that
 // UNDECLAREDLY narrowed the revision base's scope (#2516). UndeclaredRemovals
 // is the set of base-scoped paths the refused revision dropped without a
@@ -529,6 +545,14 @@ type Trigger struct {
 	// acceptance verdict. Empty/nil for a normal (non-fix-up) implement
 	// dispatch, in which case the section is omitted.
 	FixupConcerns []FixupConcern
+	// FixupReportObligations carries the REPORTING obligations detected among
+	// this fix-up's routed instructions (#2737). When non-empty (and the
+	// run/stage ids are populated), buildImplementFixup renders a binding
+	// "### Reporting obligations routed with this fix-up" block naming each one
+	// and requiring a per-id entry in the self-report sidecar. Empty/nil — the
+	// common case, including every non-fix-up dispatch — omits the block and
+	// keeps the fix-up prompt byte-identical to before this field existed.
+	FixupReportObligations []FixupReportObligation
 	// FixupPriorDiff is the prior implement commit's full unified-diff hunk
 	// text for the slim fix-up prompt (#1163) — the change the fresh fix-up
 	// agent is amending. Populated by the server fix-up prompt handler from the
@@ -757,6 +781,26 @@ type GateEvidence struct {
 	// arbitrate. Nil (no fix-up pass, no claim, or claim and reality agreed)
 	// omits the section. Advisory only — it never failed or re-opened the pass.
 	FixupSelfReportDivergence *GateFixupSelfReportDivergence
+	// FixupObligationReports carries the agent's VALIDATED per-obligation
+	// self-reports for a fix-up pass (#2737), mapped from the runner's
+	// gate_evidence `fixup_reporting_obligations`. It is a DATA CARRIER, not a
+	// rendered section: writeGateEvidence never prints it. It exists because
+	// *GateEvidence is the only channel into runImplementReviews, and the
+	// review-time join needs the runner-validated reports to subtract from the
+	// re-derived declared set. The RESULT of that join rides
+	// FixupReportingObligations below, which is what gets rendered.
+	FixupObligationReports []GateFixupObligationReport
+	// FixupReportingObligations carries the routed REPORTING obligations a
+	// fix-up pass did NOT deliver (#2737) — declared from the stage's
+	// stage_fixup_triggered audit payload and left without a valid `met`
+	// self-report. Like OperatorScopeUndelivered it is backend-derived at
+	// implement-review dispatch time rather than bundle-carried, so a nil/empty
+	// slice keeps the reviewer prompt byte-identical (prompt-hash replay
+	// stability). writeGateEvidence renders it as a distinct high-priority
+	// block, deliberately worded so it cannot be confused with a generic
+	// "unverifiable in a diff-only review" concern. ADVISORY only: it never
+	// failed, re-opened, or re-budgeted the pass.
+	FixupReportingObligations []GateFixupReportingObligation
 	// OperatorScopeUndelivered carries the operator-deliberately-added scope
 	// paths (an add_scope_files path folded at plan approval, or an approved
 	// mid-stage scope amendment) that the implement commit left UNTOUCHED
@@ -877,6 +921,29 @@ type GateScopeFold struct {
 type GateFixupSelfReportDivergence struct {
 	ClaimedVerifyStatus string
 	ActualVerifyStatus  string
+}
+
+// GateFixupObligationReport is one runner-validated per-obligation self-report
+// (#2737): the obligation id the agent answered, the status literal it claimed
+// (`met` | `declined`), and the bounded free text it supplied (the attestation
+// when met, the decline reason when declined). Mirrors
+// bundle.FixupReportingObligationEvidence. Carrier only — never rendered.
+type GateFixupObligationReport struct {
+	ID     string
+	Status string
+	Record string
+}
+
+// GateFixupReportingObligation is one UNDELIVERED routed reporting obligation
+// (#2737): the stable id, the routed channel it came from, whether the agent
+// left it `unreported` or honestly `declined`, the bounded excerpt of the
+// operator's instruction, and — for a decline — the agent's reason.
+type GateFixupReportingObligation struct {
+	ID     string
+	Source string
+	Status string
+	Text   string
+	Record string
 }
 
 // GateScopeExemption is one validated scope self-exemption (#1153): a declared
@@ -1977,7 +2044,52 @@ func writeFixupSelfReport(b *strings.Builder, t Trigger) {
 	b.WriteString("Rules:\n\n")
 	b.WriteString("- `run_id` and `stage_id` MUST be exactly the values shown above. A mismatch is ignored.\n")
 	b.WriteString("- `verify_status` MUST be one of exactly `passed` (the verify gate passed on your change) or " +
-		"`failed` (it did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n\n")
+		"`failed` (it did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n")
+	if len(t.FixupReportObligations) > 0 {
+		b.WriteString("- `obligations` MUST carry ONE entry per reporting obligation id listed in the section " +
+			"above — this same sidecar is the sanctioned record for them. Each entry is " +
+			"`{\"id\":\"ob-N\",\"status\":\"met\",\"record\":\"<the text you recorded>\"}` or " +
+			"`{\"id\":\"ob-N\",\"status\":\"declined\",\"reason\":\"<why you did not>\"}`. `status` MUST be " +
+			"exactly `met` or `declined`; a `met` entry MUST carry a non-empty `record` holding the ACTUAL text " +
+			"you are attesting, and a `declined` entry MUST carry a non-empty `reason`. An entry that breaks any " +
+			"of these rules is DROPPED, which leaves its obligation recorded as unreported.\n")
+	}
+	b.WriteString("\n")
+}
+
+// writeFixupReportObligations renders the binding "### Reporting obligations
+// routed with this fix-up" block (#2737). It exists because a fix-up pass has no
+// sanctioned transport for a routed PR-BODY reporting instruction: the slim
+// fix-up prompt deliberately renders no PR-description block (the pull request
+// already exists and this pass must never clobber its title/body — see
+// writeFixupCommitMessage), so an instruction like "record the per-deletion
+// counterfactual results in the PR body's ## Notes" could previously only be
+// declined silently. The block names each obligation by its stable id and
+// routes the record into the fix-up self-report sidecar, whose entries are
+// surfaced to the implement reviewer and to the operator at the gate.
+//
+// Like the self-report block it extends, this is EVIDENCE ONLY: reporting
+// truthfully — INCLUDING an honest `declined` — never fails, re-opens, or
+// re-budgets the pass. That is stated plainly so the agent is not nudged to
+// fabricate a `met`. Fix-up-only, and rendered only when obligations were
+// detected, so an ordinary fix-up prompt is byte-identical to today.
+func writeFixupReportObligations(b *strings.Builder, t Trigger) {
+	b.WriteString("### Reporting obligations routed with this fix-up\n\n")
+	b.WriteString("The instructions routed with this pass include the following REPORTING obligations — asks to " +
+		"RECORD something rather than to change code. They are binding.\n\n")
+	for _, ob := range t.FixupReportObligations {
+		fmt.Fprintf(b, "- `%s` (from the routed %s): %s\n", ob.ID, ob.Source, ob.Text)
+	}
+	b.WriteString("\n")
+	b.WriteString("This pass CANNOT write the pull-request description: the pull request already exists and a " +
+		"fix-up must never clobber its title or body, which is why no PR-description file is offered above. The " +
+		"sanctioned record for these obligations is therefore the self-report sidecar described in the next " +
+		"section: add one `obligations` entry per id above, either `met` with the ACTUAL text you are recording, " +
+		"or `declined` with the reason. Those entries are surfaced to the implement reviewer and to the operator " +
+		"at the gate.\n\n")
+	b.WriteString("Report honestly. An obligation you genuinely could not carry out should be `declined` with the " +
+		"reason — that never fails, re-opens, or re-budgets this pass. An obligation you simply say nothing about " +
+		"is recorded as UNREPORTED and surfaced as such.\n\n")
 }
 
 // writeFixupCommitMessage renders the "### Write this pass's commit message"
@@ -2161,6 +2273,16 @@ func buildImplementFixup(t Trigger) string {
 	// block and before the git-ops prohibition. Guarded on the populated run/
 	// stage ids so a trigger missing them omits the section rather than rendering
 	// a malformed (run/stage-unkeyed) sidecar path the runner would never read.
+	// Routed reporting obligations (#2737): rendered immediately BEFORE the
+	// self-report block, because it routes their record into that same sidecar.
+	// Guarded on a non-empty detected set AND the populated run/stage ids, so a
+	// trigger missing them omits the block rather than naming an unkeyed
+	// sidecar path — and an ordinary fix-up (no obligation detected) renders a
+	// byte-identical prompt.
+	if len(t.FixupReportObligations) > 0 && t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeFixupReportObligations(&b, t)
+	}
+
 	if t.ImplementRunID != "" && t.ImplementStageID != "" {
 		writeFixupSelfReport(&b, t)
 	}
@@ -4209,6 +4331,27 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			"committed-tree verify outcome above is authoritative, so weigh whether the agent's change actually " +
 			"does what its PR body claims, and name a concern if the divergence indicates an unsound or " +
 			"misrepresented change.\n\n")
+	}
+
+	if len(ev.FixupReportingObligations) > 0 {
+		b.WriteString("### Routed reporting obligation NOT carried out (operator instruction, high priority)\n\n")
+		b.WriteString("This is NOT a \"cannot be verified from the diff\" observation — it is a deterministic " +
+			"backend fact. The operator routed the reporting obligation(s) below with this fix-up pass, the " +
+			"fix-up prompt named each one to the agent by id, and the agent's structured self-report came back " +
+			"WITHOUT a valid `met` record for each of them. A routed instruction was not carried out.\n\n")
+		for _, ob := range ev.FixupReportingObligations {
+			fmt.Fprintf(b, "- `%s` (routed as %s) — %s: %s\n", ob.ID, ob.Source, ob.Status, ob.Text)
+			if ob.Record != "" {
+				fmt.Fprintf(b, "  agent's stated reason: %s\n", ob.Record)
+			}
+		}
+		b.WriteString("\n")
+		b.WriteString("`unreported` means the agent said nothing about the obligation (or its report failed " +
+			"validation and was dropped); `declined` means it answered and declined, with the reason above. " +
+			"This signal is ADVISORY — it did NOT fail, re-open, or re-budget the pass. Judge whether the " +
+			"omission matters: an obligation whose evidence the operator explicitly asked for, silently absent, " +
+			"is a concern worth naming, and name it as an uncarried-out operator instruction rather than as a " +
+			"diff-only-unverifiable finding.\n\n")
 	}
 
 	if len(ev.PolicyViolations) > 0 {
