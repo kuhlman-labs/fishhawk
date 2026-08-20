@@ -10,6 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22966,4 +22970,86 @@ func TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged
 	if !strings.Contains(parkedLog, `"event":"runner_cancelled"`) {
 		t.Errorf("missing the standard runner_cancelled record:\n%s", parkedLog)
 	}
+}
+
+// TestFixupObligationsBranch_NeverTouchesStageOutcome is APPROVAL CONDITION 1's
+// counterfactual vehicle on the RUNNER side, added after physically running the
+// prescribed deletion: mutating the obligation branch to set `res.OK = false`
+// left the entire runner package GREEN, because no test drives that branch
+// through run() with a self-report sidecar present. The evidence-only claim was
+// therefore asserted in prose and unpinned exactly where the plan said it must
+// be pinned. (The BACKEND half of the same invariant IS behaviorally pinned, by
+// TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome.)
+//
+// run() is a several-thousand-line function with no seam for driving just this
+// branch, so the control that actually defends the property here is structural:
+// parse main.go and assert the branch's BODY contains no assignment to
+// res.OK / res.FailureCategory. That is what makes the invariant hold — an
+// evidence-only branch that never writes the outcome fields cannot change the
+// stage result or the fix-up budget derived from it.
+//
+// Counterfactual (run, observed RED): add `res.OK = false` to the branch body.
+func TestFixupObligationsBranch_NeverTouchesStageOutcome(t *testing.T) {
+	// TestMain chdirs into a throwaway git repo, so resolve main.go from this
+	// test file's own compile-time path rather than from the CWD.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: could not resolve this test file's path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	// The branch is `if len(selfReport.obligations) > 0 { ... }` inside run().
+	const cond = "len(selfReport.obligations) > 0"
+	var body *ast.BlockStmt
+	ast.Inspect(file, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		var buf strings.Builder
+		if err := printNode(&buf, fset, ifStmt.Cond); err != nil {
+			return true
+		}
+		if strings.Join(strings.Fields(buf.String()), " ") == cond {
+			body = ifStmt.Body
+			return false
+		}
+		return true
+	})
+	if body == nil {
+		t.Fatalf("could not locate the `if %s` branch in main.go — if it was renamed or "+
+			"restructured, re-point this pin rather than deleting it", cond)
+	}
+
+	// Any write to a stage-outcome field inside the branch turns this RED.
+	forbidden := map[string]bool{"OK": true, "FailureCategory": true}
+	ast.Inspect(body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, lhs := range assign.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok || ident.Name != "res" || !forbidden[sel.Sel.Name] {
+				continue
+			}
+			t.Errorf("the routed-reporting-obligation branch assigns res.%s at %s — the signal is "+
+				"EVIDENCE ONLY and must never fail, re-open, or re-budget the pass",
+				sel.Sel.Name, fset.Position(assign.Pos()))
+		}
+		return true
+	})
+}
+
+// printNode renders an AST node back to source for the comparison above.
+func printNode(w io.Writer, fset *token.FileSet, node ast.Node) error {
+	return format.Node(w, fset, node)
 }

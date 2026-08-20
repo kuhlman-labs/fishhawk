@@ -298,8 +298,26 @@ reports and is never rendered — the backend joins against it and renders only
 the remainder, so a fully-met pass keeps the reviewer prompt byte-identical
 (prompt-hash replay stability).
 
-That block's fields are **split by trust**. `ID`/`Source`/`Status`/`Text` are
-backend- or operator-authored and render inline. `Record` — the agent's stated
+That block's fields are **split by trust**. `ID`/`Source`/`Status` are
+backend-authored and always render inline. `Text` — the routed instruction
+excerpt — is trusted only when `Untrusted` is false: an obligation detected
+inside an ACCEPTANCE-derived concern note carries attacker-influenceable
+validator free-text (ADR-050 / #1613), which `writeFixupConcerns` already
+quarantines, so its obligation MIRROR must not become a second inline path for
+the same bytes. Both render sites — `writeFixupReportObligations` (agent) and
+`writeGateEvidence`'s undelivered block (reviewer) — therefore partition on the
+flag: the id/source line still names the obligation, while the excerpt goes
+through the shared `writeUntrustedObligationExcerpts` helper
+(`sanitizeUntrustedComment` per line inside a `<<<BEGIN/END UNTRUSTED OBLIGATION
+TEXT>>>` envelope, the caller's binding instruction kept OUTSIDE it, capped at
+`maxFixupObligationTextBytes`). An operator-authored obligation renders inline
+byte-identically to before. Pinned adversarially by
+`TestBuild_ImplementFixup_ReportObligations_UntrustedTextQuarantined`,
+`TestBuild_ImplementReview_GateEvidence_UntrustedObligationTextQuarantined`,
+their `_TrustedTextStillInline` counterparts, and end to end by
+`TestImplementReview_AcceptanceDerivedObligation_TextQuarantined`.
+
+`Record` — the agent's stated
 decline reason — is **agent-authored and untrusted**: a fix-up agent running
 arbitrary repository commands controls every byte, and the text reaches the
 reviewer without ever appearing in the committed diff. So it renders ONLY

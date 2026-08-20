@@ -11621,6 +11621,68 @@ func TestResolveFixupReportObligations_Channels(t *testing.T) {
 	})
 }
 
+// TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted pins the
+// #2737 security fix-up at the resolver: the obligation mirror must carry the
+// SAME trust provenance resolveFixupConcerns puts on
+// prompt.FixupConcern.AcceptanceDerived. An acceptance-synthesized concern's
+// note is attacker-influenceable validator free-text (ADR-050 / E31.8 / #1613);
+// dropping the marker here would hand both render sites an obligation they
+// cannot tell from operator instruction, and the quarantine writeFixupConcerns
+// applies to that very note would be bypassed by its own mirror.
+//
+// The two arms are SELF-PAIRED — byte-identical note text, differing ONLY in
+// planreview.Concern.Provenance — so the assertion isolates provenance rather
+// than passing on a text comparison.
+//
+// Counterfactual: drop the Untrusted field from the Source built in
+// resolveFixupReportObligations and the acceptance arm goes RED.
+func TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	resolve := func(t *testing.T, provenance string) fixupobligation.Obligation {
+		t.Helper()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{
+					Severity: planreview.SeverityMedium, Category: "process",
+					Note: note, Provenance: provenance,
+				}}, "", "route it")}},
+		}})
+		got := s.resolveFixupReportObligations(context.Background(), runID, stageID)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want exactly one obligation", got)
+		}
+		return got[0]
+	}
+
+	acceptance := resolve(t, planreview.ConcernProvenanceAcceptance)
+	if !acceptance.Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted true for an acceptance-derived concern note", acceptance)
+	}
+	operator := resolve(t, "")
+	if operator.Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted false for an operator/reviewer-authored concern note", operator)
+	}
+	// Discrimination: only the flag differs between the two arms.
+	if acceptance.ID != operator.ID || acceptance.Text != operator.Text {
+		t.Fatalf("the arms differ in more than the provenance flag (%+v vs %+v)", acceptance, operator)
+	}
+
+	// The operator's own channels are trusted by construction: the fix-up
+	// trigger records exactly what the operator typed.
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+		byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+			[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "correctness", Note: "guard the nil pool"}},
+			"", "Record the observed RED output in the PR body's ## Notes.")}},
+	}})
+	got := s.resolveFixupReportObligations(context.Background(), runID, stageID)
+	if len(got) != 1 || got[0].Source != fixupobligation.SourceReason || got[0].Untrusted {
+		t.Errorf("got %+v, want one trusted reason-sourced obligation", got)
+	}
+}
+
 // servedFixupPromptWithConcernNote drives the REAL prompt endpoint for an
 // implement stage re-opened for a fix-up whose sole routed concern carries the
 // given note, and returns the served prompt text. It exercises the handler

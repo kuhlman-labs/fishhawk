@@ -3026,8 +3026,23 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 			// The RAW note, not the "[severity/category] note" render: the
 			// operator_concern dedupe compares against the minted concern's
 			// note text (#2623), so the two channels must be comparable.
-			sources = append(sources, fixupobligation.Source{Kind: fixupobligation.SourceConcern, Text: c.Note})
+			//
+			// Carry the concern's TRUST provenance through on the SAME
+			// predicate resolveFixupConcerns uses for
+			// prompt.FixupConcern.AcceptanceDerived. An acceptance-synthesized
+			// concern's note is attacker-influenceable free text (ADR-050 /
+			// E31.8 / #1613); an obligation detected inside one must stay
+			// quarantined at every render site rather than being laundered into
+			// trusted prompt content by this mirror.
+			sources = append(sources, fixupobligation.Source{
+				Kind:      fixupobligation.SourceConcern,
+				Text:      c.Note,
+				Untrusted: c.Provenance == planreview.ConcernProvenanceAcceptance,
+			})
 		}
+		// operator_concern and reason are operator-authored by construction —
+		// the fix-up trigger records exactly what the operator typed — so they
+		// carry no untrusted marking.
 		sources = append(sources,
 			fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: payload.OperatorConcern},
 			fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: payload.Reason},
@@ -3055,7 +3070,12 @@ func fixupReportObligationsForPrompt(obligations []fixupobligation.Obligation) [
 	}
 	out := make([]prompt.FixupReportObligation, 0, len(obligations))
 	for _, ob := range obligations {
-		out = append(out, prompt.FixupReportObligation{ID: ob.ID, Source: string(ob.Source), Text: ob.Text})
+		out = append(out, prompt.FixupReportObligation{
+			ID:        ob.ID,
+			Source:    string(ob.Source),
+			Text:      ob.Text,
+			Untrusted: ob.Untrusted,
+		})
 	}
 	return out
 }

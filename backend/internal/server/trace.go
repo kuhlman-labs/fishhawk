@@ -2844,6 +2844,12 @@ type fixupReportingObligationDetail struct {
 	Source      string `json:"source"`
 	Status      string `json:"status"`
 	TextExcerpt string `json:"text_excerpt"`
+	// Untrusted marks an excerpt that came from an acceptance-derived concern
+	// note rather than from operator-authored text, so an operator reading the
+	// audit row knows the excerpt is quoted validator output and not their own
+	// instruction. omitempty keeps the operator-authored (common) payload
+	// byte-identical to before the field existed.
+	Untrusted bool `json:"untrusted,omitempty"`
 }
 
 // concernRelitigationSuppressedCategory is the audit-log category for the
@@ -3610,13 +3616,18 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 						Source: string(f.Source),
 						Status: f.Status,
 						Text:   f.Text,
-						Record: f.Detail,
+						// Trust provenance rides through from the resolver so
+						// an acceptance-derived excerpt reaches the reviewer
+						// prompt quarantined rather than inline (#2737 fix-up).
+						Untrusted: f.Untrusted,
+						Record:    f.Detail,
 					})
 				details = append(details, fixupReportingObligationDetail{
 					ID:          f.ID,
 					Source:      string(f.Source),
 					Status:      f.Status,
 					TextExcerpt: f.Text,
+					Untrusted:   f.Untrusted,
 				})
 			}
 			// Best-effort advisory append with a WARN on failure; a nil

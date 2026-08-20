@@ -74,11 +74,18 @@ const MaxExcerptBytes = 400
 // text was cut rather than authored short.
 const truncationMarker = "… (truncated)"
 
-// Source is one operator-authored routed instruction, tagged with the channel
-// it arrived on.
+// Source is one routed instruction, tagged with the channel it arrived on and
+// with its TRUST provenance.
 type Source struct {
 	Kind SourceKind
 	Text string
+	// Untrusted marks text that is NOT operator-authored: today, a routed
+	// concern synthesized from the acceptance agent's attacker-influenceable
+	// free-text verdict (ADR-050 / E31.8 / #1613). Detect carries the flag onto
+	// the Obligation so both render sites can quarantine the excerpt instead of
+	// rendering it inline as trusted operator instruction. The flag is the
+	// caller's to set: this package classifies text, it cannot know provenance.
+	Untrusted bool
 }
 
 // Obligation is one DECLARED reporting obligation: a stable id, the channel it
@@ -91,6 +98,14 @@ type Obligation struct {
 	Source SourceKind
 	// Text is the bounded excerpt of the instruction.
 	Text string
+	// Untrusted mirrors the originating Source's trust provenance. An
+	// obligation detected in an acceptance-derived concern note carries text
+	// that an attacker-influenceable validator authored, so it must reach the
+	// fix-up agent and the reviewer only inside a quarantine envelope — the
+	// same trust boundary the concern itself is rendered on. Losing this flag
+	// would launder untrusted text into trusted prompt content, which is the
+	// bypass this field exists to close.
+	Untrusted bool
 }
 
 // Report is one agent self-report entry for a declared obligation, as
@@ -177,7 +192,12 @@ func containsAny(folded string, needles []string) bool {
 // A SourceOperatorConcern whose trimmed text already appeared as a
 // SourceConcern is SKIPPED: since #2623 the free-text operator_concern is also
 // minted as a durable concern, so it otherwise arrives twice and would draw two
-// ids for one instruction.
+// ids for one instruction. The surviving SourceConcern keeps ITS OWN Untrusted
+// flag, so the dedupe can only ever retain the more-quarantined of the two.
+//
+// Each Obligation carries its Source's Untrusted flag through unchanged, so a
+// reporting obligation detected inside an acceptance-derived (untrusted)
+// concern note stays marked as untrusted at every downstream render site.
 //
 // Returns nil when nothing is classified — the common case, and the one that
 // keeps the fix-up prompt byte-identical to today.
@@ -208,9 +228,10 @@ func Detect(sources []Source) []Obligation {
 				continue
 			}
 			out = append(out, Obligation{
-				ID:     nextID(len(out)),
-				Source: kind,
-				Text:   Bound(trimmed),
+				ID:        nextID(len(out)),
+				Source:    kind,
+				Text:      Bound(trimmed),
+				Untrusted: s.Untrusted,
 			})
 		}
 	}

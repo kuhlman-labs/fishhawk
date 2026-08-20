@@ -109,10 +109,41 @@ Dropping is the **safe direction**: a dropped `met` leaves the obligation
 undelivered and the signal fires. Admitting a malformed `met` would falsely
 satisfy the obligation and silence the very signal this exists to raise.
 
+## Trust boundary on the routed instruction excerpt
+
+An obligation's `Text` is trusted **only when it is operator-authored**. One of
+the three routed channels — the concern note — can carry an *acceptance-derived*
+concern: free text an automated acceptance validator wrote while driving the
+change against a running instance, i.e. attacker-influenceable content (ADR-050 /
+E31.8 / #1613). The classifier will happily detect a "reporting obligation"
+inside such a note, and the excerpt is a **mirror** of the very bytes
+`writeFixupConcerns` already quarantines — so rendering the mirror inline under
+the binding fix-up framing would be a second, unquarantined path for the same
+text, at both the agent prompt and the reviewer prompt.
+
+`Source.Untrusted` / `Obligation.Untrusted` therefore carries the concern's trust
+provenance end to end. `resolveFixupReportObligations` sets it on the SAME
+predicate `resolveFixupConcerns` uses for `prompt.FixupConcern.AcceptanceDerived`
+(`Concern.Provenance == acceptance`); `Detect` carries it onto the obligation
+(the `operator_concern` dedupe retains the surviving concern's flag, so the
+dedupe can only ever keep the more-quarantined of the two); the trace handler
+copies it onto `prompt.GateFixupReportingObligation` and onto the audit detail's
+`untrusted` field. `operator_concern` and `reason` are operator-authored by
+construction and are never marked.
+
+| Layer | Control | Pinned by |
+|---|---|---|
+| Provenance carry-through | `Source.Untrusted` → `Obligation.Untrusted` → prompt/gate mirrors + audit `untrusted` | `TestDetect_CarriesUntrustedProvenance`, `TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted` |
+| Fix-up agent render | `writeUntrustedObligationExcerpts` — the id/source line stays trusted, the excerpt goes through `sanitizeUntrustedComment` inside a `<<<BEGIN/END UNTRUSTED OBLIGATION TEXT>>>` envelope, capped at `maxFixupObligationTextBytes` | `TestBuild_ImplementFixup_ReportObligations_UntrustedTextQuarantined` (+ `_TrustedTextStillInline`) |
+| Reviewer render | the same helper, called from `writeGateEvidence`'s undelivered block | `TestBuild_ImplementReview_GateEvidence_UntrustedObligationTextQuarantined` (+ `_TrustedTextStillInline`), `TestImplementReview_AcceptanceDerivedObligation_TextQuarantined` (end to end) |
+
+An operator-authored obligation renders **byte-identically to before** at both
+sites: the partition is on the flag alone.
+
 ## Trust boundary on the agent's free text
 
-An obligation's operator-authored excerpt (`Text`) and the backend-minted `ob-N`
-id are trusted. The agent's `record`/`reason` is **not**. The fix-up agent
+The backend-minted `ob-N` id is trusted. The agent's `record`/`reason` is
+**not**. The fix-up agent
 executes arbitrary repository commands, so it controls every byte it writes
 there, and that text leaves the repository over the trace bundle and lands in
 the implement reviewer's prompt *without ever appearing in the committed diff* —
@@ -130,7 +161,8 @@ reviewer still sees what it claimed, but they can no longer impersonate a prompt
 section, open a fenced block, or carry a multi-line document. The audit payload
 does not carry the agent's text at all — only `{id, source, status,
 text_excerpt}`, where the excerpt is the *operator's* instruction — so the
-advisory audit entry is not an egress path either.
+advisory audit entry is not an egress path either — and the excerpt itself is
+marked `untrusted` when it is not the operator's own words.
 
 ## Evidence-only posture
 
@@ -141,6 +173,14 @@ invariant is pinned in the firing direction as well as the absent one:
 `TestRunImplementReviews_FixupReportingObligation_SignalDoesNotAlterOutcome`
 runs both arms and asserts the review dispatch result, the stage status, and the
 fix-up budget input (`countFixupPasses`) are identical.
+
+The RUNNER half of the same invariant needed a different vehicle. Running the
+prescribed counterfactual — adding `res.OK = false` to the obligation branch —
+left the whole runner package GREEN: `run()` has no seam for driving that branch
+with a self-report sidecar present, so the claim was unpinned exactly where it
+mattered. `TestFixupObligationsBranch_NeverTouchesStageOutcome` closes it
+structurally instead: it parses `main.go` and fails if the branch body assigns
+`res.OK` or `res.FailureCategory` at all. It goes RED under that same mutation.
 
 This is deliberate. A signal that could fail or re-budget a pass would make
 operators route *fewer* reporting obligations, not more — and it would reopen

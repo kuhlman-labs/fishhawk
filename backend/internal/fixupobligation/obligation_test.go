@@ -260,3 +260,51 @@ func TestUndelivered_DuplicateReportCannotUpgradeADecline(t *testing.T) {
 		t.Fatalf("Undelivered = %+v, want the first (declined) report to stand", got)
 	}
 }
+
+// TestDetect_CarriesUntrustedProvenance pins the trust-provenance carry-through
+// the #2737 security fix-up added. A routed concern note can be
+// acceptance-SYNTHESIZED — attacker-influenceable free text an automated
+// validator authored (ADR-050 / E31.8 / #1613) — and the render sites decide
+// whether to quarantine an excerpt solely from this flag. Detect dropping it
+// would launder untrusted text into trusted prompt content at both sites.
+//
+// The two arms are SELF-PAIRED: byte-identical instruction text, differing only
+// in the caller-supplied Untrusted flag, so the assertion cannot pass on a text
+// comparison that would hold with or without the carry-through.
+func TestDetect_CarriesUntrustedProvenance(t *testing.T) {
+	const note = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+
+	untrusted := Detect([]Source{{Kind: SourceConcern, Text: note, Untrusted: true}})
+	if len(untrusted) != 1 {
+		t.Fatalf("untrusted arm = %+v, want one obligation", untrusted)
+	}
+	if !untrusted[0].Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted true carried from the source", untrusted[0])
+	}
+
+	trusted := Detect([]Source{{Kind: SourceConcern, Text: note}})
+	if len(trusted) != 1 {
+		t.Fatalf("trusted arm = %+v, want one obligation", trusted)
+	}
+	if trusted[0].Untrusted {
+		t.Errorf("obligation = %+v, want Untrusted false for operator-authored text", trusted[0])
+	}
+	// Discrimination: everything but the flag is identical between the arms.
+	if untrusted[0].ID != trusted[0].ID || untrusted[0].Text != trusted[0].Text {
+		t.Fatalf("the arms differ in more than the flag (%+v vs %+v) — the assertion is not isolating provenance",
+			untrusted[0], trusted[0])
+	}
+
+	// The operator_concern dedupe must retain the CONCERN's flag, never
+	// silently upgrade the surviving obligation to trusted.
+	deduped := Detect([]Source{
+		{Kind: SourceConcern, Text: note, Untrusted: true},
+		{Kind: SourceOperatorConcern, Text: note},
+	})
+	if len(deduped) != 1 {
+		t.Fatalf("deduped = %+v, want exactly one obligation", deduped)
+	}
+	if !deduped[0].Untrusted {
+		t.Errorf("deduped obligation = %+v, want the surviving concern's Untrusted flag retained", deduped[0])
+	}
+}
