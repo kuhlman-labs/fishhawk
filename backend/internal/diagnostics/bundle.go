@@ -40,6 +40,84 @@ type DiagnosticBundle struct {
 	FailingStage       *FailingStage  `json:"failing_stage,omitempty"`
 	AuditSequenceRange *SequenceRange `json:"audit_sequence_range,omitempty"`
 	Versions           VersionFacts   `json:"versions"`
+	// WedgeContext names WHY the run is stuck, when it is stuck in a
+	// shape the backend can describe structurally (#1737). Absent
+	// (omitted from the JSON entirely) on a run with no wedge shape and
+	// on every bundle produced by the no-wedge Collect wrapper.
+	WedgeContext *WedgeContext `json:"wedge_context,omitempty"`
+}
+
+// WedgeFacts is the caller-INJECTED wedge input, the same idiom as
+// VersionFacts: the diagnostics package is pure, so the facts that need
+// a repository read (required-check states, campaign item linkage) are
+// assembled by the caller and handed in. The collector still owns the
+// redaction contract — every injected field is either a closed-enum
+// normalization (CampaignItemState) or a structured identifier set
+// (BlockingChecks), never free text.
+type WedgeFacts struct {
+	// BlockingChecks are the run's required-check CONTEXT NAMES whose
+	// latest recorded state is red. Context names come from the run's
+	// branch-protection snapshot — configuration identifiers, not
+	// output. Empty for every run with no resolved snapshot (#2497),
+	// so the block degrades rather than fabricating names.
+	BlockingChecks []string
+	// CampaignItemState is the campaign item state for the item this run
+	// executes, if any. Normalized through the closed campaign
+	// item-state set on the way into WedgeContext — an unrecognized
+	// value is DROPPED, never echoed.
+	CampaignItemState string
+	// BlockedDependents is how many sibling campaign items are blocked
+	// waiting on this run's item. A count, never a name list.
+	BlockedDependents int
+}
+
+// WedgeContext is the wire block: structured wedge facts only. Like the
+// rest of the bundle it is redaction-safe BY CONSTRUCTION — every field
+// is a count, a configuration identifier, or a table-owned enum literal.
+// The drive Advance.Event string and a stage's free-text FailureReason
+// are never copied in.
+type WedgeContext struct {
+	// BlockingChecks are red required-check context names. Omitted when
+	// none are red, or when the run has no resolved checks snapshot.
+	BlockingChecks []string `json:"blocking_checks,omitempty"`
+	// CampaignItemState is a campaign item-state enum literal
+	// ("blocked" | "running" | "paused" | "failed" | ...), or empty.
+	CampaignItemState string `json:"campaign_item_state,omitempty"`
+	// BlockedDependents counts sibling items waiting on this one.
+	BlockedDependents int `json:"blocked_dependents,omitempty"`
+	// IntegrateWaveError is a closed marker for a fan-in failure,
+	// derived from the run's audit CATEGORY set (never a payload body).
+	// Currently the single literal "slice_integration_conflict".
+	IntegrateWaveError string `json:"integrate_wave_error,omitempty"`
+}
+
+// sliceIntegrationConflictMarker is the audit category the fan-in
+// conflict path emits AND the enum literal the wedge block carries. The
+// two are deliberately the same string: the marker is the category
+// itself, so nothing is derived from an audit payload.
+const sliceIntegrationConflictMarker = "slice_integration_conflict"
+
+// campaignItemStates is the closed set of campaign item-state literals
+// the wedge block may carry. Kept as a package-local table (rather than
+// importing internal/campaign) so this package stays dependency-light
+// and the emitted value is TABLE-OWNED: normalizeCampaignItemState
+// returns the literal from this map, never any part of its input.
+var campaignItemStates = map[string]string{
+	"pending":   "pending",
+	"blocked":   "blocked",
+	"running":   "running",
+	"paused":    "paused",
+	"succeeded": "succeeded",
+	"failed":    "failed",
+	"cancelled": "cancelled",
+}
+
+// normalizeCampaignItemState maps an injected item state onto the closed
+// table above. An unrecognized value yields "" — the wedge block drops
+// it rather than echoing an unvetted string across the redaction
+// boundary.
+func normalizeCampaignItemState(state string) string {
+	return campaignItemStates[state]
 }
 
 // StageFact is one stage's position and state — no timing detail, no
@@ -107,7 +185,23 @@ type Component struct {
 //
 // By construction the returned bundle contains only structured facts.
 // The failing stage's free-text FailureReason is never copied in.
+//
+// Collect is the no-wedge wrapper over CollectWithWedge: it passes a nil
+// WedgeFacts, and a nil WedgeFacts suppresses the wedge block entirely,
+// so every pre-#1737 caller keeps producing the bundle it produced
+// before — no new key appears, not even on a run whose audit chain
+// carries a fan-in conflict.
 func Collect(r *run.Run, stages []*run.Stage, auditEntries []*audit.Entry, versions VersionFacts) DiagnosticBundle {
+	return CollectWithWedge(r, stages, auditEntries, versions, nil)
+}
+
+// CollectWithWedge is Collect plus the wedge block (#1737). Pass a
+// non-nil (possibly zero-valued) wedge to opt the bundle in: the block
+// is then assembled from the injected facts AND the structured fan-in
+// signal read off the audit CATEGORIES, and omitted when that assembly
+// finds nothing — a healthy run opted in still carries no
+// wedge_context. Pass nil to get Collect's exact pre-wedge output.
+func CollectWithWedge(r *run.Run, stages []*run.Stage, auditEntries []*audit.Entry, versions VersionFacts, wedge *WedgeFacts) DiagnosticBundle {
 	b := DiagnosticBundle{
 		Versions: versions,
 		Stages:   []StageFact{},
@@ -164,7 +258,54 @@ func Collect(r *run.Run, stages []*run.Stage, auditEntries []*audit.Entry, versi
 		b.AuditSequenceRange = rng
 	}
 
+	// The nil gate is what keeps Collect byte-identical to its
+	// pre-wedge self for every un-migrated caller.
+	if wedge != nil {
+		b.WedgeContext = buildWedgeContext(wedge, auditEntries)
+	}
+
 	return b
+}
+
+// buildWedgeContext assembles the wire block from the injected facts
+// plus the structured fan-in signal. Returns nil when nothing was
+// found, so the bundle omits the key rather than carrying an empty
+// object. Every value is copied through a closed table, a count, or a
+// configuration identifier — see the WedgeContext doc.
+func buildWedgeContext(wedge *WedgeFacts, entries []*audit.Entry) *WedgeContext {
+	wc := WedgeContext{
+		CampaignItemState:  normalizeCampaignItemState(wedge.CampaignItemState),
+		BlockedDependents:  wedge.BlockedDependents,
+		IntegrateWaveError: integrateWaveError(entries),
+	}
+	for _, name := range wedge.BlockingChecks {
+		if name == "" {
+			continue
+		}
+		wc.BlockingChecks = append(wc.BlockingChecks, name)
+	}
+	if len(wc.BlockingChecks) == 0 && wc.CampaignItemState == "" &&
+		wc.BlockedDependents == 0 && wc.IntegrateWaveError == "" {
+		return nil
+	}
+	return &wc
+}
+
+// integrateWaveError returns the fan-in conflict marker when the run's
+// audit chain carries a slice_integration_conflict entry. Only the
+// entry CATEGORY is read — the payload (which names branches and
+// carries conflict detail) is never touched — and the returned value is
+// the package-owned literal, not the entry's own string.
+func integrateWaveError(entries []*audit.Entry) string {
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		if e.Category == sliceIntegrationConflictMarker {
+			return sliceIntegrationConflictMarker
+		}
+	}
+	return ""
 }
 
 // failingSurface returns the audit category of the most-recent entry
