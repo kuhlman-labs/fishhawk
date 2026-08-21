@@ -30,3 +30,14 @@ The per-repo `gitlab` conventions block carries only the non-secret optional `pr
 
 - `File` only. `Transitioner` (#1012), `NumberDiscoverer` (#1269), and `EpicChildrenQuerier` (ADR-047) are **not** implemented in v0 — the capability-asserting hooks yield a no-op, matching the jira sibling.
 - Auth deliberately bypasses `forge.CredentialScope` in v0 (`Target.Scope` stays zero for gitlab filings): the client authenticates with the env token like `jiraclient`. Rehoming it onto the credential-scope seam is deferred to the #1855 chain.
+
+## Work-item read/list: reviewed, not implemented in v0 (#2230 / ADR-064)
+
+The optional `workmgmt.WorkItemReader` capability (read one work item by reference / list a query-scoped set) is **deliberately not implemented here**, matching the jira sibling and this provider's existing posture on `Transitioner` (#1012), `NumberDiscoverer` (#1269) and `EpicChildrenQuerier` (ADR-047). `workmgmt.ReaderFor("gitlab")` resolves to a typed `*workmgmt.UnavailableError{Reason: ReasonNotImplemented}` — never a nil interface a caller could dispatch against, and never an empty page it could misread as an empty backlog. `TestProvider_DoesNotImplementWorkItemReader` and `TestReaderFor_GitLabResolvesTypedUnavailable` pin both halves.
+
+**The GitLab shape was reviewed before the deferral, and the finding is what pins the interface vocabulary.** GitLab issue boards are LABEL-driven — the board-status label rides the create (see "Board placement → label" above) — so a GitLab reader would derive a work item's board state from its state LABEL, not from a single-select project field as GitHub Projects does. That is precisely why:
+
+- `workmgmt.WorkItemRecord.BoardState` is a CANONICAL state with the PROVIDER owning the mapping, rather than the interface exposing a GitHub "Status field" concept; and
+- the canonical → provider-option map travels ON THE REQUEST (`States`, exactly as `TransitionRequest` already carries it) rather than being read from conventions inside a provider.
+
+A GitLab implementation therefore needs **no interface change** — it is deferred purely because v0 has no consumer for it. That is the acceptance point of #2230's fourth criterion: the second implementation is not forced into a GitHub-shaped contract.
