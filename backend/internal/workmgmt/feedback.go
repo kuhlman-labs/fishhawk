@@ -16,6 +16,59 @@ type FeedbackReport struct {
 	Body        string
 	Labels      []string
 	Fingerprint string
+	// BoardPlacement is the desired project-board placement for a newly
+	// filed report (#1737). It reaches the board only when the Target
+	// carries a Project; placement is BEST-EFFORT exactly as it is on the
+	// work-item path (#1107) — the filed report is the durable result, so a
+	// placement failure records its cause and never fails the filing.
+	BoardPlacement BoardPlacement
+}
+
+// Boarding-status values reported alongside a filed product report
+// (#1737). They exist because `boarded=false` alone is ambiguous, and the
+// two false cases call for DIFFERENT operator actions: nothing to do when
+// no project is configured, versus investigate a real placement failure.
+//
+// "no project configured" is a CONFIGURATION STATE, not an error, so it
+// carries its own status and leaves BoardingError empty; a genuine
+// placement failure is the only case that sets BoardingError.
+const (
+	// BoardingStatusBoarded — the report was placed on the board.
+	BoardingStatusBoarded = "boarded"
+	// BoardingStatusNotAttemptedNoProject — the conventions declare no
+	// project, so placement was never attempted. Not an error.
+	BoardingStatusNotAttemptedNoProject = "not_attempted_no_project"
+	// BoardingStatusFailed — placement was attempted and failed; the
+	// cause is in BoardingError.
+	BoardingStatusFailed = "failed"
+	// BoardingStatusNotAttemptedNoReport — no new report was created (a
+	// dedup hit appended an occurrence comment to an existing report), so
+	// there was nothing to board.
+	BoardingStatusNotAttemptedNoReport = "not_attempted_no_report"
+)
+
+// BoardingStatusOf classifies the board-placement outcome of a filed
+// report into one of the closed statuses above. It is the single place
+// the "boarded=false, why?" question is answered, so the response
+// surface, the docs, and the tests cannot drift apart.
+//
+// A nil created item means nothing was filed (the dedup-hit path).
+func BoardingStatusOf(target Target, created *CreatedItem) string {
+	switch {
+	case created == nil:
+		return BoardingStatusNotAttemptedNoReport
+	case target.Project == nil:
+		return BoardingStatusNotAttemptedNoProject
+	case created.BoardingError != "":
+		return BoardingStatusFailed
+	case created.Boarded:
+		return BoardingStatusBoarded
+	default:
+		// A provider that neither boarded nor recorded a cause while a
+		// project IS configured: report the failure status rather than
+		// claiming success, and let the empty cause be the tell.
+		return BoardingStatusFailed
+	}
 }
 
 // ExistingReport is a previously-filed open upstream report that a dedup
