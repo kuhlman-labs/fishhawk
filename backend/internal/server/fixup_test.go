@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -3262,13 +3263,36 @@ func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
 		}
 	})
 
-	t.Run("append error still returns obligations", func(t *testing.T) {
+	t.Run("append error warn-logs and still returns obligations", func(t *testing.T) {
 		au := newAuditFake()
 		au.appendErrCategory = CategoryFixupPRBodyUnsatisfiable
-		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		var logBuf bytes.Buffer
+		s := New(Config{
+			Addr:      "127.0.0.1:0",
+			AuditRepo: au,
+			Logger:    slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		})
 		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", "")
+		// Fail-open: the obligation set is returned regardless of the append error.
 		if len(got) != 1 {
 			t.Errorf("obligations = %+v, want the PR-body obligation despite an append error", got)
+		}
+		// And the append failure is observably WARN-logged with the run/stage
+		// context — so downgrading or dropping the LogAttrs call in
+		// recordFixupPRBodyUnsatisfiable reddens this test rather than silently
+		// swallowing the fail-open path.
+		rec := soleLogRecord(t, &logBuf, "fixup: append fixup_pr_body_unsatisfiable audit entry failed")
+		if lvl := rec["level"]; lvl != "WARN" {
+			t.Errorf("log level = %v, want WARN", lvl)
+		}
+		if rec["stage_id"] != stageID.String() {
+			t.Errorf("log stage_id = %v, want %s", rec["stage_id"], stageID)
+		}
+		if rec["run_id"] != runID.String() {
+			t.Errorf("log run_id = %v, want %s", rec["run_id"], runID)
+		}
+		if _, ok := rec["error"]; !ok {
+			t.Errorf("log record missing error attr: %v", rec)
 		}
 	})
 
