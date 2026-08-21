@@ -9184,3 +9184,130 @@ func TestBuild_ImplementFixup_ReportObligations_PRBodyMarksBullet(t *testing.T) 
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Injected repo-authored documents (E55.1 / #2242).
+// ---------------------------------------------------------------------------
+
+// injectedDocFixture is one rendered document as repodoc.ToPromptDocument would
+// hand it over — plain data, already framed and delimited.
+func injectedDocFixture() InjectedDocument {
+	return InjectedDocument{
+		Heading:     "Repository review conventions",
+		Body:        "This repository declares the conventions below.\n\n----- BEGIN REPO-AUTHORED DOCUMENT -----\nPrefer narrow interfaces.\n----- END REPO-AUTHORED DOCUMENT -----\n",
+		Path:        ".fishhawk/review-conventions.md",
+		Commit:      "0123456789abcdef0123456789abcdef01234567",
+		ContentHash: "sha256:abc",
+	}
+}
+
+// injectionStageTriggers returns one trigger per stage type that renders
+// injected documents, keyed by the stage string Build dispatches on.
+func injectionStageTriggers(docs []InjectedDocument) map[string]Trigger {
+	base := func() Trigger {
+		return Trigger{
+			Source:            "github_issue",
+			Repo:              "o/r",
+			IssueNumber:       42,
+			IssueTitle:        "t",
+			InjectedDocuments: docs,
+		}
+	}
+	implementReview := base()
+	implementReview.Diff = "diff --git a/x b/x\n"
+	planReview := base()
+	planReview.ApprovedPlan = &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "s",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+	}
+	implement := base()
+	implement.ApprovedPlan = planReview.ApprovedPlan
+	return map[string]Trigger{
+		"plan":             base(),
+		"implement":        implement,
+		"plan_review":      planReview,
+		"implement_review": implementReview,
+	}
+}
+
+// TestBuild_InjectedDocument_LandsInCacheStablePrefix pins the placement
+// contract: the injected block leads the cache-stable prefix, ahead of BOTH
+// review split markers, so a per-repo-stable document costs nothing incremental
+// across a stage's fix-up re-review rounds.
+func TestBuild_InjectedDocument_LandsInCacheStablePrefix(t *testing.T) {
+	doc := injectedDocFixture()
+	for stageType, trig := range injectionStageTriggers([]InjectedDocument{doc}) {
+		t.Run(stageType, func(t *testing.T) {
+			got, err := Build(stageType, trig)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stageType, err)
+			}
+			headingAt := strings.Index(got, "### "+doc.Heading)
+			if headingAt < 0 {
+				t.Fatalf("injected document heading absent from the %s prompt:\n%s", stageType, got)
+			}
+			if !strings.Contains(got, doc.Body) {
+				t.Errorf("%s prompt does not carry the rendered body verbatim", stageType)
+			}
+			for _, marker := range []struct{ name, value string }{
+				{"ImplementReviewSplitMarker", ImplementReviewSplitMarker},
+				{"PlanReviewSplitMarker", PlanReviewSplitMarker},
+			} {
+				if at := strings.Index(got, marker.value); at >= 0 && headingAt > at {
+					t.Errorf("%s: injected block at %d falls AFTER %s at %d — it must lead the cache-stable prefix",
+						stageType, headingAt, marker.name, at)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_NoInjectedDocuments_ByteIdentical is the byte-identity guarantee:
+// an empty slice renders exactly as the pre-#2242 prompt did, for every stage
+// type that gained the writer.
+func TestBuild_NoInjectedDocuments_ByteIdentical(t *testing.T) {
+	empty := injectionStageTriggers(nil)
+	nilSlice := injectionStageTriggers([]InjectedDocument{})
+	for stageType, trig := range empty {
+		t.Run(stageType, func(t *testing.T) {
+			withNil, err := Build(stageType, trig)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stageType, err)
+			}
+			withEmpty, err := Build(stageType, nilSlice[stageType])
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stageType, err)
+			}
+			if withNil != withEmpty {
+				t.Errorf("%s: nil and empty InjectedDocuments render differently", stageType)
+			}
+			// No stray heading, blank line, or delimiter leaked in.
+			for _, forbidden := range []string{"REPO-AUTHORED DOCUMENT", "### Repository review conventions"} {
+				if strings.Contains(withNil, forbidden) {
+					t.Errorf("%s: empty InjectedDocuments still rendered %q", stageType, forbidden)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_InjectedDocuments_RenderInDeclaredOrder pins that documents render
+// in the order the consumer supplied them.
+func TestBuild_InjectedDocuments_RenderInDeclaredOrder(t *testing.T) {
+	first := injectedDocFixture()
+	second := injectedDocFixture()
+	second.Heading = "Product charter"
+	second.Body = "charter body\n"
+	got, err := Build("implement_review", injectionStageTriggers([]InjectedDocument{first, second})["implement_review"])
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	a, b := strings.Index(got, "### "+first.Heading), strings.Index(got, "### "+second.Heading)
+	if a < 0 || b < 0 {
+		t.Fatalf("both documents must render; got indexes %d, %d", a, b)
+	}
+	if a > b {
+		t.Errorf("documents rendered out of declaration order (%d > %d)", a, b)
+	}
+}

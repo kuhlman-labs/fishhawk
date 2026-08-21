@@ -71,6 +71,14 @@ import "sort"
 // stage's effective scope, and it is ALSO read as an invalidator by
 // server/prompt.go::resolveHeldCommitExemption, which demotes a stale
 // `exempted` decision when an amend supersedes it. When a new
+// E55.1 / #2242 added the two document-injection markers written by
+// backend/internal/repodoc: document_injected (one per repo-authored document
+// injected into an agent prompt, naming the resolved path, the PINNED commit,
+// the sha256 content hash over the resolved bytes, and the declaration site)
+// and document_truncated (written IN ADDITION when the document exceeded the
+// effective cap, naming the cap and the dropped-byte count). Both are written
+// per prompt SERVE, so a retry or re-dispatch attributes again — the guarantee
+// is that every injection is attributed. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -133,6 +141,8 @@ var KnownCategories = map[string]struct{}{
 	"deployment_rollback_completed":           {},
 	"deployment_rollback_initiated":           {},
 	"dispatch_reaper_failed":                  {},
+	"document_injected":                       {},
+	"document_truncated":                      {},
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
 	"fixup_no_changes":                        {},

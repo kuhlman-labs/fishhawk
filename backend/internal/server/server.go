@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -105,6 +106,28 @@ type Config struct {
 	// ApprovalRepo persists gate decisions. Wired by
 	// POST /v0/stages/{id}/approvals; nil leaves it 503.
 	ApprovalRepo approval.Repository
+
+	// DocumentDeclarations / DocumentResolver / DocumentScope are the
+	// document-injection seam (E55.1 / #2242): the ONE attachment point for
+	// every consumer that wants a repo-authored governance document injected
+	// into an agent prompt — E55's review_conventions[] and #2234's
+	// charter.path. All three are NIL in production today (no declaration
+	// site exists yet), which makes injection a no-op and every served prompt
+	// byte-identical to the pre-#2242 render.
+	//
+	// DocumentDeclarations returns the documents declared for a run/stage plus
+	// the BASE REF they must be pinned against. That base ref is the security
+	// input: it must name the run's base branch or a commit SHA, never the
+	// run's own branch (which the agent can write). See
+	// backend/internal/repodoc/README.md for where a consumer gets it.
+	DocumentDeclarations func(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]repodoc.Declaration, string, error)
+	// DocumentResolver reads declared documents from the forge at a pinned
+	// commit. Nil disables injection.
+	DocumentResolver *repodoc.Resolver
+	// DocumentScope resolves the credential scope the document read acts
+	// under. Nil means the zero scope (adequate for a forge whose credentials
+	// are deployment-level, e.g. the GitLab static-token path).
+	DocumentScope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error)
 
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and
