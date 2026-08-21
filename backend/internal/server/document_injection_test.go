@@ -148,13 +148,26 @@ func TestGetStagePrompt_InjectedDocument_EndToEnd(t *testing.T) {
 		}
 	}
 
-	// (b) the injected block precedes the split marker in the served bytes.
+	// (b) the injected block LEADS the served bytes: it precedes every
+	// per-stage-variable element of the prompt.
+	//
+	// The boundary asserted here is the one this prompt actually has. An
+	// implement prompt carries NO review split marker, so an
+	// ImplementReviewSplitMarker comparison guarded by "if the marker is
+	// present" would pass here without comparing anything. The review-marker
+	// boundary is asserted, unconditionally and with the marker REQUIRED to
+	// exist, by TestInjectedDocument_ReviewPrompts_PrecedeSplitMarker below.
 	headingAt := strings.Index(resp.Prompt, "### "+injFraming().Heading)
 	if headingAt < 0 {
 		t.Fatalf("served prompt has no injected block:\n%s", resp.Prompt)
 	}
-	if at := strings.Index(resp.Prompt, prompt.ImplementReviewSplitMarker); at >= 0 && headingAt > at {
-		t.Errorf("injected block at %d falls after the split marker at %d", headingAt, at)
+	stageRefAt := strings.Index(resp.Prompt, stageID.String())
+	if stageRefAt < 0 {
+		t.Fatalf("served implement prompt carries no per-stage identifier to order against:\n%s", resp.Prompt)
+	}
+	if headingAt > stageRefAt {
+		t.Errorf("injected block at %d falls after the per-stage content at %d — it must lead the cache-stable prefix",
+			headingAt, stageRefAt)
 	}
 
 	// (c) the document_injected audit entry landed with path / commit / content_hash.
@@ -183,6 +196,81 @@ func TestGetStagePrompt_InjectedDocument_EndToEnd(t *testing.T) {
 	}
 	if h, _ := payload["content_hash"].(string); !strings.HasPrefix(h, "sha256:") || len(h) != len("sha256:")+64 {
 		t.Errorf("audit payload content_hash = %q, want a sha256:<64 hex> value", h)
+	}
+}
+
+// TestInjectedDocument_ReviewPrompts_PrecedeSplitMarker is the REVIEW-marker
+// half of the placement contract, asserted unconditionally: the applicable
+// marker must EXIST before any offset is compared, so a render that stopped
+// emitting the marker fails the test instead of skipping the comparison.
+//
+// Why not through the signed endpoint: that handler dispatches prompt.Build on
+// run.Stage.Type, whose closed set is plan/implement/review/deploy/acceptance
+// (backend/internal/run/run.go) — there is no plan_review or implement_review
+// stage type, and prompt.Build rejects "review" with ErrUnsupportedStage. The
+// review prompts are built in-process by server/plan.go and server/trace.go and
+// never pass through this endpoint. So the documents are resolved through the
+// SAME server seam the endpoint calls — s.resolveInjectedDocuments, base-ref
+// pinned, attributed — and rendered into both review prompts here.
+func TestInjectedDocument_ReviewPrompts_PrecedeSplitMarker(t *testing.T) {
+	ff := newInjFetcher()
+	s, runID, stageID, _ := newInjectionServer(t, newStoringAuditRepo(),
+		&repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+
+	docs, err := s.resolveInjectedDocuments(context.Background(),
+		&run.Run{ID: runID, Repo: "o/r"},
+		&run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement})
+	if err != nil {
+		t.Fatalf("resolveInjectedDocuments: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("resolved %d documents, want 1", len(docs))
+	}
+	// The rendered document is the pinned one, so this test orders the SAME
+	// bytes the endpoint serves — not an unrelated fixture.
+	if !strings.Contains(docs[0].Body, injBaseContent) {
+		t.Fatalf("resolved document does not carry the base-ref content %q", injBaseContent)
+	}
+
+	for _, tc := range []struct {
+		stageType  string
+		markerName string
+		marker     string
+	}{
+		{"plan_review", "PlanReviewSplitMarker", prompt.PlanReviewSplitMarker},
+		{"implement_review", "ImplementReviewSplitMarker", prompt.ImplementReviewSplitMarker},
+	} {
+		t.Run(tc.stageType, func(t *testing.T) {
+			got, err := prompt.Build(tc.stageType, prompt.Trigger{
+				Source:            "github_issue",
+				Repo:              "o/r",
+				IssueNumber:       42,
+				IssueTitle:        "t",
+				Diff:              "diff --git a/x b/x\n",
+				InjectedDocuments: docs,
+			})
+			if err != nil {
+				t.Fatalf("Build(%s): %v", tc.stageType, err)
+			}
+			headingAt := strings.Index(got, "### "+injFraming().Heading)
+			if headingAt < 0 {
+				t.Fatalf("%s prompt has no injected block:\n%s", tc.stageType, got)
+			}
+			markerAt := strings.Index(got, tc.marker)
+			if markerAt < 0 {
+				t.Fatalf("%s prompt has no %s — there is no boundary to order against:\n%s",
+					tc.stageType, tc.markerName, got)
+			}
+			if headingAt > markerAt {
+				t.Errorf("%s: injected block at %d falls AFTER %s at %d — it must lead the cache-stable prefix",
+					tc.stageType, headingAt, tc.markerName, markerAt)
+			}
+			// And the document's content rides in the cached prefix with it.
+			if bodyAt := strings.Index(got, injBaseContent); bodyAt < 0 || bodyAt > markerAt {
+				t.Errorf("%s: document content at %d is not inside the cache-stable prefix (marker at %d)",
+					tc.stageType, bodyAt, markerAt)
+			}
+		})
 	}
 }
 

@@ -37,6 +37,15 @@ import (
 // so it would stand as a claim that document 1 was injected into a prompt that
 // was never served.
 //
+// A COMPLETE ATTRIBUTION SET IS NOT PROOF OF A SERVE. This call runs BEFORE
+// prompt.Build at its call site, so a failure after attribution succeeds — the
+// ErrUnsupportedStage branch below Build, any other build failure, or a failed
+// response write — leaves a complete, well-formed injection set behind for a
+// prompt no agent ever read. A SHORT set still means the assembly failed and
+// nothing was injected; a COMPLETE set means only "resolved and handed to the
+// renderer". Consumers establish an actual serve from the stage's own evidence.
+// Rationale and the reordering trade-off: backend/internal/repodoc/README.md.
+//
 // PARTIAL CONFIGURATION IS A FAILURE, NOT AN INERT STATE. Inert means NO
 // declaration seam: nothing declares a document, so nothing is missing. A
 // CONFIGURED declaration seam with a nil DocumentResolver is a different thing

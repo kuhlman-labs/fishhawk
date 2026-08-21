@@ -279,6 +279,38 @@ a successful one (`TestAttribute_MultiDocumentFailure_AuditStateIsHonest`,
 outright needs a batched transactional append on `audit.Repository`; that is a
 change to the audit package, not to this one.
 
+### A COMPLETE set is not proof the prompt was SERVED
+
+The section above establishes what a **short** set means: the assembly failed
+and no document reached a prompt. The converse does **not** hold, and #2234
+must not read it that way.
+
+`Server.resolveInjectedDocuments` — resolution, attribution and all — runs
+*before* `prompt.Build` in the stage-prompt handler
+(`backend/internal/server/prompt.go`). So a failure **after** attribution
+succeeds leaves a complete, well-formed injection set behind for a prompt that
+was never served: `prompt.Build` returning `ErrUnsupportedStage` (the branch
+immediately below the call), any other build failure, or a response that fails
+while being written. Every entry is present and `document_count` is satisfied,
+so the set is byte-indistinguishable from one whose prompt reached a runner.
+
+Read a `document_injected` entry as **"the server resolved this revision at this
+commit and handed it to the renderer"**, not as "an agent read it". To establish
+that a prompt was actually served and executed, join against the stage's own
+evidence — the stage reaching a running/terminal state, and its `trace_uploaded`
+entry — rather than treating the injection set as the proof.
+
+Why this is not fixed by reordering. Moving the `Attribute` call to *after*
+`prompt.Build` succeeds would narrow the window to the response-write path, and
+that is a reasonable future refinement; it cannot close it. A response that
+fails in transmission after a 200 was written is unattributable from the
+server's side no matter where the append happens, and attributing after a
+successful *write* would reintroduce the opposite defect — an injection served
+with no audit entry, which is the failure this mechanism exists to prevent. The
+fail-**closed** direction is the correct one: an injection claimed but not
+served is a conservative over-record; an injection served but not claimed is
+not.
+
 ### Attribution is PER SERVE — intended, not a bug
 
 Attribution runs in the stage-prompt handler, so **every fetch of a stage

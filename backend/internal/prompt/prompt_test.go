@@ -9231,10 +9231,29 @@ func injectionStageTriggers(docs []InjectedDocument) map[string]Trigger {
 	}
 }
 
+// splitMarkerForStage names the split marker each stage prompt is REQUIRED to
+// carry. A review prompt has exactly one; plan and implement prompts have none,
+// and must carry neither — a marker appearing there would mean the boundary the
+// caching adapters key on moved.
+func splitMarkerForStage(stageType string) (name, value string, required bool) {
+	switch stageType {
+	case "plan_review":
+		return "PlanReviewSplitMarker", PlanReviewSplitMarker, true
+	case "implement_review":
+		return "ImplementReviewSplitMarker", ImplementReviewSplitMarker, true
+	default:
+		return "", "", false
+	}
+}
+
 // TestBuild_InjectedDocument_LandsInCacheStablePrefix pins the placement
-// contract: the injected block leads the cache-stable prefix, ahead of BOTH
-// review split markers, so a per-repo-stable document costs nothing incremental
+// contract: the injected block leads the cache-stable prefix, ahead of the
+// review split marker, so a per-repo-stable document costs nothing incremental
 // across a stage's fix-up re-review rounds.
+//
+// The marker comparison is UNCONDITIONAL for the stages that have one: an
+// absent marker fails the subtest rather than silently skipping the offset
+// comparison, so this cannot degrade into an assertion that checks nothing.
 func TestBuild_InjectedDocument_LandsInCacheStablePrefix(t *testing.T) {
 	doc := injectedDocFixture()
 	for stageType, trig := range injectionStageTriggers([]InjectedDocument{doc}) {
@@ -9250,14 +9269,28 @@ func TestBuild_InjectedDocument_LandsInCacheStablePrefix(t *testing.T) {
 			if !strings.Contains(got, doc.Body) {
 				t.Errorf("%s prompt does not carry the rendered body verbatim", stageType)
 			}
-			for _, marker := range []struct{ name, value string }{
-				{"ImplementReviewSplitMarker", ImplementReviewSplitMarker},
-				{"PlanReviewSplitMarker", PlanReviewSplitMarker},
-			} {
-				if at := strings.Index(got, marker.value); at >= 0 && headingAt > at {
-					t.Errorf("%s: injected block at %d falls AFTER %s at %d — it must lead the cache-stable prefix",
-						stageType, headingAt, marker.name, at)
+			name, value, required := splitMarkerForStage(stageType)
+			if !required {
+				// Nothing to order against — assert the absence instead, so the
+				// two halves of this table stay exhaustive.
+				for _, marker := range []struct{ name, value string }{
+					{"ImplementReviewSplitMarker", ImplementReviewSplitMarker},
+					{"PlanReviewSplitMarker", PlanReviewSplitMarker},
+				} {
+					if at := strings.Index(got, marker.value); at >= 0 {
+						t.Errorf("%s: unexpected %s at %d — update splitMarkerForStage and order against it",
+							stageType, marker.name, at)
+					}
 				}
+				return
+			}
+			at := strings.Index(got, value)
+			if at < 0 {
+				t.Fatalf("%s prompt has no %s — there is no boundary to order against:\n%s", stageType, name, got)
+			}
+			if headingAt > at {
+				t.Errorf("%s: injected block at %d falls AFTER %s at %d — it must lead the cache-stable prefix",
+					stageType, headingAt, name, at)
 			}
 		})
 	}
