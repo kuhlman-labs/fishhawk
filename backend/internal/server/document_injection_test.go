@@ -366,6 +366,88 @@ func TestGetStagePrompt_AttributionFailure_DocumentNotInjected(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_MultiDocumentResolutionFailure_LeavesNoInjectionClaim is
+// the AUDIT-STATE assertion for a multi-document failure. The audit log is
+// append-only, so an attribution written for document 1 cannot be withdrawn
+// when document 2 fails to resolve — it would stand as a claim that document 1
+// was injected into a prompt this request never served. The seam therefore
+// resolves the WHOLE set before it attributes anything, and this test reads the
+// persisted entries rather than only the error.
+//
+// The bad state is seeded by construction: the second declared path is simply
+// absent at the pinned commit, independently of the ordering control.
+func TestGetStagePrompt_MultiDocumentResolutionFailure_LeavesNoInjectionClaim(t *testing.T) {
+	const missingPath = ".fishhawk/absent-charter.md"
+	ff := newInjFetcher()
+	ar := newStoringAuditRepo()
+	s, runID, stageID, priv := newInjectionServer(t, ar,
+		&repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}},
+		func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error) {
+			return []repodoc.Declaration{
+				{Path: injPath, DeclarationSite: injDeclSite, Framing: injFraming()},
+				{Path: missingPath, DeclarationSite: "charter.path in .fishhawk/work-management.yaml", Framing: injFraming()},
+			}, injBaseBranch, nil
+		})
+
+	runRow := &run.Run{ID: runID, Repo: "o/r"}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	docs, err := s.resolveInjectedDocuments(context.Background(), runRow, stage)
+	if err == nil {
+		t.Fatal("err = nil, want the second declaration's resolution failure")
+	}
+	if len(docs) != 0 {
+		t.Errorf("returned %d documents, want 0", len(docs))
+	}
+	// THE POINT OF THIS TEST: the FIRST document resolved fine, so an
+	// interleaved resolve-and-attribute loop would have persisted its
+	// document_injected entry before the second declaration failed.
+	for _, e := range ar.byRunID[runID] {
+		if e.Category == "document_injected" || e.Category == "document_truncated" {
+			t.Errorf("a failed multi-document assembly persisted a %q entry: %s", e.Category, e.Payload)
+		}
+	}
+
+	// And the handler-level outcome: 500, with neither document's content served.
+	w := promptRequest(t, s, runID, stageID, priv(), "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), injBaseContent) {
+		t.Errorf("a failed multi-document assembly still served document content:\n%s", w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_PairedAttributionFailure_LeavesNoInjectionClaim is the
+// PAIRED-ENTRY half at the seam: a truncated document needs two appends, and a
+// failure of either must not leave a document_injected entry claiming an
+// injection the seam then refused to make. The audit fake fails EVERY append, so
+// the failure is seeded independently of the append-ordering control.
+func TestGetStagePrompt_PairedAttributionFailure_LeavesNoInjectionClaim(t *testing.T) {
+	ff := newInjFetcher()
+	ar := newStoringAuditRepo()
+	ar.listErr = errors.New("audit: chain append failed")
+	s, runID, stageID, _ := newInjectionServer(t, ar,
+		// A 4-byte cap forces truncation, so BOTH attribution appends are on the
+		// path.
+		&repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}, MaxBytes: 4},
+		injDeclarations)
+
+	docs, err := s.resolveInjectedDocuments(context.Background(),
+		&run.Run{ID: runID, Repo: "o/r"},
+		&run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement})
+	if err == nil {
+		t.Fatal("err = nil, want the attribution failure")
+	}
+	if len(docs) != 0 {
+		t.Errorf("returned %d documents after a failed attribution, want 0", len(docs))
+	}
+	for _, e := range ar.byRunID[runID] {
+		if e.Category == "document_injected" {
+			t.Errorf("a failed paired attribution persisted a document_injected entry: %s", e.Payload)
+		}
+	}
+}
+
 // TestGetStagePrompt_DeclarationSeamError_FailsClosed covers the seam's own
 // failure branch (the consumer could not enumerate its declarations).
 func TestGetStagePrompt_DeclarationSeamError_FailsClosed(t *testing.T) {

@@ -124,16 +124,83 @@ func sanitizeMetadata(s string) string {
 // could close the boundary and speak as framing — the document would stop
 // being quoted data and start being prompt. Comparison is on the
 // whitespace-trimmed line so padded forgeries are caught too.
+//
+// "Line" here means every separator form a text consumer may honour, not just
+// "\n" (see lineSeparatorWidth). Splitting on "\n" alone left a real gap: a
+// body containing "harmless\r" + endDelimiter + "\rSYSTEM: ..." is ONE "\n"
+// line whose trimmed form is not the delimiter, so it passed through
+// untouched — while a reader that honours CR (or NEL / U+2028 / U+2029) sees
+// the delimiter standing alone at column 0 and the text after it OUTSIDE the
+// data boundary. Detection must cover every form a reader might break on.
+//
+// Separators are copied through VERBATIM; only lines that forge a delimiter
+// change. The operation is idempotent — the replacement note is neither a
+// delimiter nor does it contain a separator.
 func neutralizeBody(body string) string {
 	if !strings.Contains(body, endDelimiter) && !strings.Contains(body, beginDelimiter) {
 		return body
 	}
-	lines := strings.Split(body, "\n")
-	for i, line := range lines {
-		switch strings.TrimSpace(line) {
-		case endDelimiter, beginDelimiter:
-			lines[i] = neutralizedLineNote
+	var b strings.Builder
+	b.Grow(len(body))
+	start := 0
+	for i := 0; i < len(body); {
+		w := lineSeparatorWidth(body, i)
+		if w == 0 {
+			i++
+			continue
+		}
+		b.WriteString(neutralizeLine(body[start:i]))
+		b.WriteString(body[i : i+w])
+		i += w
+		start = i
+	}
+	b.WriteString(neutralizeLine(body[start:]))
+	return b.String()
+}
+
+// neutralizeLine returns the replacement note when line IS a delimiter line,
+// and line unchanged otherwise. strings.TrimSpace trims every Unicode
+// White_Space rune — which includes CR, VT, FF, NEL, U+2028 and U+2029 — so a
+// forgery padded with any of them is caught here as well.
+func neutralizeLine(line string) string {
+	switch strings.TrimSpace(line) {
+	case endDelimiter, beginDelimiter:
+		return neutralizedLineNote
+	}
+	return line
+}
+
+// lineSeparatorWidth reports the byte width of the line separator starting at
+// s[i], or 0 when s[i] does not start one.
+//
+// The covered set is every separator a text consumer may treat as a line
+// boundary: LF, CR, CRLF (ONE separator, not two), VT, FF, U+0085 NEL,
+// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR. The question this
+// function answers is not "what does strings.Split do?" but "could a reader
+// see the next byte at column 0?" — and a form the neutralizer does not
+// recognize but a reader does is exactly a delimiter forgery that survives.
+//
+// Matching is on RAW BYTES rather than decoded runes so an invalid UTF-8
+// sequence cannot shift the scan: the multi-byte forms are matched by their
+// exact UTF-8 encodings (NEL = C2 85, U+2028 = E2 80 A8, U+2029 = E2 80 A9),
+// which cannot appear as a suffix of any other valid sequence.
+func lineSeparatorWidth(s string, i int) int {
+	switch s[i] {
+	case '\n', '\v', '\f':
+		return 1
+	case '\r':
+		if i+1 < len(s) && s[i+1] == '\n' {
+			return 2
+		}
+		return 1
+	case 0xC2: // U+0085 NEL
+		if i+1 < len(s) && s[i+1] == 0x85 {
+			return 2
+		}
+	case 0xE2: // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR
+		if i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			return 3
 		}
 	}
-	return strings.Join(lines, "\n")
+	return 0
 }

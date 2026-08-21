@@ -31,6 +31,12 @@ import (
 // what the attribution property forbids, so the caller must not fall back to
 // injecting the resolved-but-unattributed document.
 //
+// RESOLUTION IS COMPLETED BEFORE ATTRIBUTION BEGINS. The two phases are
+// ordered, not interleaved, because the audit log is append-only: an entry
+// written for document 1 cannot be withdrawn when document 2 fails to resolve,
+// so it would stand as a claim that document 1 was injected into a prompt that
+// was never served.
+//
 // PARTIAL CONFIGURATION IS A FAILURE, NOT AN INERT STATE. Inert means NO
 // declaration seam: nothing declares a document, so nothing is missing. A
 // CONFIGURED declaration seam with a nil DocumentResolver is a different thing
@@ -71,7 +77,14 @@ func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, 
 		}
 	}
 
-	out := make([]prompt.InjectedDocument, 0, len(decls))
+	// RESOLVE EVERY DECLARATION BEFORE ANY AUDIT ENTRY IS WRITTEN. Attribution
+	// used to run per document, interleaved with resolution, so a LATER
+	// declaration that failed to resolve left the EARLIER documents'
+	// document_injected entries persisted — audit claims that a document was
+	// injected into a prompt this request then refused to serve. The audit log
+	// is append-only, so the fix is ordering: nothing is claimed until the
+	// whole set is known to be resolvable.
+	docs := make([]repodoc.Document, 0, len(decls))
 	for _, decl := range decls {
 		doc, err := s.cfg.DocumentResolver.Resolve(ctx, repodoc.Request{
 			Repo:        repo,
@@ -82,13 +95,21 @@ func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, 
 		if err != nil {
 			return nil, err
 		}
-		// Attribute BEFORE the document joins the returned slice, and return
-		// nothing on failure — the injection and its audit entry ship together
-		// or not at all.
-		if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, *doc); err != nil {
-			return nil, err
-		}
-		out = append(out, repodoc.ToPromptDocument(*doc, decl.Framing))
+		docs = append(docs, *doc)
+	}
+
+	// Attribute the whole set, and return NOTHING on failure — the injection
+	// and its audit entries ship together or not at all. repodoc.Attribute
+	// orders its own appends so a failure cannot leave a successful-injection
+	// claim behind (truncations first, injection claims last, all tagged with
+	// one injection_set_id).
+	if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, docs...); err != nil {
+		return nil, err
+	}
+
+	out := make([]prompt.InjectedDocument, 0, len(docs))
+	for i, doc := range docs {
+		out = append(out, repodoc.ToPromptDocument(doc, decls[i].Framing))
 	}
 	return out, nil
 }

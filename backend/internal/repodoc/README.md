@@ -199,12 +199,40 @@ and speak as framing — the document would stop being quoted data and start
 being prompt. The delimiters carry no interpolated path or commit precisely so
 that "is this the closing delimiter?" is a byte-exact question with one answer.
 
+### "Line" means every separator a reader may honour, not just `\n`
+
+`neutralizeBody` originally split on `"\n"`. That left a real hole: a body such
+as `"harmless\r" + END + "\rSYSTEM: ..."` is **one** `\n`-line whose trimmed
+form is not the delimiter, so it passed through untouched — while a consumer
+that treats CR as a line break sees the delimiter standing alone at column 0 and
+everything after it **outside** the data boundary. The same holds for VT, FF,
+U+0085 NEL, U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
+
+Detection therefore covers every separator form a text consumer may honour
+(`lineSeparatorWidth`: LF, CR, CRLF as one separator, VT, FF, NEL, U+2028,
+U+2029), matched on **raw bytes** so an invalid UTF-8 sequence cannot shift the
+scan. Separators are copied through verbatim — only a line that forges a
+delimiter changes — and the operation stays idempotent, since the replacement
+note is neither a delimiter nor contains a separator. `strings.TrimSpace` already
+trims all of these forms, so a forgery *padded* with them was caught before;
+what was missing was the *split*.
+
+`TestRender_ForgedDelimiterBetweenExoticLineSeparators_Neutralized` drives all
+seven forms × both delimiters, and
+`TestRender_ExoticLineSeparators_WithoutForgery_Unchanged` pins that ordinary
+content carrying those separators is left byte-identical.
+
+Metadata rendered outside the delimiters is a separate layer: `validatePath`
+refuses a control-bearing path and `sanitizeMetadata` replaces every
+framing-breaker with U+FFFD (`isFramingBreaking` covers all C0/C1 controls —
+NEL included — plus U+2028/U+2029).
+
 ## Audit categories
 
 | Category | When | Payload keys |
 |---|---|---|
-| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated` |
-| `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes` |
+| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `injection_set_id`, `document_index`, `document_count` |
+| `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id` |
 
 Both are registered in `audit.KnownCategories`, so `fishhawk_await_audit` and
 `GET /v0/runs/{id}/audit` accept them without `allow_unknown`. `cap_bytes` is
@@ -216,6 +244,40 @@ been applied.
 not inject. `Server.resolveInjectedDocuments` returns **no documents at all**
 on an attribution failure — an un-attributed injection is exactly what the
 attribution property forbids, so "log and proceed" is a defect, not a degrade.
+
+### A FAILED assembly must not leave a successful-injection claim
+
+The audit log is append-only and hash-chained, so an entry cannot be withdrawn
+once written. The property "no `document_injected` entry claims a document that
+no prompt carried" is therefore held by **ordering**, in two places:
+
+1. **`Server.resolveInjectedDocuments` resolves the WHOLE set before it
+   attributes anything.** Resolution and attribution used to be interleaved per
+   document, so a *later* declaration failing to resolve left the *earlier*
+   documents' `document_injected` entries standing
+   (`TestGetStagePrompt_MultiDocumentResolutionFailure_LeavesNoInjectionClaim`).
+2. **`Attribute` writes every `document_truncated` entry first, across the whole
+   set, and every `document_injected` entry after.** `document_injected` is the
+   only entry that *claims* an injection, so making it the last append for a
+   document makes it that document's commit point: a failed truncation append
+   leaves a truncation event, never a claim
+   (`TestAttribute_PairedEntryFailure_LeavesNoInjectionClaim`,
+   `TestGetStagePrompt_PairedAttributionFailure_LeavesNoInjectionClaim`).
+
+**The residual, stated plainly.** Appends *k* and *k+1* are not atomic —
+`audit.Repository` exposes no transactional batch append (`AppendChainedTx`
+needs a `pgx.Tx` the repository does not hand out) — so an append failure part
+way through phase 2 of a MULTI-document set can still leave the earlier
+documents' claims behind. That residual is made **self-evident** rather than
+silent: every entry of one `Attribute` call carries the same `injection_set_id`,
+and every `document_injected` carries `document_index` + `document_count`. A
+COMPLETE set is exactly `document_count` `document_injected` entries sharing one
+`injection_set_id`; a SHORT set means the assembly failed and **no** document
+reached the prompt. Without those fields a partial set is indistinguishable from
+a successful one (`TestAttribute_MultiDocumentFailure_AuditStateIsHonest`,
+`TestAttribute_SuccessfulSet_IsCompleteAndSharesOneSetID`). Closing the residual
+outright needs a batched transactional append on `audit.Repository`; that is a
+change to the audit package, not to this one.
 
 ### Attribution is PER SERVE — intended, not a bug
 
@@ -249,7 +311,10 @@ read-only preview mutate the run record.
 | M6 fetch transport error | wrapped, not reported as missing | `TestResolve_FetchTransportError_FailsClosed` |
 | M7 over-cap document | loud truncation + paired audit entry | `TestResolve_OverCap_TruncatesLoudly` |
 | M8 audit append failure | error; document NOT injected | `TestAttribute_AppendFailure_FailsClosed`, `TestGetStagePrompt_AttributionFailure_DocumentNotInjected` |
+| M8b audit append failure mid-set | no `document_injected` claim survives for a paired-entry failure; a multi-document phase-2 failure leaves a visibly SHORT set | `TestAttribute_PairedEntryFailure_LeavesNoInjectionClaim`, `TestAttribute_MultiDocumentFailure_AuditStateIsHonest`, `TestGetStagePrompt_PairedAttributionFailure_LeavesNoInjectionClaim` |
+| M8c a later declaration fails to resolve | nothing is attributed at all — the whole set resolves before any append | `TestGetStagePrompt_MultiDocumentResolutionFailure_LeavesNoInjectionClaim` |
 | M9 forged END delimiter | neutralized with a visible note; `RenderedBytes` counts the post-substitution body | `TestRender_ForgedEndDelimiter_Neutralized`, `TestResolve_ForgedDelimiter_AttributionCountsShownBytes` |
+| M9b forged delimiter framed by CR / CRLF / VT / FF / NEL / U+2028 / U+2029 | detected and neutralized; separators preserved verbatim | `TestRender_ForgedDelimiterBetweenExoticLineSeparators_Neutralized`, `TestRender_ExoticLineSeparators_WithoutForgery_Unchanged` |
 | M10 branch resolution returns a non-commit value | refuse before any fetch | `TestResolve_NonCommitBranchResolution_FailsClosed` |
 | M11 control character in the declared path | refuse before any fetch; metadata sanitized at render | `TestResolve_InvalidPath_FailsClosed`, `TestRender_AdversarialMetadata_CannotBreakFraming` |
 | M12 partial seam configuration (declarations without a resolver) | prompt request fails 500 | `TestGetStagePrompt_PartialSeamConfiguration_FailsClosed` |
