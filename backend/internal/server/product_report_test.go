@@ -1246,12 +1246,27 @@ func TestProductReport_FingerprintStableAcrossWedge(t *testing.T) {
 }
 
 // TestProductReport_NotAttemptedStatusIsAlwaysCauseFree defends the
-// handler's cause-clearing guard, which the no-project happy path does
-// NOT reach: a provider that records a BoardingError while no project is
-// configured must still surface a cause-free not_attempted_no_project,
-// because a cause on a "not attempted" status is exactly the ambiguity
-// Condition 1 exists to remove. Found by running the counterfactual —
-// deleting the guard left every other test green.
+// cause-free invariant on a not-attempted status, which the no-project
+// happy path does NOT reach: a provider that records a BoardingError
+// while no project is configured must still surface a cause-free
+// not_attempted_no_project, because a cause on a "not attempted" status
+// is exactly the ambiguity Condition 1 exists to remove. Found by running
+// the counterfactual — deleting the guard left every other test green.
+//
+// HONEST SCOPE (observed, not reasoned — #1737 fix-up pass). The handler
+// defends this invariant with a REDUNDANT PAIR: the `== failed` gate
+// around the BoardingError assignment, and the trailing
+// `!= failed -> BoardingError = ""` re-assertion. Deleting EITHER ONE
+// alone leaves this test GREEN, because the survivor still clears or
+// still withholds the cause; the test goes RED only when BOTH are
+// removed (observed: boarding_error = "placement_failed" on a
+// not_attempted_no_project body). So this test pins the INVARIANT, not
+// either individual guard, and it is not a single-deletion
+// counterfactual vehicle for either one. That redundancy is deliberate
+// (see the handler comment calling the trailing clear a positive
+// re-assertion) and the pairing is what makes a future edit to one arm
+// non-fatal — but a reader must not read this test as proof that either
+// arm is independently load-bearing.
 func TestProductReport_NotAttemptedStatusIsAlwaysCauseFree(t *testing.T) {
 	// The provider reports a cause even though nothing was boardable.
 	fp := &fakeFeedbackProvider{boardErr: "stale cause from a provider that should not have tried"}
