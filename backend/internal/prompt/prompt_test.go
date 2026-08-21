@@ -9184,3 +9184,222 @@ func TestBuild_ImplementFixup_ReportObligations_PRBodyMarksBullet(t *testing.T) 
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Injected repo-authored documents (E55.1 / #2242).
+// ---------------------------------------------------------------------------
+
+// injectedDocFixture is one rendered document as repodoc.ToPromptDocument would
+// hand it over — plain data, already framed and delimited.
+func injectedDocFixture() InjectedDocument {
+	return InjectedDocument{
+		Heading:     "Repository review conventions",
+		Body:        "This repository declares the conventions below.\n\n----- BEGIN REPO-AUTHORED DOCUMENT -----\nPrefer narrow interfaces.\n----- END REPO-AUTHORED DOCUMENT -----\n",
+		Path:        ".fishhawk/review-conventions.md",
+		Commit:      "0123456789abcdef0123456789abcdef01234567",
+		ContentHash: "sha256:abc",
+	}
+}
+
+// injectionStageTriggers returns one trigger per stage type that renders
+// injected documents, keyed by the stage string Build dispatches on.
+func injectionStageTriggers(docs []InjectedDocument) map[string]Trigger {
+	base := func() Trigger {
+		return Trigger{
+			Source:            "github_issue",
+			Repo:              "o/r",
+			IssueNumber:       42,
+			IssueTitle:        "t",
+			InjectedDocuments: docs,
+		}
+	}
+	implementReview := base()
+	implementReview.Diff = "diff --git a/x b/x\n"
+	planReview := base()
+	planReview.ApprovedPlan = &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "s",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+	}
+	implement := base()
+	implement.ApprovedPlan = planReview.ApprovedPlan
+	return map[string]Trigger{
+		"plan":             base(),
+		"implement":        implement,
+		"plan_review":      planReview,
+		"implement_review": implementReview,
+	}
+}
+
+// splitMarkerForStage names the split marker each stage prompt is REQUIRED to
+// carry. A review prompt has exactly one; plan and implement prompts have none,
+// and must carry neither — a marker appearing there would mean the boundary the
+// caching adapters key on moved.
+func splitMarkerForStage(stageType string) (name, value string, required bool) {
+	switch stageType {
+	case "plan_review":
+		return "PlanReviewSplitMarker", PlanReviewSplitMarker, true
+	case "implement_review":
+		return "ImplementReviewSplitMarker", ImplementReviewSplitMarker, true
+	default:
+		return "", "", false
+	}
+}
+
+// TestBuild_InjectedDocument_LandsInCacheStablePrefix pins the placement
+// contract: the injected block leads the cache-stable prefix, ahead of the
+// review split marker, so a per-repo-stable document costs nothing incremental
+// across a stage's fix-up re-review rounds.
+//
+// The marker comparison is UNCONDITIONAL for the stages that have one: an
+// absent marker fails the subtest rather than silently skipping the offset
+// comparison, so this cannot degrade into an assertion that checks nothing.
+func TestBuild_InjectedDocument_LandsInCacheStablePrefix(t *testing.T) {
+	doc := injectedDocFixture()
+	for stageType, trig := range injectionStageTriggers([]InjectedDocument{doc}) {
+		t.Run(stageType, func(t *testing.T) {
+			got, err := Build(stageType, trig)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stageType, err)
+			}
+			headingAt := strings.Index(got, "### "+doc.Heading)
+			if headingAt < 0 {
+				t.Fatalf("injected document heading absent from the %s prompt:\n%s", stageType, got)
+			}
+			if !strings.Contains(got, doc.Body) {
+				t.Errorf("%s prompt does not carry the rendered body verbatim", stageType)
+			}
+			name, value, required := splitMarkerForStage(stageType)
+			if !required {
+				// Nothing to order against — assert the absence instead, so the
+				// two halves of this table stay exhaustive.
+				for _, marker := range []struct{ name, value string }{
+					{"ImplementReviewSplitMarker", ImplementReviewSplitMarker},
+					{"PlanReviewSplitMarker", PlanReviewSplitMarker},
+				} {
+					if at := strings.Index(got, marker.value); at >= 0 {
+						t.Errorf("%s: unexpected %s at %d — update splitMarkerForStage and order against it",
+							stageType, marker.name, at)
+					}
+				}
+				return
+			}
+			at := strings.Index(got, value)
+			if at < 0 {
+				t.Fatalf("%s prompt has no %s — there is no boundary to order against:\n%s", stageType, name, got)
+			}
+			if headingAt > at {
+				t.Errorf("%s: injected block at %d falls AFTER %s at %d — it must lead the cache-stable prefix",
+					stageType, headingAt, name, at)
+			}
+		})
+	}
+}
+
+// preChangeInjectionSpans freezes, for every stage prompt that gained the
+// injected-document writer, the span of the PRE-#2242 render that BRACKETS the
+// point where writeInjectedDocuments now emits. Each `want` was captured by
+// building the same fixture trigger against prompt.go as it stood at commit
+// 880575c7 — the commit BEFORE this mechanism existed. That is what makes the
+// byte-identity claim checkable: the assertion compares today's bytes against
+// the PRE-CHANGE bytes, not against a second render by the same code, which is
+// equal by construction whatever the writer does (a writer emitting an
+// identical stray blank line for both nil and empty slices would satisfy a
+// same-code comparison and fail this one). When the wording inside a span is
+// deliberately changed, regenerate the constant and say so.
+var preChangeInjectionSpans = map[string]struct{ start, end, want string }{
+	"plan": {
+		start: "You are drafting an implementation plan",
+		end:   "Stage budget (ADR-025)",
+		want:  "You are drafting an implementation plan for a change in the repository `o/r`.\n\nTriggering issue: #42\nTitle: t\n\n",
+	},
+	"implement": {
+		start: "You are implementing a change",
+		end:   "Approved plan (binding instruction)",
+		want:  "You are implementing a change in the repository `o/r`.\n\n",
+	},
+	"plan_review": {
+		start: "will be rejected.",
+		end:   "REPOSITORY ACCESS",
+		want:  "will be rejected.\n\n",
+	},
+	"implement_review": {
+		start: "will be rejected.",
+		end:   "REPOSITORY ACCESS",
+		want:  "will be rejected.\n\n",
+	},
+}
+
+// TestBuild_NoInjectedDocuments_ByteIdentical is the byte-identity guarantee:
+// with no declared document every stage prompt that gained the writer renders
+// the injection point exactly as the PRE-#2242 prompt did — asserted against
+// the frozen pre-change spans above, for a nil slice AND an empty slice.
+func TestBuild_NoInjectedDocuments_ByteIdentical(t *testing.T) {
+	nilDocs := injectionStageTriggers(nil)
+	emptyDocs := injectionStageTriggers([]InjectedDocument{})
+	for stageType, span := range preChangeInjectionSpans {
+		t.Run(stageType, func(t *testing.T) {
+			// The frozen golden must not itself carry an injected block — a
+			// golden regenerated from POST-change code would pass silently.
+			for _, marker := range []string{"REPO-AUTHORED DOCUMENT", "### Repository review conventions"} {
+				if strings.Contains(span.want, marker) {
+					t.Fatalf("the frozen pre-change span contains %q; it was regenerated from post-change code", marker)
+				}
+			}
+
+			spanOf := func(t *testing.T, tr Trigger) string {
+				t.Helper()
+				got, err := Build(stageType, tr)
+				if err != nil {
+					t.Fatalf("Build(%s): %v", stageType, err)
+				}
+				i := strings.Index(got, span.start)
+				j := strings.Index(got, span.end)
+				if i < 0 || j < i {
+					t.Fatalf("%s: span anchors not found (start=%d end=%d):\n%s", stageType, i, j, got)
+				}
+				return got[i:j]
+			}
+
+			if got := spanOf(t, nilDocs[stageType]); got != span.want {
+				t.Errorf("%s: a nil InjectedDocuments slice changed the injection point from the PRE-CHANGE render.\n--- got ---\n%q\n--- want ---\n%q",
+					stageType, got, span.want)
+			}
+			if got := spanOf(t, emptyDocs[stageType]); got != span.want {
+				t.Errorf("%s: an empty InjectedDocuments slice changed the injection point from the PRE-CHANGE render.\n--- got ---\n%q\n--- want ---\n%q",
+					stageType, got, span.want)
+			}
+
+			// And nothing of the mechanism leaks anywhere else in the prompt.
+			whole, err := Build(stageType, nilDocs[stageType])
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stageType, err)
+			}
+			for _, forbidden := range []string{"REPO-AUTHORED DOCUMENT", "### Repository review conventions"} {
+				if strings.Contains(whole, forbidden) {
+					t.Errorf("%s: empty InjectedDocuments still rendered %q", stageType, forbidden)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_InjectedDocuments_RenderInDeclaredOrder pins that documents render
+// in the order the consumer supplied them.
+func TestBuild_InjectedDocuments_RenderInDeclaredOrder(t *testing.T) {
+	first := injectedDocFixture()
+	second := injectedDocFixture()
+	second.Heading = "Product charter"
+	second.Body = "charter body\n"
+	got, err := Build("implement_review", injectionStageTriggers([]InjectedDocument{first, second})["implement_review"])
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	a, b := strings.Index(got, "### "+first.Heading), strings.Index(got, "### "+second.Heading)
+	if a < 0 || b < 0 {
+		t.Fatalf("both documents must render; got indexes %d, %d", a, b)
+	}
+	if a > b {
+		t.Errorf("documents rendered out of declaration order (%d > %d)", a, b)
+	}
+}

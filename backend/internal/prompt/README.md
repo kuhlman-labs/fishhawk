@@ -349,3 +349,45 @@ render byte-identically to before the fields existed. Honesty framing is
 preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,
 never fails, re-opens, or re-budgets the pass. Long-form contract:
 `backend/internal/fixupobligation/README.md`.
+
+## Injected repo-authored documents (E55.1 / #2242)
+
+`Trigger.InjectedDocuments` carries repo-authored governance documents the
+server resolved **server-side** — a review-conventions file (E55), a product
+charter (#2234) — read from the run's BASE REF at a pinned commit and rendered
+as quoted DATA, never as a "go read this file" pointer the agent could satisfy
+from a tree it can write. `InjectedDocument` is plain data: resolution,
+base-ref pinning, size capping, content hashing and audit attribution all
+happen in `backend/internal/repodoc` before the value reaches this package.
+
+One shared writer (`writeInjectedDocuments`) serves **all four** stage prompts —
+`buildPlan`, `buildPlanReview`, `buildImplement`, `buildImplementReview` — so
+the injected block is byte-identical regardless of which stage (and which
+adapter) consumes it. Documents render in the order the consumer declared them.
+
+**Placement is the head of the cache-stable prefix**: after the opening
+sentence / ROLE CONSTRAINT preamble and BEFORE the verdict schema, the plan,
+and the issue blocks — therefore far ahead of `PlanReviewSplitMarker` and
+`ImplementReviewSplitMarker`. A governance document is per-repo stable, so
+leading with it means it is paid for once per cached prefix rather than once
+per fix-up re-review round. `TestBuild_InjectedDocument_LandsInCacheStablePrefix`
+asserts the byte offset of the injected heading precedes both split markers.
+
+**Empty renders nothing.** The writer returns before emitting any byte when the
+slice is empty — no heading, no blank line — so every prompt that declares no
+document is byte-identical to the pre-#2242 output and no golden test moves.
+That is the production posture today: the server's declaration seam is nil
+until a consumer ships a declaration site.
+
+`TestBuild_NoInjectedDocuments_ByteIdentical` asserts that claim against
+FROZEN PRE-CHANGE SPANS (`preChangeInjectionSpans`), captured by building the
+same fixture against `prompt.go` at commit 880575c7 — the commit before this
+mechanism existed — one span per stage prompt, each bracketing the point where
+the writer now emits. Comparing a nil slice against an empty slice through the
+same post-change writer would be equal by construction whatever the writer did
+(a stray blank line emitted on BOTH paths would pass); the pre-change span is
+what makes the claim checkable. Regenerate a span only when the wording inside
+it is deliberately changed, and say so.
+
+The slim fix-up prompt (`buildImplementFixup`) forks before the writer and does
+not render injected documents; see `backend/internal/repodoc/README.md`.

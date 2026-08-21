@@ -772,6 +772,38 @@ type Trigger struct {
 	// ungrounded prompt) omits the disclosure.
 	ReviewTreeSkippedSymlinks     int
 	ReviewTreeSkippedInstructions int
+
+	// InjectedDocuments carries repo-authored documents the server resolved
+	// server-side and injected into this prompt (E55.1 / #2242): a governance
+	// document (review conventions, a product charter) read from the run's
+	// BASE REF at a pinned commit, rendered as quoted DATA rather than as a
+	// "go read this file" pointer the agent could satisfy from a tree it can
+	// write. The prompt package treats these as opaque plain data — resolution,
+	// pinning, capping and audit attribution all happen in
+	// backend/internal/repodoc before the value reaches here.
+	//
+	// Rendered in the supplied order at the HEAD of the cache-stable prefix of
+	// buildPlan / buildPlanReview / buildImplement / buildImplementReview — far
+	// ahead of PlanReviewSplitMarker and ImplementReviewSplitMarker — so a
+	// per-repo-stable document costs nothing incremental across a stage's
+	// fix-up re-review rounds. EMPTY (the production default until a consumer
+	// declares a document) renders NOTHING, keeping every existing prompt
+	// byte-identical.
+	InjectedDocuments []InjectedDocument
+}
+
+// InjectedDocument is one repo-authored document rendered into a prompt.
+// It is plain data: the prompt package neither resolves nor validates it.
+// Body is the fully-rendered block BELOW the heading (framing, delimiters and
+// the document text), produced by repodoc.Render; Path, Commit, ContentHash
+// and Truncated are carried for tests and observability.
+type InjectedDocument struct {
+	Heading     string
+	Body        string
+	Path        string
+	Commit      string
+	ContentHash string
+	Truncated   bool
 }
 
 // GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
@@ -1310,6 +1342,12 @@ func buildImplement(t Trigger) string {
 	b.WriteString(quoteRepo(t.Repo))
 	b.WriteString(".\n\n")
 
+	// Injected repo-authored documents (E55.1 / #2242) lead the cache-stable
+	// prefix: they are per-repo stable, so placing them ahead of every
+	// per-run/per-round block (and far ahead of the review split markers)
+	// maximizes the cached prefix. No-op when none are declared.
+	writeInjectedDocuments(&b, t)
+
 	// Scope constraint (#541): for decomposed child runs, inject a
 	// binding SCOPE CONSTRAINT block before the plan and issue sections.
 	// The constraint names this child's scope_hint and lists sibling
@@ -1643,6 +1681,30 @@ func priorRejectionRetrievalPointer(runID string) string {
 			runID)
 	}
 	return "To recover the dropped tail: read the rejecting run's approval_submitted audit entry (rejection_comment payload key, via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion."
+}
+
+// writeInjectedDocuments renders Trigger.InjectedDocuments (E55.1 / #2242) as
+// one "### <Heading>" section per document, in the order the consumer declared
+// them. ONE shared writer serves all four stage prompts so the injected block
+// is byte-identical regardless of which stage (and which adapter) consumes it.
+//
+// Returns immediately on an empty slice — no heading, no blank line, no bytes
+// at all — so every prompt that declares no document renders exactly as it did
+// before this mechanism existed.
+func writeInjectedDocuments(b *strings.Builder, t Trigger) {
+	if len(t.InjectedDocuments) == 0 {
+		return
+	}
+	for _, d := range t.InjectedDocuments {
+		b.WriteString("### ")
+		b.WriteString(d.Heading)
+		b.WriteString("\n\n")
+		b.WriteString(d.Body)
+		if !strings.HasSuffix(d.Body, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
 }
 
 // writeApprovalConditions renders the binding "### Approval conditions" block
@@ -2781,6 +2843,12 @@ func buildPlan(t Trigger) string {
 	b.WriteString(quoteRepo(t.Repo))
 	b.WriteString(".\n\n")
 
+	// Injected repo-authored documents (E55.1 / #2242) lead the cache-stable
+	// prefix: they are per-repo stable, so placing them ahead of every
+	// per-run/per-round block (and far ahead of the review split markers)
+	// maximizes the cached prefix. No-op when none are declared.
+	writeInjectedDocuments(&b, t)
+
 	if t.DecomposeRequired {
 		b.WriteString("IMPORTANT: Your previous plan was rejected because predicted_runtime_minutes " +
 			"exceeded the implement-stage budget without a decomposition block. " +
@@ -3352,6 +3420,12 @@ func buildPlanReview(t Trigger) string {
 		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
 
+	// Injected repo-authored documents (E55.1 / #2242) lead the cache-stable
+	// prefix: they are per-repo stable, so placing them ahead of every
+	// per-run/per-round block (and far ahead of the review split markers)
+	// maximizes the cached prefix. No-op when none are declared.
+	writeInjectedDocuments(&b, t)
+
 	// Repository-access posture (#2486): grounded → name the exported tree and
 	// its commit; ungrounded → state the review is diff-only.
 	writeReviewRepoAccess(&b, t)
@@ -3658,6 +3732,12 @@ func buildImplementReview(t Trigger) string {
 		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
 		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
+
+	// Injected repo-authored documents (E55.1 / #2242) lead the cache-stable
+	// prefix: they are per-repo stable, so placing them ahead of every
+	// per-run/per-round block (and far ahead of the review split markers)
+	// maximizes the cached prefix. No-op when none are declared.
+	writeInjectedDocuments(&b, t)
 
 	// Supplemental base-rebase re-invoke framing (#1250). This pass is NOT a
 	// full re-review: the first review already covered the full diff against

@@ -1311,6 +1311,21 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
 	trigger.ImplementStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)) * time.Second
 
+	// Repo-authored document injection (E55.1 / #2242). Resolved here, AFTER
+	// both trigger-construction branches above, so every stage type this
+	// handler serves (plan, implement, and both reviews) gets the same
+	// treatment from one call. Fails the request CLOSED: serving a prompt
+	// whose declared governance document silently went missing is the failure
+	// this mechanism exists to prevent. Inert (nil, nil) until a consumer
+	// declares a document, keeping today's prompts byte-identical.
+	injected, err := s.resolveInjectedDocuments(r.Context(), runRow, stage)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+			"resolve declared repo document failed", documentInjectionErrorDetails(err))
+		return
+	}
+	trigger.InjectedDocuments = injected
+
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		if errors.Is(err, prompt.ErrUnsupportedStage) {
