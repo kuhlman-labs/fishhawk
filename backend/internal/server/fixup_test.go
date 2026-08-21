@@ -3129,11 +3129,13 @@ func TestFixupStage_PRBodyInstruction_AppendsAdvisoryAudit(t *testing.T) {
 		t.Fatalf("response pr_body_obligations = %+v, want exactly 1", resp.PRBodyObligations)
 	}
 	ob := resp.PRBodyObligations[0]
-	// The operator_concern is folded into `selected` as a synthetic concern and
-	// deduped against its own operator_concern channel, so the surviving
-	// obligation is the concern-sourced ob-1 (#2623 dedupe).
-	if ob.ID != "ob-1" || ob.Source != "concern" || ob.TextExcerpt != prBodyInstruction {
-		t.Errorf("obligation = %+v, want ob-1/concern with the PR-body excerpt", ob)
+	// The operator_concern is folded into `selected` as a synthetic concern, but
+	// buildFixupObligationSources excludes that synthetic duplicate so the
+	// surviving obligation preserves the TRUE arrival channel: operator_concern
+	// (#2782 — the warning must name the channel the instruction actually arrived
+	// on, not the "concern" channel the synthetic fold would mint).
+	if ob.ID != "ob-1" || ob.Source != "operator_concern" || ob.TextExcerpt != prBodyInstruction {
+		t.Errorf("obligation = %+v, want ob-1/operator_concern with the PR-body excerpt", ob)
 	}
 
 	payloads := prBodyUnsatisfiablePayloads(t, au)

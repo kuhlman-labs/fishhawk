@@ -481,7 +481,13 @@ func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
 	if len(fixupOut.Warnings) != 1 {
 		t.Fatalf("warnings = %+v, want exactly 1 naming the PR-body limitation", fixupOut.Warnings)
 	}
-	for _, w := range []string{"ob-1", "PULL-REQUEST BODY", "CANNOT update", "self-report sidecar"} {
+	// CROSS-BOUNDARY channel assertion (#2782): the warning names the TRUE arrival
+	// channel — operator_concern — derived by the REAL backend, not a value the
+	// test seeded. The backend folds operator_concern into a synthetic selected
+	// concern, so a naive dedupe would mis-report this instruction as arriving via
+	// "concern"; this pins that the server-minted obligation preserves the real
+	// channel end to end (the vacuity the unit-level rendering test cannot catch).
+	for _, w := range []string{"ob-1", "operator_concern", "PULL-REQUEST BODY", "CANNOT update", "self-report sidecar"} {
 		if !strings.Contains(fixupOut.Warnings[0], w) {
 			t.Errorf("warning missing %q:\n%s", w, fixupOut.Warnings[0])
 		}
@@ -510,8 +516,8 @@ func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
 	if payload.StageID != stage.ID.String() || payload.ObligationCount != 1 || len(payload.Obligations) != 1 {
 		t.Fatalf("payload = %+v, want the stage id and one obligation", payload)
 	}
-	if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].TextExcerpt != prBodyInstruction {
-		t.Errorf("audit obligation = %+v, want ob-1 with the PR-body excerpt", payload.Obligations[0])
+	if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].Source != "operator_concern" || payload.Obligations[0].TextExcerpt != prBodyInstruction {
+		t.Errorf("audit obligation = %+v, want ob-1/operator_concern with the PR-body excerpt", payload.Obligations[0])
 	}
 
 	// (c) The served fix-up prompt marks the obligation as naming a surface the

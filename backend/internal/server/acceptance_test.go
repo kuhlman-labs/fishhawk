@@ -1419,6 +1419,46 @@ func TestTriageAcceptance_Class1_Error_FixupDispatched(t *testing.T) {
 	}
 }
 
+// TestTriageAcceptance_Class1_PRBodyInstruction_AppendsAdvisoryAudit is the
+// #2782 every-routing-path pin for acceptance triage: when a synthesized
+// acceptance concern's evidence names the PR body, routing it through
+// routeAcceptanceClass1 (NOT the HTTP handler) still writes the advisory
+// fixup_pr_body_unsatisfiable audit entry inside fixupStageAs. It guards the
+// documented every-path guarantee against a refactor that moves
+// recordFixupPRBodyUnsatisfiable onto the HTTP handler. The obligation is
+// UNTRUSTED (Provenance acceptance), so its payload carries untrusted:true.
+//
+// Counterfactual: move the recordFixupPRBodyUnsatisfiable call out of
+// fixupStageAs and this goes RED — acceptance triage then appends zero
+// fixup_pr_body_unsatisfiable entries.
+func TestTriageAcceptance_Class1_PRBodyInstruction_AppendsAdvisoryAudit(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	// The failed criterion's behavioral evidence names the PR body — the surface
+	// a fix-up pass cannot write — so the synthesized concern note carries a
+	// PR-body reporting obligation.
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "failed", Observed: "record the counterfactual results in the PR body's ## Notes"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	e := findAppendedByCategory(t, au, CategoryFixupPRBodyUnsatisfiable)
+	var pl fixupPRBodyUnsatisfiablePayload
+	if err := json.Unmarshal(e.Payload, &pl); err != nil {
+		t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+	}
+	if pl.ObligationCount != 1 || len(pl.Obligations) != 1 {
+		t.Fatalf("payload = %+v, want exactly one obligation", pl)
+	}
+	ob := pl.Obligations[0]
+	if ob.ID != "ob-1" || ob.Source != "concern" || !ob.Untrusted {
+		t.Errorf("obligation = %+v, want ob-1/concern marked untrusted (acceptance-synthesized)", ob)
+	}
+}
+
 // TestTriageAcceptance_Class1_AssertionExplicit_FixupDispatched: assertion_fail
 // where every failed criterion is explicit-source routes to class-1 fix-up.
 func TestTriageAcceptance_Class1_AssertionExplicit_FixupDispatched(t *testing.T) {

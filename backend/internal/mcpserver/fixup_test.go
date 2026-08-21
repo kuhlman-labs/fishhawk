@@ -495,13 +495,18 @@ func fixupResolverReturning(t *testing.T, stageID, runID uuid.UUID, obligations 
 	return &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})}
 }
 
-// TestFixupStage_PRBodyInstruction_WarnsAtRouting is the DONE-MEANS behavioral
-// test (#1169): when the server returns a PR-body obligation, the verb's tool
-// result carries a warning that (a) names the pull-request body, (b) states a
-// fix-up pass cannot update it, (c) points at the self-report sidecar as the
-// surface that works, and (d) names the ARRIVAL CHANNEL and the server's
-// obligation id (CONDITION 2). Prose compilation cannot enforce — a comment-only
-// or no-op touch of the guard fails this.
+// TestFixupStage_PRBodyInstruction_WarnsAtRouting is the verb-level RENDERING
+// unit: GIVEN a server-minted PR-body obligation, the verb's tool result carries
+// a warning that (a) names the pull-request body, (b) states a fix-up pass
+// cannot update it, (c) points at the self-report sidecar as the surface that
+// works, and (d) echoes the obligation's arrival channel and id verbatim. It
+// injects the obligation's `source` value, so it can prove the verb RENDERS the
+// channel it is handed but NOT that the backend derives the correct channel —
+// that cross-boundary claim (an operator_concern-only pass must report
+// "operator_concern", not the synthetic "concern" fold) is pinned end to end
+// against the REAL backend response by the integration test
+// TestE2E_Fixup_PRBodyInstruction (#2782). Prose compilation cannot enforce this
+// rendering — a comment-only or no-op touch of the guard fails it.
 //
 // Counterfactual: replace the prBodyInstructionWarnings call in fixupStage with
 // nil and this goes RED (no warning).

@@ -850,7 +850,25 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 // is deduped inside Detect, exactly as on the prompt-serve path.
 func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern, reason string) []fixupobligation.Source {
 	sources := make([]fixupobligation.Source, 0, len(concerns)+2)
+	trimmedOperator := strings.TrimSpace(operatorConcern)
 	for _, c := range concerns {
+		// Skip the SYNTHETIC [high/operator] concern that handleFixupStage folds
+		// into `selected` from the free-text operator_concern (#1311): it carries
+		// the SAME note text as the operator_concern arg below, so if it were
+		// emitted as a SourceConcern, Detect's text-dedupe would retain the
+		// concern channel and mis-report the instruction as having ARRIVED via
+		// "concern" — the #2782 fix-up defect: an operator_concern-only pass's
+		// warning then names the wrong arrival channel. Excluding it here lets the
+		// explicit SourceOperatorConcern below carry the instruction, so the
+		// server-minted obligation preserves the TRUE operator_concern channel and
+		// the routing-time warning names it. Identified by BOTH the operator
+		// category AND the matching note, so a real review concern (never both) is
+		// never dropped. The exclusion is applied at this single shared site, so
+		// the routing-time warning and the review-time re-derivation stay
+		// id-identical (they both call buildFixupObligationSources).
+		if trimmedOperator != "" && c.Category == operatorConcernCategory && strings.TrimSpace(c.Note) == trimmedOperator {
+			continue
+		}
 		// The RAW note, not the "[severity/category] note" render — the
 		// operator_concern dedupe compares against the minted concern's note
 		// text (#2623), so the channels must be comparable. Carry the concern's
