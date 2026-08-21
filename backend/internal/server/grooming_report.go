@@ -91,7 +91,7 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 		return
 	}
 
-	// Validate against grooming-report-v1 plus the four semantic rules the
+	// Validate against grooming-report-v1 plus the five semantic rules the
 	// schema cannot express (report-wide id uniqueness, id class prefix, id
 	// recomposition, rank permutation). An invalid report is the agent's bad
 	// output: fail category-B and walk the run to terminal, exactly as the

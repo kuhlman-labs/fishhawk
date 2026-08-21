@@ -186,7 +186,15 @@ lowercase by construction (they are the schema enum values).
 3. **An entry's id recomposes** from its own `item_ref` / `pair` / `from`+`to` and
    qualifier via `GroomingEntryID`. This is the control that makes run-over-run
    stability mechanical rather than aspirational.
-4. **The `ordering` ranks are exactly the permutation `1..N`.** A duplicated or
+4. **A `duplicates` pair and a `dependency_edges` edge relate two DISTINCT
+   items.** Endpoint identity is the derived **item key**, not the raw
+   `item_ref` object, so two refs differing only in `url` or in `id` casing are
+   the same endpoint here exactly as they are in the id. Every other rule
+   accepts the degenerate case — `duplicate:<k>+<k>` and `dependency:<k>+<k>`
+   recompose from their own refs and are unique — so without this rule "item A
+   duplicates item A" and "item A depends_on item A" would reach the operator
+   gate, and #2240's diff, as proposals with no actionable content.
+5. **The `ordering` ranks are exactly the permutation `1..N`.** A duplicated or
    gapped rank is not an applicable proposal.
 
 ## Workflow declaration
@@ -243,7 +251,7 @@ documented on `ensureGovernanceAuditEntry`.
 | Code | HTTP | Meaning |
 |---|---|---|
 | `grooming_report_stage_invalid` | 400 | Shipped from a stage whose type is not `plan`. Fails the stage category-B — re-shipping the same bytes cannot help. |
-| `grooming_report_invalid` | 400 | Fails `grooming-report-v1` schema validation or one of the four semantic rules. Category-B. |
+| `grooming_report_invalid` | 400 | Fails `grooming-report-v1` schema validation or one of the five semantic rules. Category-B. |
 
 ## Size
 

@@ -13344,7 +13344,7 @@ paths:
             - `clarification_request_invalid` — the clarification sibling
               failed `clarification-request-v1` or its unique-question-id rule.
             - `grooming_report_invalid` — the grooming report failed
-              `grooming-report-v1` or one of its four semantic rules
+              `grooming-report-v1` or one of its five semantic rules
               (report-wide entry-id uniqueness, id class prefix, id
               recomposition from the entry's own item reference, ordering
               ranks forming the permutation 1..N). Fails the stage category-B.

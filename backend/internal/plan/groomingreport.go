@@ -255,7 +255,7 @@ func GroomingEntryID(class string, qualifier string, refs ...ItemRef) string {
 }
 
 // ValidateGroomingReport validates bytes against the grooming-report-v1 schema
-// and then enforces the four semantic invariants the schema cannot express
+// and then enforces the five semantic invariants the schema cannot express
 // (see docs/spec/grooming-report-v1.md § "Semantic rules"):
 //
 //   - entry ids are UNIQUE across the whole report — the id is the join key
@@ -266,6 +266,10 @@ func GroomingEntryID(class string, qualifier string, refs ...ItemRef) string {
 //   - an entry's id RECOMPOSES from its own item refs and qualifier via
 //     GroomingEntryID — the control that makes run-over-run id stability
 //     mechanical, since a per-run-minted id cannot recompose;
+//   - a duplicate PAIR and a dependency EDGE relate two DISTINCT items — "A
+//     duplicates A" and "A depends_on A" are degenerate: they validate against
+//     every other rule (their derived ids recompose and are unique) yet state
+//     nothing an operator could act on;
 //   - the ordering ranks are exactly the permutation 1..N — a duplicated or
 //     gapped rank is not an applicable proposal.
 //
@@ -327,7 +331,7 @@ type groomingEntry struct {
 	field string
 }
 
-// groomingSemanticCheck runs the four rules ValidateGroomingReport documents.
+// groomingSemanticCheck runs the five rules ValidateGroomingReport documents.
 func groomingSemanticCheck(gr *GroomingReport) error {
 	entries := collectGroomingEntries(gr)
 
@@ -349,6 +353,12 @@ func groomingSemanticCheck(gr *GroomingReport) error {
 				"%s: entry id %q is not derived from its own item reference(s); expected %q. Entry ids MUST be derived, never minted per run — a per-run id makes the run-over-run report diff (#2240) impossible. See docs/spec/grooming-report-v1.md § Entry-id derivation",
 				e.field, e.declaredID, e.derivedID)}
 		}
+	}
+
+	// Rule (e): a two-endpoint relation relates two DISTINCT items. Checked
+	// after recomposition so a malformed id is reported as a malformed id.
+	if err := checkGroomingEndpointsDistinct(gr); err != nil {
+		return err
 	}
 
 	// Rule (a): ids are unique across the WHOLE report, not per-array.
@@ -428,6 +438,35 @@ func collectGroomingEntries(gr *GroomingReport) []groomingEntry {
 		})
 	}
 	return out
+}
+
+// checkGroomingEndpointsDistinct rejects a self-referential duplicate pair or
+// dependency edge (#2235 fix-up). Both classes relate TWO items, and every
+// other rule accepts the degenerate case: "duplicate:<k>+<k>" and
+// "dependency:<k>+<k>" recompose from their own refs and are unique, so
+// "item A duplicates item A" / "item A depends_on item A" would reach the
+// operator gate and #2240's diff as a proposal with no actionable content.
+//
+// Identity is the derived ITEM KEY, not the raw ItemRef: the key is what the
+// entry id — and therefore every downstream join — is built from, so two refs
+// that differ only in `url` or in `id` casing are the same item here exactly as
+// they are there.
+func checkGroomingEndpointsDistinct(gr *GroomingReport) error {
+	for i, e := range gr.Duplicates {
+		if len(e.Pair) == 2 && itemKey(e.Pair[0]) == itemKey(e.Pair[1]) {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/duplicates/%d/pair: both entries reference the same item (%s); a duplicate pair must relate two DISTINCT items — \"A duplicates A\" is not an actionable proposal",
+				i, itemKey(e.Pair[0]))}
+		}
+	}
+	for i, e := range gr.DependencyEdges {
+		if itemKey(e.From) == itemKey(e.To) {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/dependency_edges/%d: from and to reference the same item (%s); a dependency edge must relate two DISTINCT items — \"A depends_on A\" is not an actionable proposal",
+				i, itemKey(e.From))}
+		}
+	}
+	return nil
 }
 
 // checkGroomingRanks enforces that the ordering ranks are exactly the

@@ -268,6 +268,66 @@ func TestValidateGroomingReport_GappedRank_Rejected(t *testing.T) {
 	}
 }
 
+// TestValidateGroomingReport_SelfReferentialPair_Rejected and
+// _SelfReferentialEdge_Rejected pin the distinctness rule. Both fixtures are
+// self-paired BY CONSTRUCTION — the same item on both endpoints, and each id is
+// the CORRECT derivation of that degenerate pair/edge — so every other semantic
+// rule accepts them: the class prefix matches, the id recomposes, it is unique,
+// and no ordering rank is touched. Each therefore reddens only on the
+// distinctness rule, and each asserts the rule's own message rather than merely
+// "some *SemanticError".
+func TestValidateGroomingReport_SelfReferentialPair_Rejected(t *testing.T) {
+	body := groomingDoc(
+		`[{"id":"ordering:github/kuhlman-labs/fishhawk#2235","item_ref":`+gr2235Ref+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
+		`[{"id":"duplicate:github/kuhlman-labs/fishhawk#2235+github/kuhlman-labs/fishhawk#2235","pair":[`+gr2235Ref+`,`+gr2235Ref+`],"basis":"identical title","confidence":"high"}]`,
+		`[]`, `[]`, `[]`, `[]`)
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "must relate two DISTINCT items") {
+		t.Errorf("SemanticError should be the distinctness rejection; got %v", se)
+	}
+	if !strings.Contains(se.Error(), "/duplicates/0/pair") {
+		t.Errorf("SemanticError should name the offending entry; got %v", se)
+	}
+}
+
+func TestValidateGroomingReport_SelfReferentialEdge_Rejected(t *testing.T) {
+	body := groomingDoc(
+		`[{"id":"ordering:github/kuhlman-labs/fishhawk#2235","item_ref":`+gr2235Ref+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
+		`[]`, `[]`,
+		`[{"id":"dependency:github/kuhlman-labs/fishhawk#2235+github/kuhlman-labs/fishhawk#2235","from":`+gr2235Ref+`,"to":`+gr2235Ref+`,"basis":"self","kind":"depends_on"}]`,
+		`[]`, `[]`)
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "must relate two DISTINCT items") {
+		t.Errorf("SemanticError should be the distinctness rejection; got %v", se)
+	}
+	if !strings.Contains(se.Error(), "/dependency_edges/0") {
+		t.Errorf("SemanticError should name the offending entry; got %v", se)
+	}
+}
+
+// TestValidateGroomingReport_DistinctEndpointsAccepted is the distinctness
+// rule's positive control: the same two classes with DIFFERENT endpoints stay
+// valid, so the rule rejects the degenerate case and nothing wider.
+func TestValidateGroomingReport_DistinctEndpointsAccepted(t *testing.T) {
+	body := groomingDoc(
+		`[{"id":"ordering:github/kuhlman-labs/fishhawk#2235","item_ref":`+gr2235Ref+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
+		`[{"id":"duplicate:github/kuhlman-labs/fishhawk#2235+github/kuhlman-labs/fishhawk#2240","pair":[`+gr2235Ref+`,`+gr2240Ref+`],"basis":"overlap","confidence":"low"}]`,
+		`[]`,
+		`[{"id":"dependency:github/kuhlman-labs/fishhawk#2240+github/kuhlman-labs/fishhawk#2235","from":`+gr2240Ref+`,"to":`+gr2235Ref+`,"basis":"needs the schema first","kind":"depends_on"}]`,
+		`[]`, `[]`)
+	if err := plan.ValidateGroomingReport(body); err != nil {
+		t.Fatalf("ValidateGroomingReport(distinct endpoints): err = %v, want nil", err)
+	}
+}
+
 // TestGroomingEntryID_DependencyDirectionPreserved is condition F1's proof: a
 // depends_on edge is DIRECTIONAL, so A→B and B→A derive DIFFERENT ids and
 // coexist in one report without tripping report-wide id uniqueness. A duplicate

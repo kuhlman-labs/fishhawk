@@ -78,7 +78,7 @@ import "sort"
 // and document_truncated (written IN ADDITION when the document exceeded the
 // effective cap, naming the cap and the dropped-byte count). Both are written
 // per prompt SERVE, so a retry or re-dispatch attributes again — the guarantee
-// is that every injection is attributed. When a new
+// is that every injection is attributed.
 // E54.3 / #2235 added grooming_report_recorded, written once per ingested
 // grooming_report artifact on POST /v0/runs/{run_id}/plan (the plan-stage
 // discriminator's second additive sibling) carrying the artifact's content hash
