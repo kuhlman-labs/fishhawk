@@ -690,9 +690,15 @@ func TestValidateAcceptanceVerdict_UndecidableReasonPresence(t *testing.T) {
 			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true},
 		{"absent-on-undecidable-row-rejected",
 			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true},
+		// \t and \n here are the two-character JSON ESCAPE sequences (a Go raw
+		// string leaves them uninterpreted), so the decoder turns them into real
+		// whitespace and the TrimSpace rule is what rejects the row. Embedding
+		// LITERAL control characters instead makes the body malformed JSON —
+		// encoding/json rejects it with "invalid character '\t' in string
+		// literal" before the rule is ever reached, and the subtest then goes
+		// green for the wrong reason, surviving deletion of the trim check.
 		{"whitespace-only-on-undecidable-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  	
- "}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, true},
 		{"non-empty-on-undecidable-row-accepted",
 			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false},
 	}

@@ -1909,6 +1909,90 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 	}
 }
 
+// TestNextActions_AcceptanceFailedVerdict_NoTriageDisposition pins the arm for
+// the state the #2512 severity ladder made newly REACHABLE: a recorded `failed`
+// acceptance verdict with NO acceptance_triage_decided disposition.
+//
+// A body the agent ships as `passed` carrying a `failed` criterion row records
+// `failed` (acceptanceVerdictAtLeast) and gates the merge at
+// acceptanceGateTriage, but handleShipAcceptance keys triage on the AGENT's own
+// failed claim, so no classifier runs and no disposition is written. Before
+// #2512 every recorded failed verdict got a disposition, so this arm was
+// unreachable and the empty-disposition case fell to the rerouting POLL — which
+// would tell the operator to wait for a re-opened stage that never appears.
+//
+// The load-bearing assertion is that the arm surfaces
+// fishhawk_arbitrate_acceptance: it is the only verb that discharges
+// acceptanceGateTriage for this outcome, so without it the run's merge gate is
+// undischargeable in-loop.
+func TestNextActions_AcceptanceFailedVerdict_NoTriageDisposition(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+
+	na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+		naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+		acceptanceVerdictFailed, "", releaseSignals{})
+	if na == nil {
+		t.Fatal("nextActionsFor returned nil")
+	}
+	if na.State != "acceptance_triage_no_disposition" {
+		t.Fatalf("state = %q, want acceptance_triage_no_disposition (NOT the rerouting poll arm)", na.State)
+	}
+	got := actionNames(na)
+	want := []string{
+		"fishhawk_list_audit",
+		"fishhawk_fixup_stage",
+		"fishhawk_arbitrate_acceptance",
+		"merge_and_file_follow_up",
+		"fishhawk_cancel_run",
+		"fishhawk_get_run_status",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("actions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("actions[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+	// The leading audit read must describe the NO-disposition case, not the
+	// paged-disposition case it is derived from — an operator reading a
+	// precondition that claims a paged disposition landed would go looking for
+	// an acceptance_triage_decided entry that does not exist.
+	if strings.Contains(firstPrecondition(na), "landed on a paged triage disposition") {
+		t.Error("leading audit-read precondition still claims a paged disposition landed")
+	}
+	if !strings.Contains(firstPrecondition(na), "NO acceptance_triage_decided disposition") {
+		t.Errorf("leading audit-read precondition does not name the no-disposition case: %q", firstPrecondition(na))
+	}
+	// Every action still carries the structured fields.
+	for i, a := range na.Actions {
+		if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
+			t.Errorf("actions[%d] (%s) missing precondition/consumes/reason: %+v", i, a.Action, a)
+		}
+	}
+
+	// The rewrite must not leak into the PAGED arm, which shares the same
+	// underlying action list — acceptanceTriagePagedActions returns a fresh
+	// slice per call, so mutating element 0 here must leave the paged arm's own
+	// precondition intact.
+	pagedNA := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+		naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+		acceptanceVerdictFailed, acceptanceDispositionPaged, releaseSignals{})
+	if pagedNA == nil || !strings.Contains(firstPrecondition(pagedNA), "landed on a paged triage disposition") {
+		t.Errorf("paged arm's leading precondition was clobbered by the no-disposition rewrite: %+v", pagedNA)
+	}
+}
+
+// firstPrecondition returns the first suggested action's precondition.
+func firstPrecondition(na *NextActions) string {
+	if na == nil || len(na.Actions) == 0 {
+		return ""
+	}
+	return na.Actions[0].Precondition
+}
+
 // TestNextActions_AcceptanceTriagePaged_EveryDisposition covers mode (5): each
 // paged-family disposition routes to acceptance_triage_paged with the
 // read-evidence-then-arbitrate arm. Table-driven over the vocabulary, pinning
@@ -2280,7 +2364,10 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	// failed arm: paged + rerouting states both carry the drive triage prefix.
 	paged := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, acceptanceDispositionPaged).State
 	rerouting := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, acceptanceDispositionFixupDispatched).State
-	for _, st := range []string{paged, rerouting} {
+	// #2512: the empty-disposition arm is a THIRD failed-arm state, so it must
+	// carry the same drive triage prefix.
+	noDisposition := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, "").State
+	for _, st := range []string{paged, rerouting, noDisposition} {
 		if !strings.HasPrefix(st, string(drive.RuleAcceptanceTriage)) {
 			t.Errorf("failed-arm state %q does not carry the drive triage prefix %q", st, drive.RuleAcceptanceTriage)
 		}

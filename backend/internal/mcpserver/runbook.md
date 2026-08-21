@@ -555,6 +555,20 @@ after `fixup_dispatched`, the **acceptance** stage after `retry_dispatched`.
 `next_actions` surfaces this as the `acceptance_triage_rerouting` state; on the
 next snapshot the re-opened stage's own dispatch arm serves the move.
 
+**A failed verdict with NO triage disposition (#2512).** The severity-monotone
+ladder makes this reachable by design: a body the acceptance agent ships as
+`passed` that carries a `failed` criterion row is RECORDED `failed` and gates the
+merge at `acceptance_triage`, but the deterministic triage keys on the agent's
+OWN failed claim — which this body does not make — so no classifier runs and no
+`acceptance_triage_decided` entry is ever written. `next_actions` surfaces this
+as `acceptance_triage_no_disposition`: the same arbitration menu as the paged arm
+(read the evidence, then `fishhawk_fixup_stage` /
+`fishhawk_arbitrate_acceptance` / `merge_and_file_follow_up` /
+`fishhawk_cancel_run`), plus a trailing poll for the other reading of an empty
+disposition — one that was decided but has not landed in, or has aged out of, the
+recent-audit window. Do NOT wait for an auto-routed re-open here: none is coming,
+and `fishhawk_arbitrate_acceptance` is the only verb that discharges the gate.
+
 **Paged arbitration.** For a paged-family disposition, `next_actions` gives the
 `acceptance_triage_paged` arm: read the evidence first (`fishhawk_list_audit` on
 `acceptance_outcome_recorded` for the criteria results and

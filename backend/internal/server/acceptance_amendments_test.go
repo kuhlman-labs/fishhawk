@@ -681,6 +681,100 @@ func TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun(t *testing.T)
 	}
 }
 
+// TestDowngrade_ShippedPassed_D1GuardLivesInTheFunction pins that
+// acceptanceDowngrade's D1 verdict==failed precondition is enforced INSIDE the
+// function, not by its call site.
+//
+// #2512 made the downgrade block in handleShipAcceptance UNCONDITIONAL — the
+// retired-id set is now resolved for EVERY shipped verdict, because the
+// precedence ladder needs it regardless of what the agent shipped. Before that,
+// `acc.Verdict == failed` was also the call-site gate. If D1 had relied on that
+// gate, a shipped `passed` verdict whose failed rows all name retired criteria
+// would now set downgradedVerdict, emit the "failed verdict neutralized" log
+// line, and attach downgrade_basis + retired_criterion_ids to the payload of a
+// PASSED outcome — a misleading log and spurious audit-payload keys on the
+// governance chain.
+//
+// Layer 1 calls acceptanceDowngrade DIRECTLY with a shipped `passed` body whose
+// only failed row is the retired criterion — the shape that satisfies D2/D3/D4
+// and is therefore rejected by D1 ALONE. Layer 2 pins the observable
+// consequence at the ingest seam: the recorded verdict is `passed` either way
+// (the non-retired rows all pass, so the ladder derives `passed`), which is
+// exactly why the discriminating assertion is the ABSENCE of the two
+// downgrade-specific payload keys rather than the verdict itself.
+//
+// OBSERVED counterfactual (run, not reasoned). Deleting ONLY
+// `acc.Verdict != acceptanceVerdictFailed ||` from D1 reddens layer 1 and leaves
+// layer 2 GREEN. That is a finding worth stating plainly rather than papering
+// over: at the INGEST seam the verdict half of D1 is REDUNDANT for this body,
+// because the wire validator forbids failure_mode on a passed verdict, so
+// acc.FailureMode is always "" there and D1's OTHER half refuses the downgrade
+// on its own. Layer 2 does go RED when BOTH halves of D1 are removed (verified:
+// downgrade_basis + retired_criterion_ids appear on a passed outcome).
+//
+// So the two layers defend different things and both are kept: layer 1 is the
+// only vehicle that isolates the verdict half of D1 — the half the now-removed
+// call-site gate used to duplicate, which is what this concern is about — and
+// layer 2 pins the observable end-to-end property (a shipped PASSED verdict
+// never acquires downgrade provenance on the governance chain) against D1 being
+// weakened in any way at all.
+func TestDowngrade_ShippedPassed_D1GuardLivesInTheFunction(t *testing.T) {
+	// Layer 1 — the pure function. D2 (every failed row retired), D3 (crit-1 and
+	// crit-3 survive) and D4 (no surviving skipped/undecidable row) all HOLD, so
+	// D1's verdict check is the only thing that can refuse the downgrade.
+	acc := acceptanceBody{Verdict: acceptanceVerdictPassed, FailureMode: acceptanceFailureAssertionFail}
+	acc.normalizedCriteria = []acceptanceCriterionResult{
+		{ID: "crit-1", Result: acceptanceResultPassed},
+		{ID: "crit-2", Result: acceptanceResultFailed},
+		{ID: "crit-3", Result: acceptanceResultPassed},
+	}
+	eff := effectiveAcceptanceCriteria{
+		Live:    []plan.AcceptanceCriterion{{ID: "crit-1"}, {ID: "crit-3"}},
+		Retired: []retiredCriterion{{ID: "crit-2", Reason: "superseded", Source: "approval"}},
+		AllIDs:  []string{"crit-1", "crit-2", "crit-3"},
+	}
+	// Errorf, not Fatalf: layer 2 below is defended by D1's OTHER half, so it
+	// must still run and report independently when this one trips.
+	if down, ids, basis := acceptanceDowngrade(acc, eff); down {
+		t.Errorf("acceptanceDowngrade downgraded a shipped PASSED verdict (ids=%v basis=%q) — D1's verdict half is relying on the removed call-site gate", ids, basis)
+	}
+	// Discriminator: the SAME fixture with the shipped verdict flipped to failed
+	// DOES downgrade, so layer 1 above is refused by D1 and not by an unrelated
+	// precondition silently failing.
+	acc.Verdict = acceptanceVerdictFailed
+	if down, _, _ := acceptanceDowngrade(acc, eff); !down {
+		t.Fatal("the failed-verdict twin did NOT downgrade — the fixture does not isolate D1")
+	}
+
+	// Layer 2 — the ingest seam. The downgrade block runs unconditionally now, so
+	// a shipped passed verdict must still record NO downgrade provenance. Note
+	// (see the counterfactual above) that this layer is held by D1's
+	// failure_mode half, not its verdict half: a passed verdict carries no
+	// failure_mode by wire rule.
+	runID, stageID := uuid.New(), uuid.New()
+	srv, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+	)
+	if w := shipAcceptanceRequest(t, srv, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed (crit-2 is retired, so the ladder sees only passing rows)", payload["verdict"])
+	}
+	for _, key := range []string{"downgrade_basis", "retired_criterion_ids", "verdict_reported"} {
+		if _, present := payload[key]; present {
+			t.Errorf("payload carries %q on a shipped PASSED verdict: %v", key, payload)
+		}
+	}
+}
+
 // TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable is the
 // paired positive for the ordering above: when NO retirement is in play, a
 // surviving undecidable row DOES reach the ladder and records undecidable. It
