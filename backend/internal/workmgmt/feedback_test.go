@@ -45,3 +45,85 @@ func TestGetFeedback_RegisteredAndUnknown(t *testing.T) {
 		t.Errorf("RegisteredFeedback() = %v, want it to include github_projects", RegisteredFeedback())
 	}
 }
+
+// TestBoardingStatusOf covers every arm of the boarding-outcome
+// classification (#1737). The point of the enum is that boarded=false
+// alone cannot tell an operator whether there was nothing to board or
+// whether placement was tried and failed, so each arm is pinned
+// separately rather than only the happy path.
+func TestBoardingStatusOf(t *testing.T) {
+	proj := &Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}
+	tests := []struct {
+		name    string
+		target  Target
+		created *CreatedItem
+		want    string
+	}{
+		{
+			name:   "dedup hit created nothing to board",
+			target: Target{Project: proj},
+			want:   BoardingStatusNotAttemptedNoReport,
+		},
+		{
+			name:    "no project configured is a configuration state not an error",
+			target:  Target{},
+			created: &CreatedItem{Number: 7},
+			want:    BoardingStatusNotAttemptedNoProject,
+		},
+		{
+			name:    "placement attempted and failed",
+			target:  Target{Project: proj},
+			created: &CreatedItem{Number: 7, BoardingError: "projects API 403"},
+			want:    BoardingStatusFailed,
+		},
+		{
+			name:    "boarded",
+			target:  Target{Project: proj},
+			created: &CreatedItem{Number: 7, Boarded: true},
+			want:    BoardingStatusBoarded,
+		},
+		{
+			name:    "project configured but provider neither boarded nor named a cause",
+			target:  Target{Project: proj},
+			created: &CreatedItem{Number: 7},
+			want:    BoardingStatusFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := BoardingStatusOf(tt.target, tt.created); got != tt.want {
+				t.Errorf("BoardingStatusOf = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBoardingStatus_NoProjectDistinctFromFailure is the Condition-1 pin,
+// in its own test because it is the contract an operator reads: the
+// no-project arm must NOT masquerade as a failure. The distinguishing
+// signal is the STATUS.
+//
+// The no-cause half of that contract is NOT asserted here and used to be:
+// BoardingStatusOf is a pure classifier that never mutates its argument,
+// so re-reading the CreatedItem it was handed could only observe the
+// value the test itself constructed two lines earlier. That property is
+// enforced where the code that could set the field actually runs —
+// github.TestFeedback_FileNoProjectNotAttempted on the provider path, and
+// server.TestProductReport_NotAttemptedStatusIsAlwaysCauseFree at the
+// response surface.
+func TestBoardingStatus_NoProjectDistinctFromFailure(t *testing.T) {
+	noProject := BoardingStatusOf(Target{}, &CreatedItem{Number: 7})
+	withProject := BoardingStatusOf(Target{Project: &Project{Number: 7}},
+		&CreatedItem{Number: 7, BoardingError: "boom"})
+
+	if noProject == withProject {
+		t.Fatalf("no-project and placement-failure report the same status %q; "+
+			"an operator cannot tell 'nothing to board' from 'boarding failed'", noProject)
+	}
+	if noProject != BoardingStatusNotAttemptedNoProject {
+		t.Errorf("no-project status = %q, want %q", noProject, BoardingStatusNotAttemptedNoProject)
+	}
+	if withProject != BoardingStatusFailed {
+		t.Errorf("placement-failure status = %q, want %q", withProject, BoardingStatusFailed)
+	}
+}

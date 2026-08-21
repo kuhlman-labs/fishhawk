@@ -3162,6 +3162,23 @@ type DiagnosticBundle struct {
 	FailingStage       *DiagnosticFailingStage `json:"failing_stage,omitempty"`
 	AuditSequenceRange *DiagnosticSeqRange     `json:"audit_sequence_range,omitempty"`
 	Versions           DiagnosticVersions      `json:"versions"`
+	WedgeContext       *DiagnosticWedgeContext `json:"wedge_context,omitempty"`
+}
+
+// DiagnosticWedgeContext mirrors the bundle's wedge block (#1737): WHY a
+// stuck run is stuck, in structured facts only. Absent on a healthy run.
+type DiagnosticWedgeContext struct {
+	// BlockingChecks are red required-check context names. Empty on a run
+	// with no resolved required-checks snapshot (every local run) — the
+	// block degrades rather than fabricating names.
+	BlockingChecks []string `json:"blocking_checks,omitempty"`
+	// CampaignItemState is a campaign item-state enum literal.
+	CampaignItemState string `json:"campaign_item_state,omitempty"`
+	// BlockedDependents counts sibling campaign items waiting on this one.
+	BlockedDependents int `json:"blocked_dependents,omitempty"`
+	// IntegrateWaveError is a closed marker for a fan-in failure, never a
+	// free-text reason.
+	IntegrateWaveError string `json:"integrate_wave_error,omitempty"`
 }
 
 // DiagnosticStageFact is one stage's position + state in the bundle.
@@ -3233,6 +3250,22 @@ type ProductReport struct {
 	Number      int    `json:"number"`
 	URL         string `json:"url"`
 	Destination string `json:"destination"`
+	// Boarded reports whether a newly filed report was placed on the
+	// tracker board (#1737). Best-effort: the report is filed either way.
+	Boarded bool `json:"boarded"`
+	// BoardingStatus disambiguates boarded=false: "boarded",
+	// "not_attempted_no_project" (no project configured — a configuration
+	// state, not an error), "not_attempted_no_report" (a dedup hit created
+	// nothing to board), "not_attempted_project_not_authorized" (a board
+	// is configured but its coordinates are not authorized for the fixed
+	// product tracker — also a configuration state), or "failed"
+	// (attempted and failed; see BoardingError).
+	BoardingStatus string `json:"boarding_status,omitempty"`
+	// BoardingError is the placement failure cause, set only when
+	// BoardingStatus is "failed" — and then always non-empty. A CLOSED
+	// product-owned literal naming which step failed, never the
+	// provider's raw error.
+	BoardingError string `json:"boarding_error,omitempty"`
 }
 
 // ReportProductIssue files a deduped, audited upstream product report for

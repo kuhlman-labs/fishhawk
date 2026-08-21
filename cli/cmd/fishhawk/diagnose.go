@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -46,6 +47,20 @@ type diagnosticBundle struct {
 		} `json:"fishhawkd"`
 		MinRunnerVersion string `json:"min_runner_version"`
 	} `json:"versions"`
+	// WedgeContext names WHY a stuck run is stuck (#1737). Absent —
+	// and rendered as nothing at all — on a run with no wedge shape,
+	// so a healthy run's output is byte-identical to pre-#1737.
+	//
+	// `omitempty` is load-bearing on BOTH halves of that promise: the
+	// text renderer skips a nil block, but `--output json` RE-ENCODES
+	// this struct, so without it a healthy bundle would gain a
+	// `"wedge_context": null` key the server never sent.
+	WedgeContext *struct {
+		BlockingChecks     []string `json:"blocking_checks"`
+		CampaignItemState  string   `json:"campaign_item_state"`
+		BlockedDependents  int      `json:"blocked_dependents"`
+		IntegrateWaveError string   `json:"integrate_wave_error"`
+	} `json:"wedge_context,omitempty"`
 }
 
 // runDiagnose implements `fishhawk diagnose <run-id> [--output text|json]`.
@@ -171,5 +186,29 @@ func printDiagnostics(w io.Writer, b *diagnosticBundle) {
 			_, _ = fmt.Fprintf(w, ", surface %s", b.FailingStage.FailureSurface)
 		}
 		_, _ = fmt.Fprintln(w, ")")
+	}
+	printWedgeContext(w, b)
+}
+
+// printWedgeContext renders the wedge block, or nothing at all when the
+// run carries none — the anti-noise half of #1737: a healthy run's
+// `fishhawk diagnose` output is unchanged by this feature.
+func printWedgeContext(w io.Writer, b *diagnosticBundle) {
+	if b.WedgeContext == nil {
+		return
+	}
+	wc := b.WedgeContext
+	_, _ = fmt.Fprintln(w, "  wedge context:")
+	if len(wc.BlockingChecks) > 0 {
+		_, _ = fmt.Fprintf(w, "    blocking checks:   %s\n", strings.Join(wc.BlockingChecks, ", "))
+	}
+	if wc.CampaignItemState != "" {
+		_, _ = fmt.Fprintf(w, "    campaign item:     %s\n", wc.CampaignItemState)
+	}
+	if wc.BlockedDependents > 0 {
+		_, _ = fmt.Fprintf(w, "    blocked dependents: %d\n", wc.BlockedDependents)
+	}
+	if wc.IntegrateWaveError != "" {
+		_, _ = fmt.Fprintf(w, "    fan-in:            %s\n", wc.IntegrateWaveError)
 	}
 }

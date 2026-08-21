@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,4 +131,146 @@ func TestFeedbackAPIAdapter_SearchOpenIssuesMapsFields(t *testing.T) {
 	if got[0] != want {
 		t.Errorf("mapped = %+v, want %+v", got[0], want)
 	}
+}
+
+// graphqlCall is one recorded GraphQL round trip: the operation text the
+// client put on the wire and the variables it bound. The three
+// board-placement client methods all POST to /graphql, so the operation +
+// variables are what distinguish them — which is exactly what a
+// wrong-but-signature-compatible delegation would get wrong.
+type graphqlCall struct {
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables"`
+}
+
+// newGraphQLFake returns a real *githubclient.Client pointed at an httptest
+// server that records every /graphql request and replies with the given
+// canned data envelope. The returned pointer is read only after the call
+// under test has returned, so no synchronization is needed.
+func newGraphQLFake(t *testing.T, dataEnvelope string) (*githubclient.Client, *[]graphqlCall) {
+	t.Helper()
+	calls := &[]graphqlCall{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var got graphqlCall
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode graphql request: %v", err)
+		}
+		*calls = append(*calls, got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, dataEnvelope)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  stubTokenProvider{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}, calls
+}
+
+// TestFeedbackAPIAdapter_BoardPlacementDelegations closes the one seam the
+// board-placement tests (#1737) otherwise leave un-exercised: every other
+// placement test drives a fake FeedbackAPI, so nothing reaches the
+// production adapter -> real *githubclient.Client edge these three methods
+// exist for.
+//
+// The residual bug class is a delegation to a WRONG-BUT-SIGNATURE-COMPATIBLE
+// client call — a transposed argument on the four-string
+// SetProjectItemSingleSelect, a swapped project/content pair on
+// AddProjectItem, a hard-coded field name on ProjectFields. All three
+// compile clean and only surface on a real boarding attempt. So each
+// sub-test binds a DISTINCT sentinel per argument and asserts the operation
+// + variables observed on the wire, which no transposition can satisfy.
+func TestFeedbackAPIAdapter_BoardPlacementDelegations(t *testing.T) {
+	scope := forge.FromGitHubInstallationID(99)
+
+	t.Run("ProjectFields", func(t *testing.T) {
+		c, calls := newGraphQLFake(t,
+			`{"data":{"user":{"projectV2":{"id":"PVT_proj","field":{"id":"FLD_status","options":[{"id":"OPT_backlog","name":"Backlog"}]}}}}}`)
+		adapter := feedbackAPIAdapter{c}
+
+		meta, err := adapter.ProjectFields(context.Background(), scope,
+			githubclient.ProjectCoord{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}, "Priority")
+		if err != nil {
+			t.Fatalf("ProjectFields: %v", err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("graphql calls = %d, want 1", len(*calls))
+		}
+		got := (*calls)[0]
+		if !strings.Contains(got.Query, "query ProjectFields") {
+			t.Errorf("operation = %q, want the ProjectFields query", got.Query)
+		}
+		// "Priority", not a hard-coded "Status": the field name must be the
+		// one the caller passed.
+		wantVars := map[string]any{"login": "kuhlman-labs", "number": float64(7), "field": "Priority"}
+		if !maps.Equal(got.Variables, wantVars) {
+			t.Errorf("variables = %v, want %v", got.Variables, wantVars)
+		}
+		want := githubclient.ProjectMeta{
+			ProjectID:     "PVT_proj",
+			FieldID:       "FLD_status",
+			StatusOptions: map[string]string{"Backlog": "OPT_backlog"},
+		}
+		if meta == nil || meta.ProjectID != want.ProjectID || meta.FieldID != want.FieldID ||
+			!maps.Equal(meta.StatusOptions, want.StatusOptions) {
+			t.Errorf("meta = %+v, want %+v", meta, want)
+		}
+	})
+
+	t.Run("AddProjectItem", func(t *testing.T) {
+		c, calls := newGraphQLFake(t,
+			`{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM_created"}}}}`)
+		adapter := feedbackAPIAdapter{c}
+
+		itemID, err := adapter.AddProjectItem(context.Background(), scope, "PVT_proj", "ISSUE_content")
+		if err != nil {
+			t.Fatalf("AddProjectItem: %v", err)
+		}
+		if itemID != "ITEM_created" {
+			t.Errorf("item id = %q, want %q", itemID, "ITEM_created")
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("graphql calls = %d, want 1", len(*calls))
+		}
+		got := (*calls)[0]
+		if !strings.Contains(got.Query, "addProjectV2ItemById") {
+			t.Errorf("operation = %q, want the addProjectV2ItemById mutation", got.Query)
+		}
+		// Distinct sentinels: a swapped (projectID, contentID) pair fails here.
+		wantVars := map[string]any{"projectId": "PVT_proj", "contentId": "ISSUE_content"}
+		if !maps.Equal(got.Variables, wantVars) {
+			t.Errorf("variables = %v, want %v", got.Variables, wantVars)
+		}
+	})
+
+	t.Run("SetProjectItemSingleSelect", func(t *testing.T) {
+		c, calls := newGraphQLFake(t,
+			`{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM_created"}}}}`)
+		adapter := feedbackAPIAdapter{c}
+
+		if err := adapter.SetProjectItemSingleSelect(context.Background(), scope,
+			"PVT_proj", "ITEM_created", "FLD_status", "OPT_backlog"); err != nil {
+			t.Fatalf("SetProjectItemSingleSelect: %v", err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("graphql calls = %d, want 1", len(*calls))
+		}
+		got := (*calls)[0]
+		if !strings.Contains(got.Query, "updateProjectV2ItemFieldValue") {
+			t.Errorf("operation = %q, want the updateProjectV2ItemFieldValue mutation", got.Query)
+		}
+		// Four distinct sentinels: any transposition among the four string
+		// arguments lands a value under the wrong key and fails here.
+		wantVars := map[string]any{
+			"projectId": "PVT_proj",
+			"itemId":    "ITEM_created",
+			"fieldId":   "FLD_status",
+			"optionId":  "OPT_backlog",
+		}
+		if !maps.Equal(got.Variables, wantVars) {
+			t.Errorf("variables = %v, want %v", got.Variables, wantVars)
+		}
+	})
 }

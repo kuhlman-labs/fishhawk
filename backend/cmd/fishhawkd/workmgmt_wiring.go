@@ -83,3 +83,20 @@ func (a feedbackAPIAdapter) CreateIssue(ctx context.Context, scope forge.Credent
 func (a feedbackAPIAdapter) CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	return a.client.CreateIssueComment(ctx, scope, repo, issueNumber, body)
 }
+
+// The three board-placement delegations (#1737): the feedback provider
+// places a filed product report on the configured project board through
+// the same GraphQL calls the work-item provider uses, so FeedbackAPI
+// carries them too. Pass-throughs, like the neighbours above.
+
+func (a feedbackAPIAdapter) ProjectFields(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
+	return a.client.ProjectFields(ctx, scope, coord, fieldName)
+}
+
+func (a feedbackAPIAdapter) AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error) {
+	return a.client.AddProjectItem(ctx, scope, projectID, contentID)
+}
+
+func (a feedbackAPIAdapter) SetProjectItemSingleSelect(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
+	return a.client.SetProjectItemSingleSelect(ctx, scope, projectID, itemID, fieldID, optionID)
+}

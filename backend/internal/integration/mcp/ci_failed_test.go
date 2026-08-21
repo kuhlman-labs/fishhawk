@@ -3,6 +3,7 @@ package mcpe2e_test
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,31 @@ func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
 	}
 	if !sawCommitVouch {
 		t.Fatalf("next_actions.actions = %+v, want commit_and_vouch present (#1044 operator remediation)", na.Actions)
+	}
+
+	// Layer 4b (E32.11 / #1737): the SAME end-to-end walk proves the
+	// product-directed filing suggestion reaches an operator through the REAL
+	// MCP surface, not just the pure classifier — a red required check on an
+	// otherwise gate-green run is the shape the issue names. It is appended
+	// LAST (the remediation move still leads) and pre-populated with THIS run's
+	// id plus kind=bug, so the operator accepts a suggestion rather than
+	// hand-assembling the call.
+	last := na.Actions[len(na.Actions)-1]
+	if last.Action != "fishhawk_report_product_issue" {
+		t.Fatalf("next_actions.actions = %+v, want fishhawk_report_product_issue LAST (#1737)", na.Actions)
+	}
+	if last.Params["run_id"] != run.ID.String() {
+		t.Errorf("filing run_id = %q, want this run's id %q", last.Params["run_id"], run.ID)
+	}
+	if last.Params["kind"] != "bug" {
+		t.Errorf("filing kind = %q, want bug", last.Params["kind"])
+	}
+	if last.Consumes != "none" {
+		t.Errorf("filing consumes = %q, want none — filing is operator-gated and spends no budget", last.Consumes)
+	}
+	// Operator-gated, never a default recommendation.
+	if !strings.Contains(last.Precondition, "OPERATOR JUDGEMENT") {
+		t.Errorf("filing precondition = %q, want the operator-gated wording", last.Precondition)
 	}
 }
 

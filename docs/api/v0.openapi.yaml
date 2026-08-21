@@ -3583,6 +3583,42 @@ components:
             min_runner_version:
               type: string
               description: Minimum fishhawk-runner version this backend requires.
+        wedge_context:
+          type: object
+          description: |
+            Why a STUCK run is stuck (#1737). Absent entirely on a healthy
+            run and on a run with no recognizable wedge shape, so its
+            presence is itself the signal. Structured facts only — the
+            block is assembled from typed state (the required-checks
+            snapshot, campaign item rows, a closed audit-category marker)
+            and never from the drive event string or a stage's free-text
+            failure reason, so it inherits the bundle's
+            redaction-safe-by-construction contract.
+
+            Every field is BEST-EFFORT: an unwired repository, a missing
+            campaign linkage, or a read error yields fewer facts, never an
+            error. In particular `blocking_checks` is empty on any run
+            with no resolved required-checks snapshot (every local run,
+            #2497) — the block degrades rather than fabricating names.
+          properties:
+            blocking_checks:
+              type: array
+              description: Red required-check context names. Omitted when none are known.
+              items: { type: string }
+            campaign_item_state:
+              type: string
+              description: >-
+                Campaign item-state enum literal for the item this run
+                executes (a table-owned normalization; an unrecognized
+                state is dropped rather than echoed).
+            blocked_dependents:
+              type: integer
+              description: How many sibling campaign items are blocked waiting on this one.
+            integrate_wave_error:
+              type: string
+              description: >-
+                Closed marker for a fan-in failure (e.g.
+                slice_integration_conflict) — never a free-text reason.
 
     ProductReportRequest:
       type: object
@@ -3600,8 +3636,12 @@ components:
 
     ProductReportResponse:
       type: object
-      description: What left the boundary — echoed so the caller can render the outcome.
-      required: [fingerprint, action, number, url, destination]
+      description: |
+        What left the boundary — echoed so the caller can render the
+        outcome. Since #1737 it also reports whether a NEWLY filed report
+        reached the project board; placement is best-effort, so a
+        placement failure still returns 201 with the filed report intact.
+      required: [fingerprint, action, number, url, destination, boarded, boarding_status]
       properties:
         fingerprint:
           type: string
@@ -3623,6 +3663,67 @@ components:
         destination:
           type: string
           description: The fixed upstream product repo the report landed in (owner/name).
+        boarded:
+          type: boolean
+          description: >-
+            Whether a newly filed report was placed on the configured
+            project board at Status=Backlog. Always false when `action` is
+            `occurrence` (a dedup hit creates nothing to board).
+        boarding_status:
+          type: string
+          enum:
+            - boarded
+            - not_attempted_no_project
+            - not_attempted_no_report
+            - not_attempted_project_not_authorized
+            - failed
+          description: |
+            Why `boarded` has the value it does. `boarded=false` alone is
+            ambiguous and the false cases call for DIFFERENT operator
+            actions, so the cause is explicit:
+
+            - `boarded` — placed on the board.
+            - `not_attempted_no_project` — the repo's conventions declare
+              no project, so placement was never attempted. This is a
+              CONFIGURATION STATE, not an error, and `boarding_error` is
+              absent. Nothing for the operator to fix unless they want a
+              board.
+            - `not_attempted_no_report` — a dedup hit appended an
+              occurrence comment, so nothing was created to board.
+              `boarding_error` is absent.
+            - `not_attempted_project_not_authorized` — a board IS
+              configured, but its coordinates came from a repo other than
+              the fixed product tracker this report was filed into, so
+              placement was refused before any privileged call. Also a
+              configuration state, not an error: `boarding_error` is
+              absent and there is nothing to investigate.
+            - `failed` — placement was attempted and failed. This is the
+              ONLY status that carries `boarding_error`, and the only one
+              an operator should investigate.
+        boarding_error:
+          type: string
+          enum:
+            - project_fields_unavailable
+            - add_project_item_failed
+            - status_option_unknown
+            - set_status_failed
+            - placement_failed
+            - provider_reported_neither_placement_nor_cause
+          description: >-
+            Placement failure cause, naming WHICH STEP failed. Present —
+            and always non-empty — when `boarding_status` is `failed`, and
+            absent on every other status, where its absence means "not
+            attempted" rather than "attempted and quietly fine". The value
+            is a CLOSED product-owned literal, never the provider's raw
+            error: a raw cause carries third-party API text and, on the
+            unknown-status path, the project's own field-option names, so
+            it reaches the operator through the server log and never the
+            caller (the same posture the error envelope's default-deny
+            detail allow-list applies to non-2xx bodies). An unrecognized
+            provider error degrades to `placement_failed`;
+            `provider_reported_neither_placement_nor_cause` is synthesized
+            when a provider reports neither outcome, so a `failed` verdict
+            is never cause-free.
 
     RunBudgetStatus:
       type: object
