@@ -445,10 +445,26 @@ func titleNumberRegexp(format string) (*regexp.Regexp, error) {
 	return regexp.Compile(b.String())
 }
 
+// boardAPI is the board-placement slice of the GitHub calls, split out so
+// BOTH the work-item provider (API) and the product-feedback provider
+// (FeedbackAPI) can drive the same placement routine (#1737) without one
+// depending on the other's full interface.
+type boardAPI interface {
+	ProjectFields(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
+	AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error)
+	SetProjectItemSingleSelect(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error
+}
+
 // placeOnBoard adds the created issue to the configured project and sets
 // its Status field. No-op when the conventions declare no project.
 func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope, req workmgmt.ProviderRequest, issue *githubclient.CreatedIssue) error {
-	proj := req.Target.Project
+	return placeIssueOnBoard(ctx, p.api, scope, req.Target.Project, req.Item.BoardPlacement.Status, issue)
+}
+
+// placeIssueOnBoard is the shared placement routine: add the issue to the
+// project and set its single-select Status. A nil project is a no-op (the
+// caller reports that as "not attempted", not as a failure).
+func placeIssueOnBoard(ctx context.Context, api boardAPI, scope forge.CredentialScope, proj *workmgmt.Project, desiredStatus string, issue *githubclient.CreatedIssue) error {
 	if proj == nil {
 		return nil
 	}
@@ -464,15 +480,15 @@ func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope
 	if proj.OwnerType == "user" {
 		ctx = githubclient.WithProjectsToken(ctx)
 	}
-	meta, err := p.api.ProjectFields(ctx, scope, coord, statusFieldName)
+	meta, err := api.ProjectFields(ctx, scope, coord, statusFieldName)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
-	itemID, err := p.api.AddProjectItem(ctx, scope, meta.ProjectID, issue.NodeID)
+	itemID, err := api.AddProjectItem(ctx, scope, meta.ProjectID, issue.NodeID)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: add project item: %w", err)
 	}
-	status := strings.TrimSpace(req.Item.BoardPlacement.Status)
+	status := strings.TrimSpace(desiredStatus)
 	if status == "" {
 		return nil
 	}
@@ -481,7 +497,7 @@ func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope
 		return fmt.Errorf("workmgmt/github: status %q is not a %s option on the project; available: %s",
 			status, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))
 	}
-	if err := p.api.SetProjectItemSingleSelect(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
+	if err := api.SetProjectItemSingleSelect(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
 		return fmt.Errorf("workmgmt/github: set status field: %w", err)
 	}
 	return nil

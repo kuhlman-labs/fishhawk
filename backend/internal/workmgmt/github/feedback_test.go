@@ -26,6 +26,56 @@ type fakeFeedbackAPI struct {
 	commentNumber int
 	commentBody   string
 	commentErr    error
+
+	// Board-placement recording (#1737). meta defaults to a Backlog-bearing
+	// project in newBoardingFeedbackAPI; the *Err fields drive the
+	// placement-failure arm.
+	meta          *githubclient.ProjectMeta
+	fieldsCoord   githubclient.ProjectCoord
+	fieldsErr     error
+	addItemCalled bool
+	addItemErr    error
+	setOptionID   string
+	setCalled     bool
+	setErr        error
+}
+
+func (f *fakeFeedbackAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+	f.fieldsCoord = coord
+	if f.fieldsErr != nil {
+		return nil, f.fieldsErr
+	}
+	return f.meta, nil
+}
+
+func (f *fakeFeedbackAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, _, _ string) (string, error) {
+	f.addItemCalled = true
+	if f.addItemErr != nil {
+		return "", f.addItemErr
+	}
+	return "item-1", nil
+}
+
+func (f *fakeFeedbackAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, _, _, _, optionID string) error {
+	f.setCalled, f.setOptionID = true, optionID
+	return f.setErr
+}
+
+// newBoardingFeedbackAPI returns a fake whose project carries a Backlog
+// Status option, so a placement request for Backlog can succeed.
+func newBoardingFeedbackAPI() *fakeFeedbackAPI {
+	return &fakeFeedbackAPI{meta: &githubclient.ProjectMeta{
+		ProjectID:     "proj-1",
+		FieldID:       "field-1",
+		StatusOptions: map[string]string{"Backlog": "opt-backlog"},
+	}}
+}
+
+// boardingTarget is testTarget plus a configured project board.
+func boardingTarget() workmgmt.Target {
+	tgt := testTarget()
+	tgt.Project = &workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}
+	return tgt
 }
 
 func (f *fakeFeedbackAPI) SearchOpenIssues(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, query string) ([]MatchedIssue, error) {
@@ -133,5 +183,126 @@ func TestFeedback_PropagatesSearchError(t *testing.T) {
 	p := NewFeedback(api)
 	if _, err := p.SearchOpenByFingerprint(context.Background(), testTarget(), "x"); err == nil {
 		t.Error("search error should propagate")
+	}
+}
+
+// --- board placement on a filed product report (#1737) ---
+
+// TestFeedback_FileBoardsAtBacklog is the done-means behavioral pin: the
+// filed report is placed on the configured project and its Status is set
+// to the requested Backlog option.
+func TestFeedback_FileBoardsAtBacklog(t *testing.T) {
+	api := newBoardingFeedbackAPI()
+	p := NewFeedback(api)
+
+	created, err := p.File(context.Background(), boardingTarget(), workmgmt.FeedbackReport{
+		Title:          "Diagnostic report",
+		Body:           "facts",
+		Labels:         []string{"type:bug", "autonomy:medium"},
+		Fingerprint:    "fp1",
+		BoardPlacement: workmgmt.BoardPlacement{Status: "Backlog"},
+	})
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if !created.Boarded || created.BoardingError != "" {
+		t.Errorf("Boarded=%v BoardingError=%q, want true/empty", created.Boarded, created.BoardingError)
+	}
+	if !api.addItemCalled || !api.setCalled {
+		t.Errorf("addItem=%v set=%v, want both true", api.addItemCalled, api.setCalled)
+	}
+	if api.setOptionID != "opt-backlog" {
+		t.Errorf("status option = %q, want opt-backlog", api.setOptionID)
+	}
+	if created.Status != "Backlog" {
+		t.Errorf("created.Status = %q, want Backlog", created.Status)
+	}
+	if got := workmgmt.BoardingStatusOf(boardingTarget(), created); got != workmgmt.BoardingStatusBoarded {
+		t.Errorf("BoardingStatusOf = %q, want boarded", got)
+	}
+	// The report itself is unaffected by boarding.
+	if created.Number != 7 {
+		t.Errorf("Number = %d, want 7", created.Number)
+	}
+}
+
+// TestFeedback_FileBoardingFailureStillFiles is failure mode m7 and the
+// counterfactual vehicle for the best-effort recover: placement errors,
+// the report is still returned with number/URL intact, and the cause is
+// recorded rather than returned as an error.
+func TestFeedback_FileBoardingFailureStillFiles(t *testing.T) {
+	api := newBoardingFeedbackAPI()
+	api.addItemErr = errors.New("projects API 403")
+	p := NewFeedback(api)
+
+	created, err := p.File(context.Background(), boardingTarget(), workmgmt.FeedbackReport{
+		Title: "t", Body: "b", Fingerprint: "fp2",
+		BoardPlacement: workmgmt.BoardPlacement{Status: "Backlog"},
+	})
+	if err != nil {
+		t.Fatalf("File returned an error on a placement failure: %v", err)
+	}
+	if created == nil || created.Number != 7 || created.URL == "" {
+		t.Fatalf("created = %+v, want the filed report preserved", created)
+	}
+	if created.Boarded {
+		t.Error("Boarded = true, want false after a placement failure")
+	}
+	if !strings.Contains(created.BoardingError, "projects API 403") {
+		t.Errorf("BoardingError = %q, want it to name the cause", created.BoardingError)
+	}
+	if got := workmgmt.BoardingStatusOf(boardingTarget(), created); got != workmgmt.BoardingStatusFailed {
+		t.Errorf("BoardingStatusOf = %q, want failed", got)
+	}
+}
+
+// TestFeedback_FileNoProjectNotAttempted is failure mode m6 and the
+// Condition-1 contract: no project configured is a CONFIGURATION STATE,
+// so boarding is not attempted, no cause is recorded, and the distinct
+// not_attempted_no_project status is what tells the operator apart from
+// a real failure.
+func TestFeedback_FileNoProjectNotAttempted(t *testing.T) {
+	api := newBoardingFeedbackAPI()
+	p := NewFeedback(api)
+
+	created, err := p.File(context.Background(), testTarget(), workmgmt.FeedbackReport{
+		Title: "t", Body: "b", Fingerprint: "fp3",
+		BoardPlacement: workmgmt.BoardPlacement{Status: "Backlog"},
+	})
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if created.Boarded || created.BoardingError != "" {
+		t.Errorf("Boarded=%v BoardingError=%q, want false/empty (nothing to board)",
+			created.Boarded, created.BoardingError)
+	}
+	if api.addItemCalled || api.setCalled {
+		t.Error("board API called with no project configured")
+	}
+	if got := workmgmt.BoardingStatusOf(testTarget(), created); got != workmgmt.BoardingStatusNotAttemptedNoProject {
+		t.Errorf("BoardingStatusOf = %q, want not_attempted_no_project", got)
+	}
+}
+
+// TestFeedback_FileBoardingUnknownStatusOption pins the second placement
+// failure branch: the project has no matching Status option, so placement
+// fails with a naming cause while the report still lands.
+func TestFeedback_FileBoardingUnknownStatusOption(t *testing.T) {
+	api := &fakeFeedbackAPI{meta: &githubclient.ProjectMeta{
+		ProjectID: "proj-1", FieldID: "field-1",
+		StatusOptions: map[string]string{"Todo": "opt-todo"},
+	}}
+	p := NewFeedback(api)
+
+	created, err := p.File(context.Background(), boardingTarget(), workmgmt.FeedbackReport{
+		Title: "t", Body: "b", Fingerprint: "fp4",
+		BoardPlacement: workmgmt.BoardPlacement{Status: "Backlog"},
+	})
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if created.Boarded || !strings.Contains(created.BoardingError, "Backlog") {
+		t.Errorf("Boarded=%v BoardingError=%q, want false and a Backlog-naming cause",
+			created.Boarded, created.BoardingError)
 	}
 }

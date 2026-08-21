@@ -63,8 +63,18 @@ range, binary versions + git SHAs, workflow spec hash, runner kind),
 fingerprints the failure, searches the FIXED upstream product repo for an open
 report already carrying that fingerprint, and either appends an occurrence
 comment (dedup hit — nothing new is created) or files a new fingerprint-marked
-report (dedup miss). A source-side product_report_filed audit entry records
-what left the boundary.
+report (dedup miss). A newly filed report is then placed on the tracker board
+at Status=Backlog, BEST-EFFORT: the report is the durable result, so a
+placement failure still returns the filed report and names its cause. A
+source-side product_report_filed audit entry records what left the boundary.
+
+The bundle also carries a wedge_context block naming WHY a stuck run is stuck
+(red required checks, campaign item state + blocked dependents, a fan-in
+conflict marker) when the run is wedged, so the drafted report reads like a
+hand-authored one. On a healthy run the block is absent.
+
+next_actions pre-populates this call on the failure shapes where product
+friction is plausible; filing remains the OPERATOR's call, never automatic.
 
 THE REDACTION BOUNDARY IS THE HARD CONTRACT. By default the report carries
 product-level FACTS ONLY — no diffs, paths, prompts, or free text. Operator
@@ -79,8 +89,13 @@ run_id explicitly. kind is 'bug' (default) or 'feature'. description +
 include_free_text carry the consented, redacted free text.
 
 Returns the egress outcome (report.action created|occurrence, fingerprint,
-upstream number/url, destination), a transparency preview of the product
-facts that were attached (diagnostics), and free_text_included. Tool errors:
+upstream number/url, destination, plus boarded / boarding_status /
+boarding_error), a transparency preview of the product facts that were
+attached (diagnostics), and free_text_included. boarding_status
+disambiguates boarded=false: 'not_attempted_no_project' means the repo
+declares no board (a configuration state, not an error),
+'not_attempted_no_report' means a dedup hit created nothing to board, and
+'failed' means placement was attempted and failed (see boarding_error). Tool errors:
 validation_failed (400), authentication_required (401), run_not_entitled
 (403 — a run-bound token may only file for its own run), insufficient_scope
 (403 — a non-run-bound operator bearer is missing write:runs),

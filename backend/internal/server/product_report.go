@@ -39,6 +39,12 @@ const productRepo = "kuhlman-labs/fishhawk"
 // free text. Documented in docs/issue-comment-surfaces.md.
 const categoryProductReportFiled = "product_report_filed"
 
+// productReportBoardStatus is the board column a newly filed product
+// report is placed in. Backlog matches the fishhawk_file_issue path's
+// creation default (AGENTS.md: Status MUST be set on creation — a null
+// Status breaks the kanban view).
+const productReportBoardStatus = "Backlog"
+
 // productReportRequest is the POST /v0/runs/{run_id}/product-reports body.
 // `kind` selects the report flavor (bug default; feature for an enhancement
 // request). The egress carries product facts ONLY unless the caller sets
@@ -64,6 +70,24 @@ type productReportResponse struct {
 	Number      int    `json:"number"`
 	URL         string `json:"url"`
 	Destination string `json:"destination"`
+	// Boarded reports whether a NEWLY filed report was placed on the
+	// configured project board (#1737). Board placement is best-effort:
+	// the report is the durable result, so a placement failure still
+	// returns 201.
+	Boarded bool `json:"boarded"`
+	// BoardingStatus disambiguates boarded=false, which alone cannot tell
+	// an operator whether there was nothing to board or whether placement
+	// was tried and failed — two different actions for them. One of
+	// "boarded", "not_attempted_no_project" (no project is configured;
+	// a configuration state, NOT an error), "not_attempted_no_report" (a
+	// dedup hit appended an occurrence comment, so nothing was created to
+	// board), or "failed".
+	BoardingStatus string `json:"boarding_status"`
+	// BoardingError carries the placement failure cause. It is set ONLY
+	// when BoardingStatus is "failed" — an empty value on the
+	// not_attempted_* statuses means "not attempted", never "attempted
+	// and succeeded silently".
+	BoardingError string `json:"boarding_error,omitempty"`
 }
 
 // handleFileProductReport implements POST /v0/runs/{run_id}/product-reports.
@@ -211,7 +235,15 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	bundle := diagnostics.Collect(runRow, stages, auditEntries, currentVersionFacts())
+	// CollectWithWedge (not Collect): a product report's whole job is to
+	// describe WHY a run is stuck, so the auto-drafted body carries the
+	// same structured wedge facts the diagnostics read surfaces — red
+	// required checks, campaign item state + blocked dependents, a fan-in
+	// conflict marker. collectWedgeFacts is best-effort throughout, so a
+	// missing fact yields a thinner report, never a failed egress. The
+	// dedup fingerprint is deliberately UNAFFECTED (see bundleFingerprint).
+	bundle := diagnostics.CollectWithWedge(runRow, stages, auditEntries,
+		currentVersionFacts(), s.collectWedgeFacts(r.Context(), runRow, stages))
 	fingerprint := bundleFingerprint(bundle)
 
 	// Consent/redaction boundary (binding condition 2): operator free text
@@ -221,7 +253,11 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	freeText := redactedFreeText(req)
 
 	owner, name, _ := splitRepoFullName(productRepo)
-	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: owner, Name: name}}
+	// Project: the conventions' board, so a filed report lands on the
+	// tracker the same way fishhawk_file_issue's work items do (#1737).
+	// Nil when the repo declares no project — that is a configuration
+	// state, reported as boarding_status=not_attempted_no_project.
+	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: owner, Name: name}, Project: conv.Project}
 	// Installation: the source run supplies the installation that can act
 	// on the product repo (in dogfooding the run repo IS the product repo).
 	if runRow.InstallationID != nil {
@@ -239,6 +275,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		action    string
 		resultNum int
 		resultURL string
+		created   *workmgmt.CreatedItem
 	)
 	if existing != nil {
 		// Dedup hit: append an occurrence comment, create nothing.
@@ -251,11 +288,12 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		action, resultNum, resultURL = "occurrence", existing.Number, existing.URL
 	} else {
 		// Dedup miss: file a new fingerprint-marked report.
-		created, err := provider.File(r.Context(), target, workmgmt.FeedbackReport{
-			Title:       renderReportTitle(bundle, req.Kind),
-			Body:        renderReportBody(bundle, fingerprint, freeText),
-			Labels:      reportLabels(req.Kind),
-			Fingerprint: fingerprint,
+		created, err = provider.File(r.Context(), target, workmgmt.FeedbackReport{
+			Title:          renderReportTitle(bundle, req.Kind),
+			Body:           renderReportBody(bundle, fingerprint, freeText),
+			Labels:         reportLabels(req.Kind),
+			Fingerprint:    fingerprint,
+			BoardPlacement: workmgmt.BoardPlacement{Status: productReportBoardStatus},
 		})
 		if err != nil {
 			s.writeError(w, r, http.StatusBadGateway, "product_report_failed",
@@ -267,13 +305,36 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 
 	s.auditProductReport(r, runRow, fingerprint, owner+"/"+name, action, resultNum, resultURL, id.Subject)
 
-	s.writeJSON(w, r, http.StatusCreated, productReportResponse{
-		Fingerprint: fingerprint,
-		Action:      action,
-		Number:      resultNum,
-		URL:         resultURL,
-		Destination: owner + "/" + name,
-	})
+	resp := productReportResponse{
+		Fingerprint:    fingerprint,
+		Action:         action,
+		Number:         resultNum,
+		URL:            resultURL,
+		Destination:    owner + "/" + name,
+		BoardingStatus: workmgmt.BoardingStatusOf(target, created),
+	}
+	if created != nil {
+		resp.Boarded = created.Boarded
+		resp.BoardingError = created.BoardingError
+	}
+	if resp.BoardingStatus == workmgmt.BoardingStatusFailed {
+		// Amendment condition 3: a best-effort failure that is swallowed is
+		// indistinguishable from silently-broken. Name the cause server-side
+		// too, so an operator seeing boarded=false has a log line as well as
+		// the response field.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "product report board placement failed",
+			slog.String("error", resp.BoardingError),
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("upstream_num", resultNum),
+		)
+	}
+	if resp.BoardingStatus != workmgmt.BoardingStatusFailed {
+		// An empty cause is only meaningful on the failed status; keep the
+		// not_attempted_* statuses cause-free by construction so an
+		// operator never has to guess which reading applies.
+		resp.BoardingError = ""
+	}
+	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
 // decodeProductReportRequest reads and validates the request body. An
@@ -440,10 +501,66 @@ func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint, freeText stri
 	fmt.Fprintf(&sb, "- versions: fishhawkd `%s` (`%s`), min runner `%s`\n",
 		b.Versions.Fishhawkd.Version, b.Versions.Fishhawkd.GitSHA, b.Versions.MinRunnerVersion)
 	fmt.Fprintf(&sb, "- fingerprint: `%s`\n", fingerprint)
+	sb.WriteString(renderWedgeLines(b.WedgeContext))
 	if freeText != "" {
 		fmt.Fprintf(&sb, "\n## Operator notes (redacted)\n\n%s\n", freeText)
 	}
 	return sb.String()
+}
+
+// renderWedgeLines renders the bundle's wedge block as markdown list
+// items under a heading, or "" when the run carries no wedge context (the
+// healthy-run case — the body is then byte-identical to the pre-#1737
+// rendering). The block names WHY the run is stuck: which required checks
+// are red, the campaign item's state and how many siblings it blocks, and
+// a fan-in conflict marker. Every value is a structured product fact the
+// diagnostics package built from typed state, never free text.
+func renderWedgeLines(wc *diagnostics.WedgeContext) string {
+	if wc == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n## Wedge context\n\n")
+	if len(wc.BlockingChecks) > 0 {
+		fmt.Fprintf(&sb, "- blocking required checks: `%s`\n", strings.Join(wc.BlockingChecks, "`, `"))
+	}
+	if wc.CampaignItemState != "" {
+		fmt.Fprintf(&sb, "- campaign item state: `%s`\n", wc.CampaignItemState)
+	}
+	if wc.BlockedDependents > 0 {
+		fmt.Fprintf(&sb, "- blocked dependents: `%d`\n", wc.BlockedDependents)
+	}
+	if wc.IntegrateWaveError != "" {
+		fmt.Fprintf(&sb, "- fan-in error: `%s`\n", wc.IntegrateWaveError)
+	}
+	return sb.String()
+}
+
+// wedgeSummaryLine is the ONE-line wedge summary an occurrence comment
+// carries — enough for an operator scanning recurrences to see whether
+// this occurrence is wedged the same way, without repeating the full
+// block. Empty when there is no wedge context.
+func wedgeSummaryLine(wc *diagnostics.WedgeContext) string {
+	if wc == nil {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if len(wc.BlockingChecks) > 0 {
+		parts = append(parts, fmt.Sprintf("blocking checks `%s`", strings.Join(wc.BlockingChecks, "`, `")))
+	}
+	if wc.CampaignItemState != "" {
+		parts = append(parts, fmt.Sprintf("campaign item `%s`", wc.CampaignItemState))
+	}
+	if wc.BlockedDependents > 0 {
+		parts = append(parts, fmt.Sprintf("`%d` blocked dependents", wc.BlockedDependents))
+	}
+	if wc.IntegrateWaveError != "" {
+		parts = append(parts, fmt.Sprintf("fan-in `%s`", wc.IntegrateWaveError))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n- wedge: " + strings.Join(parts, "; ")
 }
 
 // renderOccurrenceComment is the body of an occurrence comment appended to
@@ -455,6 +572,7 @@ func renderOccurrenceComment(b diagnostics.DiagnosticBundle, fingerprint, freeTe
 	fmt.Fprintf(&sb,
 		"Another occurrence of fingerprint `%s`.\n\n- run: `%s`\n- run state: `%s`\n- observed: %s",
 		fingerprint, b.RunID, b.RunState, time.Now().UTC().Format(time.RFC3339))
+	sb.WriteString(wedgeSummaryLine(b.WedgeContext))
 	if freeText != "" {
 		fmt.Fprintf(&sb, "\n\n## Operator notes (redacted)\n\n%s\n", freeText)
 	}

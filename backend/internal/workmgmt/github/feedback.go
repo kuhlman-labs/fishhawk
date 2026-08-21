@@ -45,10 +45,15 @@ type MatchedIssue struct {
 // production client gains in a follow-up (the provider is wired
 // run-scoped alongside the work-item provider, which is itself not yet
 // registered at startup).
+//
+// Since #1737 it also carries the three board-placement calls (the
+// boardAPI slice), so a filed product report reaches the project board on
+// the same best-effort terms as a filed work item.
 type FeedbackAPI interface {
 	SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, query string) ([]MatchedIssue, error)
 	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
 	CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
+	boardAPI
 }
 
 // FeedbackProvider is the GitHub product-feedback provider: it files
@@ -91,7 +96,17 @@ func (p *FeedbackProvider) SearchOpenByFingerprint(ctx context.Context, target w
 }
 
 // File creates a new product report with the fingerprint marker appended
-// to the body so a later search can dedup against it.
+// to the body so a later search can dedup against it, then places it on
+// the configured project board.
+//
+// Board placement is BEST-EFFORT (#1737, mirroring the work-item path's
+// #1107 posture): the filed report is the durable result, so once the
+// issue exists File always returns it with a nil error, recording whether
+// placement landed in CreatedItem.Boarded and its cause in
+// CreatedItem.BoardingError when it did not. A nil Target.Project means
+// nothing to board — Boarded stays false with NO error, which
+// workmgmt.BoardingStatusOf reports as the distinct "not attempted, no
+// project configured" state rather than as a failure.
 func (p *FeedbackProvider) File(ctx context.Context, target workmgmt.Target, report workmgmt.FeedbackReport) (*workmgmt.CreatedItem, error) {
 	repo, scope, err := p.resolve(target)
 	if err != nil {
@@ -106,12 +121,22 @@ func (p *FeedbackProvider) File(ctx context.Context, target workmgmt.Target, rep
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: create product report: %w", err)
 	}
-	return &workmgmt.CreatedItem{
+	created := &workmgmt.CreatedItem{
 		Provider:      FeedbackProviderName,
 		Number:        issue.Number,
 		URL:           issue.HTMLURL,
 		AppliedLabels: report.Labels,
-	}, nil
+		Status:        report.BoardPlacement.Status,
+		BoardColumn:   report.BoardPlacement.BoardColumn,
+	}
+	if target.Project == nil {
+		created.Boarded = false
+	} else if err := placeIssueOnBoard(ctx, p.api, scope, target.Project, report.BoardPlacement.Status, issue); err != nil {
+		created.BoardingError = err.Error()
+	} else {
+		created.Boarded = true
+	}
+	return created, nil
 }
 
 // AppendOccurrence records another occurrence of the deduped failure as a

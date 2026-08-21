@@ -101,6 +101,7 @@ var exportBaseline = []string{
 	"DiagnosticSeqRange",
 	"DiagnosticStageFact",
 	"DiagnosticVersions",
+	"DiagnosticWedgeContext",
 	"DiffSummary",
 	"DispatchStageInput",
 	"DispatchStageOutput",
