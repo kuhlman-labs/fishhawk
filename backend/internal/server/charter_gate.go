@@ -34,6 +34,23 @@ import (
 // workflowRequiresCharter is kept PURE and EXPORTED-shaped (no receiver, no
 // I/O) so wiring it into static validation later is a call rather than a
 // rewrite.
+//
+// THE `haveStageDefs` GUARD IS A NARROWING, NOT THE SAFETY PROPERTY. The call
+// site in runs.go sits inside the existing `haveStageDefs` admission region,
+// beside checkAppliesTo, so it is fair to ask whether a grooming run could
+// reach CreateRunForTrigger with that flag false and skip the gate. It cannot:
+// BOTH spec-resolution branches in handleCreateRun set haveStageDefs true in
+// the same statement that assigns workflowDef, and each rejects a zero-stage
+// workflow before reaching it — so haveStageDefs == false means NO workflow
+// definition was resolved at all, workflowDef is the zero spec.Workflow, and
+// WorkflowRequiresCharter (which iterates wf.Stages) is false by construction.
+// A grooming-capable workflow necessarily DECLARES a grooming_report-producing
+// stage, so it can never sit behind that branch; the only other
+// CreateRunForTrigger caller, the campaign driver, passes HaveStageDefs: true
+// unconditionally. Removing the guard therefore changes no outcome — verified
+// by deleting it and re-running the suite green — which is exactly what makes
+// the structural early return below, not the guard, the load-bearing control.
+// TestCharterGate_NoStageDefsPathCarriesNoWorkflow pins the observable half.
 
 // charterRefusalReason enumerates WHY admission was refused. Three branches
 // share the 422, so the reason is what makes them distinguishable to an

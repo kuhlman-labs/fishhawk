@@ -6690,8 +6690,19 @@ func TestShippedGroomingExample_MatrixDefaults(t *testing.T) {
 // TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate is AC7's
 // second half (approval condition G2): a report-mode class surfaces a proposal
 // and does nothing else — it derives no may_* knob, adds no gate, and adds no
-// page event that would park the run. If report mode ever acquires gating or
-// parking behaviour, this test reddens.
+// page event that would park the run.
+//
+// SCOPE, STATED HONESTLY. This test asserts the STATIC shape of the shipped
+// declaration: the derived operator_agent block, the declared gate inventory,
+// the page list. That is necessary and NOT sufficient — a runtime consumer
+// could begin treating a report-mode class as gated, or park the run on it,
+// without modifying the workflow's Gates slices or ResolveAutonomy's
+// PageHumanOn, and this test would stay green. The BEHAVIOURAL half is pinned
+// where the consumers live, in backend/internal/server:
+// TestShippedGrooming_ReportModeNeitherGatesNorParksAtTheConsumer drives this
+// same declaration through delegation.Evaluate + AutoDriveRunGate's report arm
+// at a live gate, with TestShippedGrooming_ReportArmIsLiveInThisHarness as its
+// paired control. Read the two together; neither alone verifies AC7.
 func TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate(t *testing.T) {
 	wf := parseShippedGroomingExample(t)
 	rm := spec.ResolveAutonomy(&wf, nil)

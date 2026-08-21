@@ -2,9 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -343,5 +348,232 @@ workflows:
 `, "backlog_grooming")
 	if WorkflowRequiresCharter(named) {
 		t.Error("WorkflowRequiresCharter keyed off the workflow NAME; it must key off the produced artifact")
+	}
+}
+
+// --- the haveStageDefs admission region (review follow-up) -------------------
+
+// TestCharterGate_NoStageDefsPathCarriesNoWorkflow answers the review's
+// question about the gate's `haveStageDefs` guard executably rather than by
+// assertion.
+//
+// THE INVARIANT. `haveStageDefs` is set true by BOTH spec-resolution branches
+// in handleCreateRun — the inline `workflow_spec` branch and the GitHub-fetch
+// branch — in the same statement that assigns `workflowDef`, and each branch
+// rejects a workflow with zero stages BEFORE reaching that assignment. So
+// `haveStageDefs == false` means no workflow definition was resolved AT ALL:
+// `workflowDef` is the zero spec.Workflow, no stage rows are created, and
+// WorkflowRequiresCharter — which iterates wf.Stages — is false by
+// construction. A grooming-capable workflow necessarily DECLARES a stage
+// producing grooming_report, so it can never be behind that branch. The only
+// other CreateRunForTrigger caller, the campaign driver, passes
+// HaveStageDefs: true unconditionally and errors out before the call when the
+// resolved workflow has no stages.
+//
+// This test pins the observable half: the no-spec path really does create a
+// run with ZERO stages, and it does so with the loader stubbed to the WORST
+// case (no charter declared at all) — so if that path ever began carrying a
+// grooming-capable workflow, the gate would refuse and the 201 below would be
+// a 422.
+func TestCharterGate_NoStageDefsPathCarriesNoWorkflow(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	stubConventions(t, conventionsWithoutCharter(t), nil)
+
+	// No workflow_spec, and newDelegationServer wires no GitHub client — the
+	// ONE input combination that reaches CreateRunForTrigger with
+	// haveStageDefs false.
+	w := createRunViaHandler(t, s, map[string]any{
+		"repo": "x/y", "workflow_id": "backlog_grooming", "workflow_sha": "abc",
+		"trigger_source": "cli",
+	})
+	if w.Code != 201 {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if n := len(repo.stagesFor(created.ID)); n != 0 {
+		t.Errorf("stage rows = %d, want 0 — haveStageDefs=false means NO workflow definition was resolved, "+
+			"so a run behind that branch cannot declare a grooming_report-producing stage", n)
+	}
+	// The value the branch actually carries into CreateRunForTrigger. Note the
+	// workflow_id above IS `backlog_grooming`: the name does not make a run
+	// grooming-capable, the resolved stages do, and there are none.
+	if WorkflowRequiresCharter(spec.Workflow{}) {
+		t.Error("WorkflowRequiresCharter(zero Workflow) = true — the haveStageDefs=false branch would then need its own gate")
+	}
+	if n := countGlobalAppends(au, "run_rejected_missing_charter"); n != 0 {
+		t.Errorf("run_rejected_missing_charter appends = %d, want 0 — there is no workflow to refuse", n)
+	}
+}
+
+// --- AC7: report mode at the RUNTIME consumer -------------------------------
+//
+// The spec-package TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate
+// asserts the STATIC shape of the shipped declaration: empty may_* knobs, the
+// declared gate inventory, an empty page list. That is necessary and not
+// sufficient — a runtime consumer could begin treating a report-mode class as
+// gated, or park the run on it, without touching either the workflow's Gates
+// slices or ResolveAutonomy's PageHumanOn. The BEHAVIOURAL half is therefore
+// pinned here, at the real consumers: delegation.Evaluate (which decides what
+// authority a class derives) and AutoDriveRunGate's `mode: report` arm (the
+// only runtime site that reads a report entry), driven over the SHIPPED
+// declaration read from disk.
+
+// groomingExampleFromServer is the shipped declaration under test, at this
+// package's depth. Read from disk for the same reason the spec-package family
+// does: a drift in the example must redden this test.
+const groomingExampleFromServer = "../../../docs/spec/examples/workflow-v2-backlog-grooming.yaml"
+
+// startShippedGroomingRun creates a run governed by the shipped grooming
+// declaration and returns its id plus its three stages (groom/apply/confirm).
+//
+// The audited applies_to override is required and honest: the declaration
+// routes on `trigger: [scheduled, on_demand]` and no producer emits either
+// form yet (appliesto.TriggerFormForSource maps every source to `diff`), so
+// admission would otherwise refuse before the run-state path under test is
+// reachable. The override bypasses ROUTING only — it touches no autonomy
+// resolution and no action-class mode.
+func startShippedGroomingRun(t *testing.T, s *Server, repo *autoDriveRepo) (uuid.UUID, []*run.Stage) {
+	t.Helper()
+	raw, err := os.ReadFile(groomingExampleFromServer)
+	if err != nil {
+		t.Fatalf("read %s: %v", groomingExampleFromServer, err)
+	}
+	w := createRunViaHandler(t, s, map[string]any{
+		"repo": "x/y", "workflow_id": "backlog_grooming", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": string(raw),
+		"applies_to_override":        true,
+		"applies_to_override_reason": "no producer emits the scheduled/on_demand trigger form yet; exercising the run-state path",
+	})
+	if w.Code != 201 {
+		t.Fatalf("create status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	stages := repo.stagesFor(created.ID)
+	if len(stages) != 3 {
+		t.Fatalf("stage rows = %d, want 3 (groom/apply/confirm)", len(stages))
+	}
+	return created.ID, stages
+}
+
+// TestShippedGrooming_ReportModeNeitherGatesNorParksAtTheConsumer is AC7's
+// behavioural half (approval condition G2, sharpened by the implement review).
+//
+// The shipped `scoping: report` class is carried all the way to the runtime
+// consumer, and the consumer is asserted to do NOTHING with it: it derives no
+// delegated decision, surfaces no proposal, dispatches no action, emits no
+// page, parks neither the stage nor the run, and appends no run_auto_driven
+// row. Every assertion reads state AFTER the real AutoDriveRunGate call
+// returns, not the resolved matrix it was handed.
+//
+// COUNTERFACTUALS (run, not reasoned — see the PR notes):
+//   - mapping the `scoping` class to a delegation verb in
+//     delegation.actionClasses makes the report arm find a live gate and
+//     append an act:report row → RED on Reported / the row count.
+//   - flipping the shipped `scoping` default to `gated` → RED on the
+//     precondition below, which is what keeps this test from being a test
+//     about report mode that never saw one.
+func TestShippedGrooming_ReportModeNeitherGatesNorParksAtTheConsumer(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	stubConventions(t, conventionsWithCharter(t), nil)
+	runID, stages := startShippedGroomingRun(t, s, repo)
+	groom := stages[0]
+	// Park the propose stage at its declared approval gate and seed the clean
+	// two-agent review round: the gate is LIVE, which is precisely the state
+	// the report arm fires on. A test run at a dead gate would prove nothing.
+	groom.State = run.StageStateAwaitingApproval
+	seedCleanPlanApproval(t, au, runID)
+	runBefore := getRun(t, repo, runID)
+	stateBefore := runBefore.State
+
+	// PRECONDITION — non-vacuity. The matrix the consumer reads must actually
+	// carry `scoping` at mode: report, and hygiene at auto (proving the whole
+	// grooming block reached the consumer, not just a default).
+	res, _, ok := s.evaluateRunDelegation(context.Background(), runBefore, nil)
+	if !ok || res == nil {
+		t.Fatal("evaluateRunDelegation returned no result; the consumer never saw the shipped matrix")
+	}
+	scoping, found := res.MatrixEntry(spec.ActionGroomScoping)
+	if !found || scoping.Mode != spec.ModeReport {
+		t.Fatalf("consumer matrix entry for scoping = %+v (found %v), want mode: report", scoping, found)
+	}
+	if hygiene, ok := res.MatrixEntry(spec.ActionGroomHygiene); !ok || hygiene.Mode != spec.ModeAuto {
+		t.Fatalf("consumer matrix entry for hygiene = %+v (found %v), want mode: auto", hygiene, ok)
+	}
+
+	// NO AUTHORITY at the enforcement site: a report-mode class produces no
+	// delegated Decision, and — being an extension class with no
+	// backend-evaluable condition — no Report decision either. res.Actions is
+	// what every delegated dispatch arm reads.
+	for _, d := range res.Actions {
+		t.Errorf("delegated decision %+v derived under a grooming matrix; autonomy: low delegates nothing", d)
+	}
+	for _, d := range res.Reports {
+		t.Errorf("report decision %+v derived for an extension class with no backend-evaluable condition", d)
+	}
+
+	// THE RUNTIME PATH. This is the call the campaign driver and the
+	// POST /auto-drive endpoint both make.
+	out, err := s.AutoDriveRunGate(context.Background(), runBefore, campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || out.Reported || out.Paged || out.DecisionRequired {
+		t.Errorf("outcome = %+v; a report-mode grooming class must neither act, surface a proposal, page, nor park", out)
+	}
+
+	// NO GATE, NO PARK — read as COMMITTED STATE after the call, because an
+	// outcome struct alone cannot distinguish "did nothing" from "did
+	// something and reported nothing".
+	if groom.State != run.StageStateAwaitingApproval {
+		t.Errorf("groom stage = %q, want awaiting_approval — report mode moved no stage", groom.State)
+	}
+	for _, st := range stages[1:] {
+		if st.State != run.StageStatePending {
+			t.Errorf("stage %q = %q, want pending — report mode created no new gate", st.Type, st.State)
+		}
+	}
+	if after := getRun(t, repo, runID); after.State != stateBefore {
+		t.Errorf("run state = %q, want %q (unchanged) — report mode must not park the run", after.State, stateBefore)
+	}
+	if n := countAudit(au, CategoryRunAutoDriven); n != 0 {
+		t.Errorf("run_auto_driven rows = %d, want 0 — the consumer acted on and reported nothing", n)
+	}
+	if n := countAudit(au, CategoryCampaignGatePaged); n != 0 {
+		t.Errorf("campaign_gate_paged rows = %d, want 0 — a report-mode class pages nobody", n)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted rows = %d, want 0", n)
+	}
+}
+
+// TestShippedGrooming_ReportArmIsLiveInThisHarness is the PAIRED CONTROL for
+// the zeros above. Same server harness, same AutoDriveRunGate call, same live
+// plan-approval gate — but with the report entry on a BACKEND-KNOWN class. It
+// DOES surface a proposal and DOES append the act:report row, so the previous
+// test's zeros are the consumer answering rather than the consumer never
+// running.
+func TestShippedGrooming_ReportArmIsLiveInThisHarness(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("outcome = %+v, want Reported — the report arm is inert in this harness, so the negative test proves nothing", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows = %d, want 1", n)
 	}
 }
