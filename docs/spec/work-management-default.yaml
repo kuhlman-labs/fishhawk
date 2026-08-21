@@ -62,6 +62,23 @@ transitions:
   issue_closed: done
   issue_reopened: backlog
 
+# Where this repo's charter document lives (E54.1 / #2233) — the
+# prioritization anchor a backlog-grooming run reads so every ranking it
+# proposes can cite a rubric line by id. The document is human-authored and
+# is resolved from the run's BASE ref, so a change can never rewrite the
+# charter constraining it.
+#
+# `.fishhawk/charter.md` is the CONVENTIONAL location: a repo that writes its
+# charter there needs no `.fishhawk/work-management.yaml` override at all,
+# because it resolves through this shipped default. A repo that wants the
+# document elsewhere overrides `charter.path` in its own config.
+#
+# Schema-optional, feature-mandatory: backlog_grooming fails closed when no
+# charter resolves (#2234/#2236). Declaration only — nothing reads or injects
+# the document from here; that mechanism is backend/internal/repodoc (#2796).
+charter:
+  path: .fishhawk/charter.md
+
 # Per-repo kill-switch for upstream product-feedback egress (ADR-029,
 # #1006). Shipped in its enabled (egress-on) position. To hard-disable the
 # product-report endpoint for a repo, set the object's enabled to false:

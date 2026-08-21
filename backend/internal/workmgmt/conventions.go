@@ -57,6 +57,37 @@ type Conventions struct {
 	ProductFeedback  *ProductFeedback    `json:"product_feedback,omitempty"`
 	States           map[string]string   `json:"states,omitempty"`
 	Transitions      map[string]string   `json:"transitions,omitempty"`
+	Charter          *Charter            `json:"charter,omitempty"`
+}
+
+// Charter declares where the repo's checked-in charter document lives
+// (E54.1 / #2233) — the prioritization anchor a backlog-grooming run reads
+// so every ranking it proposes cites a rubric line by id. The document is
+// human-authored (agents read it, agents never write it) and is resolved
+// from the run's BASE ref, so a change cannot rewrite the charter
+// constraining it.
+//
+// The field is a POINTER so absent (nil) stays distinguishable from
+// present-but-empty: a value type would render a config that omits the
+// block as a zero-valued present one, and a consumer could not tell "no
+// charter declared" from "charter declared with an empty path".
+//
+// Schema-optional, feature-mandatory: the block's absence is not a
+// fail-open. backlog_grooming fails closed when no charter resolves, and
+// that enforcement lives in #2234/#2236, not here. This declaration ships
+// no reading, injection, or rendering — the injection mechanism is
+// backend/internal/repodoc (#2796), whose validatePath owns declared-path
+// safety fail-closed at the single point where the path is used to fetch
+// the document. That is why validateSemantics carries no path-shape rule:
+// a second copy of it here would be a second owner of the same invariant,
+// free to drift from the one that actually gates the read.
+type Charter struct {
+	// Path is the repo-relative path of the charter document, relative to
+	// the filing repo's root (e.g. .fishhawk/charter.md, the conventional
+	// location the shipped default declares). The schema requires it and
+	// enforces minLength 1, so a parsed Charter always carries a non-empty
+	// path.
+	Path string `json:"path"`
 }
 
 // ProductFeedback configures the upstream product-feedback egress path

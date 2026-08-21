@@ -2,6 +2,9 @@ package workmgmt
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -386,54 +389,73 @@ func TestParseDoneMeansSpaceVariant(t *testing.T) {
 }
 
 func TestParseSchemaErrors(t *testing.T) {
-	cases := map[string]string{
-		"unknown top-level key": minimalConfig + "playbook: nope\n",
-		"wrong spec_version": `
+	// wantPath, when non-empty, additionally pins the *SchemaError's JSON
+	// Pointer so a case proves WHICH construct rejected the config, not
+	// merely that something did.
+	cases := map[string]struct {
+		cfg      string
+		wantPath string
+	}{
+		"unknown top-level key": {cfg: minimalConfig + "playbook: nope\n"},
+		"wrong spec_version": {cfg: `
 spec_version: work-management-v9
 provider: github_projects
 project: {owner: a, number: 1}
 required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
-`,
-		"unknown provider": `
+`},
+		"unknown provider": {cfg: `
 spec_version: work-management-v0
 provider: trello
 project: {owner: a, number: 1}
 required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
-`,
-		"empty body_skeleton": `
+`},
+		"empty body_skeleton": {cfg: `
 spec_version: work-management-v0
 provider: github_projects
 project: {owner: a, number: 1}
 required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: []}}
-`,
-		"malformed label": `
+`},
+		"malformed label": {cfg: `
 spec_version: work-management-v0
 provider: github_projects
 project: {owner: a, number: 1}
 required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary], default_labels: ["NOT VALID"]}}
-`,
-		"non-object document": `just a string`,
+`},
+		"non-object document": {cfg: `just a string`},
 		// product_feedback:{} omits the required enabled flag, guarding
 		// required:["enabled"] against a regression that would re-introduce
 		// the implicit enabled=false kill-switch footgun (#1132).
-		"product_feedback missing required enabled": minimalConfig + "product_feedback: {}\n",
+		"product_feedback missing required enabled": {cfg: minimalConfig + "product_feedback: {}\n"},
 		// An unknown nested key under product_feedback guards the nested
 		// object's additionalProperties:false (#1132).
-		"product_feedback unknown nested key": minimalConfig + "product_feedback:\n  enabled: false\n  extra: nope\n",
+		"product_feedback unknown nested key": {cfg: minimalConfig + "product_feedback:\n  enabled: false\n  extra: nope\n"},
+		// The charter block's whole declaration-time contract is structural
+		// (E54.1 / #2233): required:["path"] + minLength:1 + the nested
+		// additionalProperties:false. Each of the three is pinned by its own
+		// case, and each asserts the JSON Pointer names /charter so a passing
+		// case cannot be some unrelated construct rejecting the config.
+		// Deleting required/minLength from the EMBEDDED mirror (the copy
+		// //go:embed compiles) reddens the first two.
+		"charter missing required path": {cfg: minimalConfig + "charter: {}\n", wantPath: "/charter"},
+		"charter empty path":            {cfg: minimalConfig + "charter:\n  path: \"\"\n", wantPath: "/charter/path"},
+		"charter unknown nested key":    {cfg: minimalConfig + "charter:\n  path: docs/charter.md\n  extra: nope\n", wantPath: "/charter"},
 	}
-	for name, cfg := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := Parse(strings.NewReader(cfg))
+			_, err := Parse(strings.NewReader(tc.cfg))
 			if err == nil {
 				t.Fatal("Parse accepted an invalid config")
 			}
 			var serr *SchemaError
 			if !errors.As(err, &serr) {
 				t.Fatalf("error = %v (%T), want *SchemaError", err, err)
+			}
+			if tc.wantPath != "" && serr.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q (full error: %v)", serr.Path, tc.wantPath, serr)
 			}
 		})
 	}
@@ -865,5 +887,90 @@ func TestParseProductFeedbackEnabled(t *testing.T) {
 	}
 	if !c.ProductFeedbackEnabled() {
 		t.Error("product_feedback.enabled:true should keep egress enabled")
+	}
+}
+
+// TestDefaultCharterPath is the DONE-MEANS test for the shipped default's
+// charter declaration (E54.1 / #2233). A config/default-value change is not
+// structurally enforced by compilation, so presence of a touched YAML file
+// proves nothing: this asserts the shipped OBSERVABLE value, and then stats
+// the declared path from the package directory so the conventional location
+// is proven to name a file that actually exists in this repository rather
+// than merely being a well-formed string. A comment-only or no-op touch of
+// the default YAML fails here.
+func TestDefaultCharterPath(t *testing.T) {
+	d := Default()
+	if d.Charter == nil {
+		t.Fatal("Default().Charter is nil; the shipped default declares no charter block")
+	}
+	const want = ".fishhawk/charter.md"
+	if d.Charter.Path != want {
+		t.Fatalf("Default().Charter.Path = %q, want %q", d.Charter.Path, want)
+	}
+
+	// backend/internal/workmgmt -> repo root is three levels up.
+	onDisk := filepath.Join("..", "..", "..", filepath.FromSlash(want))
+	info, err := os.Stat(onDisk)
+	if err != nil {
+		t.Fatalf("stat %s: %v — the shipped default declares a conventional charter path that does not resolve to a file in this repo", onDisk, err)
+	}
+	if info.IsDir() {
+		t.Fatalf("%s is a directory, want a charter document", onDisk)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("%s is empty, want a charter document", onDisk)
+	}
+}
+
+// TestParseCharter proves a repo config can override the conventional
+// location: the declared path round-trips verbatim into the typed struct.
+func TestParseCharter(t *testing.T) {
+	cfg := minimalConfig + "charter:\n  path: docs/charter.md\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(charter) = %v, want nil", err)
+	}
+	if c.Charter == nil {
+		t.Fatal("Charter is nil; the block did not round-trip into the struct")
+	}
+	if c.Charter.Path != "docs/charter.md" {
+		t.Errorf("Charter.Path = %q, want %q", c.Charter.Path, "docs/charter.md")
+	}
+}
+
+// TestParseWithoutCharter is the no-behaviour-change pin (AC2): the charter
+// block is additive-optional, so a config omitting it parses exactly as it
+// did before — and the POINTER field is what keeps absent (nil)
+// distinguishable from present-but-empty. A value-typed field could not
+// satisfy the nil assertion below.
+func TestParseWithoutCharter(t *testing.T) {
+	c, err := Parse(strings.NewReader(minimalConfig))
+	if err != nil {
+		t.Fatalf("Parse(no charter) = %v, want nil", err)
+	}
+	if c.Charter != nil {
+		t.Errorf("Charter = %+v, want nil for a config that declares no charter block", c.Charter)
+	}
+}
+
+// TestParseCharterNoSemanticPathRule records the deliberate decision (E54.1
+// / #2233) that workmgmt adds NO path-shape semantic rule: a traversal- or
+// absolute-path declaration parses here and is rejected fail-closed by
+// backend/internal/repodoc's validatePath at the single point where the
+// declared path is used to fetch the document. A second copy of the rule
+// here would be a second owner of the same invariant, free to drift from the
+// one that actually gates the read. If a future change adds declaration-time
+// path validation, this test is the one to delete deliberately.
+func TestParseCharterNoSemanticPathRule(t *testing.T) {
+	for _, p := range []string{"/etc/passwd", "../escape.md", `a\b.md`} {
+		t.Run(p, func(t *testing.T) {
+			c, err := Parse(strings.NewReader(minimalConfig + "charter:\n  path: " + strconv.Quote(p) + "\n"))
+			if err != nil {
+				t.Fatalf("Parse(charter path %q) = %v, want nil: workmgmt validates the path structurally only", p, err)
+			}
+			if c.Charter == nil || c.Charter.Path != p {
+				t.Fatalf("Charter = %+v, want path %q", c.Charter, p)
+			}
+		})
 	}
 }
