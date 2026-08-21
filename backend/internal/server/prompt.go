@@ -3064,33 +3064,17 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		if len(payload.Concerns) == 0 {
 			continue
 		}
-		sources := make([]fixupobligation.Source, 0, len(payload.Concerns)+2)
-		for _, c := range payload.Concerns {
-			// The RAW note, not the "[severity/category] note" render: the
-			// operator_concern dedupe compares against the minted concern's
-			// note text (#2623), so the two channels must be comparable.
-			//
-			// Carry the concern's TRUST provenance through on the SAME
-			// predicate resolveFixupConcerns uses for
-			// prompt.FixupConcern.AcceptanceDerived. An acceptance-synthesized
-			// concern's note is attacker-influenceable free text (ADR-050 /
-			// E31.8 / #1613); an obligation detected inside one must stay
-			// quarantined at every render site rather than being laundered into
-			// trusted prompt content by this mirror.
-			sources = append(sources, fixupobligation.Source{
-				Kind:      fixupobligation.SourceConcern,
-				Text:      c.Note,
-				Untrusted: c.Provenance == planreview.ConcernProvenanceAcceptance,
-			})
-		}
-		// operator_concern and reason are operator-authored by construction —
-		// the fix-up trigger records exactly what the operator typed — so they
-		// carry no untrusted marking.
-		sources = append(sources,
-			fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: payload.OperatorConcern},
-			fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: payload.Reason},
-		)
-		obligations := fixupobligation.Detect(sources)
+		// The SAME source-slice construction the routing-time PR-body detection
+		// uses (buildFixupObligationSources), so the two sites cannot drift on id
+		// minting: the ids the operator sees in the routing-time warning are the
+		// ids the reviewer sees here (#2782). The RAW concern note is used (not
+		// the "[severity/category]" render) so the operator_concern dedupe
+		// compares against the minted concern's note text (#2623), and each
+		// concern's TRUST provenance rides through so an obligation detected
+		// inside an acceptance-synthesized note stays quarantined at every render
+		// site (ADR-050 / E31.8 / #1613).
+		obligations := fixupobligation.Detect(
+			buildFixupObligationSources(payload.Concerns, payload.OperatorConcern, payload.Reason))
 		if len(obligations) == 0 {
 			return nil, 0
 		}
@@ -3205,6 +3189,7 @@ func fixupReportObligationsForPrompt(obligations []fixupobligation.Obligation) [
 		out = append(out, prompt.FixupReportObligation{
 			ID:        ob.ID,
 			Source:    string(ob.Source),
+			PRBody:    ob.PRBody,
 			Text:      ob.Text,
 			Untrusted: ob.Untrusted,
 		})

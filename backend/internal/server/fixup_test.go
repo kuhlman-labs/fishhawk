@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -2911,7 +2912,7 @@ func TestFixupStageAs_DoesNotMutateCallerConcernIDs(t *testing.T) {
 	backing := concernIDs[:cap(concernIDs)] // a view over the full backing array
 	before := backing[1]                    // uuid.Nil — the slot append would clobber
 
-	if _, err := s.fixupStageAs(context.Background(), testOperatorIdentity(), fixupActionParams{
+	if _, _, err := s.fixupStageAs(context.Background(), testOperatorIdentity(), fixupActionParams{
 		StageID:         stage.ID,
 		Options:         run.FixupOptions{PriorPassCount: 0, MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
 		ConcernIDs:      concernIDs,
@@ -3071,4 +3072,213 @@ func TestFixupStage_NoOperatorEvidence_KeyAbsent(t *testing.T) {
 	if _, present := latestFixupTriggeredPayload(t, au)["operator_evidence"]; present {
 		t.Error("payload carries an operator_evidence key with the field unset, want it omitted")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #2782: PR-body-unsatisfiable routing-time signal.
+// ---------------------------------------------------------------------------
+
+const prBodyInstruction = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+
+// prBodyUnsatisfiablePayloads decodes the fixup_pr_body_unsatisfiable audit
+// entries appended during a test.
+func prBodyUnsatisfiablePayloads(t *testing.T, au *auditFake) []fixupPRBodyUnsatisfiablePayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []fixupPRBodyUnsatisfiablePayload
+	for _, e := range au.appended {
+		if e.Category != CategoryFixupPRBodyUnsatisfiable {
+			continue
+		}
+		var p fixupPRBodyUnsatisfiablePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestFixupStage_PRBodyInstruction_AppendsAdvisoryAudit is the named
+// counterfactual vehicle for the PR-body classification (#2782): an
+// operator_concern naming the PR body drives the FULL HTTP handler, which
+// returns the obligation on the response's pr_body_obligations field AND records
+// the advisory fixup_pr_body_unsatisfiable audit entry.
+//
+// Counterfactual: force fixupobligation.NamesPRBodySurface to return false and
+// this goes RED — the obligation classifies PRBody false, the filter drops it,
+// and both the response field and the audit entry come back empty.
+func TestFixupStage_PRBodyInstruction_AppendsAdvisoryAudit(t *testing.T) {
+	s, repo, au, _ := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		OperatorConcern: prBodyInstruction,
+		Reason:          "route the reporting concern",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var resp fixupResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode fixup response: %v", err)
+	}
+	if len(resp.PRBodyObligations) != 1 {
+		t.Fatalf("response pr_body_obligations = %+v, want exactly 1", resp.PRBodyObligations)
+	}
+	ob := resp.PRBodyObligations[0]
+	// The operator_concern is folded into `selected` as a synthetic concern and
+	// deduped against its own operator_concern channel, so the surviving
+	// obligation is the concern-sourced ob-1 (#2623 dedupe).
+	if ob.ID != "ob-1" || ob.Source != "concern" || ob.TextExcerpt != prBodyInstruction {
+		t.Errorf("obligation = %+v, want ob-1/concern with the PR-body excerpt", ob)
+	}
+
+	payloads := prBodyUnsatisfiablePayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("fixup_pr_body_unsatisfiable entries = %d, want 1", len(payloads))
+	}
+	p := payloads[0]
+	if p.StageID != stage.ID.String() || p.ObligationCount != 1 || len(p.Obligations) != 1 {
+		t.Fatalf("audit payload = %+v, want the stage id and one obligation", p)
+	}
+	if p.Obligations[0] != ob {
+		t.Errorf("audit obligation = %+v, response obligation = %+v — they must match", p.Obligations[0], ob)
+	}
+}
+
+// TestFixupStage_RunLogObligation_NoPRBodySignal is the ANTI-NOISE + narrow-
+// classification control at the routing layer: an obligation naming the RUN LOG
+// — a surface the pass CAN write — is NOT a PR-body obligation, so no
+// fixup_pr_body_unsatisfiable entry is appended and the response carries no
+// pr_body_obligations field (byte-identical to a pass that routed no obligation
+// at all).
+//
+// Counterfactual: delete the `if !ob.PRBody { continue }` filter in
+// recordFixupPRBodyUnsatisfiable (append unconditionally) and this goes RED —
+// the run-log obligation is then emitted as a PR-body signal.
+func TestFixupStage_RunLogObligation_NoPRBodySignal(t *testing.T) {
+	s, repo, au, _ := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		OperatorConcern: "Report the observed RED output in the run log.",
+		Reason:          "route the reporting concern",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp fixupResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode fixup response: %v", err)
+	}
+	if len(resp.PRBodyObligations) != 0 {
+		t.Errorf("a run-log obligation must emit no PR-body signal, got %+v", resp.PRBodyObligations)
+	}
+	// The optional field must be ABSENT on the wire (omitempty), so an unchanged
+	// consumer sees a byte-identical response.
+	if strings.Contains(w.Body.String(), "pr_body_obligations") {
+		t.Errorf("response must omit pr_body_obligations when empty:\n%s", w.Body.String())
+	}
+	if n := countAppendedByCategory(au, CategoryFixupPRBodyUnsatisfiable); n != 0 {
+		t.Errorf("fixup_pr_body_unsatisfiable entries = %d, want 0 for a run-log obligation", n)
+	}
+}
+
+// TestFixupStage_OrdinaryPass_ResponseByteIdentical pins that an ordinary
+// fix-up (a routine code-change concern, no reporting obligation) returns a
+// response with NO pr_body_obligations key at all — the acceptance-criterion-2
+// no-churn guarantee at the wire.
+func TestFixupStage_OrdinaryPass_ResponseByteIdentical(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "Guard the nil pool in the retry path.")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}, Reason: "fix the nil deref"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "pr_body_obligations") {
+		t.Errorf("ordinary pass response must omit pr_body_obligations:\n%s", w.Body.String())
+	}
+	if n := countAppendedByCategory(au, CategoryFixupPRBodyUnsatisfiable); n != 0 {
+		t.Errorf("ordinary pass emitted %d PR-body signals, want 0", n)
+	}
+}
+
+// TestFixupPRBodySources_MatchPromptServeDerivation is CONDITION 2 / fable's-low
+// pin: the routing-time PR-body detection and the review-time re-derivation must
+// mint the SAME ob-N id for the same routed instruction, so the operator and the
+// reviewer name the same obligation. Both go through buildFixupObligationSources
+// + fixupobligation.Detect; this drives the review path (resolveFixupReport
+// Obligations over a seeded trigger) and compares its id/source to the shared
+// helper's output.
+func TestFixupPRBodySources_MatchPromptServeDerivation(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+	seq := seedFixupTriggerWithConcern(t, au, runID, stageID, prBodyInstruction, "route the reporting concern")
+
+	reviewObs, _ := s.resolveFixupReportObligations(t.Context(), runID, stageID, seq)
+	if len(reviewObs) != 1 {
+		t.Fatalf("review-time obligations = %+v, want 1", reviewObs)
+	}
+
+	// The routing-time derivation over the SAME (concerns, operator_concern,
+	// reason) triple the trigger recorded.
+	routingObs := fixupobligation.Detect(buildFixupObligationSources(
+		[]planreview.Concern{{Severity: "medium", Category: "process", Note: prBodyInstruction}},
+		"", "route the reporting concern"))
+	if len(routingObs) != 1 {
+		t.Fatalf("routing-time obligations = %+v, want 1", routingObs)
+	}
+	if reviewObs[0].ID != routingObs[0].ID || reviewObs[0].Source != routingObs[0].Source {
+		t.Errorf("id/source diverge: review %s/%s vs routing %s/%s",
+			reviewObs[0].ID, reviewObs[0].Source, routingObs[0].ID, routingObs[0].Source)
+	}
+	if !reviewObs[0].PRBody || !routingObs[0].PRBody {
+		t.Errorf("both derivations must mark PRBody: review %v routing %v", reviewObs[0].PRBody, routingObs[0].PRBody)
+	}
+}
+
+// TestRecordFixupPRBodyUnsatisfiable_FailOpen exercises the per-failure-mode
+// branches of recordFixupPRBodyUnsatisfiable (#2782): a nil AuditRepo, an
+// append error, and empty routed text each degrade without panicking and never
+// change the returned obligation set's correctness.
+func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
+	stageID, runID := uuid.New(), uuid.New()
+	dec := &run.FixupDecision{Stage: &run.Stage{ID: stageID, RunID: runID}}
+	prConcerns := []planreview.Concern{{Severity: "high", Category: "operator", Note: prBodyInstruction}}
+
+	t.Run("nil audit repo returns obligations without appending", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"}) // no AuditRepo
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", "")
+		if len(got) != 1 {
+			t.Errorf("obligations = %+v, want the PR-body obligation even with no audit repo", got)
+		}
+	})
+
+	t.Run("append error still returns obligations", func(t *testing.T) {
+		au := newAuditFake()
+		au.appendErrCategory = CategoryFixupPRBodyUnsatisfiable
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, prConcerns, "", "")
+		if len(got) != 1 {
+			t.Errorf("obligations = %+v, want the PR-body obligation despite an append error", got)
+		}
+	})
+
+	t.Run("empty routed text detects nothing", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		got := s.recordFixupPRBodyUnsatisfiable(context.Background(), dec, nil, "", "")
+		if got != nil {
+			t.Errorf("obligations = %+v, want nil for empty routed text", got)
+		}
+		if n := countAppendedByCategory(au, CategoryFixupPRBodyUnsatisfiable); n != 0 {
+			t.Errorf("entries = %d, want 0 for empty routed text", n)
+		}
+	})
 }

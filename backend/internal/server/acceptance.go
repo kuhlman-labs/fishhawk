@@ -2030,7 +2030,10 @@ func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, sta
 	}
 
 	acceptanceStageID := stage.ID
-	dec, ferr := s.fixupStageAs(ctx, Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
+	// The PR-body-unsatisfiable set (#2782) is unused on the acceptance-triage
+	// path — there is no operator tool result to warn on — so it is discarded;
+	// the advisory audit entry is still written inside fixupStageAs.
+	dec, _, ferr := s.fixupStageAs(ctx, Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
 		StageID: implement.ID,
 		Options: run.FixupOptions{
 			PriorPassCount:    priorPasses,

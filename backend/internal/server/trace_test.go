@@ -6952,10 +6952,14 @@ func TestBackstopFixupReReview_ParseRepoError_NoDispatch(t *testing.T) {
 // #2737: routed reporting obligation undelivered signal.
 // ---------------------------------------------------------------------------
 
-// obligationConcernNote is the routed concern note used across the #2737 tests.
-// It carries BOTH classifier halves (a recording verb and a report surface), so
-// fixupobligation.Detect classifies it as ob-1.
-const obligationConcernNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+// obligationConcernNote is the routed concern note used across the #2737 tests
+// that pin the SATISFIABLE reporting path (unreported / declined / met). It names
+// the RUN LOG — a surface a fix-up pass CAN write — so it carries both classifier
+// halves (a recording verb and a report surface) and is classified as ob-1 with
+// PRBody false, keeping the pre-#2782 unreported/declined/met-suppressed
+// behaviour those tests assert. A PR-body note would instead be `unsatisfiable`
+// regardless of the report (#2782), which the dedicated PR-body tests pin.
+const obligationConcernNote = "Report the observed RED output in the run log."
 
 // seedFixupTriggerWithConcern appends a stage_fixup_triggered audit entry bound
 // to the stage, carrying one routed concern with the given note plus the given
@@ -7061,8 +7065,9 @@ func metReportEvidence(id string) *prompt.GateEvidence {
 // TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAndRendersEvidence
 // is the DONE-MEANS behavioral test (#1169) for #2737. It drives the real
 // implement-review path end to end: seed a stage_fixup_triggered audit entry
-// whose routed concern note carries a PR-body reporting obligation, dispatch the
-// review with gate_evidence that carries NO obligation report, then read
+// whose routed concern note carries a (satisfiable, run-log) reporting
+// obligation, dispatch the review with gate_evidence that carries NO obligation
+// report, then read
 // COMMITTED STATE after the call returns — the audit entries — plus the rendered
 // reviewer prompt.
 func TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAndRendersEvidence(t *testing.T) {
@@ -7104,11 +7109,55 @@ func TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAn
 		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
 	}
 	for _, w := range []string{
-		"### Routed reporting obligation NOT carried out (operator instruction, high priority)",
+		"### Routed reporting obligation status (operator instruction, high priority)",
 		"`ob-1` (routed as concern) — unreported: " + obligationConcernNote,
 	} {
 		if !strings.Contains(reviewer.calls[0], w) {
 			t.Errorf("reviewer prompt missing %q from the undelivered signal:\n%s", w, reviewer.calls[0])
+		}
+	}
+}
+
+// TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet drives the REAL
+// review path for the #2782 heart: a PR-body reporting obligation is surfaced
+// with status `unsatisfiable` EVEN when the agent reported it `met`, because the
+// pass could not have written the PR body. The reviewer prose reframes it as a
+// routing-surface limitation, not an agent omission.
+func TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet(t *testing.T) {
+	const prBodyNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, prBodyNote, "route the reporting concern")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	// A VALID met report — which for an ordinary obligation would suppress the
+	// finding — must NOT suppress a PR-body obligation.
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", metReportEvidence("ob-1")) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	payloads := fixupObligationUndeliveredPayloads(t, au)
+	if len(payloads) != 1 || len(payloads[0].Obligations) != 1 {
+		t.Fatalf("payloads = %+v, want one entry naming one obligation despite the met report", payloads)
+	}
+	if got := payloads[0].Obligations[0].Status; got != "unsatisfiable" {
+		t.Errorf("status = %q, want unsatisfiable even with a met report", got)
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	rp := reviewer.calls[0]
+	for _, w := range []string{
+		"`ob-1` (routed as concern) — unsatisfiable: " + prBodyNote,
+		"limitation of the ROUTING SURFACE, not an agent omission",
+	} {
+		if !strings.Contains(rp, w) {
+			t.Errorf("reviewer prompt missing %q:\n%s", w, rp)
 		}
 	}
 }
@@ -7138,7 +7187,7 @@ func TestImplementReview_FixupReportingObligationMet_NoAuditEntry(t *testing.T) 
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
-	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation status") {
 		t.Errorf("a satisfied pass must render NO undelivered block:\n%s", reviewer.calls[0])
 	}
 }
@@ -7180,7 +7229,7 @@ func TestImplementReview_FixupReportingObligationDeclined_ReportedAsDeclined(t *
 	rp := reviewer.calls[0]
 	for _, w := range []string{
 		"`ob-1` (routed as concern) — declined: " + obligationConcernNote,
-		"stated reason for a decline is deliberately NOT carried here",
+		"stated reason is deliberately NOT carried here",
 	} {
 		if !strings.Contains(rp, w) {
 			t.Errorf("reviewer prompt missing %q:\n%s", w, rp)
@@ -7225,7 +7274,7 @@ func TestImplementReview_NoReportingObligationRouted_NoSignal(t *testing.T) {
 	if routineEntries != 0 {
 		t.Errorf("entries = %d, want 0 for a routine fix-up carrying no reporting obligation", routineEntries)
 	}
-	if strings.Contains(withRoutine, "### Routed reporting obligation NOT carried out") {
+	if strings.Contains(withRoutine, "### Routed reporting obligation status") {
 		t.Errorf("a routine fix-up must render no undelivered block:\n%s", withRoutine)
 	}
 
@@ -7239,7 +7288,7 @@ func TestImplementReview_NoReportingObligationRouted_NoSignal(t *testing.T) {
 	if firstEntries != 0 {
 		t.Errorf("entries = %d, want 0 for a first (non-fix-up) implement review", firstEntries)
 	}
-	if strings.Contains(firstReview, "### Routed reporting obligation NOT carried out") {
+	if strings.Contains(firstReview, "### Routed reporting obligation status") {
 		t.Errorf("a first (non-fix-up) implement review must render no undelivered block:\n%s", firstReview)
 	}
 	if firstReview != withRoutine {
@@ -7480,7 +7529,7 @@ func TestRunImplementReviews_FixupObligationWithoutAnchor_NoSignal(t *testing.T)
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
-	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+	if strings.Contains(reviewer.calls[0], "### Routed reporting obligation status") {
 		t.Errorf("an unanchored obligation must render no block:\n%s", reviewer.calls[0])
 	}
 }
@@ -7607,7 +7656,7 @@ func TestImplementReview_FixupReportingObligation_AuditAppendFailureWarnsAndProc
 	if len(reviewer.calls) != 1 {
 		t.Fatalf("reviewer invoked %d times, want 1 — the review must proceed", len(reviewer.calls))
 	}
-	if !strings.Contains(reviewer.calls[0], "### Routed reporting obligation NOT carried out") {
+	if !strings.Contains(reviewer.calls[0], "### Routed reporting obligation status") {
 		t.Errorf("the prompt signal must survive an audit-append failure:\n%s", reviewer.calls[0])
 	}
 }
@@ -7702,8 +7751,11 @@ func TestImplementReview_AcceptanceDerivedObligation_TextQuarantined(t *testing.
 	if outside := prompt[:begin] + prompt[end:]; strings.Contains(outside, injected) {
 		t.Errorf("acceptance-derived obligation text leaked OUTSIDE the quarantine envelope:\n%s", prompt)
 	}
-	// The obligation is still named by id, so the signal itself is unchanged.
-	if !strings.Contains(prompt, "`ob-1` (routed as concern) — unreported: instruction text quarantined as untrusted DATA below") {
+	// The obligation is still named by id. This note names the PR body, so its
+	// status is `unsatisfiable` (#2782) — the pass could not have written it —
+	// and it carries the PR-body cannot-write marker, but the untrusted excerpt
+	// stays quarantined either way.
+	if !strings.Contains(prompt, "`ob-1` (routed as concern) — unsatisfiable: instruction text quarantined as untrusted DATA below") {
 		t.Errorf("the undelivered obligation must still be named by id and status:\n%s", prompt)
 	}
 }

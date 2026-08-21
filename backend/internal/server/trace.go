@@ -2835,10 +2835,11 @@ type fixupReportingObligationUndeliveredPayload struct {
 	Obligations      []fixupReportingObligationDetail `json:"obligations"`
 }
 
-// fixupReportingObligationDetail is one undelivered obligation on the audit
-// payload: its stable id, the routed channel it arrived on, whether the agent
-// left it `unreported` or honestly `declined`, and the bounded excerpt of the
-// operator's instruction.
+// fixupReportingObligationDetail is one obligation on the audit payload: its
+// stable id, the routed channel it arrived on, its Status — `unreported`,
+// `declined`, or `unsatisfiable` (it named the PR body, a surface the pass
+// cannot write, so it is recorded regardless of the agent's report, #2782) —
+// and the bounded excerpt of the operator's instruction.
 type fixupReportingObligationDetail struct {
 	ID          string `json:"id"`
 	Source      string `json:"source"`
@@ -3590,6 +3591,15 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// subtract the agent's runner-validated `met` reports carried on
 	// gate_evidence, and signal any remainder. Adjacent to the #1407 block and
 	// using the same allocate-if-nil gateEvidence pattern.
+	//
+	// fixupobligation.Undelivered classifies each remainder with a Status the
+	// backend derives — `unreported`, `declined`, or `unsatisfiable` — and that
+	// string flows verbatim into both prompt.GateFixupReportingObligation.Status
+	// and the fixupReportingObligationDetail audit payload here. A PR-body
+	// obligation is `unsatisfiable`: it is surfaced EVEN when the agent reported
+	// `met`, because the pass could not have written the PR body (#2782), and
+	// writeGateEvidence reframes it as a routing-surface limitation rather than
+	// an agent omission.
 	//
 	// EVIDENCE ONLY, byte-for-byte the #1407 posture: this branch appends an
 	// advisory audit entry and sets a prompt field. It NEVER touches the review

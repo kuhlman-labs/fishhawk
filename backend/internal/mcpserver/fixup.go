@@ -2,12 +2,63 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// PRBodyObligation mirrors one entry of the fix-up response's optional
+// pr_body_obligations field (#2782): a routed instruction that named the
+// pull-request body — a surface a fix-up pass cannot write. The verb renders
+// its operator warning FROM this server-minted set (naming the arrival channel
+// and the id), so the ids the operator sees at routing time are the SAME ids
+// the reviewer sees later. TextExcerpt is inert DATA — the verb deliberately
+// never renders it into the warning, so an Untrusted (acceptance-derived)
+// excerpt cannot become an injection path. Each json tag MUST byte-match the
+// backend or the field silently decodes to its zero value (the #371 trap).
+type PRBodyObligation struct {
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	TextExcerpt string `json:"text_excerpt"`
+	Untrusted   bool   `json:"untrusted,omitempty"`
+}
+
+// fixupStageWithObligations posts the fix-up (`POST /v0/stages/{id}/fixup`) and
+// returns the re-opened Stage PLUS the server-minted PR-body obligation set
+// (#2782) from the SAME response, so the verb can warn the operator FROM the
+// response rather than re-deriving anything locally. It lives beside the verb
+// (not in the generic client surface) because `pr_body_obligations` is specific
+// to this endpoint; it reuses the client's marshal/do path. The Stage fields
+// promote to the top level of the response, so the embedded Stage decodes
+// exactly as before; pr_body_obligations is the optional sibling (omitempty),
+// nil for the common pass and on an older backend that omits it.
+func (c *apiClient) fixupStageWithObligations(ctx context.Context, id uuid.UUID, in FixupStageInput) (*Stage, []PRBodyObligation, error) {
+	body, err := json.Marshal(fixupRequest{
+		ConcernIDs:          in.ConcernIDs,
+		Concerns:            in.Concerns,
+		Reason:              in.Reason,
+		AllowCreate:         in.AllowCreate,
+		ForceAdditionalPass: in.ForceAdditionalPass,
+		ImplementModel:      in.ImplementModel,
+		OperatorConcern:     in.OperatorConcern,
+		OperatorEvidence:    in.OperatorEvidence,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal fixup: %w", err)
+	}
+	var resp struct {
+		Stage
+		PRBodyObligations []PRBodyObligation `json:"pr_body_obligations,omitempty"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+id.String()+"/fixup", body, &resp); err != nil {
+		return nil, nil, err
+	}
+	return &resp.Stage, resp.PRBodyObligations, nil
+}
 
 // FixupStageInput is the fishhawk_fixup_stage tool's input schema
 // (E22.X / #762). Mirrors `POST /v0/stages/{stage_id}/fixup`.
@@ -48,6 +99,15 @@ type FixupStageInput struct {
 // fixup_budget_exhausted or fixup_ceiling_reached).
 type FixupStageOutput struct {
 	Stage Stage `json:"stage"`
+	// Warnings carries one advisory line per routed instruction that named the
+	// PULL-REQUEST BODY — a surface a fix-up pass has NO mechanism to write
+	// (#2782). It is rendered FROM the server-minted pr_body_obligations set on
+	// the fix-up response (never re-derived locally), so each line names the
+	// arrival channel and the same obligation id the reviewer will see, and it
+	// is ADVISORY: the fix-up still proceeded and returned its Stage. Present
+	// (omitempty) only when a routed instruction named the PR body, so an
+	// ordinary pass returns a byte-identical output.
+	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings emitted when a routed instruction named the PR body — a surface a fix-up pass cannot write. Each line names the arrival channel and obligation id and points at the surfaces that DO work. Present only when such an instruction was routed; the fix-up still proceeds regardless."`
 }
 
 // registerFixupStage wires the fishhawk_fixup_stage tool (E22.X / #762).
@@ -155,6 +215,17 @@ Inputs:
     on the stage_fixup_triggered audit entry and surfaced on the run's
     fixup_model status field.
 
+A fix-up pass CANNOT update the pull-request body or title. The PR body is
+composed once, at PR-open, by the first implement attempt; a fix-up pass only
+pushes commits onto the existing branch. So an instruction routed here that asks
+the agent to RECORD something in the PR body (e.g. "put the counterfactual table
+in the ## Notes") cannot take effect on any pass — route such an attestation to
+a surface the pass CAN write (the fix-up self-report sidecar, a run log, or a
+file inside the declared scope), or make the change in a fresh run. When a routed
+instruction (in reason, operator_concern, OR a routed concern note) names the PR
+body, the tool result carries a "warnings" entry naming the arrival channel and
+the obligation id; "warnings" is absent otherwise.
+
 Bounded + operator-gated: the NORMAL bound defaults to ONE pass per stage.
 The budget is the number of remaining passes (max − fix-ups already
 triggered, observable on the stage_fixup_triggered audit entry's
@@ -210,9 +281,38 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 && strings.TrimSpace(in.OperatorConcern) == "" {
 		return nil, FixupStageOutput{}, fmt.Errorf("select at least one of: concern_ids (stable concern UUIDs from fishhawk_get_run_status's run.concerns block), the deprecated positional concerns indices, or a free-text operator_concern")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel, in.OperatorConcern, in.OperatorEvidence)
+	fixed, prBodyObligations, err := r.api.fixupStageWithObligations(ctx, stageID, in)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}
-	return nil, FixupStageOutput{Stage: *fixed}, nil
+	return nil, FixupStageOutput{Stage: *fixed, Warnings: prBodyInstructionWarnings(prBodyObligations)}, nil
+}
+
+// prBodyInstructionWarnings renders one advisory warning per routed instruction
+// that named the PR body (#2782), FROM the server-minted obligation set — never
+// re-deriving anything locally, so the arrival channel and id each line reports
+// are exactly what the backend recorded and what the reviewer will later see.
+// It deliberately does NOT render the obligation's TextExcerpt: the excerpt can
+// be attacker-influenceable (an acceptance-derived note), and the reviewer-
+// facing gate evidence is the one site that prints an excerpt, under quarantine
+// — keeping this operator-facing warning free of any injection surface. Returns
+// nil for the common pass that named no PR-body surface, so the output stays
+// byte-identical.
+func prBodyInstructionWarnings(obligations []PRBodyObligation) []string {
+	if len(obligations) == 0 {
+		return nil
+	}
+	warnings := make([]string, 0, len(obligations))
+	for _, ob := range obligations {
+		warnings = append(warnings, fmt.Sprintf(
+			"routed instruction %s (arrived via %s) names the PULL-REQUEST BODY, which a fix-up pass CANNOT update: "+
+				"the PR title and body are composed once at PR-open by the first implement attempt, and a fix-up pass "+
+				"only pushes commits — it has no mechanism to re-compose or PATCH them, so this instruction cannot take "+
+				"effect. Record the attestation on a surface this pass CAN write — the fix-up self-report sidecar (its "+
+				"ids and statuses reach the implement reviewer and the operator at the gate), a run log, or a file "+
+				"inside the declared scope — or make the change in a fresh run whose first implement attempt composes "+
+				"the body.",
+			ob.ID, ob.Source))
+	}
+	return warnings
 }

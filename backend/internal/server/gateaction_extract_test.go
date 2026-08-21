@@ -210,7 +210,7 @@ func TestGateActionExtract_ScopeEnforcedInServiceMethods(t *testing.T) {
 	if _, err := s.approveStageAs(context.Background(), underScoped, approveActionParams{}); !errors.As(err, &scopeErr) {
 		t.Errorf("approveStageAs under an identity missing write:approvals: err = %v, want gateActionScopeError", err)
 	}
-	if _, err := s.fixupStageAs(context.Background(), underScoped, fixupActionParams{}); !errors.As(err, &scopeErr) {
+	if _, _, err := s.fixupStageAs(context.Background(), underScoped, fixupActionParams{}); !errors.As(err, &scopeErr) {
 		t.Errorf("fixupStageAs under an identity missing write:stages/write:fixups: err = %v, want gateActionScopeError", err)
 	}
 	if _, err := s.retryStageAs(context.Background(), underScoped, retryActionParams{}); !errors.As(err, &scopeErr) {

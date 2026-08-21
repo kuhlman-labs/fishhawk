@@ -611,8 +611,12 @@ Notes:
   valid `met` entry in the fix-up self-report sidecar. Payload
   `{declared_count, undelivered_count, obligations:[{id, source, status,
   text_excerpt}]}`, where `status` is `unreported` (the agent said nothing, or
-  its report failed the runner's fail-closed validation) or `declined` (it
-  answered and honestly declined). Advisory + best-effort — a nil `AuditRepo`, a
+  its report failed the runner's fail-closed validation), `declined` (it
+  answered and honestly declined), or `unsatisfiable` (#2782 — the obligation
+  named the PR body, a surface the pass cannot write, so it is recorded even when
+  the agent reported `met`, and the reviewer prompt reframes it as a
+  routing-surface limitation rather than an agent omission). Advisory +
+  best-effort — a nil `AuditRepo`, a
   list error, or a malformed trigger payload contributes nothing and never
   blocks the review, and the entry is written only when the undelivered set is
   non-empty (a pass whose every obligation carries a `met` report keeps the
@@ -635,6 +639,25 @@ Notes:
   an append failure WARNs, and the consequence is simply that the review emits no
   signal, the fail-safe direction. Listed here only so a future reader grepping
   the audit categories doesn't mistake it for a comment surface.
+- The routing-time PR-body advisory kind — `fixup_pr_body_unsatisfiable` (#2782),
+  written by `server/fixup.go::recordFixupPRBodyUnsatisfiable` from inside
+  `fixupStageAs` on EVERY routing path (the HTTP verb, the in-process campaign
+  auto-driver, and acceptance triage) — is likewise an **internal, advisory audit
+  kind, not an issue-comment surface**. Nothing in `issuecomment` posts it. It
+  records, at ROUTING time (before the review), that a routed instruction named
+  the PULL-REQUEST BODY — a surface a fix-up pass has no mechanism to write, since
+  the PR body is composed once at PR-open by the first implement attempt and a
+  fix-up pass only pushes commits — so the operator learns the instruction is
+  structurally unsatisfiable without waiting for the review. Payload `{stage_id,
+  obligation_count, obligations:[{id, source, text_excerpt, untrusted?}]}`, the
+  same set returned on the fix-up response's optional `pr_body_obligations` field
+  (which the MCP verb renders its operator warning from). Written only when the
+  set is non-empty (an ordinary pass keeps the payload absent). Advisory +
+  best-effort and fail-open — a nil `AuditRepo` or an append error contributes
+  nothing and never unwinds the committed fix-up transition or changes the HTTP
+  status. EVIDENCE ONLY: it never fails, re-opens, or re-budgets the pass. Listed
+  here only so a future reader grepping the audit categories doesn't mistake it
+  for a comment surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,

@@ -290,13 +290,28 @@ self-report sidecar, whose documented rules `writeFixupSelfReport` extends with
 the per-id `obligations` array (`met` requires a non-empty `record`, `declined`
 requires a non-empty `reason`, anything else is DROPPED).
 
+A PR-body obligation (`FixupReportObligation.PRBody`, #2782 — the instruction
+names the pull-request body, a surface THIS pass cannot write) is additionally
+marked on its bullet as such, and the agent is told plainly to report it
+`declined` rather than fabricate a `met` (reporting a `met` for a surface the
+pass cannot write is not truthful). Pinned by
+`TestBuild_ImplementFixup_ReportObligations_PRBodyMarksBullet`.
+
 The reviewer-facing half is `GateEvidence.FixupReportingObligations`, rendered
-by `writeGateEvidence` as a DISTINCT high-priority block worded so it cannot be
-confused with a generic "unverifiable in a diff-only review" concern.
+by `writeGateEvidence`. Its title ("### Routed reporting obligation status") no
+longer unconditionally accuses the agent, because a routed obligation now
+carries one of three statuses. `unreported` / `declined` render as before (a
+possible agent omission the reviewer judges from the operator instruction + the
+diff). `unsatisfiable` (#2782) is DIFFERENT and reframed explicitly: the
+obligation named the PR body, which a fix-up pass has no mechanism to write, so
+it is a **routing-surface limitation, NOT an agent omission** — the reviewer is
+told not to raise it against the agent and not to treat an overridden `met` as
+dishonesty. Pinned by
+`TestBuild_ImplementReview_GateEvidence_UnsatisfiableObligation_NotFramedAsOmission`.
 `GateEvidence.FixupObligationReports` is a data CARRIER for the runner-validated
 reports and is never rendered — the backend joins against it and renders only
-the remainder, so a fully-met pass keeps the reviewer prompt byte-identical
-(prompt-hash replay stability).
+the remainder, so a fully-met pass with no PR-body obligation keeps the reviewer
+prompt byte-identical (prompt-hash replay stability).
 
 That block's fields are **split by trust**. `ID`/`Source`/`Status` are
 backend-authored and always render inline. `Text` — the routed instruction

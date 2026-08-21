@@ -8534,7 +8534,7 @@ func TestBuild_ImplementReview_GateEvidence_RendersFixupReportingObligations(t *
 		t.Fatalf("Build: %v", err)
 	}
 	for _, w := range []string{
-		"### Routed reporting obligation NOT carried out (operator instruction, high priority)",
+		"### Routed reporting obligation status (operator instruction, high priority)",
 		"This is NOT a \"cannot be verified from the diff\" observation",
 		"`ob-1` (routed as concern) — unreported: Record the per-deletion counterfactual results",
 		"`ob-2` (routed as reason) — declined: Report the observed RED output in the run log.",
@@ -8542,7 +8542,7 @@ func TestBuild_ImplementReview_GateEvidence_RendersFixupReportingObligations(t *
 		"rather than as a diff-only-unverifiable finding",
 		// The block states plainly that the agent's own decline reason is not
 		// carried, so a reviewer does not read its absence as a render bug.
-		"stated reason for a decline is deliberately NOT carried here",
+		"stated reason is deliberately NOT carried here",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("reporting-obligation gate-evidence render missing %q:\n%s", w, got)
@@ -8581,7 +8581,7 @@ func TestBuild_ImplementReview_GateEvidence_FixupObligation_NoAgentTextChannel(t
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "### Routed reporting obligation NOT carried out") {
+	if !strings.Contains(got, "### Routed reporting obligation status") {
 		t.Fatalf("the undelivered block must still render:\n%s", got)
 	}
 	// The decline-reason envelope and its framing are gone entirely — there is
@@ -8622,7 +8622,7 @@ func TestBuild_ImplementReview_GateEvidence_NoFixupReportingObligationsSection(t
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if strings.Contains(plain, "### Routed reporting obligation NOT carried out") {
+	if strings.Contains(plain, "### Routed reporting obligation status") {
 		t.Errorf("the block must be absent when nothing is undelivered:\n%s", plain)
 	}
 
@@ -8837,7 +8837,7 @@ func TestBuild_ImplementReview_GateEvidence_UntrustedObligationTextQuarantined(t
 	if !strings.Contains(got, "- `ob-1` (routed as concern) — unreported: instruction text quarantined as untrusted DATA below") {
 		t.Errorf("the untrusted obligation must still be named by id and status:\n%s", got)
 	}
-	if !strings.Contains(got, "### Routed reporting obligation NOT carried out") {
+	if !strings.Contains(got, "### Routed reporting obligation status") {
 		t.Errorf("the undelivered block must still render:\n%s", got)
 	}
 	assertObligationTextQuarantined(t, got, text)
@@ -9029,5 +9029,80 @@ func TestBuild_Plan_UndecidableCriteriaGuardrail(t *testing.T) {
 	// authors to mark drivable criteria as skips to dodge a phantom gate.
 	if !strings.Contains(got, "it does not reject the plan") {
 		t.Errorf("plan prompt must state the undecidable_criterion rule is advisory:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_UnsatisfiableObligation_NotFramedAsOmission
+// is the named counterfactual vehicle for the `unsatisfiable` arm (#2782): an
+// obligation the backend classified `unsatisfiable` — it named the PR body,
+// which a fix-up pass cannot write — must be reframed for the reviewer as a
+// ROUTING-SURFACE limitation, NOT an agent omission, so the reviewer does not
+// raise it against the agent even though it came back without a `met`.
+//
+// Counterfactual: delete the `unsatisfiable` arm in writeGateEvidence and this
+// goes RED — the reframing prose disappears.
+func TestBuild_ImplementReview_GateEvidence_UnsatisfiableObligation_NotFramedAsOmission(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+			FixupReportingObligations: []GateFixupReportingObligation{
+				{ID: "ob-1", Source: "operator_concern", Status: "unsatisfiable",
+					Text: "Record the counterfactual table in the PR body's ## Notes."},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"`ob-1` (routed as operator_concern) — unsatisfiable: Record the counterfactual table",
+		"named the PULL-REQUEST BODY, which a fix-up pass has NO mechanism to write",
+		"limitation of the ROUTING SURFACE, not an agent omission",
+		"Do NOT name it as an uncarried-out instruction",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("unsatisfiable reframing missing %q:\n%s", w, got)
+		}
+	}
+	// The title no longer unconditionally accuses the agent.
+	if strings.Contains(got, "Routed reporting obligation NOT carried out") {
+		t.Errorf("the block must not unconditionally assert NOT carried out:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementFixup_ReportObligations_PRBodyMarksBullet: a PR-body
+// obligation's bullet in the AGENT prompt is marked as naming a surface this
+// pass cannot write, and the agent is told to report it `declined` rather than
+// fabricate a `met`. A run-log (non-PR-body) obligation gets no such marker.
+//
+// Counterfactual: drop the prBodyNote in writeFixupReportObligations and the
+// PR-body arm goes RED.
+func TestBuild_ImplementFixup_ReportObligations_PRBodyMarksBullet(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[high/operator] Record the table in the PR body's ## Notes."}},
+		ImplementRunID:   "11112222333344445555666677778888",
+		ImplementStageID: "99990000aaaabbbbccccddddeeeeffff",
+		FixupReportObligations: []FixupReportObligation{
+			{ID: "ob-1", Source: "operator_concern", PRBody: true, Text: "Record the table in the PR body's ## Notes."},
+			{ID: "ob-2", Source: "reason", PRBody: false, Text: "Report the observed RED output in the run log."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "this names the PULL-REQUEST BODY, which THIS pass cannot write; report it `declined`") {
+		t.Errorf("the PR-body obligation bullet must carry the cannot-write/declined marker:\n%s", got)
+	}
+	// The run-log obligation is a plain bullet with no PR-body marker.
+	lines := strings.Split(got, "\n")
+	for _, ln := range lines {
+		if strings.Contains(ln, "ob-2") && strings.Contains(ln, "PULL-REQUEST BODY") {
+			t.Errorf("the run-log obligation must NOT be marked as a PR-body surface:\n%s", ln)
+		}
 	}
 }

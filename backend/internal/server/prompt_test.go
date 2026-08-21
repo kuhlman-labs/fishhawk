@@ -11649,6 +11649,49 @@ func TestResolveFixupReportObligations_Channels(t *testing.T) {
 	})
 }
 
+// TestResolveFixupReportObligations_PRBodyFlagFlowsToPrompt pins the #2782
+// PR-body flag through the server-side resolver and its prompt mapping: a
+// PR-body concern note resolves with PRBody true and carries that flag into the
+// prompt mirror, while a run-log note resolves with PRBody false.
+func TestResolveFixupReportObligations_PRBodyFlagFlowsToPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+
+	resolveOne := func(t *testing.T, note string) fixupobligation.Obligation {
+		t.Helper()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "process", Note: note}},
+				"", "route it")}},
+		}})
+		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
+		if len(got) != 1 {
+			t.Fatalf("got %+v, want exactly one obligation", got)
+		}
+		return got[0]
+	}
+
+	prBody := resolveOne(t, "Record the per-deletion counterfactual results in the PR body's ## Notes.")
+	if !prBody.PRBody {
+		t.Errorf("PR-body note resolved with PRBody false: %+v", prBody)
+	}
+	runLog := resolveOne(t, "Report the observed RED output in the run log.")
+	if runLog.PRBody {
+		t.Errorf("run-log note resolved with PRBody true: %+v", runLog)
+	}
+
+	// The prompt mirror carries the flag verbatim.
+	mapped := fixupReportObligationsForPrompt([]fixupobligation.Obligation{prBody, runLog})
+	want := []prompt.FixupReportObligation{
+		{ID: prBody.ID, Source: string(prBody.Source), PRBody: true, Text: prBody.Text},
+		{ID: runLog.ID, Source: string(runLog.Source), PRBody: false, Text: runLog.Text},
+	}
+	for i := range want {
+		if mapped[i] != want[i] {
+			t.Errorf("prompt obligation %d = %+v, want %+v", i, mapped[i], want[i])
+		}
+	}
+}
+
 // TestResolveFixupReportObligations_AcceptanceDerivedConcernIsUntrusted pins the
 // #2737 security fix-up at the resolver: the obligation mirror must carry the
 // SAME trust provenance resolveFixupConcerns puts on

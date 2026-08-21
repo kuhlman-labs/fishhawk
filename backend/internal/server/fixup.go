@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -572,7 +573,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// the request validation, the model/budget gates above, and the sentinel
 	// error → HTTP mapping below; run.FixupStage's errors are returned
 	// verbatim and mapped here exactly as before.
-	dec, err := s.fixupStageAs(r.Context(), id, fixupActionParams{
+	dec, prBodyObligations, err := s.fixupStageAs(r.Context(), id, fixupActionParams{
 		StageID: stageID,
 		Options: run.FixupOptions{
 			PriorPassCount:      priorPasses,
@@ -633,7 +634,66 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+	s.writeJSON(w, r, http.StatusOK, toFixupResponse(dec.Stage, prBodyObligations))
+}
+
+// CategoryFixupPRBodyUnsatisfiable is the audit-log category for the advisory
+// routing-time signal (#2782) fixupStageAs appends when a routed instruction
+// names the PULL-REQUEST BODY — a surface a fix-up pass has NO mechanism to
+// write (the slim fix-up prompt renders no PR-description block and the pass
+// pushes commits only). It records, at ROUTING time, that the operator's
+// instruction is structurally unsatisfiable so the operator learns it without
+// waiting for the review. Internal advisory kind — NOT an issue-comment surface
+// (nothing in issuecomment posts it) — written on EVERY routing path including
+// the in-process campaign auto-driver and acceptance triage. EVIDENCE ONLY: it
+// never fails, re-opens, or re-budgets the pass; a nil AuditRepo or an append
+// error is best-effort/fail-open.
+const CategoryFixupPRBodyUnsatisfiable = "fixup_pr_body_unsatisfiable"
+
+// fixupPRBodyObligation is one routed instruction that names the PR body — a
+// surface a fix-up pass cannot write (#2782). It is BOTH the shape returned on
+// the fix-up HTTP response (pr_body_obligations, omitempty) — so the MCP verb
+// renders its operator warning FROM the server-minted set rather than
+// re-deriving anything locally, which keeps the ids the operator sees at
+// routing time identical to the ids the reviewer sees later — AND the shape
+// recorded on the fixup_pr_body_unsatisfiable audit payload.
+type fixupPRBodyObligation struct {
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	TextExcerpt string `json:"text_excerpt"`
+	// Untrusted marks an excerpt drawn from an acceptance-derived concern note
+	// (attacker-influenceable validator text). omitempty keeps the common
+	// operator-authored payload byte-identical. The MCP verb deliberately never
+	// renders the excerpt into its warning, so this field is inert DATA on the
+	// wire and cannot become an injection path — the reviewer-facing render
+	// (writeGateEvidence) is the only site that prints an excerpt and it
+	// quarantines an untrusted one.
+	Untrusted bool `json:"untrusted,omitempty"`
+}
+
+// fixupPRBodyUnsatisfiablePayload is the advisory audit payload (#2782): the
+// stage the pass re-opened, the count, and the PR-body obligations.
+type fixupPRBodyUnsatisfiablePayload struct {
+	StageID         string                  `json:"stage_id"`
+	ObligationCount int                     `json:"obligation_count"`
+	Obligations     []fixupPRBodyObligation `json:"obligations"`
+}
+
+// fixupResponse is the fix-up endpoint's 200 body: the re-opened Stage with an
+// OPTIONAL pr_body_obligations field (#2782, operator condition 1). stageResponse
+// is embedded so its fields promote to the top level exactly as before, and the
+// obligations field is omitempty — so a fix-up that routed no PR-body
+// instruction serves a byte-identical response to the pre-#2782 shape.
+type fixupResponse struct {
+	stageResponse
+	PRBodyObligations []fixupPRBodyObligation `json:"pr_body_obligations,omitempty"`
+}
+
+// toFixupResponse builds the fix-up 200 body from the re-opened stage and the
+// server-minted PR-body obligation set (nil for the overwhelmingly common
+// non-PR-body pass).
+func toFixupResponse(s *run.Stage, obligations []fixupPRBodyObligation) fixupResponse {
+	return fixupResponse{stageResponse: toStageResponse(s), PRBodyObligations: obligations}
 }
 
 // fixupActionParams carries the resolved inputs for fixupStageAs. The HTTP
@@ -671,17 +731,17 @@ type fixupActionParams struct {
 // caller to map (HTTP status with budget/ceiling detail in the handler);
 // every post-transition step is best-effort exactly as in the prior inline
 // handler.
-func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionParams) (*run.FixupDecision, error) {
+func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionParams) (*run.FixupDecision, []fixupPRBodyObligation, error) {
 	// Enforce the fixup gate's write scope on the acting identity (write:stages
 	// OR write:fixups, matching the handler's inline check). A no-op on the HTTP
 	// path that already gated; the authz check for the in-process campaign
 	// auto-driver, which reaches this method directly (#1445).
 	if !identityHasGateScope(id, "write:stages", "write:fixups") {
-		return nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
+		return nil, nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
 	}
 	dec, err := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Mint the free-text operator instruction into the durable concern store
@@ -708,6 +768,20 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// minted id is ALSO recorded on its own `operator_concern_id` key so the
 	// gate-view fixups[] join attributes the pass to the operator concern.
 	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence)
+
+	// PR-body-unsatisfiable signal (#2782): a routed instruction that names the
+	// PR body cannot take effect — a fix-up pass has no mechanism to write the
+	// PR title/body. Derive the FULL PR-body obligation set here, across all
+	// three routed channels (the SAME single derivation the routing-time warning
+	// and the review-time join share via buildFixupObligationSources + Detect),
+	// record the advisory audit entry on every routing path, and RETURN the set
+	// so the HTTP handler can put it on the response for the MCP verb to warn
+	// FROM. AFTER writeFixupAudit so the trigger entry stays the durable record;
+	// best-effort and fail-open, and it never unwinds the committed transition
+	// or changes the HTTP status. Deliberately NOT gated on a zero-concern skip:
+	// an operator_concern-only pass whose instruction names the PR body is
+	// unsatisfiable either way.
+	prBodyObligations := s.recordFixupPRBodyUnsatisfiable(ctx, dec, p.Selected, p.OperatorConcern, p.Reason)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's fix-up reason as state_reason. AFTER the
@@ -762,7 +836,91 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// to pending / dispatched; the status comment should reflect that.
 	s.notifyStatusUpdate(ctx, dec.Stage.RunID, "stage_fixup")
 
-	return dec, nil
+	return dec, prBodyObligations, nil
+}
+
+// buildFixupObligationSources assembles the ordered fixupobligation.Source
+// slice for a fix-up pass's routed instructions, so the routing-time PR-body
+// detection in recordFixupPRBodyUnsatisfiable and the prompt-serve/review
+// re-derivation in resolveFixupReportObligations mint IDENTICAL ob-N ids for
+// the same (concerns, operator_concern, reason) triple (#2782). One
+// SourceConcern per concern note carrying its acceptance-trust provenance, then
+// the operator_concern, then the reason — the fixed order Detect assigns ids
+// by. The operator_concern text that already appears as a minted concern note
+// is deduped inside Detect, exactly as on the prompt-serve path.
+func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern, reason string) []fixupobligation.Source {
+	sources := make([]fixupobligation.Source, 0, len(concerns)+2)
+	for _, c := range concerns {
+		// The RAW note, not the "[severity/category] note" render — the
+		// operator_concern dedupe compares against the minted concern's note
+		// text (#2623), so the channels must be comparable. Carry the concern's
+		// trust provenance so an obligation detected inside an acceptance-
+		// synthesized note stays marked untrusted at every render site.
+		sources = append(sources, fixupobligation.Source{
+			Kind:      fixupobligation.SourceConcern,
+			Text:      c.Note,
+			Untrusted: c.Provenance == planreview.ConcernProvenanceAcceptance,
+		})
+	}
+	// operator_concern and reason are operator-authored by construction, so they
+	// carry no untrusted marking.
+	sources = append(sources,
+		fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: operatorConcern},
+		fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: reason},
+	)
+	return sources
+}
+
+// recordFixupPRBodyUnsatisfiable derives the PR-body obligation set from the
+// pass's routed instructions (#2782), appends the advisory
+// fixup_pr_body_unsatisfiable audit entry when the set is non-empty, and
+// returns the set for the HTTP response. Returns nil when nothing named the PR
+// body — the common case, keeping the pre-#2782 response byte-identical.
+//
+// Best-effort and fail-open: a nil AuditRepo skips the append, an append error
+// WARN-logs, and neither ever unwinds the already-committed fix-up transition
+// or changes the HTTP status. The returned set is independent of the audit
+// write, so a fail-open append still returns the obligations for the warning.
+func (s *Server) recordFixupPRBodyUnsatisfiable(ctx context.Context, dec *run.FixupDecision, selected []planreview.Concern, operatorConcern, reason string) []fixupPRBodyObligation {
+	obligations := fixupobligation.Detect(buildFixupObligationSources(selected, operatorConcern, reason))
+	var prBody []fixupPRBodyObligation
+	for _, ob := range obligations {
+		if !ob.PRBody {
+			continue
+		}
+		prBody = append(prBody, fixupPRBodyObligation{
+			ID:          ob.ID,
+			Source:      string(ob.Source),
+			TextExcerpt: ob.Text,
+			Untrusted:   ob.Untrusted,
+		})
+	}
+	if len(prBody) == 0 {
+		return nil
+	}
+	if s.cfg.AuditRepo != nil {
+		payload, _ := json.Marshal(fixupPRBodyUnsatisfiablePayload{
+			StageID:         dec.Stage.ID.String(),
+			ObligationCount: len(prBody),
+			Obligations:     prBody,
+		})
+		systemKind := audit.ActorKind("system")
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     dec.Stage.RunID,
+			StageID:   &dec.Stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  CategoryFixupPRBodyUnsatisfiable,
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fixup: append fixup_pr_body_unsatisfiable audit entry failed",
+				slog.String("run_id", dec.Stage.RunID.String()),
+				slog.String("stage_id", dec.Stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+	return prBody
 }
 
 // mintOperatorConcern persists a free-text operator instruction as a durable
