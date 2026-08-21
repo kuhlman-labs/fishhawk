@@ -62,12 +62,16 @@ type WedgeFacts struct {
 	// so the block degrades rather than fabricating names.
 	BlockingChecks []string
 	// CampaignItemState is the campaign item state for the item this run
-	// executes, if any. Normalized through the closed campaign
-	// item-state set on the way into WedgeContext — an unrecognized
-	// value is DROPPED, never echoed.
+	// executes, if any. Normalized through the closed WEDGE-INDICATING
+	// item-state set on the way into WedgeContext — a healthy state
+	// (running/succeeded/pending) and any unrecognized value are both
+	// DROPPED, never echoed. The caller may inject the item's real state
+	// unconditionally; the filtering is the collector's job.
 	CampaignItemState string
 	// BlockedDependents is how many sibling campaign items are blocked
-	// waiting on this run's item. A count, never a name list.
+	// waiting on this run's item. A count, never a name list. Carried
+	// into WedgeContext only alongside a wedge-indicating
+	// CampaignItemState — see buildWedgeContext.
 	BlockedDependents int
 }
 
@@ -80,14 +84,18 @@ type WedgeContext struct {
 	// BlockingChecks are red required-check context names. Omitted when
 	// none are red, or when the run has no resolved checks snapshot.
 	BlockingChecks []string `json:"blocking_checks,omitempty"`
-	// CampaignItemState is a campaign item-state enum literal
-	// ("blocked" | "running" | "paused" | "failed" | ...), or empty.
+	// CampaignItemState is a WEDGE-INDICATING campaign item-state enum
+	// literal ("blocked" | "paused" | "failed"), or empty. A healthy
+	// item state (running/succeeded/pending) is dropped, not echoed.
 	CampaignItemState string `json:"campaign_item_state,omitempty"`
-	// BlockedDependents counts sibling items waiting on this one.
+	// BlockedDependents counts sibling items waiting on this one. Present
+	// only alongside a wedge-indicating CampaignItemState.
 	BlockedDependents int `json:"blocked_dependents,omitempty"`
 	// IntegrateWaveError is a closed marker for a fan-in failure,
 	// derived from the run's audit CATEGORY set (never a payload body).
-	// Currently the single literal "slice_integration_conflict".
+	// Currently the single literal "slice_integration_conflict", and
+	// only while the conflict is the run's CURRENT fan-in state — a
+	// later children_settled clears it.
 	IntegrateWaveError string `json:"integrate_wave_error,omitempty"`
 }
 
@@ -97,27 +105,44 @@ type WedgeContext struct {
 // itself, so nothing is derived from an audit payload.
 const sliceIntegrationConflictMarker = "slice_integration_conflict"
 
-// campaignItemStates is the closed set of campaign item-state literals
-// the wedge block may carry. Kept as a package-local table (rather than
-// importing internal/campaign) so this package stays dependency-light
-// and the emitted value is TABLE-OWNED: normalizeCampaignItemState
-// returns the literal from this map, never any part of its input.
-var campaignItemStates = map[string]string{
-	"pending":   "pending",
-	"blocked":   "blocked",
-	"running":   "running",
-	"paused":    "paused",
-	"succeeded": "succeeded",
-	"failed":    "failed",
-	"cancelled": "cancelled",
+// childrenSettledCategory is the audit category the fan-in path emits
+// when integration SUCCEEDS (both the consolidate handler and the
+// childcompletion sweeper write it). It is read only to decide whether
+// a conflict earlier in the chain is still the run's CURRENT fan-in
+// state — see integrateWaveError.
+const childrenSettledCategory = "children_settled"
+
+// wedgingCampaignItemStates is the closed set of campaign item-state
+// literals the wedge block may carry. It is deliberately a STRICT SUBSET
+// of the campaign item-state enum: only states that EXPLAIN a stuck run
+// belong here.
+//
+// `running`, `succeeded`, `pending` and `cancelled` are excluded because
+// they describe a run that is progressing, done, or deliberately stopped
+// — emitting them would make the block fire on every campaign-linked
+// run, turning "why is this stuck?" into "this run has a campaign
+// item", which is historical association rather than a wedge (#1737
+// implement review). The healthy-run omission is the whole anti-noise
+// contract of this feature, so a healthy campaign item contributes
+// nothing.
+//
+// Kept as a package-local table (rather than importing
+// internal/campaign) so this package stays dependency-light and the
+// emitted value is TABLE-OWNED: normalizeCampaignItemState returns the
+// literal from this map, never any part of its input.
+var wedgingCampaignItemStates = map[string]string{
+	"blocked": "blocked",
+	"paused":  "paused",
+	"failed":  "failed",
 }
 
 // normalizeCampaignItemState maps an injected item state onto the closed
-// table above. An unrecognized value yields "" — the wedge block drops
-// it rather than echoing an unvetted string across the redaction
-// boundary.
+// table above. A state that is not wedge-indicating — and any
+// unrecognized value — yields "": the wedge block drops it rather than
+// describing a healthy item or echoing an unvetted string across the
+// redaction boundary.
 func normalizeCampaignItemState(state string) string {
-	return campaignItemStates[state]
+	return wedgingCampaignItemStates[state]
 }
 
 // StageFact is one stage's position and state — no timing detail, no
@@ -275,8 +300,15 @@ func CollectWithWedge(r *run.Run, stages []*run.Stage, auditEntries []*audit.Ent
 func buildWedgeContext(wedge *WedgeFacts, entries []*audit.Entry) *WedgeContext {
 	wc := WedgeContext{
 		CampaignItemState:  normalizeCampaignItemState(wedge.CampaignItemState),
-		BlockedDependents:  wedge.BlockedDependents,
 		IntegrateWaveError: integrateWaveError(entries),
+	}
+	// The dependent count is the blast radius OF A STUCK ITEM, so it
+	// rides with a wedge-indicating item state and is dropped without
+	// one. Siblings queued behind a healthily-`running` item are ordinary
+	// campaign sequencing, not a wedge — reporting the count there would
+	// re-open the healthy-run noise this filter closes.
+	if wc.CampaignItemState != "" {
+		wc.BlockedDependents = wedge.BlockedDependents
 	}
 	for _, name := range wedge.BlockingChecks {
 		if name == "" {
@@ -291,19 +323,42 @@ func buildWedgeContext(wedge *WedgeFacts, entries []*audit.Entry) *WedgeContext 
 	return &wc
 }
 
-// integrateWaveError returns the fan-in conflict marker when the run's
-// audit chain carries a slice_integration_conflict entry. Only the
-// entry CATEGORY is read — the payload (which names branches and
-// carries conflict detail) is never touched — and the returned value is
-// the package-owned literal, not the entry's own string.
+// integrateWaveError returns the fan-in conflict marker when the run is
+// CURRENTLY stuck on a fan-in conflict. Only the entry CATEGORY is read
+// — the payload (which names branches and carries conflict detail) is
+// never touched — and the returned value is the package-owned literal,
+// not the entry's own string.
+//
+// "Currently" is load-bearing (#1737 implement review): the audit chain
+// is append-only history, so a run that hit a conflict, had it resolved,
+// and integrated cleanly still carries the conflict entry forever. A
+// scan that reported ANY conflict in the chain would describe that run
+// as wedged for the rest of its life. So the marker is reported only
+// when the conflict is the LATEST fan-in lifecycle signal: a later
+// children_settled entry (integration succeeded) supersedes it. The
+// decision is made on the highest SEQUENCE rather than slice position,
+// so it does not depend on the caller handing entries in chain order.
 func integrateWaveError(entries []*audit.Entry) string {
+	var (
+		latest    int64
+		conflict  bool
+		anySignal bool
+	)
 	for _, e := range entries {
 		if e == nil {
 			continue
 		}
-		if e.Category == sliceIntegrationConflictMarker {
-			return sliceIntegrationConflictMarker
+		isConflict := e.Category == sliceIntegrationConflictMarker
+		if !isConflict && e.Category != childrenSettledCategory {
+			continue
 		}
+		if anySignal && e.Sequence <= latest {
+			continue
+		}
+		anySignal, latest, conflict = true, e.Sequence, isConflict
+	}
+	if conflict {
+		return sliceIntegrationConflictMarker
 	}
 	return ""
 }

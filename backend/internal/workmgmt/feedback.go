@@ -45,6 +45,45 @@ const (
 	// dedup hit appended an occurrence comment to an existing report), so
 	// there was nothing to board.
 	BoardingStatusNotAttemptedNoReport = "not_attempted_no_report"
+	// BoardingStatusNotAttemptedProjectNotAuthorized — a project IS
+	// configured, but its coordinates did not come from the destination
+	// repo's own conventions, so placement was refused before any
+	// privileged call. Also a configuration state, not an error: the
+	// caller did nothing wrong and there is no cause to investigate.
+	BoardingStatusNotAttemptedProjectNotAuthorized = "not_attempted_project_not_authorized"
+)
+
+// BoardingCause is the closed set of CALLER-SAFE placement-failure
+// literals. A raw provider error is not safe to echo on a 2xx body: it
+// carries third-party API text and, on the unknown-status path, the
+// project's own field-option names — private board metadata reachable
+// only through the operator's privileged token. So the wire carries a
+// literal from this set naming WHICH STEP failed, and the raw cause goes
+// to the server-side log the operator already reads. This mirrors the
+// error-envelope posture (see writeError's default-deny detail
+// allow-list): causes reach the operator, never the caller.
+const (
+	// BoardingCauseProjectFieldsUnavailable — resolving the project's
+	// Status field failed (missing project, missing token, no access).
+	BoardingCauseProjectFieldsUnavailable = "project_fields_unavailable"
+	// BoardingCauseAddItemFailed — adding the issue to the project failed.
+	BoardingCauseAddItemFailed = "add_project_item_failed"
+	// BoardingCauseStatusOptionUnknown — the desired Status column is not
+	// an option on the project's Status field.
+	BoardingCauseStatusOptionUnknown = "status_option_unknown"
+	// BoardingCauseSetStatusFailed — setting the Status field failed after
+	// the item was added.
+	BoardingCauseSetStatusFailed = "set_status_failed"
+	// BoardingCauseUnclassified — placement failed in a way this table
+	// does not recognize. The FAIL-SAFE default: an unmatched cause is
+	// reported as unclassified rather than echoed, so a new or reworded
+	// provider error can never become a disclosure by omission.
+	BoardingCauseUnclassified = "placement_failed"
+	// BoardingCauseUnreported — the provider reported neither placement
+	// nor a cause. Synthesized so `failed` ALWAYS carries a cause, which
+	// is what the docs and the response schema promise; a `failed` with an
+	// empty cause is a state an operator cannot act on.
+	BoardingCauseUnreported = "provider_reported_neither_placement_nor_cause"
 )
 
 // BoardingStatusOf classifies the board-placement outcome of a filed
@@ -66,7 +105,10 @@ func BoardingStatusOf(target Target, created *CreatedItem) string {
 	default:
 		// A provider that neither boarded nor recorded a cause while a
 		// project IS configured: report the failure status rather than
-		// claiming success, and let the empty cause be the tell.
+		// claiming success. The caller synthesizes
+		// BoardingCauseUnreported for this arm, so `failed` never
+		// reaches the wire cause-free — the docs and the response schema
+		// both state that `failed` is the status that CARRIES a cause.
 		return BoardingStatusFailed
 	}
 }

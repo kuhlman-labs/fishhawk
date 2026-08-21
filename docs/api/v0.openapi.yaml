@@ -3671,7 +3671,12 @@ components:
             `occurrence` (a dedup hit creates nothing to board).
         boarding_status:
           type: string
-          enum: [boarded, not_attempted_no_project, not_attempted_no_report, failed]
+          enum:
+            - boarded
+            - not_attempted_no_project
+            - not_attempted_no_report
+            - not_attempted_project_not_authorized
+            - failed
           description: |
             Why `boarded` has the value it does. `boarded=false` alone is
             ambiguous and the false cases call for DIFFERENT operator
@@ -3686,15 +3691,39 @@ components:
             - `not_attempted_no_report` — a dedup hit appended an
               occurrence comment, so nothing was created to board.
               `boarding_error` is absent.
+            - `not_attempted_project_not_authorized` — a board IS
+              configured, but its coordinates came from a repo other than
+              the fixed product tracker this report was filed into, so
+              placement was refused before any privileged call. Also a
+              configuration state, not an error: `boarding_error` is
+              absent and there is nothing to investigate.
             - `failed` — placement was attempted and failed. This is the
               ONLY status that carries `boarding_error`, and the only one
               an operator should investigate.
         boarding_error:
           type: string
+          enum:
+            - project_fields_unavailable
+            - add_project_item_failed
+            - status_option_unknown
+            - set_status_failed
+            - placement_failed
+            - provider_reported_neither_placement_nor_cause
           description: >-
-            Placement failure cause. Present ONLY when `boarding_status`
-            is `failed` — its absence on the `not_attempted_*` statuses
-            means "not attempted", never "attempted and quietly fine".
+            Placement failure cause, naming WHICH STEP failed. Present —
+            and always non-empty — when `boarding_status` is `failed`, and
+            absent on every other status, where its absence means "not
+            attempted" rather than "attempted and quietly fine". The value
+            is a CLOSED product-owned literal, never the provider's raw
+            error: a raw cause carries third-party API text and, on the
+            unknown-status path, the project's own field-option names, so
+            it reaches the operator through the server log and never the
+            caller (the same posture the error envelope's default-deny
+            detail allow-list applies to non-2xx bodies). An unrecognized
+            provider error degrades to `placement_failed`;
+            `provider_reported_neither_placement_nor_cause` is synthesized
+            when a provider reports neither outcome, so a `failed` verdict
+            is never cause-free.
 
     RunBudgetStatus:
       type: object

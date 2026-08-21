@@ -94,8 +94,12 @@ boarding_error), a transparency preview of the product facts that were
 attached (diagnostics), and free_text_included. boarding_status
 disambiguates boarded=false: 'not_attempted_no_project' means the repo
 declares no board (a configuration state, not an error),
-'not_attempted_no_report' means a dedup hit created nothing to board, and
-'failed' means placement was attempted and failed (see boarding_error). Tool errors:
+'not_attempted_no_report' means a dedup hit created nothing to board,
+'not_attempted_project_not_authorized' means a board is configured but its
+coordinates are not authorized for the fixed product tracker (also a
+configuration state), and 'failed' means placement was attempted and failed.
+boarding_error accompanies 'failed' only, as a closed literal naming which
+step failed rather than the provider's raw error. Tool errors:
 validation_failed (400), authentication_required (401), run_not_entitled
 (403 — a run-bound token may only file for its own run), insufficient_scope
 (403 — a non-run-bound operator bearer is missing write:runs),

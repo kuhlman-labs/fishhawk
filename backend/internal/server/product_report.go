@@ -254,10 +254,11 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 
 	owner, name, _ := splitRepoFullName(productRepo)
 	// Project: the conventions' board, so a filed report lands on the
-	// tracker the same way fishhawk_file_issue's work items do (#1737).
-	// Nil when the repo declares no project — that is a configuration
-	// state, reported as boarding_status=not_attempted_no_project.
-	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: owner, Name: name}, Project: conv.Project}
+	// tracker the same way fishhawk_file_issue's work items do (#1737) —
+	// but ONLY when those coordinates are authorized for this fixed
+	// destination. See productReportBoard.
+	boardProject, boardWithheld := productReportBoard(runRow.Repo, conv.Project)
+	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: owner, Name: name}, Project: boardProject}
 	// Installation: the source run supplies the installation that can act
 	// on the product repo (in dogfooding the run repo IS the product repo).
 	if runRow.InstallationID != nil {
@@ -313,28 +314,107 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		Destination:    owner + "/" + name,
 		BoardingStatus: workmgmt.BoardingStatusOf(target, created),
 	}
+	rawBoardingCause := ""
 	if created != nil {
 		resp.Boarded = created.Boarded
-		resp.BoardingError = created.BoardingError
+		rawBoardingCause = created.BoardingError
+	}
+	if boardWithheld && created != nil {
+		// A board WAS configured; this handler declined to use it. Say so
+		// rather than reporting "no project configured", which would send
+		// an operator to add a board they already have.
+		resp.BoardingStatus = workmgmt.BoardingStatusNotAttemptedProjectNotAuthorized
 	}
 	if resp.BoardingStatus == workmgmt.BoardingStatusFailed {
 		// Amendment condition 3: a best-effort failure that is swallowed is
 		// indistinguishable from silently-broken. Name the cause server-side
 		// too, so an operator seeing boarded=false has a log line as well as
-		// the response field.
+		// the response field. The log gets the RAW cause; the wire does not
+		// (see safeBoardingCause).
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "product report board placement failed",
-			slog.String("error", resp.BoardingError),
+			slog.String("error", rawBoardingCause),
+			slog.String("cause", safeBoardingCause(rawBoardingCause)),
 			slog.String("run_id", runRow.ID.String()),
 			slog.Int("upstream_num", resultNum),
 		)
+		resp.BoardingError = safeBoardingCause(rawBoardingCause)
 	}
+	// Every other status stays cause-free by construction: an empty cause
+	// is only meaningful on `failed`, so an operator never has to guess
+	// which reading applies. (resp.BoardingError is only ever assigned on
+	// the failed arm above, so this is a positive re-assertion of that
+	// invariant rather than a cleanup of a value already set.)
 	if resp.BoardingStatus != workmgmt.BoardingStatusFailed {
-		// An empty cause is only meaningful on the failed status; keep the
-		// not_attempted_* statuses cause-free by construction so an
-		// operator never has to guess which reading applies.
 		resp.BoardingError = ""
 	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
+}
+
+// productReportBoard decides which project a filed product report may be
+// placed on, and reports whether a configured board was WITHHELD.
+//
+// A product report always lands in the FIXED product tracker
+// (productRepo), but the board coordinates come from the SOURCE run's
+// repo conventions — a different repo, whose `.fishhawk` config this
+// deployment does not own. Handing those coordinates straight to
+// placeIssueOnBoard would let any repo Fishhawk runs against name an
+// arbitrary Projects-v2 board and have this server write to it under a
+// privileged credential — and for a user-owned board that credential is
+// the operator's static FISHHAWKD_PROJECTS_TOKEN (#1114), not the run's
+// scoped installation token. So the destination must be independently
+// authorized, and the binding is the narrowest one that still serves the
+// dogfood case the feature was built for: the coordinates are honored
+// only when they came from the DESTINATION repo's own conventions, i.e.
+// the source run's repo IS the product tracker.
+//
+// Returns (nil, true) when a board was configured but refused, so the
+// caller can report that distinctly from "no board configured" — those
+// are different facts and only one of them is worth acting on.
+func productReportBoard(sourceRepo string, project *workmgmt.Project) (*workmgmt.Project, bool) {
+	if project == nil {
+		return nil, false
+	}
+	// GitHub owner/name comparison is case-insensitive.
+	if !strings.EqualFold(strings.TrimSpace(sourceRepo), productRepo) {
+		return nil, true
+	}
+	return project, false
+}
+
+// safeBoardingCause maps a raw placement error onto the closed
+// workmgmt.BoardingCause* set for the RESPONSE body.
+//
+// The 201 body is not covered by writeError's default-deny detail
+// allow-list, so without this a raw provider error would cross to the
+// caller on a success response — carrying third-party API text and, on
+// the unknown-status path, the project's Status field OPTION NAMES,
+// which are private board metadata reachable only through the operator's
+// privileged token. The raw cause still reaches the operator through the
+// WARN log this function's caller emits.
+//
+// Classification is by the marker substrings placeIssueOnBoard's own
+// wrapper messages carry, and the default arm is FAIL-SAFE: anything
+// unrecognized reports BoardingCauseUnclassified rather than falling
+// back to echoing the input, so a reworded or newly added provider error
+// degrades to a vaguer literal and never to a disclosure.
+func safeBoardingCause(raw string) string {
+	switch {
+	case strings.TrimSpace(raw) == "":
+		// A `failed` verdict with no cause recorded: the provider
+		// misbehaved. Synthesize a cause so `failed` never reaches the
+		// wire cause-free, which the schema and the README both promise.
+		return workmgmt.BoardingCauseUnreported
+	case strings.Contains(raw, "resolve project fields"):
+		return workmgmt.BoardingCauseProjectFieldsUnavailable
+	case strings.Contains(raw, "add project item"):
+		return workmgmt.BoardingCauseAddItemFailed
+	case strings.Contains(raw, "option on the project"):
+		return workmgmt.BoardingCauseStatusOptionUnknown
+	case strings.Contains(raw, "set status field"):
+		return workmgmt.BoardingCauseSetStatusFailed
+	default:
+		return workmgmt.BoardingCauseUnclassified
+	}
 }
 
 // decodeProductReportRequest reads and validates the request body. An

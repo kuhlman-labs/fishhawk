@@ -50,12 +50,17 @@ type diagnosticBundle struct {
 	// WedgeContext names WHY a stuck run is stuck (#1737). Absent —
 	// and rendered as nothing at all — on a run with no wedge shape,
 	// so a healthy run's output is byte-identical to pre-#1737.
+	//
+	// `omitempty` is load-bearing on BOTH halves of that promise: the
+	// text renderer skips a nil block, but `--output json` RE-ENCODES
+	// this struct, so without it a healthy bundle would gain a
+	// `"wedge_context": null` key the server never sent.
 	WedgeContext *struct {
 		BlockingChecks     []string `json:"blocking_checks"`
 		CampaignItemState  string   `json:"campaign_item_state"`
 		BlockedDependents  int      `json:"blocked_dependents"`
 		IntegrateWaveError string   `json:"integrate_wave_error"`
-	} `json:"wedge_context"`
+	} `json:"wedge_context,omitempty"`
 }
 
 // runDiagnose implements `fishhawk diagnose <run-id> [--output text|json]`.

@@ -297,17 +297,88 @@ func TestCollectWithWedge_PopulatedBlock(t *testing.T) {
 // TestCollectWithWedge_NoConflictEntry_NoFanInMarker pins the negative
 // half of the fan-in derivation: no slice_integration_conflict audit
 // category means no marker, so the block never over-claims a fan-in
-// failure.
+// failure. The item is `blocked` so the block is populated at all — the
+// dependent count no longer stands on its own (see
+// TestCollectWithWedge_HealthyCampaignItemOmitsBlock).
 func TestCollectWithWedge_NoConflictEntry_NoFanInMarker(t *testing.T) {
 	r := &run.Run{ID: uuid.New(), State: run.StateFailed}
 	entries := []*audit.Entry{{Sequence: 1, Category: "children_settled"}}
 
-	b := CollectWithWedge(r, nil, entries, sampleVersions(), &WedgeFacts{BlockedDependents: 1})
+	b := CollectWithWedge(r, nil, entries, sampleVersions(),
+		&WedgeFacts{CampaignItemState: "blocked", BlockedDependents: 1})
 	if b.WedgeContext == nil {
-		t.Fatal("wedge_context = nil, want populated by blocked_dependents")
+		t.Fatal("wedge_context = nil, want populated by the blocked item")
 	}
 	if b.WedgeContext.IntegrateWaveError != "" {
 		t.Errorf("integrate_wave_error = %q, want empty", b.WedgeContext.IntegrateWaveError)
+	}
+}
+
+// TestCollectWithWedge_HealthyCampaignItemOmitsBlock is the healthy-run
+// counterfactual at the collector, and the arm the implement review
+// found open: a run whose campaign item is `running` (or `succeeded`) is
+// PROGRESSING, so injecting its state must produce NO wedge block at
+// all. Before the wedge-indicating filter, every campaign-linked run
+// emitted the block — describing historical association rather than why
+// the run is stuck.
+//
+// Counterfactual: put "running"/"succeeded" back into
+// wedgingCampaignItemStates and this goes RED.
+func TestCollectWithWedge_HealthyCampaignItemOmitsBlock(t *testing.T) {
+	for _, state := range []string{"running", "succeeded", "pending", "cancelled"} {
+		t.Run(state, func(t *testing.T) {
+			r := &run.Run{ID: uuid.New(), State: run.StateRunning}
+			// Dependents are injected too: a sibling queued behind a
+			// healthily-running item is ordinary campaign sequencing, so
+			// the count must not resurrect the block on its own.
+			b := CollectWithWedge(r, nil, nil, sampleVersions(),
+				&WedgeFacts{CampaignItemState: state, BlockedDependents: 4})
+			if b.WedgeContext != nil {
+				t.Errorf("healthy campaign item %q emitted wedge_context = %+v",
+					state, b.WedgeContext)
+			}
+		})
+	}
+}
+
+// TestCollectWithWedge_ResolvedFanInConflictOmitsMarker is the other
+// half of the same finding: the audit chain is append-only history, so a
+// run that hit a fan-in conflict, had it resolved, and then integrated
+// cleanly still carries the conflict entry forever. A whole-chain scan
+// would describe that run as wedged for the rest of its life. A LATER
+// children_settled supersedes the conflict.
+//
+// Counterfactual: restore the any-conflict-in-the-chain scan in
+// integrateWaveError and this goes RED.
+func TestCollectWithWedge_ResolvedFanInConflictOmitsMarker(t *testing.T) {
+	r := &run.Run{ID: uuid.New(), State: run.StateSucceeded}
+	// Conflict first, resolution after — the recovered run.
+	entries := []*audit.Entry{
+		{Sequence: 7, Category: "slice_integration_conflict"},
+		{Sequence: 9, Category: "children_settled"},
+	}
+	b := CollectWithWedge(r, nil, entries, sampleVersions(), &WedgeFacts{})
+	if b.WedgeContext != nil {
+		t.Fatalf("recovered run still reports a wedge: %+v", b.WedgeContext)
+	}
+
+	// Order-independence: the same two entries handed in reverse slice
+	// order must reach the same verdict, because the decision is made on
+	// audit SEQUENCE, not on slice position.
+	reversed := []*audit.Entry{entries[1], entries[0]}
+	if b := CollectWithWedge(r, nil, reversed, sampleVersions(), &WedgeFacts{}); b.WedgeContext != nil {
+		t.Errorf("verdict depended on slice order: %+v", b.WedgeContext)
+	}
+
+	// And the un-recovered direction still reports: a conflict AFTER the
+	// last settle is the run's current fan-in state.
+	stillStuck := []*audit.Entry{
+		{Sequence: 9, Category: "children_settled"},
+		{Sequence: 11, Category: "slice_integration_conflict"},
+	}
+	got := CollectWithWedge(r, nil, stillStuck, sampleVersions(), &WedgeFacts{})
+	if got.WedgeContext == nil || got.WedgeContext.IntegrateWaveError != "slice_integration_conflict" {
+		t.Errorf("re-conflicted run lost its marker: %+v", got.WedgeContext)
 	}
 }
 
@@ -369,15 +440,22 @@ func TestWedgeContext_NeverCarriesFreeText(t *testing.T) {
 	}
 }
 
-// TestNormalizeCampaignItemState_ClosedTable pins that every real
-// campaign item state round-trips and everything else is dropped.
+// TestNormalizeCampaignItemState_ClosedTable pins that every
+// WEDGE-INDICATING campaign item state round-trips and everything else
+// is dropped — including the real-but-healthy states, which are the ones
+// that made the block fire on healthy campaign-linked runs.
 func TestNormalizeCampaignItemState_ClosedTable(t *testing.T) {
-	for _, s := range []string{"pending", "blocked", "running", "paused", "succeeded", "failed", "cancelled"} {
+	for _, s := range []string{"blocked", "paused", "failed"} {
 		if got := normalizeCampaignItemState(s); got != s {
 			t.Errorf("normalizeCampaignItemState(%q) = %q, want %q", s, got, s)
 		}
 	}
-	for _, s := range []string{"", "FAILED", "failed ", "wedged", "failed: reason"} {
+	// Real item states that do NOT explain a stuck run, alongside
+	// unvetted free text: both drop.
+	for _, s := range []string{
+		"pending", "running", "succeeded", "cancelled",
+		"", "FAILED", "failed ", "wedged", "failed: reason",
+	} {
 		if got := normalizeCampaignItemState(s); got != "" {
 			t.Errorf("normalizeCampaignItemState(%q) = %q, want empty", s, got)
 		}

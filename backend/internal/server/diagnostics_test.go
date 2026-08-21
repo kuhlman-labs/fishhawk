@@ -60,6 +60,13 @@ func (r *diagCampaignRepo) ListCampaignItemsForCampaign(context.Context, uuid.UU
 // diagWedgeFixture builds a run wedged in every shape at once: a review
 // stage with a red required check, a campaign item in `failed` with one
 // blocked dependent, and a slice_integration_conflict audit entry.
+// diagWedgeSentinel is the free-text token diagWedgeFixture seeds into
+// every free-text-bearing field of the wedged run (a stage FailureReason
+// and the fan-in audit payload). It exists so a "must not leak" assertion
+// against this fixture can actually FAIL: an assertion that the egress
+// lacks a token the fixture never carried is evidence of nothing.
+const diagWedgeSentinel = "SENSITIVE-WEDGE-FREE-TEXT"
+
 func diagWedgeFixture(t *testing.T) (*run.Run, []*run.Stage, *scAuditFake, *stageCheckRepoFake, *diagCampaignRepo) {
 	t.Helper()
 	runID := uuid.New()
@@ -78,11 +85,23 @@ func diagWedgeFixture(t *testing.T) (*run.Run, []*run.Stage, *scAuditFake, *stag
 	}
 	stages := []*run.Stage{
 		{ID: uuid.New(), Sequence: 0, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
-		{ID: reviewStageID, Sequence: 1, Type: run.StageTypeReview, State: run.StageStateRunning},
+		// The wedged review stage carries a free-text FailureReason
+		// holding diagWedgeSentinel BY CONSTRUCTION. Nothing in the wedge
+		// derivation reads it, which is exactly the point: every
+		// consumer of this fixture that asserts the sentinel is ABSENT
+		// from an egress is then asserting something real. Seeding it
+		// only where the wedge code already looks would make those
+		// assertions unfalsifiable (#1737 implement review).
+		{ID: reviewStageID, Sequence: 1, Type: run.StageTypeReview, State: run.StageStateRunning,
+			FailureReason: strPtr("merge refused: " + diagWedgeSentinel)},
 	}
 	af := &scAuditFake{allEntries: []*audit.Entry{
 		{Sequence: 5, Category: "stage_dispatched"},
-		{Sequence: 6, Category: "slice_integration_conflict"},
+		// The conflict entry's PAYLOAD is the other place free text
+		// plausibly rides in (it names branches and conflict detail);
+		// the derivation reads the CATEGORY only.
+		{Sequence: 6, Category: "slice_integration_conflict",
+			Payload: []byte(`{"detail":"` + diagWedgeSentinel + `"}`)},
 	}}
 
 	checks := newStageCheckRepoFake()

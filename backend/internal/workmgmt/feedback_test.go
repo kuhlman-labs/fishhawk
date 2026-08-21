@@ -98,13 +98,21 @@ func TestBoardingStatusOf(t *testing.T) {
 	}
 }
 
-// TestBoardingStatus_NoProjectRecordsNoCause is the Condition-1 pin, in
-// its own test because it is the contract an operator reads: the
-// no-project arm must NOT masquerade as a failure and must NOT carry a
-// cause string. The distinguishing signal is the status, not an error.
-func TestBoardingStatus_NoProjectRecordsNoCause(t *testing.T) {
-	created := &CreatedItem{Number: 7}
-	noProject := BoardingStatusOf(Target{}, created)
+// TestBoardingStatus_NoProjectDistinctFromFailure is the Condition-1 pin,
+// in its own test because it is the contract an operator reads: the
+// no-project arm must NOT masquerade as a failure. The distinguishing
+// signal is the STATUS.
+//
+// The no-cause half of that contract is NOT asserted here and used to be:
+// BoardingStatusOf is a pure classifier that never mutates its argument,
+// so re-reading the CreatedItem it was handed could only observe the
+// value the test itself constructed two lines earlier. That property is
+// enforced where the code that could set the field actually runs —
+// github.TestFeedback_FileNoProjectNotAttempted on the provider path, and
+// server.TestProductReport_NotAttemptedStatusIsAlwaysCauseFree at the
+// response surface.
+func TestBoardingStatus_NoProjectDistinctFromFailure(t *testing.T) {
+	noProject := BoardingStatusOf(Target{}, &CreatedItem{Number: 7})
 	withProject := BoardingStatusOf(Target{Project: &Project{Number: 7}},
 		&CreatedItem{Number: 7, BoardingError: "boom"})
 
@@ -112,7 +120,10 @@ func TestBoardingStatus_NoProjectRecordsNoCause(t *testing.T) {
 		t.Fatalf("no-project and placement-failure report the same status %q; "+
 			"an operator cannot tell 'nothing to board' from 'boarding failed'", noProject)
 	}
-	if created.BoardingError != "" {
-		t.Errorf("no-project path recorded a cause %q, want none", created.BoardingError)
+	if noProject != BoardingStatusNotAttemptedNoProject {
+		t.Errorf("no-project status = %q, want %q", noProject, BoardingStatusNotAttemptedNoProject)
+	}
+	if withProject != BoardingStatusFailed {
+		t.Errorf("placement-failure status = %q, want %q", withProject, BoardingStatusFailed)
 	}
 }

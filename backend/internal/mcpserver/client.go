@@ -3256,11 +3256,15 @@ type ProductReport struct {
 	// BoardingStatus disambiguates boarded=false: "boarded",
 	// "not_attempted_no_project" (no project configured — a configuration
 	// state, not an error), "not_attempted_no_report" (a dedup hit created
-	// nothing to board), or "failed" (attempted and failed; see
-	// BoardingError).
+	// nothing to board), "not_attempted_project_not_authorized" (a board
+	// is configured but its coordinates are not authorized for the fixed
+	// product tracker — also a configuration state), or "failed"
+	// (attempted and failed; see BoardingError).
 	BoardingStatus string `json:"boarding_status,omitempty"`
 	// BoardingError is the placement failure cause, set only when
-	// BoardingStatus is "failed".
+	// BoardingStatus is "failed" — and then always non-empty. A CLOSED
+	// product-owned literal naming which step failed, never the
+	// provider's raw error.
 	BoardingError string `json:"boarding_error,omitempty"`
 }
 

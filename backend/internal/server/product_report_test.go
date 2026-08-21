@@ -56,12 +56,18 @@ func (f *fakeFeedbackProvider) File(_ context.Context, target workmgmt.Target, r
 	if f.fileErr != nil {
 		return nil, f.fileErr
 	}
+	// Mirror the real provider's nil-project contract: with no project on
+	// the Target there is nothing to place, so Boarded is false whatever
+	// the double was configured with. BoardingError is left alone so a
+	// test can still model a provider that records a stale cause it had
+	// no business recording.
+	boarded := f.boardOK && target.Project != nil
 	return &workmgmt.CreatedItem{
 		Provider:      f.name,
 		Number:        4242,
 		URL:           "https://github.com/kuhlman-labs/fishhawk/issues/4242",
 		Status:        report.BoardPlacement.Status,
-		Boarded:       f.boardOK,
+		Boarded:       boarded,
 		BoardingError: f.boardErr,
 	}, nil
 }
@@ -808,8 +814,20 @@ func TestProductReport_FiledLabelsIncludeAutonomy(t *testing.T) {
 // conventions so the no-project / with-project boarding arms can differ.
 func wedgedProductReportServer(t *testing.T, fp *fakeFeedbackProvider, project *workmgmt.Project) (*Server, uuid.UUID) {
 	t.Helper()
+	return wedgedProductReportServerForRepo(t, fp, project, "")
+}
+
+// wedgedProductReportServerForRepo is wedgedProductReportServer with the
+// SOURCE run's repo overridden, so the egress-authorization arm can drive
+// a run whose repo is NOT the fixed product tracker. An empty sourceRepo
+// keeps the fixture's own repo (which IS the product tracker).
+func wedgedProductReportServerForRepo(t *testing.T, fp *fakeFeedbackProvider, project *workmgmt.Project, sourceRepo string) (*Server, uuid.UUID) {
+	t.Helper()
 	registerFakeFeedback(t, fp)
 	runRow, stages, af, checks, camp := diagWedgeFixture(t)
+	if sourceRepo != "" {
+		runRow.Repo = sourceRepo
+	}
 
 	prev := conventionsLoader
 	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
@@ -866,9 +884,25 @@ func TestProductReport_WedgeEvidenceInBody(t *testing.T) {
 			t.Errorf("filed body missing %q\n---\n%s", want, body)
 		}
 	}
-	// The redaction contract still holds: the stage's free-text failure
-	// reason must not have ridden along on the wedge block.
-	if strings.Contains(body, "SENSITIVE") {
+	// The redaction contract still holds across the EGRESS boundary: the
+	// fixture seeds diagWedgeSentinel BY CONSTRUCTION into the wedged
+	// review stage's FailureReason and into the fan-in audit payload, so
+	// this assertion can genuinely fail if the wedge block ever starts
+	// copying either through.
+	//
+	// Vacuity guard: if the fixture ever stops seeding the sentinel this
+	// FAILS LOUD rather than degrading into an assertion that cannot fail.
+	_, fixtureStages, fixtureAudit, _, _ := diagWedgeFixture(t)
+	seededReason := ""
+	if fr := fixtureStages[1].FailureReason; fr != nil {
+		seededReason = *fr
+	}
+	if !strings.Contains(seededReason, diagWedgeSentinel) ||
+		!strings.Contains(string(fixtureAudit.allEntries[1].Payload), diagWedgeSentinel) {
+		t.Fatal("diagWedgeFixture no longer seeds diagWedgeSentinel into a stage FailureReason " +
+			"AND the fan-in audit payload; the leak assertion below would be vacuous")
+	}
+	if strings.Contains(body, diagWedgeSentinel) {
 		t.Errorf("filed body leaked free text:\n%s", body)
 	}
 
@@ -930,7 +964,8 @@ func TestProductReport_OccurrenceCommentCarriesWedgeSummary(t *testing.T) {
 
 // TestProductReport_BoardingFailureStillFiles is counterfactual (9) and
 // failure mode m7: placement fails, the report still returns 201 with the
-// created number/URL, boarded=false, and a NON-EMPTY boarding_error.
+// created number/URL, boarded=false, and a NON-EMPTY boarding_error
+// naming which step failed.
 func TestProductReport_BoardingFailureStillFiles(t *testing.T) {
 	fp := &fakeFeedbackProvider{boardErr: "workmgmt/github: add project item: 403"}
 	s, runID := wedgedProductReportServer(t, fp,
@@ -947,11 +982,184 @@ func TestProductReport_BoardingFailureStillFiles(t *testing.T) {
 	if got.BoardingStatus != workmgmt.BoardingStatusFailed {
 		t.Errorf("boarding_status = %q, want failed", got.BoardingStatus)
 	}
-	if !strings.Contains(got.BoardingError, "403") {
-		t.Errorf("boarding_error = %q, want it to name the cause", got.BoardingError)
+	if got.BoardingError != workmgmt.BoardingCauseAddItemFailed {
+		t.Errorf("boarding_error = %q, want the closed literal %q",
+			got.BoardingError, workmgmt.BoardingCauseAddItemFailed)
 	}
 	if got.Number != 4242 || got.URL == "" {
 		t.Errorf("created issue lost: number=%d url=%q", got.Number, got.URL)
+	}
+}
+
+// TestProductReport_BoardingErrorIsCallerSafe is the disclosure control.
+// The 201 body is a SUCCESS response, so writeError's default-deny detail
+// allow-list never runs on it; without safeBoardingCause the raw provider
+// error crosses to the caller. The worst instance is the unknown-status
+// path, whose message enumerates the project's Status field OPTION
+// NAMES — private board metadata reachable only through the operator's
+// privileged projects token.
+//
+// The sentinels are seeded BY CONSTRUCTION into the raw cause the
+// provider records, and every one of them is asserted absent from the
+// wire while the closed literal is asserted present.
+//
+// Counterfactual: assign created.BoardingError straight to
+// resp.BoardingError (drop the safeBoardingCause call) and this goes RED.
+func TestProductReport_BoardingErrorIsCallerSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		raw       string
+		wantCause string
+		sentinels []string
+	}{
+		{
+			name: "unknown status leaks the project's option names",
+			raw: `workmgmt/github: status "Backlog" is not a Status option on the project; ` +
+				`available: Embargoed-Legal, Security-Incident-Queue, Up Next`,
+			wantCause: workmgmt.BoardingCauseStatusOptionUnknown,
+			sentinels: []string{"Embargoed-Legal", "Security-Incident-Queue", "available:"},
+		},
+		{
+			name:      "add item leaks third-party API text",
+			raw:       "workmgmt/github: add project item: POST https://api.internal.example.com/graphql: 403 SAML enforcement",
+			wantCause: workmgmt.BoardingCauseAddItemFailed,
+			sentinels: []string{"api.internal.example.com", "SAML enforcement"},
+		},
+		{
+			name:      "resolve fields",
+			raw:       "workmgmt/github: resolve project fields: token TOPSECRET-PAT rejected",
+			wantCause: workmgmt.BoardingCauseProjectFieldsUnavailable,
+			sentinels: []string{"TOPSECRET-PAT"},
+		},
+		{
+			name:      "set status",
+			raw:       "workmgmt/github: set status field: node MDEwOlNlY3JldE5vZGU= denied",
+			wantCause: workmgmt.BoardingCauseSetStatusFailed,
+			sentinels: []string{"MDEwOlNlY3JldE5vZGU="},
+		},
+		{
+			// The fail-safe default arm: an error this table does not
+			// recognize must degrade to a vaguer literal, never to an echo.
+			name:      "unrecognized cause degrades, never echoes",
+			raw:       "some future provider error mentioning INTERNAL-HOSTNAME",
+			wantCause: workmgmt.BoardingCauseUnclassified,
+			sentinels: []string{"INTERNAL-HOSTNAME", "future provider error"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeFeedbackProvider{boardErr: tc.raw}
+			s, runID := wedgedProductReportServer(t, fp,
+				&workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7})
+
+			rec := postProductReport(s, runID, "mcp:run:"+runID.String(), `{}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+			}
+			got := decodeProductReportResponse(t, rec)
+			if got.BoardingStatus != workmgmt.BoardingStatusFailed {
+				t.Fatalf("boarding_status = %q, want failed", got.BoardingStatus)
+			}
+			if got.BoardingError != tc.wantCause {
+				t.Errorf("boarding_error = %q, want the closed literal %q", got.BoardingError, tc.wantCause)
+			}
+			for _, sentinel := range tc.sentinels {
+				if strings.Contains(rec.Body.String(), sentinel) {
+					t.Errorf("201 body leaked %q from the raw placement error: %s",
+						sentinel, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// TestProductReport_ForeignRepoBoardNotAuthorized is the egress-
+// authorization control. A product report always lands in the FIXED
+// product tracker, but the board coordinates come from the SOURCE run's
+// repo conventions. Without the binding, any repo Fishhawk runs against
+// could name an arbitrary Projects-v2 board and have this server write to
+// it under a privileged credential — the operator's static projects token
+// for a user-owned board.
+//
+// Counterfactual: pass conv.Project straight into the Target (drop
+// productReportBoard) and this goes RED on the filedTarget assertion.
+func TestProductReport_ForeignRepoBoardNotAuthorized(t *testing.T) {
+	foreign := &workmgmt.Project{Owner: "someone-else", OwnerType: "user", Number: 99}
+	fp := &fakeFeedbackProvider{boardOK: true}
+	s, runID := wedgedProductReportServerForRepo(t, fp, foreign, "attacker-org/not-fishhawk")
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), `{}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Fatal("provider.File was not called")
+	}
+	if fp.filedTarget.Project != nil {
+		t.Errorf("unauthorized board coordinates reached the provider: %+v", fp.filedTarget.Project)
+	}
+	got := decodeProductReportResponse(t, rec)
+	if got.Boarded {
+		t.Error("boarded = true against an unauthorized board")
+	}
+	if got.BoardingStatus != workmgmt.BoardingStatusNotAttemptedProjectNotAuthorized {
+		t.Errorf("boarding_status = %q, want not_attempted_project_not_authorized", got.BoardingStatus)
+	}
+	if got.BoardingError != "" {
+		t.Errorf("boarding_error = %q; a refused destination is a configuration state, not a failure",
+			got.BoardingError)
+	}
+
+	// Control arm: the SAME project coordinates, from the destination
+	// repo's own conventions, DO reach the provider. Pairing the refused
+	// input with ITSELF is what makes this discrimination rather than a
+	// comparison of two different values.
+	fp2 := &fakeFeedbackProvider{boardOK: true}
+	s2, runID2 := wedgedProductReportServerForRepo(t, fp2, foreign, productRepo)
+	rec2 := postProductReport(s2, runID2, "mcp:run:"+runID2.String(), `{}`)
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("control status = %d, want 201 (body %s)", rec2.Code, rec2.Body.String())
+	}
+	if fp2.filedTarget.Project == nil || fp2.filedTarget.Project.Number != 99 {
+		t.Errorf("authorized board coordinates were dropped: %+v", fp2.filedTarget.Project)
+	}
+	if got2 := decodeProductReportResponse(t, rec2); got2.BoardingStatus != workmgmt.BoardingStatusBoarded {
+		t.Errorf("control boarding_status = %q, want boarded", got2.BoardingStatus)
+	}
+}
+
+// TestProductReport_FailedStatusAlwaysCarriesACause is the other half of
+// TestProductReport_NotAttemptedStatusIsAlwaysCauseFree, and closes the
+// contract seam the implement review found: BoardingStatusOf's defensive
+// default arm (a project IS configured, and the provider neither boarded
+// nor recorded a cause) returns `failed`, while the OpenAPI schema and
+// the workmgmt README both state `failed` is the status that CARRIES a
+// cause. An operator reading status=failed with no cause sees a state the
+// docs say cannot happen — and the WARN log line carried an empty error
+// string too.
+//
+// Counterfactual: delete safeBoardingCause's empty-input arm (return ""
+// instead of BoardingCauseUnreported) and this goes RED.
+func TestProductReport_FailedStatusAlwaysCarriesACause(t *testing.T) {
+	// Neither boarded nor a cause, with a project configured.
+	fp := &fakeFeedbackProvider{boardOK: false, boardErr: ""}
+	s, runID := wedgedProductReportServer(t, fp,
+		&workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7})
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), `{}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	got := decodeProductReportResponse(t, rec)
+	if got.BoardingStatus != workmgmt.BoardingStatusFailed {
+		t.Fatalf("boarding_status = %q, want failed", got.BoardingStatus)
+	}
+	if got.BoardingError != workmgmt.BoardingCauseUnreported {
+		t.Errorf("boarding_error = %q, want the synthesized %q — a `failed` with no cause "+
+			"is a state the schema and the README both say cannot happen",
+			got.BoardingError, workmgmt.BoardingCauseUnreported)
+	}
+	if !strings.Contains(rec.Body.String(), `"boarding_error"`) {
+		t.Errorf("wire body omits boarding_error on a failed status: %s", rec.Body.String())
 	}
 }
 

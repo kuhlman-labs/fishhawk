@@ -272,3 +272,38 @@ func TestRunDiagnose_WedgeContextJSONOutput(t *testing.T) {
 		t.Errorf("wedge_context = %+v", decoded.WedgeContext)
 	}
 }
+
+// TestRunDiagnose_NoWedgeContext_JSONOmitsKey is the JSON half of the
+// anti-noise contract, and the arm the text-only no-wedge test above
+// cannot reach: `--output json` RE-ENCODES the mirror struct rather than
+// echoing the server's bytes, so a `wedge_context` field without
+// `omitempty` would ADD a `"wedge_context": null` key to every healthy
+// bundle — a key the server documents as absent, and a change to output
+// this feature promised not to make.
+//
+// Counterfactual: drop `,omitempty` from diagnosticBundle.WedgeContext
+// and this goes RED on the substring assertion.
+func TestRunDiagnose_NoWedgeContext_JSONOmitsKey(t *testing.T) {
+	id := uuid.New()
+	srv := newDiagBackend(t, id.String())
+	t.Setenv("FISHHAWK_BACKEND_URL", srv.URL)
+	t.Setenv("FISHHAWK_TOKEN", "")
+
+	var stdout strings.Builder
+	if got := run([]string{"diagnose", id.String(), "--output", "json"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	out := stdout.String()
+	if strings.Contains(out, "wedge_context") {
+		t.Errorf("healthy bundle re-encoded a wedge_context key:\n%s", out)
+	}
+	// And the key is absent from the decoded object too, not merely
+	// spelled differently.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := raw["wedge_context"]; ok {
+		t.Errorf("healthy bundle carries wedge_context = %s", raw["wedge_context"])
+	}
+}
