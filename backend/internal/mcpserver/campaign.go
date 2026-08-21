@@ -453,7 +453,7 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		Items:       st.Items,
 		Rollup:      st.Rollup,
 		NextAction:  st.NextAction,
-		NextActions: campaignNextActionsFor(st.Rollup, st.NextAction),
+		NextActions: campaignNextActionsFor(st.Rollup, st.NextAction, st.Items),
 		// Best-effort acceptance-slot visibility (E48.71 / #2503), computed from
 		// the items AFTER the successful backend read so a campaign_not_found
 		// still surfaces unchanged. Nil (block omitted) when no item is at or near
