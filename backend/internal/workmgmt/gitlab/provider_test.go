@@ -427,8 +427,8 @@ func TestProvider_DoesNotImplementWorkItemReader(t *testing.T) {
 // interface a caller could dispatch against, and never an empty page it could
 // misread as an empty backlog.
 func TestReaderFor_GitLabResolvesTypedUnavailable(t *testing.T) {
-	workmgmt.Register(New(&fakeAPI{}))
-	r, err := workmgmt.ReaderFor(ProviderName)
+	workmgmt.Register(&namedFileOnlyProvider{Provider: New(&fakeAPI{})})
+	r, err := workmgmt.ReaderFor(fileOnlyRegistryName)
 	if r != nil {
 		t.Errorf("reader = %v, want nil alongside the unavailable error", r)
 	}
@@ -439,7 +439,24 @@ func TestReaderFor_GitLabResolvesTypedUnavailable(t *testing.T) {
 	if ue.Reason != workmgmt.ReasonNotImplemented {
 		t.Errorf("Reason = %q, want %q", ue.Reason, workmgmt.ReasonNotImplemented)
 	}
-	if ue.Provider != ProviderName {
-		t.Errorf("Provider = %q, want %q", ue.Provider, ProviderName)
+	if ue.Provider != fileOnlyRegistryName {
+		t.Errorf("Provider = %q, want %q", ue.Provider, fileOnlyRegistryName)
 	}
 }
+
+// fileOnlyRegistryName is a unique test-only registry id. workmgmt.Register
+// REPLACES any prior registration for a name, so registering a fake-API-backed
+// provider under the real ProviderName would clobber the production
+// registration for every other test sharing this package's test binary — the
+// same clobber the github-side reader test avoids with readerRegistryName and
+// that refinement_file_test.go warns about. ReaderFor only needs an id that
+// maps to a registered provider, so the real name buys nothing here.
+const fileOnlyRegistryName = ProviderName + "_file_only_capability_test"
+
+// namedFileOnlyProvider wraps the real provider under fileOnlyRegistryName.
+// The embedded *Provider promotes File, and — load-bearing for this test —
+// promotes NO read methods, so the WorkItemReader assertion inside ReaderFor
+// still fails exactly as it does for the production registration.
+type namedFileOnlyProvider struct{ *Provider }
+
+func (*namedFileOnlyProvider) Name() string { return fileOnlyRegistryName }

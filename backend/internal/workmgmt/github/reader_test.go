@@ -374,6 +374,15 @@ func TestProvider_ReadWorkItem_AcceptsEveryRefForm(t *testing.T) {
 		if rec.OnBoard || rec.BoardState != "" {
 			t.Errorf("ReadWorkItem(%q) board = %v/%q, want unresolved", ref, rec.OnBoard, rec.BoardState)
 		}
+		// URL is LIST-PATH-ONLY: GetIssue decodes githubclient.Issue, the REST
+		// single-issue payload, which carries no URL field, so the read path
+		// leaves it empty where the list path populates it from the GraphQL
+		// node. Pinned here so that documented asymmetry cannot drift silently
+		// — a change that starts populating it must update the contract on
+		// workmgmt.WorkItemRecord.URL and this assertion together.
+		if rec.URL != "" {
+			t.Errorf("ReadWorkItem(%q).URL = %q, want empty; the documented contract is list-path-only", ref, rec.URL)
+		}
 	}
 }
 
@@ -646,6 +655,61 @@ func TestResolveBoard_ForbiddenFromProjectFields(t *testing.T) {
 	assertUnavailable(t, err, workmgmt.ReasonForbidden)
 	if !errors.Is(err, githubclient.ErrForbidden) {
 		t.Errorf("errors.Is lost the sentinel: %v", err)
+	}
+}
+
+// TestListWorkItems_UndecidableBoardMembershipIsTyped is condition C3 asserted
+// at the PROVIDER boundary, end to end over HTTP: an issue whose per-issue
+// projectItems page comes back FULL without carrying the target project has
+// undecidable board membership, and the refusal must reach the caller as a
+// CLASSIFIABLE degradation.
+//
+// The githubclient-layer fixture (TestListRepoIssues_TruncatedProjectItems-
+// FailsClosed) proves the refusal happens; this proves it survives the
+// provider boundary as a type rather than as message text a caller would have
+// to grep. Both classifications must hold on the SAME value: errors.As yields
+// *workmgmt.UnavailableError with Reason ReasonBoardStateUndecidable (what a
+// caller switches on), and errors.As through Unwrap still yields the
+// *githubclient.BoardMembershipUndecidableError naming the offending issue.
+func TestListWorkItems_UndecidableBoardMembershipIsTyped(t *testing.T) {
+	// A FULL projectItems page (the cap's worth), none of them the target.
+	var items []string
+	for i := 0; i < 20; i++ {
+		items = append(items, fmt.Sprintf(`{"project":{"id":"OTHER_%d"},"fieldValueByName":null}`, i))
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(body.Query, "ProjectFields") {
+			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[{"id":"OPT_B","name":"Backlog"}]}}}}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[`+
+			`{"number":2230,"title":"t","url":"u","body":"b","state":"OPEN","stateReason":null,"labels":{"nodes":[]},"projectItems":{"nodes":[`+
+			strings.Join(items, ",")+`]}}]}}}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	c.ProjectsToken = "pat_projects"
+
+	page, err := New(c).ListWorkItems(context.Background(), listRequest())
+	if page != nil {
+		t.Errorf("page = %+v, want NIL — an undecidable membership is not an answer", page)
+	}
+	assertUnavailable(t, err, workmgmt.ReasonBoardStateUndecidable)
+	var undecidable *githubclient.BoardMembershipUndecidableError
+	if !errors.As(err, &undecidable) {
+		t.Fatalf("errors.As lost the typed cause through the wrapper: %v (%T)", err, err)
+	}
+	if undecidable.IssueNumber != 2230 {
+		t.Errorf("cause names issue #%d, want #2230", undecidable.IssueNumber)
 	}
 }
 

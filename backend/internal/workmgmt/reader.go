@@ -109,6 +109,17 @@ type ListWorkItemsRequest struct {
 // canonical state, and is EMPTY when the item is off-board, when board state
 // was not requested, or when the column maps to no canonical state — an
 // unmapped column is reported as unmapped, never guessed.
+//
+// URL is LIST-PATH-ONLY in v0 and is always EMPTY from ReadWorkItem. That
+// asymmetry is a property of the payloads the two paths read, not an
+// oversight: the GitHub list path decodes the GraphQL issue node, which
+// selects `url`, while the read path decodes githubclient.Issue — the REST
+// single-issue payload, which carries no URL field at all. Populating it on
+// the read path would mean widening that shared REST struct, which several
+// unrelated callers consume; #2230 leaves that to the first consumer that
+// needs it. Until then a caller MUST NOT treat an empty URL from ReadWorkItem
+// as "this item has no URL" — reconstruct it from Number and the target repo,
+// or read the item through ListWorkItems.
 type WorkItemRecord struct {
 	Number      int
 	Title       string
@@ -154,6 +165,17 @@ const (
 	// ReasonNoInstallation is set when no installation/credential scope is available, so
 	// no token can be minted for the read.
 	ReasonNoInstallation UnavailableReason = "no_installation"
+	// ReasonBoardStateUndecidable is set when the forge CAN be read but its
+	// answer is ambiguous, so no board state can be reported honestly — the
+	// GitHub case is an issue whose per-issue project-membership page came back
+	// FULL without carrying the target project, leaving "is it on this board?"
+	// undecidable. It is a distinct reason from ReasonForbidden because the
+	// remedy is different: nothing about the credential is wrong, so prompting
+	// the operator for a token would be the wrong response. The provider-level
+	// cause (e.g. *githubclient.BoardMembershipUndecidableError) is retained in
+	// Cause, so a caller that wants the offending item number can errors.As for
+	// it through Unwrap.
+	ReasonBoardStateUndecidable UnavailableReason = "board_state_undecidable"
 )
 
 // UnavailableError is the typed capability-unavailable result (#2230

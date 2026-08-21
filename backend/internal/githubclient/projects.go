@@ -909,6 +909,33 @@ const listRepoIssuesMaxPages = 100
 // trip per issue on every page.
 const listRepoIssuesProjectItemsFirst = 20
 
+// BoardMembershipUndecidableError is the TYPED fail-closed result for a
+// truncated nested projectItems page (#2230 condition C3). It is a distinct
+// type rather than a bare fmt.Errorf because this condition is a CLASSIFIABLE
+// degradation, not a transport fault: a caller (the work-management provider,
+// and through it a selection source) must be able to tell "this issue's board
+// membership is undecidable because it sits on more projects than one page
+// carries" apart from every other enumeration failure, and error TEXT is not
+// an interface anything can branch on. The workmgmt/github provider matches it
+// with errors.As and re-surfaces it as a typed
+// *workmgmt.UnavailableError{Reason: ReasonBoardStateUndecidable} whose Cause
+// retains this value, so both classifications hold on the same error.
+type BoardMembershipUndecidableError struct {
+	// Owner and Name identify the repository the enumeration ran against.
+	Owner, Name string
+	// IssueNumber is the issue whose membership could not be decided.
+	IssueNumber int
+	// PageCap is the projectItems page size the response filled, and
+	// ProjectID the target project that was absent from that full page.
+	PageCap   int
+	ProjectID string
+}
+
+func (e *BoardMembershipUndecidableError) Error() string {
+	return fmt.Sprintf("githubclient: list issues for %s/%s: issue #%d sits on at least %d projects (the projectItems page cap) and none is the target project %q, so its board membership is undecidable; refusing to report it as off-board",
+		e.Owner, e.Name, e.IssueNumber, e.PageCap, e.ProjectID)
+}
+
 // ListRepoIssues enumerates a repository's ISSUES via the GraphQL
 // repository.issues connection — never a ProjectV2 board item list (#2230).
 // That choice is load-bearing, not stylistic: a board item list is capped and
@@ -931,7 +958,8 @@ const listRepoIssuesProjectItemsFirst = 20
 // ProjectID supplies BoardStatus — the same unambiguous match ProjectItemStatus
 // makes. If that nested page comes back FULL and the target project is not
 // among its nodes, the answer is ambiguous (the item may exist beyond the
-// page) and ListRepoIssues fails closed rather than reporting OnBoard=false.
+// page) and ListRepoIssues fails closed with a typed
+// *BoardMembershipUndecidableError rather than reporting OnBoard=false.
 //
 // Honors the user-owned-projects token opt-in (WithProjectsToken) like the
 // other GraphQL calls, since it routes through doGraphQL. Returns ErrForbidden
@@ -1038,10 +1066,14 @@ func (c *Client) ListRepoIssues(ctx context.Context, scope forge.CredentialScope
 				// FULL projectItems page that does not carry the target project is
 				// ambiguous — the item may sit beyond the page — and reporting
 				// OnBoard=false would be a silent wrong answer for an issue that IS
-				// on the board. Refuse instead, naming the issue and the cap.
+				// on the board. Refuse with a TYPED error so the condition is
+				// classifiable through errors.As at every layer above, not just
+				// greppable in the message.
 				if !found && len(n.ProjectItems.Nodes) >= listRepoIssuesProjectItemsFirst {
-					return nil, fmt.Errorf("githubclient: list issues for %s/%s: issue #%d sits on at least %d projects (the projectItems page cap) and none is the target project %q, so its board membership is undecidable; refusing to report it as off-board",
-						repo.Owner, repo.Name, n.Number, listRepoIssuesProjectItemsFirst, opts.ProjectID)
+					return nil, &BoardMembershipUndecidableError{
+						Owner: repo.Owner, Name: repo.Name, IssueNumber: n.Number,
+						PageCap: listRepoIssuesProjectItemsFirst, ProjectID: opts.ProjectID,
+					}
 				}
 			}
 			results = append(results, issue)

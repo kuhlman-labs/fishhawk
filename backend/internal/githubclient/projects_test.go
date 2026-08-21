@@ -1050,6 +1050,18 @@ func TestListRepoIssues_TruncatedProjectItemsFailsClosed(t *testing.T) {
 	if issues != nil {
 		t.Errorf("issues = %+v alongside the error, want NO result", issues)
 	}
+	// The refusal must be CLASSIFIABLE, not merely greppable: a caller decides
+	// what to do about an undecidable membership by matching the TYPE, so
+	// assert errors.As and the fields, not the message text.
+	var undecidable *BoardMembershipUndecidableError
+	if !errors.As(err, &undecidable) {
+		t.Fatalf("err = %v (%T), want *BoardMembershipUndecidableError", err, err)
+	}
+	if undecidable.IssueNumber != 42 || undecidable.ProjectID != "PROJ" ||
+		undecidable.PageCap != listRepoIssuesProjectItemsFirst ||
+		undecidable.Owner != "o" || undecidable.Name != "r" {
+		t.Errorf("error fields = %+v, want issue 42 on o/r against PROJ at the %d cap", undecidable, listRepoIssuesProjectItemsFirst)
+	}
 	if !strings.Contains(err.Error(), "#42") || !strings.Contains(err.Error(), "undecidable") {
 		t.Errorf("error must name the issue and the undecidable membership, got %v", err)
 	}

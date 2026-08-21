@@ -12,7 +12,8 @@ package github
 //
 // Every degradation is a TYPED *workmgmt.UnavailableError with a nil result:
 // no installation scope, no project configured, a user-owned board with no
-// projects token (#1114), or a forge permission refusal. A read must fail
+// projects token (#1114), a forge permission refusal, or an undecidable board
+// membership (a truncated per-issue projectItems page). A read must fail
 // typed where Transition degrades to a best-effort skip — a silent empty
 // answer here is indistinguishable from an empty backlog, which is exactly the
 // wrong-decision class the capability exists to prevent.
@@ -152,6 +153,19 @@ func (p *Provider) ListWorkItems(ctx context.Context, req workmgmt.ListWorkItems
 			return nil, unavailable(workmgmt.ReasonForbidden,
 				"the forge refused the issue enumeration; the token needs read access to the repository's issues", err)
 		}
+		// A truncated per-issue projectItems page leaves board membership
+		// UNDECIDABLE (condition C3). githubclient already fails closed on it;
+		// re-surface that as a TYPED capability degradation so a caller can
+		// classify it through the same errors.As chokepoint every other
+		// degradation uses, instead of matching on message text. The typed
+		// githubclient cause rides along in Cause, so errors.As for
+		// *githubclient.BoardMembershipUndecidableError still yields the
+		// offending issue number.
+		var undecidable *githubclient.BoardMembershipUndecidableError
+		if errors.As(err, &undecidable) {
+			return nil, unavailable(workmgmt.ReasonBoardStateUndecidable,
+				"an issue sits on more projects than one project-membership page carries, so its board membership cannot be decided; narrow the enumeration (labels, closed-state) or read that item individually", err)
+		}
 		return nil, fmt.Errorf("workmgmt/github: list issues for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 
@@ -210,6 +224,13 @@ func canonicalStateSet(states []string) map[string]bool {
 // reference. Ref accepts `#N`, `N`, or `issue:N` — the repo's existing ref
 // conventions, parsed by the SAME parseIssueRef helper ResolveDependencies
 // uses (no second regex).
+//
+// The record's URL is left EMPTY here: GetIssue is the REST single-issue
+// payload and githubclient.Issue carries no URL field, where the list path's
+// GraphQL node selects `url`. That asymmetry is documented on
+// workmgmt.WorkItemRecord.URL as list-path-only rather than papered over with
+// a hand-built URL string, so a caller is never handed a synthesized link this
+// package did not read from the forge.
 //
 // It reaches the same degradations ListWorkItems does — no installation scope,
 // and (only when ResolveBoardState is set) no project configured, a user-owned
