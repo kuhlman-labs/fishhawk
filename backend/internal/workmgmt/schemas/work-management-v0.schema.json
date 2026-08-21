@@ -151,6 +151,19 @@
           "description": "Whether upstream product-feedback egress is allowed for this repo. enabled:false hard-disables the product-report endpoint."
         }
       }
+    },
+    "charter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "description": "Declares where the repo's checked-in charter document lives (E54.1 / #2233) — the prioritization anchor a backlog-grooming run reads so every ranking it proposes cites a rubric line by id. The document is human-authored: agents read it, agents never write it, and it is resolved from the run's BASE ref so a change cannot rewrite the charter constraining it. This block is SCHEMA-OPTIONAL but FEATURE-MANDATORY — its absence is not a fail-open: backlog_grooming fails closed when no charter resolves (there is no report-only-without-a-charter degradation anywhere in E54), and that enforcement lives in #2234/#2236, not in this schema. This slice ships DECLARATION ONLY: nothing here reads, injects, or renders the document. Path safety and resolution are owned by backend/internal/repodoc (#2796), whose validatePath rejects an absolute, traversal-bearing, backslash-carrying, control-character-carrying, or non-canonical path fail-closed at resolve time. See docs/spec/work-management-v0.md for the charter's content contract.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path of the charter document, relative to the filing repo's root (e.g. .fishhawk/charter.md, the conventional location declared by the shipped default). Must be non-empty. Declaration-time validation is structural only — the path-shape rule (no absolute, no .. segment, no backslash, canonical spelling) is enforced fail-closed by repodoc.validatePath at the single point where the declared path is used to fetch the document, so this schema deliberately does not carry a second copy of it."
+        }
+      }
     }
   },
 

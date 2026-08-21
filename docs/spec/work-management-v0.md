@@ -24,6 +24,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `states` | no | object: canonical state → provider option | Canonical board-state map for run-lifecycle transitions (#1012). Keys from the closed set `backlog`/`up_next`/`in_progress`/`in_review`/`blocked`/`done`; values are provider option strings. |
 | `transitions` | no | object: lifecycle event → canonical state | Run-lifecycle-event → canonical-state map (#1012). Keys from the closed set `run_started`/`pr_opened`/`run_failed`/`run_merged`, the campaign-scoped `campaign_started` (#1816), and the issue-lifecycle `issue_closed`/`issue_reopened` (#1817); each value must be a key declared in `states` (semantic check). |
 | `product_feedback` | no | object `{enabled: boolean}` | Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means enabled (the default). `enabled: false` → `POST /v0/runs/{id}/product-reports` returns 403 `product_feedback_disabled` and files nothing. Set it as the object form (`product_feedback:` / `  enabled: false`), **not** a bare string. |
+| `charter` | no | object `{path: string}` | Declares the repo-relative path of the checked-in charter document a backlog-grooming run reads (E54.1 / #2233), e.g. `.fishhawk/charter.md`. `path` is required and non-empty **when the block is present**; the block itself is optional. Schema-optional but **feature-mandatory**: `backlog_grooming` fails closed when no charter resolves, enforced in #2234/#2236 — never a fail-open. See [Charter](#charter). |
 
 ### Per-type fields (`types.<name>`)
 
@@ -163,6 +164,64 @@ Both blocks are optional: absent (or empty) means no transitions are configured 
 
 The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions` value must be a key present in `states`**. The schema constrains transition values to the canonical enum, but only the semantic check ties a value to a declared `states` key, so a transition can't target a state that has no provider option.
 
+## Charter
+
+The `charter` block (optional, additive within v0) declares where the repo's checked-in **charter document** lives — the prioritization anchor a backlog-grooming run (ADR-065 / E54) reads so every ranking it proposes cites a rubric line by id.
+
+```yaml
+charter:
+  path: .fishhawk/charter.md
+```
+
+`path` is repo-relative to the filing repo's root, required and non-empty when the block is present. `.fishhawk/charter.md` is the **conventional location** and is what the shipped default declares, so a repo that writes its charter there needs no `.fishhawk/work-management.yaml` override at all; a repo that wants the document elsewhere overrides `charter.path` in its own config.
+
+The document is **human-authored**: agents read it, agents never write it. It is resolved from the run's **base ref**, so a change can never rewrite the charter that constrains it.
+
+### Three contract facts
+
+1. **Schema-optional, feature-mandatory — the optionality is not a fail-open.** The block is absent from the schema's top-level `required` array because adding a required field to an existing major is a breaking change (see [Versioning](#versioning)). That is a *schema-compatibility* decision, not a statement that grooming degrades gracefully without a charter: `backlog_grooming` **fails closed** when no charter resolves, and there is no report-only-without-a-charter mode anywhere in E54. The enforcement lives in #2234/#2236 — the resolution and the grooming stage — not in this schema.
+2. **This is a declaration only.** Nothing here reads, injects, or renders the charter. The injection mechanism is `backend/internal/repodoc` (#2796), and it is reused rather than duplicated: its base-ref resolution, content-hash attribution, size cap, and framing integrity apply to the charter exactly as to any other repo-authored document. `repodoc.validatePath` also **owns declared-path safety**, rejecting an absolute, `..`-bearing, backslash-carrying, control-character-carrying, or non-canonical path fail-closed at the single point where the path is used to fetch anything.
+3. **This repository's own [`.fishhawk/charter.md`](../../.fishhawk/charter.md) is the worked example** of the content contract below. It is the citable reference for what a charter must contain, and #2235's citation validation is written against what it actually contains.
+
+### Content contract
+
+A charter is not free-form vision prose. A grooming run has to be able to *cite* it, so it must carry four things:
+
+- **North star.** The stable framing successive grooming runs reuse instead of re-deriving. Without it, each run invents its own theory of what the product is for and rankings stop being comparable across runs.
+- **Current-phase themes.** What this phase means *architecturally* — named, so a scoping decision has a stated basis rather than a taste argument. State what the phase does **not** require as well; that is what lets an item be ranked "real value, wrong time" instead of silently deprioritized.
+- **Explicit non-goals.** What makes vision-drift flags possible at all. Without stated non-goals a groomer cannot distinguish drift from expansion — every new capability looks like progress. A non-goal is a standing commitment, so it should be stable across phases.
+- **A prioritization rubric** covering **value**, **risk**, **dependency-unblocking**, and **staleness**, whose lines are **individually addressable by id**.
+
+### The rubric must be citable, line by line
+
+Four prose paragraphs describing "what we value" cannot satisfy #2235's citation validation: there is nothing to cite. The rubric is a table of id-bearing lines, each independently satisfiable. This repository's charter uses `V1`–`V5` (value), `R1`–`R5` (risk), `U1`–`U4` (dependency-unblocking), and `S1`–`S5` (staleness and hygiene). An excerpt, verbatim in shape:
+
+```markdown
+### Value — does it move the current phase?
+
+| id | line |
+|---|---|
+| **V1** | Directly unblocks the current phase definition (§2). For alpha: an external team cannot self-host, or cannot run on their forge, without it. |
+| **V2** | Advances a named phase theme T1–T6 without being strictly blocking. |
+
+### Risk — what does deferring it cost?
+
+| id | line |
+|---|---|
+| **R1** | A window that closes. A breaking change that becomes unmakeable after the next milestone (the E52 case: a spec major cannot be broken in place after the first external consumer). Deferring converts a cheap change into a permanent constraint. |
+| **R2** | A safety or containment property. Anything where the failure mode is an agent acting outside what a human approved, or an audit chain that cannot substantiate a claim. Governance defects outrank feature work. |
+```
+
+A ranking then reads "ranked here on **V1** and **R2**" — a claim a human can check against a specific line, and a validator can check for presence at all. Groups are not strictly ordered against each other: an item scoring `V1` and one scoring `R1` both belong near the top, and the report should say *which* rather than blending them into a single number.
+
+**Rubric ids are stable identifiers: retire ids, never recycle them.** Reusing a retired id for a different meaning would silently rewrite the justification of every past ranking that cited it — the audit record would still say "ranked on V3" while V3 now means something else. Retiring an id leaves a gap in the sequence, which is the intended cost.
+
+### No semantic rule is added for `charter`
+
+`workmgmt.Parse` adds **no** `*SemanticError` rule for this block; the schema's `required: ["path"]` + `minLength: 1` is the whole declaration-time contract. This is a **design decision**, recorded here so the omission reads as intent rather than an oversight.
+
+Rejecting absolute and `..`-bearing paths at parse time would give an earlier error, and an earlier error is genuinely worth something. It is worth less than a single owner. `repodoc.validatePath` already enforces exactly that rule, fail-closed, at the only point where the declared path is used to fetch a document; a second copy in `workmgmt` would be a second owner of one invariant, free to drift from the one that actually gates the read — and the drifted copy would be the *permissive* one, since the enforcing copy is the one under test by the code that reads files. `TestParseCharterNoSemanticPathRule` pins this side of the behaviour explicitly — a traversal-, absolute-, or backslash-bearing declaration parses here without error — and `repodoc`'s own `validatePath` table pins the refusal at resolve time.
+
 ## Validation
 
 `workmgmt.Parse` validates in two stages and returns a typed error:
@@ -170,6 +229,8 @@ The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions`
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
 - `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, `gitlab` is missing its `gitlab` block (or a `gitlab` block is set under another provider), a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, a type's `label_defaults` value does not begin with its key's namespace prefix, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
+
+The `charter` block deliberately adds no `*SemanticError` rule — structural validation (`required: ["path"]` + `minLength: 1` + `additionalProperties: false`) is its whole declaration-time contract, and path shape is owned fail-closed by `repodoc.validatePath` at resolve time. See [No semantic rule is added for `charter`](#no-semantic-rule-is-added-for-charter).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.
 
