@@ -298,3 +298,16 @@ func TestKnownCategories_GroomingReportRecorded(t *testing.T) {
 			"grooming_report_created", SuggestCategories("grooming_report_created", 5))
 	}
 }
+
+// TestKnownCategories_RunRejectedMissingCharter pins the E54.4 / #2236
+// category: the charter admission gate writes it when it refuses a
+// grooming run in a repo whose work-management conventions declare no
+// charter. An unregistered category is un-awaitable — an operator could not
+// arm fishhawk_await_audit on their own refusal — and
+// categories_completeness_test.go's AST sweep would fail the build the
+// moment the emit site lands.
+func TestKnownCategories_RunRejectedMissingCharter(t *testing.T) {
+	if !IsKnownCategory("run_rejected_missing_charter") {
+		t.Fatal("run_rejected_missing_charter is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

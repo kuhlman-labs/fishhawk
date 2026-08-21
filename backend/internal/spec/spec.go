@@ -274,6 +274,24 @@ const (
 	// ConditionGatesResolvedCIGreen (may_merge): no pending gate
 	// approvals, zero open concerns, PR open, required checks green.
 	ConditionGatesResolvedCIGreen DelegationCondition = "gates_resolved_ci_green"
+	// ConditionObjectiveReversible is the BACKLOG-GROOMING condition
+	// (ADR-065 / E54.4 / #2236), legal for the `hygiene` action class
+	// only: every mutation the grooming report proposes is an objective,
+	// reversible hygiene defect fix (a missing label, an absent parent
+	// link, a stale status) and none of them is destructive.
+	//
+	// HONESTLY: it ships with NO EVALUATOR. The grooming apply-stage
+	// consumer that would answer the predicate is out of this slice, and
+	// no enforcement site queries it today. That is fail-CLOSED, not a
+	// gap: DerivedOperatorAgent maps only the five run-driving classes
+	// onto may_* knobs, so a `hygiene: {mode: auto}` class derives an
+	// EMPTY OperatorAgent knob block and therefore delegates NOTHING at
+	// any enforcement site. The posture is the one
+	// `trigger: [scheduled, on_demand]` already ships with — no producer
+	// emits a non-diff trigger form either (see
+	// backend/internal/appliesto.TriggerFormForSource), and both are
+	// accepted as declarable grammar rather than rejected.
+	ConditionObjectiveReversible DelegationCondition = "objective_reversible"
 )
 
 // must_page_human events — the closed set of events that always page

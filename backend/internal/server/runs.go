@@ -1088,6 +1088,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Charter admission gate (ADR-065 / E54.4 / #2236). A workflow that
+	// produces a grooming report has nothing to rank the backlog against
+	// unless the repo declares a charter, so it is refused here with 422
+	// charter_required. Sits beside checkAppliesTo, immediately after it and
+	// before CreateRunForTrigger, for the same two reasons: it is PRE-INSERT
+	// (a refusal leaves no run row) and POST-REPLAY (a replayed
+	// Idempotency-Key short-circuits above, so the gate decides once per NEW
+	// run and appends no second audit entry). See charter_gate.go for where
+	// this rule is — and is not — enforced.
+	if haveStageDefs && !s.checkCharterDeclared(w, r, req.Repo, req.WorkflowID, workflowDef) {
+		return
+	}
+
 	// Map the request's issue context (#415) to the domain value, then
 	// hand the resolved inputs to CreateRunForTrigger — the single
 	// integrating seam for run + stage creation, reused by the

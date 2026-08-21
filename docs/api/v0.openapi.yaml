@@ -6048,6 +6048,30 @@ paths:
             label set and is refused by any labels-declaring
             workflow — this is by design, and the message says so
             explicitly rather than reporting a generic mismatch.
+
+            Also `charter_required` (ADR-065 / E54.4 / #2236) when the
+            resolved workflow declares a stage producing the
+            `grooming_report` artifact and the repo's work-management
+            conventions declare no `charter:` block. A backlog-grooming
+            run ranks the backlog against the charter's rubric, so
+            there is no unanchored-grooming mode. Fail-closed and
+            pre-insert: no run row is created, and a global
+            `run_rejected_missing_charter` audit entry is appended
+            best-effort. `details.reason` distinguishes the three
+            branches: `charter_absent` (no block), `charter_path_empty`
+            (a block whose `path` is empty or whitespace) and
+            `conventions_unavailable` (the conventions could not be
+            read — refused rather than assumed). `details` also carries
+            `workflow_id` and `conventions_path`. The discriminator is
+            STRUCTURAL — the produced artifact, never the workflow name
+            and never a `kind:` field — so renaming the workflow does
+            not evade it. Clear it by declaring `charter: {path: …}` in
+            `.fishhawk/work-management.yaml`. A replay never reaches
+            this gate: an `Idempotency-Key` that resolves to an
+            existing run returns it with 200 first (#2366). This rule
+            is enforced at run admission ONLY — `fishhawk validate`
+            does not check it, because the CLI parses no
+            work-management conventions.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

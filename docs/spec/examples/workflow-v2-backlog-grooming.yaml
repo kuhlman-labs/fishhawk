@@ -25,11 +25,48 @@
 # The grooming_report artifact kind is ADR-065 §3's decision and lands HERE
 # (E54.3 / #2235): the propose stage below declares it, which is what makes this
 # example ALSO the proof that the artifact is declarable on a real propose stage.
-# The backlog_grooming WORKFLOW DECLARATION in this repo's own
-# .fishhawk/workflows.yaml is the separate follow-on (E54.4 / #2236). Declaring
-# grooming_report does not make this a code-change workflow — no stage declares
-# the pull_request artifact, so the post-hoc diff constraints stay unavailable
-# here exactly as described above.
+# Declaring grooming_report does not make this a code-change workflow — no stage
+# declares the pull_request artifact, so the post-hoc diff constraints stay
+# unavailable here exactly as described above.
+#
+# THIS FILE IS THE SHIPPED BACKLOG-GROOMING DECLARATION (E54.4 / #2236), and it
+# is the declaration UNDER TEST: the TestShippedGroomingExample_* family in
+# backend/internal/spec reads THESE bytes from disk and asserts the resolved
+# matrix, the trigger routing, the approval gates and the stage types. A drift
+# in this file reddens those tests rather than passing unnoticed.
+#
+# THE AUTONOMY DECLARATION. Two blocks that look like they overlap and do not:
+#
+#   autonomy: low   governs the five RUN-DRIVING classes (approve, fixup, waive,
+#                   retry, merge). Low delegates none of them.
+#   actions: {...}  governs the four BACKLOG-GROOMING classes. Low's expansion
+#                   never names a grooming class, so the two sets are DISJOINT
+#                   and declaring both is not an explicit-overrides-tier
+#                   conflict: hygiene legitimately resolves to auto here.
+#
+# (An escalation `max_autonomy: low` CEILING is a different operation and DOES
+# clamp hygiene to gated — ClampResolvedMatrix downgrades every auto class the
+# ceiling tier's expansion does not name.)
+#
+# WHY EACH GROOMING CLASS SITS WHERE IT DOES:
+#
+#   hygiene: auto     objective, reversible defect fixes (a missing label, an
+#                     absent parent link) — the ONE auto-eligible grooming class,
+#                     and the only one for which a backend-evaluable condition
+#                     (objective_reversible) exists.
+#   ordering: gated   re-ranks the backlog. Not objectively reversible.
+#   dedup: gated      closes items as duplicates. Not objectively reversible.
+#   scoping: report   decomposes, iceboxes or closes items — the most destructive
+#                     class, so it only ever SURFACES a proposal and never acts.
+#                     `mode: auto` on any of these three is refused at PARSE time
+#                     by the backend, not merely defaulted away.
+#
+# THE TRIGGER FORM. `applies_to: {trigger: [scheduled, on_demand]}` is the
+# non-diff routing declaration (ADR-067): a grooming run arrives periodically or
+# on operator demand and carries no diff, so it must not be routed as one. No
+# producer emits a non-diff trigger form yet (appliesto.TriggerFormForSource
+# maps every source to `diff`), which is why this is declarable grammar today
+# and enforcement rather than aspiration tomorrow.
 
 version: "2"
 
@@ -39,6 +76,27 @@ workflows:
       Propose a backlog grooming report, gate it on a human approval, then apply
       the approved mutations. Produces no code diff at any stage.
     auto_advance: true
+
+    # Non-diff routing (ADR-067): a grooming run is periodic or operator-
+    # initiated and carries no paths. See the header for why this is the
+    # declarable form today.
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    # The five run-driving classes: nothing delegated.
+    autonomy: low
+
+    # The four backlog-grooming classes. Disjoint from the tier above.
+    actions:
+      hygiene:
+        mode: auto
+        when: objective_reversible
+      ordering:
+        mode: gated
+      dedup:
+        mode: gated
+      scoping:
+        mode: report
 
     stages:
       # PROPOSE. A `plan`-typed stage need not emit a plan artifact — it emits a

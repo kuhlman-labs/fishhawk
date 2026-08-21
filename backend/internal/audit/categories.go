@@ -233,6 +233,7 @@ var KnownCategories = map[string]struct{}{
 	"run_rejected_applies_to":                 {},
 	"run_rejected_budget":                     {},
 	"run_rejected_misconfigured":              {},
+	"run_rejected_missing_charter":            {},
 	"run_revived":                             {},
 	"runner_kind_mismatch":                    {},
 	"runner_kind_resolved":                    {},
