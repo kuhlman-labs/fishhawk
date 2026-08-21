@@ -1323,6 +1323,110 @@ func TestNextActions_AcceptanceNotValidated_AcknowledgementPrompt(t *testing.T) 
 	})
 }
 
+// TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt is the #2512 twin
+// of the #2347 prompt pin above, and it exists for the same reason: the
+// acknowledgement is a PROMPT, not an enforcement, so the reason string in these
+// two arms is the ONE mechanism standing in for a gate — and prose in a reason
+// field is exactly what a refactor deletes without anyone noticing.
+//
+// Three load-bearing claims are asserted on both arms:
+//
+//	(a) the stage could not DECIDE one or more criteria,
+//	(b) the operator's merge verdict should say which, and
+//	(c) it is NOT a triage — no criterion failed, so there is nothing to
+//	    arbitrate. (c) is the claim that distinguishes this state from the
+//	    failed/paged arm, and offering an arbitration here would send the
+//	    operator to a verb the server refuses (the gate never reads
+//	    acceptance_triage for an undecidable verdict, so no disposition exists
+//	    to discharge).
+func TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt(t *testing.T) {
+	assertPrompt := func(t *testing.T, na *NextActions, wantState string) {
+		t.Helper()
+		if na == nil || na.State != wantState {
+			t.Fatalf("state = %+v, want %s", na, wantState)
+		}
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+			t.Fatalf("actions = %v, want the merge ritual [approve_pr fishhawk_merge_run] — undecidable is merge-ELIGIBLE", got)
+		}
+		// No arbitration verb: an undecidable row is not a triageable defect.
+		for _, n := range actionNames(na) {
+			if n == "fishhawk_arbitrate_acceptance" {
+				t.Errorf("actions offer fishhawk_arbitrate_acceptance — an undecidable verdict routes NO triage disposition to discharge (#2512): %v", actionNames(na))
+			}
+		}
+		reason := na.Actions[0].Reason
+		// (a) criteria could not be decided.
+		if !strings.Contains(reason, "DECIDE") {
+			t.Errorf("reason no longer tells the operator criteria could not be DECIDED (#2512):\n%s", reason)
+		}
+		// (b) the merge verdict should acknowledge it.
+		if !strings.Contains(reason, "merge verdict") {
+			t.Errorf("reason no longer asks the operator to acknowledge the undecided criteria in their merge verdict (#2512):\n%s", reason)
+		}
+		if !strings.Contains(reason, "acknowledge") {
+			t.Errorf("reason dropped the acknowledgement ask (#2512):\n%s", reason)
+		}
+		// (c) it is not a triage.
+		if !strings.Contains(reason, "not a triage") {
+			t.Errorf("reason no longer says this is NOT a triage — the operator will look for an arbitration that does not exist (#2512):\n%s", reason)
+		}
+		// The prompt must not read as a pass.
+		if strings.Contains(reason, "the acceptance stage passed") {
+			t.Errorf("reason reads as a validated pass:\n%s", reason)
+		}
+	}
+
+	prURL := "https://github.com/x/y/pull/42"
+
+	t.Run("running-run acceptance arm", func(t *testing.T) {
+		r := naLocalRun("running")
+		r.PullRequestURL = &prURL
+		na := nextActionsFor(r, naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+			acceptanceVerdictUndecidable, "", releaseSignals{})
+		assertPrompt(t, na, "acceptance_undecidable")
+	})
+
+	t.Run("terminal-run arm", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, false, acceptanceVerdictUndecidable, "", releaseSignals{})
+		assertPrompt(t, na, "succeeded_acceptance_undecidable")
+	})
+
+	// Degradation control: a verdict aged out of the recent-audit window leaves
+	// the terminal run on plain succeeded_pr_open — merge-eligible, same as
+	// today. The label is what the signal gates, never the eligibility.
+	t.Run("verdict aged out -> succeeded_pr_open", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "succeeded_pr_open" {
+			t.Fatalf("state = %+v, want succeeded_pr_open (graceful degradation)", na)
+		}
+	})
+
+	// Partition control (the design question #2512 settles): not_validated and
+	// undecidable are mutually exclusive BY CONSTRUCTION, and each must keep its
+	// own label. A drift that collapsed one arm into the other would make a
+	// zero-observation short-circuit and a ran-but-undecided stage read
+	// identically to the operator, which is precisely what this change removes.
+	t.Run("not_validated keeps its own distinct state", func(t *testing.T) {
+		r := naLocalRun("running")
+		r.PullRequestURL = &prURL
+		na := nextActionsFor(r, naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+			acceptanceVerdictNotValidated, "", releaseSignals{})
+		if na == nil || na.State != "acceptance_not_validated" {
+			t.Fatalf("state = %+v, want acceptance_not_validated — the two arms must not collapse", na)
+		}
+	})
+}
+
 // TestNextActions_SucceededAcceptanceSkippedOutOfScope pins the E38.3 (#1657)
 // arm: a succeeded run with an open PR AND the acceptanceSkippedOutOfScope flag
 // set classifies succeeded_acceptance_skipped_out_of_scope and STILL returns the
@@ -1725,6 +1829,18 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
 		},
 		{
+			// (4c, #2512) acceptance succeeded + verdict undecidable ->
+			// acceptance_undecidable + the SAME merge ritual. Merge-eligible with
+			// NO arbitration: an undecidable row is not a defect, so the run must
+			// not be routed to the triage arm below.
+			name:        "4c_acceptance_undecidable_merge_ritual",
+			run:         withPR(naLocalRun("running")),
+			stages:      naAcceptanceStages("succeeded"),
+			verdict:     "undecidable",
+			wantState:   "acceptance_undecidable",
+			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
+		},
+		{
 			// (6) fixup_dispatched with the implement stage re-opened -> the
 			// existing implement_pending dispatch arm wins (acceptance still
 			// succeeded, but implement pending short-circuits earlier).
@@ -1791,6 +1907,90 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNextActions_AcceptanceFailedVerdict_NoTriageDisposition pins the arm for
+// the state the #2512 severity ladder made newly REACHABLE: a recorded `failed`
+// acceptance verdict with NO acceptance_triage_decided disposition.
+//
+// A body the agent ships as `passed` carrying a `failed` criterion row records
+// `failed` (acceptanceVerdictAtLeast) and gates the merge at
+// acceptanceGateTriage, but handleShipAcceptance keys triage on the AGENT's own
+// failed claim, so no classifier runs and no disposition is written. Before
+// #2512 every recorded failed verdict got a disposition, so this arm was
+// unreachable and the empty-disposition case fell to the rerouting POLL — which
+// would tell the operator to wait for a re-opened stage that never appears.
+//
+// The load-bearing assertion is that the arm surfaces
+// fishhawk_arbitrate_acceptance: it is the only verb that discharges
+// acceptanceGateTriage for this outcome, so without it the run's merge gate is
+// undischargeable in-loop.
+func TestNextActions_AcceptanceFailedVerdict_NoTriageDisposition(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+
+	na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+		naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+		acceptanceVerdictFailed, "", releaseSignals{})
+	if na == nil {
+		t.Fatal("nextActionsFor returned nil")
+	}
+	if na.State != "acceptance_triage_no_disposition" {
+		t.Fatalf("state = %q, want acceptance_triage_no_disposition (NOT the rerouting poll arm)", na.State)
+	}
+	got := actionNames(na)
+	want := []string{
+		"fishhawk_list_audit",
+		"fishhawk_fixup_stage",
+		"fishhawk_arbitrate_acceptance",
+		"merge_and_file_follow_up",
+		"fishhawk_cancel_run",
+		"fishhawk_get_run_status",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("actions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("actions[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+	// The leading audit read must describe the NO-disposition case, not the
+	// paged-disposition case it is derived from — an operator reading a
+	// precondition that claims a paged disposition landed would go looking for
+	// an acceptance_triage_decided entry that does not exist.
+	if strings.Contains(firstPrecondition(na), "landed on a paged triage disposition") {
+		t.Error("leading audit-read precondition still claims a paged disposition landed")
+	}
+	if !strings.Contains(firstPrecondition(na), "NO acceptance_triage_decided disposition") {
+		t.Errorf("leading audit-read precondition does not name the no-disposition case: %q", firstPrecondition(na))
+	}
+	// Every action still carries the structured fields.
+	for i, a := range na.Actions {
+		if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
+			t.Errorf("actions[%d] (%s) missing precondition/consumes/reason: %+v", i, a.Action, a)
+		}
+	}
+
+	// The rewrite must not leak into the PAGED arm, which shares the same
+	// underlying action list — acceptanceTriagePagedActions returns a fresh
+	// slice per call, so mutating element 0 here must leave the paged arm's own
+	// precondition intact.
+	pagedNA := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+		naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+		acceptanceVerdictFailed, acceptanceDispositionPaged, releaseSignals{})
+	if pagedNA == nil || !strings.Contains(firstPrecondition(pagedNA), "landed on a paged triage disposition") {
+		t.Errorf("paged arm's leading precondition was clobbered by the no-disposition rewrite: %+v", pagedNA)
+	}
+}
+
+// firstPrecondition returns the first suggested action's precondition.
+func firstPrecondition(na *NextActions) string {
+	if na == nil || len(na.Actions) == 0 {
+		return ""
+	}
+	return na.Actions[0].Precondition
 }
 
 // TestNextActions_AcceptanceTriagePaged_EveryDisposition covers mode (5): each
@@ -2080,6 +2280,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"acceptanceVerdictPassed":           acceptanceVerdictPassed,
 		"acceptanceVerdictFailed":           acceptanceVerdictFailed,
 		"acceptanceVerdictNotValidated":     acceptanceVerdictNotValidated,
+		"acceptanceVerdictUndecidable":      acceptanceVerdictUndecidable,
 		"fixup_dispatched":                  acceptanceDispositionFixupDispatched,
 		"retry_dispatched":                  acceptanceDispositionRetryDispatched,
 		"paged":                             acceptanceDispositionPaged,
@@ -2098,7 +2299,13 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		// mirrors rather than imports it (#875) — a rename on the plan/server side
 		// with no mirror silently routes every short-circuited run into the
 		// defensive acceptance_settled_outcome_unknown arm.
-		"acceptanceVerdictNotValidated":  "not_validated",
+		"acceptanceVerdictNotValidated": "not_validated",
+		// #2512: the SERVER-DERIVED fourth verdict, mirrored for the same reason
+		// and carrying the same failure mode — a rename with no mirror routes
+		// every undecidable run into the defensive
+		// acceptance_settled_outcome_unknown arm, which offers a retry that will
+		// only reproduce the same undecidable rows.
+		"acceptanceVerdictUndecidable":   "undecidable",
 		"fixup_dispatched":               "fixup_dispatched",
 		"retry_dispatched":               "retry_dispatched",
 		"paged":                          "paged",
@@ -2157,7 +2364,10 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	// failed arm: paged + rerouting states both carry the drive triage prefix.
 	paged := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, acceptanceDispositionPaged).State
 	rerouting := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, acceptanceDispositionFixupDispatched).State
-	for _, st := range []string{paged, rerouting} {
+	// #2512: the empty-disposition arm is a THIRD failed-arm state, so it must
+	// carry the same drive triage prefix.
+	noDisposition := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, "").State
+	for _, st := range []string{paged, rerouting, noDisposition} {
 		if !strings.HasPrefix(st, string(drive.RuleAcceptanceTriage)) {
 			t.Errorf("failed-arm state %q does not carry the drive triage prefix %q", st, drive.RuleAcceptanceTriage)
 		}

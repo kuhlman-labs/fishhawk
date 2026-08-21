@@ -2539,12 +2539,16 @@ hold:
 - **D3** the surviving partition is non-empty (at least one reported result whose
   id is NOT retired) — a verdict reporting only retired criteria evidences
   nothing about the live contract.
-- **D4** no surviving BLOCKING skip: no non-retired criterion REPORTED `skipped`
-  whose plan `blocking` value (nil → true) is true. D4 keys on what the verdict
-  REPORTS, not on the live set: a blocking live criterion the verdict OMITS
-  entirely does not block the downgrade (the same trust model that already lets a
-  validator omit criteria from a `passed` verdict). Pinned in both directions by
-  `TestDowngrade_SurvivingBlockingSkip_NotDowngraded` and
+- **D4** no surviving BLOCKING un-evaluated criterion: no non-retired criterion
+  REPORTED `skipped` **or `undecidable`** whose plan `blocking` value (nil → true)
+  is true. D4 keys on what the verdict REPORTS, not on the live set: a blocking
+  live criterion the verdict OMITS entirely does not block the downgrade (the
+  same trust model that already lets a validator omit criteria from a `passed`
+  verdict). `undecidable` (#2512) joins the arm with identical semantics — without
+  it, a retirement plus a surviving blocking criterion the validator could not
+  decide silently produces `passed`, a green light over unevaluated evidence.
+  Pinned in both directions by `TestDowngrade_SurvivingBlockingSkip_NotDowngraded`,
+  `TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded` and
   `TestDowngrade_OmittedBlockingLiveCriterion_StillDowngrades`.
 
 On a downgrade the `acceptance_outcome_recorded` payload records
@@ -2554,6 +2558,121 @@ the agent reported (evidence, not verdict), the STORED ARTIFACT BYTES are never
 rewritten, and triage is skipped (no failure left to route). The merge gate reads
 the audit payload, so `acceptanceGateState` returns the merge-eligible
 `acceptance_passed` with no gate change.
+
+### The undecidable acceptance outcome (#2512, E48.78 layer 4)
+
+A validator that attempted a criterion and genuinely could not DECIDE it used to
+have only two words for it: `failed` (which flattens honest uncertainty into a
+defect signal, lands the run in acceptance triage, and can be discharged only by
+the #2474 arbitration verb) or `passed` (a green light over an unevaluated
+criterion). `undecidable` is the third: a per-criterion `result` value carrying a
+REQUIRED, non-whitespace `undecidable_reason`, from which the server derives a
+run-level disposition.
+
+**The partition, settled by construction rather than by convention.** Three names
+share one contract — merge-eligible, never a pass, distinct state string,
+operator acknowledgement asked for in the merge verdict — and are partitioned by
+a single total question: *was there evidence, and what did it say?*
+
+| | decided | evidence | outcome |
+|---|---|---|---|
+| `not_validated` (#2347) | PRE-SPAWN, from the plan alone | none — no runner, no preview, no observation, and therefore NO criteria rows | merge-eligible |
+| `undecidable` (#2512) | POST-RUN, from the agent's own rows | the stage ran and drove the preview; at least one row could not be decided | merge-eligible |
+| `failed` → `acceptance_triage` (#2474) | POST-RUN, from the agent's own rows | a criterion genuinely failed | blocked until arbitrated |
+
+They are MUTUALLY EXCLUSIVE by construction: the short-circuit skips dispatch
+entirely so no criteria rows can exist for the ladder to read, and the precedence
+ladder puts `failed` strictly above `undecidable` so one failed row keeps the run
+in triage exactly as today. `undecidable` routes NO `acceptance_triage_decided`
+disposition and never enters the class-1..5 triage classifier — an undecidable row
+is not a defect, so there is nothing to fix up or retry. That is the #2474
+wedge-surface reduction: the run lands merge-eligible with no arbitration.
+Disjointness is pinned by
+`TestAcceptanceAdmission_ShortCircuitIsDisjointFromUndecidable`.
+
+**The aggregation is a TOTAL, EXPLICIT precedence ladder** over the per-criterion
+rows (`aggregateAcceptanceResults`): any `failed` row → `failed`; else any
+`undecidable` row → `undecidable`, **including when EVERY row is undecidable and
+nothing was verified**; else `passed`. Read that last clause literally — this is
+NOT "verified some criteria and could not evaluate others". A run that verified
+nothing at all is admitted by the ladder, and it is exactly the case an operator
+most needs described correctly. A row set containing an undecidable row can NEVER
+be recorded as `passed`: a green light over an unevaluated criterion is the
+dangerous direction, because nobody looks behind it.
+
+The shipped-verdict/derived-verdict mismatch resolves SEVERITY-MONOTONE as a
+lower bound on the total order `passed < undecidable < failed`:
+`recorded = acceptanceVerdictAtLeast(shipped, derived)`. Nothing is ever softened
+below what either source claims. **Compatibility note (not purely additive):** an
+already-valid body shipping top-level `passed` with a `failed` criterion row
+recorded `passed` before #2512 and records `failed` now. That is a behaviour
+change on a pre-existing wire shape carrying no undecidable data, and it is
+deliberate — recording a pass over a row the agent itself reported failed was the
+dishonest direction. Pinned by
+`TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`.
+
+`aggregateAcceptanceResults` is TOTAL and answers an EMPTY row set with `passed`.
+That is safe ONLY behind the caller-side `len(rows) > 0` guard at its single call
+site; the hazard is pinned openly by
+`TestAggregateAcceptanceResults/EMPTY-row-set-answers-passed-the-documented-hazard`
+and the guard by
+`TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged`.
+
+**Ordering at the ingest seam is load-bearing.** The #2581 retired-criterion
+downgrade runs FIRST over the retired-id set; the ladder then runs over the
+NON-RETIRED rows only. If the ladder ran over all rows, a retired criterion's
+undecidable row would pin the run to `undecidable` forever and the operator's
+retirement would have no effect
+(`TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun`, with its paired
+positive `TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable`).
+`verdict_reported` is the ONE "what the agent said vs what was recorded" field
+and is present whenever the two differ, for either reason; `downgrade_basis` and
+`retired_criterion_ids` stay gated on an actual retirement.
+
+**`undecidable` is SERVER-DERIVED and UNFORGEABLE.** The ship endpoint's
+top-level verdict enum still admits only `passed`/`failed` — that switch is
+deliberately INCOMPLETE with respect to the `acceptanceVerdict*` constant set, and
+`undecidable` joins `not_validated` in never being admissible on the wire. A
+producer expresses undecidability on a criterion ROW, never at the top level. Do
+not "complete" the enum: the counterfactual for that control is COMPLETION, not
+deletion (`TestAcceptanceBody_TopLevelUndecidableVerdictRejected`).
+
+`acceptanceGateState` resolves a recorded `undecidable` verdict to
+`acceptance_undecidable`, handled BESIDE the `not_validated` arm rather than
+falling through to the settled-outcome-unknown hole (which would wedge every
+undecidable run at a 409), and `acceptanceGateAdmitsMerge` admits it — one
+predicate, so all three merge consumers (#2474) admit it at once.
+
+**`undecidable_reason` is decided on field PRESENCE, never on emptiness.** It is
+decoded as a `*string` on both validators: Go's `encoding/json` makes an ABSENT
+field indistinguishable from a PRESENT empty one on a plain `string`, so
+`{"result":"passed","undecidable_reason":""}` would be silently admitted while
+violating the rule that the field belongs only on an undecidable row. Absent is
+accepted on a non-undecidable row; present — empty or not — is rejected. A literal
+JSON `null` decodes to nil and is treated as absent.
+
+**Corpus agreement, not byte-carrying.** The wire shape is validated by two
+hand-maintained twins that cannot import each other:
+`validateAcceptanceVerdict` in package `main` of `runner/cmd/fishhawk-runner` (the
+runner module does not require the backend module) and `acceptanceBody.validate`
+here. `docs/spec/acceptance-verdict-fixtures.json`, mirrored into both `testdata/`
+dirs by `scripts/sync-schemas`, is the shared proof surface: each side runs the
+SAME rows and must produce the SAME admit/reject partition, and CI's schema-sync
+gate red-lines a mirror that drifts. The claim established is corpus agreement —
+NOT that any test carries bytes returned by one validator into the other, which is
+unimplementable across the module boundary. The sharpest row is a WHITESPACE-ONLY
+`undecidable_reason`: the shape one side would admit and the other reject if
+either compared against `""` instead of trimming, which would strand a completed
+acceptance stage while both suites stayed green.
+
+The backend half proves the partition at the WIRE, not only at the decoder:
+EVERY row — both halves — is POSTed VERBATIM to the real ship endpoint, an
+admitted body asserted `201` and a rejected body asserted `400
+acceptance_invalid`. POSTing only the admitted half would leave a handler whose
+decode path had become laxer than the test's own strict decoder admitting a
+corpus-rejected shape while the test stayed green; the `top-level-unknown-field`
+row is the one that detects exactly that drift (deleting the handler's top-level
+`DisallowUnknownFields` admits it `201`).
 
 ### Invariants
 

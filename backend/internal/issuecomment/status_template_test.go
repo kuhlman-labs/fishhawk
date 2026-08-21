@@ -409,6 +409,35 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 4, "criteria_live_validation": 2},
 			want:     "Acceptance not validated — 0/4 criteria verified (all criteria skip-expected); 2 require live validation",
 		},
+		// #2512: the ladder-derived undecidable outcome renders its OWN row.
+		// Same construction as the not_validated rows above — the outcome value
+		// comes from the plan-package constant the ingest emits, so these double
+		// as the byte-identity pin for the package-local mirror.
+		{
+			name:     "undecidable outcome renders its own row, not a tally under 'undecidable'",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 2, "criteria_total": 4, "criteria_undecidable": 2},
+			want:     "Acceptance undecidable — 2/4 criteria could not be decided (2 passed)",
+		},
+		{
+			// The ALL-undecidable arm the ladder explicitly admits: nothing at all
+			// was decided. This is the shape the row most has to get right, since
+			// it is the one an operator would otherwise read as a partial pass.
+			name:     "all-undecidable renders 4/4 undecided with zero passed",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 0, "criteria_total": 4, "criteria_undecidable": 4},
+			want:     "Acceptance undecidable — 4/4 criteria could not be decided (0 passed)",
+		},
+		{
+			// Degradation arm: an undecidable outcome whose tally fields are absent
+			// (an older/partial payload) must still render the undecidable row
+			// rather than falling back to the "Acceptance recorded — undecidable"
+			// certification shape.
+			name:     "undecidable with no tally degrades to the count-free row",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeUndecidable},
+			want:     "Acceptance undecidable — criteria could not be decided",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

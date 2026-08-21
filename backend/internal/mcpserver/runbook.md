@@ -494,7 +494,8 @@ trace-bundle path regardless of pass/fail. Read the `verdict` from the
 `acceptance_outcome_recorded` audit entry, never from the stage state. Merge only
 on a merge-eligible next-actions state: `acceptance_passed` (ADR-049 decision #6:
 the merge is gated on the acceptance_passed evidence condition),
-`acceptance_skipped_out_of_scope`, or `acceptance_not_validated`.
+`acceptance_skipped_out_of_scope`, `acceptance_not_validated`, or
+`acceptance_undecidable`.
 
 **`acceptance_not_validated` (#2347) is merge-eligible but is NOT a pass.** The
 orchestrator short-circuited the stage pre-spawn — every criterion was
@@ -507,6 +508,29 @@ acceptance validated nothing. The status comment carries the same distinction
 ("Acceptance not validated — 0/N criteria verified"), and the payload's
 `criteria_live_validation` count tells you whether a tracked operator-validation
 walk (#2338 / #2345) is outstanding.
+
+**`acceptance_undecidable` (#2512) is merge-eligible, is NOT a pass, and is NOT
+a triage.** It is the post-run twin of `acceptance_not_validated`, and the two
+are mutually exclusive by construction: `not_validated` is settled PRE-SPAWN
+from the plan (no runner, no preview, no criteria rows at all), while
+`undecidable` means the stage RAN, drove the preview, and reported per-criterion
+rows of which at least one carries `result: "undecidable"` with an
+`undecidable_reason` — and **no row failed**. The backend derives the verdict
+from those rows with a total precedence ladder (any failed row → `failed`; else
+any undecidable row → `undecidable`, INCLUDING when every row is undecidable and
+nothing was verified; else `passed`), so a producer cannot ship it: the ship
+endpoint still admits only `passed`/`failed` at top level.
+
+Because no criterion failed, there is **nothing to arbitrate** — the gate never
+reads `acceptance_triage` for this verdict, no `acceptance_triage_decided`
+disposition is written, and `fishhawk_arbitrate_acceptance` has nothing to
+discharge. That is the point: before #2512 a validator that could not decide a
+criterion had to ship `failed`, page a human, and wait for an arbitration.
+Merging is permitted with no operator act, but **say in your merge verdict which
+criteria went undecided and why you are merging anyway** — read each row's
+`undecidable_reason` in the acceptance artifact first. The terminal-run twin
+state is `succeeded_acceptance_undecidable`, and the status comment carries the
+matching row ("Acceptance undecidable — N/M criteria could not be decided").
 
 **Deterministic triage of a failure** (ADR-049 decision #2, server-side, bounded
 at **2 auto re-runs** per run):
@@ -530,6 +554,20 @@ runner** — the same rule as local-drive fixup above, generalized. You MUST
 after `fixup_dispatched`, the **acceptance** stage after `retry_dispatched`.
 `next_actions` surfaces this as the `acceptance_triage_rerouting` state; on the
 next snapshot the re-opened stage's own dispatch arm serves the move.
+
+**A failed verdict with NO triage disposition (#2512).** The severity-monotone
+ladder makes this reachable by design: a body the acceptance agent ships as
+`passed` that carries a `failed` criterion row is RECORDED `failed` and gates the
+merge at `acceptance_triage`, but the deterministic triage keys on the agent's
+OWN failed claim — which this body does not make — so no classifier runs and no
+`acceptance_triage_decided` entry is ever written. `next_actions` surfaces this
+as `acceptance_triage_no_disposition`: the same arbitration menu as the paged arm
+(read the evidence, then `fishhawk_fixup_stage` /
+`fishhawk_arbitrate_acceptance` / `merge_and_file_follow_up` /
+`fishhawk_cancel_run`), plus a trailing poll for the other reading of an empty
+disposition — one that was decided but has not landed in, or has aged out of, the
+recent-audit window. Do NOT wait for an auto-routed re-open here: none is coming,
+and `fishhawk_arbitrate_acceptance` is the only verb that discharges the gate.
 
 **Paged arbitration.** For a paged-family disposition, `next_actions` gives the
 `acceptance_triage_paged` arm: read the evidence first (`fishhawk_list_audit` on

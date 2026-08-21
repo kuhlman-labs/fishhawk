@@ -1,0 +1,149 @@
+{
+  "$comment": "Canonical acceptance-verdict corpus (#2512, E48.78). The acceptance verdict wire shape is validated by TWO hand-maintained twins that cannot import each other: validateAcceptanceVerdict in package main of runner/cmd/fishhawk-runner (the runner module does not require the backend module) and acceptanceBody.validate in backend/internal/server. This file is the shared proof surface: each side runs the SAME rows and must produce the SAME admit/reject partition. The claim is CORPUS AGREEMENT, not byte-carrying -- no test carries bytes returned by one validator into the other, which is unimplementable across the module boundary. Mirrored verbatim into both testdata dirs by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
+  "rows": [
+    {
+      "name": "passed-no-criteria",
+      "body": {"verdict": "passed"},
+      "admitted": true,
+      "reason": "The pre-existing minimal shape: a settled pass with no itemized evidence."
+    },
+    {
+      "name": "passed-with-passed-row",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed"}]},
+      "admitted": true,
+      "reason": "The ordinary happy path."
+    },
+    {
+      "name": "failed-with-failure-mode",
+      "body": {"verdict": "failed", "failure_mode": "assertion_fail", "criteria": [{"id": "crit-1", "result": "failed"}]},
+      "admitted": true,
+      "reason": "A real defect. failure_mode is required on a failed verdict."
+    },
+    {
+      "name": "undecidable-row-valid",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": "the preview exposes no seam that distinguishes the two outcomes"}]},
+      "admitted": true,
+      "reason": "The new per-criterion value with a non-empty reason. The top-level verdict stays passed -- the server derives the undecidable disposition from the rows."
+    },
+    {
+      "name": "undecidable-row-reason-absent",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable"}]},
+      "admitted": false,
+      "reason": "undecidable_reason is REQUIRED on an undecidable row: without it the row is indistinguishable from a silently dropped criterion."
+    },
+    {
+      "name": "undecidable-row-reason-empty",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": ""}]},
+      "admitted": false,
+      "reason": "An empty reason carries no information."
+    },
+    {
+      "name": "undecidable-row-reason-whitespace-only",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": "   \t\n  "}]},
+      "admitted": false,
+      "reason": "THE NAMED TWIN-DIVERGENCE RISK: a whitespace-only reason is the shape one validator would admit and the other reject if either side compared against the empty string instead of trimming. A divergence here strands a completed acceptance stage while both suites stay green."
+    },
+    {
+      "name": "undecidable-reason-on-passed-row-non-empty",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed", "undecidable_reason": "why"}]},
+      "admitted": false,
+      "reason": "The field belongs ONLY on an undecidable row."
+    },
+    {
+      "name": "undecidable-reason-on-passed-row-empty",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed", "undecidable_reason": ""}]},
+      "admitted": false,
+      "reason": "BINDING CONDITION 1: rejected on PRESENCE, not on emptiness. A validator that decodes the field into a plain string cannot tell this row from the absent-field row and would silently admit it."
+    },
+    {
+      "name": "undecidable-reason-on-failed-row-empty",
+      "body": {"verdict": "failed", "failure_mode": "assertion_fail", "criteria": [{"id": "crit-1", "result": "failed", "undecidable_reason": ""}]},
+      "admitted": false,
+      "reason": "Same presence rule on a failed row."
+    },
+    {
+      "name": "undecidable-reason-on-skipped-row-non-empty",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "skipped", "undecidable_reason": "why"}]},
+      "admitted": false,
+      "reason": "Same presence rule on a skipped row. skipped and undecidable are distinct dispositions."
+    },
+    {
+      "name": "passed-row-reason-absent-accepted",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed"}, {"id": "crit-2", "result": "skipped"}]},
+      "admitted": true,
+      "reason": "The absent-field control that pairs with the two rejection rows above: absence is admitted, presence is not."
+    },
+    {
+      "name": "top-level-verdict-undecidable",
+      "body": {"verdict": "undecidable", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": "unknown"}]},
+      "admitted": false,
+      "reason": "undecidable is SERVER-DERIVED and unforgeable: the top-level wire enum stays passed|failed on BOTH validators, so a producer cannot ship it. Both twins reject."
+    },
+    {
+      "name": "undecidable-row-unknown-field",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": "unknown", "undecideable_reason": "typo"}]},
+      "admitted": false,
+      "reason": "DisallowUnknownFields does not descend into a json.RawMessage field, so the strict decode is re-applied per criteria element. A typo'd field name must fail closed rather than be silently dropped."
+    },
+    {
+      "name": "top-level-unknown-field",
+      "body": {"verdict": "passed", "undecidable_reason": "at the wrong level", "criteria": [{"id": "crit-1", "result": "passed"}]},
+      "admitted": false,
+      "reason": "The TOP-LEVEL strict decode, the sibling of the per-element one above. undecidable_reason is a per-criterion field; hoisted to the top level it is an unknown field and must fail closed on both twins. Without this row the corpus cannot detect a refactor that drops top-level DisallowUnknownFields on either side."
+    },
+    {
+      "name": "mixed-failed-and-undecidable",
+      "body": {"verdict": "failed", "failure_mode": "assertion_fail", "criteria": [{"id": "crit-1", "result": "failed"}, {"id": "crit-2", "result": "undecidable", "undecidable_reason": "no seam"}]},
+      "admitted": true,
+      "reason": "Both values coexist on one verdict. The server's precedence ladder puts failed strictly above undecidable."
+    },
+    {
+      "name": "all-undecidable",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": "no seam"}, {"id": "crit-2", "result": "undecidable", "undecidable_reason": "ambiguous evidence"}]},
+      "admitted": true,
+      "reason": "The nothing-was-verified arm: a valid wire body the server records as undecidable, never as a pass."
+    },
+    {
+      "name": "unknown-criterion-result",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "inconclusive"}]},
+      "admitted": false,
+      "reason": "The result enum is closed. undecidable did not open it to arbitrary values."
+    },
+    {
+      "name": "criteria-object-keyed-coercion",
+      "body": {"verdict": "passed", "criteria": {"crit-1": {"result": "passed"}, "crit-2": {"result": "undecidable", "undecidable_reason": "no seam"}}},
+      "admitted": true,
+      "reason": "The pre-existing #1574 object-keyed coercion, exercised WITH an undecidable row so the new field survives the coercion path on both sides."
+    },
+    {
+      "name": "criteria-object-keyed-bad-undecidable",
+      "body": {"verdict": "passed", "criteria": {"crit-1": {"result": "undecidable"}}},
+      "admitted": false,
+      "reason": "The reason requirement applies after coercion too -- the object-keyed path must not bypass it."
+    },
+    {
+      "name": "target-url-schemeless-coercion",
+      "body": {"verdict": "passed", "target_url": "localhost:8080", "criteria": [{"id": "crit-1", "result": "passed"}]},
+      "admitted": true,
+      "reason": "The pre-existing schemeless target_url coercion, pinned here so the corpus also covers the existing twin rules."
+    },
+    {
+      "name": "target-url-foreign-scheme",
+      "body": {"verdict": "passed", "target_url": "ftp://example.test"},
+      "admitted": false,
+      "reason": "A foreign scheme fails closed on both sides."
+    },
+    {
+      "name": "failed-missing-failure-mode",
+      "body": {"verdict": "failed", "criteria": [{"id": "crit-1", "result": "failed"}]},
+      "admitted": false,
+      "reason": "Pre-existing rule, kept in the corpus so a refactor of the per-criterion switch cannot quietly loosen the verdict switch beside it."
+    },
+    {
+      "name": "criterion-missing-id",
+      "body": {"verdict": "passed", "criteria": [{"result": "undecidable", "undecidable_reason": "no seam"}]},
+      "admitted": false,
+      "reason": "id is the plan-criterion join key and is required on every row, undecidable included."
+    }
+  ]
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -978,5 +979,259 @@ func TestAcceptanceSeam_ArbitrationInvalidatedByAcceptanceRerun(t *testing.T) {
 	}
 	if merger.called != 0 {
 		t.Errorf("merger called %d times, want 0 (a superseded arbitration must not admit a merge)", merger.called)
+	}
+}
+
+// --- #2512 / E48.78: the undecidable disposition, walked across the layers ---
+
+// outcomePayloadOf decodes the newest acceptance_outcome_recorded payload from
+// the seam's SHARED audit store. Reading the COMMITTED STATE (rather than the
+// HTTP status) is what makes these tests valid counterfactual vehicles: the ship
+// endpoint returns 201 whether or not a rewrite fired, so a status-code
+// assertion would pass with the control deleted.
+func outcomePayloadOf(t *testing.T, seam *exampleAcceptanceSeam) map[string]any {
+	t.Helper()
+	entries, err := seam.au.ListForRun(context.Background(), seam.runID)
+	if err != nil {
+		t.Fatalf("list audit entries: %v", err)
+	}
+	var newest json.RawMessage
+	for _, e := range entries {
+		if e.Category == CategoryAcceptanceOutcomeRecorded {
+			newest = e.Payload
+		}
+	}
+	if newest == nil {
+		t.Fatal("no acceptance_outcome_recorded entry on the chain")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(newest, &m); err != nil {
+		t.Fatalf("decode acceptance_outcome_recorded payload: %v", err)
+	}
+	return m
+}
+
+func undecidableRow(id, reason string) acceptanceCriterionResult {
+	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+}
+
+// TestAcceptanceSeam_AllUndecidableCrossesToMergeEligible is the #2512 DONE-MEANS
+// walked end to end over ONE shared store, crossing every layer this slice
+// touches — the #618 layer-crossing rule, because per-layer units pass while the
+// seam breaks:
+//
+//	ship an ALL-UNDECIDABLE verdict (top-level `passed`, every row undecidable)
+//	  -> acceptance_outcome_recorded carries verdict=undecidable, outcome=undecidable,
+//	     criteria_undecidable=2, verdict_reported=passed
+//	  -> acceptanceGateState resolves acceptance_undecidable
+//	  -> acceptanceGateAdmitsMerge admits it
+//	  -> NO acceptance_triage_decided is routed (an undecidable row is not a defect)
+//
+// This is the arm where NOTHING was verified — the case an operator most needs
+// described correctly, and the one a "verified some, could not evaluate others"
+// framing would misreport.
+func TestAcceptanceSeam_AllUndecidableCrossesToMergeEligible(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body, err := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: critRaw(
+			undecidableRow("ac-create", "the preview returns 201 for every payload, so the criterion's two outcomes are indistinguishable"),
+			undecidableRow("ac-list", "listing requires a seeded fixture the sandbox cannot create"),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, "")
+	if w.Code != 201 {
+		t.Fatalf("ship all-undecidable verdict status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) The recorded outcome.
+	got := outcomePayloadOf(t, seam)
+	if got["verdict"] != acceptanceVerdictUndecidable {
+		t.Errorf("recorded verdict = %v, want %q — an undecidable row must NEVER be recorded as a pass",
+			got["verdict"], acceptanceVerdictUndecidable)
+	}
+	if got["outcome"] != plan.AcceptanceOutcomeUndecidable {
+		t.Errorf("recorded outcome = %v, want %q", got["outcome"], plan.AcceptanceOutcomeUndecidable)
+	}
+	if got["criteria_undecidable"] != float64(2) {
+		t.Errorf("criteria_undecidable = %v, want 2", got["criteria_undecidable"])
+	}
+	if got["criteria_passed"] != float64(0) || got["criteria_total"] != float64(2) {
+		t.Errorf("raw tallies = passed %v of %v, want 0 of 2 (the agent's evidence, unrewritten)",
+			got["criteria_passed"], got["criteria_total"])
+	}
+	if got["verdict_reported"] != acceptanceVerdictPassed {
+		t.Errorf("verdict_reported = %v, want %q (what the agent shipped)", got["verdict_reported"], acceptanceVerdictPassed)
+	}
+	// A ladder-only difference must NOT fabricate a retirement basis.
+	if _, ok := got["downgrade_basis"]; ok {
+		t.Error("downgrade_basis present on a ladder-only difference; it belongs to the #2581 retirement path only")
+	}
+
+	// (b) + (c) The gate resolves the new state and the SHARED merge predicate
+	// admits it — one predicate, so all three merge consumers admit it at once.
+	if state := gateStateOf(t, seam.s, seam); state != acceptanceGateUndecidable {
+		t.Fatalf("acceptanceGateState = %q, want %q", state, acceptanceGateUndecidable)
+	}
+	if !acceptanceGateAdmitsMerge(acceptanceGateUndecidable) {
+		t.Error("acceptanceGateAdmitsMerge(acceptance_undecidable) = false, want true")
+	}
+
+	// (d) No triage: an undecidable row is not a triageable defect.
+	if n := countAppendedByCategory(seam.au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0 on an undecidable outcome", n)
+	}
+}
+
+// TestAcceptanceSeam_MixedFailedAndUndecidable_RecordsFailed asserts that a
+// single failed row keeps the run in triage exactly as today, with an
+// undecidable row beside it.
+//
+// HONEST SCOPE (observed, not reasoned): this test is NOT a counterfactual
+// vehicle for the ladder's failed arm. Deleting `case acceptanceResultFailed:
+// return acceptanceVerdictFailed` from aggregateAcceptanceResults leaves it
+// GREEN, because this body ships top-level `failed` and the severity-monotone
+// floor preserves that verdict whatever the ladder derives. The controls that
+// actually defend the failed arm are
+// TestAggregateAcceptanceResults/any-failed-outranks-undecidable (the unit) and
+// TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed (the seam, where
+// the shipped verdict does NOT already carry the floor). This test's value is
+// the gate-state assertion below — that an undecidable row cannot soften a
+// failed run out of triage.
+func TestAcceptanceSeam_MixedFailedAndUndecidable_RecordsFailed(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body, err := json.Marshal(acceptanceBody{
+		Verdict:     "failed",
+		FailureMode: "assertion_fail",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "failed", Observed: "500 returned"},
+			undecidableRow("ac-list", "could not seed the fixture"),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, ""); w.Code != 201 {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got := outcomePayloadOf(t, seam)
+	if got["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed (failed outranks undecidable)", got["verdict"])
+	}
+	if state := gateStateOf(t, seam.s, seam); state != acceptanceGateTriage {
+		t.Errorf("acceptanceGateState = %q, want %q — a real defect stays in triage", state, acceptanceGateTriage)
+	}
+}
+
+// TestAcceptanceSeam_ShippedFailed_AllUndecidableRows_StaysFailed pins the
+// SEVERITY-MONOTONE floor: the derived verdict is a lower bound, never a
+// replacement. A shipped `failed` whose rows are all undecidable stays failed —
+// the recorded verdict is never softened below what either source claims.
+//
+// Counterfactual: delete acceptanceVerdictAtLeast's max() so the derived verdict
+// simply overwrites, and this test goes RED (recorded becomes undecidable).
+func TestAcceptanceSeam_ShippedFailed_AllUndecidableRows_StaysFailed(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body, err := json.Marshal(acceptanceBody{
+		Verdict:     "failed",
+		FailureMode: "error",
+		Criteria: critRaw(
+			undecidableRow("ac-create", "the target crashed before the assertion could run"),
+			undecidableRow("ac-list", "the target crashed before the assertion could run"),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, ""); w.Code != 201 {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got := outcomePayloadOf(t, seam)
+	if got["verdict"] != acceptanceVerdictFailed {
+		t.Fatalf("recorded verdict = %v, want failed — a derived undecidable must NOT soften a shipped failed verdict",
+			got["verdict"])
+	}
+	if _, ok := got["verdict_reported"]; ok {
+		t.Error("verdict_reported present although the recorded verdict equals the shipped one")
+	}
+}
+
+// TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed pins BINDING
+// CONDITION 3 explicitly. This is a PRE-EXISTING wire shape carrying no
+// undecidable data whose classification CHANGES: an already-valid body shipping
+// top-level `passed` with a failed criterion row recorded `passed` before #2512
+// and records `failed` now, because the ladder is severity-monotone over ALL
+// rows and not gated on the presence of undecidable evidence.
+//
+// The change is deliberate and is stated plainly in the PR's compatibility note
+// rather than papered over: recording a pass over a row the agent itself
+// reported failed was the dishonest direction.
+func TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body, err := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "failed", Observed: "empty list"},
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, ""); w.Code != 201 {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got := outcomePayloadOf(t, seam)
+	if got["verdict"] != acceptanceVerdictFailed {
+		t.Errorf("recorded verdict = %v, want failed (the ladder's top arm over a self-contradictory body)", got["verdict"])
+	}
+	if got["verdict_reported"] != acceptanceVerdictPassed {
+		t.Errorf("verdict_reported = %v, want passed — the agent's own claim stays on the chain", got["verdict_reported"])
+	}
+	if state := gateStateOf(t, seam.s, seam); state != acceptanceGateTriage {
+		t.Errorf("acceptanceGateState = %q, want %q", state, acceptanceGateTriage)
+	}
+	// Triage stays keyed on the AGENT's failed claim, which this body does not
+	// make: the run routes to operator arbitration rather than through a
+	// deterministic classifier fed an empty failure_mode.
+	if n := countAppendedByCategory(seam.au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0 (no agent-reported failure_mode to classify)", n)
+	}
+}
+
+// TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged pins the
+// caller-side len(rows) > 0 GUARD that makes aggregateAcceptanceResults' total
+// empty-set `passed` answer safe. A failed verdict with NO itemized rows must
+// record failed: if the guard were dropped, the empty-set answer would soften it
+// to a pass — exactly the hazard #2512 exists to remove.
+func TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body, err := json.Marshal(acceptanceBody{Verdict: "failed", FailureMode: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, ""); w.Code != 201 {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got := outcomePayloadOf(t, seam)
+	if got["verdict"] != acceptanceVerdictFailed {
+		t.Fatalf("recorded verdict = %v, want failed — an EMPTY row set must never soften the shipped verdict",
+			got["verdict"])
+	}
+	if got["criteria_undecidable"] != float64(0) || got["criteria_total"] != float64(0) {
+		t.Errorf("tallies = %v undecidable of %v, want 0 of 0", got["criteria_undecidable"], got["criteria_total"])
 	}
 }

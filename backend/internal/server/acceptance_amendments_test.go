@@ -610,3 +610,191 @@ func TestAmendCriteria_OversizedText_Capped(t *testing.T) {
 		t.Errorf("recorded reason is not the capped form: ...%q", reason[max(0, len(reason)-40):])
 	}
 }
+
+// --- #2512: the D4 arm's undecidable extension, and the ordering it depends on ---
+
+// undecidableResult builds an undecidable per-criterion row. The reason is a
+// pointer because the wire rule is decided on field PRESENCE, not emptiness.
+func undecidableResult(id, reason string) acceptanceCriterionResult {
+	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+}
+
+// TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded is the #2512
+// extension of D4, and the coupling the earlier design predates: a SURVIVING
+// BLOCKING criterion the validator could not DECIDE was never evaluated, so it
+// must not ride out on someone else's retirement downgrade. Without it, a
+// retirement plus an unevaluated blocking criterion silently produces `passed` —
+// a green light over unevaluated evidence.
+//
+// COMMITTED-STATE control (rule 3): both the guarded and unguarded paths return
+// HTTP 201, so assertNoDowngrade READS the acceptance_outcome_recorded entry
+// after the POST returns and asserts verdict==failed with no downgrade keys. A
+// status-code assertion would pass either way. The bad state is seeded BY
+// CONSTRUCTION (crit-2 retired by a real approve call in seedRetirementFixture;
+// crit-1's undecidable row written literally), so the RED lands on the
+// behavioral assertion and never on fixture setup.
+//
+// Counterfactual: delete acceptanceResultUndecidable from acceptanceDowngrade's
+// D4 arm and this test goes RED (the verdict is recorded passed).
+func TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded(t *testing.T) {
+	assertNoDowngrade(t, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		undecidableResult("crit-1", "the preview returns the same body for both branches, so the criterion cannot be decided"),
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+	))
+}
+
+// TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun pins the
+// load-bearing ORDER at the ingest seam: the #2581 downgrade runs FIRST over the
+// retired-id set, and the #2512 ladder then runs over the NON-RETIRED rows only.
+// If the ladder ran over ALL rows, a retired criterion's undecidable row would
+// pin the run to undecidable forever and the operator's retirement would have no
+// effect at all.
+//
+// Fixture: crit-2 is RETIRED and reported undecidable; every surviving row
+// passed. The derived verdict over the surviving partition is `passed`, so the
+// recorded verdict is `passed`. Delete the retired-row exclusion and the run
+// records `undecidable` instead — RED.
+func TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+		undecidableResult("crit-2", "the retired criterion's target no longer exists"),
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed — a RETIRED criterion's undecidable row must not pin the run",
+			payload["verdict"])
+	}
+	// The raw tally still reports the agent's evidence unrewritten.
+	if payload["criteria_undecidable"] != float64(1) {
+		t.Errorf("criteria_undecidable = %v, want 1 (the agent's evidence is never rewritten)",
+			payload["criteria_undecidable"])
+	}
+}
+
+// TestDowngrade_ShippedPassed_D1GuardLivesInTheFunction pins that
+// acceptanceDowngrade's D1 verdict==failed precondition is enforced INSIDE the
+// function, not by its call site.
+//
+// #2512 made the downgrade block in handleShipAcceptance UNCONDITIONAL — the
+// retired-id set is now resolved for EVERY shipped verdict, because the
+// precedence ladder needs it regardless of what the agent shipped. Before that,
+// `acc.Verdict == failed` was also the call-site gate. If D1 had relied on that
+// gate, a shipped `passed` verdict whose failed rows all name retired criteria
+// would now set downgradedVerdict, emit the "failed verdict neutralized" log
+// line, and attach downgrade_basis + retired_criterion_ids to the payload of a
+// PASSED outcome — a misleading log and spurious audit-payload keys on the
+// governance chain.
+//
+// Layer 1 calls acceptanceDowngrade DIRECTLY with a shipped `passed` body whose
+// only failed row is the retired criterion — the shape that satisfies D2/D3/D4
+// and is therefore rejected by D1 ALONE. Layer 2 pins the observable
+// consequence at the ingest seam: the recorded verdict is `passed` either way
+// (the non-retired rows all pass, so the ladder derives `passed`), which is
+// exactly why the discriminating assertion is the ABSENCE of the two
+// downgrade-specific payload keys rather than the verdict itself.
+//
+// OBSERVED counterfactual (run, not reasoned). Deleting ONLY
+// `acc.Verdict != acceptanceVerdictFailed ||` from D1 reddens layer 1 and leaves
+// layer 2 GREEN. That is a finding worth stating plainly rather than papering
+// over: at the INGEST seam the verdict half of D1 is REDUNDANT for this body,
+// because the wire validator forbids failure_mode on a passed verdict, so
+// acc.FailureMode is always "" there and D1's OTHER half refuses the downgrade
+// on its own. Layer 2 does go RED when BOTH halves of D1 are removed (verified:
+// downgrade_basis + retired_criterion_ids appear on a passed outcome).
+//
+// So the two layers defend different things and both are kept: layer 1 is the
+// only vehicle that isolates the verdict half of D1 — the half the now-removed
+// call-site gate used to duplicate, which is what this concern is about — and
+// layer 2 pins the observable end-to-end property (a shipped PASSED verdict
+// never acquires downgrade provenance on the governance chain) against D1 being
+// weakened in any way at all.
+func TestDowngrade_ShippedPassed_D1GuardLivesInTheFunction(t *testing.T) {
+	// Layer 1 — the pure function. D2 (every failed row retired), D3 (crit-1 and
+	// crit-3 survive) and D4 (no surviving skipped/undecidable row) all HOLD, so
+	// D1's verdict check is the only thing that can refuse the downgrade.
+	acc := acceptanceBody{Verdict: acceptanceVerdictPassed, FailureMode: acceptanceFailureAssertionFail}
+	acc.normalizedCriteria = []acceptanceCriterionResult{
+		{ID: "crit-1", Result: acceptanceResultPassed},
+		{ID: "crit-2", Result: acceptanceResultFailed},
+		{ID: "crit-3", Result: acceptanceResultPassed},
+	}
+	eff := effectiveAcceptanceCriteria{
+		Live:    []plan.AcceptanceCriterion{{ID: "crit-1"}, {ID: "crit-3"}},
+		Retired: []retiredCriterion{{ID: "crit-2", Reason: "superseded", Source: "approval"}},
+		AllIDs:  []string{"crit-1", "crit-2", "crit-3"},
+	}
+	// Errorf, not Fatalf: layer 2 below is defended by D1's OTHER half, so it
+	// must still run and report independently when this one trips.
+	if down, ids, basis := acceptanceDowngrade(acc, eff); down {
+		t.Errorf("acceptanceDowngrade downgraded a shipped PASSED verdict (ids=%v basis=%q) — D1's verdict half is relying on the removed call-site gate", ids, basis)
+	}
+	// Discriminator: the SAME fixture with the shipped verdict flipped to failed
+	// DOES downgrade, so layer 1 above is refused by D1 and not by an unrelated
+	// precondition silently failing.
+	acc.Verdict = acceptanceVerdictFailed
+	if down, _, _ := acceptanceDowngrade(acc, eff); !down {
+		t.Fatal("the failed-verdict twin did NOT downgrade — the fixture does not isolate D1")
+	}
+
+	// Layer 2 — the ingest seam. The downgrade block runs unconditionally now, so
+	// a shipped passed verdict must still record NO downgrade provenance. Note
+	// (see the counterfactual above) that this layer is held by D1's
+	// failure_mode half, not its verdict half: a passed verdict carries no
+	// failure_mode by wire rule.
+	runID, stageID := uuid.New(), uuid.New()
+	srv, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+		acceptanceCriterionResult{ID: "crit-3", Result: "passed"},
+	)
+	if w := shipAcceptanceRequest(t, srv, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictPassed {
+		t.Errorf("recorded verdict = %v, want passed (crit-2 is retired, so the ladder sees only passing rows)", payload["verdict"])
+	}
+	for _, key := range []string{"downgrade_basis", "retired_criterion_ids", "verdict_reported"} {
+		if _, present := payload[key]; present {
+			t.Errorf("payload carries %q on a shipped PASSED verdict: %v", key, payload)
+		}
+	}
+}
+
+// TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable is the
+// paired positive for the ordering above: when NO retirement is in play, a
+// surviving undecidable row DOES reach the ladder and records undecidable. It
+// discriminates the exclusion from a blanket "ignore undecidable rows".
+func TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		undecidableResult("crit-3", "the assertion needs an instrument the sandbox lacks"),
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != acceptanceVerdictUndecidable {
+		t.Errorf("recorded verdict = %v, want undecidable (a SURVIVING undecidable row reaches the ladder)",
+			payload["verdict"])
+	}
+}

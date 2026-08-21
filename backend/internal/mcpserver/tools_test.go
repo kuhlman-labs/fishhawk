@@ -12957,3 +12957,100 @@ func TestApprovePlan_NoMoveScopeFilesToSlice_OmitsFieldOnTheWire(t *testing.T) {
 		t.Errorf("move_scope_files_to_slice = %v, want nil when no move declared", fb.approvalsBody.MoveScopeFilesToSlice)
 	}
 }
+
+// TestApprovePlan_ReasonLint_WarnsOnTheResultAndStillApproves is the LAYER 1
+// (#2512) wiring pin. reason_lint_test.go proves the lint's vocabulary and its
+// never-refuses property in isolation; this proves it is actually CALLED — a
+// lint that is written, tested, and never invoked passes every unit test and
+// does nothing, which is the failure mode the plan's counterfactual (h) names.
+//
+// Both halves are asserted in ONE call, because the whole design is that they
+// happen together:
+//
+//	(a) the warning surfaces on the tool result, and
+//	(b) the approval STILL SUBMITS, with the reason byte-unmodified on the wire.
+//
+// (b) is the half that keeps this a warning rather than a gate. If the lint
+// ever gained a refusal path, fb.approvalsBody.Comment would not match and this
+// test would fail — so the never-refuses property is pinned at the seam where
+// it could actually be violated, not only in the pure function.
+func TestApprovePlan_ReasonLint_WarnsOnTheResultAndStillApproves(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	const reason = "approved, but retire criterion AC-4 — it needs a live MCP client"
+	res, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: reason,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan returned an error — the lint must WARN, never refuse: %v", err)
+	}
+
+	// (b) the approval submitted, with the reason byte-unmodified.
+	if fb.approvalsCalledByID[stageID] != 1 {
+		t.Fatalf("approvals call count = %d, want 1 — the lint must not block the submission", fb.approvalsCalledByID[stageID])
+	}
+	if fb.approvalsBody.Decision != "approve" {
+		t.Errorf("decision = %q, want approve", fb.approvalsBody.Decision)
+	}
+	if fb.approvalsBody.Comment != reason {
+		t.Errorf("comment = %q, want the reason byte-unmodified %q — the lint must not rewrite the operator's words",
+			fb.approvalsBody.Comment, reason)
+	}
+	if out.Stage.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded", out.Stage.State)
+	}
+
+	// (a) the warning reached the tool result.
+	if res == nil {
+		t.Fatal("tool result is nil — the approve-reason lint warning never reached the operator (#2512)")
+	}
+	var texts []string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			texts = append(texts, tc.Text)
+		}
+	}
+	joined := strings.Join(texts, "\n")
+	if !strings.Contains(joined, "approve-reason lint (#2512)") {
+		t.Fatalf("tool result carries no approve-reason lint warning:\n%s", joined)
+	}
+	if !strings.Contains(joined, "amend_acceptance_criteria") {
+		t.Errorf("lint warning on the result does not name amend_acceptance_criteria:\n%s", joined)
+	}
+}
+
+// TestApprovePlan_ReasonLint_SilentOnOrdinaryReason is the negative control for
+// the test above. Without it, a lint that fired on EVERY reason would satisfy
+// the warning assertion and nobody would notice until operators started
+// ignoring the channel. An ordinary approval reason must leave the tool result
+// exactly as it is today — here, nil, since no other warning applies.
+func TestApprovePlan_ReasonLint_SilentOnOrdinaryReason(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	res, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "approved; keep the change under 200 lines and add a table test",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.Decision != "approve" {
+		t.Errorf("decision = %q, want approve", fb.approvalsBody.Decision)
+	}
+	if res != nil {
+		for _, c := range res.Content {
+			if tc, ok := c.(*mcp.TextContent); ok && strings.Contains(tc.Text, "approve-reason lint") {
+				t.Errorf("lint fired on an ordinary approval reason — a lint that fires on everything is a lint that gets ignored:\n%s", tc.Text)
+			}
+		}
+	}
+}

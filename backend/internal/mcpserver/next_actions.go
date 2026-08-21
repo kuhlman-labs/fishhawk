@@ -373,6 +373,17 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 				return &NextActions{State: "succeeded_acceptance_not_validated", Actions: mergeRitualActions(run,
 					"the run succeeded with its PR open; the acceptance stage verified ZERO acceptance criteria (short-circuited with no runner and no preview, #2347) — merge-eligible, but NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
 			}
+			// #2512: the terminal-run twin of the acceptance_undecidable arm. The
+			// stage RAN and reported at least one criterion it could not DECIDE,
+			// with nothing failing. Merge-eligible on the same merge ritual, and
+			// the state label + reason are what keep a terminal-run read from
+			// reporting a validated pass over an unevaluated criterion. Same
+			// degradation: a verdict aged out of the recent-audit window leaves the
+			// flag empty and falls back to plain succeeded_pr_open.
+			if acceptanceVerdict == acceptanceVerdictUndecidable {
+				return &NextActions{State: "succeeded_acceptance_undecidable", Actions: mergeRitualActions(run,
+					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided")}
+			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
 		return &NextActions{State: run.State}
@@ -1174,6 +1185,12 @@ func dispatchOrPollActions(run *Run, stageType string, stage *Stage) []Suggested
 // wins over the flag; a marker aged out of the window (flag false) degrades to
 // the read-first outcome-unknown arm (fail toward read, never toward merge).
 //
+// The verdict switch has four arms, and the two non-pass, non-fail ones are
+// mutually exclusive BY CONSTRUCTION rather than by convention: not_validated
+// (#2347) is settled PRE-SPAWN from the plan, so no criteria rows can exist,
+// while undecidable (#2512) is derived POST-RUN from rows the agent actually
+// reported. Both are merge-eligible and neither is a pass.
+//
 // arbitrated is the E66.37 / #2474 flag: an operator recorded an
 // acceptance_triage_arbitrated discharge BOUND by outcome_sequence to the newest
 // recorded verdict, so the server gate reads acceptance_arbitrated and the merge
@@ -1255,6 +1272,29 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		// merge verdict) so a refactor cannot silently drop them.
 		return &NextActions{State: "acceptance_not_validated", Actions: mergeRitualActions(run,
 			"the acceptance stage verified ZERO acceptance criteria — it was short-circuited with no runner and no preview because every criterion was skip-expected with a basis, or the plan declared none (#2347). The run is merge-eligible, but this is NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
+	case acceptanceVerdictUndecidable:
+		// #2512: the acceptance stage RAN — a runner spawned, the preview came up,
+		// the agent drove it — and reported per-criterion rows of which at least
+		// one it could not DECIDE, with no row failing. The backend's precedence
+		// ladder derives this verdict from the rows; a producer cannot ship it.
+		//
+		// This is the OTHER half of the partition from not_validated above, and
+		// the two are mutually exclusive by construction: not_validated is settled
+		// PRE-SPAWN from the plan and can carry no criteria rows at all, while
+		// undecidable is decided POST-RUN from the agent's own evidence. It is
+		// also deliberately not the failed arm: an undecidable row is not a
+		// defect, so there is nothing to fix up, retry, or arbitrate — which is
+		// exactly the #2474 wedge-surface reduction #2512 delivers. Before it, a
+		// validator that could not decide a criterion had to ship `failed`, page a
+		// human, and wait for an arbitration.
+		//
+		// The acknowledgement ask is a PROMPT, not a gate, for the same reason it
+		// is on the not_validated arm: text-matching operator prose to decide
+		// whether a merge may proceed would strand runs over wording. This reason
+		// text is the only mechanism carrying the ask, so next_actions_test.go
+		// pins its load-bearing claims.
+		return &NextActions{State: "acceptance_undecidable", Actions: mergeRitualActions(run,
+			"the acceptance stage RAN but could not DECIDE one or more acceptance criteria (#2512) — read the undecidable_reason on each row in the acceptance artifact. No criterion FAILED, so this is not a triage and there is nothing to arbitrate; the run is merge-eligible. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided and why you are merging anyway")}
 	case acceptanceVerdictFailed:
 		// E66.37 / #2474: an operator arbitration bound to THIS verdict discharges
 		// the paged triage, so the server gate reads acceptance_arbitrated and the
@@ -1270,12 +1310,33 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		if isAcceptancePagedDisposition(disposition) {
 			return &NextActions{State: "acceptance_triage_paged", Actions: acceptanceTriagePagedActions(run)}
 		}
-		// fixup_dispatched / retry_dispatched (or a triage decision not yet
-		// recorded): the deterministic server-side triage (E31.8) re-opens the
-		// implement stage (class 1) or the acceptance stage (class 2), so on the
-		// NEXT snapshot the existing implement_pending / acceptance_pending
-		// stage-state arms serve the move — nothing to duplicate here. Poll
-		// until the re-opened stage surfaces.
+		if disposition == "" {
+			// #2512: a recorded `failed` verdict carrying NO triage disposition.
+			// The severity-monotone ladder made this state REACHABLE BY DESIGN: a
+			// body the agent shipped as `passed` that carries a `failed` criterion
+			// row records `failed` and gates the merge at acceptanceGateTriage, but
+			// handleShipAcceptance deliberately keys triage on the agent's OWN
+			// failed claim (`acc.Verdict == failed && downgradedVerdict == ""`), so
+			// no classifier runs and no acceptance_triage_decided entry is written
+			// — there is no failure_mode for the deterministic classifier to read.
+			// The server-side comment names operator arbitration as the intended
+			// route, so this arm must surface it: routing here to the rerouting
+			// POLL below would tell the operator to wait for a re-opened stage that
+			// will never appear, leaving the merge gate undischargeable.
+			//
+			// It also subsumes the pre-existing TRANSIENT reading of an empty
+			// disposition (triage decided but its audit entry has not landed in, or
+			// has aged out of, the recent window): the arm leads with the
+			// acceptance_triage_decided audit read, which answers both cases, and
+			// keeps a poll as the last action for the genuinely-transient one.
+			return &NextActions{State: "acceptance_triage_no_disposition",
+				Actions: acceptanceTriageNoDispositionActions(run, acceptance)}
+		}
+		// fixup_dispatched / retry_dispatched: the deterministic server-side
+		// triage (E31.8) re-opens the implement stage (class 1) or the acceptance
+		// stage (class 2), so on the NEXT snapshot the existing implement_pending
+		// / acceptance_pending stage-state arms serve the move — nothing to
+		// duplicate here. Poll until the re-opened stage surfaces.
 		return &NextActions{
 			State: "acceptance_triage_rerouting",
 			Actions: []SuggestedAction{pollAction(run,
@@ -1364,6 +1425,25 @@ func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 			Reason:       "cancel the run — the acceptance failure is neither fixable in-loop nor acceptable",
 		},
 	}
+}
+
+// acceptanceTriageNoDispositionActions is the arm for a recorded `failed`
+// acceptance verdict that carries NO triage disposition (#2512). It reuses the
+// paged arbitration menu — which is the intended route per handleShipAcceptance
+// — with the leading audit-read action's precondition/reason rewritten to
+// describe the no-disposition case honestly, and a poll appended for the
+// transient reading (a disposition that simply has not landed in, or has aged
+// out of, the recent-audit window). The arbitration action is preserved
+// verbatim: it is the operator's only way to discharge acceptanceGateTriage for
+// this outcome, and dropping it would strand the merge.
+func acceptanceTriageNoDispositionActions(run *Run, acceptance *Stage) []SuggestedAction {
+	actions := acceptanceTriagePagedActions(run)
+	if len(actions) > 0 && actions[0].Action == "fishhawk_list_audit" {
+		actions[0].Precondition = "a failed acceptance verdict is recorded but NO acceptance_triage_decided disposition is visible: either the deterministic triage never ran (the agent shipped `passed` and a criterion row carried `failed`, so the severity ladder recorded `failed` with no failure_mode to classify — #2512), or its entry has not landed in / has aged out of the recent-audit window"
+		actions[0].Reason = "read the acceptance_outcome_recorded criteria results and confirm whether ANY acceptance_triage_decided entry exists for this outcome before acting — no disposition means no auto-route is coming, and the merge gate stays at acceptance_triage until an operator arbitration discharges it"
+	}
+	return append(actions, pollAction(run, derivedStageWaitPollInterval(run, acceptance),
+		"re-poll with a larger audit_limit in case a triage disposition was decided and merely aged out of the recent-audit window — if none ever appears, arbitrate"))
 }
 
 // mergeRitualActions is the ordered operator merge ritual for a run whose
@@ -1699,6 +1779,15 @@ const (
 	// match backend/internal/plan.AcceptanceVerdictNotValidated (mirrored, not
 	// imported — the #875 compile trap) and is pinned by the literal-table test.
 	acceptanceVerdictNotValidated = "not_validated"
+	// acceptanceVerdictUndecidable is the SERVER-DERIVED fourth verdict (#2512):
+	// the acceptance stage RAN, drove the preview, and reported per-criterion
+	// rows of which at least one could not be DECIDED, with no row failing. Like
+	// not_validated it never arrives over the wire — the ship endpoint still
+	// admits passed/failed only, and the backend's precedence ladder derives this
+	// from the rows — so a producer cannot forge it. MUST match
+	// backend/internal/plan.AcceptanceVerdictUndecidable (mirrored, not imported
+	// — the #875 compile trap) and is pinned by the literal-table test.
+	acceptanceVerdictUndecidable = "undecidable"
 
 	// Auto-routed dispositions (a state transition fired): NOT paged.
 	acceptanceDispositionFixupDispatched = "fixup_dispatched"
