@@ -48,6 +48,17 @@ type API interface {
 	// from. Signature matches *githubclient.Client.GetIssue, so the production
 	// client satisfies it directly.
 	GetIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*githubclient.Issue, error)
+	// ListRepoIssues enumerates the repository's issues via the paginated
+	// GraphQL repository.issues connection — the enumeration primitive the
+	// optional workmgmt.WorkItemReader capability lists through (#2230), never a
+	// ProjectV2 board item list (which caps and truncates silently). Signature
+	// matches *githubclient.Client.ListRepoIssues, so the production client
+	// satisfies it directly.
+	//
+	// The read capability also calls GetIssue (single-item read), IssueNodeID +
+	// ProjectItemStatus (per-item board state) and ProjectFields (project node
+	// id) — all already members above, which is why this is the only addition.
+	ListRepoIssues(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, opts githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error)
 	ProjectsTokenConfigured() bool
 }
 
@@ -57,13 +68,22 @@ type Provider struct {
 }
 
 // Compile-time capability assertions: the GitHub provider implements the
-// optional board-transition, number-discovery, and epic-children capability
-// interfaces in addition to the base Provider.
+// optional board-transition, number-discovery, epic-children, issue-set
+// dependency and work-item read capability interfaces in addition to the base
+// Provider.
+//
+// WorkItemReader (#2230 / ADR-064) reserves the board-as-input seam: it is
+// implemented here (reader.go) but has NO production consumer — no HTTP route,
+// MCP tool, CLI verb, env var or config field resolves a reader — and the
+// ratified invariant that no board-read path is exposed through the MCP agent
+// tool surface is enforced by
+// backend/internal/mcpserver/board_read_guard_test.go.
 var (
 	_ workmgmt.Transitioner               = (*Provider)(nil)
 	_ workmgmt.NumberDiscoverer           = (*Provider)(nil)
 	_ workmgmt.EpicChildrenQuerier        = (*Provider)(nil)
 	_ workmgmt.IssueSetDependencyResolver = (*Provider)(nil)
+	_ workmgmt.WorkItemReader             = (*Provider)(nil)
 )
 
 // New returns a Provider backed by api (in production *githubclient.Client).

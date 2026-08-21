@@ -846,3 +846,272 @@ func (c *Client) doGraphQL(ctx context.Context, installationID int64, query stri
 	}
 	return nil
 }
+
+// RepoIssue is one issue from the repository-issue enumeration (#2230): the
+// fields the work-management read capability maps into a
+// workmgmt.WorkItemRecord. State/StateReason carry the GraphQL IssueState /
+// IssueStateReason enums verbatim (UPPERCASE: OPEN|CLOSED, and
+// COMPLETED|REOPENED|NOT_PLANNED|DUPLICATE), matching SubIssue and unlike the
+// REST GetIssue payload's lowercase strings. Labels is nil for a labelless
+// issue.
+//
+// OnBoard/BoardStatus are populated only when ListRepoIssuesOptions requested
+// board status AND a ProjectID was supplied; otherwise OnBoard is false and
+// BoardStatus empty because the board was never read — the caller
+// (workmgmt) is what distinguishes "not asked" from "asked and off-board",
+// via WorkItemPage.BoardStateResolved.
+type RepoIssue struct {
+	Number      int
+	Title       string
+	URL         string
+	Body        string
+	State       string
+	StateReason string
+	Labels      []string
+	OnBoard     bool
+	BoardStatus string
+}
+
+// ListRepoIssuesOptions are the server-side filters and the board-status
+// opt-in for ListRepoIssues. Labels filters to issues carrying EVERY named
+// label (GitHub AND-s the `labels:` argument); empty means unfiltered. States
+// filters by IssueState enum ("OPEN"/"CLOSED"); empty means both. ProjectID is
+// the project NODE id (from ProjectFields) whose item the per-issue board
+// status is read from; WantBoardStatus opts the per-issue projectItems
+// selection into the query at all, so a caller that does not need board status
+// pays neither the extra selection nor its permission surface.
+type ListRepoIssuesOptions struct {
+	Labels          []string
+	States          []string
+	ProjectID       string
+	WantBoardStatus bool
+}
+
+// listRepoIssuesFirst is the repository-issues connection page size (#2230),
+// mirroring listSubIssuesFirst. 100 is GitHub's per-page maximum.
+const listRepoIssuesFirst = 100
+
+// listRepoIssuesMaxPages bounds the pagination loop so a connection that never
+// reports hasNextPage:false cannot spin. 100 pages * first:100 = 10 000 issues;
+// reaching the cap with more pages remaining is a fail-closed error (naming the
+// repo + accumulated count), never a silently-partial slice.
+const listRepoIssuesMaxPages = 100
+
+// listRepoIssuesProjectItemsFirst caps the per-issue projectItems connection.
+// Unlike the labels connection (100 is GitHub's documented per-issue maximum,
+// so one page is complete by construction) there is NO documented bound on how
+// many projects one issue can sit on — so this page CAN truncate, and a
+// truncated page that omits the target project would report OnBoard=false for
+// an issue that IS on the board: a silent wrong answer of exactly the class
+// this enumeration exists to eliminate. ListRepoIssues therefore FAILS CLOSED
+// on that ambiguity (see the FULL-page check in the decode loop) rather than
+// paginating a nested connection per issue, which would cost one extra round
+// trip per issue on every page.
+const listRepoIssuesProjectItemsFirst = 20
+
+// ListRepoIssues enumerates a repository's ISSUES via the GraphQL
+// repository.issues connection — never a ProjectV2 board item list (#2230).
+// That choice is load-bearing, not stylistic: a board item list is capped and
+// truncates silently (the AGENTS.md Project #7 pagination trap), and the
+// search REST API caps a result set at 1000 items (searchByTitleMaxPages).
+// This connection paginates to completion.
+//
+//	query repository(owner,name) { issues(first:100, after:$after, states:, labels:, orderBy:{field:NUMBER,direction:ASC}) { pageInfo{hasNextPage endCursor} nodes{ … } } }
+//
+// It follows pageInfo.endCursor while hasNextPage is true, so a repo whose
+// backlog exceeds 100 issues yields its COMPLETE set. The loop is bounded by
+// listRepoIssuesMaxPages: reaching the cap with more pages remaining is a
+// fail-closed error naming the repo and the accumulated count — the caller
+// gets the complete set or a hard error, never a partial slice it could
+// mistake for complete. A nil `repository` is a fail-closed error (the repo is
+// not visible), not an empty set.
+//
+// When opts.WantBoardStatus and opts.ProjectID are both set, each node also
+// selects its projectItems and the item whose project node id equals
+// ProjectID supplies BoardStatus — the same unambiguous match ProjectItemStatus
+// makes. If that nested page comes back FULL and the target project is not
+// among its nodes, the answer is ambiguous (the item may exist beyond the
+// page) and ListRepoIssues fails closed rather than reporting OnBoard=false.
+//
+// Honors the user-owned-projects token opt-in (WithProjectsToken) like the
+// other GraphQL calls, since it routes through doGraphQL. Returns ErrForbidden
+// on auth issues, ErrValidation when GraphQL reports an application error.
+func (c *Client) ListRepoIssues(ctx context.Context, scope forge.CredentialScope, repo RepoRef, opts ListRepoIssuesOptions) ([]RepoIssue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	wantBoard := opts.WantBoardStatus && opts.ProjectID != ""
+	query := listRepoIssuesQuery(wantBoard)
+
+	vars := map[string]any{
+		"owner":       repo.Owner,
+		"name":        repo.Name,
+		"first":       listRepoIssuesFirst,
+		"labelsFirst": listSubIssuesLabelsFirst,
+		// A nil variable is GraphQL null, which both `states:` and `labels:`
+		// treat as "no filter" — so an unfiltered call needs no separate query.
+		"states": nilIfEmpty(opts.States),
+		"labels": nilIfEmpty(opts.Labels),
+	}
+	if wantBoard {
+		vars["projectItemsFirst"] = listRepoIssuesProjectItemsFirst
+		vars["field"] = statusFieldNameGraphQL
+	}
+
+	var results []RepoIssue
+	var after *string
+	for page := 1; ; page++ {
+		vars["after"] = after
+		var data struct {
+			Repository *struct {
+				Issues struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						Number      int    `json:"number"`
+						Title       string `json:"title"`
+						URL         string `json:"url"`
+						Body        string `json:"body"`
+						State       string `json:"state"`
+						StateReason string `json:"stateReason"`
+						Labels      struct {
+							Nodes []struct {
+								Name string `json:"name"`
+							} `json:"nodes"`
+						} `json:"labels"`
+						ProjectItems struct {
+							Nodes []struct {
+								Project struct {
+									ID string `json:"id"`
+								} `json:"project"`
+								FieldValueByName *struct {
+									Name string `json:"name"`
+								} `json:"fieldValueByName"`
+							} `json:"nodes"`
+						} `json:"projectItems"`
+					} `json:"nodes"`
+				} `json:"issues"`
+			} `json:"repository"`
+		}
+		if err := c.doGraphQL(ctx, installationID, query, vars, &data); err != nil {
+			return nil, err
+		}
+		if data.Repository == nil {
+			return nil, fmt.Errorf("githubclient: list issues for %s/%s: repository returned a nil node on page %d after %d issues", repo.Owner, repo.Name, page, len(results))
+		}
+		for _, n := range data.Repository.Issues.Nodes {
+			var labels []string
+			for _, l := range n.Labels.Nodes {
+				if l.Name != "" {
+					labels = append(labels, l.Name)
+				}
+			}
+			issue := RepoIssue{
+				Number:      n.Number,
+				Title:       n.Title,
+				URL:         n.URL,
+				Body:        n.Body,
+				State:       n.State,
+				StateReason: n.StateReason,
+				Labels:      labels,
+			}
+			if wantBoard {
+				found := false
+				for _, it := range n.ProjectItems.Nodes {
+					if it.Project.ID != opts.ProjectID {
+						continue
+					}
+					found = true
+					issue.OnBoard = true
+					if it.FieldValueByName != nil {
+						issue.BoardStatus = it.FieldValueByName.Name
+					}
+					break
+				}
+				// FAIL CLOSED on a truncated nested page (#2230 condition C3): a
+				// FULL projectItems page that does not carry the target project is
+				// ambiguous — the item may sit beyond the page — and reporting
+				// OnBoard=false would be a silent wrong answer for an issue that IS
+				// on the board. Refuse instead, naming the issue and the cap.
+				if !found && len(n.ProjectItems.Nodes) >= listRepoIssuesProjectItemsFirst {
+					return nil, fmt.Errorf("githubclient: list issues for %s/%s: issue #%d sits on at least %d projects (the projectItems page cap) and none is the target project %q, so its board membership is undecidable; refusing to report it as off-board",
+						repo.Owner, repo.Name, n.Number, listRepoIssuesProjectItemsFirst, opts.ProjectID)
+				}
+			}
+			results = append(results, issue)
+		}
+		if !data.Repository.Issues.PageInfo.HasNextPage {
+			break
+		}
+		if page >= listRepoIssuesMaxPages {
+			return nil, fmt.Errorf("githubclient: list issues for %s/%s exceeded the %d-page cap after accumulating %d issues with more pages remaining; refusing to return a partial issue set",
+				repo.Owner, repo.Name, listRepoIssuesMaxPages, len(results))
+		}
+		cursor := data.Repository.Issues.PageInfo.EndCursor
+		after = &cursor
+	}
+	return results, nil
+}
+
+// statusFieldNameGraphQL is the conventional single-select board field name
+// the per-issue board status is read from. It matches the field name the
+// work-management provider passes to ProjectFields/ProjectItemStatus.
+const statusFieldNameGraphQL = "Status"
+
+// listRepoIssuesQuery composes the enumeration document. The per-issue
+// projectItems selection is included ONLY when board status was requested, so
+// a caller that does not need it pays neither the extra selection nor the
+// Projects (v2) permission surface it implies.
+func listRepoIssuesQuery(wantBoard bool) string {
+	head := `query ListRepoIssues($owner: String!, $name: String!, $first: Int!, $after: String, $labelsFirst: Int!, $states: [IssueState!], $labels: [String!]`
+	boardSelection := ""
+	if wantBoard {
+		head += `, $projectItemsFirst: Int!, $field: String!`
+		boardSelection = `
+          projectItems(first: $projectItemsFirst) {
+            nodes {
+              project { id }
+              fieldValueByName(name: $field) {
+                ... on ProjectV2ItemFieldSingleSelectValue { name }
+              }
+            }
+          }`
+	}
+	return head + `) {
+  repository(owner: $owner, name: $name) {
+    issues(first: $first, after: $after, states: $states, labels: $labels, orderBy: {field: NUMBER, direction: ASC}) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        number
+        title
+        url
+        body
+        state
+        stateReason
+        labels(first: $labelsFirst) {
+          nodes { name }
+        }` + boardSelection + `
+      }
+    }
+  }
+}`
+}
+
+// nilIfEmpty returns nil for an empty slice so the GraphQL variable encodes as
+// null ("no filter") rather than an empty list (which some connection
+// arguments read as "match nothing").
+func nilIfEmpty(v []string) any {
+	if len(v) == 0 {
+		return nil
+	}
+	return v
+}

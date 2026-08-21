@@ -80,7 +80,29 @@ type fakeAPI struct {
 	searchResultsFn func(query string) []githubclient.IssueTitleResult
 	searchErr       error
 
+	// listRepoIssues is the canned enumeration ListRepoIssues returns, and
+	// listRepoIssuesErr the error it returns instead. listRepoIssuesOpts /
+	// listRepoIssuesRepo record the arguments so a test can assert the label and
+	// state filters were forwarded verbatim (#2230).
+	listRepoIssues     []githubclient.RepoIssue
+	listRepoIssuesErr  error
+	listRepoIssuesOpts githubclient.ListRepoIssuesOptions
+	listRepoIssuesRepo githubclient.RepoRef
+	// listRepoIssuesProjectsToken records whether the context ListRepoIssues was
+	// called with carried the projects-token opt-in, so the user-owned-board
+	// routing is assertable without the wire.
+	listRepoIssuesProjectsToken bool
+
 	projectsTokenConfigured bool
+}
+
+func (f *fakeAPI) ListRepoIssues(ctx context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, opts githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error) {
+	f.listRepoIssuesRepo, f.listRepoIssuesOpts = repo, opts
+	f.listRepoIssuesProjectsToken = githubclient.ProjectsTokenRequested(ctx)
+	if f.listRepoIssuesErr != nil {
+		return nil, f.listRepoIssuesErr
+	}
+	return f.listRepoIssues, nil
 }
 
 func (f *fakeAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {

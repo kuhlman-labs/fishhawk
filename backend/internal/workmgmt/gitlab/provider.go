@@ -8,10 +8,25 @@
 // turns a resolved workmgmt.ProviderRequest into them.
 //
 // Only Provider.File is implemented in v0 — the Transitioner (#1012),
-// NumberDiscoverer (#1269), and EpicChildrenQuerier (ADR-047) capabilities
-// are deliberately NOT implemented, matching the jira sibling. Because
-// board placement rides the create as a label, no separate transition call
-// exists; the board-sync hook type-asserts Transitioner and yields a no-op.
+// NumberDiscoverer (#1269), EpicChildrenQuerier (ADR-047) and WorkItemReader
+// (#2230) capabilities are deliberately NOT implemented, matching the jira
+// sibling. Because board placement rides the create as a label, no separate
+// transition call exists; the board-sync hook type-asserts Transitioner and
+// yields a no-op.
+//
+// WorkItemReader (#2230 / ADR-064) was REVIEWED against the GitLab shape
+// before being left unimplemented, and the finding is what pins the interface
+// vocabulary: GitLab issue boards are LABEL-driven (the board-status label
+// rides the create, above), so a GitLab reader would derive a work item's
+// board state from its state LABEL — not from a single-select project field
+// as GitHub Projects does. That is precisely why WorkItemRecord.BoardState is
+// a CANONICAL state with the provider owning the mapping, and why the
+// canonical -> provider-option map travels ON THE REQUEST (States) instead of
+// the interface exposing a GitHub "Status field" concept. A GitLab
+// implementation therefore needs no interface change; it is deferred purely
+// because v0 has no consumer. workmgmt.ReaderFor resolves this provider to a
+// typed *workmgmt.UnavailableError{Reason: ReasonNotImplemented} — never a nil
+// interface or an empty page a caller could misread as an empty backlog.
 //
 // The mapping decisions (canonical states -> GitLab label names,
 // parent_epic -> a Free-tier relates_to issue link rather than a Premium

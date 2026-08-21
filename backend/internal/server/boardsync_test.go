@@ -565,6 +565,13 @@ func (f *boardSyncGHAPI) GetIssue(context.Context, forge.CredentialScope, github
 
 func (f *boardSyncGHAPI) ProjectsTokenConfigured() bool { return true }
 
+// ListRepoIssues satisfies the work-item read capability's slice of the
+// workmgmt/github API interface (#2230). This fake exercises the FILING and
+// board-sync paths, which never enumerate issues, so it is a mechanical stub.
+func (f *boardSyncGHAPI) ListRepoIssues(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error) {
+	return nil, nil
+}
+
 // TestBoardTransition_RealProviderNotApplicable_SuppressesAudit is the
 // CROSS-BOUNDARY test #2494 approval condition 3 requires: the
 // TransitionResult is produced by the REAL workmgmt/github provider — not a

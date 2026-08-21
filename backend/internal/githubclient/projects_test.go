@@ -820,3 +820,292 @@ func TestDoGraphQL_FallsBackToInstallationToken(t *testing.T) {
 		t.Errorf("Authorization without flag = %q, want installation token", pf.gotGraphQLAuth)
 	}
 }
+
+// repoIssueNode renders one repository.issues node with a labels connection
+// and, when projectItems is non-empty, the nested project-items selection.
+func repoIssueNode(number int, projectItems string) string {
+	items := ""
+	if projectItems != "" {
+		items = `,"projectItems":{"nodes":[` + projectItems + `]}`
+	}
+	return fmt.Sprintf(`{"number":%d,"title":"issue %d","url":"https://github.com/o/r/issues/%d","body":"body %d","state":"OPEN","stateReason":null,"labels":{"nodes":[{"name":"type:feature"}]}%s}`,
+		number, number, number, number, items)
+}
+
+// TestListRepoIssues_PaginatesBeyondOneHundred is the acceptance-criterion-2
+// beyond-the-cap fixture at the TRANSPORT layer: 150 issues served as two
+// cursor pages (100 + 50) must all come back, ascending by number, with the
+// per-issue fields decoded. A single-page read (the truncation this issue
+// exists to eliminate) would return 100.
+func TestListRepoIssues_PaginatesBeyondOneHundred(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListRepoIssues"] = func(vars map[string]any) string {
+		if after, _ := vars["after"].(string); after == "C1" {
+			var nodes []string
+			for n := 101; n <= 150; n++ {
+				nodes = append(nodes, repoIssueNode(n, ""))
+			}
+			return `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"C2"},"nodes":[` +
+				strings.Join(nodes, ",") + `]}}}}`
+		}
+		var nodes []string
+		for n := 1; n <= 100; n++ {
+			nodes = append(nodes, repoIssueNode(n, ""))
+		}
+		return `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"C1"},"nodes":[` +
+			strings.Join(nodes, ",") + `]}}}}`
+	}
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 150 {
+		t.Fatalf("issues = %d, want 150 across two cursor pages (a one-page read returns 100)", len(issues))
+	}
+	for i, iss := range issues {
+		if iss.Number != i+1 {
+			t.Fatalf("issues[%d].Number = %d, want %d (ascending by number)", i, iss.Number, i+1)
+		}
+	}
+	last := issues[149]
+	if last.Title != "issue 150" || last.URL != "https://github.com/o/r/issues/150" || last.Body != "body 150" {
+		t.Errorf("last issue = %+v, want title/url/body decoded", last)
+	}
+	if last.State != "OPEN" || last.StateReason != "" {
+		t.Errorf("last issue state = %q/%q, want OPEN with an empty stateReason", last.State, last.StateReason)
+	}
+	if len(last.Labels) != 1 || last.Labels[0] != "type:feature" {
+		t.Errorf("last issue labels = %v, want [type:feature]", last.Labels)
+	}
+	if pf.gotGraphQLReqs["ListRepoIssues"] != 2 {
+		t.Errorf("requests = %d, want 2 (two-page walk)", pf.gotGraphQLReqs["ListRepoIssues"])
+	}
+	if vars := pf.gotGraphQLVars["ListRepoIssues"]; vars["after"] != "C1" {
+		t.Errorf("page 2 after = %v, want C1 (page 1's endCursor threaded)", vars["after"])
+	}
+}
+
+// TestListRepoIssues_QueriesIssuesNotBoardItems is the DONE-MEANS behavioral
+// test for the enumeration rule (#1169): the rule is a convention compilation
+// cannot enforce, so assert on the GraphQL DOCUMENT the server received. A
+// rewrite to a ProjectV2 board item list would introduce a `projectV2(`
+// selection and fail here, where a comment-only touch would pass.
+func TestListRepoIssues_QueriesIssuesNotBoardItems(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}}}}`
+	if _, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{ProjectID: "PROJ", WantBoardStatus: true}); err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	q := pf.gotGraphQLQuery["ListRepoIssues"]
+	if !strings.Contains(q, "repository(") || !strings.Contains(q, "issues(") {
+		t.Fatalf("query must enumerate repository issues, got:\n%s", q)
+	}
+	// A board ITEM-LIST enumeration roots at a projectV2 node
+	// (user(login:){projectV2(number:){items(first:…)}}). Its absence is the
+	// discriminator; the `... on ProjectV2ItemFieldSingleSelectValue` fragment
+	// used to READ a status is not a `projectV2(` selection.
+	if strings.Contains(strings.ToLower(q), "projectv2(") {
+		t.Errorf("query enumerates a ProjectV2 board item list, which caps and truncates silently; enumerate repository.issues instead:\n%s", q)
+	}
+	if !strings.Contains(q, "orderBy: {field: NUMBER, direction: ASC}") {
+		t.Errorf("query must order ascending by number for a deterministic walk, got:\n%s", q)
+	}
+}
+
+// TestListRepoIssues_PageCapFailsClosed proves the walk is bounded and fails
+// CLOSED: a connection that always reports hasNextPage:true errors at the cap
+// naming the repo and the accumulated count, and returns NO partial slice.
+func TestListRepoIssues_PageCapFailsClosed(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListRepoIssues"] = func(map[string]any) string {
+		return `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR"},"nodes":[` +
+			repoIssueNode(1, "") + `]}}}}`
+	}
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, ListRepoIssuesOptions{})
+	if err == nil {
+		t.Fatalf("want a fail-closed cap error, got %d issues and nil error", len(issues))
+	}
+	if issues != nil {
+		t.Errorf("issues = %d entries alongside the error, want NO partial slice", len(issues))
+	}
+	if !strings.Contains(err.Error(), "kuhlman-labs/fishhawk") || !strings.Contains(err.Error(), "exceeded the") {
+		t.Errorf("cap error must name the repo, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "issues") {
+		t.Errorf("cap error must name the accumulated issue count, got %v", err)
+	}
+	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != listRepoIssuesMaxPages {
+		t.Errorf("requests = %d, want the %d-page cap (bounded)", got, listRepoIssuesMaxPages)
+	}
+}
+
+// TestListRepoIssues_ForbiddenClassified proves a 403 surfaces as the
+// ErrForbidden sentinel, which is what the provider wraps into a typed
+// ReasonForbidden while keeping errors.Is matching.
+func TestListRepoIssues_ForbiddenClassified(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"message":"Resource not accessible by integration"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, Tokens: &stubTokens{token: "ghs"}, HTTP: &http.Client{Timeout: 5 * time.Second}}
+	_, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{})
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+}
+
+// TestListRepoIssues_ForwardsFiltersAndReadsBoardStatus proves the label/state
+// filters reach the GraphQL variables verbatim and that the per-issue board
+// status is read off the item whose project node id matches the target.
+func TestListRepoIssues_ForwardsFiltersAndReadsBoardStatus(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[` +
+		repoIssueNode(7, `{"project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}},{"project":{"id":"PROJ"},"fieldValueByName":{"name":"In Progress"}}`) + `,` +
+		repoIssueNode(8, `{"project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}}`) + `]}}}}`
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{
+			Labels: []string{"type:feature", "area:backend"}, States: []string{"OPEN"},
+			ProjectID: "PROJ", WantBoardStatus: true,
+		})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues = %d, want 2", len(issues))
+	}
+	// The matching item's status wins; the other board's item is ignored.
+	if !issues[0].OnBoard || issues[0].BoardStatus != "In Progress" {
+		t.Errorf("issue 7 board = %v/%q, want on-board In Progress from the TARGET project's item", issues[0].OnBoard, issues[0].BoardStatus)
+	}
+	// An issue on a DIFFERENT board only, with the page NOT full, is off-board.
+	if issues[1].OnBoard || issues[1].BoardStatus != "" {
+		t.Errorf("issue 8 board = %v/%q, want off-board (its only item is another project)", issues[1].OnBoard, issues[1].BoardStatus)
+	}
+	vars := pf.gotGraphQLVars["ListRepoIssues"]
+	gotLabels, _ := vars["labels"].([]any)
+	if len(gotLabels) != 2 || gotLabels[0] != "type:feature" || gotLabels[1] != "area:backend" {
+		t.Errorf("labels variable = %v, want the caller's labels forwarded verbatim", vars["labels"])
+	}
+	gotStates, _ := vars["states"].([]any)
+	if len(gotStates) != 1 || gotStates[0] != "OPEN" {
+		t.Errorf("states variable = %v, want [OPEN]", vars["states"])
+	}
+}
+
+// TestListRepoIssues_UnfilteredSendsNullVariables proves an unfiltered call
+// encodes `labels`/`states` as GraphQL null ("no filter") rather than an empty
+// list, which a connection argument can read as "match nothing".
+//
+// The options carry EXPLICITLY EMPTY, non-nil slices — the shape a caller that
+// built a filter and then found it empty produces. A nil slice would marshal
+// to null on its own, so an all-nil fixture could not tell the nilIfEmpty
+// control apart from its absence.
+func TestListRepoIssues_UnfilteredSendsNullVariables(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}}}}`
+	if _, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{Labels: []string{}, States: []string{}}); err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	vars := pf.gotGraphQLVars["ListRepoIssues"]
+	if vars["labels"] != nil || vars["states"] != nil {
+		t.Errorf("labels/states = %v/%v, want null (no filter)", vars["labels"], vars["states"])
+	}
+	// Board status was not requested, so the projectItems selection is absent.
+	if strings.Contains(pf.gotGraphQLQuery["ListRepoIssues"], "projectItems(") {
+		t.Errorf("query selects projectItems without a board-status request:\n%s", pf.gotGraphQLQuery["ListRepoIssues"])
+	}
+}
+
+// TestListRepoIssues_TruncatedProjectItemsFailsClosed is the condition-C3
+// fixture: an issue whose projectItems page comes back FULL and does NOT carry
+// the target project has UNDECIDABLE board membership — the item may sit
+// beyond the page. Reporting OnBoard=false there would be a silent wrong
+// answer for an issue that IS on the board, so the read must fail closed.
+func TestListRepoIssues_TruncatedProjectItemsFailsClosed(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	var items []string
+	for i := 0; i < listRepoIssuesProjectItemsFirst; i++ {
+		items = append(items, fmt.Sprintf(`{"project":{"id":"OTHER_%d"},"fieldValueByName":null}`, i))
+	}
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[` +
+		repoIssueNode(42, strings.Join(items, ",")) + `]}}}}`
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{ProjectID: "PROJ", WantBoardStatus: true})
+	if err == nil {
+		t.Fatalf("want a fail-closed truncation error; got issues = %+v", issues)
+	}
+	if issues != nil {
+		t.Errorf("issues = %+v alongside the error, want NO result", issues)
+	}
+	if !strings.Contains(err.Error(), "#42") || !strings.Contains(err.Error(), "undecidable") {
+		t.Errorf("error must name the issue and the undecidable membership, got %v", err)
+	}
+}
+
+// TestListRepoIssues_FullProjectItemsPageContainingTargetIsFine proves the
+// truncation guard is not over-broad: a FULL page that DOES carry the target
+// project resolves normally.
+func TestListRepoIssues_FullProjectItemsPageContainingTargetIsFine(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	items := []string{`{"project":{"id":"PROJ"},"fieldValueByName":{"name":"Backlog"}}`}
+	for i := 1; i < listRepoIssuesProjectItemsFirst; i++ {
+		items = append(items, fmt.Sprintf(`{"project":{"id":"OTHER_%d"},"fieldValueByName":null}`, i))
+	}
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[` +
+		repoIssueNode(42, strings.Join(items, ",")) + `]}}}}`
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{ProjectID: "PROJ", WantBoardStatus: true})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 1 || !issues[0].OnBoard || issues[0].BoardStatus != "Backlog" {
+		t.Fatalf("issues = %+v, want one on-board Backlog item", issues)
+	}
+}
+
+// TestListRepoIssues_NilRepositoryFailsClosed proves an invisible repo is a
+// hard error, not an empty (and misreadable) issue set.
+func TestListRepoIssues_NilRepositoryFailsClosed(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":null}}`
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{})
+	if err == nil || issues != nil {
+		t.Fatalf("want a fail-closed nil-repository error, got %+v / %v", issues, err)
+	}
+	if !strings.Contains(err.Error(), "nil node") {
+		t.Errorf("error should name the nil repository node, got %v", err)
+	}
+}
+
+// TestListRepoIssues_MissingRepoRejected proves the argument guard.
+func TestListRepoIssues_MissingRepoRejected(t *testing.T) {
+	_, c := newProjectsFake(t)
+	if _, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o"}, ListRepoIssuesOptions{}); err == nil {
+		t.Fatal("want an error for a missing repo name")
+	}
+}
+
+// TestListRepoIssues_ProjectsTokenOptIn proves the enumeration honours the
+// user-owned-board token opt-in, since it routes through doGraphQL.
+func TestListRepoIssues_ProjectsTokenOptIn(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	c.ProjectsToken = "pat_projects"
+	pf.graphqlByOp["ListRepoIssues"] = `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}}}}`
+	if _, err := c.ListRepoIssues(WithProjectsToken(context.Background()), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{}); err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer pat_projects" {
+		t.Errorf("Authorization = %q, want the static projects token", pf.gotGraphQLAuth)
+	}
+}

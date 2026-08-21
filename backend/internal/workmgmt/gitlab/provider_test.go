@@ -398,3 +398,48 @@ func TestParseIssueRef(t *testing.T) {
 		}
 	}
 }
+
+// TestProvider_DoesNotImplementWorkItemReader is the executable form of
+// acceptance criterion 4 (#2230): the SECOND provider is not forced into a
+// GitHub-shaped contract. The read/list capability is an OPTIONAL capability
+// interface, so this File-only provider does not satisfy it — and, decisively,
+// this test would not COMPILE if the methods had been folded into the base
+// Provider instead.
+//
+// GitLab issue boards are LABEL-driven (the board-status label rides the
+// create), so a GitLab reader would derive board state from the state LABEL
+// rather than a single-select project field. That is why
+// workmgmt.WorkItemRecord.BoardState is a CANONICAL state with the provider
+// owning the mapping, and why the canonical -> provider-option map travels on
+// the request. See the package doc comment.
+func TestProvider_DoesNotImplementWorkItemReader(t *testing.T) {
+	var p workmgmt.Provider = New(&fakeAPI{})
+	if _, ok := p.(workmgmt.WorkItemReader); ok {
+		t.Fatal("gitlab provider satisfies workmgmt.WorkItemReader; v0 is File-only — if a reader was added deliberately, update the package doc and this test")
+	}
+}
+
+// TestReaderFor_GitLabResolvesTypedUnavailable is failure mode 5 asserted
+// against the REAL provider (the sibling assertion in
+// workmgmt/reader_test.go uses a File-only fake): resolving the read
+// capability for the registered gitlab provider yields a NIL reader and a
+// typed *workmgmt.UnavailableError{Reason: ReasonNotImplemented} — never a nil
+// interface a caller could dispatch against, and never an empty page it could
+// misread as an empty backlog.
+func TestReaderFor_GitLabResolvesTypedUnavailable(t *testing.T) {
+	workmgmt.Register(New(&fakeAPI{}))
+	r, err := workmgmt.ReaderFor(ProviderName)
+	if r != nil {
+		t.Errorf("reader = %v, want nil alongside the unavailable error", r)
+	}
+	var ue *workmgmt.UnavailableError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if ue.Reason != workmgmt.ReasonNotImplemented {
+		t.Errorf("Reason = %q, want %q", ue.Reason, workmgmt.ReasonNotImplemented)
+	}
+	if ue.Provider != ProviderName {
+		t.Errorf("Provider = %q, want %q", ue.Provider, ProviderName)
+	}
+}
