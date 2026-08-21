@@ -193,17 +193,41 @@ func TestProvider_ListWorkItems_ReturnsBeyondBoardItemListCap(t *testing.T) {
 }
 
 // TestProvider_ListWorkItems_LimitCapsAfterFiltering proves Limit is a caller
-// cap applied to the FILTERED set, and 0 means no cap.
+// cap applied to the FILTERED set, not to the enumerated one.
+//
+// The corpus is ORDERING-DISCRIMINATING by construction: the first two
+// enumerated issues FAIL the board-state filter and the next three PASS it, so
+// a Limit of 2 yields #3 and #4 under filter-then-limit and an EMPTY page
+// under limit-then-filter. A no-filter fixture would pass under either
+// ordering and leave the contract unpinned.
 func TestProvider_ListWorkItems_LimitCapsAfterFiltering(t *testing.T) {
-	c, _ := newRepoIssuesClient(t, 150, "pat_projects")
+	api := readerAPI()
+	api.listRepoIssues = []githubclient.RepoIssue{
+		{Number: 1, State: "OPEN", OnBoard: true, BoardStatus: "Backlog"},
+		{Number: 2, State: "OPEN", OnBoard: true, BoardStatus: "Backlog"},
+		{Number: 3, State: "OPEN", OnBoard: true, BoardStatus: "In Progress"},
+		{Number: 4, State: "OPEN", OnBoard: true, BoardStatus: "In Progress"},
+		{Number: 5, State: "OPEN", OnBoard: true, BoardStatus: "In Progress"},
+	}
 	req := listRequest()
-	req.Limit = 5
-	page, err := New(c).ListWorkItems(context.Background(), req)
+	req.BoardStates = []string{workmgmt.CanonicalStateInProgress}
+	req.Limit = 2
+	page, err := New(api).ListWorkItems(context.Background(), req)
 	if err != nil {
 		t.Fatalf("ListWorkItems: %v", err)
 	}
-	if len(page.Items) != 5 || page.Items[4].Number != 5 {
-		t.Fatalf("items = %d (last #%d), want the first 5", len(page.Items), page.Items[len(page.Items)-1].Number)
+	if len(page.Items) != 2 || page.Items[0].Number != 3 || page.Items[1].Number != 4 {
+		t.Fatalf("items = %+v, want exactly #3 and #4 — an empty page means the limit was applied BEFORE the filter", page.Items)
+	}
+
+	// Limit 0 means no cap: the whole filtered set comes back.
+	req.Limit = 0
+	all, err := New(api).ListWorkItems(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if len(all.Items) != 3 {
+		t.Fatalf("uncapped items = %d, want 3 (Limit 0 is no cap)", len(all.Items))
 	}
 }
 
@@ -652,6 +676,29 @@ func TestReader_NonForbiddenErrorsStayPlain(t *testing.T) {
 	if errors.As(err, &ue) {
 		t.Errorf("a transport fault must not masquerade as a capability degradation: %v", err)
 	}
+
+	// The shared board precondition has the same non-forbidden branch: a plain
+	// ProjectFields failure stays a plain wrapped error on BOTH paths.
+	api3 := readerAPI()
+	api3.fieldsErr = errors.New("boom")
+	page3, err := New(api3).ListWorkItems(context.Background(), listRequest())
+	if page3 != nil || err == nil {
+		t.Fatalf("want a nil page and an error, got %+v / %v", page3, err)
+	}
+	if errors.As(err, &ue) {
+		t.Errorf("a plain project-fields fault must not masquerade as a capability degradation: %v", err)
+	}
+	api4 := readerAPI()
+	api4.fieldsErr = errors.New("boom")
+	rec4, err := New(api4).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "7", ResolveBoardState: true, States: canonicalStates,
+	})
+	if rec4 != nil || err == nil {
+		t.Fatalf("want a nil record and an error, got %+v / %v", rec4, err)
+	}
+	if errors.As(err, &ue) {
+		t.Errorf("a plain project-fields fault must not masquerade as a capability degradation: %v", err)
+	}
 }
 
 // TestReader_MissingAPIAndRepoRejected pins the two programming-error guards
@@ -675,13 +722,28 @@ func TestReader_MissingAPIAndRepoRejected(t *testing.T) {
 	}
 }
 
+// readerRegistryName is a unique test-only registry id. workmgmt.Register
+// REPLACES any prior registration for a name, so registering a fake-backed
+// provider under the real ProviderName would clobber the production
+// registration for every other test sharing this package's test binary (the
+// same clobber refinement_file_test.go avoids with its own named wrapper).
+// ReaderFor only needs an id that maps to a WorkItemReader.
+const readerRegistryName = ProviderName + "_reader_capability_test"
+
+// namedReaderProvider wraps the real provider under readerRegistryName. The
+// embedded *Provider promotes ListWorkItems/ReadWorkItem, so the
+// WorkItemReader type assertion inside ReaderFor still resolves.
+type namedReaderProvider struct{ *Provider }
+
+func (*namedReaderProvider) Name() string { return readerRegistryName }
+
 // TestProvider_ReaderFor_ResolvesGitHubProvider proves the registry chokepoint
 // resolves THIS provider to a usable reader — the positive counterpart to the
 // gitlab not-implemented assertion.
 func TestProvider_ReaderFor_ResolvesGitHubProvider(t *testing.T) {
-	workmgmt.Register(New(readerAPI()))
-	r, err := workmgmt.ReaderFor(ProviderName)
+	workmgmt.Register(&namedReaderProvider{Provider: New(readerAPI())})
+	r, err := workmgmt.ReaderFor(readerRegistryName)
 	if err != nil || r == nil {
-		t.Fatalf("ReaderFor(%q) = %v / %v, want a usable reader", ProviderName, r, err)
+		t.Fatalf("ReaderFor(%q) = %v / %v, want a usable reader", readerRegistryName, r, err)
 	}
 }

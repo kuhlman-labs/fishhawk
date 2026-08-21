@@ -919,9 +919,12 @@ func TestListRepoIssues_QueriesIssuesNotBoardItems(t *testing.T) {
 // naming the repo and the accumulated count, and returns NO partial slice.
 func TestListRepoIssues_PageCapFailsClosed(t *testing.T) {
 	pf, c := newProjectsFake(t)
+	// TWO nodes per page, so the accumulated issue count (200) differs from the
+	// page cap (100) and from the per-page node count: an assertion on the
+	// count cannot be satisfied by either of the other numbers in the message.
 	pf.graphqlByOpFn["ListRepoIssues"] = func(map[string]any) string {
 		return `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR"},"nodes":[` +
-			repoIssueNode(1, "") + `]}}}}`
+			repoIssueNode(1, "") + `,` + repoIssueNode(2, "") + `]}}}}`
 	}
 	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
 		RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, ListRepoIssuesOptions{})
@@ -934,8 +937,10 @@ func TestListRepoIssues_PageCapFailsClosed(t *testing.T) {
 	if !strings.Contains(err.Error(), "kuhlman-labs/fishhawk") || !strings.Contains(err.Error(), "exceeded the") {
 		t.Errorf("cap error must name the repo, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "issues") {
-		t.Errorf("cap error must name the accumulated issue count, got %v", err)
+	// Discriminating: the exact accumulated count, not the bare word "issues"
+	// (which the fixed "list issues" prefix already supplies).
+	if wantCount := fmt.Sprintf("accumulating %d issues", 2*listRepoIssuesMaxPages); !strings.Contains(err.Error(), wantCount) {
+		t.Errorf("cap error must name the accumulated issue count %q, got %v", wantCount, err)
 	}
 	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != listRepoIssuesMaxPages {
 		t.Errorf("requests = %d, want the %d-page cap (bounded)", got, listRepoIssuesMaxPages)
