@@ -6530,8 +6530,17 @@ func TestGetRunStatus_NextActions_TerminalRunNamesState(t *testing.T) {
 	if out.NextActions == nil || out.NextActions.State != "cancelled" {
 		t.Fatalf("NextActions = %+v, want a block naming the terminal state cancelled", out.NextActions)
 	}
-	if len(out.NextActions.Actions) != 0 {
-		t.Errorf("terminal run carries actions %+v, want none", out.NextActions.Actions)
+	// E32.11 / #1737: a terminal FAILED/CANCELLED run is no longer actionless.
+	// It carries exactly the operator-gated filing suggestion — the only legal
+	// move left on a run with no recovery arm — pre-populated with the run id.
+	// (A terminal SUCCESS-shaped state still carries no actions; that is what
+	// the NextActions.Actions contract now says.)
+	if got := actionNames(out.NextActions); len(got) != 1 || got[0] != "fishhawk_report_product_issue" {
+		t.Fatalf("terminal run actions = %v, want exactly [fishhawk_report_product_issue]", got)
+	}
+	filing := out.NextActions.Actions[0]
+	if filing.Params["run_id"] != runID.String() || filing.Consumes != consumesNone {
+		t.Errorf("filing action = %+v, want run_id=%s consumes=none", filing, runID)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -1625,6 +1626,59 @@ func TestGetCampaignStatus_Closed_E2E_ThroughRealServer(t *testing.T) {
 	}
 	if len(out2.NextActions.Actions) != 1 || out2.NextActions.Actions[0].Action != "fishhawk_start_campaign_item_run" {
 		t.Errorf("next_actions actions = %+v, want exactly one fishhawk_start_campaign_item_run", out2.NextActions.Actions)
+	}
+
+	// --- arm 3 (E32.11 / #1737): a stranded item WITH a linked run carries the
+	// operator-gated filing suggestion LAST. This is the cross-boundary proof
+	// that the campaign's ITEMS survive the wire into campaignNextActionsFor —
+	// the seam the #1737 signature widening introduces. A per-layer unit passes
+	// on a hand-built []CampaignItem while a dropped `run_id` json tag or an
+	// items list that never reaches the classifier would leave the operator with
+	// no filing move at all.
+	linkedRun, err := runpkg.NewPostgresRepository(pool).CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create linked run: %v", err)
+	}
+	linkedID := seed(t, campaign.StateCancelled, map[string]campaign.ItemState{
+		"issue:300": campaign.ItemStateSucceeded,
+		"issue:301": campaign.ItemStateFailed,
+	})
+	items, err := repo.ListCampaignItemsForCampaign(ctx, linkedID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	for _, it := range items {
+		if it.IssueRef == "issue:301" {
+			if _, err := repo.SetCampaignItemRun(ctx, it.ID, &linkedRun.ID); err != nil {
+				t.Fatalf("link run to item: %v", err)
+			}
+		}
+	}
+	_, out3, err := r.getCampaignStatus(ctx, nil, GetCampaignStatusInput{CampaignID: linkedID.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (closed+linked run): %v", err)
+	}
+	if out3.NextActions == nil || out3.NextActions.State != "campaign_closed" {
+		t.Fatalf("next_actions = %+v, want State campaign_closed", out3.NextActions)
+	}
+	acts := out3.NextActions.Actions
+	if len(acts) != 2 || acts[0].Action != "fishhawk_start_run" || acts[1].Action != "fishhawk_report_product_issue" {
+		t.Fatalf("next_actions actions = %+v, want [fishhawk_start_run fishhawk_report_product_issue] — the recovery move leads, filing is LAST", acts)
+	}
+	filing := acts[1]
+	if filing.Params["run_id"] != linkedRun.ID.String() {
+		t.Errorf("filing run_id = %q, want the STUCK ITEM'S own run id %q (not the campaign's)", filing.Params["run_id"], linkedRun.ID)
+	}
+	if filing.Params["kind"] != "bug" || filing.Consumes != consumesNone {
+		t.Errorf("filing action = %+v, want kind=bug consumes=none", filing)
+	}
+	if !strings.Contains(filing.Reason, "issue:301") || !strings.Contains(filing.Reason, "failed") {
+		t.Errorf("filing reason = %q, want it to name the stranded item and its state", filing.Reason)
 	}
 }
 

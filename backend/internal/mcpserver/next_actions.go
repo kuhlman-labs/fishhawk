@@ -53,12 +53,13 @@ var flakeTraceEvents = []string{failuresig.AnchorVerifyInfraFlake}
 
 // SuggestedAction is one legal next move for the run's current state.
 // Action is a tool name (fishhawk_resume_run, fishhawk_merge_run) or a
-// named ritual step (approve_pr, post_merge, file_product_issue) when the
-// move happens outside the MCP surface. The merge itself is the
-// fishhawk_merge_run tool (E48.7 / #1954), which replaced the bare merge_pr
-// + post_merge ritual steps.
+// named ritual step (approve_pr, post_merge) when the move happens outside
+// the MCP surface. The merge itself is the fishhawk_merge_run tool (E48.7 /
+// #1954), which replaced the bare merge_pr + post_merge ritual steps; product
+// filing is likewise the fishhawk_report_product_issue tool (E32.11 / #1737),
+// which replaced the bare file_product_issue ritual step.
 type SuggestedAction struct {
-	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_merge_run, fishhawk_fixup_stage) or a named ritual step outside the MCP surface (approve_pr, post_merge, merge_and_file_follow_up, file_product_issue)"`
+	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_merge_run, fishhawk_fixup_stage, fishhawk_report_product_issue) or a named ritual step outside the MCP surface (approve_pr, post_merge, merge_and_file_follow_up)"`
 	Params       map[string]string `json:"params,omitempty" jsonschema:"key parameters for the action (run_id, stage_id, parent_run_id, the concern_ids source, ...); values naming a field path (e.g. run.concerns.items[].id) tell you where to read the real value"`
 	Precondition string            `json:"precondition" jsonschema:"one-line statement of when this action is legal"`
 	Consumes     string            `json:"consumes" jsonschema:"what taking the action spends: one of none, fixup_budget, retry_budget, approval_slot, new_run"`
@@ -66,11 +67,14 @@ type SuggestedAction struct {
 }
 
 // NextActions is the classified run lifecycle state plus its legal next
-// moves. Actions is nil ONLY on a terminal state (the block still names
-// the state); every non-terminal state carries at least one action.
+// moves. Actions is nil ONLY on a terminal SUCCESS-shaped state (the block
+// still names the state); every non-terminal state carries at least one
+// action. A terminal FAILED/CANCELLED run is no longer actionless: it carries
+// the operator-gated fishhawk_report_product_issue filing suggestion (E32.11 /
+// #1737).
 type NextActions struct {
 	State   string            `json:"state" jsonschema:"the classified run lifecycle state, e.g. plan_gate_parked, plan_awaiting_input, implement_failed_category_b, succeeded_pr_open, terminal states by run state name, or unclassified when no table arm matched"`
-	Actions []SuggestedAction `json:"actions,omitempty" jsonschema:"the legal next moves, ordered (first is the suggested default). Nil only on a terminal run state; every non-terminal state carries at least one entry. Display-only — never gates the run"`
+	Actions []SuggestedAction `json:"actions,omitempty" jsonschema:"the legal next moves, ordered (first is the suggested default). Nil only on a terminal SUCCESS-shaped run state; every non-terminal state carries at least one entry, and a terminal failed/cancelled run carries the operator-gated fishhawk_report_product_issue filing suggestion. Display-only — never gates the run"`
 	// Signature is the failure-signature registry's match on the run's failed
 	// stage (#1703): what the failure MEANS plus the recommended recovery
 	// sequence. ADDITIVE and DISPLAY-ONLY — it never gates a run and never
@@ -100,6 +104,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
 		foldLiveValidationAdvisory(run, na)
+		foldProductIssueSuggestion(run, stages, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -122,6 +127,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		na = fallback
 	}
 	foldLiveValidationAdvisory(run, na)
+	foldProductIssueSuggestion(run, stages, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
@@ -138,13 +144,7 @@ func failureSignatureFor(run *Run, stages []Stage) *failuresig.Hint {
 	if run == nil {
 		return nil
 	}
-	var failed *Stage
-	for i := range stages {
-		if stages[i].State == "failed" {
-			failed = &stages[i]
-			break
-		}
-	}
+	failed := firstFailedStage(stages)
 	if failed == nil {
 		return nil
 	}
@@ -173,6 +173,113 @@ func failureSignatureFor(run *Run, stages []Stage) *failuresig.Hint {
 		ev.TokensThisAttempt = p.TokensThisAttempt
 	}
 	return failuresig.Match(ev)
+}
+
+// --- product-directed discovery filing (E32.11 / #1737) --------------------
+
+// productIssueFilingPrecondition is the ONE precondition every emitted
+// fishhawk_report_product_issue suggestion carries. Filing stays
+// OPERATOR-GATED: nothing in the classifier files anything, the suggestion is
+// display-only, and the wording is deliberately conditional so the surface
+// never reads as a default recommendation on any failure (a category-B failure
+// in particular is more often an agent scope error than product friction).
+const productIssueFilingPrecondition = "OPERATOR JUDGEMENT, never automatic: file only when this failure looks like Fishhawk product friction — the loop, the runner, or the tooling behaving wrongly — rather than a defect in the task itself (a category-B scope error is usually the latter, not product friction)"
+
+// productIssueAction returns the pre-populated filing suggestion (#1737).
+//
+// runID is the run whose product-facts bundle the report carries: a real run id
+// when the classifier can resolve one, or a field-path pointer (the
+// run.concerns.items[].id idiom already used for concern_ids) when it cannot —
+// fishhawk_report_product_issue REQUIRES a run, so an arm with no resolvable id
+// either points at where to read it or emits nothing at all.
+//
+// Params carry only parameters the real tool accepts (ReportProductIssueInput:
+// run_id / kind / description / include_free_text) — inventing a param would
+// hand the agent an argument the tool would refuse.
+//
+// why is the one-line evidence anchor: what failed, and in which shape.
+func productIssueAction(runID, why string) SuggestedAction {
+	return SuggestedAction{
+		Action:       "fishhawk_report_product_issue",
+		Params:       map[string]string{"run_id": runID, "kind": "bug"},
+		Precondition: productIssueFilingPrecondition,
+		Consumes:     consumesNone,
+		Reason:       why + " — fishhawk_report_product_issue auto-collects this run's redacted product-facts bundle (stage states, failure surface, failure detail class, audit sequence range), so no evidence has to be hand-assembled; it is deduped on that bundle's fingerprint, so a recurrence lands as an occurrence comment rather than a duplicate issue",
+	}
+}
+
+// productIssueFilingStates is the CLOSED set of classified next-actions states
+// on which the filing suggestion is offered (#1737): the category-B/C/D
+// implement-failure arms, the terminal failed/cancelled arm that today carries
+// zero actions, and the two drive-derived ci_failed arms.
+//
+// Deliberately EXCLUDED: every healthy state (the anti-noise contract —
+// TestNextActions_NoFilingSuggestionOnHealthyRun), and
+// implement_failed_category_a, where the failure is an agent/harness fault that
+// routes to retry and whose recovery the failure-signature registry (#1703)
+// already names — a filing nudge there would be pure noise.
+var productIssueFilingStates = map[string]struct{}{
+	"implement_failed_category_b":                     {},
+	"implement_failed_category_b_decomposition_child": {},
+	"slices_integration_conflict":                     {},
+	"implement_failed":                                {},
+	"ci_failed_routable":                              {},
+	"ci_failed_unroutable":                            {},
+	"failed":                                          {},
+	"cancelled":                                       {},
+}
+
+// productIssueFilingState reports whether the classified state is a
+// failure shape that warrants offering the filing suggestion. THIS IS THE
+// CONTROL that keeps the suggestion off healthy runs: delete it (append
+// unconditionally) and TestNextActions_NoFilingSuggestionOnHealthyRun goes red.
+func productIssueFilingState(state string) bool {
+	_, ok := productIssueFilingStates[state]
+	return ok
+}
+
+// firstFailedStage returns the FIRST stage in state "failed" (stages are
+// ordered by sequence, so the earliest failure is the one that explains the
+// run), or nil when none failed.
+func firstFailedStage(stages []Stage) *Stage {
+	for i := range stages {
+		if stages[i].State == "failed" {
+			return &stages[i]
+		}
+	}
+	return nil
+}
+
+// productIssueFilingWhy renders the evidence anchor for the filing suggestion:
+// the failing stage type and its failure category when a failed stage is in
+// hand, else the classified state alone (a cancelled run has no failed stage).
+func productIssueFilingWhy(stages []Stage, state string) string {
+	failed := firstFailedStage(stages)
+	if failed == nil {
+		return fmt.Sprintf("the run is %s (%s)", state, state)
+	}
+	// Named failureCat, NOT "category": backend/internal/audit's completeness
+	// scanner treats any category-named identifier bound to a lowercase string
+	// literal as an AUDIT-category emission and demands a registry entry. This
+	// is a stage FAILURE category (A/B/C/D, or unclassified when unset).
+	failureCat := "unclassified"
+	if failed.FailureCategory != nil && *failed.FailureCategory != "" {
+		failureCat = *failed.FailureCategory
+	}
+	return fmt.Sprintf("the %s stage failed category %s and the run classified %s", failed.Type, failureCat, state)
+}
+
+// foldProductIssueSuggestion appends the operator-gated filing suggestion as
+// the LAST action when the classified state is one of the failure shapes above
+// (#1737). Appended last, after the drive fold, the structural guard and the
+// live-validation advisory, so the RECOVERY move always leads and filing is
+// never presented as the default next step. na is mutated in place; a nil na
+// (only the nil-run early return upstream) is a no-op.
+func foldProductIssueSuggestion(run *Run, stages []Stage, na *NextActions) {
+	if na == nil || !productIssueFilingState(na.State) {
+		return
+	}
+	na.Actions = append(na.Actions, productIssueAction(run.ID, productIssueFilingWhy(stages, na.State)))
 }
 
 // foldFailureSignature attaches the failure-signature hint to na (#1703).
@@ -1624,13 +1731,12 @@ func unclassifiedNextActions(run *Run, stages []Stage) *NextActions {
 			// returns nil).
 			pollAction(run, derivedStageWaitPollInterval(run, firstNonTerminalStage(stages)),
 				desc+" did not match the next-actions state table — re-poll while the run settles"),
-			{
-				Action:       "file_product_issue",
-				Params:       map[string]string{"run_id": run.ID},
-				Precondition: "the state persists across polls",
-				Consumes:     consumesNone,
-				Reason:       "the next-actions classifier has no arm for " + desc + "; file a Fishhawk issue naming it so the table gains one",
-			},
+			// The ONE filing verb (E32.11 / #1737): the bare
+			// file_product_issue ritual step is retired onto the real
+			// fishhawk_report_product_issue tool, the same consolidation
+			// merge_pr -> fishhawk_merge_run made (E48.7 / #1954).
+			productIssueAction(run.ID,
+				"the next-actions classifier has no arm for "+desc+", so the table itself is the defect — file a Fishhawk issue naming the state so it gains one"),
 		},
 	}
 }
@@ -2004,7 +2110,11 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 // "complete" arm returns nil actions; every other arm — including the
 // unknown-action fallback — carries at least one entry, the same structural
 // guarantee nextActionsFor upholds for runs.
-func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextActions {
+//
+// items is the campaign's item list, used ONLY to resolve the stuck item's run
+// id for the operator-gated filing suggestion on the attention/closed arms
+// (E32.11 / #1737). Nil/empty is legal and simply yields no filing suggestion.
+func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction, items []CampaignItem) *NextActions {
 	switch na.Action {
 	case "attention":
 		// A campaign item failed and is GENUINELY STUCK (#1838): its dependencies
@@ -2016,7 +2126,7 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 		// the operator can resolve it manually. NOTE: a stuck failed item no longer
 		// blocks dispatch of still-actionable siblings — start_run/resume outrank
 		// this arm, so attention fires only when nothing else is dispatchable.
-		return &NextActions{
+		attention := &NextActions{
 			State: "campaign_attention",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_get_run_status",
@@ -2026,6 +2136,8 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 				Reason:       "campaign item " + na.IssueRef + " failed and is not auto-restartable — read its run and resolve it manually; still-actionable siblings are surfaced first, so this fires only when no eligible/restartable/paused work remains",
 			}},
 		}
+		foldCampaignProductIssueSuggestion(rollup, na, items, attention)
+		return attention
 	case "resume":
 		// The auto-driver paged a human at a run gate (E25.7) and the campaign
 		// (or an item) is paused. Hand it back with fishhawk_resume_campaign
@@ -2126,7 +2238,7 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 		if na.IssueRef != "" {
 			reason = "campaign item " + na.IssueRef + " is unfinished but the campaign is closed (terminal) and can start no further item runs — drive the issue standalone with fishhawk_start_run; the campaign will NOT track its outcome"
 		}
-		return &NextActions{
+		closed := &NextActions{
 			State: "campaign_closed",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_start_run",
@@ -2136,9 +2248,42 @@ func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextA
 				Reason:       reason,
 			}},
 		}
+		foldCampaignProductIssueSuggestion(rollup, na, items, closed)
+		return closed
 	default:
 		return campaignUnclassifiedNextActions(na)
 	}
+}
+
+// foldCampaignProductIssueSuggestion appends the operator-gated filing
+// suggestion (E32.11 / #1737) as the LAST action on the campaign arms whose
+// item is genuinely stuck — attention (a failed/cancelled item with no
+// auto-restart path) and closed (the campaign went terminal with the item
+// unfinished). The suggestion is pre-populated with the STUCK ITEM'S OWN run
+// id, so the bundle the report carries is the wedged run's, not the campaign's.
+//
+// It emits NOTHING when no item matches na.IssueRef or the matched item carries
+// no run id: fishhawk_report_product_issue REQUIRES a run, so an action whose
+// run_id param is empty would be unusable — worse than no suggestion at all.
+// THAT run-id presence check is the control TestCampaignNextActions_NoFilingWithoutRunID
+// guards; delete it and the test goes red on an empty run_id param.
+func foldCampaignProductIssueSuggestion(rollup CampaignRollup, na CampaignNextAction, items []CampaignItem, out *NextActions) {
+	if out == nil || na.IssueRef == "" {
+		return
+	}
+	var item *CampaignItem
+	for i := range items {
+		if items[i].IssueRef == na.IssueRef {
+			item = &items[i]
+			break
+		}
+	}
+	if item == nil || item.RunID == "" {
+		return
+	}
+	out.Actions = append(out.Actions, productIssueAction(item.RunID, fmt.Sprintf(
+		"campaign item %s is %s with no forward path inside the campaign, and %d dependent item(s) stay blocked behind it",
+		na.IssueRef, item.State, len(rollup.Blocked))))
 }
 
 // campaignUnclassifiedNextActions is the labeled fallback for any campaign
@@ -2158,12 +2303,15 @@ func campaignUnclassifiedNextActions(na CampaignNextAction) *NextActions {
 				Consumes:     consumesNone,
 				Reason:       desc + " did not match the campaign next-actions classifier — re-poll while the campaign settles",
 			},
-			{
-				Action:       "file_product_issue",
-				Precondition: "the action persists across polls",
-				Consumes:     consumesNone,
-				Reason:       "the campaign classifier has no arm for " + desc + "; file a Fishhawk issue naming it so the classifier gains one",
-			},
+			// Same one-verb consolidation as the run-level fallback
+			// (E32.11 / #1737). No run id is resolvable from a bare
+			// CampaignNextAction, so run_id carries the FIELD-PATH POINTER
+			// telling the caller where to read one — the arm is the
+			// classifier's own defect and must keep offering a filing move,
+			// so dropping it (the empty-run-id rule the attention/closed arms
+			// follow) would regress the surface.
+			productIssueAction("campaign.items[].run_id",
+				"the campaign classifier has no arm for "+desc+", so the classifier itself is the defect — file a Fishhawk issue naming the action so it gains one"),
 		},
 	}
 }

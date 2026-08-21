@@ -204,16 +204,16 @@ func TestNextActions_StateTable(t *testing.T) {
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "scope drift")},
 			wantState:    "implement_failed_category_b",
-			wantActions:  []string{"fishhawk_resume_run"},
-			wantConsumes: []string{consumesNewRun},
+			wantActions:  []string{"fishhawk_resume_run", "fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNewRun, consumesNone},
 		},
 		{
 			name:         "d_category_b_without_plan_fresh_run",
 			run:          naRun("failed"),
 			stages:       []Stage{naFailedImplement("B", "scope drift")},
 			wantState:    "implement_failed_category_b",
-			wantActions:  []string{"fishhawk_start_run"},
-			wantConsumes: []string{consumesNewRun},
+			wantActions:  []string{"fishhawk_start_run", "fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNewRun, consumesNone},
 		},
 		{
 			// #1081: a failed decomposition child (parent_run_id set,
@@ -224,8 +224,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			run:          naDecompChild(),
 			stages:       []Stage{naFailedImplement("B", "scope drift")},
 			wantState:    "implement_failed_category_b_decomposition_child",
-			wantActions:  []string{"fishhawk_resume_run"},
-			wantConsumes: []string{consumesNone},
+			wantActions:  []string{"fishhawk_resume_run", "fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNone, consumesNone},
 		},
 		{
 			// A CI-retry child (parent_run_id set, plan-less BUT carrying a
@@ -235,8 +235,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			run:          naDecompChild(),
 			stages:       []Stage{naFailedImplement("B", "scope drift"), naStage("review", "pending")},
 			wantState:    "implement_failed_category_b",
-			wantActions:  []string{"fishhawk_start_run"},
-			wantConsumes: []string{consumesNewRun},
+			wantActions:  []string{"fishhawk_start_run", "fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNewRun, consumesNone},
 		},
 		{
 			// #1915: the category-A arm now also offers fishhawk_revive_run (the
@@ -263,8 +263,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("C", "infra")},
 			wantState:    "implement_failed",
-			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_revive_run", "fishhawk_cancel_run"},
-			wantConsumes: []string{consumesRetryBudget, consumesRetryBudget, consumesNone},
+			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_revive_run", "fishhawk_cancel_run", "fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesRetryBudget, consumesRetryBudget, consumesNone, consumesNone},
 		},
 		{
 			name:         "g_implement_review_pending_repoll",
@@ -388,18 +388,23 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone},
 		},
 		{
-			name:        "k_terminal_failed_no_recovery_arm",
-			run:         naRun("failed"),
-			stages:      []Stage{naStage("plan", "failed")},
-			wantState:   "failed",
-			wantActions: nil,
+			// E32.11 / #1737: this arm used to return ZERO actions. A
+			// terminal failed run with no recovery arm now carries the
+			// operator-gated filing suggestion — the only legal move left.
+			name:         "k_terminal_failed_no_recovery_arm",
+			run:          naRun("failed"),
+			stages:       []Stage{naStage("plan", "failed")},
+			wantState:    "failed",
+			wantActions:  []string{"fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNone},
 		},
 		{
-			name:        "k_terminal_cancelled",
-			run:         naRun("cancelled"),
-			stages:      []Stage{naStage("plan", "succeeded"), naStage("implement", "cancelled")},
-			wantState:   "cancelled",
-			wantActions: nil,
+			name:         "k_terminal_cancelled",
+			run:          naRun("cancelled"),
+			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "cancelled")},
+			wantState:    "cancelled",
+			wantActions:  []string{"fishhawk_report_product_issue"},
+			wantConsumes: []string{consumesNone},
 		},
 		{
 			name:        "k_terminal_succeeded_no_pr",
@@ -729,9 +734,20 @@ func TestNextActions_UnclassifiedFallback(t *testing.T) {
 	if !strings.Contains(poll.Reason, `"running"`) {
 		t.Errorf("re-poll reason should name the run state; got %q", poll.Reason)
 	}
-	issue := findAction(t, na, "file_product_issue")
+	// E32.11 / #1737: the bare file_product_issue ritual step is retired onto
+	// the real fishhawk_report_product_issue tool verb, pre-populated with the
+	// run id and kind.
+	issue := findAction(t, na, "fishhawk_report_product_issue")
 	if !strings.Contains(issue.Reason, "review=succeeded") {
-		t.Errorf("file_product_issue reason should name the unmatched stage shape; got %q", issue.Reason)
+		t.Errorf("filing reason should name the unmatched stage shape; got %q", issue.Reason)
+	}
+	if issue.Params["run_id"] != run.ID || issue.Params["kind"] != "bug" {
+		t.Errorf("filing params = %v, want run_id=%s kind=bug", issue.Params, run.ID)
+	}
+	for _, a := range na.Actions {
+		if a.Action == "file_product_issue" {
+			t.Errorf("the legacy bare file_product_issue ritual step is still emitted: %+v", a)
+		}
 	}
 }
 
@@ -1107,8 +1123,10 @@ func TestNextActions_CIFailedUnroutable(t *testing.T) {
 	if na.State != "ci_failed_unroutable" {
 		t.Fatalf("state = %q, want ci_failed_unroutable", na.State)
 	}
-	if got := actionNames(na); len(got) != 3 || got[0] != "commit_and_vouch" || got[1] != "rerun_ci_checks" || got[2] != "page_human" {
-		t.Fatalf("actions = %v, want [commit_and_vouch rerun_ci_checks page_human]", got)
+	// E32.11 / #1737: the filing suggestion is appended LAST, after the three
+	// remediation moves — the recovery move still leads.
+	if got := actionNames(na); len(got) != 4 || got[0] != "commit_and_vouch" || got[1] != "rerun_ci_checks" || got[2] != "page_human" || got[3] != "fishhawk_report_product_issue" {
+		t.Fatalf("actions = %v, want [commit_and_vouch rerun_ci_checks page_human fishhawk_report_product_issue]", got)
 	}
 	for i, a := range na.Actions {
 		if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
@@ -1515,7 +1533,7 @@ func caNextAction(action, issueRef string) CampaignNextAction {
 }
 
 func TestCampaignNextActionsFor_Attention(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{Failed: []string{"#27"}}, caNextAction("attention", "#27"))
+	na := campaignNextActionsFor(CampaignRollup{Failed: []string{"#27"}}, caNextAction("attention", "#27"), nil)
 	if na.State != "campaign_attention" {
 		t.Errorf("State = %q, want campaign_attention", na.State)
 	}
@@ -1546,7 +1564,7 @@ func TestCampaignNextActionsFor_Attention(t *testing.T) {
 }
 
 func TestCampaignNextActionsFor_Resume(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{Paused: []string{"#28"}}, caNextAction("resume", "#28"))
+	na := campaignNextActionsFor(CampaignRollup{Paused: []string{"#28"}}, caNextAction("resume", "#28"), nil)
 	if na.State != "campaign_paused" {
 		t.Errorf("State = %q, want campaign_paused", na.State)
 	}
@@ -1565,7 +1583,7 @@ func TestCampaignNextActionsFor_Resume(t *testing.T) {
 // on the issue ref advances the campaign. The restart verb is reserved for the
 // restartable path (TestCampaignNextActionsFor_StartRun_Restartable).
 func TestCampaignNextActionsFor_StartRun(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{Eligible: []string{"#26"}}, caNextAction("start_run", "#26"))
+	na := campaignNextActionsFor(CampaignRollup{Eligible: []string{"#26"}}, caNextAction("start_run", "#26"), nil)
 	if na.State != "campaign_start_run" {
 		t.Errorf("State = %q, want campaign_start_run", na.State)
 	}
@@ -1592,7 +1610,7 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
 	// Restartable items are folded into the wire cancelled slice
 	// (toCampaignRollupPayload).
-	na := campaignNextActionsFor(CampaignRollup{Cancelled: []string{"#40"}}, caNextAction("start_run", "#40"))
+	na := campaignNextActionsFor(CampaignRollup{Cancelled: []string{"#40"}}, caNextAction("start_run", "#40"), nil)
 	if na.State != "campaign_start_run" {
 		t.Errorf("State = %q, want campaign_start_run", na.State)
 	}
@@ -1621,7 +1639,7 @@ func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
 // fallback) with a non-dispatch, page-the-human suggested action that consumes
 // nothing — the operator-agent must lead the item by hand, not mint a run.
 func TestCampaignNextActionsFor_AttendHumanLed(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{HumanLed: []string{"#12"}}, caNextAction("attend_human_led", "#12"))
+	na := campaignNextActionsFor(CampaignRollup{HumanLed: []string{"#12"}}, caNextAction("attend_human_led", "#12"), nil)
 	if na.State != "campaign_attend_human_led" {
 		t.Errorf("State = %q, want campaign_attend_human_led", na.State)
 	}
@@ -1647,7 +1665,7 @@ func TestCampaignNextActionsFor_AttendHumanLed(t *testing.T) {
 }
 
 func TestCampaignNextActionsFor_Wait(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{Running: []string{"#29"}}, caNextAction("wait", ""))
+	na := campaignNextActionsFor(CampaignRollup{Running: []string{"#29"}}, caNextAction("wait", ""), nil)
 	if na.State != "campaign_wait" {
 		t.Errorf("State = %q, want campaign_wait", na.State)
 	}
@@ -1661,7 +1679,7 @@ func TestCampaignNextActionsFor_Wait(t *testing.T) {
 }
 
 func TestCampaignNextActionsFor_Complete_TerminalNoActions(t *testing.T) {
-	na := campaignNextActionsFor(CampaignRollup{Done: []string{"#26", "#27"}}, caNextAction("complete", ""))
+	na := campaignNextActionsFor(CampaignRollup{Done: []string{"#26", "#27"}}, caNextAction("complete", ""), nil)
 	if na.State != "campaign_complete" {
 		t.Errorf("State = %q, want campaign_complete", na.State)
 	}
@@ -1677,7 +1695,7 @@ func TestCampaignNextActionsFor_Complete_TerminalNoActions(t *testing.T) {
 func TestCampaignNextActionsFor_Closed(t *testing.T) {
 	na := campaignNextActionsFor(
 		CampaignRollup{Done: []string{"#26"}, Cancelled: []string{"#29"}},
-		caNextAction("closed", "issue:29"))
+		caNextAction("closed", "issue:29"), nil)
 	if na.State != "campaign_closed" {
 		t.Fatalf("State = %q, want campaign_closed", na.State)
 	}
@@ -1703,7 +1721,7 @@ func TestCampaignNextActionsFor_Closed(t *testing.T) {
 
 	// A closed campaign with no stranded ref still carries the action (the
 	// "never unclassified" structural invariant) with empty params.
-	bare := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", ""))
+	bare := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", ""), nil)
 	if bare.State != "campaign_closed" || len(bare.Actions) != 1 {
 		t.Fatalf("refless closed = %+v, want campaign_closed with 1 action", bare)
 	}
@@ -1718,10 +1736,10 @@ func TestCampaignNextActionsFor_Closed(t *testing.T) {
 // never returns an empty/unrouted result for a non-complete campaign. `closed`
 // is asserted NOT to land here (it has its own arm as of #2681).
 func TestCampaignNextActionsFor_UnknownAction_Unclassified(t *testing.T) {
-	if got := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", "#99")); got.State == "campaign_unclassified" {
+	if got := campaignNextActionsFor(CampaignRollup{}, caNextAction("closed", "#99"), nil); got.State == "campaign_unclassified" {
 		t.Errorf("closed classified as %q, want its own campaign_closed arm", got.State)
 	}
-	na := campaignNextActionsFor(CampaignRollup{}, caNextAction("teleport", "#99"))
+	na := campaignNextActionsFor(CampaignRollup{}, caNextAction("teleport", "#99"), nil)
 	if na.State != "campaign_unclassified" {
 		t.Errorf("State = %q, want campaign_unclassified", na.State)
 	}
@@ -1734,12 +1752,18 @@ func TestCampaignNextActionsFor_UnknownAction_Unclassified(t *testing.T) {
 		switch n {
 		case "fishhawk_get_campaign_status":
 			sawPoll = true
-		case "file_product_issue":
+		case "fishhawk_report_product_issue":
 			sawFile = true
 		}
 	}
 	if !sawPoll || !sawFile {
-		t.Errorf("unclassified actions = %v, want both a re-poll and file_product_issue", names)
+		t.Errorf("unclassified actions = %v, want both a re-poll and fishhawk_report_product_issue", names)
+	}
+	// No run id is resolvable from a bare CampaignNextAction, so run_id carries
+	// the field-path POINTER rather than an unusable empty string.
+	filing := findAction(t, na, "fishhawk_report_product_issue")
+	if filing.Params["run_id"] != "campaign.items[].run_id" {
+		t.Errorf("campaign fallback filing run_id = %q, want the campaign.items[].run_id field-path pointer", filing.Params["run_id"])
 	}
 }
 
@@ -3482,5 +3506,336 @@ func TestFailureSignatureAnchorsMatchNextActionsPhrases(t *testing.T) {
 	}
 	if len(flakeTraceEvents) != 1 || flakeTraceEvents[0] != failuresig.AnchorVerifyInfraFlake {
 		t.Errorf("flakeTraceEvents = %v, registry anchor = %q", flakeTraceEvents, failuresig.AnchorVerifyInfraFlake)
+	}
+}
+
+// --- product-directed discovery filing (E32.11 / #1737) --------------------
+
+// wantFilingLast asserts the operator-gated filing suggestion is present, is
+// the LAST entry (so the recovery move still leads), and is pre-populated with
+// the run id + kind the real tool takes.
+func wantFilingLast(t *testing.T, na *NextActions, runID string) SuggestedAction {
+	t.Helper()
+	names := actionNames(na)
+	if len(names) == 0 {
+		t.Fatalf("actions empty, want a %s suggestion", "fishhawk_report_product_issue")
+	}
+	if last := names[len(names)-1]; last != "fishhawk_report_product_issue" {
+		t.Fatalf("actions = %v, want fishhawk_report_product_issue LAST (the recovery move must lead)", names)
+	}
+	got := na.Actions[len(na.Actions)-1]
+	if got.Params["run_id"] != runID {
+		t.Errorf("filing run_id = %q, want the run id %q", got.Params["run_id"], runID)
+	}
+	if got.Params["kind"] != "bug" {
+		t.Errorf("filing kind = %q, want bug", got.Params["kind"])
+	}
+	// Only params ReportProductIssueInput actually accepts.
+	for k := range got.Params {
+		switch k {
+		case "run_id", "kind", "description", "include_free_text":
+		default:
+			t.Errorf("filing params carry %q, which fishhawk_report_product_issue does not accept", k)
+		}
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("filing consumes = %q, want none", got.Consumes)
+	}
+	if got.Precondition != productIssueFilingPrecondition {
+		t.Errorf("filing precondition = %q, want the single shared operator-gated wording", got.Precondition)
+	}
+	return got
+}
+
+// TestNextActions_ProductIssueFilingArms is the done-means behavioral table
+// (#1737): every failure arm the issue enumerates emits the pre-populated
+// fishhawk_report_product_issue suggestion, LAST, with a reason naming the
+// failing stage type and its failure category. It asserts SHIPPED output, so a
+// comment-only touch of next_actions.go fails it.
+func TestNextActions_ProductIssueFilingArms(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	cases := []struct {
+		name       string
+		run        *Run
+		stages     []Stage
+		hint       *ReviewActionHint
+		implRS     *ReviewStatus
+		drive      *DriveStatus
+		wantState  string
+		wantReason []string // substrings the evidence anchor must carry
+	}{
+		{
+			name:       "category_b_plan_succeeded",
+			run:        naRun("failed"),
+			stages:     []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "scope drift")},
+			wantState:  "implement_failed_category_b",
+			wantReason: []string{"implement", "category B"},
+		},
+		{
+			name:       "category_b_no_resumable_plan",
+			run:        naRun("failed"),
+			stages:     []Stage{naFailedImplement("B", "scope drift")},
+			wantState:  "implement_failed_category_b",
+			wantReason: []string{"implement", "category B"},
+		},
+		{
+			name:       "category_b_decomposition_child",
+			run:        naDecompChild(),
+			stages:     []Stage{naFailedImplement("B", "scope drift")},
+			wantState:  "implement_failed_category_b_decomposition_child",
+			wantReason: []string{"implement", "category B"},
+		},
+		{
+			name: "slice_integration_conflict",
+			run:  naRun("failed"),
+			stages: []Stage{
+				naStage("plan", "succeeded"),
+				naFailedImplement("B", "slice integration conflict: slice 2 could not merge"),
+				naStage("review", "pending"),
+			},
+			wantState:  "slices_integration_conflict",
+			wantReason: []string{"implement", "category B"},
+		},
+		{
+			name:       "category_c_default_arm",
+			run:        naRun("failed"),
+			stages:     []Stage{naStage("plan", "succeeded"), naFailedImplement("C", "infra")},
+			wantState:  "implement_failed",
+			wantReason: []string{"implement", "category C"},
+		},
+		{
+			name:       "category_d_default_arm",
+			run:        naRun("failed"),
+			stages:     []Stage{naStage("plan", "succeeded"), naFailedImplement("D", "unknown")},
+			wantState:  "implement_failed",
+			wantReason: []string{"implement", "category D"},
+		},
+		{
+			// The arm that returned ZERO actions before #1737.
+			name:       "terminal_failed_no_recovery_arm",
+			run:        naRun("failed"),
+			stages:     []Stage{naStage("plan", "failed")},
+			wantState:  "failed",
+			wantReason: []string{"plan", "category unclassified"},
+		},
+		{
+			name:       "terminal_cancelled",
+			run:        naRun("cancelled"),
+			stages:     []Stage{naStage("plan", "succeeded"), naStage("implement", "cancelled")},
+			wantState:  "cancelled",
+			wantReason: []string{"cancelled"},
+		},
+		{
+			name: "ci_failed_routable",
+			run: func() *Run {
+				r := naRun("running")
+				r.PullRequestURL = &prURL
+				return r
+			}(),
+			stages:     []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")},
+			hint:       &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1},
+			implRS:     naReviewStatus("implement", "complete"),
+			drive:      &DriveStatus{Drive: true, DerivedStatus: "ci_failed"},
+			wantState:  "ci_failed_routable",
+			wantReason: []string{"ci_failed_routable"},
+		},
+		{
+			name: "ci_failed_unroutable",
+			run: func() *Run {
+				r := naRun("running")
+				r.PullRequestURL = &prURL
+				return r
+			}(),
+			stages:     []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")},
+			implRS:     naReviewStatus("implement", "complete"),
+			drive:      &DriveStatus{Drive: true, DerivedStatus: "ci_failed"},
+			wantState:  "ci_failed_unroutable",
+			wantReason: []string{"ci_failed_unroutable"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(tc.run, tc.stages, nil, tc.implRS, tc.hint, tc.drive, false, false, false, "", "", releaseSignals{})
+			if na == nil || na.State != tc.wantState {
+				t.Fatalf("state = %+v, want %q", na, tc.wantState)
+			}
+			got := wantFilingLast(t, na, tc.run.ID)
+			for _, want := range tc.wantReason {
+				if !strings.Contains(got.Reason, want) {
+					t.Errorf("filing reason = %q, want it to carry %q", got.Reason, want)
+				}
+			}
+			// The bundle-is-auto-collected anchor: the operator must not think
+			// they have to hand-assemble evidence.
+			if !strings.Contains(got.Reason, "product-facts bundle") {
+				t.Errorf("filing reason = %q, want it to name the auto-collected product-facts bundle", got.Reason)
+			}
+			// Anti-noise: the precondition must read as a conditional
+			// judgement call, never as a default recommendation.
+			if !strings.Contains(got.Precondition, "OPERATOR JUDGEMENT") || !strings.Contains(got.Precondition, "product friction") {
+				t.Errorf("filing precondition = %q, want the operator-gated product-friction wording", got.Precondition)
+			}
+		})
+	}
+}
+
+// TestNextActions_NoFilingSuggestionOnHealthyRun is the ANTI-NOISE
+// COUNTERFACTUAL (#1737): healthy run shapes carry NO filing suggestion.
+//
+// The control is productIssueFilingState — the closed failure-shape set
+// foldProductIssueSuggestion consults. Delete it (append the suggestion
+// unconditionally) and this test goes RED on every case below.
+//
+// implement_failed_category_a is included deliberately: an agent/harness
+// failure routes to retry and the failure-signature registry (#1703) already
+// names its recovery, so a filing nudge there would be noise.
+func TestNextActions_NoFilingSuggestionOnHealthyRun(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	succeeded := naRun("succeeded")
+	succeeded.PullRequestURL = &prURL
+
+	cases := []struct {
+		name      string
+		run       *Run
+		stages    []Stage
+		wantState string
+	}{
+		{
+			name:      "succeeded_pr_open",
+			run:       succeeded,
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},
+			wantState: "succeeded_pr_open",
+		},
+		{
+			name:      "implement_running",
+			run:       naRun("running"),
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "running")},
+			wantState: "implement_running",
+		},
+		{
+			name:      "plan_gate_parked",
+			run:       naRun("running"),
+			stages:    []Stage{naStage("plan", "awaiting_approval")},
+			wantState: "plan_gate_parked",
+		},
+		{
+			name:      "terminal_succeeded_no_pr",
+			run:       naRun("succeeded"),
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},
+			wantState: "succeeded",
+		},
+		{
+			name:      "implement_failed_category_a",
+			run:       naRun("failed"),
+			stages:    []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "agent crashed")},
+			wantState: "implement_failed_category_a",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(tc.run, tc.stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+			if na == nil || na.State != tc.wantState {
+				t.Fatalf("state = %+v, want %q", na, tc.wantState)
+			}
+			for _, a := range na.Actions {
+				if a.Action == "fishhawk_report_product_issue" {
+					t.Errorf("healthy state %q carries a filing suggestion %+v — the anti-noise contract is broken", tc.wantState, a)
+				}
+			}
+		})
+	}
+}
+
+// TestCampaignNextActions_FilingOnStuckItem pins the campaign arms (#1737):
+// a stuck attention item and a stranded closed item each carry the filing
+// suggestion LAST, pre-populated with the STUCK ITEM'S OWN run id, with a
+// reason naming the item state and the blocked-dependent count.
+func TestCampaignNextActions_FilingOnStuckItem(t *testing.T) {
+	runID := uuid.NewString()
+	items := []CampaignItem{
+		{ID: uuid.NewString(), IssueRef: "#27", RunID: runID, State: "failed"},
+		{ID: uuid.NewString(), IssueRef: "#28", State: "blocked", DependsOn: []string{"#27"}},
+		{ID: uuid.NewString(), IssueRef: "#29", State: "blocked", DependsOn: []string{"#27"}},
+	}
+	rollup := CampaignRollup{Failed: []string{"#27"}, Blocked: []string{"#28", "#29"}}
+
+	for _, action := range []string{"attention", "closed"} {
+		t.Run(action, func(t *testing.T) {
+			na := campaignNextActionsFor(rollup, caNextAction(action, "#27"), items)
+			got := wantFilingLast(t, na, runID)
+			for _, want := range []string{"#27", "failed", "2 dependent item(s)"} {
+				if !strings.Contains(got.Reason, want) {
+					t.Errorf("campaign filing reason = %q, want it to carry %q", got.Reason, want)
+				}
+			}
+			// The recovery move still leads.
+			if na.Actions[0].Action == "fishhawk_report_product_issue" {
+				t.Errorf("filing suggestion leads the %s arm; the recovery move must", action)
+			}
+		})
+	}
+}
+
+// TestCampaignNextActions_NoFilingWithoutRunID is the campaign COUNTERFACTUAL
+// (#1737): fishhawk_report_product_issue REQUIRES a run, so a stuck item that
+// carries NO run id (never dispatched) must emit NO filing suggestion — an
+// action whose run_id param is empty is unusable.
+//
+// The control is the `item.RunID == ""` presence check in
+// foldCampaignProductIssueSuggestion. Delete it and this test goes RED with a
+// filing action whose run_id is empty.
+func TestCampaignNextActions_NoFilingWithoutRunID(t *testing.T) {
+	rollup := CampaignRollup{Failed: []string{"#27"}, Blocked: []string{"#28"}}
+	cases := []struct {
+		name  string
+		items []CampaignItem
+	}{
+		{
+			name:  "item_matches_but_carries_no_run_id",
+			items: []CampaignItem{{ID: uuid.NewString(), IssueRef: "#27", State: "failed"}},
+		},
+		{
+			name:  "no_item_matches_the_issue_ref",
+			items: []CampaignItem{{ID: uuid.NewString(), IssueRef: "#99", RunID: uuid.NewString(), State: "failed"}},
+		},
+		{
+			name:  "no_items_at_all",
+			items: nil,
+		},
+	}
+	for _, tc := range cases {
+		for _, action := range []string{"attention", "closed"} {
+			t.Run(tc.name+"_"+action, func(t *testing.T) {
+				na := campaignNextActionsFor(rollup, caNextAction(action, "#27"), tc.items)
+				if len(na.Actions) == 0 {
+					t.Fatal("the arm must still carry its recovery action")
+				}
+				for _, a := range na.Actions {
+					if a.Action == "fishhawk_report_product_issue" {
+						t.Errorf("emitted an unusable filing suggestion %+v — run_id is %q", a, a.Params["run_id"])
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestCampaignNextActions_NoFilingOnHealthyArms is the campaign anti-noise
+// control: the arms that are NOT a stuck-item shape (resume/start_run/
+// attend_human_led/wait/complete) never carry a filing suggestion, even when
+// the matching item carries a run id.
+func TestCampaignNextActions_NoFilingOnHealthyArms(t *testing.T) {
+	items := []CampaignItem{{ID: uuid.NewString(), IssueRef: "#27", RunID: uuid.NewString(), State: "running"}}
+	for _, action := range []string{"resume", "start_run", "attend_human_led", "wait", "complete"} {
+		t.Run(action, func(t *testing.T) {
+			na := campaignNextActionsFor(CampaignRollup{Running: []string{"#27"}}, caNextAction(action, "#27"), items)
+			for _, a := range na.Actions {
+				if a.Action == "fishhawk_report_product_issue" {
+					t.Errorf("campaign arm %q carries a filing suggestion %+v — anti-noise contract broken", action, a)
+				}
+			}
+		})
 	}
 }

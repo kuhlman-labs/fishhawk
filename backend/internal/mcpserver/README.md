@@ -524,9 +524,9 @@ Every arm that advertises a `fishhawk_get_run_status` poll uses the SAME derived
 
 `fishhawk_get_run_status` and the run-terminal `fishhawk_run_stage` result both carry a `next_actions` block — the generalization of `review_action_hint` (#777/#860) across the whole run lifecycle. The classifier (`next_actions.go`) is a pure function over data the tools already fetch (run row, stage rows, review statuses, the computed hint, the drive read view): no extra backend round-trip, no new endpoint.
 
-Shape: `{state, actions[]}`. `state` is the classified lifecycle state (`plan_gate_parked`, `implement_failed_category_b`, `implement_concerns_open`, `succeeded_pr_open`, `succeeded_merged`, …; terminal runs name the run state with no actions; an unmatched non-terminal state classifies `unclassified`). Each action entry carries:
+Shape: `{state, actions[]}`. `state` is the classified lifecycle state (`plan_gate_parked`, `implement_failed_category_b`, `implement_concerns_open`, `succeeded_pr_open`, `succeeded_merged`, …; a terminal SUCCESS-shaped run names the run state with no actions, while a terminal `failed`/`cancelled` run carries the product-directed filing suggestion below; an unmatched non-terminal state classifies `unclassified`). Each action entry carries:
 
-- `action` — the tool to call (`fishhawk_resume_run`, `fishhawk_fixup_stage`, …) or a named ritual step outside the MCP surface (`approve_pr`, `merge_pr`, `post_merge`, `merge_and_file_follow_up`, `file_product_issue`);
+- `action` — the tool to call (`fishhawk_resume_run`, `fishhawk_fixup_stage`, `fishhawk_report_product_issue`, …) or a named ritual step outside the MCP surface (`approve_pr`, `merge_pr`, `post_merge`, `merge_and_file_follow_up`);
 - `params` — key parameters (`run_id`, `stage_id`, `parent_run_id`, the `concern_ids` source);
 - `precondition` — when the action is legal;
 - `consumes` — what taking it spends: `none` | `fixup_budget` | `retry_budget` | `approval_slot` | `new_run`;
@@ -536,7 +536,8 @@ Invariants:
 
 - **Display-only, never gates** — like the periodic-budget block and the hint it generalizes, the block is advisory; the server-side applicability predicates stay authoritative.
 - **A matched failure carries a recovery hint** (E22.X / [#1703](https://github.com/kuhlman-labs/fishhawk/issues/1703)). See [The failure-signature block](#the-failure-signature-block-next_actionssignature-1703) below.
-- **A non-terminal run always carries ≥ 1 action.** Any state the table does not match falls back to `unclassified` (re-poll + file a product issue naming the state), structurally — never an empty list.
+- **A non-terminal run always carries ≥ 1 action.** Any state the table does not match falls back to `unclassified` (re-poll + `fishhawk_report_product_issue` naming the state), structurally — never an empty list.
+- **A failure shape carries a product-directed filing suggestion** (E32.11 / [#1737](https://github.com/kuhlman-labs/fishhawk/issues/1737)). See [The product-directed filing suggestion](#the-product-directed-filing-suggestion-fishhawk_report_product_issue-1737) below.
 - **The concern arm derives from the hint computation** (`ReviewActionHint.suggestedActions`), so `review_action_hint` and `next_actions` cannot disagree on the remaining fix-up budget or override availability.
 - **Drive folds first**: on drive-enabled runs the `drive_status.next_action` is prepended, so drive and `next_actions` never point different ways.
 - **Decomposed parent at `awaiting_children`** (#1147) classifies `implement_awaiting_children` — a dedicated arm offering `fishhawk_run_children` (fan out the still-pending children) plus a poll pointing at the `children_status` block for each child's live state and the fan-in/integration phase.
@@ -558,6 +559,21 @@ Invariants:
 - **Constant-size.** `failuresig.Hint` echoes only registry-owned strings — never the failure reason — which is what licenses classifying `next_actions.signature` **`tierNever`** in the response byte ladder (`bound.go`). The diagnosis skeleton and the constant-size floor both rebuild `next_actions` without it, so neither is enlarged.
 - **Folded on BOTH return paths** — the general classifier and the `ci_failed` early return — and AFTER the structural empty-actions guard, so that guard keeps measuring the classifier's own actions.
 - **The diagnosis stage is the FIRST stage in state `failed`** (stages are sequence-ordered, so the earliest failure explains the run). A nil run, an empty stage slice, or no failed stage yields no block.
+
+### The product-directed filing suggestion (`fishhawk_report_product_issue`, #1737)
+
+Discovery filing used to be convention-driven: `fishhawk_report_product_issue` existed ([#1006](https://github.com/kuhlman-labs/fishhawk/issues/1006)) but nothing routed an operator to it, so a wedged run offered retry/attend/wait and filing depended on operator vigilance. The failure arms now fold in a **pre-populated** `fishhawk_report_product_issue` suggestion, so filing is one accepted suggestion rather than a remembered ritual — the FILING counterpart to the RECOVERY hints the [failure-signature registry](../failuresig/README.md) produces (#1703).
+
+Emitted on exactly this closed set of classified states (`productIssueFilingStates`): `implement_failed_category_b`, `implement_failed_category_b_decomposition_child`, `slices_integration_conflict`, `implement_failed` (the category-C/D default arm), `ci_failed_routable`, `ci_failed_unroutable`, and the terminal `failed` / `cancelled` arm — which before this carried **zero** actions.
+
+Invariants:
+
+- **Operator-gated, never automatic.** Nothing files anything: the entry is display-only, and its `precondition` is a single shared string reading as a conditional judgement call ("file only when this failure looks like Fishhawk product friction … rather than a defect in the task itself"), deliberately naming category-B as usually the latter so the surface never reads as a default recommendation.
+- **Appended LAST**, after the drive fold, the structural empty-actions guard and the live-validation advisory — the RECOVERY move always leads. `TestNextActions_ProductIssueFilingArms` pins the position on every arm.
+- **Silent on healthy runs.** `productIssueFilingState` is the control: `TestNextActions_NoFilingSuggestionOnHealthyRun` drives `succeeded_pr_open`, `implement_running`, `plan_gate_parked`, terminal `succeeded` and `implement_failed_category_a` and asserts no filing entry. **`implement_failed_category_a` is excluded deliberately** — an agent/harness fault routes to retry and the signature registry already names its recovery, so a filing nudge there would be noise.
+- **Only real tool params.** `params` carries `run_id` + `kind: bug` — parameters `ReportProductIssueInput` actually accepts. Inventing (say) a `failure_category` param would hand the agent an argument the tool refuses.
+- **ONE filing verb.** The bare `file_product_issue` ritual step is retired onto the real tool verb in both legacy emissions (the run-level and campaign-level `unclassified` fallbacks), the same consolidation `merge_pr` → `fishhawk_merge_run` made (E48.7 / #1954).
+- **`NextActions.Actions` is nil only on a terminal SUCCESS-shaped state**, no longer on every terminal state.
 
 **Single source for the failure-reason literals.** `externalAPIReasonPhrase`, `quotaUnavailableReasonPhrase`, `sliceIntegrationConflictReasonPrefix` and `flakeTraceEvents` are now SOURCED FROM `failuresig.Anchor*` rather than declared here. Two literals for one contract would drift silently — the hint stops matching while the surrounding action still fires, presenting to the operator as "no signature matched", which is the worst failure shape this feature has. `TestFailureSignatureAnchorsMatchNextActionsPhrases` fails if a local re-declaration ever diverges.
 
@@ -1636,6 +1652,14 @@ per-tool contract). Internals not covered there:
   would refuse — and its reason states the campaign will NOT track that run's outcome. Unlike `complete` (terminal, nil
   actions) this arm carries an action: there IS work left, just not campaign-tracked work. `closed` is in the
   classifier's enumerated closed set, so it no longer falls through to the `campaign_unclassified` fallback.
+  The `attention` and `closed` arms additionally carry the operator-gated `fishhawk_report_product_issue` filing
+  suggestion LAST (E32.11 / #1737), pre-populated with the STUCK ITEM'S OWN `run_id` (resolved from the campaign's
+  `items`, not the campaign) and a reason naming the item state plus the blocked-dependent count. It is emitted ONLY
+  when an item matches `next_action.issue_ref` AND carries a run id — `fishhawk_report_product_issue` requires a run,
+  so an unusable empty-`run_id` entry is worse than none. The `campaign_unclassified` fallback is the one exception:
+  no run is resolvable from a bare `next_action`, so its `run_id` carries the `campaign.items[].run_id` FIELD-PATH
+  POINTER (the same idiom `concern_ids` uses) rather than being dropped — that arm's whole point is that the
+  classifier itself is the defect.
 - **`fishhawk_cancel_campaign` (E25.20 / #2355).** `campaign_id` only. Marks the campaign AND every unfinished
   (non-terminal) item `cancelled` so an abandoned/rebuilt campaign stops showing as live work in the campaign list;
   it does NOT cancel the linked RUNS (`fishhawk_cancel_run` owns that). Idempotent + convergent — re-invoking after a
