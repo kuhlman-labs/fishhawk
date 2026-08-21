@@ -72,6 +72,12 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		// and treats a short-circuited run as blocked (or as a pass).
 		"acceptance_not_validated",
 		"acknowledge that in your merge verdict",
+		// #2512: the same argument for the undecidable state. An operator whose
+		// onboarding guide omits it reads a merge-eligible run as blocked and
+		// goes looking for an arbitration that does not exist, which is the
+		// wedge this change removes rather than adds.
+		"acceptance_undecidable",
+		"say which criteria went undecided in your merge verdict",
 		// E34.4: the refinement intake one-liner names the tool.
 		"fishhawk_draft_epic",
 		runbookURI,
@@ -271,6 +277,13 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"acceptance_not_validated",
 		"succeeded_acceptance_not_validated",
 		"say so in your merge verdict",
+		// #2512: the runbook's merge-eligible-state list + the undecidable
+		// section. The three anchors are the section's load-bearing claims —
+		// the state name, its terminal-run twin, and that it is NOT a triage
+		// (the claim that stops an operator hunting for an arbitration).
+		"acceptance_undecidable",
+		"succeeded_acceptance_undecidable",
+		"**nothing to arbitrate**",
 		// E34.4 refinement intake loop anchors (incl. the rejection/re-draft path).
 		"Refinement intake loop",
 		"Rejection / re-draft path",

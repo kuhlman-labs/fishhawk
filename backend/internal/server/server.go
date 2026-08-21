@@ -1302,7 +1302,7 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 	default:
 		// acceptanceGatePassed / acceptanceGateNotDeclared /
 		// acceptanceGateSkippedOutOfScope / acceptanceGateNotValidated /
-		// acceptanceGateArbitrated: the merge
+		// acceptanceGateArbitrated / acceptanceGateUndecidable: the merge
 		// is not (or no longer) acceptance-gated — fall through to the
 		// RuleChecksGreenAwaitingMerge stamp below (derived status awaiting_merge,
 		// merge_pr next_action). This default arm's membership is the same set the
@@ -1316,7 +1316,13 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		// acceptance_settled_outcome_unknown; a not_validated short-circuit verdict
 		// (#2347) lands here for the same reason — it verified zero criteria, but
 		// it is a RECORDED outcome and merge-eligible, so parking it would wedge
-		// every no-live-target run. Both are enumerated deliberately: this
+		// every no-live-target run. An undecidable verdict (#2512) lands here
+		// third: the stage RAN and could not decide a criterion with nothing
+		// failing, which is a recorded, merge-eligible outcome carrying NO
+		// triageable defect — parking it in acceptance_settled_outcome_unknown (or
+		// in acceptance_triage, which routes an arbitration the state has no
+		// disposition for) would wedge exactly the runs this change exists to
+		// unwedge. All three are enumerated deliberately: this
 		// fall-through is the documented arm, not an incidental default. The
 		// distinguishing operator signal is the MCP next_actions state, not this
 		// derived status. The latest-entry supersession in applyDriveSurfaces

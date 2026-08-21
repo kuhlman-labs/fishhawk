@@ -458,8 +458,29 @@ func renderAcceptanceLine(verb string) string {
 // non-validation first, then the 0/N tally, and appends the live-validation count
 // when the plan tracks an operator-validation walk (#2338 / #2345) so the
 // operator can tell a skip they owe a manual walk from one they do not.
+//
+// The undecidable outcome (#2512) gets its OWN row for the SAME reason and by
+// the same construction — it is the post-run twin of not_validated. The stage
+// RAN and drove the preview, but at least one criterion could not be DECIDED,
+// with nothing failing. "Acceptance recorded — undecidable (2/4 criteria
+// passed)" would bury the whole point in a tally: the operator needs to see
+// HOW MANY criteria went undecided, because that count is what their merge
+// verdict has to acknowledge. The row therefore leads with the undecided count.
+//
+// The ladder admits an ALL-undecidable row set, so this row must read correctly
+// when nothing at all was decided — 4/4 undecided is a legitimate shape, not a
+// degenerate one, and the phrasing deliberately never claims a partial
+// verification it cannot support.
 func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	a := decodeAcceptanceActivity(payload)
+	if a.outcome == acceptanceOutcomeUndecidable {
+		line := "Acceptance undecidable — criteria could not be decided"
+		if a.criteriaTotal > 0 {
+			line = fmt.Sprintf("Acceptance undecidable — %d/%d criteria could not be decided (%d passed)",
+				a.criteriaUndecidable, a.criteriaTotal, a.criteriaPassed)
+		}
+		return line
+	}
 	if a.outcome == acceptanceOutcomeNotValidated {
 		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
 		if a.criteriaTotal > 0 {
@@ -491,6 +512,17 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 // stops rendering the not-validated row and fails there.
 const acceptanceOutcomeNotValidated = "not_validated"
 
+// acceptanceOutcomeUndecidable is the `outcome` value the acceptance ingest
+// records when the precedence ladder derives an undecidable verdict from the
+// agent's per-criterion rows (#2512). Mirrored here rather than imported for
+// the same reason as its not_validated peer above — issuecomment is a pure
+// render package with no backend dependency — and pinned the same way: the
+// same-package tests build their payloads FROM plan.AcceptanceOutcomeUndecidable,
+// so a drift on either side stops rendering the undecidable row and fails there
+// rather than silently falling back to the "Acceptance recorded — <outcome>"
+// certification shape.
+const acceptanceOutcomeUndecidable = "undecidable"
+
 // renderAcceptanceTriageLine renders an acceptance_triage_decided row with the
 // finding class and its disposition, e.g. "Acceptance triage — class-3:
 // waived". Degrades field-by-field: a missing class or disposition drops that
@@ -521,6 +553,10 @@ type acceptanceActivity struct {
 	// short-circuit payload sets it; a validator-recorded outcome leaves it zero
 	// and every existing render path is unaffected.
 	criteriaLiveValidation int
+	// criteriaUndecidable is how many per-criterion rows the acceptance agent
+	// reported as `undecidable` (#2512). Zero on every pre-#2512 payload and on
+	// every outcome whose rows all decided, so no existing render path changes.
+	criteriaUndecidable int
 }
 
 // decodeAcceptanceActivity reads the {outcome, criteria_passed, criteria_total,
@@ -541,6 +577,10 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		// criteria_live_validation (#2347) is additive and short-circuit-only;
 		// every pre-change payload simply lacks it and decodes to zero.
 		CriteriaLiveValidation int `json:"criteria_live_validation"`
+		// criteria_undecidable (#2512) is the per-result tally of rows the
+		// acceptance agent could not DECIDE. Additive: every pre-change payload
+		// lacks it and decodes to zero, so no existing render path changes.
+		CriteriaUndecidable int `json:"criteria_undecidable"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return acceptanceActivity{}
@@ -552,6 +592,7 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		class:                  p.Class,
 		disposition:            p.Disposition,
 		criteriaLiveValidation: p.CriteriaLiveValidation,
+		criteriaUndecidable:    p.CriteriaUndecidable,
 	}
 }
 

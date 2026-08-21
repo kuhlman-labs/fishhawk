@@ -1323,6 +1323,110 @@ func TestNextActions_AcceptanceNotValidated_AcknowledgementPrompt(t *testing.T) 
 	})
 }
 
+// TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt is the #2512 twin
+// of the #2347 prompt pin above, and it exists for the same reason: the
+// acknowledgement is a PROMPT, not an enforcement, so the reason string in these
+// two arms is the ONE mechanism standing in for a gate — and prose in a reason
+// field is exactly what a refactor deletes without anyone noticing.
+//
+// Three load-bearing claims are asserted on both arms:
+//
+//	(a) the stage could not DECIDE one or more criteria,
+//	(b) the operator's merge verdict should say which, and
+//	(c) it is NOT a triage — no criterion failed, so there is nothing to
+//	    arbitrate. (c) is the claim that distinguishes this state from the
+//	    failed/paged arm, and offering an arbitration here would send the
+//	    operator to a verb the server refuses (the gate never reads
+//	    acceptance_triage for an undecidable verdict, so no disposition exists
+//	    to discharge).
+func TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt(t *testing.T) {
+	assertPrompt := func(t *testing.T, na *NextActions, wantState string) {
+		t.Helper()
+		if na == nil || na.State != wantState {
+			t.Fatalf("state = %+v, want %s", na, wantState)
+		}
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+			t.Fatalf("actions = %v, want the merge ritual [approve_pr fishhawk_merge_run] — undecidable is merge-ELIGIBLE", got)
+		}
+		// No arbitration verb: an undecidable row is not a triageable defect.
+		for _, n := range actionNames(na) {
+			if n == "fishhawk_arbitrate_acceptance" {
+				t.Errorf("actions offer fishhawk_arbitrate_acceptance — an undecidable verdict routes NO triage disposition to discharge (#2512): %v", actionNames(na))
+			}
+		}
+		reason := na.Actions[0].Reason
+		// (a) criteria could not be decided.
+		if !strings.Contains(reason, "DECIDE") {
+			t.Errorf("reason no longer tells the operator criteria could not be DECIDED (#2512):\n%s", reason)
+		}
+		// (b) the merge verdict should acknowledge it.
+		if !strings.Contains(reason, "merge verdict") {
+			t.Errorf("reason no longer asks the operator to acknowledge the undecided criteria in their merge verdict (#2512):\n%s", reason)
+		}
+		if !strings.Contains(reason, "acknowledge") {
+			t.Errorf("reason dropped the acknowledgement ask (#2512):\n%s", reason)
+		}
+		// (c) it is not a triage.
+		if !strings.Contains(reason, "not a triage") {
+			t.Errorf("reason no longer says this is NOT a triage — the operator will look for an arbitration that does not exist (#2512):\n%s", reason)
+		}
+		// The prompt must not read as a pass.
+		if strings.Contains(reason, "the acceptance stage passed") {
+			t.Errorf("reason reads as a validated pass:\n%s", reason)
+		}
+	}
+
+	prURL := "https://github.com/x/y/pull/42"
+
+	t.Run("running-run acceptance arm", func(t *testing.T) {
+		r := naLocalRun("running")
+		r.PullRequestURL = &prURL
+		na := nextActionsFor(r, naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+			acceptanceVerdictUndecidable, "", releaseSignals{})
+		assertPrompt(t, na, "acceptance_undecidable")
+	})
+
+	t.Run("terminal-run arm", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, false, acceptanceVerdictUndecidable, "", releaseSignals{})
+		assertPrompt(t, na, "succeeded_acceptance_undecidable")
+	})
+
+	// Degradation control: a verdict aged out of the recent-audit window leaves
+	// the terminal run on plain succeeded_pr_open — merge-eligible, same as
+	// today. The label is what the signal gates, never the eligibility.
+	t.Run("verdict aged out -> succeeded_pr_open", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "succeeded_pr_open" {
+			t.Fatalf("state = %+v, want succeeded_pr_open (graceful degradation)", na)
+		}
+	})
+
+	// Partition control (the design question #2512 settles): not_validated and
+	// undecidable are mutually exclusive BY CONSTRUCTION, and each must keep its
+	// own label. A drift that collapsed one arm into the other would make a
+	// zero-observation short-circuit and a ran-but-undecided stage read
+	// identically to the operator, which is precisely what this change removes.
+	t.Run("not_validated keeps its own distinct state", func(t *testing.T) {
+		r := naLocalRun("running")
+		r.PullRequestURL = &prURL
+		na := nextActionsFor(r, naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false, false,
+			acceptanceVerdictNotValidated, "", releaseSignals{})
+		if na == nil || na.State != "acceptance_not_validated" {
+			t.Fatalf("state = %+v, want acceptance_not_validated — the two arms must not collapse", na)
+		}
+	})
+}
+
 // TestNextActions_SucceededAcceptanceSkippedOutOfScope pins the E38.3 (#1657)
 // arm: a succeeded run with an open PR AND the acceptanceSkippedOutOfScope flag
 // set classifies succeeded_acceptance_skipped_out_of_scope and STILL returns the
@@ -1725,6 +1829,18 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
 		},
 		{
+			// (4c, #2512) acceptance succeeded + verdict undecidable ->
+			// acceptance_undecidable + the SAME merge ritual. Merge-eligible with
+			// NO arbitration: an undecidable row is not a defect, so the run must
+			// not be routed to the triage arm below.
+			name:        "4c_acceptance_undecidable_merge_ritual",
+			run:         withPR(naLocalRun("running")),
+			stages:      naAcceptanceStages("succeeded"),
+			verdict:     "undecidable",
+			wantState:   "acceptance_undecidable",
+			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
+		},
+		{
 			// (6) fixup_dispatched with the implement stage re-opened -> the
 			// existing implement_pending dispatch arm wins (acceptance still
 			// succeeded, but implement pending short-circuits earlier).
@@ -2080,6 +2196,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"acceptanceVerdictPassed":           acceptanceVerdictPassed,
 		"acceptanceVerdictFailed":           acceptanceVerdictFailed,
 		"acceptanceVerdictNotValidated":     acceptanceVerdictNotValidated,
+		"acceptanceVerdictUndecidable":      acceptanceVerdictUndecidable,
 		"fixup_dispatched":                  acceptanceDispositionFixupDispatched,
 		"retry_dispatched":                  acceptanceDispositionRetryDispatched,
 		"paged":                             acceptanceDispositionPaged,
@@ -2098,7 +2215,13 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		// mirrors rather than imports it (#875) — a rename on the plan/server side
 		// with no mirror silently routes every short-circuited run into the
 		// defensive acceptance_settled_outcome_unknown arm.
-		"acceptanceVerdictNotValidated":  "not_validated",
+		"acceptanceVerdictNotValidated": "not_validated",
+		// #2512: the SERVER-DERIVED fourth verdict, mirrored for the same reason
+		// and carrying the same failure mode — a rename with no mirror routes
+		// every undecidable run into the defensive
+		// acceptance_settled_outcome_unknown arm, which offers a retry that will
+		// only reproduce the same undecidable rows.
+		"acceptanceVerdictUndecidable":   "undecidable",
 		"fixup_dispatched":               "fixup_dispatched",
 		"retry_dispatched":               "retry_dispatched",
 		"paged":                          "paged",
