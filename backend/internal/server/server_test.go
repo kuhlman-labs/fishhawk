@@ -1554,3 +1554,39 @@ func TestObserveParkedReview_NilSnapshot_AcceptanceOutcomeUnknown_UnresolvedDeta
 		t.Errorf("Detail = %q, want the unresolved-checks wording", adv.NextAction.Detail)
 	}
 }
+
+// TestObserveParkedReview_AcceptanceUndecidable_StampsAwaitingMerge is the
+// #2512 pin on the DRIVE PRESENTATION surface — the third merge consumer. The
+// switch's parking cases are the pending / triage / outcome-unknown arms;
+// acceptanceGateUndecidable is in none of them, so the observer must reach
+// RuleChecksGreenAwaitingMerge and stamp awaiting_merge / merge_pr.
+//
+// The two negative assertions are the load-bearing half. Parking an undecidable
+// run in acceptance_settled_outcome_unknown would wedge it behind a read arm
+// that has nothing to read, and parking it in acceptance_triage would tell the
+// operator to arbitrate a disposition that was never written — an undecidable
+// row is not a defect and routes no acceptance_triage_decided at all.
+func TestObserveParkedReview_AcceptanceUndecidable_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictUndecidable)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge on an undecidable acceptance", advances)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "merge_pr" {
+		t.Errorf("NextAction = %+v, want merge_pr", advances[1].NextAction)
+	}
+	for _, a := range advances {
+		if a.To == "acceptance_settled_outcome_unknown" {
+			t.Error("an undecidable verdict must NOT park in acceptance_settled_outcome_unknown (#2512)")
+		}
+		if a.To == "acceptance_triage" {
+			t.Error("an undecidable verdict must NOT park in acceptance_triage — it routes no triage disposition to arbitrate (#2512)")
+		}
+	}
+}

@@ -185,14 +185,19 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// delegated merge, and the drive presentation cannot drift (E66.37 / #2474).
 	// Any pending / un-arbitrated-failed / outcome-unknown / read-error state →
 	// 409; passed / not-declared / skipped-out-of-scope / not-validated /
-	// arbitrated proceed. arbitrated (#2474) is a FAILED verdict whose paged
-	// triage an operator discharged on the audit chain — merge-eligible because
-	// the override is itself an audited operator act, not because the evidence
-	// changed. not-validated (#2347) is the
+	// arbitrated / undecidable proceed. arbitrated (#2474) is a FAILED verdict
+	// whose paged triage an operator discharged on the audit chain —
+	// merge-eligible because the override is itself an audited operator act, not
+	// because the evidence changed. not-validated (#2347) is the
 	// short-circuited zero-criteria-verified outcome: merge-ELIGIBLE by design,
 	// because a change with no live target must not be stranded — the operator
 	// reads the distinction from the run's next_actions state and status comment,
-	// not from a block here. Deliberately does NOT block on a review stage
+	// not from a block here. undecidable (#2512) is the post-run twin of that
+	// honesty: the stage RAN and reported rows of which at least one could not be
+	// DECIDED, with nothing failing — merge-ELIGIBLE with no arbitration at all,
+	// which is exactly the #2474 wedge-surface reduction (before it, a validator
+	// that could not decide a criterion had to ship `failed` and page a human).
+	// Deliberately does NOT block on a review stage
 	// awaiting approval (resolveReviewStageOnMerge settles it ON merge).
 	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 	if err != nil {
@@ -208,7 +213,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			slog.String("acceptance_gate_state", gateState),
 			slog.Bool("acceptance_read_error", gerr != nil))
 		s.writeError(w, r, http.StatusConflict, "acceptance_gate_not_passed",
-			"the acceptance gate does not admit a merge (must be passed, not-declared, skipped-out-of-scope, not-validated, or arbitrated — POST /v0/runs/{run_id}/acceptance-arbitration to discharge a PAGED triage)",
+			"the acceptance gate does not admit a merge (must be passed, not-declared, skipped-out-of-scope, not-validated, undecidable, or arbitrated — POST /v0/runs/{run_id}/acceptance-arbitration to discharge a PAGED triage)",
 			map[string]any{"run_id": runID.String(), "acceptance_gate_state": gateState})
 		return
 	}

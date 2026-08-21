@@ -1061,3 +1061,31 @@ func TestMergeRun_AcceptanceArbitrationForOlderOutcome_Blocks(t *testing.T) {
 			merger.called, len(mergeVerdictRows(au)))
 	}
 }
+
+// TestMergeRun_AcceptanceUndecidable_Proceeds is the #2512 merge-admission pin
+// for the OPERATOR merge endpoint. It is the substance of this slice: since
+// #2474 all three merge consumers route through the single
+// acceptanceGateAdmitsMerge predicate, so the production change that makes
+// acceptance_undecidable mergeable is one predicate edit — and a predicate edit
+// nobody exercises from the endpoint is exactly the half-wired state #2512's
+// scope floor names. This asserts the endpoint itself does NOT 409
+// acceptance_gate_not_passed and DOES reach the merge seam.
+//
+// Counterfactual: remove acceptanceGateUndecidable from acceptanceGateAdmitsMerge
+// and this goes RED on the 409 (observed — see the PR Notes table).
+func TestMergeRun_AcceptanceUndecidable_Proceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR,
+		[]byte(autoDriveAcceptanceSpecYAML), acceptanceMergeStages(runID, run.StageStateSucceeded))
+	seedAcceptanceOutcome(au, runID, 6, acceptanceVerdictUndecidable)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — an undecidable verdict is merge-eligible (#2512):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (undecidable acceptance proceeds)", merger.called)
+	}
+}

@@ -352,7 +352,8 @@ const (
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
 // AutoDriveRunGate's may_merge arm (E48.7 / #1954): it confirms the acceptance
 // gate admits a merge (ADR-049 decision #6 — passed / not-declared /
-// skipped-out-of-scope proceed; pending / failed / outcome-unknown and a read
+// skipped-out-of-scope / not-validated / arbitrated / undecidable proceed;
+// pending / un-arbitrated failed / outcome-unknown and a read
 // error are all fail-closed), fails closed on a nil merger BEFORE any dispatch,
 // and otherwise dispatches the merge through the seam.
 //
@@ -374,8 +375,11 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	// honest-but-mergeable, not a block. #2474: so is an ARBITRATED failed
 	// verdict — this widens what a DELEGATED may_merge can land, deliberately:
 	// the arbitration itself is operator-only and run-bound-token-forbidden, so
-	// the operator decision remains the gating act. A read error (gerr != nil)
-	// admits nothing — fail-closed.
+	// the operator decision remains the gating act. #2512: so is an UNDECIDABLE
+	// verdict — the stage ran and reported at least one row it could not decide
+	// with nothing failing, which is honest-but-mergeable exactly like #2347's
+	// not_validated and, unlike an arbitrated failure, needs no operator act to
+	// clear. A read error (gerr != nil) admits nothing — fail-closed.
 	acceptanceMergeOK := gerr == nil && acceptanceGateAdmitsMerge(gateState)
 	if !acceptanceMergeOK {
 		return mergeDispatchAcceptanceNotReady, gateState, gerr

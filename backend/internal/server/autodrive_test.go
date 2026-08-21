@@ -2004,3 +2004,34 @@ func TestAutoDriveRunGate_Merge_AcceptanceArbitrationSuperseded_ObserveOnly(t *t
 		t.Errorf("outcome=%+v merger.called=%d, want observe-only + 0 merges (superseded arbitration)", out, merger.called)
 	}
 }
+
+// TestAutoDriveRunGate_Merge_AcceptanceUndecidable_Merges is the #2512 pin on
+// the DELEGATED merge path (the operator endpoint has its own in
+// merge_run_test.go, the drive presentation its own in server_test.go). The
+// three sites are asserted separately on purpose: each is a distinct consumer
+// of the acceptance gate, and a state admitted by two of them and refused by
+// the third is the half-wired failure #2512's scope floor names. That they now
+// share one predicate is what makes this cheap to keep true — it is not a
+// reason to assert it once.
+//
+// Unlike acceptance_arbitrated, this widening needs NO operator act to clear:
+// an undecidable row is not a defect, so there is nothing to arbitrate. The
+// distinguishing signal is the state string and the next_actions reason, which
+// ask the operator to acknowledge the undecided criterion in their merge
+// verdict.
+func TestAutoDriveRunGate_Merge_AcceptanceUndecidable_Merges(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictUndecidable)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge on an undecidable acceptance", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 — an undecidable acceptance must not block the delegated merge (#2512)", merger.called)
+	}
+}

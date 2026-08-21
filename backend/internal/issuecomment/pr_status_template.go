@@ -234,6 +234,10 @@ type prAcceptanceView struct {
 	// requires_live_validation count (#2347); zero for every validator-recorded
 	// outcome.
 	criteriaLiveValidation int
+	// criteriaUndecidable carries the per-result tally of rows the acceptance
+	// agent could not DECIDE (#2512); zero on every pre-#2512 outcome and on
+	// every outcome whose rows all decided.
+	criteriaUndecidable int
 }
 
 // prAcceptanceCriterion mirrors the server package's acceptanceCriterionResult
@@ -276,6 +280,7 @@ func buildPRAcceptance(entries []*audit.Entry, artifactBody []byte) *prAcceptanc
 		criteriaPassed:         a.criteriaPassed,
 		criteriaTotal:          a.criteriaTotal,
 		criteriaLiveValidation: a.criteriaLiveValidation,
+		criteriaUndecidable:    a.criteriaUndecidable,
 	}
 	v.targetURL, v.headSHA = decodePRAcceptanceOutcome(outcome.Payload)
 	if triage != nil {
@@ -323,6 +328,15 @@ func renderPRAcceptance(v *prAcceptanceView, withTable bool) string {
 // certification-of-nothing this change removes. It takes the neutral ❓ icon (it
 // is neither an acceptance nor a rejection) and states the non-validation before
 // the count.
+//
+// The undecidable outcome (#2512) renders its own sentence for the same reason,
+// on the surface where it matters most. THIS is the comment a human actually
+// reads before clicking merge, and "❓ undecidable (2/4 criteria passed)" under
+// the generic shape reads as a partial pass — it never says that two criteria
+// were never decided at all. It takes the same neutral ❓ (it is neither an
+// acceptance nor a rejection) and leads with the undecided count, so the
+// operator can see what their merge verdict has to acknowledge. It must read
+// correctly on an ALL-undecidable set, which the ladder explicitly admits.
 func renderPRAcceptanceHeadline(v *prAcceptanceView) string {
 	icon := "❓"
 	switch v.outcome {
@@ -330,6 +344,12 @@ func renderPRAcceptanceHeadline(v *prAcceptanceView) string {
 		icon = "✅"
 	case "rejected":
 		icon = "❌"
+	case acceptanceOutcomeUndecidable:
+		if v.criteriaTotal > 0 {
+			return fmt.Sprintf("**Acceptance** — %s undecidable — %d/%d criteria could not be decided (%d passed)",
+				icon, v.criteriaUndecidable, v.criteriaTotal, v.criteriaPassed)
+		}
+		return fmt.Sprintf("**Acceptance** — %s undecidable — criteria could not be decided", icon)
 	case acceptanceOutcomeNotValidated:
 		line := fmt.Sprintf("**Acceptance** — %s not validated — 0 criteria verified (the plan declared none)", icon)
 		if v.criteriaTotal > 0 {

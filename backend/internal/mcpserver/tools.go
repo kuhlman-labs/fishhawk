@@ -1768,8 +1768,10 @@ disposition from the acceptance_outcome_recorded / acceptance_triage_decided
 audit entries (surfaced through next_actions), never from the stage state; merge
 only on a merge-eligible acceptance state — acceptance_passed (a validated pass),
 acceptance_not_validated (#2347: the stage short-circuited having verified ZERO
-criteria — mergeable, but say so in your merge verdict), or
-acceptance_skipped_out_of_scope.
+criteria — mergeable, but say so in your merge verdict), acceptance_undecidable
+(#2512: the stage RAN but could not DECIDE one or more criteria and none failed —
+mergeable with NO arbitration, but say which went undecided in your merge
+verdict), or acceptance_skipped_out_of_scope.
 
 Also returns plan_review_status + implement_review_status — each a
 ReviewStatus whose status is one of none/pending/complete/skipped/failed.
@@ -3745,7 +3747,12 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 		}
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return approvalSubmitResult(updated, warn), ApprovePlanOutput{
+	// LAYER 1 (#2512): warn — never refuse — when the reason carries
+	// plan-artifact vocabulary. Computed AFTER the submission on purpose: the
+	// approval must land byte-for-byte as the operator wrote it whether or not
+	// the lint fires, so the lint can never be mistaken for a gate, and a lint
+	// bug can never cost an operator their approval.
+	return approvalSubmitResult(updated, warn, lintApprovalReason(in.Reason)), ApprovePlanOutput{
 		Stage:               updated.Stage,
 		StageID:             updated.ID,
 		DuplicateSubmission: updated.DuplicateSubmission,
@@ -3952,19 +3959,28 @@ func resolveApproverGithubLogin() (login, warning string) {
 // approvalSubmitResult composes the tool result for an approve/reject
 // submission. A duplicate submission (#986) LEADS with an explicit
 // no-op banner — the operator loop must never mistake it for an
-// effective approval — followed by the approver-login warning when one
-// applies (mirroring startRun's warnings-on-the-result pattern so the
+// effective approval — followed by each warning that applies
+// (mirroring startRun's warnings-on-the-result pattern so the
 // operator sees the degradation without it failing the call). Nil when
 // there is nothing to report.
-func approvalSubmitResult(res *approvalResult, warning string) *mcp.CallToolResult {
+//
+// Variadic since #2512: the approve-plan path now carries a SECOND warning
+// (the approve-reason lint) alongside the approver-login one, and both must be
+// able to surface on the same call. Every warning is a separate TextContent so
+// no two get run together into one unreadable block; empty strings are dropped,
+// which is what keeps every existing single-warning call site — and the
+// no-warning case that returns nil — byte-identical to before.
+func approvalSubmitResult(res *approvalResult, warnings ...string) *mcp.CallToolResult {
 	var content []mcp.Content
 	if res.DuplicateSubmission {
 		content = append(content, &mcp.TextContent{Text: fmt.Sprintf(
 			"duplicate submission — your prior %s decision (submitted %s) stands; stage state unchanged; budget/scope gates were NOT re-run and no transition or audit entry occurred",
 			res.PriorDecision, res.PriorSubmittedAt)})
 	}
-	if warning != "" {
-		content = append(content, &mcp.TextContent{Text: warning})
+	for _, warning := range warnings {
+		if warning != "" {
+			content = append(content, &mcp.TextContent{Text: warning})
+		}
 	}
 	if len(content) == 0 {
 		return nil

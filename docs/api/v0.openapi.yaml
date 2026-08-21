@@ -3043,7 +3043,28 @@ components:
         verdict:
           type: string
           enum: [passed, failed]
-          description: The settled acceptance disposition.
+          description: |
+            The settled acceptance disposition SHIPPED BY THE VALIDATOR. The
+            enum is deliberately INCOMPLETE with respect to the verdict the
+            server records: `not_validated` (#2347) and `undecidable` (#2512)
+            are SERVER-DERIVED and are rejected here, so a wire producer can
+            forge neither.
+
+            An agent that could not decide one or more criteria reports that
+            PER CRITERION (`criteria[].result: "undecidable"` with an
+            `undecidable_reason`) and still ships `passed` at top level when no
+            criterion FAILED — undecidable rows do not make the top-level
+            verdict `failed`. The server then derives the recorded verdict from
+            the rows with a total precedence ladder: any `failed` row →
+            `failed`; else any `undecidable` row → `undecidable` (including an
+            all-undecidable set, where nothing was verified); else `passed`.
+            The recorded verdict is resolved severity-monotone as
+            `max(shipped, derived)` over `passed < undecidable < failed`, so a
+            shipped `failed` is never softened and a row set containing an
+            undecidable row can never be recorded as `passed`. When the
+            recorded verdict differs from the shipped one, the
+            `acceptance_outcome_recorded` payload carries `verdict_reported`
+            with what the agent said.
         failure_mode:
           type: string
           enum: [error, assertion_fail]
@@ -3068,7 +3089,22 @@ components:
                 description: The plan acceptance-criterion id this result maps to.
               result:
                 type: string
-                enum: [passed, failed, skipped]
+                enum: [passed, failed, skipped, undecidable]
+                description: |
+                  `undecidable` (#2512) means the validator RAN the criterion
+                  and could not DECIDE it — distinct from `skipped` (it was not
+                  attempted) and from `failed` (it was attempted and the
+                  expectation did not hold). It REQUIRES a non-whitespace
+                  `undecidable_reason`.
+              undecidable_reason:
+                type: string
+                description: |
+                  Why this criterion could not be decided (#2512). REQUIRED,
+                  and required to be non-whitespace, when `result` is
+                  `undecidable`. REJECTED whenever the field is PRESENT on any
+                  other result — including present-and-empty, which both
+                  validators decide on field PRESENCE rather than emptiness, so
+                  `{"result":"passed","undecidable_reason":""}` is refused.
               observed: { type: string }
               expected: { type: string }
               steps_taken: { type: string }
@@ -12178,7 +12214,14 @@ paths:
         outcome is merge-ELIGIBLE (a change with no live target is not
         stranded) but distinguishable at every consumer: the merge gate's
         `acceptance_not_validated` state, the MCP `next_actions` state of
-        the same name, and a distinct status-comment row. The payload also
+        the same name, and a distinct status-comment row.
+
+        It is disjoint BY CONSTRUCTION from the `undecidable` verdict
+        (#2512) and its `acceptance_undecidable` gate state: this
+        short-circuit settles the stage PRE-SPAWN from the plan alone, so
+        it can produce no per-criterion rows at all, while `undecidable`
+        is derived POST-RUN from rows the agent actually reported. Both
+        are merge-eligible; neither is a pass. The payload also
         carries `criteria_live_validation`, the count of criteria marked
         `requires_live_validation`. This verdict is SERVER-INTERNAL: the
         ship-acceptance endpoint (`POST /v0/runs/{run_id}/acceptance`)

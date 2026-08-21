@@ -207,6 +207,98 @@ func TestRenderPRStatusBody_AcceptanceNotValidated(t *testing.T) {
 	})
 }
 
+// TestRenderPRStatusBody_AcceptanceUndecidable pins the #2512 PR-comment
+// headline on the SHIPPED string. This is the surface the operator's merge
+// decision is actually made on, and it is the one the earlier attempts at this
+// change silently dropped — so the assertions are on both the honest wording
+// AND the absence of the generic "(N/M criteria passed)" shape, which would
+// present an undecided criterion as a partial pass.
+func TestRenderPRStatusBody_AcceptanceUndecidable(t *testing.T) {
+	t.Run("full fidelity", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 2,
+				"criteria_total": 4, "criteria_undecidable": 2,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		want := "**Acceptance** — ❓ undecidable — 2/4 criteria could not be decided (2 passed)"
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q:\n%s", want, body)
+		}
+		for _, forbidden := range []string{"✅ accepted", "❌ rejected", "criteria passed)"} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("body still contains %q — an undecidable outcome is neither an acceptance, a rejection, nor a partial pass (#2512):\n%s", forbidden, body)
+			}
+		}
+	})
+
+	// The ALL-undecidable arm the ladder explicitly admits: the stage ran and
+	// decided NOTHING. Asserted separately because it is the shape most likely
+	// to be misread as a pass, and the one the plan forbids describing as
+	// "verified some criteria and could not evaluate others".
+	t.Run("all-undecidable decided nothing", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 0,
+				"criteria_total": 3, "criteria_undecidable": 3,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		want := "**Acceptance** — ❓ undecidable — 3/3 criteria could not be decided (0 passed)"
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q:\n%s", want, body)
+		}
+	})
+
+	// Degradation arm: an undecidable outcome with no tally must still render
+	// the undecidable sentence rather than the generic "❓ undecidable" fallback,
+	// which reads as a bare label with no explanation.
+	t.Run("no tally degrades to the count-free sentence", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeUndecidable,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		want := "**Acceptance** — ❓ undecidable — criteria could not be decided"
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q:\n%s", want, body)
+		}
+	})
+
+	// The COLLAPSED fidelity shares renderPRAcceptanceHeadline, so the surviving
+	// line on an oversize comment must be the honest one too — same posture as
+	// the not_validated twin above.
+	t.Run("collapsed fidelity keeps the honest sentence", func(t *testing.T) {
+		basis := strings.Repeat("x", 180)
+		criteria := make([]map[string]any, 0, 500)
+		for i := 0; i < 500; i++ {
+			criteria = append(criteria, map[string]any{"id": "AC", "result": "skipped", "expectation_basis": basis})
+		}
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 0,
+				"criteria_total": 500, "criteria_undecidable": 500,
+			})},
+			AcceptanceArtifact: acceptanceArtifactJSON(t, "passed", criteria),
+			ExternalURL:        "https://app.example",
+			Now:                time.Unix(1000, 0).UTC(),
+		})
+		if len(body) > MaxIssueCommentBodyBytes {
+			t.Fatalf("body exceeds GitHub cap after degradation: %d > %d", len(body), MaxIssueCommentBodyBytes)
+		}
+		want := "**Acceptance** — ❓ undecidable — 500/500 criteria could not be decided (0 passed)"
+		if !strings.Contains(body, want) {
+			t.Errorf("collapsed line is not the honest one; missing %q", want)
+		}
+	})
+}
+
 // TestRenderPRStatusBody_CurrentRoundReviewsOnly pins that a stale earlier-round
 // verdict (below the latest implement_review_started floor) is EXCLUDED while
 // the current round's verdicts render.
