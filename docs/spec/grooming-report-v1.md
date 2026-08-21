@@ -94,11 +94,36 @@ three `item_ref.type` values and each has a defined, discriminated derivation.
 `GroomingEntryID`** — a schema that admits input its own contract cannot process
 is worse than one that rejects it.
 
-`item_ref.id`'s character class (`^[A-Za-z0-9][A-Za-z0-9._/#+-]*$`) is constrained
-so the lowercased key is always a legal item-key segment of an entry id. Notably it
-excludes `:`, the entry-id separator, and `+`… is *permitted* inside a key but is
-also the pair separator, which is unambiguous because a pair id always has exactly
-two keys and both are parsed by the recomposition check rather than by splitting.
+### Why the item-key alphabet excludes the separators
+
+`item_ref.id`'s character class is `^[A-Za-z0-9][A-Za-z0-9._/#-]*$`. It excludes
+**both** structural separators an entry id uses:
+
+- `:` — splits `<class>:<item-key>:<qualifier>`;
+- `+` — splits the two keys of a `duplicate` pair or a `dependency` edge id.
+
+Excluding `+` is **load-bearing, not cosmetic**. A pair/edge id is a *flat string
+join* of two keys, so if a key could itself contain the join character then two
+**different** pairs could derive the **same** id: `{"a", "b+github/c"}` and
+`{"a+github/b", "c"}` both join to `duplicate:github/a+github/b+github/c`. That is
+not a parse-ambiguity nit — nothing ever splits an id, so parsing is not the
+concern. **Cross-entry and cross-run id collision is.** The id is the join key
+across report → operator decision → applied mutation → audit, so a collision would
+(a) make report-wide uniqueness spuriously reject a report carrying both pairs and
+(b) let #2240's run-over-run diff conflate two distinct proposals under one id —
+the same silent-wrong-answer shape the directional-dependency rule below exists to
+prevent. No admitted provider needs `+`: GitHub/GitLab ids are
+`<owner>/<repo>#<number>` and Jira ids are `<PROJECT>-<number>`.
+
+The **entry-id** pattern still admits `+` in its key segment — that is where the
+separator legitimately appears, between two keys.
+
+`plan.GroomingEntryID` adds a second, independent layer: it percent-escapes `%`,
+`:` and `+` when building a key (`itemKeyEscaper`), which makes the key an
+**injective** encoding of `(provider, id)` for *any* input, not only for
+schema-valid input. That matters because #2240 derives ids straight from tracker
+rows rather than from an already-validated report. For every schema-valid id the
+escaper is a no-op, so derived ids are unchanged.
 
 ### Id forms
 
@@ -201,6 +226,17 @@ audit entry exists and appends it when missing** (`ensureGovernanceAuditEntry`,
 #1396): a create-then-append where the append failed would otherwise leave the
 report durable and the audit chain permanently silent about it, and the retry
 would short-circuit to success without ever healing the gap.
+
+The existence check and the writes it authorizes are **one critical section**
+(`groomingIngestMu`), so two concurrent identical POSTs produce exactly one
+artifact row and one audit entry. Without it the handler holds two check-then-act
+windows — two first-POSTs can both miss `GetByHash` and both create, and a retry
+can slip between the original's `Create` and its append, heal the "missing" entry,
+and leave the original to append a second one. The lock is **process-local**: two
+`fishhawkd` replicas racing the same report can still double-write. Closing that
+needs DB-level dedup on `(stage_id, content_hash)` governing every artifact kind,
+which is a schema change beyond this artifact's slice; the same residual is
+documented on `ensureGovernanceAuditEntry`.
 
 ## Error codes
 

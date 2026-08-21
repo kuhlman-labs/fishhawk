@@ -168,8 +168,8 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/#+-]*$",
-          "description": "Provider-native stable coordinates: \"<owner>/<repo>#<number>\" for github_issue, \"<namespace>/<project>#<number>\" for gitlab_issue, \"<PROJECT>-<number>\" for jira_issue. The character class is constrained so the LOWERCASED value is a legal item-key segment of an entry id (notably: no ':' , which is the entry-id separator)."
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/#-]*$",
+          "description": "Provider-native stable coordinates: \"<owner>/<repo>#<number>\" for github_issue, \"<namespace>/<project>#<number>\" for gitlab_issue, \"<PROJECT>-<number>\" for jira_issue. The character class EXCLUDES both entry-id separators so the LOWERCASED value is an unambiguous item-key segment: ':' (the class/qualifier separator) and '+' (the pair/edge key separator). Excluding '+' is load-bearing, not cosmetic — a '+' inside a provider-native id would let two DIFFERENT pairs derive the SAME id (see grooming-report-v1.md § Why the item-key alphabet excludes the separators). No admitted provider needs '+'."
         },
         "url": {
           "type": "string",

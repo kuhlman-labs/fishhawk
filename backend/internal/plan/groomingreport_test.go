@@ -304,6 +304,81 @@ func TestGroomingEntryID_DependencyDirectionPreserved(t *testing.T) {
 	}
 }
 
+// TestGroomingEntryID_SeparatorCollisionFree pins the id derivation as
+// COLLISION-FREE for the pair/edge classes, whose ids are a flat string join of
+// two item keys. The pair below is the concrete counterexample from the fix-up
+// review: with an unescaped join, {"a", "b+github/c"} and {"a+github/b", "c"}
+// both derive `duplicate:github/a+github/b+github/c` — two DIFFERENT proposals
+// under ONE id, which would make report-wide uniqueness spuriously reject a
+// report carrying both and let #2240's run-over-run diff conflate them.
+//
+// Counterfactual vehicle: deleting itemKeyEscaper (returning the raw lowercased
+// key) makes the two ids EQUAL and reddens the first assertion.
+func TestGroomingEntryID_SeparatorCollisionFree(t *testing.T) {
+	ref := func(id string) plan.ItemRef {
+		return plan.ItemRef{Type: "github_issue", ID: id, URL: "https://example.test/" + id}
+	}
+
+	// The two pairs are DISTINCT proposals; their ids must differ.
+	p1 := plan.GroomingEntryID(plan.GroomingClassDuplicate, "", ref("a"), ref("b+github/c"))
+	p2 := plan.GroomingEntryID(plan.GroomingClassDuplicate, "", ref("a+github/b"), ref("c"))
+	if p1 == p2 {
+		t.Fatalf("distinct duplicate pairs collided on one id: %q", p1)
+	}
+	// Same property for the directional edge id.
+	e1 := plan.GroomingEntryID(plan.GroomingClassDependency, "", ref("a"), ref("b+github/c"))
+	e2 := plan.GroomingEntryID(plan.GroomingClassDependency, "", ref("a+github/b"), ref("c"))
+	if e1 == e2 {
+		t.Fatalf("distinct dependency edges collided on one id: %q", e1)
+	}
+	// The ':' class/qualifier separator is escaped for the same reason.
+	q1 := plan.GroomingEntryID(plan.GroomingClassHygiene, "b", ref("a:x"))
+	q2 := plan.GroomingEntryID(plan.GroomingClassHygiene, "x:b", ref("a"))
+	if q1 == q2 {
+		t.Fatalf("distinct hygiene entries collided on one id: %q", q1)
+	}
+	// Escaping is a NO-OP for every schema-valid id, so published ids are
+	// unchanged by this layer.
+	if got, want := plan.GroomingEntryID(plan.GroomingClassOrdering, "", ref("kuhlman-labs/fishhawk#2235")),
+		"ordering:github/kuhlman-labs/fishhawk#2235"; got != want {
+		t.Errorf("derived id for a schema-valid item id = %q, want %q (escaping must be a no-op here)", got, want)
+	}
+}
+
+// TestGroomingReportSchema_ItemRefIDExcludesSeparators is the INPUT-BOUNDARY
+// layer of the same property: the canonical schema's item_ref.id character class
+// must not admit either entry-id separator, so a report can never carry an id
+// whose flat join is ambiguous.
+//
+// The assertion is on the ERROR IDENTITY (*SchemaError naming /item_ref/id), not
+// merely on "rejected": both layers reject a '+'-bearing id, so re-admitting '+'
+// to the character class moves the rejection to the recomposition rule
+// (*SemanticError) and reddens the errors.As. Validation is pure — there is no
+// committed state to read instead.
+func TestGroomingReportSchema_ItemRefIDExcludesSeparators(t *testing.T) {
+	for _, tc := range []struct{ name, id string }{
+		{"plus is the pair/edge key separator", "acme/repo#1+github/other#2"},
+		{"colon is the class/qualifier separator", "acme/repo#1:2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			itemRef := groomingItemRefJSON("github_issue", tc.id, "https://example.test/x")
+			// The declared id is the plain lowercased join a naive derivation
+			// would produce, hand-written by construction.
+			body := groomingDoc(
+				`[{"id":"ordering:github/`+strings.ToLower(tc.id)+`","item_ref":`+itemRef+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
+				`[]`, `[]`, `[]`, `[]`, `[]`)
+			var se *plan.SchemaError
+			err := plan.ValidateGroomingReport(body)
+			if !errors.As(err, &se) {
+				t.Fatalf("ValidateGroomingReport: err = %v (%T), want *SchemaError from the item_ref.id pattern", err, err)
+			}
+			if !schemaErrorMentions(se, "/ordering/0/item_ref/id") {
+				t.Errorf("SchemaError should name /ordering/0/item_ref/id; got %v", se)
+			}
+		})
+	}
+}
+
 // TestGroomingEntryID_ProviderDiscriminated is condition F3's proof: every
 // item_ref.type the schema admits has a defined derivation, and identical
 // textual coordinates on two forges do NOT collide on one key.

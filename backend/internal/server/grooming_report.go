@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,6 +26,33 @@ const CategoryGroomingReportRecorded = "grooming_report_recorded"
 // docs/spec/grooming-report-v1.schema.json version token and the workflow-spec
 // `schema:` a grooming_report-producing stage must declare.
 const groomingReportSchemaVersion = plan.GroomingReportVersion
+
+// groomingIngestMu serializes the grooming-report ingest CRITICAL SECTION —
+// GetByHash, the audit-entry heal, Create, and the chained append — so the
+// existence check and the writes it guards are one atomic step (#2235 fix-up).
+//
+// Without it the handler holds two separate check-then-act windows, and the
+// runner retries identical POSTs:
+//
+//   - two concurrent first-POSTs both miss GetByHash, both Create, and both
+//     append → two artifact rows and two audit entries for one report;
+//   - a retry can slip between the original's Create and its AppendChained,
+//     observe the artifact present and the chain silent, and heal — after which
+//     the original appends its own entry → one artifact, two entries.
+//
+// ensureGovernanceAuditEntry's own lock closes only the heal-versus-heal race;
+// it cannot see the create path, which never takes that lock. This one wraps
+// both paths. Lock ordering is always groomingIngestMu → governanceHealMu (the
+// heal is called from inside this section and never the reverse), so the pair
+// cannot deadlock. Contention is negligible: one report per plan stage.
+//
+// RESIDUAL, stated rather than implied: this is a PROCESS-LOCAL lock, so two
+// fishhawkd replicas ingesting the same report at the same instant can still
+// double-write. Closing that needs DB-level dedup — a uniqueness constraint on
+// (stage_id, content_hash) governing every artifact kind — which is a schema
+// change beyond this artifact's slice; the same residual is documented on
+// ensureGovernanceAuditEntry.
+var groomingIngestMu sync.Mutex
 
 // handleGroomingReport ingests a grooming_report artifact — the SECOND additive
 // plan-stage sibling (#2235, ADR-065 §3) — shipped to POST
@@ -117,6 +145,13 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 	// chain permanently silent about it. ensureGovernanceAuditEntry (#1396)
 	// verifies the entry for THIS artifact exists and appends it when absent,
 	// failing closed on a read error so a further retry can re-heal.
+	//
+	// Everything from here to the response is ONE critical section (see
+	// groomingIngestMu): the existence check and the writes it authorizes must
+	// not interleave with a concurrent identical POST.
+	groomingIngestMu.Lock()
+	defer groomingIngestMu.Unlock()
+
 	if existing, gerr := s.cfg.ArtifactRepo.GetByHash(r.Context(), stageID, contentHash); gerr == nil {
 		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
 			CategoryGroomingReportRecorded, existing.ID.String(), func() error {

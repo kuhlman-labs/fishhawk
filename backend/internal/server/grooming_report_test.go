@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -271,8 +273,16 @@ func TestHandleShipPlan_GroomingReport_HealReadError_500(t *testing.T) {
 // distinguish — that after the call returns NO artifact row was written, NO
 // audit entry was appended, and the stage transitioned to failed with
 // failure_category B.
+//
+// The table enumerates EVERY non-plan stage type, `deploy` included. The guard
+// is a single `!= StageTypePlan` comparison today, so any one row would exercise
+// it — but a rewrite into an enumerated denylist that forgot a type would leave
+// a short table green, and `deploy` is exactly the type such a denylist is most
+// likely to miss (it is the one stage type with no agent executor).
 func TestHandleShipPlan_GroomingReportFromNonPlanStage_FailsCategoryB(t *testing.T) {
-	for _, stageType := range []run.StageType{run.StageTypeImplement, run.StageTypeReview, run.StageTypeAcceptance} {
+	for _, stageType := range []run.StageType{
+		run.StageTypeImplement, run.StageTypeReview, run.StageTypeAcceptance, run.StageTypeDeploy,
+	} {
 		t.Run(string(stageType), func(t *testing.T) {
 			runID, stageID := uuid.New(), uuid.New()
 			s, sf, ar, au, rr := newGroomingServer(t, runID, stageID, stageType)
@@ -377,6 +387,107 @@ func replaceFirst(s, old, new string) string {
 		return s
 	}
 	return s[:i] + new + s[i+len(old):]
+}
+
+// TestHandleShipPlan_GroomingReport_ConcurrentIdenticalPosts is the atomicity
+// proof for the ingest critical section (groomingIngestMu). The runner retries a
+// shipped report, so identical POSTs genuinely overlap; the check-then-act
+// windows the handler holds (GetByHash → Create → append, and the heal's
+// list → append) must not interleave.
+//
+// Both subtests assert COMMITTED STATE — exactly one artifact row and exactly one
+// grooming_report_recorded entry — rather than the response status, because every
+// racing request returns a success status whether or not the writes were
+// duplicated.
+//
+// Counterfactual vehicle: deleting the groomingIngestMu Lock/Unlock pair makes
+// "first POST, concurrent" write several artifacts and several audit entries.
+func TestHandleShipPlan_GroomingReport_ConcurrentIdenticalPosts(t *testing.T) {
+	const n = 8
+
+	// fire runs n identical signed POSTs concurrently, released from one
+	// barrier so they overlap inside the handler, and returns their statuses.
+	fire := func(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed25519.PrivateKey, body []byte) []int {
+		t.Helper()
+		codes := make([]int, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range codes {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				codes[i] = shipPlanRequest(t, s, runID, stageID, priv, body, "").Code
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		return codes
+	}
+
+	t.Run("first POST, concurrent", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+		priv, _ := sf.issue(t, runID)
+		body := validGroomingReportBytes(t)
+
+		codes := fire(t, s, runID, stageID, priv, body)
+		created := 0
+		for i, c := range codes {
+			switch c {
+			case http.StatusCreated:
+				created++
+			case http.StatusOK:
+			default:
+				t.Fatalf("request %d status = %d, want 201 or 200", i, c)
+			}
+		}
+		if created != 1 {
+			t.Errorf("201 responses = %d, want exactly 1 (the rest must dedup to 200)", created)
+		}
+		if len(ar.all) != 1 {
+			t.Errorf("artifacts = %d, want 1 — concurrent identical POSTs must not fork the artifact row", len(ar.all))
+		}
+		if got := len(groomingAuditEntries(au)); got != 1 {
+			t.Errorf("grooming_report_recorded entries = %d, want 1 — the existence check and the append must be atomic", got)
+		}
+	})
+
+	// The gapped state is seeded BY CONSTRUCTION (artifact durable, chain
+	// silent), so every racing request takes the heal branch and the RED lands
+	// on the entry count rather than on fixture setup.
+	t.Run("concurrent retries heal a gapped chain exactly once", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+		priv, _ := sf.issue(t, runID)
+		body := validGroomingReportBytes(t)
+
+		schemaVersion := groomingReportSchemaVersion
+		if _, err := ar.Create(t.Context(), artifact.CreateParams{
+			StageID:       stageID,
+			Kind:          artifact.KindGroomingReport,
+			SchemaVersion: &schemaVersion,
+			Content:       json.RawMessage(body),
+			ContentHash:   sha256Hex(body),
+		}); err != nil {
+			t.Fatalf("seed artifact: %v", err)
+		}
+		if got := len(groomingAuditEntries(au)); got != 0 {
+			t.Fatalf("fixture must start with ZERO audit entries, got %d", got)
+		}
+
+		for i, c := range fire(t, s, runID, stageID, priv, body) {
+			if c != http.StatusOK {
+				t.Fatalf("retry %d status = %d, want 200", i, c)
+			}
+		}
+		if len(ar.all) != 1 {
+			t.Errorf("artifacts = %d, want 1", len(ar.all))
+		}
+		if got := len(groomingAuditEntries(au)); got != 1 {
+			t.Errorf("grooming_report_recorded entries = %d, want 1 — concurrent heals must not double-append", got)
+		}
+	})
 }
 
 // TestHandleShipPlan_GroomingReport_StorageFailures_500 pins the three

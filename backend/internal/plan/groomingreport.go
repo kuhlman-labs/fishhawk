@@ -172,16 +172,40 @@ var groomingProviderPrefixes = map[string]string{
 	"jira_issue":   "jira",
 }
 
+// itemKeyEscaper percent-escapes the two entry-id STRUCTURAL SEPARATORS — ':'
+// (which splits <class>:<key>:<qualifier>) and '+' (which splits the two keys of
+// a duplicate pair or a dependency edge) — plus '%' itself, so that an item key
+// is an INJECTIVE encoding of (provider, id).
+//
+// Injectivity is the whole point (#2235 fix-up). A pair/edge id is a FLAT string
+// join of two keys, so if a key could itself contain the join character then two
+// DIFFERENT pairs could derive the SAME id: {"a", "b+github/c"} and
+// {"a+github/b", "c"} both join to "duplicate:github/a+github/b+github/c". That
+// is not a parse-ambiguity nit — the id is the join key across report → operator
+// decision → applied mutation → audit, so a collision makes report-wide
+// uniqueness spuriously reject a report carrying both pairs, and makes #2240's
+// run-over-run diff conflate two distinct proposals under one id.
+//
+// The canonical schema closes this at the input boundary too: item_ref.id's
+// character class excludes ':' and '+'. This escaper is the SECOND layer, for
+// callers that derive an id straight from a tracker row rather than from a
+// schema-validated report (#2240 does exactly that). Escaping '%' first makes
+// the encoding decodable and therefore injective for ANY input: every '%' in a
+// key is one this escaper wrote. strings.Replacer replaces in a single
+// left-to-right pass, so an emitted escape is never re-escaped.
+var itemKeyEscaper = strings.NewReplacer("%", "%25", ":", "%3a", "+", "%2b")
+
 // itemKey derives the stable, provider-discriminated, lowercased key for one
-// backlog item: "<provider>/<id>". An unknown type yields a key that cannot
-// match any derivable id, so the recomposition check rejects the entry with a
-// message naming the offending type rather than accepting an ambiguous id.
+// backlog item: "<provider>/<id>", with the entry-id separators escaped. An
+// unknown type yields a key that cannot match any derivable id (no real key ever
+// starts with '<'), so the recomposition check rejects the entry with a message
+// naming the offending type rather than accepting an ambiguous id.
 func itemKey(ref ItemRef) string {
 	prefix, ok := groomingProviderPrefixes[ref.Type]
 	if !ok {
 		return "<unsupported-item-ref-type:" + ref.Type + ">"
 	}
-	return strings.ToLower(prefix + "/" + ref.ID)
+	return itemKeyEscaper.Replace(strings.ToLower(prefix + "/" + ref.ID))
 }
 
 // GroomingEntryID derives a grooming-report entry id. It is the SINGLE owner

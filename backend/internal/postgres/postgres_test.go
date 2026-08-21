@@ -3104,8 +3104,49 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 		return def
 	}
 
+	ctx := context.Background()
+
+	// A real artifact row is what the CHECK actually governs, so the assertions
+	// below INSERT one per kind rather than grepping the rendered constraint
+	// text: a CHECK that merely MENTIONS 'grooming_report' (say, in a negated
+	// or misspelled clause) would satisfy a text search while still rejecting
+	// the row the product must write.
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'backlog_grooming', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'plan', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID,
+	); err != nil {
+		t.Fatalf("seed plan stage: %v", err)
+	}
+	insertArtifact := func(kind string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO artifacts (id, stage_id, kind, schema_version, content, content_hash)
+			 VALUES ($1, $2, $3, 'grooming_report_v1', '{}'::jsonb, 'hash-'||$3)`,
+			uuid.New(), stageID, kind)
+		return err
+	}
+
 	if def := constraintDef(); !strings.Contains(def, "grooming_report") {
 		t.Errorf("artifacts_kind_check after MigrateUp does not admit 'grooming_report': %s", def)
+	}
+	// BEHAVIOR after MigrateUp: the row inserts.
+	if err := insertArtifact("grooming_report"); err != nil {
+		t.Fatalf("insert kind='grooming_report' after MigrateUp: %v — 0073 must make the row insertable, not merely name it in the CHECK", err)
+	}
+
+	// Remove it before rolling back: 0073's down restores a CHECK the row would
+	// violate, and its documented contract is that the rollback runs before any
+	// grooming_report artifact is persisted. Leaving it would fail the ADD
+	// CONSTRAINT and mask the assertion under test.
+	if _, err := pool.Exec(ctx, `DELETE FROM artifacts WHERE kind = 'grooming_report'`); err != nil {
+		t.Fatalf("clear grooming_report artifacts before rollback: %v", err)
 	}
 
 	// Exactly one MigrateDown reverses 0073.
@@ -3117,12 +3158,27 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 	if strings.Contains(def, "grooming_report") {
 		t.Errorf("artifacts_kind_check after rollback still admits 'grooming_report': %s", def)
 	}
-	// The prior additive widenings are untouched by 0073's rollback.
+	// BEHAVIOR after rollback: the same insert is REFUSED by the restored CHECK.
+	var checkErr *pgconn.PgError
+	if err := insertArtifact("grooming_report"); !errors.As(err, &checkErr) || checkErr.Code != "23514" {
+		t.Fatalf("insert kind='grooming_report' after rollback returned %v, want SQLSTATE 23514 from artifacts_kind_check", err)
+	}
+	if checkErr.ConstraintName != "artifacts_kind_check" {
+		t.Errorf("rejecting constraint = %q, want artifacts_kind_check", checkErr.ConstraintName)
+	}
+
+	// The prior additive widenings are untouched by 0073's rollback — asserted
+	// the same way, by inserting a row of each kind.
 	if !strings.Contains(def, "release_notes") {
 		t.Errorf("artifacts_kind_check after 0073 rollback dropped 0051's 'release_notes': %s", def)
 	}
 	if !strings.Contains(def, "acceptance") {
 		t.Errorf("artifacts_kind_check after 0073 rollback dropped 0045's 'acceptance': %s", def)
+	}
+	for _, kind := range []string{"release_notes", "acceptance", "plan"} {
+		if err := insertArtifact(kind); err != nil {
+			t.Errorf("insert kind=%q after 0073 rollback: %v — the rollback must disturb no earlier widening", kind, err)
+		}
 	}
 }
 
