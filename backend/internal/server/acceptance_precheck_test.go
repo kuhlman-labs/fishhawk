@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
@@ -496,12 +497,30 @@ func TestAcceptancePrecheck_UndecidableCriterion_FlaggedAndCounted(t *testing.T)
 	}
 }
 
-// (#2512 layer 3, advisory) The finding NEVER refuses the plan: the pre-check
-// returns a non-nil result and the entry is written exactly as on a clean
-// plan. Advisory-only is the whole posture — a criterion may legitimately name
-// a capability in prose while being drivable.
-func TestAcceptancePrecheck_UndecidableCriterion_IsAdvisoryNotARefusal(t *testing.T) {
-	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+// TestShipPlan_UndecidableCriterion_IsAdvisoryNotARefusal drives the REAL
+// plan-upload/admission seam (POST /v0/runs/{run_id}/plan -> handleShipPlan ->
+// runAcceptancePrecheck), not the pre-check in isolation: the finding is
+// advisory, so the plan carrying an undecidable criterion must still be
+// ADMITTED to the operator gate.
+//
+// COUNTERFACTUAL: teaching handleShipPlan to refuse a plan whose acceptance
+// pre-check reports undecidable_criterion (the shape the sibling
+// tryScopeRetry / overCapSplitRejection gates use) makes this test go RED on
+// the committed stage state. The admission assertion reads COMMITTED state
+// back through the repo rather than the response, because a refusal that
+// re-opens the stage still answers 201 (trap (a)) — a response-only assertion
+// would stay green under the refusal.
+func TestShipPlan_UndecidableCriterion_IsAdvisoryNotARefusal(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	// The pre-check is stage-conditional: give the run a workflow that
+	// declares an acceptance stage so resolveAcceptanceStage returns ok.
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specWithAcceptanceStage
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
 	body := acceptancePlanBody(t, []map[string]any{
 		{
 			"id":         "live-forge",
@@ -511,11 +530,39 @@ func TestAcceptancePrecheck_UndecidableCriterion_IsAdvisoryNotARefusal(t *testin
 		},
 	}, nil)
 
-	if got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body); got == nil {
-		t.Fatal("the undecidable_criterion rule must never suppress the result (advisory only)")
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
-	if n := countAcceptancePrecheckEntries(au); n != 1 {
-		t.Fatalf("want exactly 1 entry; got %d", n)
+
+	// COMMITTED state first: the plan was ADMITTED — the stage walked to the
+	// operator gate, was never re-opened or failed, and the run is alive.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (an advisory finding must never refuse the plan)\ntransitions: %+v",
+			got, rr.stageTransitions)
+	}
+	if got := rr.stagesByID[planStage.ID].FailureCategory; got != nil {
+		t.Errorf("stage carries failure category %q; the undecidable_criterion rule must never fail a plan", *got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Error("run state = failed; an advisory acceptance finding must never terminate a run")
+	}
+
+	// And the advisory finding genuinely fired on THIS upload, so the
+	// admission above is not vacuously green on a plan that tripped no rule.
+	if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+		t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+	f := hasAcceptanceFinding(entry, acceptanceRuleUndecidableCriterion)
+	if f == nil {
+		t.Fatalf("want an undecidable_criterion finding on the admitted plan; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "live-forge" {
+		t.Errorf("CriterionID = %q, want live-forge", f.CriterionID)
+	}
+	if entry.UndecidableCount != 1 {
+		t.Errorf("persisted undecidable_count = %d, want 1", entry.UndecidableCount)
 	}
 }
 

@@ -3154,9 +3154,10 @@ func loadAcceptanceVerdictCorpus(t *testing.T) acceptanceVerdictCorpus {
 // TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner is the backend half
 // of the CORPUS AGREEMENT claim (#2512). It runs the SAME rows the runner's
 // TestValidateAcceptanceVerdict_Corpus runs through acceptanceBody.validate and
-// asserts the SAME admit/reject partition, then POSTs every admitted body
-// VERBATIM to the real ship endpoint and asserts it is accepted — so the
-// partition is proved at the wire, not just at the decoder.
+// asserts the SAME admit/reject partition, then POSTs EVERY row — both halves —
+// VERBATIM to the real ship endpoint: an admitted body must be accepted 201 and
+// a rejected body must be refused 400 acceptance_invalid. So the partition is
+// proved at the wire, not just at the decoder.
 //
 // HONEST SCOPE: this is corpus agreement between two hand-maintained validators,
 // NOT byte-carrying. No test can carry bytes returned by the runner's
@@ -3181,18 +3182,34 @@ func TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner(t *testing.T) {
 			case !row.Admitted && err == nil:
 				t.Fatalf("corpus row %q must be REJECTED (%s) but was admitted", row.Name, row.Reason)
 			}
-			if !row.Admitted {
-				return
-			}
-			// Every admitted body must also survive the REAL ship endpoint
-			// verbatim — the decoder partition and the wire must not diverge.
+			// BOTH halves of the partition are pinned at the WIRE, not only at
+			// this local decoder: an admitted row must be accepted 201 and a
+			// rejected row must be refused 400 acceptance_invalid by the real
+			// ship endpoint. POSTing only the admitted half would leave a
+			// handler whose decode path is laxer than this local
+			// DisallowUnknownFields decoder (a future refactor dropping
+			// top-level strictness) admitting a corpus-rejected shape while
+			// this test stayed green.
 			runID, stageID := uuid.New(), uuid.New()
 			s, sf, _, _, _ := newAcceptanceServer(t, runID, stageID)
 			priv, _ := sf.issue(t, runID)
 			w := shipAcceptanceRequest(t, s, runID, stageID, priv, row.Body, "")
-			if w.Code != http.StatusCreated {
-				t.Fatalf("admitted corpus row %q POSTed verbatim: status = %d, want 201:\n%s",
+			if row.Admitted {
+				if w.Code != http.StatusCreated {
+					t.Fatalf("admitted corpus row %q POSTed verbatim: status = %d, want 201:\n%s",
+						row.Name, w.Code, w.Body.String())
+				}
+				return
+			}
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("rejected corpus row %q POSTed verbatim: status = %d, want 400:\n%s",
 					row.Name, w.Code, w.Body.String())
+			}
+			// The refusal must be the decode/validate one, not an unrelated
+			// 400 from an earlier precondition.
+			if !strings.Contains(w.Body.String(), "acceptance_invalid") {
+				t.Errorf("rejected corpus row %q: want an acceptance_invalid refusal; got:\n%s",
+					row.Name, w.Body.String())
 			}
 		})
 	}

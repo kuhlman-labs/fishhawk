@@ -86,6 +86,12 @@
       "reason": "DisallowUnknownFields does not descend into a json.RawMessage field, so the strict decode is re-applied per criteria element. A typo'd field name must fail closed rather than be silently dropped."
     },
     {
+      "name": "top-level-unknown-field",
+      "body": {"verdict": "passed", "undecidable_reason": "at the wrong level", "criteria": [{"id": "crit-1", "result": "passed"}]},
+      "admitted": false,
+      "reason": "The TOP-LEVEL strict decode, the sibling of the per-element one above. undecidable_reason is a per-criterion field; hoisted to the top level it is an unknown field and must fail closed on both twins. Without this row the corpus cannot detect a refactor that drops top-level DisallowUnknownFields on either side."
+    },
+    {
       "name": "mixed-failed-and-undecidable",
       "body": {"verdict": "failed", "failure_mode": "assertion_fail", "criteria": [{"id": "crit-1", "result": "failed"}, {"id": "crit-2", "result": "undecidable", "undecidable_reason": "no seam"}]},
       "admitted": true,

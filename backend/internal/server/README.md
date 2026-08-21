@@ -2665,6 +2665,15 @@ unimplementable across the module boundary. The sharpest row is a WHITESPACE-ONL
 either compared against `""` instead of trimming, which would strand a completed
 acceptance stage while both suites stayed green.
 
+The backend half proves the partition at the WIRE, not only at the decoder:
+EVERY row — both halves — is POSTed VERBATIM to the real ship endpoint, an
+admitted body asserted `201` and a rejected body asserted `400
+acceptance_invalid`. POSTing only the admitted half would leave a handler whose
+decode path had become laxer than the test's own strict decoder admitting a
+corpus-rejected shape while the test stayed green; the `top-level-unknown-field`
+row is the one that detects exactly that drift (deleting the handler's top-level
+`DisallowUnknownFields` admits it `201`).
+
 ### Invariants
 
 - **`acceptance_criteria_ids` stays a SUPERSET.** The ids served on the
