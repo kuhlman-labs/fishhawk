@@ -16,7 +16,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json
+//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json schemas/grooming-report-v1.schema.json
 var schemaFS embed.FS
 
 // compiledSchema is the JSON Schema used by Validate / Parse. Compiled
@@ -28,13 +28,29 @@ var compiledSchema = mustCompileSchema()
 // sibling artifact, compiled once at init for the same fail-loud reason.
 var compiledClarificationSchema = mustCompileNamedSchema("schemas/clarification-request-v1.schema.json", "clarification-request-v1.schema.json")
 
+// compiledGroomingReportSchema is the JSON Schema for the grooming_report
+// sibling artifact (#2235), compiled once at init for the same fail-loud reason.
+var compiledGroomingReportSchema = mustCompileNamedSchema("schemas/grooming-report-v1.schema.json", "grooming-report-v1.schema.json")
+
 // embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
 // bytes of the embedded plan-standard-v1 schema. Computed once at init
 // so /healthz can serve it cheaply.
 var embeddedSchemaHash = computeSchemaHash()
 
+// embeddedGroomingReportSchemaHash is the hex-encoded SHA-256 of the canonical
+// JSON bytes of the embedded grooming-report-v1 schema, computed once at init
+// so /healthz can advertise it cheaply alongside the plan schema hash (the
+// AGENTS.md schema-change checklist step 3).
+var embeddedGroomingReportSchemaHash = computeNamedSchemaHash("schemas/grooming-report-v1.schema.json")
+
 func computeSchemaHash() string {
-	const path = "schemas/plan-standard-v1.schema.json"
+	return computeNamedSchemaHash("schemas/plan-standard-v1.schema.json")
+}
+
+// computeNamedSchemaHash canonicalizes and hashes one embedded schema. Panics
+// on any failure so a malformed embedded schema crashes at process start rather
+// than serving a wrong hash.
+func computeNamedSchemaHash(path string) string {
 	data, err := schemaFS.ReadFile(path)
 	if err != nil {
 		panic(fmt.Sprintf("plan: read embedded schema for hash %s: %v", path, err))
@@ -55,6 +71,12 @@ func computeSchemaHash() string {
 // bytes of the embedded plan-standard-v1 schema. Callers use this to detect
 // schema drift between the backend and runner at startup.
 func EmbeddedSchemaHash() string { return embeddedSchemaHash }
+
+// EmbeddedGroomingReportSchemaHash returns the hex-encoded SHA-256 of the
+// canonical JSON bytes of the embedded grooming-report-v1 schema (#2235).
+// Advertised by /healthz so a runner writing grooming reports can detect
+// schema drift against the backend that validates them.
+func EmbeddedGroomingReportSchemaHash() string { return embeddedGroomingReportSchemaHash }
 
 // expensiveTestRuntimeThreshold is the minimum predicted_runtime_minutes
 // value that suppresses the expensive-test-strategy advisory warning.
@@ -117,7 +139,8 @@ func Validate(data []byte) error {
 
 // DetectArtifactKind inspects the top-level "kind" discriminator and
 // reports which plan-stage artifact the document is. A document carrying
-// kind == "clarification_request" is ArtifactKindClarificationRequest;
+// kind == "clarification_request" is ArtifactKindClarificationRequest and one
+// carrying kind == "grooming_report" is ArtifactKindGroomingReport (#2235);
 // anything else (including the plan artifact, which has no "kind" field)
 // defaults to ArtifactKindPlan. The bytes are only peeked, not fully
 // validated — callers route to ValidateArtifact / Validate next. Returns
@@ -132,17 +155,21 @@ func DetectArtifactKind(data []byte) (ArtifactKind, error) {
 	if err := json.Unmarshal(data, &disc); err != nil {
 		return "", &ParseError{Msg: err.Error(), Cause: err}
 	}
-	if disc.Kind == KindClarificationRequest {
+	switch disc.Kind {
+	case KindClarificationRequest:
 		return ArtifactKindClarificationRequest, nil
+	case KindGroomingReport:
+		return ArtifactKindGroomingReport, nil
 	}
 	return ArtifactKindPlan, nil
 }
 
 // ValidateArtifact validates a plan-stage artifact, discriminating on the
 // top-level "kind" field BEFORE validation so the frozen plan schema is
-// never consulted for a clarification_request (and vice versa). A
-// clarification_request is validated by ValidateClarificationRequest
-// (schema + unique-id semantics); anything else is validated as a plan.
+// never consulted for a sibling (and vice versa). A clarification_request is
+// validated by ValidateClarificationRequest (schema + unique-id semantics), a
+// grooming_report by ValidateGroomingReport (schema + the four id/rank
+// semantics); anything else is validated as a plan.
 func ValidateArtifact(data []byte) error {
 	kind, err := DetectArtifactKind(data)
 	if err != nil {
@@ -151,6 +178,8 @@ func ValidateArtifact(data []byte) error {
 	switch kind {
 	case ArtifactKindClarificationRequest:
 		return ValidateClarificationRequest(data)
+	case ArtifactKindGroomingReport:
+		return ValidateGroomingReport(data)
 	default:
 		return Validate(data)
 	}

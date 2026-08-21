@@ -16,6 +16,13 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       # clarification_request outcome semantically and does not embed it.
       cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
       ;;
+    grooming-report-*.schema.json)
+      # The plan-stage grooming_report SIBLING schema (#2235) is embedded
+      # into the backend plan validator only: the runner WRITES the report
+      # and the backend validates it on ingest, so the runner needs no
+      # embedded copy (same split as clarification-request above).
+      cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
+      ;;
     workflow-v*.schema.json)
       cp "$schema" "$REPO_ROOT/backend/internal/spec/schemas/$base"
       cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"

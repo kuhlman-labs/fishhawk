@@ -266,6 +266,67 @@ func TestPostgres_CreateAndGet_ReleaseNotesKind(t *testing.T) {
 	}
 }
 
+// TestPostgres_CreateAndGet_GroomingReportKind pins E54.3 / #2235: the
+// `grooming_report` artifact kind (ADR-065 §3) round-trips through Create +
+// Get + ListForStage. This is the real-DB assertion that migration 0073 widened
+// artifacts_kind_check to admit it — the pgtest template auto-applies 0073, so a
+// Create with KindGroomingReport that would fail SQLSTATE 23514 against the
+// un-migrated five-value CHECK succeeds here. The constant + migration coupling
+// gate: if either is missing, this test fails.
+func TestPostgres_CreateAndGet_GroomingReportKind(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := artifact.NewPostgresRepository(pool)
+	stageID := makeStage(t, pool)
+
+	body, err := json.Marshal(map[string]any{
+		"kind":           "grooming_report",
+		"report_version": "grooming_report_v1",
+		"summary":        "Groomed four alpha-phase items.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaVersion := "grooming_report_v1"
+	created, err := repo.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindGroomingReport,
+		SchemaVersion: &schemaVersion,
+		Content:       body,
+		ContentHash:   sha256Hex(body),
+	})
+	if err != nil {
+		t.Fatalf("Create grooming_report artifact (migration 0073 must admit the kind): %v", err)
+	}
+	if created.Kind != artifact.KindGroomingReport {
+		t.Errorf("Kind = %q, want grooming_report", created.Kind)
+	}
+
+	got, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Kind != artifact.KindGroomingReport {
+		t.Errorf("round-tripped Kind = %q, want grooming_report", got.Kind)
+	}
+	if got.SchemaVersion == nil || *got.SchemaVersion != schemaVersion {
+		t.Errorf("round-tripped SchemaVersion = %v, want %q", got.SchemaVersion, schemaVersion)
+	}
+
+	listed, err := repo.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	var found bool
+	for _, a := range listed {
+		if a.ID == created.ID && a.Kind == artifact.KindGroomingReport {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListForStage did not return the grooming_report artifact; got %d artifacts", len(listed))
+	}
+}
+
 func TestPostgres_GetArtifact_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := artifact.NewPostgresRepository(pool)

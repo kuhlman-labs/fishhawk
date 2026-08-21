@@ -22,9 +22,14 @@
 # constraint on a workflow with no diff can never be evaluated, and v2 says so
 # at parse time instead of at run time.
 #
-# The grooming_report artifact kind is ADR-065 §3's decision and is NOT part of
-# this change — it lands with E54.4 / #2236. Until then the propose stage
-# declares no `produces` at all, which is exactly the case this example needs.
+# The grooming_report artifact kind is ADR-065 §3's decision and lands HERE
+# (E54.3 / #2235): the propose stage below declares it, which is what makes this
+# example ALSO the proof that the artifact is declarable on a real propose stage.
+# The backlog_grooming WORKFLOW DECLARATION in this repo's own
+# .fishhawk/workflows.yaml is the separate follow-on (E54.4 / #2236). Declaring
+# grooming_report does not make this a code-change workflow — no stage declares
+# the pull_request artifact, so the post-hoc diff constraints stay unavailable
+# here exactly as described above.
 
 version: "2"
 
@@ -37,7 +42,10 @@ workflows:
 
     stages:
       # PROPOSE. A `plan`-typed stage need not emit a plan artifact — it emits a
-      # proposal, and here the proposal is a grooming report (pending #2236).
+      # proposal, and here the proposal is a grooming report. The artifact binds
+      # to the stage TYPE (plan = PROPOSE per ADR-067 §2), not to the workflow
+      # name, and a grooming_report-producing stage must declare its schema for
+      # the same forward-compatibility reason a plan declares standard_v1.
       - id: groom
         type: plan
         executor:
@@ -46,6 +54,9 @@ workflows:
         inputs:
           - source: github_issue
             required: true
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
         gates:
           - type: approval
             sla: 24_hours

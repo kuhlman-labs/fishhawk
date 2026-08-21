@@ -308,6 +308,30 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			want: nil,
 		},
 		{
+			// E54.3 / #2235: the grooming-report-v1 canonical scoped without
+			// its embedded mirror is the self-referential lockstep miss the
+			// registry entry exists to catch (scripts/sync-schemas routes the
+			// canonical to exactly one backend mirror).
+			name:  "grooming-report canonical without mirror flags",
+			scope: []string{"docs/spec/grooming-report-v1.schema.json"},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "grooming-report schema requires every mirror",
+					TriggerPath:     "docs/spec/grooming-report-v1.schema.json",
+					MissingSiblings: []string{"backend/internal/plan/schemas/grooming-report-v1.schema.json"},
+				},
+			},
+		},
+		{
+			// Both members scoped: no finding.
+			name: "grooming-report both mirrors no finding",
+			scope: []string{
+				"docs/spec/grooming-report-v1.schema.json",
+				"backend/internal/plan/schemas/grooming-report-v1.schema.json",
+			},
+			want: nil,
+		},
+		{
 			name:  "unrelated files no finding",
 			scope: []string{"backend/internal/foo/foo.go", "README.md"},
 			want:  nil,

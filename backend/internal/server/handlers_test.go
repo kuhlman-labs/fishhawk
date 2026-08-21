@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
 func TestHandleHealth(t *testing.T) {
@@ -60,6 +62,17 @@ func TestHandleHealth(t *testing.T) {
 	}
 	if v2 := body.Schemas["workflow-v2"]; v2 == body.Schemas["workflow-v0"] || v2 == body.Schemas["workflow-v1"] {
 		t.Errorf("schemas[workflow-v2] = %q must differ from the v0 and v1 hashes", v2)
+	}
+	// grooming-report-v1 (ADR-065 §3 / #2235) is advertised per the AGENTS.md
+	// schema-change checklist step 3, so a runner writing grooming reports can
+	// detect drift against the backend that validates them. Assert the exact
+	// value, not merely non-emptiness: a mistyped map key or a hash computed
+	// over the wrong embedded file would otherwise pass.
+	if got, want := body.Schemas["grooming-report-v1"], plan.EmbeddedGroomingReportSchemaHash(); got != want {
+		t.Errorf("schemas[grooming-report-v1] = %q, want %q", got, want)
+	}
+	if body.Schemas["grooming-report-v1"] == body.Schemas["plan-standard-v1"] {
+		t.Error("schemas[grooming-report-v1] must differ from the plan schema hash")
 	}
 
 	// Wire-level omission pin (#1018): with no StartNonce configured, the

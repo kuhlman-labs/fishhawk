@@ -1,0 +1,175 @@
+{
+  "kind": "grooming_report",
+  "report_version": "grooming_report_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/2235",
+    "id": "kuhlman-labs/fishhawk#2235"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-5",
+    "timestamp": "2026-08-21T14:02:11Z"
+  },
+  "summary": "Groomed the 4 open alpha-phase items touching the grooming loop. Proposes #2235 first (it blocks the rest of E54), flags one duplicate pair, one unboarded Jira item, one directional dependency, and one non-goal drift.",
+  "charter_ref": {
+    "path": ".fishhawk/charter.md",
+    "content_hash": "3726dca74f7729cbe084869f755e3ffff92812011e61fe13084faf603fd13561",
+    "ref": "main"
+  },
+  "ordering": [
+    {
+      "id": "ordering:github/kuhlman-labs/fishhawk#2235",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2235",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2235"
+      },
+      "rank": 1,
+      "score": 9.5,
+      "rubric_citations": [
+        {
+          "rubric_id": "U1",
+          "quote": "Blocks two or more other items, or blocks an entire epic's critical path.",
+          "note": "The grooming_report artifact kind blocks #2236 and #2240."
+        },
+        {
+          "rubric_id": "R4",
+          "note": "Every later groomer surface is written against this shape; retrofitting it gets more expensive per consumer."
+        }
+      ],
+      "rationale": "Keystone of E54: nothing downstream can be declared or diffed until the artifact kind exists."
+    },
+    {
+      "id": "ordering:github/kuhlman-labs/fishhawk#2236",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2236",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2236"
+      },
+      "rank": 2,
+      "score": 7.0,
+      "rubric_citations": [
+        {
+          "rubric_id": "U2",
+          "note": "On the critical path of E54, the current phase's tracking epic."
+        }
+      ]
+    },
+    {
+      "id": "ordering:gitlab/acme/platform#17",
+      "item_ref": {
+        "type": "gitlab_issue",
+        "id": "acme/platform#17",
+        "url": "https://gitlab.com/acme/platform/-/issues/17"
+      },
+      "rank": 3,
+      "score": 4.0,
+      "rubric_citations": [
+        {
+          "rubric_id": "V5",
+          "note": "Real value, wrong phase — ranked below the alpha-blocking items and said so."
+        }
+      ]
+    },
+    {
+      "id": "ordering:jira/plat-412",
+      "item_ref": {
+        "type": "jira_issue",
+        "id": "PLAT-412",
+        "url": "https://acme.atlassian.net/browse/PLAT-412"
+      },
+      "rank": 4,
+      "score": 2.5,
+      "rubric_citations": [
+        {
+          "rubric_id": "U4",
+          "note": "Blocks nothing and nothing blocks it; scheduled on value alone."
+        }
+      ]
+    }
+  ],
+  "duplicates": [
+    {
+      "id": "duplicate:github/kuhlman-labs/fishhawk#2236+github/kuhlman-labs/fishhawk#2240",
+      "pair": [
+        {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2236",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2236"
+        },
+        {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2240",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2240"
+        }
+      ],
+      "basis": "Both describe run-over-run report comparison; #2240 supersedes the churn-guard half of #2236's body.",
+      "confidence": "medium"
+    }
+  ],
+  "hygiene_defects": [
+    {
+      "id": "hygiene:jira/plat-412:unboarded",
+      "item_ref": {
+        "type": "jira_issue",
+        "id": "PLAT-412",
+        "url": "https://acme.atlassian.net/browse/PLAT-412"
+      },
+      "defect": "unboarded",
+      "detail": "Not present on the tracking board, so it is invisible to the kanban view the phase is driven from.",
+      "suggested_fix": "Add the item to the phase board and set Status=Backlog."
+    }
+  ],
+  "dependency_edges": [
+    {
+      "id": "dependency:github/kuhlman-labs/fishhawk#2240+github/kuhlman-labs/fishhawk#2235",
+      "from": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2240",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2240"
+      },
+      "to": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2235",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2235"
+      },
+      "basis": "The churn guard diffs two grooming reports, so it cannot be built before the report artifact exists.",
+      "kind": "depends_on"
+    }
+  ],
+  "vision_drift": [
+    {
+      "id": "vision_drift:gitlab/acme/platform#17:ng2",
+      "item_ref": {
+        "type": "gitlab_issue",
+        "id": "acme/platform#17",
+        "url": "https://gitlab.com/acme/platform/-/issues/17"
+      },
+      "basis": "non_goal",
+      "charter_ref_id": "NG2",
+      "detail": "Proposes a hosted multi-tenant control plane, which the charter names as a non-goal for the current phase."
+    }
+  ],
+  "decomposition_suggestions": [
+    {
+      "id": "decomposition:github/kuhlman-labs/fishhawk#2236",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2236",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2236"
+      },
+      "rationale": "The body couples the workflow declaration to the apply-stage mutation path; they land on different gates and should not share one review.",
+      "proposed_children": [
+        {
+          "title": "Declare the backlog_grooming workflow in .fishhawk/workflows.yaml",
+          "scope_hint": "Spec declaration plus its parse test; no runtime code."
+        },
+        {
+          "title": "Apply approved grooming mutations from the implement stage",
+          "scope_hint": "Tracker mutation path keyed by grooming-report entry id."
+        }
+      ]
+    }
+  ]
+}

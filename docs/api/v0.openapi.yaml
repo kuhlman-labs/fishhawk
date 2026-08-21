@@ -5051,12 +5051,14 @@ paths:
                     description: |
                       Map of schema name to hex-encoded SHA-256 of the backend's
                       embedded canonical schema bytes. Keys: "plan-standard-v1",
-                      "workflow-v0", "workflow-v1", "workflow-v2". Callers compare
-                      against their own embedded hashes to detect schema drift.
+                      "grooming-report-v1", "workflow-v0", "workflow-v1",
+                      "workflow-v2". Callers compare against their own embedded
+                      hashes to detect schema drift.
                     additionalProperties:
                       type: string
                     example:
                       plan-standard-v1: "abc123..."
+                      grooming-report-v1: "89abcd..."
                       workflow-v0: "def456..."
                       workflow-v1: "0123ab..."
                       workflow-v2: "4567cd..."
@@ -13265,17 +13267,36 @@ paths:
   /v0/runs/{run_id}/plan:
     post:
       operationId: shipPlan
-      summary: Upload a standard_v1 plan artifact
+      summary: Upload a plan-stage artifact (plan or a discriminated sibling)
       description: |
         Called by the runner after a successful plan-stage agent
-        invocation. The body is the agent-produced JSON validated
-        against `docs/spec/plan-standard-v1.schema.json`. Auth is the
-        per-run Ed25519 signature in `X-Fishhawk-Signature` (same
-        scheme as `/v0/runs/{run_id}/trace`).
+        invocation. Auth is the per-run Ed25519 signature in
+        `X-Fishhawk-Signature` (same scheme as `/v0/runs/{run_id}/trace`).
+
+        The endpoint DISCRIMINATES on the body's top-level `kind` field
+        BEFORE validation, so each artifact is checked against its own
+        schema and the frozen plan schema is never consulted for a sibling:
+
+        - no `kind` (or an unrecognized value) → the **plan** artifact,
+          validated against `docs/spec/plan-standard-v1.schema.json`;
+        - `kind: "clarification_request"` → the plannability sibling,
+          validated against `docs/spec/clarification-request-v1.schema.json`
+          and parking the stage at `awaiting_input`;
+        - `kind: "grooming_report"` → the backlog-grooming proposal
+          (ADR-065 §3 / #2235), validated against
+          `docs/spec/grooming-report-v1.schema.json`, persisted as an
+          artifact of kind `grooming_report` with `schema_version:
+          grooming_report_v1`, and recorded with a chained
+          `grooming_report_recorded` audit entry carrying the content hash
+          and the per-class entry counts. Valid only from a `plan`-typed
+          stage — the PROPOSE stage per ADR-067 §2.
 
         Idempotent on (stage_id, content_hash): re-uploading the same
-        plan bytes returns 200 with the existing artifact rather than
-        inserting a duplicate row.
+        bytes returns 200 with the existing artifact rather than inserting
+        a duplicate row. For a grooming report that idempotent path also
+        VERIFIES the paired audit entry exists and appends it when missing,
+        so a retry after a partial write cannot leave the artifact durable
+        and the chain silent.
       tags: [runner]
       security: []
       parameters:
@@ -13295,7 +13316,11 @@ paths:
           application/json:
             schema:
               type: object
-              description: Validated against plan-standard-v1.schema.json.
+              description: |
+                Validated against the schema selected by the top-level `kind`
+                discriminator: plan-standard-v1.schema.json (no `kind`),
+                clarification-request-v1.schema.json, or
+                grooming-report-v1.schema.json.
       responses:
         '201':
           description: Plan accepted; new artifact row created.
@@ -13312,8 +13337,21 @@ paths:
               schema: { $ref: '#/components/schemas/PlanUploadResponse' }
         '400':
           description: |
-            Body did not validate against `standard_v1` (`code: plan_invalid`)
-            or path/query parameters were malformed.
+            Body did not validate against the schema its `kind` selects, or
+            path/query parameters were malformed. Codes:
+
+            - `plan_invalid` — the plan artifact failed `standard_v1`.
+            - `clarification_request_invalid` — the clarification sibling
+              failed `clarification-request-v1` or its unique-question-id rule.
+            - `grooming_report_invalid` — the grooming report failed
+              `grooming-report-v1` or one of its five semantic rules
+              (report-wide entry-id uniqueness, id class prefix, id
+              recomposition from the entry's own item reference, ordering
+              ranks forming the permutation 1..N). Fails the stage category-B.
+            - `grooming_report_stage_invalid` — a grooming report was shipped
+              from a stage whose type is not `plan`. Fails the stage
+              category-B: the stage type is a property of the run, so
+              re-shipping the same bytes cannot help.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13324,7 +13362,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
-          description: Plan body exceeds the per-stage size cap (256 KiB).
+          description: Body exceeds the per-stage size cap (256 KiB).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

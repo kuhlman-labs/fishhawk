@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/grooming-report-v1.schema.json",
+  "title": "Fishhawk grooming report artifact (plan-stage sibling)",
+  "description": "The SECOND additive sibling of the plan artifact (after clarification-request-v1), produced by a `plan`-typed PROPOSE stage running the backlog_grooming workflow (ADR-065 §3, ADR-067 §2). Selected over plan-standard-v1 by the top-level 'kind' discriminator BEFORE validation, so plan-standard-v1.schema.json stays frozen. A grooming report is a PROPOSAL, never an applied mutation: it states a proposed ordering with per-item rubric-cited scores, duplicate candidates, hygiene defects, suggested depends_on edges, vision-drift flags, and decomposition suggestions, and a human decides what (if anything) to apply. THE LOAD-BEARING CONSTRAINT: an ordering entry MUST cite at least one charter rubric line (`rubric_citations` is required with minItems:1), so a ranking that cannot be justified against the charter is REJECTED by this schema rather than merely shipped undecorated — charter §5.1 states the rule, this schema enforces it. Every entry carries a stable `id` DERIVED from the underlying backlog item and proposal class (never minted per run), so two reports over the same backlog diff mechanically run-over-run (#2240). See grooming-report-v1.md for the normative id-derivation contract.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "report_version",
+    "ticket_reference",
+    "generated_by",
+    "summary",
+    "ordering",
+    "duplicates",
+    "hygiene_defects",
+    "dependency_edges",
+    "vision_drift",
+    "decomposition_suggestions"
+  ],
+
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "grooming_report",
+      "description": "Top-level discriminator. The plan package routes an artifact carrying this value to this schema; a clarification_request routes to clarification-request-v1 and anything else (carrying plan_version) to plan-standard-v1. This sibling intentionally omits plan_version so the artifacts never collide on a shared required field."
+    },
+    "report_version": {
+      "type": "string",
+      "const": "grooming_report_v1",
+      "description": "Artifact schema version, mirroring the plan artifact's plan_version. Single-value enum: a future breaking change bumps to grooming_report_v2 with its own schema file rather than editing this one in place."
+    },
+    "ticket_reference": { "$ref": "#/$defs/ticket-reference" },
+    "generated_by": { "$ref": "#/$defs/generated-by" },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable lead paragraph: what backlog slice was groomed, over what window, and the headline of what the report proposes. Rendered first at the operator gate."
+    },
+    "charter_ref": {
+      "$ref": "#/$defs/charter-ref",
+      "x-intended-required": true,
+      "description": "Optional in grooming_report_v1, INTENDED REQUIRED in the next major: the pinned charter the report was scored against. Left optional here because the charter resolution/injection machinery is E54.2 / #2234's slice and this artifact must not block on it. Draft 2020-12 §10.3 collects x-intended-required as an annotation, so declaring the intent here changes no validation result."
+    },
+    "ordering": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/ordering-entry" },
+      "description": "The proposed ranking, one entry per item, each citing at least one charter rubric line. Required and non-empty: a grooming report that proposes no ordering has nothing for the operator to decide. Ranks must be exactly the permutation 1..N (enforced semantically — JSON Schema cannot express it)."
+    },
+    "duplicates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/duplicate-candidate" },
+      "description": "Candidate duplicate/superseded PAIRS (charter S2). Required as an array — an empty array states 'none found', which is a different claim from omitting the key. Never destructive: the report flags the pair and its basis; a human decides."
+    },
+    "hygiene_defects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hygiene-defect" },
+      "description": "Objective, reversible structural defects (charter S4). Required as an array; empty states 'none found'."
+    },
+    "dependency_edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dependency-edge" },
+      "description": "Suggested depends_on edges between backlog items. DIRECTIONAL: from depends on to. Required as an array; empty states 'none found'."
+    },
+    "vision_drift": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/vision-drift-flag" },
+      "description": "Items advancing a charter non-goal (§3) or mis-aligned with a phase theme. Charter §5.3: drift is reported as a finding, never quietly ranked last. Required as an array; empty states 'none found'."
+    },
+    "decomposition_suggestions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/decomposition-suggestion" },
+      "description": "Items the groomer proposes splitting into children. Required as an array; empty states 'none found'."
+    }
+  },
+
+  "$defs": {
+    "ticket-reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "url", "id"],
+      "description": "The ticket the grooming RUN was opened against (the run's originating issue), not an item being groomed. Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["github_issue"],
+          "description": "v0 closed set; v0.x adds linear_ticket and jira_ticket. Mirrors plan-standard-v1."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical URL of the originating ticket."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier — e.g. \"kuhlman-labs/fishhawk#2235\"."
+        }
+      }
+    },
+
+    "generated-by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "model", "timestamp"],
+      "description": "Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent identifier matching the workflow spec's executor.agent."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Specific model used (e.g. claude-opus-5)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Optional. Model version or build SHA when agent reports it."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp of generation. The runner wall-clock at agent invocation."
+        }
+      }
+    },
+
+    "charter-ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "content_hash"],
+      "description": "The exact charter revision the report was scored against, so a reviewer can reproduce the scoring and #2240 can tell a genuinely-changed ranking from one that moved because the charter did.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path of the charter document (e.g. \".fishhawk/charter.md\")."
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Hex-encoded SHA-256 of the charter bytes the report was scored against."
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional. Git ref or commit SHA the charter was read at."
+        }
+      }
+    },
+
+    "item-ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "url"],
+      "description": "A reference to one backlog item. `type` is the PROVIDER DISCRIMINATOR and participates in the derived item-key — identical textual coordinates on two forges are DIFFERENT items and must not collide on one key (see grooming-report-v1.md § Entry-id derivation).",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["github_issue", "gitlab_issue", "jira_issue"],
+          "description": "Provider discriminator. Each admitted value has a defined item-key derivation: github_issue → \"github/<id>\", gitlab_issue → \"gitlab/<id>\", jira_issue → \"jira/<id>\", each lowercased. Never widen this enum without adding the matching derivation case in plan.GroomingEntryID — a value the derivation cannot handle would make the entry id underivable."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/#-]*$",
+          "description": "Provider-native stable coordinates: \"<owner>/<repo>#<number>\" for github_issue, \"<namespace>/<project>#<number>\" for gitlab_issue, \"<PROJECT>-<number>\" for jira_issue. The character class EXCLUDES both entry-id separators so the LOWERCASED value is an unambiguous item-key segment: ':' (the class/qualifier separator) and '+' (the pair/edge key separator). Excluding '+' is load-bearing, not cosmetic — a '+' inside a provider-native id would let two DIFFERENT pairs derive the SAME id (see grooming-report-v1.md § Why the item-key alphabet excludes the separators). No admitted provider needs '+'."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical URL of the backlog item."
+        }
+      }
+    },
+
+    "entry-id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(ordering|duplicate|hygiene|dependency|vision_drift|decomposition):[a-z0-9][a-z0-9._/#+-]*(:[a-z0-9][a-z0-9._-]*)?$",
+      "description": "A stable entry id, DERIVED (never minted per run) as `<class>:<item-key>` or `<class>:<item-key>:<qualifier>` or `<class>:<key-a>+<key-b>`. Lowercase throughout, including the qualifier segment — see grooming-report-v1.md § Entry-id derivation for the normative rules, which the validator machine-checks by recomposing each id from the entry's own fields."
+    },
+
+    "rubric-citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rubric_id"],
+      "description": "One citation of a charter prioritization-rubric line justifying a score.",
+      "properties": {
+        "rubric_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,31}$",
+          "description": "The charter rubric line id (e.g. \"V1\", \"R3\", \"U1\", \"S4\"). Charter ids are conventionally uppercase; entry-id qualifiers lowercase them, so charter ids must be CASE-INSENSITIVELY unique."
+        },
+        "quote": {
+          "type": "string",
+          "description": "Optional. The cited line's text, so a reviewer can check the citation without opening the charter."
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional. Why this line applies to this item."
+        }
+      }
+    },
+
+    "ordering-entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "rank", "score", "rubric_citations"],
+      "description": "One item's position in the proposed ranking. `rubric_citations` is REQUIRED with minItems:1 — this is the schema-level enforcement of charter §5.1 (\"a score with no citation fails validation\"). An entry that omits it, or ships [], is REJECTED; it is never accepted-but-undecorated.",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based position in the proposed order. Ranks across the ordering array must be exactly the permutation 1..N (enforced semantically)."
+        },
+        "score": {
+          "type": "number",
+          "description": "The groomer's numeric score. Advisory: the citations, not the number, are what the operator reviews."
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubric-citation" },
+          "description": "At least one charter rubric line justifying this ranking. REQUIRED and minItems:1 — the two together are the citation control."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Optional prose beyond the citations."
+        }
+      }
+    },
+
+    "duplicate-candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pair", "basis", "confidence"],
+      "description": "A candidate duplicate/superseded pair (charter S2). UNORDERED: the pair states that two items overlap, with no direction, which is why its id sorts the two item-keys lexicographically.",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "pair": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/item-ref" },
+          "description": "Exactly the two overlapping items."
+        },
+        "basis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the two are believed to overlap. Never destructive — a human decides."
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "The groomer's confidence in the duplication claim."
+        }
+      }
+    },
+
+    "hygiene-defect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "defect", "detail"],
+      "description": "One objective, reversible structural defect on an item (charter S4).",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "defect": {
+          "type": "string",
+          "enum": [
+            "missing_label_namespace",
+            "absent_done_means",
+            "unlinked_parent_epic",
+            "unboarded",
+            "missing_parent_epic_link",
+            "missing_estimate"
+          ],
+          "description": "Closed set. The value is ALSO this entry's id qualifier, so one item may carry one entry per distinct defect without an id collision."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What specifically is missing or wrong."
+        },
+        "suggested_fix": {
+          "type": "string",
+          "description": "Optional. The concrete correction proposed."
+        }
+      }
+    },
+
+    "dependency-edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from", "to", "basis", "kind"],
+      "description": "A suggested dependency edge. DIRECTIONAL: `from` depends on `to`. A→B and B→A are DIFFERENT proposals with opposite meaning, so the id encodes from-key then to-key UNSORTED — a sorted derivation would collapse them onto one id, forbidding a report from proposing both directions and hiding a run-over-run edge FLIP as an unchanged id (#2240).",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "from": { "$ref": "#/$defs/item-ref" },
+        "to": { "$ref": "#/$defs/item-ref" },
+        "basis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the dependency is believed to hold."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["depends_on"],
+          "description": "Edge kind. Single-value today; a future major may add blocks/relates_to."
+        }
+      }
+    },
+
+    "vision-drift-flag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "basis", "charter_ref_id", "detail"],
+      "description": "An item advancing a charter non-goal or mis-aligned with a phase theme (charter §3 / §5.3).",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "basis": {
+          "type": "string",
+          "enum": ["non_goal", "phase_theme"],
+          "description": "Which charter surface the item drifts from."
+        },
+        "charter_ref_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,31}$",
+          "description": "The addressable charter line/theme id (e.g. \"NG2\", \"T4\"). This value is ALSO this entry's id qualifier, LOWERCASED — so charter ids must be case-insensitively unique."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "How the item drifts from the cited line."
+        }
+      }
+    },
+
+    "decomposition-suggestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "rationale", "proposed_children"],
+      "description": "A proposal to split one item into children. Proposal only — nothing is filed by this artifact.",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the item should be split."
+        },
+        "proposed_children": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "scope_hint"],
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Proposed child title."
+              },
+              "scope_hint": {
+                "type": "string",
+                "minLength": 1,
+                "description": "What the child would cover."
+              }
+            }
+          },
+          "description": "At least two children — a 'split' into one is not a split."
+        }
+      }
+    }
+  }
+}

@@ -864,14 +864,28 @@ type ArtifactKind string
 // Artifact kinds per the schema. plan/pull_request are the v0 set;
 // deployment is the v1 deploy-stage artifact (ADR-038 / #925) — valid
 // only on a deploy stage; acceptance is the v1.2 acceptance-stage
-// artifact (ADR-049 / #1531) — valid only on an acceptance stage. Both
-// stage-type bindings are enforced by Validate.
+// artifact (ADR-049 / #1531) — valid only on an acceptance stage;
+// grooming_report is the v2 propose-stage artifact (ADR-065 §3 / #2235)
+// — valid only on a `plan`-typed stage, which ADR-067 §2 reads as
+// PROPOSE. All three stage-type bindings are enforced by Validate.
 const (
 	ArtifactPlan        ArtifactKind = "plan"
 	ArtifactPullRequest ArtifactKind = "pull_request"
 	ArtifactDeployment  ArtifactKind = "deployment"
 	ArtifactAcceptance  ArtifactKind = "acceptance"
+	// ArtifactGroomingReport is the backlog-grooming proposal a `plan`-typed
+	// PROPOSE stage emits instead of a plan (ADR-065 §3 / E54.3 #2235).
+	// Declared only at workflow-v2 (v0 and v1 are frozen majors whose
+	// produces enums keep rejecting it). A stage declaring it MUST also
+	// declare schema: grooming_report_v1, and may not ALSO declare the plan
+	// artifact — a propose stage proposes one thing.
+	ArtifactGroomingReport ArtifactKind = "grooming_report"
 )
+
+// GroomingReportSchemaVersion is the `schema:` token a grooming_report-producing
+// stage must declare, mirroring the plan artifact's standard_v1 rule
+// (MVP_SPEC §4.3: artifacts are schema-versioned for forward compatibility).
+const GroomingReportSchemaVersion = "grooming_report_v1"
 
 // Persistence says where an artifact is stored.
 type Persistence struct {

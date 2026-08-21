@@ -29,8 +29,8 @@ type Artifact struct {
 }
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
-// CHECK constraint (migration 0002, widened by 0037, 0045, and 0051):
-// plan, pull_request, deployment, acceptance, release_notes.
+// CHECK constraint (migration 0002, widened by 0037, 0045, 0051, and 0073):
+// plan, pull_request, deployment, acceptance, release_notes, grooming_report.
 type Kind string
 
 // Artifact kinds.
@@ -60,4 +60,16 @@ const (
 	// SQLSTATE 23514 against the un-widened CHECK), exactly as 0037 paired with
 	// KindDeployment and 0045 with KindAcceptance.
 	KindReleaseNotes Kind = "release_notes"
+	// KindGroomingReport is E54's backlog-grooming proposal record
+	// (E54.3 / #2235, ADR-065 §3): the durable artifact a `plan`-typed
+	// PROPOSE stage emits carrying the proposed ordering (each entry citing
+	// at least one charter rubric line), duplicate candidates, hygiene
+	// defects, suggested depends_on edges, vision-drift flags, and
+	// decomposition suggestions, validated against grooming-report-v1.
+	// Admitted by migration 0073, which widens artifacts_kind_check; the
+	// constant and migration ship together (a Create with this kind fails
+	// SQLSTATE 23514 against the un-widened CHECK), exactly as 0037 paired
+	// with KindDeployment, 0045 with KindAcceptance, and 0051 with
+	// KindReleaseNotes.
+	KindGroomingReport Kind = "grooming_report"
 )

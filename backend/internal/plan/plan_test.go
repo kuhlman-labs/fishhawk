@@ -1416,6 +1416,16 @@ func TestDetectArtifactKind(t *testing.T) {
 		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindClarificationRequest)
 	}
 
+	// The grooming_report sibling (#2235) is the SECOND additive kind routed
+	// by the same discriminator; the plan default below must stay unchanged.
+	k, err = plan.DetectArtifactKind(groomingMinimal())
+	if err != nil {
+		t.Fatalf("DetectArtifactKind(grooming_report): %v", err)
+	}
+	if k != plan.ArtifactKindGroomingReport {
+		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindGroomingReport)
+	}
+
 	k, err = plan.DetectArtifactKind(readFixture(t, "valid/example.json"))
 	if err != nil {
 		t.Fatalf("DetectArtifactKind(plan): %v", err)
@@ -1436,6 +1446,9 @@ func TestDetectArtifactKind(t *testing.T) {
 func TestValidateArtifact_RoutesByKind(t *testing.T) {
 	if err := plan.ValidateArtifact(validClarificationJSON(t)); err != nil {
 		t.Errorf("ValidateArtifact(clarification): %v", err)
+	}
+	if err := plan.ValidateArtifact(groomingMinimal()); err != nil {
+		t.Errorf("ValidateArtifact(grooming_report): %v", err)
 	}
 	if err := plan.ValidateArtifact(readFixture(t, "valid/example.json")); err != nil {
 		t.Errorf("ValidateArtifact(plan): %v", err)

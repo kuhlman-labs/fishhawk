@@ -23,7 +23,8 @@ func TestIsKnownCategory(t *testing.T) {
 		"run_completed",
 		"deployment_outcome_recorded",
 		"run_revived",
-		"merge_verdict_recorded", // E48.7 / #1954 operator merge-verdict chain entry
+		"merge_verdict_recorded",   // E48.7 / #1954 operator merge-verdict chain entry
+		"grooming_report_recorded", // E54.3 / #2235 grooming_report ingest entry
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {
@@ -270,5 +271,30 @@ func TestKnownCategories_FixupReportObligationsDeclared(t *testing.T) {
 func TestKnownCategories_FixupPRBodyUnsatisfiable(t *testing.T) {
 	if !IsKnownCategory("fixup_pr_body_unsatisfiable") {
 		t.Fatal("fixup_pr_body_unsatisfiable is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_GroomingReportRecorded pins E54.3 / #2235's ingest
+// category: handleGroomingReport appends it once per persisted grooming_report
+// artifact, carrying the content hash and the per-class entry counts #2240's
+// churn guard reads. An unregistered category is un-awaitable and unfilterable
+// via GET /v0/runs/{run_id}/audit?category=, and categories_completeness_test.go's
+// AST sweep fails the build on a category backend code emits but the registry
+// omits.
+func TestKnownCategories_GroomingReportRecorded(t *testing.T) {
+	if !IsKnownCategory("grooming_report_recorded") {
+		t.Fatal("grooming_report_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+	// SuggestCategories must reproduce it from a plausible near-miss, so an
+	// operator who armed a wait on the wrong string is pointed at the real one.
+	var found bool
+	for _, c := range SuggestCategories("grooming_report_created", 5) {
+		if c == "grooming_report_recorded" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface grooming_report_recorded",
+			"grooming_report_created", SuggestCategories("grooming_report_created", 5))
 	}
 }
