@@ -320,10 +320,20 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// plan.Validate reproduces the same ParseError and the existing fail-B
 	// handling owns the response — so the discriminator never swallows a
 	// malformed upload.
-	if kind, derr := plan.DetectArtifactKind(body); derr == nil &&
-		kind == plan.ArtifactKindClarificationRequest {
-		s.handleClarificationRequest(w, r, runID, stageID, stage, body)
-		return
+	// A grooming_report (#2235, ADR-065 §3) is the SECOND additive sibling,
+	// routed by the same discriminator: a `plan`-typed PROPOSE stage running a
+	// backlog-grooming workflow emits proposals over a backlog slice instead of
+	// a plan. It is persisted as an artifact + a grooming_report_recorded audit
+	// entry rather than validated as a plan.
+	if kind, derr := plan.DetectArtifactKind(body); derr == nil {
+		switch kind {
+		case plan.ArtifactKindClarificationRequest:
+			s.handleClarificationRequest(w, r, runID, stageID, stage, body)
+			return
+		case plan.ArtifactKindGroomingReport:
+			s.handleGroomingReport(w, r, runID, stageID, stage, body)
+			return
+		}
 	}
 
 	// Validate payload against standard_v1. For the known string-elision

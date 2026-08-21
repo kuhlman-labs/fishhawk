@@ -403,6 +403,54 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					),
 				}
 			}
+			// The grooming_report artifact (ADR-065 §3 / #2235) is emitted only
+			// by a `plan`-typed PROPOSE stage — ADR-067 §2 settled that the v0
+			// stage-type names are retained but GENERAL, and `plan` reads as
+			// PROPOSE. Third mirror of the deployment / acceptance bindings
+			// above: the produces $def is shared across every stage type, so
+			// this stage-type pairing is a graph-shape rule enforced here
+			// rather than in the JSON Schema. The binding keys on the stage
+			// TYPE, not on a workflow NAME — binding on a name would be unlike
+			// every existing artifact binding and would make the artifact
+			// undeclarable in any other propose workflow.
+			if p.Artifact == ArtifactGroomingReport {
+				if stage.Type != StageTypePlan {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+						Message: fmt.Sprintf(
+							"grooming_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 — not a %q stage (ADR-065 §3)",
+							stage.Type,
+						),
+					}
+				}
+				// Mirrors the plan/standard_v1 rule above and MVP_SPEC §4.3's
+				// forward-compatibility argument: a grooming report is
+				// schema-versioned, so an undeclared schema is a
+				// permanent-data-loss risk.
+				if p.Schema != GroomingReportSchemaVersion {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/schema", j)),
+						Message: fmt.Sprintf(
+							"grooming_report-producing stage must declare schema: %s, got %q",
+							GroomingReportSchemaVersion, p.Schema,
+						),
+					}
+				}
+				// A propose stage proposes ONE thing: a plan OR a grooming
+				// report, never both. Two proposal artifacts on one stage give
+				// the plan-stage ingest discriminator two legitimate answers.
+				for k, other := range stage.Produces {
+					if k != j && other.Artifact == ArtifactPlan {
+						return &ValidationError{
+							Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+							Message: fmt.Sprintf(
+								"stage %q declares both the plan and grooming_report artifacts; a propose stage proposes one thing — drop whichever this stage does not emit (ADR-065 §3)",
+								stage.ID,
+							),
+						}
+					}
+				}
+			}
 		}
 
 		// Egress / permissions declaration binding (ADR-050 / #1532;

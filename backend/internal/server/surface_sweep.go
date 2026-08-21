@@ -251,6 +251,23 @@ var surfacePatterns = []surfacePattern{
 		},
 	},
 	{
+		// E54.3 / #2235: the grooming-report-v1 schema's canonical and
+		// embedded-mirror copies must move in lockstep (scripts/sync-schemas'
+		// grooming-report-* case routes the canonical to exactly the one
+		// backend/internal/plan/schemas mirror — the runner writes the report
+		// but does not embed the schema). Self-referential (Triggers ==
+		// Siblings), matching the operator-role / work-management entries.
+		Name: "grooming-report schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/grooming-report-v1.schema.json",
+			"backend/internal/plan/schemas/grooming-report-v1.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/grooming-report-v1.schema.json",
+			"backend/internal/plan/schemas/grooming-report-v1.schema.json",
+		},
+	},
+	{
 		// #1101/#1006 case 2: the work-management-v0 schema's canonical and
 		// embedded-mirror copies must move in lockstep (scripts/sync-schemas'
 		// work-management-v* case routes the canonical to exactly the one

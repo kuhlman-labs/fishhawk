@@ -209,9 +209,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		MinRunnerVersion: version.MinRunnerVersion,
 		Schemas: map[string]string{
 			"plan-standard-v1": plan.EmbeddedSchemaHash(),
-			"workflow-v0":      spec.EmbeddedSchemaHash(),
-			"workflow-v1":      spec.EmbeddedSchemaHashV1(),
-			"workflow-v2":      spec.EmbeddedSchemaHashV2(),
+			// The grooming_report plan-stage sibling (#2235). Advertised per
+			// the AGENTS.md schema-change checklist step 3 so a runner writing
+			// grooming reports can detect drift against the backend that
+			// validates them.
+			"grooming-report-v1": plan.EmbeddedGroomingReportSchemaHash(),
+			"workflow-v0":        spec.EmbeddedSchemaHash(),
+			"workflow-v1":        spec.EmbeddedSchemaHashV1(),
+			"workflow-v2":        spec.EmbeddedSchemaHashV2(),
 		},
 		StartNonce: s.cfg.StartNonce,
 	}

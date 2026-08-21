@@ -4667,6 +4667,33 @@ func TestShipPlan_ClarificationRequest_ParksAwaitingInput(t *testing.T) {
 	}
 }
 
+// TestShipPlan_UnknownKindDiscriminator_FallsThroughToPlanPath pins the
+// discriminator's FALL-THROUGH after #2235 turned the single
+// clarification_request branch into a switch over three artifact kinds. A
+// document carrying an UNRECOGNIZED top-level "kind" must NOT be routed to a
+// sibling handler: DetectArtifactKind defaults it to the plan kind, so it takes
+// the plan path and is rejected as an invalid plan (plan_invalid), never as
+// grooming_report_invalid or clarification_request_invalid. Without the default
+// leg an unknown kind would silently reach whichever branch matched last.
+func TestShipPlan_UnknownKindDiscriminator_FallsThroughToPlanPath(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	body := []byte(`{"kind": "not_a_known_artifact", "summary": "nope"}`)
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	raw := w.Body.String()
+	if strings.Contains(raw, "grooming_report_invalid") || strings.Contains(raw, "clarification_request_invalid") {
+		t.Errorf("an unknown kind must take the PLAN path, not a sibling handler: %s", raw)
+	}
+	if !strings.Contains(raw, "plan_invalid") {
+		t.Errorf("expected the plan-path rejection (plan_invalid): %s", raw)
+	}
+}
+
 // TestShipPlan_ClarificationRequest_DuplicateID_400 confirms the unique-question-id
 // semantic (#1057): operator answers are keyed by question id on resume, so a
 // clarification_request whose questions share an id is rejected at ingest

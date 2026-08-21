@@ -6395,3 +6395,192 @@ workflows:
 		})
 	}
 }
+
+// --- E54.3 / #2235: the grooming_report produces artifact --------------------
+
+// TestValidate_GroomingReportArtifact_NonPlanStage_Rejected pins the stage-type
+// binding (the third mirror of the deployment / acceptance bindings): the
+// grooming_report artifact is valid ONLY on a `plan`-typed stage — the PROPOSE
+// stage per ADR-067 §2. Four negative rows (implement / review / deploy /
+// acceptance) plus a POSITIVE control asserting a `plan`-typed stage accepts it.
+// Deleting the binding reddens the four negative rows.
+func TestValidate_GroomingReportArtifact_NonPlanStage_Rejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType string
+		executor  string
+		wantType  string
+	}{
+		{name: "implement", stageType: "implement", executor: "          agent: claude-code\n", wantType: "implement"},
+		{name: "review", stageType: "review", executor: "          human: true\n", wantType: "review"},
+		{
+			name:      "deploy",
+			stageType: "deploy",
+			executor: "          delegate:\n" +
+				"            target: webhook\n" +
+				"            url: https://example.com/deploy\n",
+			wantType: "deploy",
+		},
+		{name: "acceptance", stageType: "acceptance", executor: "          agent: claude-code\n", wantType: "acceptance"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: s
+        type: ` + tc.stageType + `
+        executor:
+` + tc.executor + `        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+`
+			_, err := spec.ParseBytes([]byte(doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if want := "/workflows/wf/stages/0/produces/0/artifact"; ve.Path != want {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, "grooming_report artifact is valid only on a plan stage") {
+				t.Errorf("ValidationError.Message = %q, want the grooming_report stage-type binding", ve.Message)
+			}
+			if !strings.Contains(ve.Message, `"`+tc.wantType+`"`) {
+				t.Errorf("ValidationError.Message = %q, want it to name the offending stage type %q", ve.Message, tc.wantType)
+			}
+		})
+	}
+
+	// POSITIVE CONTROL: a `plan`-typed stage ACCEPTS the artifact. This is the
+	// test that would fail if the plan's binding reading (stage type, not
+	// workflow name) were wrong.
+	t.Run("plan stage accepts", func(t *testing.T) {
+		if _, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  backlog_grooming:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+`)); err != nil {
+			t.Fatalf("a plan-typed PROPOSE stage must accept grooming_report: %v", err)
+		}
+	})
+}
+
+// TestValidate_GroomingReportArtifact_MissingSchema_Rejected pins the
+// schema-version rule mirroring plan/standard_v1 (MVP_SPEC §4.3): a
+// grooming_report-producing stage MUST declare schema: grooming_report_v1.
+// Two rows — schema absent, and a wrong schema token.
+func TestValidate_GroomingReportArtifact_MissingSchema_Rejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		wantGot string
+	}{
+		{name: "absent", schema: "", wantGot: `got ""`},
+		{name: "wrong token", schema: "            schema: standard_v1\n", wantGot: `got "standard_v1"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+` + tc.schema))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if want := "/workflows/wf/stages/0/produces/0/schema"; ve.Path != want {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, "must declare schema: grooming_report_v1") {
+				t.Errorf("ValidationError.Message = %q, want the schema-version rule", ve.Message)
+			}
+			if !strings.Contains(ve.Message, tc.wantGot) {
+				t.Errorf("ValidationError.Message = %q, want it to name %s", ve.Message, tc.wantGot)
+			}
+		})
+	}
+}
+
+// TestValidate_GroomingReportAndPlan_SameStage_Rejected pins the
+// one-proposal-per-propose-stage rule: declaring BOTH plan and grooming_report
+// on one stage gives the plan-stage ingest discriminator two legitimate answers.
+// Asserted in BOTH declaration orders, so the rejection does not depend on which
+// entry the produces loop reaches first.
+func TestValidate_GroomingReportAndPlan_SameStage_Rejected(t *testing.T) {
+	orders := map[string]string{
+		"grooming first": `          - artifact: grooming_report
+            schema: grooming_report_v1
+          - artifact: plan
+            schema: standard_v1
+`,
+		"plan first": `          - artifact: plan
+            schema: standard_v1
+          - artifact: grooming_report
+            schema: grooming_report_v1
+`,
+	}
+	for name, produces := range orders {
+		t.Run(name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+` + produces))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(ve.Message, "declares both the plan and grooming_report artifacts") {
+				t.Errorf("ValidationError.Message = %q, want the both-proposals rejection", ve.Message)
+			}
+		})
+	}
+}
+
+// TestParseBytes_V0V1_GroomingReportArtifact_Rejected pins that the FROZEN
+// majors keep rejecting the new artifact: v0 and v1's own produces enums do not
+// admit grooming_report, so a v0.7 / v1.6 document declaring it fails on its own
+// schema (a *SchemaError), never reaching the version-agnostic binding.
+func TestParseBytes_V0V1_GroomingReportArtifact_Rejected(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run("frozen major "+version, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  wf:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+`))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("version %s: err = %v, want *SchemaError (the frozen major must reject the artifact)", version, err)
+			}
+		})
+	}
+}

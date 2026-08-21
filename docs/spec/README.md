@@ -12,6 +12,7 @@ Machine-readable schemas and reference docs for the v0 surfaces that span the ru
 | workflow-v1 → workflow-v2 migration (`fishhawk migrate-spec`, E52.8 / #2220) | [`workflow-migration.md`](workflow-migration.md) | — (translates between the v1 and v2 schemas above) | golden fixture pair in `cli/internal/spec/testdata/migrate/` |
 | Plan artifact `standard_v1` | [`plan-standard-v1.md`](plan-standard-v1.md) | [`plan-standard-v1.schema.json`](plan-standard-v1.schema.json) | [`examples/plan-standard-v1-example.json`](examples/plan-standard-v1-example.json) |
 | Clarification request artifact (`standard_v1` sibling) | [`clarification-request-v1.md`](clarification-request-v1.md) | [`clarification-request-v1.schema.json`](clarification-request-v1.schema.json) | inline in [`clarification-request-v1.md`](clarification-request-v1.md#example) |
+| Grooming report artifact (plan-stage sibling, ADR-065 §3) | [`grooming-report-v1.md`](grooming-report-v1.md) | [`grooming-report-v1.schema.json`](grooming-report-v1.schema.json) | [`examples/grooming-report-v1-example.json`](examples/grooming-report-v1-example.json) |
 | Operator role spec v0 (shipped default + `.fishhawk/operator.yaml` overlay, ADR-040) | [`operator-role.md`](operator-role.md) | [`operator-role.schema.json`](operator-role.schema.json), [`operator-role-overlay.schema.json`](operator-role-overlay.schema.json) | [`operator-role-default.yaml`](operator-role-default.yaml) (shipped default — a product artifact, synced like the schemas), [`examples/operator-role-overlay-example.yaml`](examples/operator-role-overlay-example.yaml) |
 
 All schemas are JSON Schema Draft 2020-12.
@@ -49,6 +50,9 @@ check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
 
 check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \
     docs/spec/examples/plan-standard-v1-example.json
+
+check-jsonschema --schemafile docs/spec/grooming-report-v1.schema.json \
+    docs/spec/examples/grooming-report-v1-example.json
 
 check-jsonschema --schemafile docs/spec/operator-role.schema.json \
     docs/spec/operator-role-default.yaml

@@ -686,8 +686,8 @@ Referent errors reuse the existing `from_stage` graph-shape rules with their unc
 
 ```yaml
 produces:
-  - artifact: plan          # plan | pull_request | deployment | acceptance
-    schema: standard_v1     # plan only; the artifact schema version
+  - artifact: plan          # plan | pull_request | deployment | acceptance | grooming_report
+    schema: standard_v1     # plan / grooming_report; the artifact schema version
     persistence:
       - target: originating_issue   # originating_issue | fishhawk_audit_log
         mode: rendered_comment      # rendered_comment | canonical
@@ -700,6 +700,16 @@ produces:
 | `pull_request` | any non-deploy stage | A code change. This is the **diff signal** the post-hoc constraints bind to. |
 | `deployment` | `deploy` only | The delegated release outcome (`{environment, ref/sha, external_run_url, outcome, rollback_handle}`). |
 | `acceptance` | `acceptance` only | The durable acceptance-evidence record (`{verdict, per-criterion results, content-hash references}`). |
+| `grooming_report` | `plan` only | **v2-only** (ADR-065 §3 / #2235). The backlog-grooming proposal a PROPOSE stage emits *instead of* a plan: a rubric-cited ordering plus duplicate candidates, hygiene defects, suggested `depends_on` edges, vision-drift flags and decomposition suggestions, as `grooming_report_v1`. `schema: grooming_report_v1` is **required** alongside it, and a stage may not declare **both** `plan` and `grooming_report` — a propose stage proposes one thing. See [`grooming-report-v1.md`](grooming-report-v1.md). |
+
+The `grooming_report` binding keys on the **stage type**, not on a workflow name: `plan` reads as PROPOSE (ADR-067 §2), so any propose stage in any workflow may emit one. Declaring it does **not** make a stage produce a diff — `pull_request` remains the only diff signal, so a grooming workflow still cannot carry a post-hoc diff constraint. Rejections:
+
+```
+grooming_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 —
+not a "implement" stage (ADR-065 §3)
+
+grooming_report-producing stage must declare schema: grooming_report_v1, got ""
+```
 
 `persistence` says where a copy of the artifact lands. `target` is `fishhawk_audit_log` (the authoritative copy, `mode: canonical`) or `originating_issue` (the human-readable echo on the tracker, `mode: rendered_comment`).
 
@@ -820,7 +830,7 @@ stage "apply" declares no pull_request artifact (ADR-067).
 Declare produces: [{artifact: pull_request}] on this stage, or remove the constraint.
 ```
 
-`pull_request` is the diff signal because it is the only artifact in the closed set that **denotes a code change**: `deployment` is delegated to an external pipeline, `acceptance` is a verdict, and `plan` is a proposal.
+`pull_request` is the diff signal because it is the only artifact in the closed set that **denotes a code change**: `deployment` is delegated to an external pipeline, `acceptance` is a verdict, and `plan` and `grooming_report` are proposals.
 
 > **An absent or empty `produces` list reads as "produces no diff."** Omitting `produces` does not exempt a stage — that is what gives the rule teeth. The permissive alternative ("absent means unknown, so allow it") would let any stage keep a diff constraint simply by staying silent, which is exactly the case this rule exists to reject. The fix is one line: declare the artifact, or drop the constraint.
 
@@ -1089,8 +1099,8 @@ test_conventions:
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
 | Input `source` | `github_issue` \| `pull_request` | external trigger |
 | Input `artifact` | `plan` \| `pull_request` | what a later stage may consume |
-| Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` | `deployment` deploy-only, `acceptance` acceptance-only |
-| `produces[].schema` | `standard_v1` | required alongside the `plan` artifact |
+| Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` \| `grooming_report` | `deployment` deploy-only, `acceptance` acceptance-only, `grooming_report` plan-only (v2-only) |
+| `produces[].schema` | `standard_v1` \| `grooming_report_v1` | required alongside the `plan` and `grooming_report` artifacts respectively |
 | `persistence.target` | `originating_issue` \| `fishhawk_audit_log` | closed set |
 | `persistence.mode` | `rendered_comment` \| `canonical` | closed set |
 | `persistence.update_on_change` | `true` \| `false` | republish in place when the artifact is regenerated |

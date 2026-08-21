@@ -234,6 +234,10 @@ type ArtifactKind string
 const (
 	ArtifactKindPlan                 ArtifactKind = "plan"
 	ArtifactKindClarificationRequest ArtifactKind = "clarification_request"
+	// ArtifactKindGroomingReport is the grooming_report sibling (#2235,
+	// ADR-065 §3): the proposal a `plan`-typed PROPOSE stage emits when it
+	// grooms a backlog slice instead of planning a code change.
+	ArtifactKindGroomingReport ArtifactKind = "grooming_report"
 )
 
 // ClarificationRequest is a parsed and schema-validated clarification_request

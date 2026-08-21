@@ -506,13 +506,14 @@
             "plan",
             "pull_request",
             "deployment",
-            "acceptance"
+            "acceptance",
+            "grooming_report"
           ],
-          "description": "Closed set. plan/pull_request are inherited from v0; deployment is the v1 runtime artifact a deploy stage emits (ADR-038 / #925) capturing the delegated release outcome {environment, ref/sha, external_run_url, outcome, rollback_handle}, valid ONLY on a deploy stage; acceptance is the artifact an acceptance stage emits (ADR-049 / #1531) capturing the acceptance-evidence record {verdict, per-criterion results, content_hash refs to evidence blobs}, valid ONLY on an acceptance stage. Both stage-type bindings are enforced semantically by the validator. Custom artifacts remain deferred."
+          "description": "Closed set. plan/pull_request are inherited from v0; deployment is the v1 runtime artifact a deploy stage emits (ADR-038 / #925) capturing the delegated release outcome {environment, ref/sha, external_run_url, outcome, rollback_handle}, valid ONLY on a deploy stage; acceptance is the artifact an acceptance stage emits (ADR-049 / #1531) capturing the acceptance-evidence record {verdict, per-criterion results, content_hash refs to evidence blobs}, valid ONLY on an acceptance stage; grooming_report is the v2-only backlog-grooming proposal a PROPOSE stage emits instead of a plan (ADR-065 §3 / E54.3 #2235) capturing the rubric-cited ordering, duplicate candidates, hygiene defects, suggested depends_on edges, vision-drift flags and decomposition suggestions, valid ONLY on a `plan`-typed stage (ADR-067 §2 reads `plan` as PROPOSE) and REQUIRING schema: grooming_report_v1, and never declared alongside the plan artifact on the same stage. v0 and v1 are frozen majors and do not admit grooming_report. All three stage-type bindings are enforced semantically by the validator. Custom artifacts remain deferred."
         },
         "schema": {
           "type": "string",
-          "description": "Artifact schema version (e.g. standard_v1 for plan)."
+          "description": "Artifact schema version (e.g. standard_v1 for plan, grooming_report_v1 for grooming_report). REQUIRED by the validator for both of those artifacts; MVP_SPEC §4.3 — a proposal artifact is schema-versioned for forward compatibility."
         },
         "persistence": {
           "type": "array",

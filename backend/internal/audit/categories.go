@@ -79,6 +79,10 @@ import "sort"
 // effective cap, naming the cap and the dropped-byte count). Both are written
 // per prompt SERVE, so a retry or re-dispatch attributes again — the guarantee
 // is that every injection is attributed. When a new
+// E54.3 / #2235 added grooming_report_recorded, written once per ingested
+// grooming_report artifact on POST /v0/runs/{run_id}/plan (the plan-stage
+// discriminator's second additive sibling) carrying the artifact's content hash
+// and the per-class entry counts #2240's churn guard reads. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -147,6 +151,7 @@ var KnownCategories = map[string]struct{}{
 	"escalation_fired":                        {},
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
+	"grooming_report_recorded":                {},
 	"implement_review_backstop_elapsed":       {},
 	"implement_review_failed":                 {},
 	"implement_review_skipped":                {},
