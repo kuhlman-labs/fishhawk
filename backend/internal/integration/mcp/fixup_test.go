@@ -407,6 +407,130 @@ func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_PRBodyInstruction is the #2782 cross-boundary integration test:
+// the real fishhawk-mcp binary routes a fix-up whose operator_concern names the
+// PR body — a surface a fix-up pass cannot write — against the real backend over
+// real Postgres, and asserts in one test that the seam holds across three layers
+// (cf. #618). (a) The tool result carries a warnings entry naming the PR-body
+// limitation and pointing at the self-report sidecar. (b) A
+// fixup_pr_body_unsatisfiable audit entry persisted, carrying the obligation id
+// and bounded excerpt. (c) The served fix-up prompt marks that obligation as
+// naming a surface the pass cannot write. The review-time leg — an
+// `unsatisfiable` obligation reframed as a routing-surface limitation, surfaced
+// even under a `met` report — is covered through the real review path by
+// TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet.
+func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	const prBodyInstruction = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":         stage.ID.String(),
+			"operator_concern": prBodyInstruction,
+			"reason":           "route the reporting obligation",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("PR-body fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// (a) The tool result carries the routing-time warning.
+	var fixupOut struct {
+		Stage struct {
+			State string `json:"state"`
+		} `json:"stage"`
+		Warnings []string `json:"warnings"`
+	}
+	decodeStructured(t, result, &fixupOut)
+	if fixupOut.Stage.State != string(runpkg.StageStatePending) {
+		t.Errorf("fix-up stage state = %q, want pending", fixupOut.Stage.State)
+	}
+	if len(fixupOut.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly 1 naming the PR-body limitation", fixupOut.Warnings)
+	}
+	// CROSS-BOUNDARY channel assertion (#2782): the warning names the TRUE arrival
+	// channel — operator_concern — derived by the REAL backend, not a value the
+	// test seeded. The backend folds operator_concern into a synthetic selected
+	// concern, so a naive dedupe would mis-report this instruction as arriving via
+	// "concern"; this pins that the server-minted obligation preserves the real
+	// channel end to end (the vacuity the unit-level rendering test cannot catch).
+	for _, w := range []string{"ob-1", "operator_concern", "PULL-REQUEST BODY", "CANNOT update", "self-report sidecar"} {
+		if !strings.Contains(fixupOut.Warnings[0], w) {
+			t.Errorf("warning missing %q:\n%s", w, fixupOut.Warnings[0])
+		}
+	}
+
+	// (b) The advisory fixup_pr_body_unsatisfiable audit entry persisted.
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryFixupPRBodyUnsatisfiable)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("fixup_pr_body_unsatisfiable entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		StageID         string `json:"stage_id"`
+		ObligationCount int    `json:"obligation_count"`
+		Obligations     []struct {
+			ID          string `json:"id"`
+			Source      string `json:"source"`
+			TextExcerpt string `json:"text_excerpt"`
+		} `json:"obligations"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+	}
+	if payload.StageID != stage.ID.String() || payload.ObligationCount != 1 || len(payload.Obligations) != 1 {
+		t.Fatalf("payload = %+v, want the stage id and one obligation", payload)
+	}
+	if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].Source != "operator_concern" || payload.Obligations[0].TextExcerpt != prBodyInstruction {
+		t.Errorf("audit obligation = %+v, want ob-1/operator_concern with the PR-body excerpt", payload.Obligations[0])
+	}
+
+	// (c) The served fix-up prompt marks the obligation as naming a surface the
+	// pass cannot write.
+	rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
+	if !strings.Contains(rendered, "### Reporting obligations routed with this fix-up") {
+		t.Errorf("rendered prompt missing the reporting-obligations block:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "this names the PULL-REQUEST BODY, which THIS pass cannot write; report it `declined`") {
+		t.Errorf("rendered prompt missing the PR-body cannot-write marker:\n%s", rendered)
+	}
+}
+
 // TestE2E_Fixup_OperatorConcernMintedToDurableStore is the #2623 cross-boundary
 // integration: the real fishhawk-mcp binary calls fishhawk_fixup_stage with ONLY
 // an operator_concern against the real backend over a real Postgres concern store

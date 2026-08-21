@@ -425,6 +425,53 @@ func TestAutoDriveRunGate_RouteFixup(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_RouteFixup_PRBodyInstruction_AppendsAdvisoryAudit is the
+// #2782 every-routing-path pin for the in-process campaign auto-driver: routing
+// a PR-body-naming concern through autoFixup (NOT the HTTP handler) still writes
+// the advisory fixup_pr_body_unsatisfiable audit entry inside fixupStageAs. This
+// guards the documented every-path guarantee against a future refactor that
+// moves recordFixupPRBodyUnsatisfiable out of fixupStageAs onto the HTTP handler
+// — which would silently break this non-HTTP path with nothing going red.
+//
+// Counterfactual: move the recordFixupPRBodyUnsatisfiable call out of
+// fixupStageAs (e.g. into handleFixupStage) and this goes RED — the auto-drive
+// path then appends zero fixup_pr_body_unsatisfiable entries.
+func TestAutoDriveRunGate_RouteFixup_PRBodyInstruction_AppendsAdvisoryAudit(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	// A high-severity open concern (so convergent_concerns fires) whose note names
+	// the PR body — the surface a fix-up pass cannot write.
+	const prBodyNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", "correctness", prBodyNote)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup", out)
+	}
+	// The advisory entry landed on the non-HTTP routing path.
+	e := auditEntry(t, au, CategoryFixupPRBodyUnsatisfiable)
+	var payload fixupPRBodyUnsatisfiablePayload
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+	}
+	if payload.StageID != impl.ID.String() || payload.ObligationCount != 1 || len(payload.Obligations) != 1 {
+		t.Fatalf("payload = %+v, want the implement stage id and one obligation", payload)
+	}
+	if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].Source != "concern" || payload.Obligations[0].TextExcerpt != prBodyNote {
+		t.Errorf("obligation = %+v, want ob-1/concern with the PR-body excerpt", payload.Obligations[0])
+	}
+}
+
 // TestAutoDriveRunGate_RouteFixupParksOnAllLow is the #1964 done-means
 // cross-layer assertion: a dual-approve implement round whose ONLY open
 // concern is low-severity parks at the default medium threshold instead of

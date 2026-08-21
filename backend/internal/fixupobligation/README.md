@@ -89,7 +89,12 @@ the case-folded text contains **both**:
 | Half | Terms |
 |---|---|
 | Recording verb | `record`, `report`, `document`, `attest`, `attestation`, `write up`, `list out` |
-| Report-surface noun | `pr body`, `pull request body`, `pull-request body`, `pr description`, `pull request description`, `pull-request description`, `## notes`, `notes section`, `run log` |
+| Report-surface noun (PR-body set) | `pr body`, `pull request body`, `pull-request body`, `pr description`, `pull request description`, `pull-request description`, `## notes`, `notes section` |
+| Report-surface noun (other) | `run log` |
+
+`IsObligation` tests the **union** of the two noun sets, so the detected set —
+and every `ob-N` id — is unchanged by the #2782 split; only the per-member
+classification is new (see "PR-body obligations" below).
 
 The narrowness is the anti-noise property: a signal that fires on every pass is
 one operators learn to ignore, which is the failure mode this change must not
@@ -103,6 +108,67 @@ which is today's exact behavior, so nothing regresses when it misses. A concern
 that mentions the PR body in passing while also using a recording verb can
 produce a **false positive** advisory entry; that entry never fails or
 re-budgets anything.
+
+## PR-body obligations (#2782)
+
+The report-surface nouns split by whether a fix-up pass **can write** the named
+surface. The PR-body set names the pull-request body — which a fix-up pass has
+**no mechanism to write**: the slim fix-up prompt renders no PR-description
+block and the pass only pushes commits, so the PR title/body composed at PR-open
+by the first implement attempt is never re-composed (verified in
+`runner/cmd/fishhawk-runner/main.go`, where `willOpenPR` is gated on
+`!cfg.fixup`). `## notes` / `notes section` count as PR-body surfaces because in
+this workflow the `## Notes` heading **is** a PR-body convention (AGENTS.md's
+git-flow PR-body template) — and it was the exact phrasing the #2782 occurrence
+used. `run log` names a surface the pass **can** write, so it stays satisfiable.
+
+`Detect` records the split on `Obligation.PRBody`, derived once (at the single
+detection site) from `NamesPRBodySurface(text)` — which, unlike `IsObligation`,
+is **not** conjunctive with the recording verbs: it answers "does this name the
+surface the pass cannot write", the question that decides unsatisfiability. The
+flag then rides every consumer (the routing-time warning, the advisory audit
+entry, the fix-up prompt bullet, and the review-time join) with no re-derivation.
+
+`Undelivered` returns a PR-body obligation as a Finding with status
+`unsatisfiable` **regardless of the agent's report — including a `met`**,
+short-circuiting ahead of the report lookup. The pass had no mechanism to write
+the PR body, so a `met` claim for such an obligation cannot be true, and silently
+honouring it is exactly what made PR #2775's rich counterfactual table read as
+complete while documenting only the first pass. The reviewer prompt reframes an
+`unsatisfiable` obligation as a **routing-surface limitation, not an agent
+omission** (`writeGateEvidence`), so the reviewer does not raise it against the
+agent. A non-PR-body (run-log) obligation keeps the prior
+`met`-suppresses-the-finding behaviour byte-for-byte — the narrow-classification
+control, pinned by `TestUndelivered_RunLogObligation_MetSuppressesFinding`.
+
+### Routing-time signal
+
+Because the impossibility is knowable at ROUTING time, the operator learns it
+without waiting for the review. `server/fixup.go::recordFixupPRBodyUnsatisfiable`
+(called from `fixupStageAs` on every routing path — the HTTP verb, the campaign
+auto-driver, and acceptance triage) derives the PR-body obligation set via the
+**shared** `buildFixupObligationSources` helper + `Detect`, so the ids match the
+reviewer's by construction; when non-empty it appends the advisory
+`fixup_pr_body_unsatisfiable` audit entry AND returns the set on the fix-up
+response's optional `pr_body_obligations` field, from which the MCP verb renders
+its operator warning (naming the arrival channel + id). Best-effort/fail-open:
+a nil `AuditRepo` or an append error contributes nothing and never unwinds the
+committed transition. An ordinary pass returns nil and keeps every surface
+byte-identical.
+
+### Option 2, not option 1
+
+#2782 asked whether a fix-up should be allowed to **re-compose and PATCH** the PR
+body (option 1) or the impossibility should be made **explicit** (option 2). This
+change takes option 2. Option 1 is declined on the egress ground #2737 already
+established: the fix-up agent controls every byte of its attestation text, and
+routing that agent-controlled text into a PUBLIC, permanent, indexed pull-request
+body is strictly worse egress than the reviewer-prompt path #2737 closed. Option
+3 (a structured per-pass artifact) is what the self-report sidecar already **is**;
+this change makes that sidecar's boundary legible rather than inventing a second
+artifact. Self-labelling an already-composed PR body (the runner-side body stamp)
+is deferred — it requires touching the runner's PR-open composition path, whereas
+this change is backend-only and advisory (tracked as a #2782 follow-up).
 
 ## ID assignment
 

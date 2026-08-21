@@ -176,6 +176,7 @@ var exportBaseline = []string{
 	"OnboardingReviewer",
 	"OnboardingScopes",
 	"OnboardingSpec",
+	"PRBodyObligation",
 	"PlanApproachStep",
 	"PlanContent",
 	"PlanDecomposed",

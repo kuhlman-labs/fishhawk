@@ -95,11 +95,14 @@ func TestDetect_IDsAreDeterministicAndKindOrdered(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("Detect returned %d, want 4: %+v", len(got), got)
 	}
+	// Every text here names a PR-body surface (PR body / ## Notes / pull
+	// request description), so each obligation carries PRBody true — the id
+	// ordering itself is unchanged by the #2782 split, which is what this pins.
 	want := []Obligation{
-		{ID: "ob-1", Source: SourceConcern, Text: concernA},
-		{ID: "ob-2", Source: SourceConcern, Text: concernB},
-		{ID: "ob-3", Source: SourceOperatorConcern, Text: operatorText},
-		{ID: "ob-4", Source: SourceReason, Text: reasonText},
+		{ID: "ob-1", Source: SourceConcern, Text: concernA, PRBody: true},
+		{ID: "ob-2", Source: SourceConcern, Text: concernB, PRBody: true},
+		{ID: "ob-3", Source: SourceOperatorConcern, Text: operatorText, PRBody: true},
+		{ID: "ob-4", Source: SourceReason, Text: reasonText, PRBody: true},
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -307,5 +310,85 @@ func TestDetect_CarriesUntrustedProvenance(t *testing.T) {
 	}
 	if !deduped[0].Untrusted {
 		t.Errorf("deduped obligation = %+v, want the surviving concern's Untrusted flag retained", deduped[0])
+	}
+}
+
+// TestDetect_PRBodyClassification pins the #2782 noun-list split: an
+// obligation naming the pull-request body (including the `## Notes` heading and
+// `notes section`, which ARE PR-body conventions in this workflow) carries
+// PRBody true, while one naming the run log — a surface the pass CAN write —
+// carries PRBody false. The classification decides whether an obligation is
+// later treated as unsatisfiable, so a change to it must be deliberate.
+//
+// Delete the run-log carve-out (fold "run log" into prBodySurfaceNouns) and the
+// run-log arm goes RED; force NamesPRBodySurface to return false and every
+// PR-body arm goes RED.
+func TestDetect_PRBodyClassification(t *testing.T) {
+	cases := []struct {
+		name       string
+		text       string
+		wantPRBody bool
+	}{
+		{"pr_body", "Record the deletion table in the PR body.", true},
+		{"pull_request_body", "Document each dropped branch in the pull request body.", true},
+		{"pr_description", "Report the mapping in the pull-request description.", true},
+		{"notes_heading", "Record the counterfactual results in the PR body's ## Notes.", true},
+		{"notes_section", "Document the failure modes in the notes section.", true},
+		{"run_log", "Report the observed RED output in the run log.", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Detect([]Source{{Kind: SourceConcern, Text: tc.text}})
+			if len(got) != 1 {
+				t.Fatalf("Detect(%q) = %+v, want exactly one obligation", tc.text, got)
+			}
+			if got[0].PRBody != tc.wantPRBody {
+				t.Errorf("Detect(%q).PRBody = %v, want %v", tc.text, got[0].PRBody, tc.wantPRBody)
+			}
+			if NamesPRBodySurface(tc.text) != tc.wantPRBody {
+				t.Errorf("NamesPRBodySurface(%q) = %v, want %v", tc.text, NamesPRBodySurface(tc.text), tc.wantPRBody)
+			}
+		})
+	}
+}
+
+// TestUndelivered_PRBodyObligation_UnsatisfiableEvenWhenMetReported is the
+// heart of #2782: a PR-body obligation is returned with StatusUnsatisfiable
+// EVEN when the agent reported it `met`, because the pass has no mechanism to
+// write the PR body so a `met` claim cannot be true.
+//
+// The `met` report is seeded BY CONSTRUCTION — a literal Report{ID:"ob-1",
+// Status:StatusMet} — never produced by calling the control, so deleting the
+// PRBody short-circuit in Undelivered lands the RED on the status assertion
+// (the obligation then follows the `met`-suppresses-the-finding path and
+// vanishes) rather than on any fixture setup.
+func TestUndelivered_PRBodyObligation_UnsatisfiableEvenWhenMetReported(t *testing.T) {
+	declared := []Obligation{
+		{ID: "ob-1", Source: SourceConcern, Text: "Record the counterfactual table in the PR body's ## Notes.", PRBody: true},
+	}
+	got := Undelivered(declared, []Report{{ID: "ob-1", Status: StatusMet}})
+	if len(got) != 1 {
+		t.Fatalf("Undelivered = %+v, want the PR-body obligation returned despite a met report", got)
+	}
+	if got[0].ID != "ob-1" || got[0].Status != StatusUnsatisfiable {
+		t.Errorf("finding = %+v, want ob-1 with status %q", got[0], StatusUnsatisfiable)
+	}
+}
+
+// TestUndelivered_RunLogObligation_MetSuppressesFinding proves the
+// classification is NARROW rather than blanket: an obligation naming the run
+// log — a surface the pass CAN write — keeps the prior `met`-suppresses-the-
+// finding behaviour, so a satisfied run-log obligation emits nothing.
+//
+// Delete the run-log carve-out (fold "run log" into prBodySurfaceNouns) and
+// this goes RED: the obligation would then classify PRBody true and be returned
+// as unsatisfiable despite the `met` report.
+func TestUndelivered_RunLogObligation_MetSuppressesFinding(t *testing.T) {
+	declared := Detect([]Source{{Kind: SourceConcern, Text: "Report the observed RED output in the run log."}})
+	if len(declared) != 1 || declared[0].PRBody {
+		t.Fatalf("run-log obligation misclassified: %+v", declared)
+	}
+	if got := Undelivered(declared, []Report{{ID: "ob-1", Status: StatusMet}}); len(got) != 0 {
+		t.Fatalf("Undelivered = %+v, want nothing — a met run-log obligation is satisfiable and suppressed", got)
 	}
 }

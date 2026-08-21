@@ -2564,6 +2564,50 @@ components:
           type: string
           format: date-time
 
+    FixupResponse:
+      description: |
+        The `POST /v0/stages/{stage_id}/fixup` 200 body (#2782): the re-opened
+        Stage with an OPTIONAL `pr_body_obligations` field. All the Stage fields
+        appear at the top level exactly as before; `pr_body_obligations` is
+        present only when a routed instruction named the pull-request body — a
+        surface a fix-up pass cannot write — so a pass that routed none serves a
+        byte-identical Stage response.
+      allOf:
+        - $ref: '#/components/schemas/Stage'
+        - type: object
+          properties:
+            pr_body_obligations:
+              type: array
+              description: |
+                Routed instructions that named the pull-request body (#2782), so
+                the caller (the MCP verb) can warn the operator that a fix-up
+                pass has no mechanism to write it. The same ids appear later to
+                the reviewer. Omitted when empty.
+              items:
+                $ref: '#/components/schemas/PRBodyObligation'
+    PRBodyObligation:
+      type: object
+      description: |
+        One routed instruction that named the pull-request body — a surface a
+        fix-up pass cannot write (#2782).
+      required: [id, source, text_excerpt]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Stable `ob-N` id, the same id the reviewer sees for this obligation.
+        source:
+          type: string
+          description: The routed channel the instruction arrived on (`concern` | `operator_concern` | `reason`).
+        text_excerpt:
+          type: string
+          description: Bounded excerpt of the routed instruction.
+        untrusted:
+          type: boolean
+          description: |
+            True when the excerpt came from an acceptance-derived (attacker-
+            influenceable) concern note rather than operator-authored text.
+            Omitted (false) for the common operator-authored case.
     StageProgress:
       type: object
       description: |
@@ -12716,10 +12760,15 @@ paths:
                     omits it leaves the payload byte-identical.
       responses:
         '200':
-          description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
+          description: |
+            Stage re-opened for the fix-up pass; refreshed Stage row in body,
+            plus an OPTIONAL `pr_body_obligations` array (#2782) — present only
+            when a routed instruction named the pull-request body, a surface a
+            fix-up pass cannot write. Absent otherwise, so an unchanged consumer
+            sees a byte-identical Stage response.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Stage' }
+              schema: { $ref: '#/components/schemas/FixupResponse' }
         '400':
           description: |
             Malformed body, no selection at all (none of `concern_ids` /

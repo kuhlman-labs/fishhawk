@@ -259,3 +259,16 @@ func TestKnownCategories_FixupReportObligationsDeclared(t *testing.T) {
 		t.Fatal("fixup_report_obligations_declared is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_FixupPRBodyUnsatisfiable pins the #2782 routing-time
+// advisory category: fixupStageAs appends it when a routed instruction names
+// the PR body — a surface the pass cannot write — so the operator sees the
+// obligation was structurally impossible. An unregistered category is
+// un-awaitable and unfilterable via GET /v0/runs/{run_id}/audit?category=, and
+// categories_completeness_test.go's AST sweep fails the build on a category
+// backend code emits but the registry omits.
+func TestKnownCategories_FixupPRBodyUnsatisfiable(t *testing.T) {
+	if !IsKnownCategory("fixup_pr_body_unsatisfiable") {
+		t.Fatal("fixup_pr_body_unsatisfiable is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

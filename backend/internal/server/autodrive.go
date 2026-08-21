@@ -630,7 +630,10 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	if refunded > priorPasses {
 		refunded = priorPasses
 	}
-	if _, err := s.fixupStageAs(ctx, id, fixupActionParams{
+	// The PR-body-unsatisfiable set (#2782) is unused on the auto-drive path —
+	// there is no operator tool result to warn on — so it is discarded; the
+	// advisory audit entry is still written inside fixupStageAs.
+	if _, _, err := s.fixupStageAs(ctx, id, fixupActionParams{
 		StageID: impl.ID,
 		Options: run.FixupOptions{
 			PriorPassCount: priorPasses,

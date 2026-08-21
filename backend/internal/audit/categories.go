@@ -143,6 +143,7 @@ var KnownCategories = map[string]struct{}{
 	"implement_review_started":                {},
 	"implement_reviewed":                      {},
 	"implement_security_findings":             {},
+	"fixup_pr_body_unsatisfiable":             {},
 	"fixup_report_obligations_declared":       {},
 	"fixup_reporting_obligation_undelivered":  {},
 	"installation_token_issued":               {},
