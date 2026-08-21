@@ -199,3 +199,187 @@ func TestSequenceRange_Unordered(t *testing.T) {
 		t.Errorf("sequenceRange = %+v, want {5,30}", rng)
 	}
 }
+
+// --- wedge context (#1737) ---
+
+// TestCollect_NoWedgeArgument_BundleUnchanged is failure mode m9 AND the
+// counterfactual vehicle for the nil gate in CollectWithWedge: the
+// no-wedge Collect wrapper must produce the bundle it produced before
+// #1737 even on a run whose audit chain carries the fan-in conflict
+// signal, so every un-migrated caller is unaffected.
+//
+// Counterfactual: delete the `if wedge != nil` gate (assemble the block
+// unconditionally) and this goes RED — Collect emits a wedge_context
+// carrying the slice_integration_conflict marker.
+func TestCollect_NoWedgeArgument_BundleUnchanged(t *testing.T) {
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateFailed}
+	entries := []*audit.Entry{
+		{Sequence: 1, Category: "stage_dispatched"},
+		{Sequence: 2, Category: "slice_integration_conflict"},
+	}
+
+	b := Collect(r, nil, entries, sampleVersions())
+	if b.WedgeContext != nil {
+		t.Fatalf("Collect emitted wedge_context = %+v, want nil", b.WedgeContext)
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "wedge_context") {
+		t.Errorf("Collect bundle carries a wedge_context key: %s", raw)
+	}
+}
+
+// TestCollectWithWedge_NoWedgeShape_OmitsBlock is failure mode m1: an
+// opted-in run with nothing wedged carries no wedge_context key at all,
+// rather than an empty object.
+func TestCollectWithWedge_NoWedgeShape_OmitsBlock(t *testing.T) {
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateSucceeded}
+	entries := []*audit.Entry{{Sequence: 7, Category: "stage_dispatched"}}
+
+	b := CollectWithWedge(r, nil, entries, sampleVersions(), &WedgeFacts{})
+	if b.WedgeContext != nil {
+		t.Fatalf("wedge_context = %+v, want nil for a run with no wedge shape", b.WedgeContext)
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "wedge_context") {
+		t.Errorf("bundle carries a wedge_context key: %s", raw)
+	}
+	// And it is otherwise identical to the no-wedge wrapper's output.
+	plain, err := json.Marshal(Collect(r, nil, entries, sampleVersions()))
+	if err != nil {
+		t.Fatalf("marshal plain: %v", err)
+	}
+	if string(raw) != string(plain) {
+		t.Errorf("opted-in bundle differs from Collect:\n got %s\nwant %s", raw, plain)
+	}
+}
+
+// TestCollectWithWedge_PopulatedBlock pins the assembled block: injected
+// blocking checks and campaign facts plus the audit-derived fan-in
+// marker.
+func TestCollectWithWedge_PopulatedBlock(t *testing.T) {
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateFailed}
+	entries := []*audit.Entry{
+		{Sequence: 3, Category: "stage_dispatched"},
+		{Sequence: 4, Category: "slice_integration_conflict"},
+	}
+	wedge := &WedgeFacts{
+		// One empty name mixed in: dropped, not carried as "".
+		BlockingChecks:    []string{"CI Pass", "", "CodeQL"},
+		CampaignItemState: "failed",
+		BlockedDependents: 3,
+	}
+
+	b := CollectWithWedge(r, nil, entries, sampleVersions(), wedge)
+	if b.WedgeContext == nil {
+		t.Fatal("wedge_context = nil, want populated")
+	}
+	wc := b.WedgeContext
+	if got, want := strings.Join(wc.BlockingChecks, ","), "CI Pass,CodeQL"; got != want {
+		t.Errorf("blocking_checks = %q, want %q", got, want)
+	}
+	if wc.CampaignItemState != "failed" {
+		t.Errorf("campaign_item_state = %q, want failed", wc.CampaignItemState)
+	}
+	if wc.BlockedDependents != 3 {
+		t.Errorf("blocked_dependents = %d, want 3", wc.BlockedDependents)
+	}
+	if wc.IntegrateWaveError != "slice_integration_conflict" {
+		t.Errorf("integrate_wave_error = %q, want slice_integration_conflict", wc.IntegrateWaveError)
+	}
+}
+
+// TestCollectWithWedge_NoConflictEntry_NoFanInMarker pins the negative
+// half of the fan-in derivation: no slice_integration_conflict audit
+// category means no marker, so the block never over-claims a fan-in
+// failure.
+func TestCollectWithWedge_NoConflictEntry_NoFanInMarker(t *testing.T) {
+	r := &run.Run{ID: uuid.New(), State: run.StateFailed}
+	entries := []*audit.Entry{{Sequence: 1, Category: "children_settled"}}
+
+	b := CollectWithWedge(r, nil, entries, sampleVersions(), &WedgeFacts{BlockedDependents: 1})
+	if b.WedgeContext == nil {
+		t.Fatal("wedge_context = nil, want populated by blocked_dependents")
+	}
+	if b.WedgeContext.IntegrateWaveError != "" {
+		t.Errorf("integrate_wave_error = %q, want empty", b.WedgeContext.IntegrateWaveError)
+	}
+}
+
+// TestWedgeContext_NeverCarriesFreeText is the redaction counterfactual.
+// The fixture seeds the sentinel BY CONSTRUCTION in three places free
+// text could plausibly be picked up from — the drive advance audit
+// payload, the failing stage's FailureReason, and the caller-injected
+// campaign item state — and asserts none of it reaches the serialized
+// wedge block.
+//
+// Counterfactual: delete normalizeCampaignItemState's table lookup
+// (assign wedge.CampaignItemState straight through) and this goes RED on
+// the campaign_item_state assertion.
+func TestWedgeContext_NeverCarriesFreeText(t *testing.T) {
+	const sentinel = "SENTINEL_WEDGE_FREE_TEXT"
+
+	failStageID := uuid.New()
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateFailed}
+	stages := []*run.Stage{{
+		ID:              failStageID,
+		Sequence:        0,
+		Type:            run.StageTypeImplement,
+		State:           run.StageStateFailed,
+		FailureCategory: ptrCat(run.FailureB),
+		FailureReason:   ptrStr("slice branch will not merge: " + sentinel),
+	}}
+	entries := []*audit.Entry{
+		// A drive advance whose Event string embeds the sentinel...
+		{Sequence: 1, Category: "run_auto_advanced", Payload: []byte(`{"event":"` + sentinel + `"}`)},
+		// ...and the structured fan-in category, whose payload also does.
+		{Sequence: 2, StageID: &failStageID, Category: "slice_integration_conflict",
+			Payload: []byte(`{"detail":"` + sentinel + `"}`)},
+	}
+	wedge := &WedgeFacts{
+		BlockingChecks: []string{"CI Pass"},
+		// An unrecognized, free-text-bearing state: must be dropped.
+		CampaignItemState: "failed because " + sentinel,
+		BlockedDependents: 2,
+	}
+
+	b := CollectWithWedge(r, stages, entries, sampleVersions(), wedge)
+	if b.WedgeContext == nil {
+		t.Fatal("wedge_context = nil, want populated")
+	}
+	if b.WedgeContext.CampaignItemState != "" {
+		t.Errorf("campaign_item_state = %q, want empty (unrecognized state dropped)",
+			b.WedgeContext.CampaignItemState)
+	}
+	// The structured marker still flows — it is the package's own literal.
+	if b.WedgeContext.IntegrateWaveError != "slice_integration_conflict" {
+		t.Errorf("integrate_wave_error = %q", b.WedgeContext.IntegrateWaveError)
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), sentinel) {
+		t.Errorf("wedge bundle leaked free text: %s", raw)
+	}
+}
+
+// TestNormalizeCampaignItemState_ClosedTable pins that every real
+// campaign item state round-trips and everything else is dropped.
+func TestNormalizeCampaignItemState_ClosedTable(t *testing.T) {
+	for _, s := range []string{"pending", "blocked", "running", "paused", "succeeded", "failed", "cancelled"} {
+		if got := normalizeCampaignItemState(s); got != s {
+			t.Errorf("normalizeCampaignItemState(%q) = %q, want %q", s, got, s)
+		}
+	}
+	for _, s := range []string{"", "FAILED", "failed ", "wedged", "failed: reason"} {
+		if got := normalizeCampaignItemState(s); got != "" {
+			t.Errorf("normalizeCampaignItemState(%q) = %q, want empty", s, got)
+		}
+	}
+}
