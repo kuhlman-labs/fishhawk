@@ -8843,6 +8843,84 @@ func TestBuild_ImplementReview_GateEvidence_UntrustedObligationTextQuarantined(t
 	assertObligationTextQuarantined(t, got, text)
 }
 
+// TestBuild_ImplementReview_GateEvidence_UntrustedUnsatisfiable_NotFramedAsOmission
+// pins the #2782 fix-up correctness concern: an `unsatisfiable` obligation whose
+// excerpt is UNTRUSTED must not be re-framed as an agent omission on the
+// quarantine path. The trusted framing above the envelope already says an
+// unsatisfiable obligation is NOT an omission, but the binding instruction handed
+// to the quarantine envelope used to tell the reviewer to "judge ... whether the
+// omission matters" for EVERY untrusted obligation — a direct contradiction for
+// an unsatisfiable one. The complete untrusted unsatisfiable prompt must never
+// direct the reviewer to judge an omission.
+//
+// Counterfactual: restore the unconditional
+// "judge ... whether the omission matters" binding in writeGateEvidence and this
+// goes RED on the negative assertion.
+func TestBuild_ImplementReview_GateEvidence_UntrustedUnsatisfiable_NotFramedAsOmission(t *testing.T) {
+	text := obligationInjectionText()
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+			FixupReportingObligations: []GateFixupReportingObligation{
+				{ID: "ob-1", Source: "concern", Status: "unsatisfiable", Text: text, Untrusted: true},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The excerpt is still quarantined as untrusted DATA, and still named.
+	if !strings.Contains(got, "- `ob-1` (routed as concern) — unsatisfiable: instruction text quarantined as untrusted DATA below") {
+		t.Errorf("the untrusted unsatisfiable obligation must still be named by id and status:\n%s", got)
+	}
+	assertObligationTextQuarantined(t, got, text)
+
+	// THE LOAD-BEARING ASSERTION: the complete prompt for an all-unsatisfiable
+	// untrusted set never directs the reviewer to judge an omission. That phrase
+	// is unique to the omission-path bindings, so its absence proves the
+	// unsatisfiable binding was selected instead.
+	if strings.Contains(got, "whether the omission matters") {
+		t.Errorf("an untrusted unsatisfiable obligation must NOT be framed as an omission in the binding:\n%s", got)
+	}
+	// And the binding affirmatively reframes it as unsatisfiable, not an omission.
+	if !strings.Contains(got, "NOT an agent omission and must NOT be raised against the") {
+		t.Errorf("the untrusted binding must reframe an unsatisfiable obligation as not-an-omission:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_UntrustedMixed_OmissionBindingSurvives
+// is the mixed-set companion: when the untrusted set carries BOTH an
+// unsatisfiable obligation and a genuine omission, the omission-judging clause
+// must still render (for the omission) while the unsatisfiable one is called out
+// as not-an-omission. This guards against a fix that drops the omission clause
+// wholesale rather than partitioning by status.
+func TestBuild_ImplementReview_GateEvidence_UntrustedMixed_OmissionBindingSurvives(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+			FixupReportingObligations: []GateFixupReportingObligation{
+				{ID: "ob-1", Source: "concern", Status: "unsatisfiable", Text: "a", Untrusted: true},
+				{ID: "ob-2", Source: "concern", Status: "unreported", Text: "b", Untrusted: true},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "whether the omission matters") {
+		t.Errorf("a mixed untrusted set must still direct judging the genuine omission:\n%s", got)
+	}
+	if !strings.Contains(got, "is NOT an agent omission — do not raise it against the agent") {
+		t.Errorf("a mixed untrusted set must still call the unsatisfiable one not-an-omission:\n%s", got)
+	}
+}
+
 // TestBuild_ImplementReview_GateEvidence_TrustedObligationTextStillInline is the
 // reviewer-side no-regression half of the pair above.
 func TestBuild_ImplementReview_GateEvidence_TrustedObligationTextStillInline(t *testing.T) {
