@@ -3,6 +3,7 @@ package repodoc
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
@@ -83,7 +84,15 @@ func renderBody(doc Document, f Framing) string {
 	}
 	b.WriteString(dataNotInstructionsClause)
 	b.WriteString("\n\n")
-	fmt.Fprintf(&b, "Source: %s at commit %s (content hash %s).\n", doc.Path, doc.Commit, doc.ContentHash)
+	// EVERY metadata value is sanitized before it is written OUTSIDE the
+	// delimiters. The path is repo-authored (a repository chooses its own file
+	// names), so a name carrying a newline could otherwise end the Source line
+	// and place repo-chosen text at column 0 — the forged-delimiter attack
+	// arriving through the file NAME rather than the file body. Resolve
+	// already REFUSES such a path; this is the second, render-side layer, and
+	// it also covers a Document a consumer constructed by hand.
+	fmt.Fprintf(&b, "Source: %s at commit %s (content hash %s).\n",
+		sanitizeMetadata(doc.Path), sanitizeMetadata(doc.Commit), sanitizeMetadata(doc.ContentHash))
 	if doc.Truncated {
 		fmt.Fprintf(&b, "This document was TRUNCATED at %d bytes — see the marker at the end of the body.\n", doc.CapBytes)
 	}
@@ -95,6 +104,19 @@ func renderBody(doc Document, f Framing) string {
 	b.WriteString(endDelimiter)
 	b.WriteString("\n")
 	return b.String()
+}
+
+// sanitizeMetadata makes a value safe to render OUTSIDE the delimiters by
+// replacing every framing-breaking character (C0/C1 controls, DEL, U+2028,
+// U+2029) with U+FFFD, and every invalid UTF-8 byte likewise. The value stays
+// one line, so no repo-authored metadata can speak as framing.
+func sanitizeMetadata(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || isFramingBreaking(r) {
+			return '\uFFFD'
+		}
+		return r
+	}, s)
 }
 
 // neutralizeBody replaces any line of the document that IS a delimiter line

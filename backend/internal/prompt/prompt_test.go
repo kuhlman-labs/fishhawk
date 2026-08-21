@@ -9263,28 +9263,87 @@ func TestBuild_InjectedDocument_LandsInCacheStablePrefix(t *testing.T) {
 	}
 }
 
+// preChangeInjectionSpans freezes, for every stage prompt that gained the
+// injected-document writer, the span of the PRE-#2242 render that BRACKETS the
+// point where writeInjectedDocuments now emits. Each `want` was captured by
+// building the same fixture trigger against prompt.go as it stood at commit
+// 880575c7 — the commit BEFORE this mechanism existed. That is what makes the
+// byte-identity claim checkable: the assertion compares today's bytes against
+// the PRE-CHANGE bytes, not against a second render by the same code, which is
+// equal by construction whatever the writer does (a writer emitting an
+// identical stray blank line for both nil and empty slices would satisfy a
+// same-code comparison and fail this one). When the wording inside a span is
+// deliberately changed, regenerate the constant and say so.
+var preChangeInjectionSpans = map[string]struct{ start, end, want string }{
+	"plan": {
+		start: "You are drafting an implementation plan",
+		end:   "Stage budget (ADR-025)",
+		want:  "You are drafting an implementation plan for a change in the repository `o/r`.\n\nTriggering issue: #42\nTitle: t\n\n",
+	},
+	"implement": {
+		start: "You are implementing a change",
+		end:   "Approved plan (binding instruction)",
+		want:  "You are implementing a change in the repository `o/r`.\n\n",
+	},
+	"plan_review": {
+		start: "will be rejected.",
+		end:   "REPOSITORY ACCESS",
+		want:  "will be rejected.\n\n",
+	},
+	"implement_review": {
+		start: "will be rejected.",
+		end:   "REPOSITORY ACCESS",
+		want:  "will be rejected.\n\n",
+	},
+}
+
 // TestBuild_NoInjectedDocuments_ByteIdentical is the byte-identity guarantee:
-// an empty slice renders exactly as the pre-#2242 prompt did, for every stage
-// type that gained the writer.
+// with no declared document every stage prompt that gained the writer renders
+// the injection point exactly as the PRE-#2242 prompt did — asserted against
+// the frozen pre-change spans above, for a nil slice AND an empty slice.
 func TestBuild_NoInjectedDocuments_ByteIdentical(t *testing.T) {
-	empty := injectionStageTriggers(nil)
-	nilSlice := injectionStageTriggers([]InjectedDocument{})
-	for stageType, trig := range empty {
+	nilDocs := injectionStageTriggers(nil)
+	emptyDocs := injectionStageTriggers([]InjectedDocument{})
+	for stageType, span := range preChangeInjectionSpans {
 		t.Run(stageType, func(t *testing.T) {
-			withNil, err := Build(stageType, trig)
+			// The frozen golden must not itself carry an injected block — a
+			// golden regenerated from POST-change code would pass silently.
+			for _, marker := range []string{"REPO-AUTHORED DOCUMENT", "### Repository review conventions"} {
+				if strings.Contains(span.want, marker) {
+					t.Fatalf("the frozen pre-change span contains %q; it was regenerated from post-change code", marker)
+				}
+			}
+
+			spanOf := func(t *testing.T, tr Trigger) string {
+				t.Helper()
+				got, err := Build(stageType, tr)
+				if err != nil {
+					t.Fatalf("Build(%s): %v", stageType, err)
+				}
+				i := strings.Index(got, span.start)
+				j := strings.Index(got, span.end)
+				if i < 0 || j < i {
+					t.Fatalf("%s: span anchors not found (start=%d end=%d):\n%s", stageType, i, j, got)
+				}
+				return got[i:j]
+			}
+
+			if got := spanOf(t, nilDocs[stageType]); got != span.want {
+				t.Errorf("%s: a nil InjectedDocuments slice changed the injection point from the PRE-CHANGE render.\n--- got ---\n%q\n--- want ---\n%q",
+					stageType, got, span.want)
+			}
+			if got := spanOf(t, emptyDocs[stageType]); got != span.want {
+				t.Errorf("%s: an empty InjectedDocuments slice changed the injection point from the PRE-CHANGE render.\n--- got ---\n%q\n--- want ---\n%q",
+					stageType, got, span.want)
+			}
+
+			// And nothing of the mechanism leaks anywhere else in the prompt.
+			whole, err := Build(stageType, nilDocs[stageType])
 			if err != nil {
 				t.Fatalf("Build(%s): %v", stageType, err)
 			}
-			withEmpty, err := Build(stageType, nilSlice[stageType])
-			if err != nil {
-				t.Fatalf("Build(%s): %v", stageType, err)
-			}
-			if withNil != withEmpty {
-				t.Errorf("%s: nil and empty InjectedDocuments render differently", stageType)
-			}
-			// No stray heading, blank line, or delimiter leaked in.
 			for _, forbidden := range []string{"REPO-AUTHORED DOCUMENT", "### Repository review conventions"} {
-				if strings.Contains(withNil, forbidden) {
+				if strings.Contains(whole, forbidden) {
 					t.Errorf("%s: empty InjectedDocuments still rendered %q", stageType, forbidden)
 				}
 			}

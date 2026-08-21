@@ -52,6 +52,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
@@ -132,15 +134,19 @@ type Document struct {
 	// pre-truncation, pre-neutralization. See the package doc comment for
 	// why this domain and not the injected bytes.
 	ContentHash string
-	// Content is the (possibly truncated) document text as it will be
-	// rendered.
+	// Content is the document text as it will be shown: post-truncation and
+	// post-neutralization (any body line forging a delimiter has already been
+	// replaced), including the truncation marker when Truncated.
 	Content string
 	// Truncated reports whether Content was cut at CapBytes.
 	Truncated bool
 	// OriginalBytes is len(resolved bytes as fetched).
 	OriginalBytes int
-	// RenderedBytes is len(Content) — what was actually shown, including the
-	// truncation marker when Truncated.
+	// RenderedBytes is len(Content) — the ACTUALLY-SHOWN byte domain:
+	// post-truncation, post-neutralization, marker included. It is measured
+	// after neutralization on purpose: a substituted delimiter line changes
+	// the body's length, and attribution that reported the pre-substitution
+	// count would name bytes the agent never saw.
 	RenderedBytes int
 	// DroppedBytes is how many of the resolved bytes were CUT (0 when not
 	// truncated). Recorded at cut time rather than derived: the loud marker
@@ -240,6 +246,12 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) 
 	sum := sha256.Sum256(fc.Content)
 	effectiveCap := r.capBytes()
 	content, dropped, truncated := capContent(string(fc.Content), effectiveCap, decl.Path, commit)
+	// Neutralize forged delimiter lines HERE, not only at render time, so
+	// Content IS the body that will be shown and RenderedBytes counts those
+	// exact bytes. Render neutralizes again (the operation is idempotent —
+	// the replacement note is not itself a delimiter), so a hand-constructed
+	// Document is still framed safely; neither layer alone is load-bearing.
+	content = neutralizeBody(content)
 	return &Document{
 		Path:            decl.Path,
 		Commit:          commit,
@@ -279,10 +291,19 @@ func (r *Resolver) pinCommit(ctx context.Context, req Request) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve base ref %q to a commit: %w", ref, err)
 	}
-	if !found || strings.TrimSpace(sha) == "" {
+	sha = strings.TrimSpace(sha)
+	if !found || sha == "" {
 		return "", fmt.Errorf("%w: base ref %q does not resolve to a branch", ErrUnpinnedBaseRef, ref)
 	}
-	return sha, nil
+	// The resolver's OUTPUT is validated, not merely its found flag. A
+	// resolver that returns "HEAD", a branch name, a short SHA, or any other
+	// non-commit string would otherwise reach FetchFile as a MUTABLE ref —
+	// the pinning code would be present and not pin. Only a full 40-hex
+	// commit id is accepted; anything else is refused BEFORE any fetch.
+	if !isCommitSHA(sha) {
+		return "", fmt.Errorf("%w: base ref %q resolved to %q, which is not a 40-hex commit SHA (a mutable ref must never be fetched)", ErrUnpinnedBaseRef, ref, sha)
+	}
+	return strings.ToLower(sha), nil
 }
 
 // isCommitSHA reports whether s is a full 40-hex git object id.
@@ -314,6 +335,20 @@ func validatePath(p string) error {
 	if strings.Contains(p, `\`) {
 		return fmt.Errorf("%w: path contains a backslash", ErrInvalidPath)
 	}
+	// The path is rendered as METADATA outside the BEGIN/END delimiters, so a
+	// control character in it (a newline above all) could end the Source line
+	// and put repo-chosen text at column 0, OUTSIDE the data boundary — the
+	// forged-delimiter attack arriving through the file NAME instead of the
+	// file body. Refuse it at the declaration boundary; Render sanitizes as
+	// well, so neither layer alone is load-bearing.
+	if !utf8.ValidString(p) {
+		return fmt.Errorf("%w: path is not valid UTF-8", ErrInvalidPath)
+	}
+	for _, r := range p {
+		if isFramingBreaking(r) {
+			return fmt.Errorf("%w: path contains the control character %q", ErrInvalidPath, r)
+		}
+	}
 	for _, seg := range strings.Split(p, "/") {
 		switch seg {
 		case "":
@@ -329,20 +364,70 @@ func validatePath(p string) error {
 }
 
 // capContent cuts s to at most max bytes and appends a LOUD self-describing
-// truncation marker, reporting how many bytes were dropped. The cut is rune-safe (strings.ToValidUTF8 drops the
-// trailing partial rune left by slicing at a fixed byte offset), the same
-// idiom prompt.CapTextWithRetrieval uses. A document at or under the cap is
-// returned unchanged with truncated=false — the > not >= boundary, so an
-// exactly-at-cap document renders verbatim.
+// truncation marker, reporting how many bytes were dropped AT THE CAP.
+//
+// The cut is rune-safe: trimTrailingPartialRune removes ONLY the partial rune
+// a fixed-offset slice can leave at the boundary, so dropped == len(s) -
+// len(prefix) is exactly the bytes the cap removed and the marker's arithmetic
+// closes. (An earlier form used strings.ToValidUTF8 for the trim, which also
+// strips every invalid sequence MID-content — over-reporting dropped bytes and
+// removing bytes the marker never disclosed.)
+//
+// Invalid UTF-8 anywhere in the shown text is then replaced IN BAND with
+// U+FFFD, in BOTH branches, so a declared binary file cannot smuggle raw bytes
+// into the prompt and the under-cap and over-cap paths behave alike. The
+// replacement is visible in the body (that is the point of U+FFFD) and does
+// not change the dropped-at-cap accounting, which is about the cut alone.
 func capContent(s string, max int, docPath, commit string) (kept string, dropped int, truncated bool) {
 	if len(s) <= max {
-		return s, 0, false
+		return sanitizeUTF8(s), 0, false
 	}
-	prefix := strings.ToValidUTF8(s[:max], "")
+	prefix := trimTrailingPartialRune(s[:max])
 	dropped = len(s) - len(prefix)
 	marker := fmt.Sprintf(
 		"\n\n...[TRUNCATED — this document is INCOMPLETE: %d of %d bytes shown, %d bytes dropped at the %d-byte cap. "+
 			"Do NOT read the visible text as the whole document. The full document is %s at commit %s.]",
 		len(prefix), len(s), dropped, max, docPath, commit)
-	return prefix + marker, dropped, true
+	return sanitizeUTF8(prefix) + marker, dropped, true
+}
+
+// trimTrailingPartialRune drops the trailing bytes of s when — and only when —
+// they are the front of a multi-byte rune whose continuation bytes fall beyond
+// the end of s. Bytes anywhere else, valid or not, are left exactly as they
+// are: this function's whole job is undoing the fixed-offset cut, not
+// sanitizing content (sanitizeUTF8 does that, visibly).
+func trimTrailingPartialRune(s string) string {
+	for i := len(s) - 1; i >= 0 && i > len(s)-utf8.UTFMax; i-- {
+		b := s[i]
+		if b < utf8.RuneSelf {
+			return s // a complete ASCII byte ends the string
+		}
+		if utf8.RuneStart(b) {
+			if r, size := utf8.DecodeRuneInString(s[i:]); r == utf8.RuneError && size <= 1 {
+				return s[:i] // lead byte without its continuation bytes
+			}
+			return s
+		}
+		// A continuation byte: keep walking back toward its lead byte.
+	}
+	return s
+}
+
+// sanitizeUTF8 replaces every invalid byte sequence with U+FFFD. Replacement
+// rather than deletion: a byte that cannot be shown as itself is still
+// accounted for on screen instead of vanishing silently.
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+// isFramingBreaking reports whether r would let repo-authored metadata escape
+// the line it is rendered on. Every C0/C1 control (newline and carriage return
+// above all), DEL, and the Unicode line/paragraph separators qualify: metadata
+// is rendered OUTSIDE the BEGIN/END delimiters, so a value that can start a
+// new line can put repo-chosen text at column 0 where the framing lives.
+func isFramingBreaking(r rune) bool {
+	return unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
 }

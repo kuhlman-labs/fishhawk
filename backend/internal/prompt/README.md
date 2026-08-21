@@ -379,5 +379,15 @@ document is byte-identical to the pre-#2242 output and no golden test moves.
 That is the production posture today: the server's declaration seam is nil
 until a consumer ships a declaration site.
 
+`TestBuild_NoInjectedDocuments_ByteIdentical` asserts that claim against
+FROZEN PRE-CHANGE SPANS (`preChangeInjectionSpans`), captured by building the
+same fixture against `prompt.go` at commit 880575c7 — the commit before this
+mechanism existed — one span per stage prompt, each bracketing the point where
+the writer now emits. Comparing a nil slice against an empty slice through the
+same post-change writer would be equal by construction whatever the writer did
+(a stray blank line emitted on BOTH paths would pass); the pre-change span is
+what makes the claim checkable. Regenerate a span only when the wording inside
+it is deliberately changed, and say so.
+
 The slim fix-up prompt (`buildImplementFixup`) forks before the writer and does
 not render injected documents; see `backend/internal/repodoc/README.md`.

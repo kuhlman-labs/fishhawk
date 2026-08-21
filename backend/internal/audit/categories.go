@@ -70,7 +70,7 @@ import "sort"
 // parked scope-completeness shortfall — it records the paths folded into the
 // stage's effective scope, and it is ALSO read as an invalidator by
 // server/prompt.go::resolveHeldCommitExemption, which demotes a stale
-// `exempted` decision when an amend supersedes it. When a new
+// `exempted` decision when an amend supersedes it.
 // E55.1 / #2242 added the two document-injection markers written by
 // backend/internal/repodoc: document_injected (one per repo-authored document
 // injected into an agent prompt, naming the resolved path, the PINNED commit,

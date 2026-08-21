@@ -122,7 +122,10 @@ type Config struct {
 	// backend/internal/repodoc/README.md for where a consumer gets it.
 	DocumentDeclarations func(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]repodoc.Declaration, string, error)
 	// DocumentResolver reads declared documents from the forge at a pinned
-	// commit. Nil disables injection.
+	// commit. Nil is inert ONLY alongside a nil DocumentDeclarations; a nil
+	// resolver under a CONFIGURED declaration seam is a misconfiguration and
+	// fails the prompt request closed, because serving a prompt without a
+	// declared governance document is the outcome this seam exists to prevent.
 	DocumentResolver *repodoc.Resolver
 	// DocumentScope resolves the credential scope the document read acts
 	// under. Nil means the zero scope (adequate for a forge whose credentials

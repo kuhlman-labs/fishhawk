@@ -30,9 +30,26 @@ import (
 // particular returns NO documents at all: an un-attributed injection is exactly
 // what the attribution property forbids, so the caller must not fall back to
 // injecting the resolved-but-unattributed document.
+//
+// PARTIAL CONFIGURATION IS A FAILURE, NOT AN INERT STATE. Inert means NO
+// declaration seam: nothing declares a document, so nothing is missing. A
+// CONFIGURED declaration seam with a nil DocumentResolver is a different thing
+// entirely — a consumer that intends to constrain the agent, and a deployment
+// that cannot read the document. Treating that as inert would serve an
+// unconstrained prompt with no error and no audit trace, and it would surface
+// as an inexplicably unconstrained agent rather than as a fault. So it is an
+// error, raised BEFORE the seam is consulted: the mismatch is a wiring defect
+// whatever the seam would have returned.
 func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
-	if s.cfg.DocumentDeclarations == nil || s.cfg.DocumentResolver == nil || runRow == nil || stage == nil {
+	if runRow == nil || stage == nil {
 		return nil, nil
+	}
+	if s.cfg.DocumentDeclarations == nil {
+		return nil, nil // fully inert: no consumer declares a document
+	}
+	if s.cfg.DocumentResolver == nil {
+		return nil, errors.New("document injection is misconfigured: DocumentDeclarations is configured but DocumentResolver is nil; " +
+			"wire a resolver or remove the declaration seam")
 	}
 	decls, baseRef, err := s.cfg.DocumentDeclarations(ctx, runRow, stage)
 	if err != nil {

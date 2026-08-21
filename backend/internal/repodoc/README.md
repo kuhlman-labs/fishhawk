@@ -16,6 +16,17 @@ caller today**: the server seam (`Config.DocumentDeclarations` /
 `Server.resolveInjectedDocuments` returns `(nil, nil)` and every served prompt
 is byte-identical to the pre-#2242 render.
 
+**Inert means NO declaration seam.** `DocumentDeclarations == nil` is the inert
+state: nothing declares a document, so nothing can be missing. A CONFIGURED
+declaration seam with a nil `DocumentResolver` is a different thing — a
+consumer that intends to constrain the agent and a deployment that cannot read
+the document — and it **fails closed** (a 500 with `document_injection_failed`),
+raised before the seam is consulted. Treating that mismatch as inert would
+serve an unconstrained prompt with no error and no audit trace, surfacing as an
+inexplicably unconstrained agent rather than as a fault. The other half of the
+pairing — a resolver with no declaration seam — stays inert
+(`TestGetStagePrompt_ResolverWithoutDeclarations_IsInert`).
+
 ## Why server-side injection at all
 
 The alternative — telling the agent "read `.fishhawk/charter.md`" — is not a
@@ -32,9 +43,9 @@ Every step fails closed.
 
 | Step | Behavior | Failure |
 |---|---|---|
-| a | Validate the declared path: non-empty, repo-relative, no leading `/`, no `\`, no `.` / `..` / empty segment, canonical under `path.Clean` | `ErrInvalidPath` |
+| a | Validate the declared path: non-empty, repo-relative, no leading `/`, no `\`, no `.` / `..` / empty segment, canonical under `path.Clean`, valid UTF-8, **no control characters** | `ErrInvalidPath` |
 | b | Refuse an **empty** base ref | `ErrUnpinnedBaseRef` |
-| c | Pin the ref: a 40-hex ref is used verbatim; anything else resolves via `GetBranchSHA` | `ErrUnpinnedBaseRef` (missing branch) or the wrapped transport error |
+| c | Pin the ref: a 40-hex ref is used verbatim; anything else resolves via `GetBranchSHA` **and its OUTPUT must itself be a 40-hex commit SHA** | `ErrUnpinnedBaseRef` (missing branch, or a non-commit resolution) or the wrapped transport error |
 | d | `FetchFile` **at the pinned commit SHA** | wrapped transport error |
 | e | `forge.ErrNotFound` → declared-but-absent | `ErrMissingDocument` |
 
@@ -55,6 +66,33 @@ missing branch as `("", false, nil)` — **not** an error. Treating `found=false
 as a fall-through would produce an empty ref and hence a default-branch read,
 so it is turned into a fail-closed error
 (`TestResolve_BaseBranchNotFound_FailsClosed`).
+
+### Why the resolver's OUTPUT is validated, not just its `found` flag
+
+`found=true` plus a non-empty string is not proof of pinning. A resolver that
+returned `HEAD`, a branch name, a qualified `refs/heads/...` ref or a short SHA
+would hand `FetchFile` a **mutable** ref — the pinning code would be present
+and not pin, which defeats the property from the inside. So the resolved value
+must itself be a full 40-hex commit id, checked BEFORE any fetch
+(`TestResolve_NonCommitBranchResolution_FailsClosed` asserts both the refusal
+and that the fetcher was never called; the softened content is seeded at the
+resolver's own output so a fetch would visibly succeed). Case and surrounding
+whitespace are normalized, not rejected — the guard refuses mutable refs, not
+spelling (`TestResolve_BranchResolutionSHAIsNormalized`).
+
+### Why a control character in the declared path is refused
+
+The path is rendered as **metadata OUTSIDE the delimiters** (the `Source:`
+line). A repository chooses its own file names, so a name carrying a newline
+plus forged framing text would end that line and put repo-authored text at
+column 0 — the forged-delimiter attack arriving through the file NAME instead
+of the file body. `validatePath` rejects every C0/C1 control, DEL, U+2028,
+U+2029 and any invalid UTF-8 in the path
+(`TestResolve_InvalidPath_FailsClosed`'s adversarial rows). `Render` then
+sanitizes path, commit and content hash independently (`sanitizeMetadata`,
+replacing framing-breakers with U+FFFD), so a hand-constructed `Document` is
+framed safely too and **neither layer alone is load-bearing**
+(`TestRender_AdversarialMetadata_CannotBreakFraming`).
 
 `forge.FileContent.SHA` is the forge's **blob** id (GitHub blob SHA, GitLab
 `blob_id`), not a commit SHA. The attributed commit therefore comes from the
@@ -109,6 +147,17 @@ and that question must have the same answer whether or not the document
 happened to exceed the cap or to contain a forged delimiter line. What was
 actually **shown** is described by the sibling fields — `OriginalBytes`,
 `RenderedBytes`, `DroppedBytes`, `CapBytes`, `Truncated` — not by the hash.
+
+`RenderedBytes` is the **actually-shown** domain and is therefore measured
+POST-truncation and POST-neutralization: `Resolve` neutralizes forged delimiter
+lines into `Content` itself, so `Content` IS the body between the delimiters and
+`RenderedBytes == len(Content)`. Measuring before substitution would report a
+byte count for text the agent never saw, because the replacement note has a
+different length than the line it replaces
+(`TestResolve_ForgedDelimiter_AttributionCountsShownBytes` compares the
+attributed count against the bytes extracted from `Render`'s own output).
+`Render` neutralizes again — the operation is idempotent, the note is not itself
+a delimiter — so a hand-constructed `Document` is still framed safely.
 `TestResolve_ContentHashCoversResolvedBytesPreTruncation` asserts the recorded
 hash against an explicitly constructed expected byte sequence and asserts it is
 **not** the hash of the truncated content.
@@ -120,9 +169,16 @@ judgment call bounded by the #606 added-prompt-cost precedent, not a measured
 limit: a governance document is per-repo stable, so it rides the cache-stable
 prefix and is paid for once per cached prefix rather than per turn.
 
-An over-cap document is cut rune-safely (`strings.ToValidUTF8` drops the
-trailing partial rune, the same idiom as `prompt.CapTextWithRetrieval`) and
-carries a marker naming bytes shown, original bytes, dropped bytes, the cap,
+An over-cap document is cut rune-safely: `trimTrailingPartialRune` removes ONLY
+the partial rune the fixed-offset slice leaves at the boundary, so
+`dropped == len(resolved) - len(prefix)` is exactly what the cap removed and
+the marker's arithmetic closes. (The earlier `strings.ToValidUTF8` trim also
+stripped every invalid sequence MID-content, over-reporting `dropped_bytes`
+and deleting bytes the marker never disclosed.) Invalid UTF-8 in the shown text
+is instead replaced IN BAND with U+FFFD, in **both** the over-cap and under-cap
+branches — visible rather than silent, and symmetric, so a declared binary file
+cannot smuggle raw bytes into the prompt on the under-cap path
+(`TestResolve_InvalidUTF8_Accounting`). The cut carries a marker naming bytes shown, original bytes, dropped bytes, the cap,
 the resolved path and the pinned commit, plus an explicit statement that the
 visible text is INCOMPLETE. Truncation is **never silent at any layer**: the
 marker is in the prompt, `Truncated` is on the Document, the rendered block
@@ -193,7 +249,10 @@ read-only preview mutate the run record.
 | M6 fetch transport error | wrapped, not reported as missing | `TestResolve_FetchTransportError_FailsClosed` |
 | M7 over-cap document | loud truncation + paired audit entry | `TestResolve_OverCap_TruncatesLoudly` |
 | M8 audit append failure | error; document NOT injected | `TestAttribute_AppendFailure_FailsClosed`, `TestGetStagePrompt_AttributionFailure_DocumentNotInjected` |
-| M9 forged END delimiter | neutralized with a visible note | `TestRender_ForgedEndDelimiter_Neutralized` |
+| M9 forged END delimiter | neutralized with a visible note; `RenderedBytes` counts the post-substitution body | `TestRender_ForgedEndDelimiter_Neutralized`, `TestResolve_ForgedDelimiter_AttributionCountsShownBytes` |
+| M10 branch resolution returns a non-commit value | refuse before any fetch | `TestResolve_NonCommitBranchResolution_FailsClosed` |
+| M11 control character in the declared path | refuse before any fetch; metadata sanitized at render | `TestResolve_InvalidPath_FailsClosed`, `TestRender_AdversarialMetadata_CannotBreakFraming` |
+| M12 partial seam configuration (declarations without a resolver) | prompt request fails 500 | `TestGetStagePrompt_PartialSeamConfiguration_FailsClosed` |
 | no fetcher / no commit resolver | refuse | `TestResolve_NoFetcherConfigured_FailsClosed`, `TestResolve_NoCommitResolverForBranchRef_FailsClosed` |
 | malformed run repo | refuse before any fetch | `TestResolveInjectedDocuments_MalformedRepo_FailsClosed` |
 | credential-scope resolution failure | refuse before any fetch | `TestResolveInjectedDocuments_ScopeResolutionError_FailsClosed` |

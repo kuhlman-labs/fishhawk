@@ -221,6 +221,57 @@ func TestGetStagePrompt_NilSeam_ByteIdenticalPrompt(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_PartialSeamConfiguration_FailsClosed: a CONFIGURED
+// declaration seam with a NIL resolver is a wiring defect, not the inert state.
+// Treating it as inert would serve a prompt without the governance document
+// meant to constrain the agent — no error, no audit trace, and a symptom
+// (an inexplicably unconstrained agent) that points nowhere near the cause. The
+// mismatch is seeded by construction: the server is built with declarations and
+// no resolver.
+func TestGetStagePrompt_PartialSeamConfiguration_FailsClosed(t *testing.T) {
+	ar := newStoringAuditRepo()
+	s, runID, stageID, priv := newInjectionServer(t, ar, nil, injDeclarations)
+
+	docs, err := s.resolveInjectedDocuments(context.Background(),
+		&run.Run{ID: runID, Repo: "o/r"}, &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement})
+	if err == nil {
+		t.Fatal("err = nil: a declaration seam with no resolver must fail closed, not serve nothing silently")
+	}
+	if len(docs) != 0 {
+		t.Errorf("returned %d documents on a misconfigured seam, want 0", len(docs))
+	}
+	if !strings.Contains(err.Error(), "DocumentResolver") {
+		t.Errorf("err = %v, want a message naming the missing DocumentResolver", err)
+	}
+
+	// The handler-level outcome: the prompt request fails rather than serving a
+	// prompt whose declared document silently went missing.
+	w := promptRequest(t, s, runID, stageID, priv(), "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "document_injection_failed") {
+		t.Errorf("error body missing the document_injection_failed code:\n%s", w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_ResolverWithoutDeclarations_IsInert is the OTHER half of
+// the pairing, stated so the boundary is explicit: a resolver with NO
+// declaration seam declares nothing, so nothing is missing and the prompt is
+// served normally.
+func TestGetStagePrompt_ResolverWithoutDeclarations_IsInert(t *testing.T) {
+	ff := newInjFetcher()
+	s, runID, stageID, priv := newInjectionServer(t, newStoringAuditRepo(),
+		&repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}, nil)
+	w := promptRequest(t, s, runID, stageID, priv(), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(ff.refs) != 0 {
+		t.Errorf("fetched %v with no declaration seam", ff.refs)
+	}
+}
+
 // TestGetStagePrompt_ResolutionFailure_FailsClosed: a declared document that
 // cannot be resolved fails the prompt request rather than serving a prompt with
 // the governance document silently missing, and the error names the path AND the
