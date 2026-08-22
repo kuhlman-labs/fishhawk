@@ -1244,6 +1244,20 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, p StartRunForCamp
 		return nil, fmt.Errorf("workflow %q in %s spec has no stages", p.WorkflowID, p.Repo)
 	}
 
+	// Charter admission gate (ADR-065 / E54.4 / #2236), the campaign seam.
+	// This path resolves an OPERATOR-NAMED workflow_id out of the repo's own
+	// fetched spec, so — unlike handleCreateRun's haveStageDefs=false branch —
+	// it is not structurally barred from carrying a grooming-capable workflow.
+	// It therefore gets the same gate as the HTTP seam, sharing the same
+	// decision core, and fires PRE-MINT so a refusal leaves no run row (AC8).
+	// The ctx/error arm rather than the HTTP one: this function holds no
+	// ResponseWriter, and its callers already map a start failure to their own
+	// response (the item-run endpoint) or leave the item un-started for the
+	// next tick (the driver).
+	if err := s.ensureCharterDeclared(ctx, p.Repo, p.WorkflowID, wf); err != nil {
+		return nil, err
+	}
+
 	triggerRef := p.IssueRef
 	// Best-effort IssueContext hydration (#1721): parse the issue number and
 	// fetch title/body/url/number + comments so campaign-minted parents carry

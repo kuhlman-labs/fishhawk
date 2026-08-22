@@ -4,11 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -575,5 +587,241 @@ func TestShippedGrooming_ReportArmIsLiveInThisHarness(t *testing.T) {
 	}
 	if n := countReportRows(t, au); n != 1 {
 		t.Errorf("act:report rows = %d, want 1", n)
+	}
+}
+
+// --- the CAMPAIGN seam (implement-review follow-up) --------------------------
+//
+// CreateRunForTrigger has two callers: handleCreateRun (gated above) and
+// StartRunForCampaignIssue, which the campaign item-run endpoint and the
+// campaign driver both reach. Unlike the haveStageDefs=false branch, that seam
+// is NOT structurally barred from carrying a grooming workflow — it fetches the
+// repo's spec from the forge and resolves an operator-named workflow_id out of
+// it — so it is gated rather than documented away, and the gate is pinned here.
+
+// newCharterCampaignServer wires the run + audit fakes plus a GitHub stub
+// serving specYAML, so StartRunForCampaignIssue resolves a real installation
+// and a real spec and reaches (or is refused before) CreateRunForTrigger.
+func newCharterCampaignServer(t *testing.T, specYAML string) (*Server, *driveE2ERepo, *auditFake) {
+	t.Helper()
+	repo := &driveE2ERepo{fakeRepo: newFakeRepo()}
+	au := newAuditFake()
+	ghSrv := newFakeGitHubForRuns(specYAML).server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, GitHub: gh})
+	return s, repo, au
+}
+
+// startCampaignRun drives the campaign seam for one workflow id.
+func startCampaignRun(t *testing.T, s *Server, workflowID string) (*run.Run, error) {
+	t.Helper()
+	return s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+		Repo:       "x/y",
+		IssueRef:   "issue:100",
+		WorkflowID: workflowID,
+		RunnerKind: "local",
+	})
+}
+
+// TestCharterGate_CampaignSeam_MissingCharter_Refuses is the seam's F1: the
+// campaign path refuses a grooming workflow in an uncharted repo BEFORE any run
+// row exists, with the same reason and the same actionable message the HTTP
+// seam's 422 carries.
+//
+// COUNTERFACTUAL: delete the ensureCharterDeclared call in
+// StartRunForCampaignIssue and this test goes RED — a run is minted and err is
+// nil.
+func TestCharterGate_CampaignSeam_MissingCharter_Refuses(t *testing.T) {
+	s, repo, au := newCharterCampaignServer(t, groomingSpecYAML)
+	stubConventions(t, conventionsWithoutCharter(t), nil)
+
+	got, err := startCampaignRun(t, s, "tidy_the_backlog")
+	if err == nil {
+		t.Fatalf("StartRunForCampaignIssue err = nil, want a charter refusal (run=%+v)", got)
+	}
+	// Error IDENTITY, not message shape: the seam has several other failure
+	// modes (installation, fetch, parse, zero stages) whose text a substring
+	// assertion could match.
+	if !errors.Is(err, errCharterRequired) {
+		t.Errorf("err = %v, want errCharterRequired", err)
+	}
+	for _, want := range []string{reasonCharterAbsent, "tidy_the_backlog", conventionsPathForMessage} {
+		if !contains(err.Error(), want) {
+			t.Errorf("err %q does not name %q", err.Error(), want)
+		}
+	}
+	// COMMITTED STATE after the call: AC8's property on this seam.
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("run rows = %d, want 0 — the campaign seam's gate is PRE-MINT", n)
+	}
+	if n := countGlobalAppends(au, "run_rejected_missing_charter"); n != 1 {
+		t.Errorf("global run_rejected_missing_charter appends = %d, want exactly 1", n)
+	}
+}
+
+// TestCharterGate_CampaignSeam_ConventionsLoadError_FailsClosed is the seam's
+// F3 — the campaign path fails CLOSED on an unreadable conventions file for the
+// same reason the HTTP path does, and with its own distinguishable reason.
+func TestCharterGate_CampaignSeam_ConventionsLoadError_FailsClosed(t *testing.T) {
+	s, repo, au := newCharterCampaignServer(t, groomingSpecYAML)
+	stubConventions(t, workmgmt.Conventions{}, errors.New("forge unreachable"))
+
+	if _, err := startCampaignRun(t, s, "tidy_the_backlog"); err == nil {
+		t.Fatal("StartRunForCampaignIssue err = nil, want a fail-closed charter refusal")
+	} else if !contains(err.Error(), reasonConventionsUnavailable) {
+		t.Errorf("err %q does not carry reason %q", err.Error(), reasonConventionsUnavailable)
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("run rows = %d, want 0", n)
+	}
+	if n := countGlobalAppends(au, "run_rejected_missing_charter"); n != 1 {
+		t.Errorf("global appends = %d, want exactly 1", n)
+	}
+}
+
+// TestCharterGate_CampaignSeam_GroomingWithCharter_Admits is the seam's
+// non-vacuity control N1: the gate does not refuse everything this path
+// resolves. It is also what proves the refusals above are the GATE answering
+// rather than the harness failing to resolve a spec at all.
+func TestCharterGate_CampaignSeam_GroomingWithCharter_Admits(t *testing.T) {
+	s, repo, au := newCharterCampaignServer(t, groomingSpecYAML)
+	stubConventions(t, conventionsWithCharter(t), nil)
+
+	created, err := startCampaignRun(t, s, "tidy_the_backlog")
+	if err != nil {
+		t.Fatalf("StartRunForCampaignIssue: %v — a grooming workflow in a chartered repo is admitted", err)
+	}
+	if created == nil || len(repo.runs) != 1 {
+		t.Errorf("run rows = %d (created=%v), want exactly 1", len(repo.runs), created)
+	}
+	if n := countGlobalAppends(au, "run_rejected_missing_charter"); n != 0 {
+		t.Errorf("run_rejected_missing_charter appends = %d, want 0 on an admitted run", n)
+	}
+}
+
+// TestCharterGate_CampaignSeam_NonGroomingWithoutCharter_Admits is the seam's
+// non-vacuity control N2: the campaign path's gate is as NARROW as the HTTP
+// path's. An ordinary code-change workflow starts in a repo with no charter.
+func TestCharterGate_CampaignSeam_NonGroomingWithoutCharter_Admits(t *testing.T) {
+	s, repo, _ := newCharterCampaignServer(t, nonGroomingSpecYAML)
+	stubConventions(t, conventionsWithoutCharter(t), nil)
+
+	if _, err := startCampaignRun(t, s, "feature_change"); err != nil {
+		t.Fatalf("StartRunForCampaignIssue: %v — the charter rule governs GROOMING workflows only", err)
+	}
+	if n := len(repo.runs); n != 1 {
+		t.Errorf("run rows = %d, want 1", n)
+	}
+}
+
+// TestCharterGate_EveryCreateRunForTriggerCallerIsGated is the SOURCE-LEVEL pin
+// for "every run-minting seam is gated". The two behavioural families above
+// prove the two callers that exist TODAY are gated; only a source scan proves a
+// THIRD one cannot be added ungated — which is exactly how this seam was missed
+// in the first place.
+//
+// Modelled on backend/internal/run/childparams_gate_test.go: AST-based (a line
+// regex misses an aliased receiver and a multi-line call), keyed by enclosing
+// function, and FAIL-CLOSED on a parse error.
+func TestCharterGate_EveryCreateRunForTriggerCallerIsGated(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed; cannot locate the backend module root")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..") // backend/
+
+	// The gate calls that discharge the obligation. Both arms consume the same
+	// evaluateCharterAdmission core, so either satisfies it.
+	gateCalls := map[string]bool{"checkCharterDeclared": true, "ensureCharterDeclared": true}
+
+	var ungated []string
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if name := d.Name(); name == "testdata" || name == "db" || name == ".git" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return fmt.Errorf("parse %s: %w", path, perr) // fail closed
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			rel = path
+		}
+		for _, decl := range file.Decls {
+			fn, isFn := decl.(*ast.FuncDecl)
+			if !isFn || fn.Body == nil || fn.Name.Name == "CreateRunForTrigger" {
+				continue
+			}
+			var mints, gated bool
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				sel, isSel := call.Fun.(*ast.SelectorExpr)
+				if !isSel {
+					return true
+				}
+				switch {
+				case sel.Sel.Name == "CreateRunForTrigger":
+					mints = true
+				case gateCalls[sel.Sel.Name]:
+					gated = true
+				}
+				return true
+			})
+			if mints && !gated {
+				ungated = append(ungated, rel+"::"+fn.Name.Name)
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("scan %s: %v", root, walkErr)
+	}
+	if len(ungated) > 0 {
+		sort.Strings(ungated)
+		t.Errorf("CreateRunForTrigger caller(s) with no charter gate: %v\n"+
+			"Every run-minting seam must call checkCharterDeclared (HTTP) or ensureCharterDeclared (ctx/error) "+
+			"BEFORE minting, or a grooming run starts unanchored on that seam (ADR-065 / #2236).", ungated)
+	}
+	// NON-VACUITY: the scan must actually have found the known callers. A
+	// walker that matched nothing would pass the assertion above trivially.
+	var found int
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil //nolint:nilerr // best-effort recount; the authoritative walk above already failed closed
+		}
+		fset := token.NewFileSet()
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return nil
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			if sel, isSel := n.(*ast.SelectorExpr); isSel && sel.Sel.Name == "CreateRunForTrigger" {
+				found++
+			}
+			return true
+		})
+		return nil
+	})
+	if found < 2 {
+		t.Errorf("scan found %d CreateRunForTrigger reference(s), want >= 2 (the declaration plus at least one caller); "+
+			"the walker is not reaching the source it is supposed to gate", found)
 	}
 }

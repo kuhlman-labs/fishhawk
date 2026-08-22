@@ -6071,7 +6071,11 @@ paths:
             existing run returns it with 200 first (#2366). This rule
             is enforced at run admission ONLY — `fishhawk validate`
             does not check it, because the CLI parses no
-            work-management conventions.
+            work-management conventions. The other run-minting seam,
+            the campaign item-run start, applies the same rule via the
+            same decision core, but surfaces it as
+            `502 campaign_run_start_failed` with the charter message in
+            `details.error` rather than as this code.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

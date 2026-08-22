@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // The CHARTER ADMISSION GATE (ADR-065 / E54.4 / #2236).
@@ -20,7 +24,9 @@ import (
 // charter is declared.
 //
 // WHERE THIS RULE IS ENFORCED, AND WHERE IT IS NOT (approval condition G3).
-// Enforcement is at RUN ADMISSION — POST /v0/runs — and nowhere else. It is
+// Enforcement is at RUN ADMISSION — on EVERY seam that mints a run, which
+// today means POST /v0/runs and the campaign item-run start — and nowhere
+// else. It is
 // deliberately NOT enforced by static validation (`fishhawk validate`, the
 // CLI's spec check): the CLI does not parse work-management conventions
 // anywhere today, so teaching static validation about the charter would mean
@@ -45,12 +51,28 @@ import (
 // definition was resolved at all, workflowDef is the zero spec.Workflow, and
 // WorkflowRequiresCharter (which iterates wf.Stages) is false by construction.
 // A grooming-capable workflow necessarily DECLARES a grooming_report-producing
-// stage, so it can never sit behind that branch; the only other
-// CreateRunForTrigger caller, the campaign driver, passes HaveStageDefs: true
-// unconditionally. Removing the guard therefore changes no outcome — verified
-// by deleting it and re-running the suite green — which is exactly what makes
-// the structural early return below, not the guard, the load-bearing control.
+// stage, so it can never sit behind that branch. Removing the guard therefore
+// changes no outcome — verified by deleting it and re-running the suite green
+// — which is exactly what makes the structural early return below, not the
+// guard, the load-bearing control.
 // TestCharterGate_NoStageDefsPathCarriesNoWorkflow pins the observable half.
+//
+// EVERY CreateRunForTrigger CALLER IS GATED, NOT JUST THE HTTP HANDLER
+// (implement-review follow-up). CreateRunForTrigger has two callers:
+// handleCreateRun and StartRunForCampaignIssue (the campaign item-run start,
+// which the campaign driver also reaches). The campaign seam is NOT
+// structurally unable to carry a grooming workflow the way the
+// haveStageDefs=false branch is: it fetches the repo's spec from the forge and
+// resolves an operator-named workflow_id out of it, so a repo whose spec
+// declares a grooming_report-producing workflow can name it there. Documenting
+// that seam as unreachable would therefore be false, so it is GATED instead —
+// which is why the decision core below is factored into evaluateCharterAdmission
+// and consumed by two arms: checkCharterDeclared (the HTTP arm, writing the 422)
+// and ensureCharterDeclared (the ctx/error arm, refusing before the mint call).
+// Both fire PRE-INSERT, so AC8's "refused before any run row exists" holds on
+// both seams. TestCharterGate_CampaignSeam_* pins the campaign arm, and
+// TestCharterGate_EveryCreateRunForTriggerCallerIsGated is the source-level pin
+// that a THIRD caller cannot be added without a gate.
 
 // charterRefusalReason enumerates WHY admission was refused. Three branches
 // share the 422, so the reason is what makes them distinguishable to an
@@ -94,40 +116,59 @@ func WorkflowRequiresCharter(wf spec.Workflow) bool {
 	return false
 }
 
-// checkCharterDeclared is the admission gate. It returns true to ADMIT and
-// false having already written the refusal response.
-//
-// It is called pre-insert (a refusal leaves no run row) and POST-REPLAY (an
-// Idempotency-Key resolving to an existing run short-circuits before it, so a
-// replay re-evaluates no configuration decision and appends no second entry) —
-// the same seam and the same two properties checkAppliesTo documents.
-func (s *Server) checkCharterDeclared(w http.ResponseWriter, r *http.Request, repo, workflowID string, wf spec.Workflow) bool {
-	if !WorkflowRequiresCharter(wf) {
-		// Narrow by construction: an ordinary code-change workflow never
-		// reaches the conventions loader, so this gate cannot refuse a run it
-		// has no business refusing.
-		return true
-	}
+// errCharterRequired is the sentinel the ctx/error arm wraps, so a caller (and
+// a test) can identify THIS refusal rather than pattern-matching a message.
+var errCharterRequired = errors.New("charter required")
 
-	conv, err := conventionsLoader(r.Context(), repo)
-	var reason string
+// charterAdmissionReason maps a conventions load OUTCOME to a refusal reason,
+// or "" to admit. Pure — no receiver, no I/O — for the same reason
+// WorkflowRequiresCharter is: it is the half a later static-validation pass
+// would reuse, and it is what makes the two arms below provably identical in
+// their verdict rather than identical-looking.
+func charterAdmissionReason(conv workmgmt.Conventions, err error) string {
 	switch {
 	case err != nil:
-		reason = reasonConventionsUnavailable
+		return reasonConventionsUnavailable
 	case conv.Charter == nil:
-		reason = reasonCharterAbsent
+		return reasonCharterAbsent
 	case strings.TrimSpace(conv.Charter.Path) == "":
-		reason = reasonCharterPathEmpty
-	default:
-		return true
+		return reasonCharterPathEmpty
 	}
+	return ""
+}
 
+// charterRefusalMessage renders the actionable refusal text both arms carry.
+func charterRefusalMessage(repo, workflowID, reason string) string {
 	message := "workflow " + workflowID + " in " + repo + " produces a grooming report, but no backlog charter is declared: " +
 		"a grooming run ranks the backlog against the charter's rubric, and there is no unanchored-grooming mode. " +
 		"Declare a `charter:` block with its `path:` key in " + conventionsPathForMessage +
 		" pointing at the checked-in charter document (conventionally .fishhawk/charter.md), then start the run again."
 	if reason == reasonConventionsUnavailable {
 		message += " The work-management conventions could not be read for this repo, and an unreadable conventions file is refused rather than assumed to declare a charter."
+	}
+	return message
+}
+
+// evaluateCharterAdmission is the DECISION CORE both admission arms share. It
+// returns "" to ADMIT, or the refusal reason — having already appended the
+// best-effort refusal audit entry.
+//
+// Sharing the core is what makes "every run-minting seam is gated" a property
+// of one function rather than of two copies that can drift: the HTTP arm and
+// the campaign arm differ only in how they REPORT the verdict, never in the
+// verdict.
+func (s *Server) evaluateCharterAdmission(ctx context.Context, repo, workflowID string, wf spec.Workflow) string {
+	if !WorkflowRequiresCharter(wf) {
+		// Narrow by construction: an ordinary code-change workflow never
+		// reaches the conventions loader, so this gate cannot refuse a run it
+		// has no business refusing.
+		return ""
+	}
+
+	conv, err := conventionsLoader(ctx, repo)
+	reason := charterAdmissionReason(conv, err)
+	if reason == "" {
+		return ""
 	}
 
 	// The refusal audit is BEST-EFFORT — the deliberate asymmetry
@@ -144,22 +185,54 @@ func (s *Server) checkCharterDeclared(w http.ResponseWriter, r *http.Request, re
 			"required_artifact": string(spec.ArtifactGroomingReport),
 		})
 		systemKind := audit.ActorKind("system")
-		if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+		if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
 			Timestamp: time.Now().UTC(),
 			Category:  "run_rejected_missing_charter",
 			ActorKind: &systemKind,
 			Payload:   payload,
-			AccountID: identityAccountID(r.Context()),
+			AccountID: identityAccountID(ctx),
 		}); aerr != nil {
 			s.cfg.Logger.Warn("append run_rejected_missing_charter audit entry failed",
 				"repo", repo, "workflow_id", workflowID, "reason", reason, "error", aerr.Error())
 		}
 	}
+	return reason
+}
 
-	s.writeError(w, r, http.StatusUnprocessableEntity, "charter_required", message, map[string]any{
-		"workflow_id":      workflowID,
-		"conventions_path": conventionsPathForMessage,
-		"reason":           reason,
-	})
+// checkCharterDeclared is the HTTP admission arm. It returns true to ADMIT and
+// false having already written the refusal response.
+//
+// It is called pre-insert (a refusal leaves no run row) and POST-REPLAY (an
+// Idempotency-Key resolving to an existing run short-circuits before it, so a
+// replay re-evaluates no configuration decision and appends no second entry) —
+// the same seam and the same two properties checkAppliesTo documents.
+func (s *Server) checkCharterDeclared(w http.ResponseWriter, r *http.Request, repo, workflowID string, wf spec.Workflow) bool {
+	reason := s.evaluateCharterAdmission(r.Context(), repo, workflowID, wf)
+	if reason == "" {
+		return true
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, "charter_required",
+		charterRefusalMessage(repo, workflowID, reason), map[string]any{
+			"workflow_id":      workflowID,
+			"conventions_path": conventionsPathForMessage,
+			"reason":           reason,
+		})
 	return false
+}
+
+// ensureCharterDeclared is the ctx/error admission arm, for run-minting seams
+// that hold no ResponseWriter — today StartRunForCampaignIssue, which the
+// campaign item-run endpoint and the campaign driver both reach.
+//
+// It returns nil to ADMIT, or an errCharterRequired-wrapped error carrying the
+// same reason and the same actionable message the 422 carries. The caller
+// refuses BEFORE CreateRunForTrigger, so AC8's "refused before any run row
+// exists" holds identically on this seam.
+func (s *Server) ensureCharterDeclared(ctx context.Context, repo, workflowID string, wf spec.Workflow) error {
+	reason := s.evaluateCharterAdmission(ctx, repo, workflowID, wf)
+	if reason == "" {
+		return nil
+	}
+	return fmt.Errorf("%w (%s): %s", errCharterRequired, reason, charterRefusalMessage(repo, workflowID, reason))
 }
