@@ -88,7 +88,12 @@ import "sort"
 // returns the whole apply) and grooming_apply_completed (the once-per-apply
 // summary) — declared as "…Category" constants in
 // backend/internal/workmgmt/grooming_apply.go, the shape the completeness AST
-// sweep collects. When a new
+// sweep collects. E54.8 / #2240 added grooming_churn_filtered, written once per
+// CHURN GUARD pass on the same ingest path: it carries the proposed/suppressed/
+// resurfaced counts and entry ids, the charter_changed flag, and the
+// no_changes_proposed flag that IS #2240 AC1's visible "no changes proposed"
+// outcome — so an operator awaits this one category to learn what a grooming
+// run actually proposes, as distinct from what the agent emitted. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -158,6 +163,7 @@ var KnownCategories = map[string]struct{}{
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"grooming_apply_completed":                {},
+	"grooming_churn_filtered":                 {},
 	"grooming_mutation_applied":               {},
 	"grooming_report_recorded":                {},
 	"implement_review_backstop_elapsed":       {},
