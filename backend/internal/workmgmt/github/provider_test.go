@@ -54,6 +54,13 @@ type fakeAPI struct {
 	nodeIDNumber int
 	nodeIDErr    error
 	parentNode   string
+	// nodeIDs maps issue number -> node id, so a test can give the CHILD and
+	// the PARENT epic DISTINCT node ids and assert which one AddSubIssue
+	// received in which position. With one shared parentNode for every number,
+	// reversing AddSubIssue's arguments is unobservable (#2237 review). An
+	// absent number falls back to parentNode, so existing single-id fixtures
+	// are unaffected.
+	nodeIDs map[int]string
 
 	subParent, subChild string
 	subErr              error
@@ -182,6 +189,9 @@ func (f *fakeAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ gith
 	f.nodeIDNumber = number
 	if f.nodeIDErr != nil {
 		return "", f.nodeIDErr
+	}
+	if id, ok := f.nodeIDs[number]; ok {
+		return id, nil
 	}
 	return f.parentNode, nil
 }

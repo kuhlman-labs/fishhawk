@@ -293,6 +293,16 @@ type GroomingMutationRequest struct {
 // time). ProviderResponse is the short provider-side description the audit row
 // carries; Observed is the state the provider read at write time, when it read
 // one.
+//
+// EXACTLY ONE of Applied and Skipped MUST be true, and a provider that
+// returns any other combination is treated as having FAILED (#2237 review).
+// The two rejected states are not symmetric in how they were reached, but they
+// are equally unusable: a zero-value result (both false) claims neither a
+// write nor a deliberate no-op, and a result with both set claims both. The
+// apply layer VALIDATES this rather than assuming it, because
+// settleGroomingCandidate turns this struct straight into the audit outcome —
+// so a both-false result reaching an applied-by-default arm would record a
+// tracker write that never happened.
 type GroomingMutationResult struct {
 	Applied          bool          `json:"applied"`
 	Skipped          bool          `json:"skipped"`

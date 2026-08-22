@@ -58,7 +58,12 @@ var groomingBoardOptions = map[string]string{
 // and its card sits at currentStatus.
 func groomingAPI(currentStatus string, onBoard bool) *fakeAPI {
 	return &fakeAPI{
-		parentNode:              "ISSUE_NODE",
+		parentNode: "ISSUE_NODE",
+		// DISTINCT ids for the child (#2237) and the parent epic (#1437), so
+		// the epic-link direction assertion has something to discriminate on:
+		// with one shared id, swapping AddSubIssue's parent and child
+		// arguments would satisfy every assertion (#2237 review).
+		nodeIDs:                 map[int]string{2237: "CHILD_NODE", 1437: "PARENT_EPIC_NODE"},
 		meta:                    &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: groomingBoardOptions},
 		itemStatus:              &githubclient.ProjectItemStatus{OnBoard: onBoard, ItemID: "ITEM", Status: currentStatus},
 		itemID:                  "ITEM",
@@ -344,8 +349,15 @@ func TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker(t *testin
 	if !res.Applied {
 		t.Fatalf("result = %+v, want applied", res)
 	}
-	if api.subParent != "ISSUE_NODE" || api.subChild != "ISSUE_NODE" {
-		t.Errorf("AddSubIssue(parent=%q, child=%q), want both resolved node ids", api.subParent, api.subChild)
+	// DIRECTION, not merely presence: the fixture gives the parent epic
+	// (#1437) and the child (#2237) DISTINCT node ids, so a provider that
+	// passed them the other way round fails here. With one shared id — as this
+	// fixture had — the reversed call was indistinguishable (#2237 review).
+	if api.subParent != "PARENT_EPIC_NODE" {
+		t.Errorf("AddSubIssue parent = %q, want PARENT_EPIC_NODE (#1437's node); the parent epic must be passed as PARENT", api.subParent)
+	}
+	if api.subChild != "CHILD_NODE" {
+		t.Errorf("AddSubIssue child = %q, want CHILD_NODE (#2237's node); the target issue must be passed as CHILD", api.subChild)
 	}
 	if api.nodeIDNumber != 1437 {
 		t.Errorf("last IssueNodeID number = %d, want the parent epic 1437", api.nodeIDNumber)
@@ -443,6 +455,83 @@ func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
 	}
 	if res.Observed.Scalar != "#1437" {
 		t.Errorf("Observed = %+v, want the already-persisted parent #1437", res.Observed)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent is the
+// conflicting-parent gap (#2237 review).
+//
+// ensureParentEpicMarker is idempotent on the MARKER, not on the PARENT: it
+// returns ANY marker-bearing body unchanged. Reading that unchanged return as
+// "the requested relationship exists" made the provider report a body naming
+// parent #999 as already linked to the proposed #1437 — and #999 is exactly
+// the state the apply layer dispatches ON, because its pre-dispatch read diffs
+// the marker VALUE. So the one case where a correction was genuinely requested
+// was the one case reported as needing no correction, on every re-apply.
+//
+// The defined behaviour is an explicit typed REFUSAL, not a silent skip and
+// not an overwrite: this provider has no primitive to re-parent with
+// (AddSubIssue only ADDS an edge; there is no removal and no replace-parent),
+// so rewriting the marker would leave the body claiming one parent while the
+// sub-issue graph held another. The candidate fails loud, naming both, and a
+// human decides.
+//
+// The seeded body IS the conflict, by construction — the test never calls the
+// control to set up its own fixture — so removing the discrimination reddens
+// the behavioural assertions below, not a setup step.
+func TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: #999"
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+
+	// THE CONCERN'S OWN ASSERTION FIRST, and not behind a Fatalf on the error
+	// type: the defect is that a requested CORRECTION was reported as already
+	// present. With the discrimination removed the provider returns
+	// Skipped/"parent epic marker already present" and writes nothing — so the
+	// zero-write assertions below stay green and only this one reddens.
+	if res != nil {
+		t.Fatalf("result = %+v, want NO result — a requested correction must not be reported as already present", res)
+	}
+	var conflict *ParentEpicConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err = %v (%T), want *ParentEpicConflictError", err, err)
+	}
+	if conflict.Current != "#999" || conflict.Proposed != "#1437" {
+		t.Errorf("conflict = %+v, want current=#999 proposed=#1437 — both parents must be named", conflict)
+	}
+	// Committed state: nothing was written on either surface.
+	if len(api.updateIssueCalls) != 0 {
+		t.Errorf("a refused epic link still PATCHed the body: %+v", api.updateIssueCalls)
+	}
+	if api.subParent != "" || api.subChild != "" {
+		t.Errorf("a refused epic link still called AddSubIssue (parent=%q child=%q); re-parenting is not available",
+			api.subParent, api.subChild)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkMatchesTheParentAcrossRefShapes is the
+// CONTROL for the refusal above: the discrimination must be on the parent's
+// VALUE, normalized, not on the marker's raw text. A body written `Parent
+// epic: 1437` (no hash — the shape a suggested_fix may carry) names the SAME
+// parent as a proposed `#1437`, so it is an already-present SKIP, not a
+// conflict. Without this, a normalization regression would turn every
+// unhashed marker into a permanent failure.
+func TestApplyGroomingMutation_EpicLinkMatchesTheParentAcrossRefShapes(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: 1437"
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if !res.Skipped || res.Applied {
+		t.Errorf("result = %+v, want skipped — `1437` and `#1437` are the same parent", res)
+	}
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" {
+		t.Errorf("an already-linked epic still wrote: patches=%+v subParent=%q", api.updateIssueCalls, api.subParent)
 	}
 }
 

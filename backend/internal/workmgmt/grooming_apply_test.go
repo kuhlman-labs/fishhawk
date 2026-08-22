@@ -489,6 +489,92 @@ func TestApplyGrooming_DecisionForUnknownEntryIsRefused(t *testing.T) {
 	}
 }
 
+// TestApplyGrooming_ContradictoryDuplicateDecisionsAreRefused is the
+// duplicate-decision fail-closed guard (#2237 review).
+//
+// Decisions are indexed by entry id and a map insert is last-write-wins, so
+// WITHOUT the guard a set carrying both {id, approved} and {id, rejected}
+// authorizes or refuses purely by array order. The table sends BOTH orders for
+// the same entry and requires the SAME answer from each: a *GroomingJoinError
+// naming the entry and ZERO dispatches.
+//
+// The committed-state read is the mutator call log, not the error: an
+// approved-last set that dispatched and a refusal that did not both return
+// through the same envelope shape, and only the call log tells them apart.
+// Order-independence is the discriminating property — an implementation with
+// the guard removed passes the rejected-last rows (nothing dispatches because
+// the surviving verdict is a rejection) and fails the approved-last one.
+func TestApplyGrooming_ContradictoryDuplicateDecisionsAreRefused(t *testing.T) {
+	report := &plan.GroomingReport{
+		HygieneDefects: []plan.HygieneDefect{hygieneEntry(1, "missing_label_namespace", "area:api")},
+	}
+	id := report.HygieneDefects[0].ID
+
+	cases := []struct {
+		name      string
+		decisions []GroomingDecision
+	}{
+		{
+			name: "approved then rejected",
+			decisions: []GroomingDecision{
+				{EntryID: id, Verdict: GroomingApproved},
+				{EntryID: id, Verdict: GroomingRejected},
+			},
+		},
+		{
+			name: "rejected then approved",
+			decisions: []GroomingDecision{
+				{EntryID: id, Verdict: GroomingRejected},
+				{EntryID: id, Verdict: GroomingApproved},
+			},
+		},
+		{
+			// Not contradictory, still ambiguous: two rows where the caller
+			// meant one. Refused rather than resolved, so the boundary has no
+			// "harmless duplicate" arm an ambiguous set could slip through.
+			name: "identical repeats",
+			decisions: []GroomingDecision{
+				{EntryID: id, Verdict: GroomingApproved},
+				{EntryID: id, Verdict: GroomingApproved},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mut := &fakeGroomingMutator{}
+			sink := &fakeGroomingSink{}
+			res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+				Target:    groomingTarget(),
+				Report:    report,
+				Decisions: tc.decisions,
+				Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+				States:    groomingStates(),
+			})
+			// COMMITTED STATE FIRST, and never behind a t.Fatalf on the
+			// error: with the guard deleted the "rejected then approved" row
+			// returns a nil error AND dispatches, so the call log is the
+			// assertion that has to be reached to see it.
+			if len(mut.calls) != 0 {
+				t.Errorf("mutator recorded %d dispatch(es) %v, want 0 — a repeated decision id must never authorize a mutation by array order",
+					len(mut.calls), mut.kinds())
+			}
+			if len(sink.records) != 0 {
+				t.Errorf("sink recorded %d rows, want 0 — nothing settled", len(sink.records))
+			}
+			if res != nil {
+				t.Errorf("result = %+v, want nil: an ambiguous decision set runs nothing", res)
+			}
+			var je *GroomingJoinError
+			if !errors.As(err, &je) {
+				t.Fatalf("err = %v (%T), want *GroomingJoinError for a repeated decision id", err, err)
+			}
+			if je.EntryID != id {
+				t.Errorf("join error names %q, want the repeated entry id %q", je.EntryID, id)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AC2 — rejected / amended / undecided
 // ---------------------------------------------------------------------------
@@ -804,6 +890,73 @@ func TestApplyGrooming_ProviderResultBranches(t *testing.T) {
 	rec := recordFor(t, res, report.HygieneDefects[0].ID)
 	if rec.Outcome != GroomingOutcomeFailed || !strings.Contains(rec.Error, "no result") {
 		t.Errorf("record = %+v, want failed on a result-less provider reply", rec)
+	}
+}
+
+// TestApplyGrooming_MalformedProviderResultIsFailedNotFabricated pins the
+// result-state VALIDATION (#2237 review). GroomingMutationResult's contract is
+// that exactly one of Applied/Skipped is true; the two violations were each
+// silently absorbed into a load-bearing audit outcome:
+//
+//   - BOTH FALSE — a zero-value result — fell through to the switch's default
+//     arm and was recorded APPLIED, fabricating a tracker write that provably
+//     did not happen. This is the row a provider returning `&Result{}` on an
+//     unhandled path produces.
+//   - BOTH TRUE was recorded SKIPPED, hiding a provider that believes it
+//     wrote.
+//
+// Both must now be FAILED. The assertions read the recorded OUTCOME (and the
+// applied/skipped buckets), not an error identity: the call returns nil either
+// way, so only the settled record discriminates.
+func TestApplyGrooming_MalformedProviderResultIsFailedNotFabricated(t *testing.T) {
+	report := &plan.GroomingReport{
+		HygieneDefects: []plan.HygieneDefect{hygieneEntry(1, "missing_label_namespace", "area:api")},
+	}
+	id := report.HygieneDefects[0].ID
+
+	cases := []struct {
+		name   string
+		result *GroomingMutationResult
+	}{
+		{name: "zero value: neither applied nor skipped", result: &GroomingMutationResult{}},
+		{
+			name:   "contradictory: applied AND skipped",
+			result: &GroomingMutationResult{Applied: true, Skipped: true, SkipReason: "both", ProviderResponse: "confused"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mut := &fakeGroomingMutator{result: tc.result}
+			sink := &fakeGroomingSink{}
+			res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+				Target:    groomingTarget(),
+				Report:    report,
+				Decisions: approveAll(report),
+				Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+				States:    groomingStates(),
+			})
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			rec := recordFor(t, res, id)
+			if rec.Outcome != GroomingOutcomeFailed {
+				t.Errorf("outcome = %q, want %q — a malformed result must not be classified as a write or a deliberate no-op: %+v",
+					rec.Outcome, GroomingOutcomeFailed, rec)
+			}
+			if !strings.Contains(rec.Error, "malformed result") {
+				t.Errorf("error = %q, want it to name the malformed result state", rec.Error)
+			}
+			if len(res.Applied) != 0 {
+				t.Errorf("applied bucket = %+v, want empty: nothing was written", res.Applied)
+			}
+			if res.Summary.Failed != 1 || res.Summary.Applied != 0 || res.Summary.Skipped != 0 {
+				t.Errorf("summary = %+v, want failed=1 applied=0 skipped=0", res.Summary)
+			}
+			// The audit row the operator reads must agree with the verdict.
+			if len(sink.records) != 1 || sink.records[0].Outcome != GroomingOutcomeFailed {
+				t.Errorf("audited records = %+v, want one failed row", sink.records)
+			}
+		})
 	}
 }
 

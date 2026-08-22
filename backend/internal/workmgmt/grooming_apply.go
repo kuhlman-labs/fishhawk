@@ -20,7 +20,9 @@ package workmgmt
 // a tracker write, and each is pinned by a named test that goes RED when the
 // rule is deleted:
 //
-//	1. JOIN            a decision naming an entry that is not in the report
+//	1. JOIN            a decision naming an entry that is not in the report —
+//	                   or a REPEATED decision for one entry, whose last-write-wins
+//	                   collapse would let array order decide authorization —
 //	                   REFUSES the whole apply (*GroomingJoinError), before any
 //	                   dispatch. AC1.
 //	2. NOT APPROVED    a rejected/amended/undecided entry is recorded skipped
@@ -472,15 +474,33 @@ func groomingReportEntryIDs(report *plan.GroomingReport) map[string]struct{} {
 
 // validateGroomingJoin is containment rule 1 (AC1). It refuses the WHOLE apply
 // — before any dispatch — when a decision names an entry id absent from the
-// report, or when a derived candidate carries an id the report does not
-// contain (a derivation bug). Fail-closed by design: an unjoined mutation is a
-// bug, not a convenience, so there is no partial-execution path.
+// report, when the SAME entry id carries more than one decision, or when a
+// derived candidate carries an id the report does not contain (a derivation
+// bug). Fail-closed by design: an unjoined or ambiguous mutation is a bug, not
+// a convenience, so there is no partial-execution path.
+//
+// THE DUPLICATE CHECK IS AN AUTHORIZATION BOUNDARY, not tidiness (#2237
+// review). Decisions are indexed into a map keyed by entry id, and a map
+// insert is last-write-wins: a decision set carrying BOTH
+// {id, rejected} and {id, approved} would authorize or refuse the mutation
+// purely by array order, so the same input applied twice in a different order
+// would dispatch differently. That is fail-OPEN ambiguity at the exact point
+// AC2 is decided, so a repeated id refuses the whole apply here, BEFORE the
+// map is built and before anything dispatches. It refuses IDENTICAL repeats
+// too: "which of these two rows did the operator mean" has no safe answer
+// worth encoding, and a caller that meant one decision can send one.
 func validateGroomingJoin(report *plan.GroomingReport, decisions []GroomingDecision, candidates []groomingCandidate) error {
 	ids := groomingReportEntryIDs(report)
+	seen := make(map[string]struct{}, len(decisions))
 	for _, d := range decisions {
 		if _, ok := ids[d.EntryID]; !ok {
 			return &GroomingJoinError{EntryID: d.EntryID, Reason: "has a decision but is not in the grooming report"}
 		}
+		if _, dup := seen[d.EntryID]; dup {
+			return &GroomingJoinError{EntryID: d.EntryID,
+				Reason: "carries more than one decision; a repeated decision id is ambiguous and is refused rather than resolved by input order"}
+		}
+		seen[d.EntryID] = struct{}{}
 	}
 	for _, c := range candidates {
 		if _, ok := ids[c.entryID]; !ok {
@@ -523,6 +543,9 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 		return nil, err
 	}
 
+	// Safe to index by entry id ONLY because validateGroomingJoin has already
+	// refused a repeated id: without that refusal this insert is
+	// last-write-wins and array order decides authorization.
 	decisions := make(map[string]GroomingDecision, len(req.Decisions))
 	for _, d := range req.Decisions {
 		decisions[d.EntryID] = d
@@ -685,10 +708,27 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 		// nothing; recording it applied would be a fabrication.
 		rec.Outcome = GroomingOutcomeFailed
 		rec.Error = "provider returned no result and no error"
+	case res.Applied == res.Skipped:
+		// MALFORMED RESULT STATE (#2237 review). GroomingMutationResult's
+		// contract is that EXACTLY ONE of Applied/Skipped is true, and the
+		// apply layer validates it rather than trusting it, because the
+		// outcome it produces is the load-bearing audit record.
+		//
+		// Both FALSE is the dangerous one: a zero-value result reports that
+		// nothing was applied and nothing was deliberately skipped, and a
+		// switch whose applied arm is the DEFAULT would fabricate
+		// GroomingOutcomeApplied out of it — an audit row claiming a tracker
+		// write that provably did not happen. Both TRUE is self-contradictory
+		// and was silently classified skipped, hiding a provider that thinks
+		// it wrote. Neither is a state a caller can act on, so both fail.
+		rec.Outcome = GroomingOutcomeFailed
+		rec.ProviderResponse = res.ProviderResponse
+		rec.Error = fmt.Sprintf("provider returned a malformed result (applied=%t skipped=%t); exactly one must be true",
+			res.Applied, res.Skipped)
 	case res.Skipped:
 		rec.ProviderResponse = res.ProviderResponse
 		return groomingSkipped(rec, res.SkipReason)
-	default:
+	default: // res.Applied, and only res.Applied — the case above rejects the rest.
 		rec.Outcome = GroomingOutcomeApplied
 		rec.ProviderResponse = res.ProviderResponse
 	}

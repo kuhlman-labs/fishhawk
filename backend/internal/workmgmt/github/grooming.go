@@ -55,6 +55,36 @@ func (e *UnsupportedGroomingKindError) Error() string {
 	return fmt.Sprintf("workmgmt/github: cannot execute grooming mutation kind %q", e.Kind)
 }
 
+// ParentEpicConflictError is the TYPED refusal for an epic link whose item
+// already records a DIFFERENT parent epic (#2237 review).
+//
+// It exists because the alternative is the worst outcome available. The apply
+// layer dispatches an epic link ONLY when its pre-dispatch read saw a parent
+// marker that does not match the proposal — i.e. exactly when a CORRECTION is
+// being requested — and reporting that correction as "already present" would
+// tell the operator the tracker agrees with the report when it does not, and
+// would keep telling them on every re-apply.
+//
+// It refuses rather than re-parents because this provider has no primitive to
+// re-parent with: linkEpic's only edge write is AddSubIssue, which ADDS an
+// edge, and there is no RemoveSubIssue and no replace-parent option on the
+// client. Overwriting the marker while leaving the old sub-issue edge in place
+// would make the body claim one parent while the graph holds another — a
+// worse lie than the one this replaces. So the conflict is surfaced as a
+// FAILED candidate naming both parents, and a human decides which is right.
+type ParentEpicConflictError struct {
+	Number   int
+	Current  string
+	Proposed string
+}
+
+func (e *ParentEpicConflictError) Error() string {
+	return fmt.Sprintf(
+		"workmgmt/github: #%d already records parent epic %s but %s was proposed; "+
+			"re-parenting is not available through this provider (no sub-issue removal primitive) — resolve the parent by hand",
+		e.Number, e.Current, e.Proposed)
+}
+
 // groomingFieldNames maps each VALUE-SET kind onto the project board field it
 // writes. These are FIELD WRITES, not positional reordering (approval
 // condition I3): this provider implements no positional primitive, so a
@@ -256,7 +286,8 @@ func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingM
 func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMutationRequest,
 	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
 	parent := strings.TrimSpace(req.After.Scalar)
-	if parent == "" {
+	want := renderParentEpicMarker(parent)
+	if want == "" {
 		return nil, &UnsupportedGroomingKindError{Kind: req.Kind, Detail: "no parent epic reference was proposed"}
 	}
 	issue, err := p.api.GetIssue(ctx, req.Target.Scope, repo, number)
@@ -264,14 +295,32 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 		return nil, fmt.Errorf("workmgmt/github: read body of #%d: %w", number, err)
 	}
 	observed := workmgmt.GroomingValue{Scalar: parseParentEpicMarker(issue.Body)}
-	updated := ensureParentEpicMarker(issue.Body, parent)
-	if updated == issue.Body {
-		// The relationship is already recorded on the surface the next read
-		// observes, so re-linking would be a duplicate dispatch.
-		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present",
-			ProviderResponse: fmt.Sprintf("#%d already records a parent epic", number),
-			Observed:         observed}, nil
+	// THE ALREADY-PRESENT TEST IS PER-PARENT, NOT PER-MARKER (#2237 review).
+	// ensureParentEpicMarker is idempotent on the MARKER — it returns any
+	// marker-bearing body unchanged — so reading its unchanged return as
+	// "the requested relationship exists" conflates two different bodies: one
+	// naming the proposed parent, and one naming a DIFFERENT parent. The
+	// second is precisely the case the apply layer dispatches on (its
+	// pre-dispatch read diffs the marker value), so treating it as a skip
+	// reports the requested correction as already done.
+	//
+	// Every marker line is compared, not just the first, mirroring the read
+	// side's multi-marker observation; each is normalized through
+	// renderParentEpicMarker so `1437` and `#1437` are one parent, not two.
+	if existing := parentEpicMarkerValues(issue.Body); len(existing) > 0 {
+		for _, cur := range existing {
+			if renderParentEpicMarker(cur) == want {
+				// The relationship is already recorded on the surface the next
+				// read observes, so re-linking would be a duplicate dispatch.
+				return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present",
+					ProviderResponse: fmt.Sprintf("#%d already records parent epic %s", number, cur),
+					Observed:         observed}, nil
+			}
+		}
+		return nil, &ParentEpicConflictError{Number: number,
+			Current: strings.Join(existing, ", "), Proposed: strings.TrimPrefix(want, "Parent epic: ")}
 	}
+	updated := ensureParentEpicMarker(issue.Body, parent)
 	childNodeID, err := p.api.IssueNodeID(ctx, req.Target.Scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve issue #%d: %w", number, err)
@@ -306,9 +355,15 @@ func renderParentEpicMarker(ref string) string {
 }
 
 // ensureParentEpicMarker appends the marker line to body when body does not
-// already carry one. Idempotent: a body that already has a `Parent epic:` line
-// is returned UNCHANGED, so re-applying never double-stamps it — and the
-// caller reads that unchanged return as the already-linked skip.
+// already carry one. Idempotent on the MARKER: a body that already has a
+// `Parent epic:` line is returned UNCHANGED, so re-applying never
+// double-stamps it.
+//
+// Its unchanged return is NOT an "already linked to this parent" signal and
+// must not be read as one — it is marker-shaped, not parent-valued, so a body
+// naming a DIFFERENT parent also comes back unchanged. groomingLinkEpic
+// therefore discriminates on the marker VALUES (parentEpicMarkerValues) before
+// calling this, and only reaches it once no marker exists.
 func ensureParentEpicMarker(body, ref string) string {
 	marker := renderParentEpicMarker(ref)
 	if marker == "" {
@@ -332,6 +387,21 @@ func parseParentEpicMarker(body string) string {
 		return ""
 	}
 	return strings.TrimSpace(m[1])
+}
+
+// parentEpicMarkerValues returns the reference on EVERY `Parent epic:` body
+// line, in body order, or nil when the body carries none. groomingLinkEpic
+// needs all of them, not just the first: a body carrying two marker lines is
+// malformed but real, and an already-linked test that looked only at the first
+// would refuse a link the body already records further down.
+func parentEpicMarkerValues(body string) []string {
+	var out []string
+	for _, m := range parentEpicMarkerRE.FindAllStringSubmatch(body, -1) {
+		if v := strings.TrimSpace(m[1]); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // groomingAddDependsOn records a depends_on edge on the item's body, reusing

@@ -37,7 +37,7 @@ Why a GitHub App installation token can't board Project #7:
 | Kind | Primitive | Notes |
 |---|---|---|
 | `label_set` | `GetIssue` → `AddIssueLabels` (POST `.../labels`) | **Additive, not a union PATCH — see below.** The payload carries only the labels being added; GitHub merges server-side. A label already present is a provider-side skip, not a write. |
-| `epic_link` | `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | The sub-issues path `File`'s `linkEpic` uses, **plus** the `Parent epic: #N` body marker — see below. A body already carrying the marker is a skip. |
+| `epic_link` | `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | The sub-issues path `File`'s `linkEpic` uses, **plus** the `Parent epic: #N` body marker — see below. A body already naming the PROPOSED parent is a skip; one naming a DIFFERENT parent is a typed `*ParentEpicConflictError`, never a skip. |
 | `depends_on_add` | `GetIssue` → `ensureDependsOnMarker` → `UpdateIssue(body)` | Reuses the existing idempotent body-marker helper; a body already carrying a marker is a skip. |
 | `close_duplicate` | `UpdateIssue(state=closed, state_reason=duplicate)` | **Destructive.** |
 | `close_not_planned` | `UpdateIssue(state=closed, state_reason=not_planned)` | **Destructive.** Never `completed`, which would misreport a descoped item as delivered work. |
@@ -65,7 +65,11 @@ So `groomingLinkEpic` writes both, and the marker is the projection of the relat
 
 **Order is deliberate: link first, marker second.** A marker written before a failed link would claim a relationship that does not exist and would *suppress* the retry. This way a failure between the two is loud (an error, candidate recorded failed) and the next apply re-attempts; the residual is that the re-attempted `AddSubIssue` may be refused by GitHub as a duplicate edge, which surfaces as a failed candidate rather than as a false "applied".
 
-Pinned by `TestApplyGroomingMutation_EpicLinkReapplyIsANoOp`, a **real-provider** round trip: the first call's written body is fed back as the issue's body and the second call must dispatch nothing.
+Pinned by `TestApplyGroomingMutation_EpicLinkReapplyIsANoOp`, a **real-provider** round trip: the first call's written body is fed back as the issue's body and the second call must dispatch nothing. Direction is pinned separately: the fixture gives the child (`#2237`) and the parent epic (`#1437`) **distinct** node ids, so `TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker` asserts which node reached `AddSubIssue` in which position. With one shared id — as the fixture originally had — reversing the arguments satisfied every assertion (#2237 review).
+
+**A DIFFERENT existing parent is refused, not reported as already present.** `ensureParentEpicMarker` is idempotent on the *marker*, not on the *parent*: it returns any marker-bearing body unchanged. Reading that unchanged return as "the requested relationship exists" meant a body naming `#999` was reported already-linked to a proposed `#1437` — and that is exactly the state the apply core dispatches ON, since its pre-dispatch read diffs the marker VALUE. So the one case where a correction was genuinely requested was the one case reported as needing none, on every re-apply. `groomingLinkEpic` now discriminates on the marker VALUES (`parentEpicMarkerValues`, every line, each normalized through `renderParentEpicMarker` so `1437` ≡ `#1437`) before it reaches `ensureParentEpicMarker`: a match is the already-present skip, anything else is a typed `*ParentEpicConflictError` naming both parents, and the candidate is recorded FAILED.
+
+It **refuses rather than re-parents** because this provider has no primitive to re-parent with: `linkEpic`'s only edge write is `AddSubIssue`, which ADDS an edge, and the client carries no sub-issue removal and no replace-parent option. Rewriting the marker alone would leave the body claiming one parent while the sub-issue graph held another — a worse lie than the one it replaces. Pinned by `TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent` (typed error, nil result, zero `UpdateIssue`, zero `AddSubIssue`) with `..._EpicLinkMatchesTheParentAcrossRefShapes` as the normalization control.
 
 ### `rank_set` and `priority_set` are FIELD writes, not positional reordering (I3)
 
