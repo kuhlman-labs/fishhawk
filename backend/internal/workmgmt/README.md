@@ -153,6 +153,10 @@ The decision order, the three-state baseline, the per-class fingerprint table an
 
 **Recency is enforced here, not inherited.** The candidate set is sorted `created_at DESC, id DESC` in the function rather than trusting query order. The production `ListRuns` does declare that ORDER BY — but a suppression control that silently diffs against the OLDEST baseline if the clause ever changes fails in the unsafe direction (suppressing against stale dispositions), and nothing else binds this function to that clause.
 
+**A candidate must be a PREDECESSOR, not merely a different run (#2240 fix-up).** Excluding the current run's own id is a weaker rule than the "prior run" boundary this function claims and AC4 means. Grooming runs on one repo can overlap, and `ListRuns` returns every same-tenant run on the repo regardless of when it was created — so a run created AFTER this one, including a grooming run that started later and settled first, sorts newest-first and would let FUTURE dispositions suppress findings in an EARLIER run. Candidates are therefore restricted to runs strictly preceding the current one in the SAME `(created_at, id)` total order the sort declares, which is also what excludes the current run itself. Strictness is the fail-safe direction: an unset current `created_at` admits no candidate and so proposes.
+
+**A newer run that SETTLED NOTHING does not shadow an older one that did (#2240 fix-up).** A grooming run whose report was never decided — or whose applies all failed — contributes no disposition, so its baseline is entry-less, and diffing against it re-proposes the whole unchanged backlog: the convergence break AC1/AC4 exist to prevent, triggered by an intermediate run the operator never acted on. The scan therefore CONTINUES past a disposition-less candidate to the last SETTLED baseline, falling back to the newest report's entry-less baseline only when no candidate settled anything — where it is the correct answer, and carries that report's charter revision for the charter-drift signal.
+
 **The gap, stated rather than implied: nothing in production calls `ApplyGrooming` yet.** #2237 shipped the apply layer with its seam deliberately unwired, so no `grooming_mutation_applied` row exists today and every baseline currently resolves empty — which correctly proposes everything, since nothing has in fact been applied or rejected. The wiring above reads the real category, so dispositions populate the instant an apply consumer lands, with no change to this package or to the handler.
 
 ### Counterfactual table — which test goes RED when which control is deleted
@@ -172,10 +176,12 @@ Every row below was run empirically (control deleted in the working tree, named 
 | the deterministic proposal + suppression sort, ACROSS two separate runs | `TestGroomingIngest_DistinctRunsProduceIdenticalVerdict` |
 | the baseline tenant discriminator (account + installation), and the query-level `AccountID` scoping | `TestGroomingIngest_BaselineIsTenantScoped` |
 | the explicit newest-first candidate sort | `TestGroomingIngest_MostRecentPriorRunWins` |
+| the strict-predecessor restriction, and its `(created_at, id)` tiebreak | `TestGroomingIngest_ANewerRunIsNotABaseline` |
+| continuing the scan past a disposition-less newer run to the last SETTLED baseline | `TestGroomingIngest_AnUnsettledRunDoesNotShadowASettledOne` |
 | the schema floors and both `additionalProperties: false` levels | `TestSchemaRejectsSubFloorThresholds` |
 | the guard INVOCATION on the ingest path; the baseline assembly; the current-run self-exclusion; the prior-report parse guard | `TestGroomingIngest_UnchangedBacklogProposesNothing` |
 | the churn-verdict fail-closed 500 | `TestGroomingIngest_ChurnAuditFailureIs500` |
-| the retry-path heal; the `ensureGovernanceAuditEntry` dedup | `TestGroomingIngest_RetryHealsAGappedChurnVerdict`, `TestGroomingIngest_UnchangedBacklogProposesNothing` |
+| the retry-path heal; the `ensureGovernanceAuditEntry` dedup; the heal write's OWN fail-closed 500 | `TestGroomingIngest_RetryHealsAGappedChurnVerdict`, `TestGroomingIngest_UnchangedBacklogProposesNothing` |
 | the per-repo conventions read; the baseline degrade fail-opens; the undecodable apply-record guard | `TestGroomingIngest_ThresholdsComeFromRepoConventions`, `TestGroomingIngest_ChurnDegradeModes` |
 
 ### Stated residuals

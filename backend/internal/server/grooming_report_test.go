@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -599,6 +600,14 @@ var churnFixedTime = time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
 // uncontrolled variable in these assertions.
 const churnCharterHash = "3726dca74f7729cbe084869f755e3ffff92812011e61fe13084faf603fd13561"
 
+// churnCurrentRunTime is the CURRENT run's created_at. It is fixed and late
+// enough that every prior run these fixtures seed — including the ones that
+// set an explicit created_at — precedes it, because the baseline now admits
+// only STRICT predecessors in (created_at, id) order rather than merely
+// "not this run". A fixture whose current run carried the zero time would
+// admit no candidate at all and pass every suppression assertion vacuously.
+var churnCurrentRunTime = time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+
 func newChurnFixture(t *testing.T, runID, stageID uuid.UUID) *churnFixture {
 	t.Helper()
 	sf := newSigningFake()
@@ -606,7 +615,7 @@ func newChurnFixture(t *testing.T, runID, stageID uuid.UUID) *churnFixture {
 	au := newAuditFake()
 	base := newPromptRunRepo()
 	base.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
-	base.getRuns[runID] = &run.Run{ID: runID, Repo: churnRepo, WorkflowID: "backlog_grooming"}
+	base.getRuns[runID] = &run.Run{ID: runID, Repo: churnRepo, WorkflowID: "backlog_grooming", CreatedAt: churnCurrentRunTime}
 	base.stagesByRunID = map[uuid.UUID][]*run.Stage{}
 	rr := &groomingRunRepo{promptRunRepo: base, byRepo: map[string][]*run.Run{}}
 	s := New(Config{
@@ -1248,6 +1257,199 @@ func TestGroomingIngest_MostRecentPriorRunWins(t *testing.T) {
 	}
 }
 
+// TestGroomingIngest_ANewerRunIsNotABaseline pins the PREDECESSOR boundary
+// (#2240 fix-up). Excluding the current run's own id is not the same rule as
+// "a PRIOR run": ListRuns returns every same-tenant run on the repo whenever
+// it was created, so a grooming run that started LATER and settled FIRST — the
+// concurrency case — would sort newest-first and let FUTURE dispositions
+// suppress findings in this earlier run.
+func TestGroomingIngest_ANewerRunIsNotABaseline(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	t.Run("a run created after this one cannot suppress anything", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		// A concurrently-started grooming run that COMPLETED FIRST, having
+		// applied every entry. Adopting it would suppress this whole report
+		// against dispositions that did not exist when this run began.
+		f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(time.Minute)
+		}, report, ids, nil)
+
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if v.Summary.BaselineEntries != 0 {
+			t.Errorf("baseline_entries = %d, want 0 — a run created AFTER this one became the baseline", v.Summary.BaselineEntries)
+		}
+		if v.Summary.Proposed != 3 || v.Summary.NoChangesProposed {
+			t.Errorf("proposed=%v no_changes=%v; a FUTURE run's dispositions suppressed this run's findings",
+				v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
+		}
+	})
+
+	t.Run("the newest PRECEDING run wins over a newer concurrent one", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		entry := report.HygieneDefects[0].ID
+		// Divergent dispositions for the SAME entry, so the suppression reason
+		// identifies which run was adopted rather than two identical baselines
+		// masking the difference. The later run is seeded FIRST, so insertion
+		// order cannot be what produces the right answer.
+		f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(time.Minute)
+		}, report, nil, ids) // AFTER this run: rejected
+		f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+		}, report, ids, nil) // BEFORE this run: applied
+
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		var reason string
+		for _, sp := range v.Suppressed {
+			if sp.EntryID == entry {
+				reason = sp.Reason
+			}
+		}
+		if reason != workmgmt.GroomingSuppressAlreadyApplied {
+			t.Errorf("suppression reason = %q, want %q — the baseline came from a run created AFTER this one",
+				reason, workmgmt.GroomingSuppressAlreadyApplied)
+		}
+	})
+
+	// The ID half of the total order, one call below the HTTP boundary because
+	// the fixture cannot choose the seeded run's uuid: at an IDENTICAL
+	// created_at the declared order is id DESC, so a candidate whose id sorts
+	// ABOVE the current run's is "newer" and must be refused too. Without the
+	// tiebreak the predicate would be a bare created_at compare and a
+	// same-instant peer would be adopted non-deterministically.
+	t.Run("an equal created_at is broken by id, not adopted", func(t *testing.T) {
+		curStage := uuid.New()
+		f := newChurnFixture(t, uuid.New(), curStage)
+		priorID := f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime
+		}, report, ids, nil)
+
+		below := &run.Run{ID: uuidJustBelow(t, priorID), Repo: churnRepo, CreatedAt: churnCurrentRunTime}
+		base, degraded := f.s.groomingChurnBaseline(context.Background(), below)
+		if len(degraded) != 0 {
+			t.Fatalf("degraded = %v, want none", degraded)
+		}
+		if len(base.Entries) != 0 {
+			t.Errorf("baseline entries = %d, want 0 — a same-instant run with a HIGHER id sorts newer and is not a predecessor", len(base.Entries))
+		}
+		// The positive control: the same fixture with a current id ABOVE the
+		// candidate's DOES adopt it, so the assertion above is the tiebreak and
+		// not a fixture that can never produce a baseline.
+		above := &run.Run{ID: uuidJustAbove(t, priorID), Repo: churnRepo, CreatedAt: churnCurrentRunTime}
+		base, degraded = f.s.groomingChurnBaseline(context.Background(), above)
+		if len(degraded) != 0 {
+			t.Fatalf("degraded = %v, want none", degraded)
+		}
+		if len(base.Entries) != len(ids) {
+			t.Errorf("baseline entries = %d, want %d — a same-instant run with a LOWER id IS a predecessor", len(base.Entries), len(ids))
+		}
+	})
+}
+
+// uuidJustBelow / uuidJustAbove return the adjacent uuid in the big-endian
+// byte order uuid.String() renders positionally, so numeric adjacency IS string
+// adjacency. Deterministic, unlike generating uuids until one happens to sort
+// the right way.
+func uuidJustBelow(t *testing.T, id uuid.UUID) uuid.UUID {
+	t.Helper()
+	out := id
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] > 0 {
+			out[i]--
+			return out
+		}
+		out[i] = 0xff
+	}
+	t.Fatalf("no uuid sorts below %s", id)
+	return uuid.Nil
+}
+
+func uuidJustAbove(t *testing.T, id uuid.UUID) uuid.UUID {
+	t.Helper()
+	out := id
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i] < 0xff {
+			out[i]++
+			return out
+		}
+		out[i] = 0
+	}
+	t.Fatalf("no uuid sorts above %s", id)
+	return uuid.Nil
+}
+
+// TestGroomingIngest_AnUnsettledRunDoesNotShadowASettledOne pins the second
+// half of the "prior run" boundary (#2240 fix-up): a grooming run whose report
+// was never decided — or whose applies all failed — records NO disposition, so
+// its baseline is entry-less. Adopting it because it is merely the most recent
+// would re-propose the entire unchanged backlog after every undecided
+// intermediate run, which is exactly the convergence break AC1/AC4 exist to
+// prevent. The last SETTLED baseline must survive it.
+func TestGroomingIngest_AnUnsettledRunDoesNotShadowASettledOne(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	f := newChurnFixture(t, runID, stageID)
+
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// Older: decided AND applied — the real baseline.
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.CreatedAt = churnCurrentRunTime.Add(-48 * time.Hour)
+	}, report, ids, nil)
+	// Newer: shipped the same report and settled NOTHING (undecided, or every
+	// apply failed). It is the most recent prior run by created_at.
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+	}, report, nil, nil)
+
+	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", code)
+	}
+	v := churnVerdict(t, f.au)
+	if v.Summary.BaselineEntries != len(ids) {
+		t.Errorf("baseline_entries = %d, want %d — the dispositionless newer run shadowed the settled older one",
+			v.Summary.BaselineEntries, len(ids))
+	}
+	if !v.Summary.NoChangesProposed || v.Summary.Proposed != 0 {
+		t.Errorf("proposed=%v no_changes=%v; an unchanged backlog after an UNDECIDED intermediate run must still converge to nothing proposed",
+			v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
+	}
+	// The hygiene entry is the one whose reason IDENTIFIES the disposition: an
+	// unchanged ordering entry is suppressed at the ordering threshold without
+	// ever reading its disposition, so only this one distinguishes "adopted the
+	// settled baseline" from "adopted a baseline at all".
+	hygiene := report.HygieneDefects[0].ID
+	var reason string
+	for _, sp := range v.Suppressed {
+		if sp.EntryID == hygiene {
+			reason = sp.Reason
+		}
+	}
+	if reason != workmgmt.GroomingSuppressAlreadyApplied {
+		t.Errorf("entry %s suppression reason = %q, want %q from the last SETTLED baseline", hygiene, reason, workmgmt.GroomingSuppressAlreadyApplied)
+	}
+}
+
 // TestGroomingIngest_ChurnDegradeModes covers each defensive branch in the
 // wiring, asserting the NAMED degrade reason AND that the guard fell toward
 // PROPOSING — a suppression control that cannot read its inputs must never
@@ -1436,4 +1638,43 @@ func TestGroomingIngest_RetryHealsAGappedChurnVerdict(t *testing.T) {
 	if v.Summary.Proposed != 2 {
 		t.Errorf("healed verdict proposed = %v, want the real guard output, not a placeholder", v.Summary.ProposedIDs)
 	}
+
+	// The heal's OWN failure branch, which the success path above cannot reach:
+	// the retry finds the report durable and the verdict absent, and the write
+	// that would close the gap fails. Reporting 200 there would be the same
+	// silent gap in a different disguise, so it must 500 for a further retry to
+	// re-heal — the same fail-closed rule the first-write path obeys.
+	t.Run("a failing heal write surfaces 500", func(t *testing.T) {
+		gapRun, gapStage := uuid.New(), uuid.New()
+		g := newChurnFixture(t, gapRun, gapStage)
+		if _, cerr := g.ar.Create(context.Background(), artifact.CreateParams{
+			StageID: gapStage, Kind: artifact.KindGroomingReport, SchemaVersion: &sv,
+			Content: body, ContentHash: sha256Hex(body),
+		}); cerr != nil {
+			t.Fatalf("seed gapped artifact: %v", cerr)
+		}
+		if n := countChurnEntries(g.au); n != 0 {
+			t.Fatalf("fixture: churn entries = %d, want 0 (the gapped state)", n)
+		}
+		g.s.cfg.AuditRepo = &churnAuditFailFake{auditFake: g.au}
+
+		gpriv, _ := g.sf.issue(t, gapRun)
+		gw := shipPlanRequest(t, g.s, gapRun, gapStage, gpriv, body, "")
+		if gw.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 when the retry cannot heal the missing churn verdict", gw.Code)
+		}
+		// Attributable to the HEAL branch, not to the first-write one: both
+		// return 500, and only the message distinguishes which ran.
+		if !strings.Contains(gw.Body.String(), "heal grooming churn audit entry failed") {
+			t.Errorf("body = %s, want the heal-path churn failure", gw.Body.String())
+		}
+		// Attributable to the HEAL branch, not to the first-write one: both
+		// return 500, and only the message distinguishes which ran.
+		if msg := strings.Contains(gw.Body.String(), "heal grooming churn audit entry failed"); !msg {
+			t.Errorf("body = %s, want the heal-path churn failure", gw.Body.String())
+		}
+		if n := countChurnEntries(g.au); n != 0 {
+			t.Errorf("churn entries = %d, want 0 — the 500 must reflect a verdict that was NOT recorded", n)
+		}
+	})
 }

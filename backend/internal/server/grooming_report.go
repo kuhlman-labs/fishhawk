@@ -382,6 +382,29 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 // failing in the unsafe direction against stale dispositions, and no
 // repository-level test binds this function to that clause.
 //
+// PREDECESSOR, not merely "not me" (#2240 fix-up). Excluding the current run's
+// own id is not the same boundary as "a PRIOR run", which is what this
+// function claims and what AC4 means. Grooming runs on one repo can overlap:
+// ListRuns returns every same-tenant run on the repo regardless of when it was
+// created, so a run created AFTER this one — including a grooming run that
+// started later and settled first — would sort newest-first and be adopted,
+// letting FUTURE dispositions suppress findings in an EARLIER run. Candidates
+// are therefore restricted to runs strictly preceding the current one in the
+// SAME (created_at, id) total order the sort below declares, so "newest" is
+// always read from the past half of that order. An unset current created_at
+// admits no candidate and so proposes — the fail-safe direction.
+//
+// A newer prior run that SETTLED NOTHING must not shadow an older one that did
+// (#2240 fix-up). A grooming run whose report was never decided (or whose
+// applies all failed) contributes no disposition, so its baseline is
+// entry-less and diffing against it proposes the whole backlog again — the
+// convergence break AC1/AC4 exist to prevent, triggered by an intermediate run
+// the operator never acted on. The scan therefore CONTINUES past a
+// disposition-less candidate to the last SETTLED baseline, and falls back to
+// the newest report's (entry-less) baseline only when no candidate settled
+// anything — where it is the correct answer and carries the current charter
+// revision for the charter-drift signal.
+//
 // Dispositions come from the prior run's grooming_mutation_applied audit rows,
 // which the apply layer (#2237) writes once per SETTLED candidate. That single
 // category carries both halves of the baseline: an `applied` outcome (or a
@@ -417,7 +440,7 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (w
 
 	candidates := make([]*run.Run, 0, len(runs))
 	for _, rn := range runs {
-		if rn == nil || rn.ID == current.ID || !sameGroomingTenant(rn, current) {
+		if rn == nil || !sameGroomingTenant(rn, current) || !groomingRunPrecedes(rn, current) {
 			continue
 		}
 		candidates = append(candidates, rn)
@@ -431,18 +454,48 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (w
 		return candidates[i].ID.String() > candidates[j].ID.String()
 	})
 
+	// unsettled holds the NEWEST candidate that shipped a report but settled
+	// nothing, used only if no older candidate settled anything either.
+	var unsettled *workmgmt.GroomingBaseline
 	for _, rn := range candidates {
 		prior := s.priorGroomingReport(ctx, rn.ID)
 		if prior == nil {
 			continue
 		}
 		decisions, applied := s.priorGroomingDispositions(ctx, rn.ID)
-		return workmgmt.NewGroomingBaseline(prior, decisions, applied), nil
+		candidate := workmgmt.NewGroomingBaseline(prior, decisions, applied)
+		if len(candidate.Entries) == 0 {
+			// Undecided, or every apply failed: this run decided nothing, so it
+			// is not the "last approved and applied state" AC4 diffs against.
+			// Keep scanning; the last SETTLED baseline is still the truth.
+			if unsettled == nil {
+				unsettled = &candidate
+			}
+			continue
+		}
+		return candidate, nil
+	}
+	if unsettled != nil {
+		return *unsettled, nil
 	}
 	// No prior grooming run in this tenant on this repo: the first-ever run.
 	// Not a degrade — an empty baseline is the CORRECT answer, and everything
 	// is proposed.
 	return empty, nil
+}
+
+// groomingRunPrecedes reports whether a candidate run strictly precedes the
+// current one in the (created_at, id) total order groomingChurnBaseline sorts
+// by — the same order the production ListRuns query declares. Strictness is
+// what excludes the current run itself, so no separate self-exclusion is
+// needed; a candidate created at the same instant is ordered by id, so the
+// predicate is total and deterministic rather than dependent on clock
+// resolution.
+func groomingRunPrecedes(candidate, current *run.Run) bool {
+	if !candidate.CreatedAt.Equal(current.CreatedAt) {
+		return candidate.CreatedAt.Before(current.CreatedAt)
+	}
+	return candidate.ID.String() < current.ID.String()
 }
 
 // sameGroomingTenant reports whether a candidate prior run belongs to the same
