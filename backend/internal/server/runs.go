@@ -1088,6 +1088,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Charter admission gate (ADR-065 / E54.4 / #2236). A workflow that
+	// produces a grooming report has nothing to rank the backlog against
+	// unless the repo declares a charter, so it is refused here with 422
+	// charter_required. Sits beside checkAppliesTo, immediately after it and
+	// before CreateRunForTrigger, for the same two reasons: it is PRE-INSERT
+	// (a refusal leaves no run row) and POST-REPLAY (a replayed
+	// Idempotency-Key short-circuits above, so the gate decides once per NEW
+	// run and appends no second audit entry). See charter_gate.go for where
+	// this rule is — and is not — enforced.
+	if haveStageDefs && !s.checkCharterDeclared(w, r, req.Repo, req.WorkflowID, workflowDef) {
+		return
+	}
+
 	// Map the request's issue context (#415) to the domain value, then
 	// hand the resolved inputs to CreateRunForTrigger — the single
 	// integrating seam for run + stage creation, reused by the
@@ -1229,6 +1242,20 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, p StartRunForCamp
 	}
 	if len(wf.Stages) == 0 {
 		return nil, fmt.Errorf("workflow %q in %s spec has no stages", p.WorkflowID, p.Repo)
+	}
+
+	// Charter admission gate (ADR-065 / E54.4 / #2236), the campaign seam.
+	// This path resolves an OPERATOR-NAMED workflow_id out of the repo's own
+	// fetched spec, so — unlike handleCreateRun's haveStageDefs=false branch —
+	// it is not structurally barred from carrying a grooming-capable workflow.
+	// It therefore gets the same gate as the HTTP seam, sharing the same
+	// decision core, and fires PRE-MINT so a refusal leaves no run row (AC8).
+	// The ctx/error arm rather than the HTTP one: this function holds no
+	// ResponseWriter, and its callers already map a start failure to their own
+	// response (the item-run endpoint) or leave the item un-started for the
+	// next tick (the driver).
+	if err := s.ensureCharterDeclared(ctx, p.Repo, p.WorkflowID, wf); err != nil {
+		return nil, err
 	}
 
 	triggerRef := p.IssueRef

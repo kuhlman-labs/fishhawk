@@ -6584,3 +6584,324 @@ workflows:
 		})
 	}
 }
+
+// --- E54.4 / #2236: the SHIPPED backlog-grooming declaration -----------------
+//
+// The TestShippedGroomingExample_* family below reads
+// docs/spec/examples/workflow-v2-backlog-grooming.yaml FROM DISK — the shipped
+// bytes, never a copy — and asserts the declaration's behaviour end to end:
+// YAML -> version routing -> the v2removed sweep -> schema validation ->
+// normalizeV2Shapes -> typed decode -> deriveV2Autonomy -> Validate ->
+// ResolveAutonomy. The change is config-shaped, so presence-of-edit proves
+// nothing; each test asserts a resolved OUTCOME that a drift in the file
+// reddens.
+
+// parseShippedGroomingExample reads and parses the shipped declaration.
+func parseShippedGroomingExample(t *testing.T) spec.Workflow {
+	t.Helper()
+	raw, err := os.ReadFile(groomingExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", groomingExampleRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", groomingExampleRelPath, err)
+	}
+	wf, ok := s.Workflows["backlog_grooming"]
+	if !ok {
+		t.Fatalf("workflows = %v, want a backlog_grooming workflow", s.Workflows)
+	}
+	return wf
+}
+
+// resolvedGroomingAction looks up one class in the shipped declaration's
+// resolved matrix.
+func resolvedGroomingAction(t *testing.T, rm *spec.ResolvedMatrix, action string) spec.ResolvedAction {
+	t.Helper()
+	if rm == nil {
+		t.Fatal("ResolveAutonomy = nil; the shipped example declares no autonomy block")
+	}
+	for _, a := range rm.Actions {
+		if a.Action == action {
+			return a
+		}
+	}
+	t.Fatalf("resolved matrix has no %q entry (actions: %+v)", action, rm.Actions)
+	return spec.ResolvedAction{}
+}
+
+// TestShippedGroomingExample_MatrixDefaults is AC4 + AC7: the shipped matrix
+// resolves to EXACTLY the declared per-class settings. Every grooming class is
+// asserted to its specific mode, not to a gated-OR-report disjunction: a suite
+// that accepts either stays green when the destructive `scoping` default drifts
+// from report to gated, which is exactly what AC7 exists to prevent (approval
+// condition G2).
+//
+// COUNTERFACTUALS: setting the shipped `scoping` to `{mode: auto, when:
+// objective_reversible}` reddens this test (the parser refuses the flipped
+// document); setting it to `{mode: gated}` also reddens it, on the exact-mode
+// assertion.
+func TestShippedGroomingExample_MatrixDefaults(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	rm := spec.ResolveAutonomy(&wf, nil)
+
+	// The ONE auto-eligible grooming class, under its own condition.
+	hygiene := resolvedGroomingAction(t, rm, spec.ActionGroomHygiene)
+	if hygiene.Mode != spec.ModeAuto {
+		t.Errorf("hygiene mode = %q, want auto", hygiene.Mode)
+	}
+	if hygiene.Condition != spec.ConditionObjectiveReversible {
+		t.Errorf("hygiene condition = %q, want %q", hygiene.Condition, spec.ConditionObjectiveReversible)
+	}
+
+	// The three non-delegable classes, each pinned to its EXACT shipped mode.
+	for _, tc := range []struct {
+		class string
+		want  spec.ActionMode
+	}{
+		{spec.ActionGroomOrdering, spec.ModeGated},
+		{spec.ActionGroomDedup, spec.ModeGated},
+		{spec.ActionGroomScoping, spec.ModeReport},
+	} {
+		got := resolvedGroomingAction(t, rm, tc.class)
+		if got.Mode != tc.want {
+			t.Errorf("%s mode = %q, want EXACTLY %q", tc.class, got.Mode, tc.want)
+		}
+	}
+
+	// AC4's separately-named safety assertion: the most destructive class is
+	// not auto. Redundant with the exact-mode row above ON PURPOSE — this is
+	// the property the epic exists to hold, and it must be readable as its own
+	// failure rather than as one row of a table.
+	if scoping := resolvedGroomingAction(t, rm, spec.ActionGroomScoping); scoping.Mode == spec.ModeAuto {
+		t.Errorf("scoping resolved to mode: auto — a destructive grooming class must NEVER delegate")
+	}
+
+	// The five run-driving classes are governed by `autonomy: low` and stay
+	// gated: the tier and the grooming matrix are disjoint, so declaring both
+	// is not an override conflict.
+	for _, class := range []string{spec.ActionApprove, spec.ActionFixup, spec.ActionWaive, spec.ActionRetry, spec.ActionMerge} {
+		if got := resolvedGroomingAction(t, rm, class); got.Mode != spec.ModeGated {
+			t.Errorf("%s mode = %q, want gated under autonomy: low", class, got.Mode)
+		}
+	}
+}
+
+// TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate is AC7's
+// second half (approval condition G2): a report-mode class surfaces a proposal
+// and does nothing else — it derives no may_* knob, adds no gate, and adds no
+// page event that would park the run.
+//
+// SCOPE, STATED HONESTLY. This test asserts the STATIC shape of the shipped
+// declaration: the derived operator_agent block, the declared gate inventory,
+// the page list. That is necessary and NOT sufficient — a runtime consumer
+// could begin treating a report-mode class as gated, or park the run on it,
+// without modifying the workflow's Gates slices or ResolveAutonomy's
+// PageHumanOn, and this test would stay green. The BEHAVIOURAL half is pinned
+// where the consumers live, in backend/internal/server:
+// TestShippedGrooming_ReportModeNeitherGatesNorParksAtTheConsumer drives this
+// same declaration through delegation.Evaluate + AutoDriveRunGate's report arm
+// at a live gate, with TestShippedGrooming_ReportArmIsLiveInThisHarness as its
+// paired control. Read the two together; neither alone verifies AC7.
+func TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	rm := spec.ResolveAutonomy(&wf, nil)
+	if got := resolvedGroomingAction(t, rm, spec.ActionGroomScoping); got.Mode != spec.ModeReport {
+		t.Fatalf("scoping mode = %q, want report — this test is about report mode", got.Mode)
+	}
+
+	// No authority: every may_* knob is empty.
+	derived := spec.DerivedOperatorAgent(rm)
+	if derived == nil {
+		t.Fatal("DerivedOperatorAgent = nil, want a block (the workflow declares autonomy + actions)")
+	}
+	for _, k := range []struct {
+		name string
+		cond spec.DelegationCondition
+	}{
+		{"may_approve", derived.MayApprove},
+		{"may_route_fixup", derived.MayRouteFixup},
+		{"may_waive", derived.MayWaive},
+		{"may_retry", derived.MayRetry},
+		{"may_merge", derived.MayMerge},
+	} {
+		if k.cond != "" {
+			t.Errorf("%s = %q, want EMPTY — no grooming class may widen authority", k.name, k.cond)
+		}
+	}
+
+	// No gate: the gate inventory is exactly the two DECLARED approval gates
+	// (groom and confirm). A report-mode class contributes none.
+	gates := map[string]int{}
+	for _, st := range wf.Stages {
+		gates[st.ID] = len(st.Gates)
+	}
+	want := map[string]int{"groom": 1, "apply": 0, "confirm": 1}
+	if !reflect.DeepEqual(gates, want) {
+		t.Errorf("gates per stage = %v, want %v — declaring scoping: report must add no gate", gates, want)
+	}
+
+	// No parking: `autonomy: low` expands to no page list, and a report-mode
+	// class adds none, so nothing here pages the human for the grooming
+	// classes' sake.
+	if len(rm.PageHumanOn) != 0 {
+		t.Errorf("page_human_on = %v, want empty — report mode must not park the run", rm.PageHumanOn)
+	}
+}
+
+// TestShippedGroomingExample_StageTypesAndNoKindDiscriminator is AC1: the
+// workflow is built on the STANDARD stage types and carries no `kind:`
+// discriminator anywhere. A grooming workflow is recognised structurally (by
+// the artifact it produces), never by a workflow-type tag.
+func TestShippedGroomingExample_StageTypesAndNoKindDiscriminator(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	if len(wf.Stages) == 0 {
+		t.Fatal("backlog_grooming declares no stages")
+	}
+	allowed := map[spec.StageType]bool{
+		spec.StageTypePlan: true, spec.StageTypeImplement: true, spec.StageTypeReview: true,
+	}
+	for _, st := range wf.Stages {
+		if !allowed[st.Type] {
+			t.Errorf("stage %q has type %q, want one of plan/implement/review — AC1 forbids a bespoke stage type", st.ID, st.Type)
+		}
+	}
+	raw, err := os.ReadFile(groomingExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", groomingExampleRelPath, err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		if strings.Contains(line, "kind:") {
+			t.Errorf("the example carries a `kind:` discriminator (%q); AC1 forbids one", strings.TrimSpace(line))
+		}
+	}
+}
+
+// TestShippedGroomingExample_TriggerRouting is AC5: the declared applies_to
+// routes the two NON-DIFF trigger forms and refuses a diff-shaped change.
+func TestShippedGroomingExample_TriggerRouting(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	if wf.AppliesTo == nil {
+		t.Fatal("backlog_grooming declares no applies_to; the non-diff routing form is missing")
+	}
+	for _, tc := range []struct {
+		trigger spec.TriggerForm
+		want    bool
+	}{
+		{spec.TriggerScheduled, true},
+		{spec.TriggerOnDemand, true},
+		{spec.TriggerDiff, false},
+	} {
+		got, err := wf.AppliesTo.Match(spec.Change{Trigger: tc.trigger})
+		if err != nil {
+			t.Fatalf("Match(trigger=%s): %v", tc.trigger, err)
+		}
+		if got != tc.want {
+			t.Errorf("Match(trigger=%s) = %v, want %v", tc.trigger, got, tc.want)
+		}
+	}
+}
+
+// TestShippedGroomingExample_ApprovalGatesExcludeAgents is AC6: both gates
+// carry a forge-neutral `approvals` predicate that excludes agents, so no
+// agent can approve its own grooming proposal or its application.
+func TestShippedGroomingExample_ApprovalGatesExcludeAgents(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	seen := 0
+	for _, st := range wf.Stages {
+		for gi := range st.Gates {
+			g := st.Gates[gi]
+			if g.Type != spec.GateTypeApproval {
+				continue
+			}
+			seen++
+			if g.Approvals == nil {
+				t.Errorf("stage %q gate %d declares no `approvals` block; v2's forge-neutral predicate is the only approval form", st.ID, gi)
+				continue
+			}
+			if g.Approvals.Count == nil || *g.Approvals.Count < 1 {
+				t.Errorf("stage %q gate %d approvals.count = %v, want >= 1", st.ID, gi, g.Approvals.Count)
+			}
+			if !containsRole(g.Approvals.Not, "agent") {
+				t.Errorf("stage %q gate %d approvals.not = %v, want it to exclude \"agent\"", st.ID, gi, g.Approvals.Not)
+			}
+		}
+	}
+	if seen != 2 {
+		t.Errorf("found %d approval gates, want 2 (the propose gate and the confirm gate)", seen)
+	}
+}
+
+// containsRole reports whether a forge-neutral role list names role.
+func containsRole(roles []string, role string) bool {
+	for _, r := range roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// TestShippedGroomingExample_ReconcilesWith2219Fixture is the divergence guard
+// (#2219 / #2235): the example keeps declaring grooming_report/grooming_report_v1
+// on a `plan`-typed stage and keeps declaring NO pull_request artifact, so the
+// non-code-change generalization and the artifact declaration cannot drift apart
+// under a later edit while every other assertion here still passes.
+func TestShippedGroomingExample_ReconcilesWith2219Fixture(t *testing.T) {
+	wf := parseShippedGroomingExample(t)
+	found := false
+	for _, st := range wf.Stages {
+		for _, p := range st.Produces {
+			if p.Artifact == spec.ArtifactPullRequest {
+				t.Errorf("stage %q declares the pull_request artifact; the example must stay a NON-code-change workflow", st.ID)
+			}
+			if p.Artifact != spec.ArtifactGroomingReport {
+				continue
+			}
+			found = true
+			if st.Type != spec.StageTypePlan {
+				t.Errorf("grooming_report is produced by a %q stage, want a plan (PROPOSE) stage", st.Type)
+			}
+			if p.Schema != spec.GroomingReportSchemaVersion {
+				t.Errorf("grooming_report schema = %q, want %q", p.Schema, spec.GroomingReportSchemaVersion)
+			}
+		}
+	}
+	if !found {
+		t.Error("no stage declares the grooming_report artifact; the charter gate keys off it, so its absence would silently disarm the gate")
+	}
+}
+
+// TestParseV2_GroomingStageRejectsDiffConstraint is AC2: a post-hoc diff
+// constraint on the shipped declaration's apply stage is refused at parse
+// time, because no stage produces a pull_request.
+//
+// COUNTERFACTUAL: delete the producesDiff guard in validate.go and this test
+// goes RED.
+func TestParseV2_GroomingStageRejectsDiffConstraint(t *testing.T) {
+	raw, err := os.ReadFile(groomingExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", groomingExampleRelPath, err)
+	}
+	const anchor = `      - id: apply
+        type: implement
+`
+	if !strings.Contains(string(raw), anchor) {
+		t.Fatalf("the shipped example no longer declares the apply stage in the expected form; update this test's anchor")
+	}
+	mutated := strings.Replace(string(raw), anchor, anchor+"        constraints:\n          max_files_changed: 5\n", 1)
+	_, err = spec.ParseBytes([]byte(mutated))
+	if err == nil {
+		t.Fatal("ParseBytes accepted a max_files_changed constraint on a stage that produces no pull_request")
+	}
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "declares no pull_request artifact") {
+		t.Errorf("Message = %q, want the produces-no-pull_request rejection", ve.Message)
+	}
+}

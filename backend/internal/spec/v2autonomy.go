@@ -98,6 +98,65 @@ const (
 	ActionMerge   = "merge"
 )
 
+// The four BACKLOG-GROOMING action classes (ADR-065 / E54.4 / #2236).
+// They are registered as KNOWN grooming classes so the grammar can say
+// something specific about each, but they are deliberately NOT added to
+// knownActionOrder: that slice drives resolveBlock's always-emit-a-gated-
+// default loop and DerivedOperatorAgent's knob switch, so registering
+// them there would attach four permanently-gated entries to EVERY
+// workflow's resolved matrix and to every run-status delegation block for
+// no safety gain. Extension-ordered rendering already surfaces them
+// (sorted by name) whenever a workflow declares them.
+const (
+	// ActionGroomHygiene is the ONE auto-eligible grooming class: objective,
+	// reversible hygiene defect fixes, bound to ConditionObjectiveReversible.
+	ActionGroomHygiene = "hygiene"
+	// ActionGroomOrdering re-ranks the backlog. Non-delegable.
+	ActionGroomOrdering = "ordering"
+	// ActionGroomDedup closes duplicates. Non-delegable.
+	ActionGroomDedup = "dedup"
+	// ActionGroomScoping decomposes, iceboxes or closes items. Non-delegable.
+	ActionGroomScoping = "scoping"
+)
+
+// nonDelegableGroomingClasses are the grooming classes that can NEVER
+// reach `mode: auto`. They are KNOWN (the grammar names them, and the
+// rejection message says why each is non-delegable) but carry NO entry in
+// classConditions, so no backend-evaluable condition exists for them and
+// none can be written.
+//
+// TWO INDEPENDENT CONTROLS refuse `mode: auto` on these classes, and that
+// is deliberate defence in depth (approval condition G1):
+//
+//  1. the explicit non-delegable branch in validateAutonomy, which fires
+//     first and rejects with MsgNonDelegableGroomingClassAuto — pinned by
+//     TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto, which
+//     asserts the exact message, so deleting the branch (leaving the
+//     extension-class branch to reject with a DIFFERENT message) reddens it;
+//  2. their ABSENCE from classConditions, which makes them extension
+//     classes to the pre-existing branch below — pinned by
+//     TestGroomingRegistry_NonDelegableClassesCarryNoCondition, which
+//     reddens the moment any of them is given a condition.
+//
+// Each control therefore has its own delete/flip-observe-red proof; neither
+// masks the other's.
+var nonDelegableGroomingClasses = map[string]string{
+	ActionGroomOrdering: "re-ranks the backlog",
+	ActionGroomDedup:    "closes items as duplicates",
+	ActionGroomScoping:  "decomposes, iceboxes or closes items",
+}
+
+// MsgNonDelegableGroomingClassAuto renders the non-delegable-grooming-class
+// rejection. It is exported and formatted here (rather than inlined) so a
+// test can assert the SHIPPED text byte-for-byte: the adjacent extension-
+// class branch would also reject these documents, so a presence-only
+// "an error occurred" assertion would discriminate nothing.
+func MsgNonDelegableGroomingClassAuto(name string) string {
+	return fmt.Sprintf(
+		"action class %q cannot declare mode: auto — it is a NON-DELEGABLE backlog-grooming class (it %s), and its effects are not objectively reversible, so no backend-evaluable condition exists or may be added for it; declare mode: gated (the human acts) or mode: report (surface a proposal without acting). The only auto-eligible grooming class is %q, under when: %s",
+		name, nonDelegableGroomingClasses[name], ActionGroomHygiene, ConditionObjectiveReversible)
+}
+
 // knownActionOrder is the canonical order known classes are resolved and
 // surfaced in, so a ResolvedMatrix is deterministic across runs (Go map
 // iteration is randomized). Extension classes follow, sorted by name.
@@ -107,12 +166,17 @@ var knownActionOrder = []string{ActionApprove, ActionFixup, ActionWaive, ActionR
 // backend-evaluable condition legal for each known class. A class absent
 // from this map is an EXTENSION class — it has no backend-evaluable
 // condition at all, which is precisely why `mode: auto` on it is rejected.
+// The four grooming classes are registered here by ABSENCE as much as by
+// presence: `hygiene` carries objective_reversible, and ordering / dedup /
+// scoping are deliberately absent, which is what makes `mode: auto` on
+// them unwritable rather than merely defaulted away.
 var classConditions = map[string]DelegationCondition{
-	ActionApprove: ConditionCleanDualApproval,
-	ActionFixup:   ConditionConvergentConcerns,
-	ActionWaive:   ConditionSoloLow,
-	ActionRetry:   ConditionInfraFlake,
-	ActionMerge:   ConditionGatesResolvedCIGreen,
+	ActionApprove:      ConditionCleanDualApproval,
+	ActionFixup:        ConditionConvergentConcerns,
+	ActionWaive:        ConditionSoloLow,
+	ActionRetry:        ConditionInfraFlake,
+	ActionMerge:        ConditionGatesResolvedCIGreen,
+	ActionGroomHygiene: ConditionObjectiveReversible,
 }
 
 // reservedMatrixKeys names the `actions` properties that are NOT action
@@ -596,6 +660,19 @@ func validateAutonomy(m *ActionMatrix, path string) *ValidationError {
 		}
 		if e.Mode != ModeAuto {
 			continue
+		}
+		// NON-DELEGABLE GROOMING CLASS. Runs BEFORE the extension-class
+		// branch so the message names the class and says why it can never
+		// be delegated, rather than reading as a generic unknown-class
+		// rejection. The extension-class branch below is the SECOND,
+		// independent control on the same documents (these classes carry no
+		// classConditions entry); see nonDelegableGroomingClasses for how
+		// each of the two is proved separately.
+		if _, nonDelegable := nonDelegableGroomingClasses[name]; nonDelegable {
+			return &ValidationError{
+				Path:    fmt.Sprintf("%s/actions/%s/mode", path, name),
+				Message: MsgNonDelegableGroomingClassAuto(name),
+			}
 		}
 		want, known := classConditions[name]
 		if !known {

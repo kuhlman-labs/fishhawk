@@ -403,7 +403,7 @@ The stage-type enum is five tokens: `plan`, `implement`, `review`, `deploy`, `ac
 | `deploy` | delegate a release (ADR-038) | delegate any externally-owned action | no (delegated) |
 | `acceptance` | validate a running instance (ADR-049) | emit a verdict against declared criteria | no |
 
-A workflow that grooms a backlog — propose a report, gate the proposal on an approval, apply the approved mutations, then confirm the result — is spelled with `plan` → `implement` → `review` and produces no code at any stage. Its first approval gate sits on the `plan` stage, because that is where the judgment is, and a second closes the `review` stage. Worked example: [`examples/workflow-v2-backlog-grooming.yaml`](examples/workflow-v2-backlog-grooming.yaml) (`groom` → `apply` → `confirm`).
+A workflow that grooms a backlog — propose a report, gate the proposal on an approval, apply the approved mutations, then confirm the result — is spelled with `plan` → `implement` → `review` and produces no code at any stage. Its first approval gate sits on the `plan` stage, because that is where the judgment is, and a second closes the `review` stage. Worked example: [`examples/workflow-v2-backlog-grooming.yaml`](examples/workflow-v2-backlog-grooming.yaml) (`groom` → `apply` → `confirm`). That file is the **shipped** grooming declaration and carries the full picture: `applies_to: {trigger: [scheduled, on_demand]}` for non-diff routing, `autonomy: low` over the run-driving classes plus the four-class grooming matrix, and a forge-neutral `approvals` gate on each of its two gated stages. It is read from disk and asserted by the `TestShippedGroomingExample_*` family in `backend/internal/spec`, so a drift in the file reddens a test.
 
 ### `plan` — propose
 
@@ -980,6 +980,7 @@ Each known action class has exactly **one** backend-evaluable condition — the 
 | `waive` | `solo_low` | exactly one open concern, and its severity is low |
 | `retry` | `infra_flake` | the latest stage failure is classified as an infrastructure flake |
 | `merge` | `gates_resolved_ci_green` | no pending gate approvals, zero open concerns, PR open, required checks green |
+| `hygiene` | `objective_reversible` | every mutation the grooming report proposes is an objective, reversible hygiene defect fix (a missing label, an absent parent link, a stale status) and none is destructive |
 
 `min_severity` is accepted on the `fixup` class only. It tunes when `convergent_concerns` auto-routes on an all-approve round: when every verdict is approve-class — no reject to arbitrate — the fix-up auto-routes only if at least one open concern ranks at or above this threshold (`low` < `medium` < `high`, default `medium`). A dual-approve round whose sole open concern is low-severity therefore parks for the operator rather than spending a full fix-up pass. A **reject** verdict bypasses the threshold entirely. An unrecognized severity ranks below `low` and parks (fail-closed).
 
@@ -988,6 +989,7 @@ Four documents are rejected with a message naming the class:
 - `mode: auto` with **no** `when`,
 - `mode: auto` whose `when` is another class's condition,
 - `mode: auto` on an **extension** class (below), which has no backend-evaluable condition at all,
+- `mode: auto` on a **non-delegable backlog-grooming** class (`ordering`, `dedup`, `scoping` — below), which is refused by its own branch, with a message naming the class and why it can never be delegated,
 - `mode: report` that declares a `when` which is **not that class's own condition** (a foreign condition, or any `when` on an extension class). A bare `report` with no `when` is always accepted; a declared `when` must name the class's own condition, so a proposal the report arm cannot evaluate is refused at validation rather than silently dropped at fire time.
 
 These rules are enforced by the **backend**, not by JSON Schema: the class-name set is open, so no schema keyword can bind a condition to a class the schema does not enumerate. A raw `check-jsonschema` run therefore accepts a document the backend rejects.
@@ -995,6 +997,27 @@ These rules are enforced by the **backend**, not by JSON Schema: the class-name 
 ### Extension classes
 
 The class-name set is deliberately **open** and per-workflow-type extensible (ADR-065): a workflow type may declare its own class, e.g. `promote` or `rollback`. An unknown class is safe **by construction** — accepted at `mode: gated` and `mode: report`, where it delegates nothing, and rejected at `mode: auto`, where it would need a condition that does not exist.
+
+A class the backend *does* name but deliberately gives no condition is a stronger case of the same rule — see [Backlog-grooming action classes](#backlog-grooming-action-classes) below.
+
+### Backlog-grooming action classes
+
+Four classes extend the open set for backlog grooming (ADR-065 / E54.4 / #2236). They are a **registry**, not a convention: what a destructive class may resolve to is decided at parse time, not by a default a later refactor can drift.
+
+| Class | The action | Delegable? |
+|---|---|---|
+| `hygiene` | objective, reversible defect fixes — a missing label, an absent parent link, a stale status | **yes**, at `mode: auto` under `when: objective_reversible` |
+| `ordering` | re-ranks the backlog | **no** |
+| `dedup` | closes items as duplicates | **no** |
+| `scoping` | decomposes, iceboxes or closes items | **no** |
+
+`hygiene` is the only one for which a backend-evaluable condition exists. The other three carry **no condition at all**, and `mode: auto` on any of them is **rejected at parse time** with a message naming the class — not defaulted away. Both are declarable at `mode: gated` and at `mode: report`.
+
+Two independent controls refuse `<non-delegable>: auto`: the explicit branch above, and the class's absence from the condition registry (which makes the extension-class rule the second refusal). Each is pinned by its own test, so neither masks the other's removal.
+
+**A workflow tier and the grooming classes are disjoint sets.** `autonomy: low` expands to `approve` / `fixup` / `waive` / `retry` / `merge` only — it never names a grooming class — so declaring `autonomy: low` **and** an explicit grooming matrix is not an explicit-overrides-tier contradiction, and `hygiene` legitimately resolves to `auto` under it. An escalation's `max_autonomy: low` **ceiling** is a different operation and *does* clamp `hygiene` to `gated`, via the documented extension-class fail-closed arm.
+
+**No grooming class reaches a `may_*` knob.** The derived-OperatorAgent bridge maps only the five run-driving classes, so a `hygiene: {mode: auto}` class derives an **empty** knob block and widens authority at no enforcement site. That is what makes shipping `objective_reversible` before its evaluator exists fail-closed rather than a gap — the same posture `trigger: [scheduled, on_demand]` already ships with, which likewise has no producer today.
 
 ### The tiers
 
@@ -1134,7 +1157,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - A `deploy` stage uses `executor.delegate`; no other stage type may.
 - The `deployment` artifact and the three pre-flight constraint kinds are deploy-only; the `acceptance` artifact and the `egress` block are acceptance-only.
 - A post-hoc diff constraint requires the `pull_request` artifact; `diff_coverage` additionally requires stage type `implement`.
-- `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`.
+- `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`) may not be `auto`.
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
@@ -1199,6 +1222,7 @@ The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, 
 | `permissions.network` | The egress host(s) a stage's agent may reach. | **Enforced on an agent-executor `acceptance` stage**, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control. On **every other stage** it is a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split. |
 | `permissions.write` | The paths a stage's agent is expected to write. | Declared, audited (`stage_permissions_declared`) and surfaced (`permissions[]`), but **not enforced anywhere**, until E51 (#2133). |
 | `permissions.shell` | The stage's shell posture (`none` / `restricted` / `unrestricted`). | Declared, audited and surfaced, but **not enforced anywhere**, until E51 (#2133). |
+| The **charter** requirement on a grooming workflow | A workflow producing the `grooming_report` artifact may not start in a repo whose work-management conventions declare no `charter:` block — a grooming run ranks the backlog against the charter's rubric, and there is no unanchored-grooming mode (ADR-065). | **Enforced at run admission ONLY** — on every run-minting seam (`POST /v0/runs` and the campaign item-run start), pre-insert, fail-closed (an unreadable conventions file refuses too), with a `run_rejected_missing_charter` audit entry. It is **NOT** enforced by `fishhawk validate` or by any other static check: the CLI parses no work-management conventions today, so static enforcement would mean giving the validator a conventions loader it has no other reason to have. Read this precisely — such a workflow **validates**, and then **fails to start**. The discriminator is structural (the produced artifact), never the workflow name and never a `kind:` field. See [Backlog-grooming action classes](#backlog-grooming-action-classes) and `backend/internal/server/charter_gate.go`. |
 
 The `permissions.network` row is the one place the "everything under `permissions:` is unenforced" shorthand is false, and getting it wrong under-claims a real control as badly as the tidy version over-claims the others: on an acceptance stage the network declaration is enforced today, because `permissions.network` is a spelling of `egress` and lands on the one enforced path. `permissions.write` and `permissions.shell` have no reader yet, and `escalations` holds only where an author has declared it.
 

@@ -1047,3 +1047,229 @@ func TestDerivedOperatorAgent_AfterMediumClamp_KeepsPermittedKnobs(t *testing.T)
 		t.Errorf("MayRetry = %q, want it preserved — medium holds retry at auto", derived.MayRetry)
 	}
 }
+
+// --- backlog-grooming action classes (ADR-065 / E54.4 / #2236) ---------------
+//
+// Four registered grooming classes: `hygiene` is the ONE auto-eligible one
+// (bound to objective_reversible), and `ordering` / `dedup` / `scoping` are
+// known but NON-DELEGABLE. `mode: auto` on the latter three is refused at
+// PARSE time by TWO independent controls, and the tests below pin each of
+// them SEPARATELY (approval condition G1) — an exact-message test for the
+// non-delegable branch, and a registry-invariant test for the condition
+// absence the extension-class branch keys off. Neither control's deletion is
+// masked by the other's.
+
+// groomingMatrixDoc wraps an `actions` block declaring one grooming class.
+func groomingMatrixDoc(class, body string) []byte {
+	return v2Doc("    actions:\n      " + class + ":\n" + body)
+}
+
+// TestValidateAutonomy_GroomingHygieneAutoAccepted is the NON-VACUITY
+// control: the registry must not reject everything it touches. hygiene at
+// auto under its own condition parses and resolves to auto/explicit.
+func TestValidateAutonomy_GroomingHygieneAutoAccepted(t *testing.T) {
+	s := mustParse(t, groomingMatrixDoc(ActionGroomHygiene,
+		"        mode: auto\n        when: objective_reversible\n"))
+	wf := s.Workflows["feature_change"]
+	got := resolvedFor(t, ResolveAutonomy(&wf, nil), ActionGroomHygiene)
+	if got.Mode != ModeAuto {
+		t.Errorf("hygiene mode = %q, want auto", got.Mode)
+	}
+	if got.Condition != ConditionObjectiveReversible {
+		t.Errorf("hygiene condition = %q, want %q", got.Condition, ConditionObjectiveReversible)
+	}
+	if got.Source != SourceExplicit {
+		t.Errorf("hygiene source = %q, want explicit", got.Source)
+	}
+}
+
+// TestValidateAutonomy_GroomingHygieneAutoNoWhen: auto with no condition is
+// rejected naming the class and its legal condition.
+func TestValidateAutonomy_GroomingHygieneAutoNoWhen(t *testing.T) {
+	_, err := ParseBytes(groomingMatrixDoc(ActionGroomHygiene, "        mode: auto\n"))
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if want := "/workflows/feature_change/actions/hygiene"; ve.Path != want {
+		t.Errorf("Path = %q, want %q", ve.Path, want)
+	}
+	const want = `action class "hygiene" declares mode: auto with no ` + "`when`" + ` condition; mode: auto requires when: objective_reversible`
+	if ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+}
+
+// TestValidateAutonomy_GroomingHygieneAutoForeignWhen: hygiene may not
+// borrow another class's condition.
+func TestValidateAutonomy_GroomingHygieneAutoForeignWhen(t *testing.T) {
+	_, err := ParseBytes(groomingMatrixDoc(ActionGroomHygiene,
+		"        mode: auto\n        when: clean_dual_approval\n"))
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if want := "/workflows/feature_change/actions/hygiene/when"; ve.Path != want {
+		t.Errorf("Path = %q, want %q", ve.Path, want)
+	}
+	const want = `action class "hygiene" declares mode: auto with when: clean_dual_approval, which is not its condition; "hygiene" accepts only when: objective_reversible`
+	if ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+}
+
+// TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto pins CONTROL 1:
+// the explicit non-delegable branch. It asserts the EXACT shipped message and
+// JSON-pointer path, not merely that an error occurred, because the adjacent
+// extension-class branch would ALSO reject these documents — a presence-only
+// assertion would discriminate nothing, and deleting the branch under test
+// would leave the test green.
+//
+// COUNTERFACTUAL: delete the nonDelegableGroomingClasses branch in
+// validateAutonomy and this test goes RED on the message (the extension-class
+// branch rejects with different text).
+func TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto(t *testing.T) {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+		t.Run(class, func(t *testing.T) {
+			// `when` is declared too: a non-delegable class must be refused for
+			// WHAT IT IS, not for a missing condition it could never satisfy.
+			_, err := ParseBytes(groomingMatrixDoc(class,
+				"        mode: auto\n        when: objective_reversible\n"))
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError refusing mode: auto on %q", err, class)
+			}
+			wantPath := "/workflows/feature_change/actions/" + class + "/mode"
+			if ve.Path != wantPath {
+				t.Errorf("Path = %q, want %q", ve.Path, wantPath)
+			}
+			want := MsgNonDelegableGroomingClassAuto(class)
+			if ve.Message != want {
+				t.Errorf("Message = %q,\nwant the non-delegable-class message %q\n(the extension-class branch rejects with different text — this assertion is what discriminates the two)", ve.Message, want)
+			}
+			if !strings.Contains(ve.Message, class) {
+				t.Errorf("Message %q does not name the offending class %q", ve.Message, class)
+			}
+		})
+	}
+}
+
+// TestGroomingRegistry_NonDelegableClassesCarryNoCondition pins CONTROL 2:
+// the ABSENCE of a classConditions entry, which is what makes the pre-existing
+// extension-class branch the second, independent refusal of `<class>: auto`.
+// The non-delegable branch fires first, so this control is invisible to a
+// message assertion — it needs its own proof.
+//
+// COUNTERFACTUAL: add `ActionGroomScoping: ConditionObjectiveReversible` to
+// classConditions and this test goes RED. Registering a condition for a
+// destructive class is exactly the refactor drift the registry design exists
+// to make impossible, and this is the assertion that catches it.
+func TestGroomingRegistry_NonDelegableClassesCarryNoCondition(t *testing.T) {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+		if _, nonDelegable := nonDelegableGroomingClasses[class]; !nonDelegable {
+			t.Errorf("%q is missing from nonDelegableGroomingClasses; the explicit refusal branch would not fire for it", class)
+		}
+		if cond, ok := classConditions[class]; ok {
+			t.Errorf("classConditions[%q] = %q, want NO entry: a non-delegable grooming class must carry no backend-evaluable condition, or `mode: auto` on it becomes writable", class, cond)
+		}
+	}
+	// The paired positive: hygiene IS registered, so the two sets are disjoint
+	// and the registry is not simply empty.
+	if got := classConditions[ActionGroomHygiene]; got != ConditionObjectiveReversible {
+		t.Errorf("classConditions[%q] = %q, want %q", ActionGroomHygiene, got, ConditionObjectiveReversible)
+	}
+	if _, bothWays := nonDelegableGroomingClasses[ActionGroomHygiene]; bothWays {
+		t.Errorf("%q appears in BOTH registries; the two must stay disjoint", ActionGroomHygiene)
+	}
+}
+
+// TestValidateAutonomy_GroomingClassesAcceptGatedAndReport is the second
+// non-vacuity control: the non-delegable classes are KNOWN and declarable, so
+// a refusal-of-everything implementation fails here.
+func TestValidateAutonomy_GroomingClassesAcceptGatedAndReport(t *testing.T) {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+		for _, mode := range []ActionMode{ModeGated, ModeReport} {
+			t.Run(class+"/"+string(mode), func(t *testing.T) {
+				s := mustParse(t, groomingMatrixDoc(class, "        mode: "+string(mode)+"\n"))
+				wf := s.Workflows["feature_change"]
+				got := resolvedFor(t, ResolveAutonomy(&wf, nil), class)
+				if got.Mode != mode {
+					t.Errorf("%s mode = %q, want %q", class, got.Mode, mode)
+				}
+			})
+		}
+	}
+}
+
+// TestDerivedOperatorAgent_GroomingClassesDeriveNoKnob is the AC7/authority
+// invariant: NO grooming class — including the auto-eligible one and a
+// report-mode one — reaches a may_* knob. This is what makes shipping
+// objective_reversible with no evaluator fail-CLOSED rather than a gap.
+//
+// COUNTERFACTUAL: add a `case ActionGroomHygiene:` arm to
+// DerivedOperatorAgent's switch and this test goes RED.
+func TestDerivedOperatorAgent_GroomingClassesDeriveNoKnob(t *testing.T) {
+	s := mustParse(t, v2Doc(`    actions:
+      hygiene:
+        mode: auto
+        when: objective_reversible
+      scoping:
+        mode: report
+`))
+	wf := s.Workflows["feature_change"]
+	rm := ResolveAutonomy(&wf, nil)
+	// Both grooming classes really are present in the resolved matrix — the
+	// assertion below must not pass because the entries vanished.
+	if got := resolvedFor(t, rm, ActionGroomHygiene); got.Mode != ModeAuto {
+		t.Fatalf("hygiene mode = %q, want auto (the fixture must actually declare auto)", got.Mode)
+	}
+	if got := resolvedFor(t, rm, ActionGroomScoping); got.Mode != ModeReport {
+		t.Fatalf("scoping mode = %q, want report", got.Mode)
+	}
+	derived := DerivedOperatorAgent(rm)
+	if derived == nil {
+		t.Fatal("DerivedOperatorAgent = nil, want a block (the workflow declares actions)")
+	}
+	if got := delegatedKnobs(derived); len(got) != 0 {
+		t.Errorf("delegated knobs = %v, want NONE — no grooming class may reach a may_* knob at any mode", got)
+	}
+}
+
+// TestClampResolvedMatrix_LowCeilingClampsGroomingHygiene is AC3: a fired
+// escalation's `max_autonomy: low` CEILING downgrades hygiene from auto to
+// gated (low's expansion does not name it — the documented extension-class
+// fail-closed arm), while a report-mode class is left alone because it
+// delegates nothing to begin with.
+//
+// COUNTERFACTUAL: delete `out.Actions[i].Mode = ModeGated` in
+// ClampResolvedMatrix and this test goes RED.
+func TestClampResolvedMatrix_LowCeilingClampsGroomingHygiene(t *testing.T) {
+	s := mustParse(t, v2Doc(`    actions:
+      hygiene:
+        mode: auto
+        when: objective_reversible
+      scoping:
+        mode: report
+`))
+	wf := s.Workflows["feature_change"]
+	clamped := ClampResolvedMatrix(ResolveAutonomy(&wf, nil), TierLow)
+
+	hygiene := resolvedFor(t, clamped, ActionGroomHygiene)
+	if hygiene.Mode != ModeGated {
+		t.Errorf("hygiene mode = %q after a low ceiling, want gated", hygiene.Mode)
+	}
+	if hygiene.Condition != "" {
+		t.Errorf("hygiene condition = %q after the clamp, want it CLEARED", hygiene.Condition)
+	}
+	if hygiene.Source != SourceEscalation {
+		t.Errorf("hygiene source = %q, want escalation — the clamp must record its own provenance", hygiene.Source)
+	}
+
+	scoping := resolvedFor(t, clamped, ActionGroomScoping)
+	if scoping.Mode != ModeReport {
+		t.Errorf("scoping mode = %q after the clamp, want report UNCHANGED — report delegates nothing, so the ceiling has nothing to close", scoping.Mode)
+	}
+	if scoping.Source == SourceEscalation {
+		t.Error("scoping source = escalation, want it untouched by the clamp")
+	}
+}
