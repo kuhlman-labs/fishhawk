@@ -122,3 +122,80 @@ The report body and the dedup-hit occurrence comment render the diagnostic bundl
 - **Schema-optional, feature-mandatory.** The block is absent from the schema's top-level `required` array purely because a new required field in an existing major is a breaking change. It is not a fail-open: `backlog_grooming` fails closed when no charter resolves, and that enforcement lives in #2234/#2236, not here.
 - **Why no path-shape semantic check lives here.** `validateSemantics` adds **no** rule for `charter`; structural validation is the whole declaration-time contract. Rejecting absolute / `..`-bearing / backslash paths at parse time would give an earlier error, but `repodoc.validatePath` already enforces exactly that rule fail-closed at the single point where the declared path is used to fetch anything. A second copy here would be a second owner of one invariant, free to drift from the enforcing one. `TestParseCharterNoSemanticPathRule` records this side of the decision as behaviour — a traversal-, absolute-, or backslash-bearing declaration parses here without error — while `repodoc`'s own `validatePath` table pins the refusal at resolve time. This is a design choice, not something the issue mandates — if a future change wants declaration-time rejection, delete that test deliberately rather than around it.
 - **Consumers (both now shipped):** `backend/internal/server/charter_injection.go` (E54.2 / #2234) reads `Charter.Path` at PROMPT-SERVE time — it is the `Config.DocumentDeclarations` implementation that declares the charter for a backlog-grooming propose stage, resolving it through `repodoc` at a pinned commit and refusing the prompt when the block is absent (`charter_absent`), its path is empty (`charter_path_empty`) or the conventions cannot be read (`conventions_unavailable`); `backend/internal/server/charter_gate.go` (E54.4 / #2236) is the RUN-ADMISSION half, refusing a grooming run 422 before any run row exists using the same three reasons. Both reach this package through the process-wide `conventionsLoader` seam, and neither adds a second path-shape rule. See `backend/internal/repodoc/README.md`, whose declaration-site table already names `charter.path` in `.fishhawk/work-management.yaml`, and the content contract in `docs/spec/work-management-v0.md` ("Charter"), worked against this repo's own `.fishhawk/charter.md`.
+
+## Grooming churn guard (E54.8 / #2240)
+
+`grooming_churn.go` is the run-over-run filter that turns a schema-valid `plan.GroomingReport` into the **proposal set** an operator actually sees. It is the mitigation ADR-065 names for its own sharpest adoption risk: a scoring agent re-run over a large backlog perturbs the ranking every time, and a report full of trivia teaches the operator to approve without reading — at which point the grooming gate is decorative and every other control in E54 rests on it.
+
+**It runs in production.** `Server.handleGroomingReport` (`backend/internal/server/grooming_report.go`) invokes `FilterGroomingChurn` on every ingested grooming report and writes the verdict to the audit chain as one `grooming_churn_filtered` entry, carrying the proposed / suppressed / resurfaced counts and ids, the resolved thresholds, the `charter_changed` flag, and the `no_changes_proposed` flag that IS #2240 AC1's visible "no changes proposed" outcome. An operator arms `fishhawk_await_audit` on that one category to learn what a run actually proposes, as distinct from what the agent emitted.
+
+### The moving parts
+
+| Symbol | Role |
+|---|---|
+| `Conventions.ResolveGroomingThresholds` | resolves the operator-declared bar (`conventions.go`), substituting the shipped defaults for absent fields and CLAMPING a sub-floor declared value to the default while naming it in `Clamped` |
+| `NewGroomingBaseline` | pure constructor of the three-state baseline from the prior report + the operator's decisions + the apply result |
+| `groomingEntryBasis` (per class) | the structural fingerprint, prose deliberately excluded |
+| `FilterGroomingChurn` | the guard itself: pure, no I/O, no clock, no provider |
+| `Server.groomingChurnBaseline` | the production baseline assembly, built only from query surfaces that already exist |
+
+The decision order, the three-state baseline, the per-class fingerprint table and the charter-change lift are documented normatively in `docs/spec/work-management-v0.md` § "Grooming churn thresholds". Two rules are worth repeating next to the code:
+
+- **The hygiene significance bar runs FIRST**, ahead of the baseline lookup, so it governs a NEW finding as well as a repeat one (#2240 approval condition J2). An operator who declares a defect class insignificant expects not to see it, not to see it once.
+- **Absence from the baseline is the third state.** This guard suppresses, so every ambiguity resolves toward proposing: a failed apply, a containment skip, an unrecognized class, an unrecognized disposition and an unreadable prior report all leave the entry proposed, with the anomaly named in the summary.
+- **Both baseline-integrity checks run ahead of EVERY suppression path.** The unrecognized-class and unrecognized-disposition checks sit together, before the basis comparison and before the ordering thresholds — not inside the disposition switch that names the final suppression. The ordering branch returns `below_ordering_threshold` without ever reading the disposition, so validating it only at the end suppressed a degraded record whenever its rank and score movement happened to be sub-threshold (#2240 fix-up).
+
+### Production baseline assembly, and its stated gap
+
+`Server.groomingChurnBaseline` walks `ListRuns(repo, workflow, account)` → `ListStagesForRun` → `artifact.ListForStage` to find the most recent prior run's grooming report, then reads that run's `grooming_mutation_applied` audit rows for the dispositions. That one category carries both halves: an `applied` outcome (or a skip whose reason is `already_applied`) is an APPLIED disposition; a skip whose reason is `not_approved` or `amended` is a REJECTED one. No new DB query, sqlc regeneration, or repository-interface widening rides along.
+
+**A repo string is not an identity, so candidate selection is tenant-scoped twice (#2240 fix-up).** ADR-057 hangs a nullable `account_id` off every root entity and installations route to different `forge_base_url`s (GHES and github.com), so two tenants can legitimately own runs whose `Repo` is the same `owner/name`. Adopting one as another's baseline would both corrupt the verdict and copy that tenant's entry ids into this run's audit payload. The `ListRuns` filter therefore carries `AccountID`, AND every candidate is re-checked against the current run's account **and** installation before it can become a baseline — the second check is not redundant, because the query's account predicate deliberately keeps `account_id IS NULL` rows visible (right for a listing surface, wrong for a suppression control), and an untenanted current run constrains the query not at all. Tenant equality is exact, an unset installation included: an over-strict mismatch costs a baseline and therefore proposes, which is the fail-safe direction.
+
+**Recency is enforced here, not inherited.** The candidate set is sorted `created_at DESC, id DESC` in the function rather than trusting query order. The production `ListRuns` does declare that ORDER BY — but a suppression control that silently diffs against the OLDEST baseline if the clause ever changes fails in the unsafe direction (suppressing against stale dispositions), and nothing else binds this function to that clause.
+
+**A candidate must be a PREDECESSOR, not merely a different run (#2240 fix-up).** Excluding the current run's own id is a weaker rule than the "prior run" boundary this function claims and AC4 means. Grooming runs on one repo can overlap, and `ListRuns` returns every same-tenant run on the repo regardless of when it was created — so a run created AFTER this one, including a grooming run that started later and settled first, sorts newest-first and would let FUTURE dispositions suppress findings in an EARLIER run. Candidates are therefore restricted to runs strictly preceding the current one in the SAME `(created_at, id)` total order the sort declares, which is also what excludes the current run itself. Strictness is the fail-safe direction: an unset current `created_at` admits no candidate and so proposes.
+
+**A newer run that SETTLED NOTHING does not shadow an older one that did (#2240 fix-up).** A grooming run whose report was never decided — or whose applies all failed — contributes no disposition, so its baseline is entry-less, and diffing against it re-proposes the whole unchanged backlog: the convergence break AC1/AC4 exist to prevent, triggered by an intermediate run the operator never acted on. The scan therefore CONTINUES past a disposition-less candidate to the last SETTLED baseline, falling back to the newest report's entry-less baseline only when no candidate settled anything — where it is the correct answer, and carries that report's charter revision for the charter-drift signal.
+
+**A retrieval failure is not an absence (#2240 fix-up).** `priorGroomingReport` and `priorGroomingDispositions` report a found/error status rather than a bare nil, because the scan behaves differently for each: "this candidate shipped no report" is a reason to keep scanning older candidates, while "this candidate's report could not be read" is not. Collapsing them let a stage-list, artifact-list, decode or audit-query failure on the NEWEST candidate walk the scan past it and adopt an OLDER run's dispositions — a suppression decided by state the operator may since have superseded, which is the one direction this guard must never fail in. An unreadable input therefore abandons the scan and returns an EMPTY baseline named `baseline_prior_report_unreadable` or `baseline_dispositions_unreadable`. A grooming_report artifact that fails to parse next to a sibling that parses is still junk to skip; a stage whose ONLY grooming_report is undecodable is an unreadable baseline.
+
+**The scan window is workflow-scoped, and a full window is named (#2240 fix-up).** `groomingBaselineRunScanLimit` caps the walk at 50 runs, which is only safe if the window is dense in grooming runs — and repo+account is not, because implement, review and deploy runs share the repo string and can push the prior grooming run off the end of a busy repo's window. The `ListRuns` filter therefore carries `WorkflowID` (an equality predicate the production query already supports; empty means no constraint) so the window contains only runs of this grooming workflow. The residual is named rather than assumed away: when the returned page is FULL and the scan still resolved no settled baseline, the verdict carries a `baseline_scan_capped` degrade, so "first-ever grooming run" and "the baseline may lie beyond the window" — identical in effect, both proposing everything — are distinguishable in the audit record.
+
+**The gap, stated rather than implied: nothing in production calls `ApplyGrooming` yet.** #2237 shipped the apply layer with its seam deliberately unwired, so no `grooming_mutation_applied` row exists today and every baseline currently resolves empty — which correctly proposes everything, since nothing has in fact been applied or rejected. The wiring above reads the real category, so dispositions populate the instant an apply consumer lands, with no change to this package or to the handler.
+
+### Counterfactual table — which test goes RED when which control is deleted
+
+Every row below was run empirically (control deleted in the working tree, named test run, RED observed, file restored byte-identically), not reasoned about.
+
+| Control | Test that goes RED |
+|---|---|
+| ordering sub-threshold suppression | `TestSubThresholdMovementNotProposed` |
+| the hygiene significance bar, and its POSITION ahead of the baseline lookup | `TestHygieneOutsideSignificanceSetSuppressed` |
+| applied-state suppression; treating a FAILED apply as applied | `TestDiffIsAgainstAppliedNotProposedState` |
+| rejected-state suppression; basis-change resurfacing | `TestRejectedProposalDoesNotReappear` |
+| the charter-change lift, and its restriction to the charter-anchored classes | `TestCharterChangeLiftsCharterAnchoredSuppressionOnly` |
+| "an absent `charter_ref` is unknown, not moved" | `TestCharterChangeLiftsCharterAnchoredSuppressionOnly` |
+| the deterministic proposal sort | `TestTwoRunsOverUnchangedBacklogAreByteIdentical` |
+| the resolve-time clamp; the nil-report guard; the unknown-class and unknown-disposition fail-opens; the disposition check's POSITION ahead of the ordering-threshold branch | `TestFilterFailureModes` (rows F5, F6, F6b) |
+| the deterministic proposal + suppression sort, ACROSS two separate runs | `TestGroomingIngest_DistinctRunsProduceIdenticalVerdict` |
+| the baseline tenant discriminator (account + installation), and the query-level `AccountID` scoping | `TestGroomingIngest_BaselineIsTenantScoped` |
+| the explicit newest-first candidate sort | `TestGroomingIngest_MostRecentPriorRunWins` |
+| the strict-predecessor restriction, and its `(created_at, id)` tiebreak | `TestGroomingIngest_ANewerRunIsNotABaseline` |
+| continuing the scan past a disposition-less newer run to the last SETTLED baseline | `TestGroomingIngest_AnUnsettledRunDoesNotShadowASettledOne` |
+| the found/error status on both baseline inputs — an unreadable NEWER candidate must not fall back to an OLDER settled one | `TestGroomingIngest_AnUnreadableBaselineInputDoesNotFallBackToAnOlderRun` |
+| the WORKFLOW scoping of the scan window | `TestGroomingIngest_BusyRepoDoesNotPushTheBaselineOutOfTheWindow` |
+| the `baseline_scan_capped` degrade on a full window | `TestGroomingIngest_AFullScanWindowIsNamed` |
+| the unparseable-only-report error (as distinct from "no report") | `TestGroomingIngest_ChurnDegradeModes` |
+| the schema floors and both `additionalProperties: false` levels | `TestSchemaRejectsSubFloorThresholds` |
+| the guard INVOCATION on the ingest path; the baseline assembly; the current-run self-exclusion; the prior-report parse guard | `TestGroomingIngest_UnchangedBacklogProposesNothing` |
+| the churn-verdict fail-closed 500 | `TestGroomingIngest_ChurnAuditFailureIs500` |
+| the retry-path heal; the `ensureGovernanceAuditEntry` dedup; the heal write's OWN fail-closed 500 | `TestGroomingIngest_RetryHealsAGappedChurnVerdict`, `TestGroomingIngest_UnchangedBacklogProposesNothing` |
+| the per-repo conventions read; the baseline degrade fail-opens; the undecodable apply-record guard | `TestGroomingIngest_ThresholdsComeFromRepoConventions`, `TestGroomingIngest_ChurnDegradeModes` |
+
+### Stated residuals
+
+1. **No apply consumer**, per above: dispositions are structurally empty until one lands.
+2. **The decomposition fingerprint is the child COUNT**, not their titles, so a re-worded split of the same item into the same number of children does not resurface. This is the coarsest choice in the design and a deliberate trade against re-litigating wording every run; switching to normalized titles is a one-line change.
+3. **A rejected proposal whose only change is re-worded justification does not resurface.** That is the direct consequence of excluding prose, and excluding prose is what makes the guard work at all.
+4. **`GroomingProposalSet` is a projection, not a `grooming_report_v1` document.** That schema requires `ordering` with `minItems: 1`, and an EMPTY proposal set is precisely the outcome AC1 demands, so the empty case cannot be expressed as a valid report artifact. Making it one is a grooming-report-v1 change belonging to #2235.
+5. **The guard does not alter what is persisted.** The report artifact is stored as the agent emitted it; the guard's verdict is a separate audit record. Nothing here mutates a tracker or rewrites an artifact.

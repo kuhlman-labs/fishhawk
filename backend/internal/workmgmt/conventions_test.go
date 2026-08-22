@@ -974,3 +974,121 @@ func TestParseCharterNoSemanticPathRule(t *testing.T) {
 		})
 	}
 }
+
+// --- E54.8 / #2240: the grooming churn-guard threshold block ----------------
+
+const groomingBlockConfig = `
+grooming:
+  thresholds:
+    min_rank_movement: 4
+    min_score_delta: 0.2
+    significant_hygiene_defects:
+      - absent_done_means
+      - missing_estimate
+`
+
+// TestParseGroomingThresholds round-trips the full block into the typed
+// struct and through the resolver.
+func TestParseGroomingThresholds(t *testing.T) {
+	c, err := Parse(strings.NewReader(minimalConfig + groomingBlockConfig))
+	if err != nil {
+		t.Fatalf("Parse(grooming block) = %v, want nil", err)
+	}
+	if c.Grooming == nil || c.Grooming.Thresholds == nil {
+		t.Fatalf("Grooming = %+v, want a populated thresholds block", c.Grooming)
+	}
+	if got := c.Grooming.Thresholds.MinRankMovement; got == nil || *got != 4 {
+		t.Errorf("min_rank_movement = %v, want 4", got)
+	}
+	if got := c.Grooming.Thresholds.MinScoreDelta; got == nil || *got != 0.2 {
+		t.Errorf("min_score_delta = %v, want 0.2", got)
+	}
+	th := c.ResolveGroomingThresholds()
+	if th.MinRankMovement != 4 || th.MinScoreDelta != 0.2 {
+		t.Errorf("resolved = %+v, want the declared values", th)
+	}
+	if !th.IsSignificantHygieneDefect("absent_done_means") || th.IsSignificantHygieneDefect("unboarded") {
+		t.Errorf("significance set = %v, want exactly the two declared", th.SignificantHygieneDefects)
+	}
+	if len(th.Clamped) != 0 {
+		t.Errorf("clamped = %v, want none for in-range declared values", th.Clamped)
+	}
+}
+
+// TestParseWithoutGrooming is the no-behaviour-change pin: the block is
+// additive-optional, so a config omitting it parses as before and resolves the
+// conservative package defaults. The POINTER field is what keeps absent (nil)
+// distinguishable from present-but-empty.
+func TestParseWithoutGrooming(t *testing.T) {
+	c, err := Parse(strings.NewReader(minimalConfig))
+	if err != nil {
+		t.Fatalf("Parse(no grooming) = %v, want nil", err)
+	}
+	if c.Grooming != nil {
+		t.Errorf("Grooming = %+v, want nil for a config that declares no grooming block", c.Grooming)
+	}
+	th := c.ResolveGroomingThresholds()
+	if th.MinRankMovement != DefaultGroomingMinRankMovement || th.MinScoreDelta != DefaultGroomingMinScoreDelta {
+		t.Errorf("resolved = %+v, want the package defaults", th)
+	}
+}
+
+// TestSchemaRejectsSubFloorThresholds asserts the JSON Schema itself refuses a
+// value that would disable the guard, so the Go-side clamp in
+// ResolveGroomingThresholds is a SECOND line rather than the only one. It also
+// pins additionalProperties:false at both levels and the hygiene defect enum.
+func TestSchemaRejectsSubFloorThresholds(t *testing.T) {
+	cases := map[string]struct {
+		cfg      string
+		wantPath string
+	}{
+		"min_rank_movement 0 disables the bar": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    min_rank_movement: 0\n",
+			wantPath: "/grooming/thresholds/min_rank_movement",
+		},
+		"min_rank_movement negative": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    min_rank_movement: -3\n",
+			wantPath: "/grooming/thresholds/min_rank_movement",
+		},
+		"min_score_delta 0 disables the bar": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    min_score_delta: 0\n",
+			wantPath: "/grooming/thresholds/min_score_delta",
+		},
+		"min_score_delta negative": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    min_score_delta: -0.1\n",
+			wantPath: "/grooming/thresholds/min_score_delta",
+		},
+		"hygiene defect outside the grooming-report-v1 enum": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    significant_hygiene_defects: [not_a_defect]\n",
+			wantPath: "/grooming/thresholds/significant_hygiene_defects/0",
+		},
+		"empty significance set": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    significant_hygiene_defects: []\n",
+			wantPath: "/grooming/thresholds/significant_hygiene_defects",
+		},
+		"duplicate significance entries": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    significant_hygiene_defects: [unboarded, unboarded]\n",
+			wantPath: "/grooming/thresholds/significant_hygiene_defects",
+		},
+		"unknown key under grooming": {
+			cfg:      minimalConfig + "grooming:\n  extra: nope\n",
+			wantPath: "/grooming",
+		},
+		"unknown key under grooming.thresholds": {
+			cfg:      minimalConfig + "grooming:\n  thresholds:\n    extra: nope\n",
+			wantPath: "/grooming/thresholds",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse(strings.NewReader(tc.cfg))
+			var serr *SchemaError
+			if !errors.As(err, &serr) {
+				t.Fatalf("Parse = %v, want a *SchemaError", err)
+			}
+			if serr.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q", serr.Path, tc.wantPath)
+			}
+		})
+	}
+}

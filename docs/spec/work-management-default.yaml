@@ -79,6 +79,36 @@ transitions:
 charter:
   path: .fishhawk/charter.md
 
+# Churn guard for backlog-grooming proposals (E54.8 / #2240) — the mitigation
+# ADR-065 names for its own sharpest adoption risk: a scoring agent re-run over
+# a large backlog perturbs the ranking every time (item 14 and item 15 swap, a
+# score moves by 0.02), and a report full of trivia teaches the operator to
+# approve without reading. At that point the gate is decorative and every other
+# control in E54 rests on it.
+#
+# The two values below are DELIBERATELY conservative, chosen against #2240's
+# own churn examples so both are suppressed and anything larger is proposed:
+#
+#   min_rank_movement: 2   a one-position swap is noise; two positions or more
+#                          is a genuine re-ordering. 1 would disable the bar.
+#   min_score_delta: 0.05  a 0.02 move is rescoring jitter; 0.05 is a fifth of
+#                          a rubric band.
+#
+# They combine with OR: EITHER dimension crossing its bar surfaces the entry,
+# because over-proposing is the safe direction for a suppression control.
+#
+# significant_hygiene_defects is OMITTED on purpose, which means all six defect
+# classes stay significant. A repo that wants a class silenced lists only the
+# ones it cares about, e.g.:
+#
+#   grooming:
+#     thresholds:
+#       significant_hygiene_defects: [absent_done_means, missing_estimate]
+grooming:
+  thresholds:
+    min_rank_movement: 2
+    min_score_delta: 0.05
+
 # Per-repo kill-switch for upstream product-feedback egress (ADR-029,
 # #1006). Shipped in its enabled (egress-on) position. To hard-disable the
 # product-report endpoint for a repo, set the object's enabled to false:

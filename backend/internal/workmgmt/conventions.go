@@ -58,6 +58,7 @@ type Conventions struct {
 	States           map[string]string   `json:"states,omitempty"`
 	Transitions      map[string]string   `json:"transitions,omitempty"`
 	Charter          *Charter            `json:"charter,omitempty"`
+	Grooming         *Grooming           `json:"grooming,omitempty"`
 }
 
 // Charter declares where the repo's checked-in charter document lives
@@ -88,6 +89,138 @@ type Charter struct {
 	// enforces minLength 1, so a parsed Charter always carries a non-empty
 	// path.
 	Path string `json:"path"`
+}
+
+// Grooming declares the operator's controls on what a backlog-grooming run
+// PROPOSES (E54.8 / #2240) — the churn guard ADR-065 names as the mitigation
+// for its own sharpest adoption risk.
+//
+// POINTER for the same reason Charter is: absent (nil) must stay
+// distinguishable from present-but-empty, so a consumer can tell "no grooming
+// controls declared" (resolve the package defaults) from "declared, with
+// nothing set".
+type Grooming struct {
+	Thresholds *GroomingThresholdSpec `json:"thresholds,omitempty"`
+}
+
+// GroomingThresholdSpec is the DECLARED form of the significance bar: every
+// scalar is a POINTER so "declared" stays distinguishable from "zero". A
+// value-typed MinRankMovement could not tell an omitted field from a declared
+// 0, and 0 is precisely the value that would disable the guard.
+type GroomingThresholdSpec struct {
+	MinRankMovement           *int     `json:"min_rank_movement,omitempty"`
+	MinScoreDelta             *float64 `json:"min_score_delta,omitempty"`
+	SignificantHygieneDefects []string `json:"significant_hygiene_defects,omitempty"`
+}
+
+// The conservative shipped defaults, declared as named constants so
+// docs/spec/work-management-default.yaml and the Go fallback have ONE citable
+// source. TestShippedDefaultMatchesCodeDefaults asserts the two cannot drift.
+const (
+	// DefaultGroomingMinRankMovement suppresses a one-position swap — #2240's
+	// own first churn example — and proposes anything larger.
+	DefaultGroomingMinRankMovement = 2
+	// DefaultGroomingMinScoreDelta suppresses a 0.02 rescoring move — #2240's
+	// second churn example — and proposes anything larger.
+	DefaultGroomingMinScoreDelta = 0.05
+)
+
+// DefaultSignificantHygieneDefects is the default significance set: ALL six of
+// grooming-report-v1's hygiene defect classes. Absent declaration means every
+// class is significant, which is the conservative direction for a suppression
+// control — a repo silences a class by naming the ones it keeps.
+//
+// Returned as a fresh copy so a caller cannot mutate the package default.
+func DefaultSignificantHygieneDefects() []string {
+	return []string{
+		"absent_done_means",
+		"missing_estimate",
+		"missing_label_namespace",
+		"missing_parent_epic_link",
+		"unboarded",
+		"unlinked_parent_epic",
+	}
+}
+
+// GroomingThresholds is the fully RESOLVED significance bar — every field
+// populated, no pointers, safe to pass by value into the pure guard.
+//
+// Clamped names any declared field this resolve REPLACED with the package
+// default because the declared value would have disabled the guard. It is a
+// recorded outcome rather than a silent substitution: a control that can be
+// declared into a no-op is not a control, and an operator who tried needs to
+// see that the attempt did not take.
+type GroomingThresholds struct {
+	MinRankMovement           int      `json:"min_rank_movement"`
+	MinScoreDelta             float64  `json:"min_score_delta"`
+	SignificantHygieneDefects []string `json:"significant_hygiene_defects"`
+	Clamped                   []string `json:"clamped,omitempty"`
+}
+
+// IsSignificantHygieneDefect reports whether a hygiene defect class is one the
+// operator considers worth proposing. Resolution always populates the set, so
+// an empty set here can only come from a hand-built zero value; it is treated
+// as "nothing is significant" rather than silently meaning "everything", since
+// a resolved value is the only supported input.
+func (t GroomingThresholds) IsSignificantHygieneDefect(defect string) bool {
+	for _, d := range t.SignificantHygieneDefects {
+		if d == defect {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveGroomingThresholds returns the fully-resolved significance bar,
+// substituting the package defaults for every absent field.
+//
+// It resolves FAIL-CLOSED on a declared value that would disable the guard —
+// a non-positive rank movement, a non-positive score delta, an
+// empty-after-trim defect name, an all-blank defect set. Each such field is
+// clamped to its default and named in Clamped. The JSON Schema already rejects
+// these at parse time, so this is the SECOND line, for a Conventions value
+// constructed in Go rather than parsed from YAML (which every server-side
+// caller building a config in code does).
+func (c Conventions) ResolveGroomingThresholds() GroomingThresholds {
+	out := GroomingThresholds{
+		MinRankMovement:           DefaultGroomingMinRankMovement,
+		MinScoreDelta:             DefaultGroomingMinScoreDelta,
+		SignificantHygieneDefects: DefaultSignificantHygieneDefects(),
+	}
+	if c.Grooming == nil || c.Grooming.Thresholds == nil {
+		return out
+	}
+	spec := c.Grooming.Thresholds
+
+	if spec.MinRankMovement != nil {
+		if *spec.MinRankMovement >= 1 {
+			out.MinRankMovement = *spec.MinRankMovement
+		} else {
+			out.Clamped = append(out.Clamped, "min_rank_movement")
+		}
+	}
+	if spec.MinScoreDelta != nil {
+		if *spec.MinScoreDelta > 0 {
+			out.MinScoreDelta = *spec.MinScoreDelta
+		} else {
+			out.Clamped = append(out.Clamped, "min_score_delta")
+		}
+	}
+	if spec.SignificantHygieneDefects != nil {
+		declared := make([]string, 0, len(spec.SignificantHygieneDefects))
+		for _, d := range spec.SignificantHygieneDefects {
+			if trimmed := strings.TrimSpace(d); trimmed != "" {
+				declared = append(declared, trimmed)
+			}
+		}
+		if len(declared) > 0 {
+			sort.Strings(declared)
+			out.SignificantHygieneDefects = declared
+		} else {
+			out.Clamped = append(out.Clamped, "significant_hygiene_defects")
+		}
+	}
+	return out
 }
 
 // ProductFeedback configures the upstream product-feedback egress path
