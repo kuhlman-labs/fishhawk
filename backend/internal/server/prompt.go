@@ -1321,7 +1321,21 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	injected, err := s.resolveInjectedDocuments(r.Context(), runRow, stage)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
-			"resolve declared repo document failed", documentInjectionErrorDetails(err))
+			"resolve declared repo document failed", charterAwareInjectionErrorDetails(err))
+		return
+	}
+	// Charter fail-closed layer L2 (E54.2 / #2234). Runs AFTER resolution and
+	// BEFORE prompt.Build: a backlog-grooming propose stage must never serve a
+	// prompt that carries no document resolved from the declared charter path.
+	// It is deliberately independent of the declaration seam above — a
+	// deployment that never wired DocumentDeclarations is exactly the
+	// configuration in which L1 cannot run, and it is still refused here.
+	// Every non-grooming stage returns nil from the first line of the check,
+	// so this adds nothing to any other prompt. NOT wired on the
+	// /prompt-render preview, which injects no documents at all (#2804).
+	if err := s.assertCharterInjected(r.Context(), runRow, stage, injected); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+			"required charter document was not injected", charterAwareInjectionErrorDetails(err))
 		return
 	}
 	trigger.InjectedDocuments = injected

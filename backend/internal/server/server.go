@@ -131,6 +131,25 @@ type Config struct {
 	// under. Nil means the zero scope (adequate for a forge whose credentials
 	// are deployment-level, e.g. the GitLab static-token path).
 	DocumentScope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error)
+	// DocumentBaseRef resolves the ref a declared document is pinned
+	// AGAINST for this repo — the repo's base/trunk branch name or a commit
+	// SHA, NEVER the run's own branch (which the agent can write). It sits
+	// alongside the trio above as the fourth member of the same seam: the
+	// three wire the mechanism, this one supplies the security input the
+	// mechanism refuses to guess.
+	//
+	// The charter consumer (#2234) resolves the repository's DEFAULT BRANCH
+	// through forge.Forge.GetRepository here and lets repodoc pin it to a
+	// 40-hex commit before any fetch. A grooming run produces no diff and
+	// owns no branch, so its trunk IS its base; a consumer attaching to
+	// code-change runs (E55's review conventions) needs the per-run source
+	// backend/internal/repodoc/README.md names, not this adapter.
+	//
+	// NIL IS A REFUSAL, NOT A DEFAULT. A charter-requiring stage whose base
+	// ref cannot be resolved fails the prompt request: an empty ref is read
+	// by forge.FileFetcher as the repo's default branch — a mutable read —
+	// which is exactly what pinning exists to prevent.
+	DocumentBaseRef func(ctx context.Context, repo forge.RepoRef) (string, error)
 
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and

@@ -66,6 +66,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -866,6 +867,230 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 		return nil
 	}
 	return ff
+}
+
+// documentInjectionForgeIDs is the preference order the repo-document
+// injection seam selects a forge in: github first, gitlab as the single-forge
+// fallback. Config.DocumentResolver holds ONE Fetcher and ONE commit resolver,
+// so a mixed deployment reads every declared document through the SELECTED
+// forge. That selection alone does NOT make a non-selected-forge repo fail:
+// forge.RepoRef carries only owner/name, so a gitlab-hosted `acme/widgets`
+// whose owner/name ALSO names an accessible github repository would resolve,
+// and the prompt would carry THAT repository's charter — a cross-repository
+// provenance failure, not the refusal the mixed-forge guarantee claims.
+// documentForgeOwnershipGuard is what actually enforces it; see there.
+// Routing per repo is a change to the shared mechanism
+// (backend/internal/repodoc), not to this wiring.
+var documentInjectionForgeIDs = []string{"github", "gitlab"}
+
+// forgeGetter is the registry read the document-injection wiring performs.
+// Injected rather than called directly so serve_test.go can assert the
+// preference order without mutating the process-wide forge registry.
+type forgeGetter func(id string) (forge.Forge, error)
+
+// repositoryGetter is the narrow view of forge.Forge the base-ref adapter
+// needs.
+type repositoryGetter interface {
+	GetRepository(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (*forge.Repository, error)
+}
+
+// documentForge is one registered forge that can read files.
+type documentForge struct {
+	id      string
+	forge   forge.Forge
+	fetcher forge.FileFetcher
+}
+
+// fileCapableForges returns every registered forge that can read files, in
+// documentInjectionForgeIDs preference order. The LENGTH is load-bearing, not
+// just the head: a deployment with more than one file-capable forge is MIXED,
+// and an owner/name that resolves to no known provider is genuinely ambiguous
+// there (see documentForgeOwnershipGuard).
+func fileCapableForges(get forgeGetter) []documentForge {
+	if get == nil {
+		return nil
+	}
+	var out []documentForge
+	for _, id := range documentInjectionForgeIDs {
+		f, err := get(id)
+		if err != nil || f == nil {
+			continue
+		}
+		ff, ok := f.(forge.FileFetcher)
+		if !ok {
+			continue
+		}
+		out = append(out, documentForge{id: id, forge: f, fetcher: ff})
+	}
+	return out
+}
+
+// selectDocumentForge returns the first registered forge that can read files,
+// in documentInjectionForgeIDs order, or ("", nil, nil) when none can.
+func selectDocumentForge(get forgeGetter) (forge.Forge, forge.FileFetcher, string) {
+	candidates := fileCapableForges(get)
+	if len(candidates) == 0 {
+		return nil, nil, ""
+	}
+	return candidates[0].forge, candidates[0].fetcher, candidates[0].id
+}
+
+// documentForgeOwnershipGuard wraps the document credential-scope resolver so a
+// repo that does NOT live on the selected forge can never resolve through it.
+//
+// This is the cross-repository provenance control. The whole document read —
+// credential scope, default-branch lookup (documentBaseRefResolver calls this
+// same func) and the file fetch (resolveInjectedDocuments resolves the scope
+// before every repodoc.Resolve) — funnels through the scope resolver, so a
+// refusal here refuses all three with ZERO forge calls. Without it a gitlab
+// run whose owner/name also names an accessible github repository injects THAT
+// repository's charter: a wrong document served as if it were the repo's own,
+// which is worse than the refusal the mixed-forge guarantee promises.
+//
+// The provider discriminator is the same accounts.provider lookup the
+// conventions loader (E45.16 / #2022) and the repo-visibility cross-forge deny
+// (#2071) consult, and the posture is deliberately aligned with them:
+//
+//   - provider RESOLVED and it is not the selected forge → REFUSE. This is the
+//     collision case, and it is refused whether or not the deployment is mixed.
+//   - resolver ERROR → REFUSE. A transient DB fault must never silently select
+//     a different provider's repository.
+//   - AMBIGUOUS (no resolver wired, or found=false: owner unregistered, or
+//     registered under both providers) → refuse only on a MIXED deployment,
+//     where a second forge genuinely could own the repo. On a single-forge
+//     deployment there is no other forge to confuse it with and no accounts
+//     row is required to read a document, so this stays exactly the
+//     pre-guard posture rather than switching document injection off for every
+//     deployment without an accounts table.
+func documentForgeOwnershipGuard(
+	selectedID string,
+	mixed bool,
+	providers server.ProviderResolver,
+	inner func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error),
+) func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+	return func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+		if providers != nil {
+			provider, found, err := providers.ResolveProvider(ctx, repo.String())
+			if err != nil {
+				return forge.CredentialScope{}, fmt.Errorf("resolve the forge that owns %s before reading a declared "+
+					"document through %s: %w", repo, selectedID, err)
+			}
+			if found {
+				if provider != selectedID {
+					return forge.CredentialScope{}, fmt.Errorf("refusing to read a declared document for %s through "+
+						"the %s forge: that repository is registered on %s, and owner/name alone does not identify a "+
+						"repository across forges — reading it through %s could return a DIFFERENT repository's "+
+						"document", repo, selectedID, provider, selectedID)
+				}
+				return inner(ctx, repo)
+			}
+		}
+		if mixed {
+			return forge.CredentialScope{}, fmt.Errorf("refusing to read a declared document for %s through the %s "+
+				"forge: this deployment has more than one forge that can read files and no accounts row identifies "+
+				"which one owns %s, so owner/name could name a different repository on the other forge. Register the "+
+				"repository owner under its provider (accounts.provider) so the document read is attributable",
+				repo, selectedID, repo)
+		}
+		return inner(ctx, repo)
+	}
+}
+
+// documentBaseRefResolver adapts a forge into Config.DocumentBaseRef: the ref
+// a declared document is pinned AGAINST is the repo's DEFAULT BRANCH, which
+// repodoc then pins to a 40-hex commit before any fetch (repodoc.pinCommit
+// refuses anything else). It REFUSES an empty default branch rather than
+// returning it: forge.FileFetcher reads an empty ref as the repo's default
+// branch — the mutable read pinning exists to prevent.
+//
+// Why the default branch and not a per-run base: a backlog-grooming run
+// produces no diff and owns no branch, so there is no per-run base to resolve
+// and the trunk IS the base. E55's review-conventions consumer attaches to
+// code-change runs and still needs the per-run source
+// backend/internal/repodoc/README.md names.
+func documentBaseRefResolver(repos repositoryGetter,
+	scope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error),
+) func(ctx context.Context, repo forge.RepoRef) (string, error) {
+	return func(ctx context.Context, repo forge.RepoRef) (string, error) {
+		var cs forge.CredentialScope
+		if scope != nil {
+			var err error
+			cs, err = scope(ctx, repo)
+			if err != nil {
+				return "", fmt.Errorf("resolve credential scope for %s: %w", repo, err)
+			}
+		}
+		meta, err := repos.GetRepository(ctx, cs, repo)
+		if err != nil {
+			return "", fmt.Errorf("resolve default branch for %s: %w", repo, err)
+		}
+		if meta == nil || strings.TrimSpace(meta.DefaultBranch) == "" {
+			return "", fmt.Errorf("forge reported no default branch for %s: a declared document must be pinned "+
+				"against an explicit ref, and an empty ref is a mutable read", repo)
+		}
+		return meta.DefaultBranch, nil
+	}
+}
+
+// wireDocumentInjection installs the FOUR repo-document injection Config
+// members — resolver, credential scope, base ref, declarations — TOGETHER, or
+// leaves all four nil. It returns the selected forge id, or "" when injection
+// stays inert.
+//
+// ALL FOUR OR NONE is load-bearing, not tidiness:
+// Server.resolveInjectedDocuments treats a CONFIGURED DocumentDeclarations
+// with a nil DocumentResolver as a wiring defect and fails EVERY prompt
+// request, not just grooming ones. A no-forge deployment must therefore leave
+// the whole seam nil — which is safe because the charter's layer-2 check
+// (Server.assertCharterInjected) refuses a backlog-grooming prompt
+// independently of the seam.
+//
+// It is called BEFORE server.New because server.New COPIES its Config by
+// value: a post-New assignment to cfg would never reach the constructed
+// Server. The Server-dependent members are supplied as closures the caller
+// binds to the srv variable server.New assigns (approval condition H3).
+//
+// The installed DocumentScope is wrapped by documentForgeOwnershipGuard, so a
+// repository that does not live on the selected forge is REFUSED rather than
+// read through it — the mixed-deployment cross-repository failure owner/name
+// alone cannot exclude.
+func wireDocumentInjection(
+	cfg *server.Config,
+	get forgeGetter,
+	githubScope func(ctx context.Context, owner, name string) (forge.CredentialScope, error),
+	declarations func(ctx context.Context, runRow *runpkg.Run, stage *runpkg.Stage) ([]repodoc.Declaration, string, error),
+) string {
+	candidates := fileCapableForges(get)
+	if len(candidates) == 0 || declarations == nil {
+		return ""
+	}
+	f, ff, id := candidates[0].forge, candidates[0].fetcher, candidates[0].id
+	var scope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error)
+	if id == "github" {
+		if githubScope == nil {
+			return ""
+		}
+		scope = func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+			return githubScope(ctx, repo.Owner, repo.Name)
+		}
+	} else {
+		static := forge.FromRef(gitlabDeploymentScopeRef)
+		scope = func(context.Context, forge.RepoRef) (forge.CredentialScope, error) { return static, nil }
+	}
+	// Cross-forge ownership guard, applied BEFORE the scope is handed to
+	// either consumer so the base-ref lookup and the file fetch are both
+	// covered. cfg.RepoProviders is already wired above (it needs only the
+	// pool), which is why this reads it off cfg rather than taking a
+	// parameter.
+	scope = documentForgeOwnershipGuard(id, len(candidates) > 1, cfg.RepoProviders, scope)
+	// forge.Forge declares GetBranchSHA, so the selected forge satisfies
+	// repodoc's commit-resolver view directly — repodoc pins the default
+	// branch to a commit itself.
+	cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: f}
+	cfg.DocumentScope = scope
+	cfg.DocumentBaseRef = documentBaseRefResolver(f, scope)
+	cfg.DocumentDeclarations = declarations
+	return id
 }
 
 // buildRepoConventionsLoader assembles the per-repo work-management
@@ -2433,7 +2658,33 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
-	srv := server.New(cfg)
+	// Repo-authored document injection (#2242's seam; charter consumer E54.2 /
+	// #2234). Wired HERE, before server.New, because cfg is copied by value
+	// into the Server — a later assignment would never be seen. The two
+	// Server-dependent members ride as closures over the `srv` variable
+	// assigned on the next line; both are only ever called while serving a
+	// request, long after that assignment.
+	var srv *server.Server
+	if forgeID := wireDocumentInjection(&cfg, forge.Get,
+		func(ctx context.Context, owner, name string) (forge.CredentialScope, error) {
+			resolve := srv.GitHubRepoScopeResolver()
+			if resolve == nil {
+				return forge.CredentialScope{}, errors.New("github credential-scope resolution is unavailable (GitHub App auth unconfigured)")
+			}
+			return resolve(ctx, owner, name)
+		},
+		func(ctx context.Context, runRow *runpkg.Run, stage *runpkg.Stage) ([]repodoc.Declaration, string, error) {
+			return srv.CharterDocumentDeclarations(ctx, runRow, stage)
+		},
+	); forgeID != "" {
+		logger.Info("repo-document injection active (backlog-grooming charter consumer)",
+			slog.String("forge", forgeID), slog.String("ref", "#2234"))
+	} else {
+		logger.Info("repo-document injection inert (no registered forge can read files); a backlog-grooming prompt is refused rather than served unanchored",
+			slog.String("ref", "#2234"))
+	}
+
+	srv = server.New(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
 	// .fishhawk/work-management.yaml from the filing repo's OWN forge,
