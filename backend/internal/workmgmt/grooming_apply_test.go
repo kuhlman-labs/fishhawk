@@ -248,9 +248,24 @@ func (f *statefulGroomingForge) ApplyGroomingMutation(_ context.Context, req Gro
 	case GroomingKindLabelSet:
 		it.Labels = append(it.Labels, req.After.List...)
 	case GroomingKindEpicLink:
+		// ensureParentEpicMarker returns a body that ALREADY carries a marker
+		// UNCHANGED, and groomingLinkEpic reports that as a provider SKIP. The
+		// fake must do the same: appending a second marker line here would
+		// persist something production does not.
+		if bodyCarriesMarker(it.Body, "Parent epic:") {
+			return &GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present"}, nil
+		}
 		// Normalized to `#N`, as renderParentEpicMarker does.
 		it.Body += "\nParent epic: #" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
 	case GroomingKindDependsOnAdd:
+		// Same single-marker semantics: ensureDependsOnMarker returns a
+		// marker-bearing body unchanged and groomingAddDependsOn reports a
+		// provider SKIP. It does NOT merge a second ref into the existing
+		// line — the residual TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip
+		// pins.
+		if bodyCarriesMarker(it.Body, "Depends on:") {
+			return &GroomingMutationResult{Skipped: true, SkipReason: "depends_on marker already present"}, nil
+		}
 		it.Body += "\nDepends on: " + req.After.Scalar
 	case GroomingKindBoardPlace, GroomingKindIcebox:
 		it.OnBoard = true
@@ -264,6 +279,31 @@ func (f *statefulGroomingForge) ApplyGroomingMutation(_ context.Context, req Gro
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// bodyCarriesMarker mirrors the PROVIDERS' `(?im)^<marker>` regexes
+// (parentEpicMarkerRE / dependsOnMarkerRE) — case-insensitive, line-anchored —
+// deliberately as an INDEPENDENT implementation rather than by calling the
+// helper under test, so the fake's "already present" arm is not a tautology
+// over groomingBodyMarkerValues.
+func bodyCarriesMarker(body, marker string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// countMarkerLines counts the body lines opening with marker, case-insensitively.
+func countMarkerLines(body, marker string) int {
+	n := 0
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), strings.ToLower(marker)) {
+			n++
+		}
+	}
+	return n
+}
 
 func recordFor(t *testing.T, res *GroomingApplyResult, entryID string) GroomingMutationRecord {
 	t.Helper()
@@ -1259,6 +1299,185 @@ func TestApplyGrooming_MarkerRefShapeDoesNotDefeatIdempotence(t *testing.T) {
 		if rec := recordFor(t, res, id); rec.SkipReason != GroomingSkipAlreadyApplied {
 			t.Errorf("%s: skip reason = %q, want %q", id, rec.SkipReason, GroomingSkipAlreadyApplied)
 		}
+	}
+}
+
+// TestApplyGrooming_MarkerObservationMatchesTheProviderParse closes the other
+// half of the marker idempotence contract (#2237 fix-up): the read side must
+// observe a marker the PROVIDER would consider present, not a narrower subset
+// of one.
+//
+// The provider's regexes are `(?im)` (case-insensitive, line-anchored) and
+// `renderDependsOnMarker` emits a COMMA-SEPARATED ref list, so an item filed
+// with two dependencies carries `Depends on: #5, #6` on one line and a body
+// may legitimately carry a lower-case or a second marker line. A read that
+// looked only at the FIRST line, exact-case, comparing the WHOLE captured
+// value, observes a non-match for every one of those and re-dispatches a
+// relationship that is already recorded — the dispatch is then absorbed by the
+// provider's own skip, so AC7's zero-dispatch re-apply guarantee quietly
+// narrowed to single-ref, canonical-case bodies.
+//
+// The last two rows are the over-broadness control: a ref the marker does NOT
+// name still dispatches, so membership did not become "any marker satisfies
+// any proposal".
+func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
+	cases := []struct {
+		name         string
+		body         string
+		epicFix      string // non-empty selects the epic_link entry
+		depTo        int    // otherwise the depends_on edge target
+		wantDispatch bool
+	}{
+		{
+			name:  "depends_on/first ref of a comma-separated marker",
+			body:  "Summary\n\nDepends on: #5, #6",
+			depTo: 5,
+		},
+		{
+			name:  "depends_on/second ref of a comma-separated marker",
+			body:  "Summary\n\nDepends on: #5, #6",
+			depTo: 6,
+		},
+		{
+			name:  "depends_on/lower-case marker",
+			body:  "Summary\n\ndepends on: #5",
+			depTo: 5,
+		},
+		{
+			name:  "depends_on/ref named by a SECOND marker line",
+			body:  "Summary\n\nDepends on: #9\n\nDepends on: #5",
+			depTo: 5,
+		},
+		{
+			name:    "epic_link/upper-case marker, bare proposed ref",
+			body:    "Summary\n\nPARENT EPIC: #1437",
+			epicFix: "1437",
+		},
+		{
+			name:         "depends_on/ref absent from the marker still dispatches",
+			body:         "Summary\n\nDepends on: #5, #6",
+			depTo:        7,
+			wantDispatch: true,
+		},
+		{
+			name:         "epic_link/different parent still dispatches",
+			body:         "Summary\n\nParent epic: #1437",
+			epicFix:      "1438",
+			wantDispatch: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var report *plan.GroomingReport
+			var entryID string
+			if tc.epicFix != "" {
+				h := hygieneEntry(1, "unlinked_parent_epic", tc.epicFix)
+				report = &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{h}}
+				entryID = h.ID
+			} else {
+				d := dependencyEntry(1, tc.depTo)
+				report = &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{d}}
+				entryID = d.ID
+			}
+			mut := &fakeGroomingMutator{}
+			reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+				"#1": {Number: 1, State: "open", Body: tc.body},
+			}}
+			res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+				Target:    groomingTarget(),
+				Report:    report,
+				Decisions: approveAll(report),
+				Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+				States:    groomingStates(),
+			})
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			rec := recordFor(t, res, entryID)
+			if tc.wantDispatch {
+				// COMMITTED STATE, not error identity: the discriminating
+				// observation is whether the provider was asked to write.
+				if len(mut.calls) != 1 {
+					t.Fatalf("dispatched %d mutations, want ONE — the marker does not name this ref: %v", len(mut.calls), mut.kinds())
+				}
+				if rec.Outcome != GroomingOutcomeApplied {
+					t.Errorf("record = %+v, want applied", rec)
+				}
+				return
+			}
+			if len(mut.calls) != 0 {
+				t.Fatalf("dispatched %d mutations, want ZERO — the marker already records this ref: %v", len(mut.calls), mut.kinds())
+			}
+			// Tried and was refused BY THE DIFF, not did-not-try: the read
+			// happened and the idempotence arm settled it.
+			if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipAlreadyApplied {
+				t.Errorf("record outcome=%q reason=%q, want skipped/%s", rec.Outcome, rec.SkipReason, GroomingSkipAlreadyApplied)
+			}
+			if !rec.IdempotenceChecked {
+				t.Error("IdempotenceChecked = false, want the diff to have settled the candidate")
+			}
+			if len(reader.reads) != 1 {
+				t.Errorf("reader saw %+v, want one read", reader.reads)
+			}
+		})
+	}
+}
+
+// TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip states the
+// remaining depends_on residual as BEHAVIOUR rather than prose (#2237 fix-up).
+//
+// `ensureDependsOnMarker` writes a marker only when the body carries NONE — it
+// never merges a second ref into an existing line — so a second approved edge
+// out of the same item is settled by the PROVIDER's skip, not by the core's
+// idempotence diff, and it re-dispatches on every apply. That is defence in
+// depth working: no duplicate write ever reaches the tracker (the body still
+// carries exactly one marker line). The cost is a redundant round trip and an
+// audit row reading `depends_on marker already present` instead of
+// `already_applied`, which is why it is pinned here and stated in the README
+// residuals rather than left to be rediscovered.
+func TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip(t *testing.T) {
+	first := dependencyEntry(1, 5)
+	second := dependencyEntry(1, 6)
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{first, second}}
+	forge := &statefulGroomingForge{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", Body: "Summary"},
+	}}
+	req := GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	}
+
+	res, err := ApplyGrooming(context.Background(), forge, forge, &fakeGroomingSink{}, req)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if rec := recordFor(t, res, first.ID); rec.Outcome != GroomingOutcomeApplied {
+		t.Errorf("first edge = %+v, want applied", rec)
+	}
+	if rec := recordFor(t, res, second.ID); rec.Outcome != GroomingOutcomeSkipped ||
+		rec.SkipReason != "depends_on marker already present" {
+		t.Errorf("second edge outcome=%q reason=%q, want the PROVIDER skip", rec.Outcome, rec.SkipReason)
+	}
+
+	forge.calls = nil
+	res, err = ApplyGrooming(context.Background(), forge, forge, &fakeGroomingSink{}, req)
+	if err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	// The FIRST edge is now settled by the core diff — that is the membership
+	// observation working, and it must not regress to a provider skip.
+	if rec := recordFor(t, res, first.ID); rec.SkipReason != GroomingSkipAlreadyApplied {
+		t.Errorf("first edge re-apply reason = %q, want %q", rec.SkipReason, GroomingSkipAlreadyApplied)
+	}
+	if len(forge.calls) != 1 || forge.calls[0].EntryID != second.ID {
+		t.Fatalf("re-apply dispatched %+v, want exactly the SECOND edge (the stated residual)", forge.calls)
+	}
+	// The residual is bounded: no duplicate write landed.
+	if got := countMarkerLines(forge.items["#1"].Body, "Depends on:"); got != 1 {
+		t.Errorf("#1 carries %d depends-on marker lines, want exactly 1 — body: %q", got, forge.items["#1"].Body)
 	}
 }
 

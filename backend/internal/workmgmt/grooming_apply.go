@@ -798,9 +798,9 @@ func groomingObserved(kind GroomingMutationKind, item *WorkItemRecord) GroomingV
 	case GroomingKindBoardPlace, GroomingKindIcebox:
 		return GroomingValue{Scalar: item.BoardColumn}
 	case GroomingKindEpicLink:
-		return GroomingValue{Scalar: groomingBodyMarkerValue(item.Body, "Parent epic:")}
+		return groomingMarkerObserved(item.Body, "Parent epic:")
 	case GroomingKindDependsOnAdd:
-		return GroomingValue{Scalar: groomingBodyMarkerValue(item.Body, "Depends on:")}
+		return groomingMarkerObserved(item.Body, "Depends on:")
 	case GroomingKindCloseDuplicate, GroomingKindCloseNotPlanned:
 		if strings.EqualFold(item.State, "closed") {
 			return GroomingValue{Scalar: "closed"}
@@ -822,14 +822,30 @@ func groomingSatisfied(kind GroomingMutationKind, observed, after GroomingValue)
 	if after.Scalar == "" && len(after.List) == 0 {
 		return false
 	}
-	// The two BODY-MARKER kinds compare NORMALIZED issue references. A
-	// suggested fix may name the parent as `1437` while the marker the
-	// provider persists is always `#1437`; a raw string compare would miss the
-	// layer's OWN write and re-dispatch on the next apply — the same
+	// The two BODY-MARKER kinds ask a MEMBERSHIP question of NORMALIZED issue
+	// references: is the proposed ref already recorded by ANY marker line?
+	//
+	// Two reasons it is membership and not equality. A suggested fix may name
+	// the parent as `1437` while the marker the provider persists is always
+	// `#1437`, so the refs are compared normalized — a raw string compare
+	// would miss the layer's OWN write and re-dispatch on the next apply, the
 	// write-and-read-must-agree property the marker exists to give (#2237
-	// review).
+	// review). And a marker is not one ref: `renderDependsOnMarker` emits a
+	// COMMA-SEPARATED list (`Depends on: #5, #6`), so an item filed with two
+	// dependencies carries both on one line. Comparing the whole captured
+	// value against a single proposed ref would observe `#5, #6`, match
+	// neither `#5` nor `#6`, and re-dispatch both edges forever
+	// (#2237 fix-up). The value's own membership set is the authority;
+	// observed.Scalar is retained as the fallback so a marker whose value is
+	// not ref-shaped still compares as it did before.
 	if kind == GroomingKindEpicLink || kind == GroomingKindDependsOnAdd {
-		return groomingNormalizeRef(observed.Scalar) == groomingNormalizeRef(after.Scalar)
+		want := groomingNormalizeRef(after.Scalar)
+		for _, got := range observed.List {
+			if got == want {
+				return true
+			}
+		}
+		return groomingNormalizeRef(observed.Scalar) == want
 	}
 	return observed.Equal(after)
 }
@@ -851,19 +867,53 @@ func groomingNormalizeRef(s string) string {
 	return "#" + digits
 }
 
-// groomingBodyMarkerValue returns the value following the FIRST body line
-// beginning with marker (e.g. "Parent epic: #1437" -> "#1437"), or "" when no
-// such line exists. It is the read-side counterpart of the body-marker
-// convention the providers write, so an epic link or depends_on edge that is
-// already recorded is observable and never applied twice.
-func groomingBodyMarkerValue(body, marker string) string {
-	for _, line := range strings.Split(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, marker) {
-			return strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
+// groomingMarkerObserved projects a body onto the value a body-marker kind
+// diffs against. It is the read-side counterpart of the marker convention the
+// providers write, so an epic link or depends_on edge that is already recorded
+// is observable and never applied twice.
+//
+// It observes what the PROVIDER's own parse observes, which is broader than
+// one exact-case line (#2237 fix-up): `parentEpicMarkerRE` / `dependsOnMarkerRE`
+// are `(?im)` — case-insensitive and line-anchored — and a marker value is a
+// comma-separated ref LIST, so a narrower read here re-dispatches a
+// relationship the provider already recorded and then skips.
+//
+//   - Scalar is the FIRST marker line's raw value, unchanged, so a surfaced
+//     record's `Before` still reads as the body does.
+//   - List is EVERY normalized ref across EVERY marker line, and is what
+//     groomingSatisfied tests membership against.
+func groomingMarkerObserved(body, marker string) GroomingValue {
+	values := groomingBodyMarkerValues(body, marker)
+	if len(values) == 0 {
+		return GroomingValue{}
+	}
+	var refs []string
+	for _, v := range values {
+		for _, tok := range strings.Split(v, ",") {
+			if ref := groomingNormalizeRef(tok); ref != "" {
+				refs = append(refs, ref)
+			}
 		}
 	}
-	return ""
+	return GroomingValue{Scalar: values[0], List: refs}
+}
+
+// groomingBodyMarkerValues returns the value following EVERY body line
+// beginning with marker (e.g. "Parent epic: #1437" -> "#1437"), in body order,
+// or nil when the body carries none. The prefix is matched CASE-INSENSITIVELY,
+// mirroring the providers' `(?im)` marker regexes — a body whose marker reads
+// `depends on:` is one the provider will treat as present, so the read side
+// must see it too.
+func groomingBodyMarkerValues(body, marker string) []string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) < len(marker) || !strings.EqualFold(trimmed[:len(marker)], marker) {
+			continue
+		}
+		out = append(out, strings.TrimSpace(trimmed[len(marker):]))
+	}
+	return out
 }
 
 // groomingPlacementAllowed is the never-fight-the-human courtesy (AC6),
