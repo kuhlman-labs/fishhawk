@@ -441,3 +441,114 @@ workflows:
               # run carries a real authorship signal (an operator-vouched
               # commit). `agent` is an unconditional floor either way.
               not: [author, agent]
+
+  # ---------------------------------------------------------------------------
+  # backlog_grooming (ADR-065 / E54.4 #2236) — the dogfood declaration.
+  #
+  # OPERATOR-AUTHORED ON PURPOSE. `.fishhawk/**` is in the feature_change
+  # implement stage's forbidden_paths, so an agent cannot write this block. That
+  # is deliberate: this file is the document that constrains the agent, and an
+  # agent able to edit it could widen its own permissions inside the very change
+  # it is proposing — the same self-serving-edit hazard that makes repodoc
+  # resolve the charter from the BASE ref (#2242). #2236 shipped the grammar,
+  # the validation and the shipped example under test; this block is the
+  # human-led half of that handoff.
+  #
+  # MIRRORS docs/spec/examples/workflow-v2-backlog-grooming.yaml. That file is
+  # the shipped example and is read from disk by the TestShippedGrooming*
+  # family, so it — not this block — is what the test suite pins. Keep the two
+  # in step: a divergence here is invisible to those tests.
+  #
+  # NOTHING CAN AUTO-CLOSE AN ISSUE UNDER THIS DECLARATION, and that is
+  # structural rather than a default. `ordering`, `dedup` and `scoping` are
+  # registered as NON-DELEGABLE grooming classes carrying no condition, so
+  # `mode: auto` on any of them is refused at PARSE time by two independent
+  # controls. Widening one is not a config edit; it is a grammar change.
+  #
+  # THE CHARTER IS MANDATORY. Starting a run on this workflow in a repo whose
+  # work-management conventions declare no `charter:` block is refused 422
+  # before any run row exists, at BOTH run-creation seams (the HTTP handler and
+  # the campaign path). This repo has no `.fishhawk/work-management.yaml`, so it
+  # resolves the shipped default, which declares `.fishhawk/charter.md` — the
+  # charter that anchors every ranking this workflow proposes.
+  #
+  # NO RUN CAN SELECT THIS WORKFLOW YET, and that is a safety property rather
+  # than a gap. `applies_to: {trigger: [scheduled, on_demand]}` is the non-diff
+  # routing form, and every trigger source v0 mints normalizes to `diff`, so the
+  # groomer cannot be started by an ordinary issue run. The `release` workflow's
+  # applies_to comment above anticipates exactly this: it stays undeclared until
+  # ADR-065's groomer gives those forms a producer. This is that producer,
+  # declared ahead of the scheduler that will drive it.
+  # ---------------------------------------------------------------------------
+  backlog_grooming:
+    description: >-
+      Propose a backlog grooming report against the checked-in charter, gate it on a human approval, then apply the approved mutations. Produces no code diff at any stage.
+    auto_advance: true
+
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    # The five run-driving classes: nothing delegated.
+    autonomy: low
+
+    # The four backlog-grooming classes, disjoint from the tier above.
+    # hygiene is the only one that may act unattended, and only because its
+    # mutations are objective and reversible (labels, fields, boarding, epic
+    # links). The destructive three cannot be widened here — see the header.
+    actions:
+      hygiene:
+        mode: auto
+        when: objective_reversible
+      ordering:
+        mode: gated
+      dedup:
+        mode: gated
+      scoping:
+        mode: report
+
+    stages:
+      # PROPOSE — emits a grooming_report, not a plan. Every ordering entry must
+      # cite a charter rubric line by id or the artifact fails validation
+      # (#2235); that citation requirement is ADR-065's named mitigation for
+      # charter-specificity risk, and it is what keeps the gate below from
+      # degrading into rubber-stamping.
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              not: [author, agent]
+
+      # APPLY — tracker mutations, not source edits. No diff constraints and no
+      # pull_request artifact; v2 binds those to what a stage produces.
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: 30m
+        needs: [groom]
+
+      # GATE — a human confirms the applied result.
+      - id: confirm
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              not: [agent]
