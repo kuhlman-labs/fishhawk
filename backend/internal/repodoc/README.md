@@ -119,8 +119,38 @@ discover it late:
 
 So `Config.DocumentDeclarations` returns the base ref **as its second return
 value**: the mechanism takes it as a caller-supplied parameter rather than
-guessing. **#2234 must create the per-run source** before it can supply a real
-one. The concrete options, in preference order:
+guessing.
+
+### What #2234 actually did (the charter consumer)
+
+The charter consumer (`backend/internal/server/charter_injection.go`) took
+**neither** option below. It supplies the **repository's DEFAULT BRANCH**,
+resolved explicitly through `forge.Forge.GetRepository` by a
+`Config.DocumentBaseRef` adapter wired in `cmd/fishhawkd`, and lets `Resolve`
+pin it to a commit.
+
+State the guarantee as it is, not as "resolved from the run's base ref":
+
+- **Resolution pins to a specific commit BEFORE any fetch, never a mutable
+  ref.** `pinCommit` accepts only a full 40-hex commit id and refuses an empty
+  ref outright, so the two-step default-branch-then-pin path cannot degrade
+  into a mutable read.
+- **The resolved commit and content hash are recorded** (`document_injected`),
+  so a ranking is attributable to an exact document revision.
+- **That commit is the default-branch head AT PROMPT-SERVE TIME**, which for a
+  non-diff workflow is the defined base: a backlog-grooming run produces no
+  diff and owns no branch, so there is no per-run base to resolve and the trunk
+  IS the base.
+
+The honest consequence: **a document amendment landing between run creation and
+prompt serve changes which revision constrains that run.** For grooming that is
+wanted (the groomer should rank against the current charter), and the recorded
+commit + content hash make which revision applied decidable after the fact.
+
+**This shortcut is NOT reusable by E55's review-conventions consumer.** That
+consumer attaches to CODE-CHANGE runs whose base may differ from the default
+branch, so it still needs a per-run base-ref source. Both options below stay
+open for it, in preference order:
 
 1. **Persist the base ref on the run row** at run-create / dispatch time (a
    `base_branch` column plus a migration), which makes it available to every
@@ -134,8 +164,16 @@ one. The concrete options, in preference order:
 Whichever is chosen, the value handed to the seam MUST be the run's **base**
 branch or a commit SHA — never the run's own branch, which the agent can write.
 A pinned-SHA preference is verified here by fake seam
-(`TestResolve_ReadsFromPinnedBaseRef`, `TestGetStagePrompt_InjectedDocument_EndToEnd`);
-the provenance of that SHA is #2234's to establish.
+(`TestResolve_ReadsFromPinnedBaseRef`, `TestGetStagePrompt_InjectedDocument_EndToEnd`,
+and the charter consumer's `TestGroomingPrompt_PinnedCommitBeatsBranchTip`).
+
+### Preview divergence (#2804)
+
+`GET /v0/stages/{id}/prompt-render` — the unsigned preview surface — does not
+resolve or inject documents at all, and no consumer's fail-closed refusal runs
+there. So a preview and a served prompt for the same stage can differ in
+exactly the injected-document block and in whether the request is refused.
+Tracked as **#2804**; widening the preview is that issue's, not a consumer's.
 
 ## Content-hash byte domain
 

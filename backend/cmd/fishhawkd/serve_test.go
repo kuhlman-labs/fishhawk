@@ -43,6 +43,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -3393,6 +3394,212 @@ func TestServe_ReviewGroundingWiring(t *testing.T) {
 		}
 		if !strings.Contains(log, line) || !strings.Contains(log, `"env_passthrough":2`) {
 			t.Errorf("passthrough must resolve to env_passthrough=2 in the real handoff:\n%s", log)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Repo-document injection wiring (charter consumer, E54.2 / #2234)
+// ---------------------------------------------------------------------------
+
+// docWiringForge is a minimal forge.Forge that can also read files, resolve a
+// branch to a commit and report a default branch — the three capabilities the
+// document-injection wiring consumes. The rest of the (large) Forge surface is
+// embedded from a nil interface, the same trick forge's own registry tests
+// use: no other method is called.
+type docWiringForge struct {
+	forge.Forge
+	name          string
+	defaultBranch string
+	repoErr       error
+	gotScope      forge.CredentialScope
+	noFetch       bool
+}
+
+func (f *docWiringForge) Name() string { return f.name }
+
+func (f *docWiringForge) GetRepository(_ context.Context, scope forge.CredentialScope, _ forge.RepoRef) (*forge.Repository, error) {
+	f.gotScope = scope
+	if f.repoErr != nil {
+		return nil, f.repoErr
+	}
+	return &forge.Repository{DefaultBranch: f.defaultBranch}, nil
+}
+
+func (f *docWiringForge) FetchFile(context.Context, forge.CredentialScope, forge.RepoRef, string, string) (*forge.FileContent, error) {
+	return nil, forge.ErrNotFound
+}
+
+func (f *docWiringForge) GetBranchSHA(context.Context, forge.CredentialScope, forge.RepoRef, string) (string, bool, error) {
+	return "", false, nil
+}
+
+// fetchlessForge satisfies forge.Forge but NOT forge.FileFetcher, so it can
+// never be selected for document reads.
+type fetchlessForge struct {
+	forge.Forge
+	name string
+}
+
+func (f *fetchlessForge) Name() string { return f.name }
+
+// docGetter builds a forgeGetter over a fixed map, so the preference order is
+// asserted without mutating the process-wide forge registry.
+func docGetter(m map[string]forge.Forge) forgeGetter {
+	return func(id string) (forge.Forge, error) {
+		f, ok := m[id]
+		if !ok {
+			return nil, &forge.UnknownForgeError{ID: id}
+		}
+		return f, nil
+	}
+}
+
+func docDeclarationsStub(context.Context, *runpkg.Run, *runpkg.Stage) ([]repodoc.Declaration, string, error) {
+	return nil, "", nil
+}
+
+// TestSelectDocumentForge_PreferenceOrder pins github-then-gitlab-then-none,
+// and that a forge which cannot read files is never selected.
+func TestSelectDocumentForge_PreferenceOrder(t *testing.T) {
+	gh := &docWiringForge{name: "github", defaultBranch: "main"}
+	gl := &docWiringForge{name: "gitlab", defaultBranch: "trunk"}
+
+	for _, tc := range []struct {
+		name     string
+		registry map[string]forge.Forge
+		want     string
+	}{
+		{"both registered prefers github", map[string]forge.Forge{"github": gh, "gitlab": gl}, "github"},
+		{"gitlab only falls back", map[string]forge.Forge{"gitlab": gl}, "gitlab"},
+		{"github only", map[string]forge.Forge{"github": gh}, "github"},
+		{"neither registered", map[string]forge.Forge{}, ""},
+		{"registered but cannot read files", map[string]forge.Forge{"github": &fetchlessForge{name: "github"}}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, got := selectDocumentForge(docGetter(tc.registry))
+			if got != tc.want {
+				t.Errorf("selected forge = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, _, got := selectDocumentForge(nil); got != "" {
+		t.Errorf("selectDocumentForge(nil) = %q, want \"\"", got)
+	}
+}
+
+// TestWireDocumentInjection_AllFourOrNone is the invariant that keeps
+// resolveInjectedDocuments's misconfiguration branch (a configured declaration
+// seam with a nil resolver, which fails EVERY prompt request) unreachable in
+// production: the four Config members are installed together or not at all.
+func TestWireDocumentInjection_AllFourOrNone(t *testing.T) {
+	ghScope := func(context.Context, string, string) (forge.CredentialScope, error) {
+		return forge.FromRef("github:1"), nil
+	}
+
+	t.Run("forge registered wires all four", func(t *testing.T) {
+		var cfg server.Config
+		id := wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{
+			"github": &docWiringForge{name: "github", defaultBranch: "main"},
+		}), ghScope, docDeclarationsStub)
+		if id != "github" {
+			t.Fatalf("selected forge = %q, want github", id)
+		}
+		if cfg.DocumentResolver == nil || cfg.DocumentScope == nil || cfg.DocumentBaseRef == nil || cfg.DocumentDeclarations == nil {
+			t.Fatalf("wiring left a member nil: resolver=%v scope=%v baseRef=%v decls=%v",
+				cfg.DocumentResolver != nil, cfg.DocumentScope != nil, cfg.DocumentBaseRef != nil, cfg.DocumentDeclarations != nil)
+		}
+	})
+
+	t.Run("no forge leaves all four nil", func(t *testing.T) {
+		var cfg server.Config
+		if id := wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{}), ghScope, docDeclarationsStub); id != "" {
+			t.Fatalf("selected forge = %q, want \"\" (nothing registered)", id)
+		}
+		if cfg.DocumentDeclarations != nil && cfg.DocumentResolver == nil {
+			t.Fatal("DocumentDeclarations is wired while DocumentResolver is nil — every prompt request would fail")
+		}
+		if cfg.DocumentResolver != nil || cfg.DocumentScope != nil || cfg.DocumentBaseRef != nil || cfg.DocumentDeclarations != nil {
+			t.Fatal("a no-forge deployment must leave the whole document seam nil")
+		}
+	})
+
+	t.Run("github without a scope resolver wires nothing", func(t *testing.T) {
+		var cfg server.Config
+		if id := wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{
+			"github": &docWiringForge{name: "github", defaultBranch: "main"},
+		}), nil, docDeclarationsStub); id != "" {
+			t.Fatalf("selected forge = %q, want \"\"", id)
+		}
+		if cfg.DocumentDeclarations != nil || cfg.DocumentResolver != nil {
+			t.Fatal("a partial github wiring must install nothing")
+		}
+	})
+
+	t.Run("gitlab fallback uses the deployment credential scope", func(t *testing.T) {
+		var cfg server.Config
+		gl := &docWiringForge{name: "gitlab", defaultBranch: "trunk"}
+		if id := wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{"gitlab": gl}), nil, docDeclarationsStub); id != "gitlab" {
+			t.Fatalf("selected forge = %q, want gitlab", id)
+		}
+		scope, err := cfg.DocumentScope(context.Background(), forge.RepoRef{Owner: "g", Name: "p"})
+		if err != nil {
+			t.Fatalf("DocumentScope: %v", err)
+		}
+		if scope != forge.FromRef(gitlabDeploymentScopeRef) {
+			t.Errorf("gitlab document scope = %v, want the deployment scope %q", scope, gitlabDeploymentScopeRef)
+		}
+	})
+}
+
+// TestDocumentBaseRefResolver pins the base-ref adapter: it returns the
+// forge's DEFAULT BRANCH, surfaces a forge error, and REFUSES an empty default
+// branch rather than handing repodoc the empty ref (which a forge reads as the
+// default branch — a mutable read).
+func TestDocumentBaseRefResolver(t *testing.T) {
+	repo := forge.RepoRef{Owner: "o", Name: "r"}
+	scope := func(context.Context, forge.RepoRef) (forge.CredentialScope, error) {
+		return forge.FromRef("github:7"), nil
+	}
+
+	t.Run("returns the default branch", func(t *testing.T) {
+		f := &docWiringForge{name: "github", defaultBranch: "trunk"}
+		got, err := documentBaseRefResolver(f, scope)(context.Background(), repo)
+		if err != nil {
+			t.Fatalf("resolver err = %v", err)
+		}
+		if got != "trunk" {
+			t.Errorf("base ref = %q, want the forge's default branch %q", got, "trunk")
+		}
+		if f.gotScope != forge.FromRef("github:7") {
+			t.Errorf("forge called with scope %v, want the resolved credential scope", f.gotScope)
+		}
+	})
+
+	t.Run("refuses an empty default branch", func(t *testing.T) {
+		_, err := documentBaseRefResolver(&docWiringForge{name: "github"}, scope)(context.Background(), repo)
+		if err == nil {
+			t.Fatal("an empty default branch was accepted; it must be refused (an empty ref is a mutable read)")
+		}
+		if !strings.Contains(err.Error(), "no default branch") {
+			t.Errorf("err = %v, want a message naming the missing default branch", err)
+		}
+	})
+
+	t.Run("surfaces a forge error", func(t *testing.T) {
+		_, err := documentBaseRefResolver(&docWiringForge{name: "github", repoErr: errors.New("boom")}, scope)(context.Background(), repo)
+		if err == nil || !strings.Contains(err.Error(), "boom") {
+			t.Errorf("err = %v, want the forge error surfaced", err)
+		}
+	})
+
+	t.Run("surfaces a credential-scope error", func(t *testing.T) {
+		bad := func(context.Context, forge.RepoRef) (forge.CredentialScope, error) {
+			return forge.CredentialScope{}, errors.New("no installation")
+		}
+		_, err := documentBaseRefResolver(&docWiringForge{name: "github", defaultBranch: "main"}, bad)(context.Background(), repo)
+		if err == nil || !strings.Contains(err.Error(), "no installation") {
+			t.Errorf("err = %v, want the scope error surfaced", err)
 		}
 	})
 }

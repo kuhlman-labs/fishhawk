@@ -290,6 +290,80 @@ not expose.
 per-surface assertions in `runs_list_test.go`, `runs_get_test.go`,
 `campaigns_test.go` and `middleware_test.go`.
 
+## Charter injection consumer (`charter_injection.go`, E54.2 / #2234)
+
+The SECOND consumer of the repo-document injection mechanism `backend/internal/repodoc`
+shipped inert (E55.1 / #2242). It adds **no** resolution, fetch, hashing, capping,
+delimiter-neutralization or audit code of its own — all of that is repodoc's, reached
+through the untouched `resolveInjectedDocuments`. It supplies exactly three things:
+the **declaration site** (`charter.path` in `.fishhawk/work-management.yaml`, read
+through the process-wide `conventionsLoader` seam), the **framing** (what a charter is,
+plus the instruction to cite rubric lines BY ID — the uppercase `V*/R*/U*/S*` ids the
+charter's rubric tables carry, matching the citation contract #2235 validates), and the
+**fail-closed policy**.
+
+**Stage discriminator — STRUCTURAL.** `stageRequiresCharter` is true for a `plan`-typed
+(PROPOSE, ADR-067 §2) run stage whose resolved workflow satisfies the shipped
+`WorkflowRequiresCharter` predicate, i.e. declares the `grooming_report` artifact. Not
+the workflow's NAME (renaming would evade it) and not a `kind:` field.
+
+**Two fail-closed layers.**
+
+| Layer | Where | Refuses when |
+|---|---|---|
+| L1 `charterDeclarations` | `Config.DocumentDeclarations` | conventions unreadable (`conventions_unavailable`), no `charter:` block (`charter_absent`), empty `path:` (`charter_path_empty`), base ref unresolvable (`charter_base_ref_unresolved`) |
+| L2 `assertCharterInjected` | `handleGetStagePrompt`, after `resolveInjectedDocuments` | the injected set carries no document resolved from the declared charter path (`charter_not_injected`) |
+
+L2 is what makes the guarantee unbypassable by a deployment that simply leaves the seam
+unwired — the one configuration in which L1 cannot run. **L2 verifies charter IDENTITY,
+not "some document":** it re-resolves the declared path and requires an injected document
+AT THAT PATH, so a grooming prompt carrying an unrelated injected document and no charter
+is refused. Both layers surface as `document_injection_failed` (no new error code) with
+the machine-readable `reason` above; the actionable message reaches the operator through
+the log record, because a 5xx body's details are redacted to the default-deny allow-list
+above.
+
+**Base ref — what is actually guaranteed.** `Config.DocumentBaseRef` (wired in
+`cmd/fishhawkd` to `forge.Forge.GetRepository`) supplies the repo's **default branch**,
+which repodoc pins to a 40-hex commit before any fetch. So: resolution pins to a specific
+commit, never a mutable ref; the commit and content hash are recorded so a ranking is
+attributable to an exact charter revision; and the commit is the default-branch head AT
+SERVE TIME, which for a non-diff workflow is the defined base (a grooming run produces no
+diff and owns no branch). Consequence, stated rather than hidden: a charter amendment
+landing between run creation and prompt serve changes which revision constrains that run
+— acceptable for grooming, decidable after the fact from the audit hash, and **not
+reusable** by E55's review-conventions consumer, which still needs the per-run source
+`backend/internal/repodoc/README.md` names.
+
+**Non-grooming prompts are byte-identical.** The declarations func returns zero
+declarations for every other stage (and never touches the conventions loader), and
+`resolveInjectedDocuments` short-circuits on an empty set. The one place that could have
+leaked is a cached `WorkflowSpec` that cannot be re-parsed: the refusal is NARROWED to
+specs whose raw bytes carry the `grooming_report` token, because a document that never
+contains it cannot yield that artifact under any parse. A corrupt spec without the token
+falls OPEN exactly as `resolveImplementConstraints` and `resolveImplementRequiredOutcomes`
+do. Residual, stated: a corruption that also destroys the token falls open on what may
+have been a grooming run.
+
+**Preview divergence (#2804).** `handleGetStagePromptRender` injects no documents at all
+(a pre-existing #2242 divergence), so L2 is deliberately NOT wired there — asserting on a
+handler that never injects would refuse every grooming preview. A preview and a served
+prompt for the same stage therefore differ in exactly the security-relevant block.
+
+**Wiring.** `cmd/fishhawkd`'s `wireDocumentInjection` installs the four `Config` members
+(resolver, scope, base ref, declarations) TOGETHER or leaves all four nil, because
+`resolveInjectedDocuments` treats a configured declaration seam with a nil resolver as a
+wiring defect and fails EVERY prompt request. Forge selection is github-then-gitlab; a
+mixed deployment reads through github and a gitlab-hosted repo's charter fetch fails
+closed. `Server.CharterDocumentDeclarations` is the exported entry point the wiring needs
+because `server.New` copies its `Config` by value, so the seam must be installed before
+construction while the implementation needs the constructed Server.
+
+Tests: `charter_injection_test.go` (cross-boundary end-to-end plus one behavioural test
+per refusal branch, each asserting the reason IDENTITY so a deleted branch reddens rather
+than passing on a neighbouring control), `cmd/fishhawkd/serve_test.go` (forge preference,
+the all-four-or-none invariant, the base-ref adapter).
+
 ## Per-repo work-management conventions loader (`conventions_loader.go`, E45.16 / #2022)
 
 `RepoConventionsLoader.Load` is what serve.go installs as the process-wide `conventionsLoader`
