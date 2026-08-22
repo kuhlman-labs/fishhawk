@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -262,11 +263,22 @@ func (s *Server) failGroomingStage(r *http.Request, runID, stageID uuid.UUID, re
 // --- E54.8 / #2240: the churn guard, ON the real ingest path ----------------
 
 // groomingBaselineRunScanLimit bounds how far back the baseline search walks.
-// A grooming report is one per plan stage, so the prior grooming run is
-// normally the first or second hit; the cap is a runaway guard, not a tuning
-// knob. When the scan reaches the cap without finding a prior report the
-// baseline is EMPTY, which fails toward proposing — the safe direction for a
-// suppression control.
+//
+// The cap is a runaway guard, not a tuning knob — but a cap alone is only safe
+// if the window it bounds is dense in grooming runs (#2240 fix-up). Repo +
+// account is NOT such a window: implement, review and deploy runs share the
+// repo string, so a busy repo can push the prior grooming run past 50 rows and
+// the baseline would resolve empty with nothing said about it. The query is
+// therefore WORKFLOW-scoped as well (ListRunsFilter.WorkflowID, an equality
+// predicate the production query already supports — empty means no
+// constraint), so the window contains only runs of THIS grooming workflow and
+// the prior report really is the first or second hit.
+//
+// The residual is named rather than assumed away: when the returned page is
+// FULL and the scan still resolved no settled baseline, the verdict carries a
+// baseline_scan_capped degrade so an operator can tell "first-ever run" from
+// "the baseline may lie beyond the window". Either way the baseline is EMPTY,
+// which fails toward proposing — the safe direction for a suppression control.
 const groomingBaselineRunScanLimit = 50
 
 // recordGroomingChurn runs the churn guard over the just-ingested report and
@@ -432,11 +444,21 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (w
 	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
 		Repo:      current.Repo,
 		AccountID: current.AccountID,
-		Limit:     groomingBaselineRunScanLimit,
+		// Workflow-scoped so the scan window is dense in grooming runs rather
+		// than diluted by the implement/review/deploy runs that share the repo
+		// string — see groomingBaselineRunScanLimit. Empty is no constraint, so
+		// a run with no workflow id degrades to the old repo-only window.
+		WorkflowID: current.WorkflowID,
+		Limit:      groomingBaselineRunScanLimit,
 	})
 	if err != nil {
 		return empty, []string{"baseline_list_runs_failed"}
 	}
+	// The page came back FULL, so an older candidate may exist beyond it. Only
+	// meaningful on the paths that resolve NO settled baseline, where it
+	// distinguishes "first-ever grooming run" from "the baseline may be out of
+	// reach"; a settled baseline found inside the window makes it irrelevant.
+	capped := len(runs) >= groomingBaselineRunScanLimit
 
 	candidates := make([]*run.Run, 0, len(runs))
 	for _, rn := range runs {
@@ -458,11 +480,28 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (w
 	// nothing, used only if no older candidate settled anything either.
 	var unsettled *workmgmt.GroomingBaseline
 	for _, rn := range candidates {
-		prior := s.priorGroomingReport(ctx, rn.ID)
+		// A RETRIEVAL FAILURE IS NOT AN ABSENCE (#2240 fix-up). Both helpers
+		// below return a found/error status rather than a bare nil, because
+		// "this candidate shipped no report" and "this candidate's report
+		// could not be read" must not resolve the same way: treating the
+		// second as the first lets the scan walk PAST the newest candidate to
+		// an OLDER settled one, and diff the current report against
+		// dispositions the operator may since have superseded — a suppression
+		// decided by stale state, which is the one direction this guard must
+		// never fail in. So an unreadable input abandons the scan entirely and
+		// returns an EMPTY baseline with a named reason: everything is
+		// proposed, and the verdict says why.
+		prior, perr := s.priorGroomingReport(ctx, rn.ID)
+		if perr != nil {
+			return empty, []string{"baseline_prior_report_unreadable"}
+		}
 		if prior == nil {
 			continue
 		}
-		decisions, applied := s.priorGroomingDispositions(ctx, rn.ID)
+		decisions, applied, derr := s.priorGroomingDispositions(ctx, rn.ID)
+		if derr != nil {
+			return empty, []string{"baseline_dispositions_unreadable"}
+		}
 		candidate := workmgmt.NewGroomingBaseline(prior, decisions, applied)
 		if len(candidate.Entries) == 0 {
 			// Undecided, or every apply failed: this run decided nothing, so it
@@ -475,13 +514,18 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (w
 		}
 		return candidate, nil
 	}
+	var cappedDegrade []string
+	if capped {
+		cappedDegrade = []string{"baseline_scan_capped"}
+	}
 	if unsettled != nil {
-		return *unsettled, nil
+		return *unsettled, cappedDegrade
 	}
 	// No prior grooming run in this tenant on this repo: the first-ever run.
 	// Not a degrade — an empty baseline is the CORRECT answer, and everything
-	// is proposed.
-	return empty, nil
+	// is proposed. Unless the scan window was full, in which case the honest
+	// answer is "no baseline found WITHIN the window", named as such.
+	return empty, cappedDegrade
 }
 
 // groomingRunPrecedes reports whether a candidate run strictly precedes the
@@ -516,23 +560,38 @@ func sameGroomingTenant(candidate, current *run.Run) bool {
 	}
 }
 
-// priorGroomingReport returns the grooming report a prior run shipped, or nil.
-// A stage-listing failure, an artifact-listing failure, or a report that no
-// longer parses all yield nil: an unreadable prior report must not be treated
-// as an empty one that would suppress nothing OR as a populated one that would
-// suppress wrongly — it simply is not a baseline.
-func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) *plan.GroomingReport {
+// priorGroomingReport returns the grooming report a prior run shipped.
+//
+// It reports THREE outcomes, not two (#2240 fix-up), because the caller's
+// scan behaves differently for each and collapsing them is a suppression bug:
+//
+//   - (report, nil)  — found;
+//   - (nil, nil)     — this run genuinely shipped no grooming report (an
+//     implement-only run, say). The scan CONTINUES to older candidates,
+//     which is correct: this run never had a baseline to offer;
+//   - (nil, err)     — a retrieval or decode failure. The scan STOPS and the
+//     caller degrades to an empty baseline. Returning "absent" here would let
+//     the scan adopt an OLDER run's dispositions in place of the newest one's,
+//     suppressing against state the operator may have superseded.
+//
+// A stage-listing or artifact-listing failure is always an error. A report
+// that no longer PARSES is an error only if no sibling artifact on the stage
+// parsed: a grooming_report row that fails validation next to a good one is
+// junk to skip, whereas a stage whose only grooming_report is undecodable is a
+// baseline that exists and cannot be read.
+func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) (*plan.GroomingReport, error) {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list stages for run %s: %w", runID, err)
 	}
+	unparseable := 0
 	for _, st := range stages {
 		if st == nil || st.Type != run.StageTypePlan {
 			continue
 		}
 		arts, aerr := s.cfg.ArtifactRepo.ListForStage(ctx, st.ID)
 		if aerr != nil {
-			continue
+			return nil, fmt.Errorf("list artifacts for stage %s: %w", st.ID, aerr)
 		}
 		for _, a := range arts {
 			if a == nil || a.Kind != artifact.KindGroomingReport {
@@ -540,12 +599,16 @@ func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) *plan
 			}
 			report, perr := plan.ParseGroomingReport(a.Content)
 			if perr != nil {
+				unparseable++
 				continue
 			}
-			return report
+			return report, nil
 		}
 	}
-	return nil
+	if unparseable > 0 {
+		return nil, fmt.Errorf("run %s shipped %d grooming_report artifact(s), none parseable", runID, unparseable)
+	}
+	return nil, nil
 }
 
 // priorGroomingDispositions reads the prior run's grooming_mutation_applied
@@ -557,10 +620,16 @@ func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) *plan
 // marshalled bare as well as one nested under the run/stage envelope the other
 // grooming categories use. An undecodable row is skipped, which contributes no
 // disposition and therefore resurfaces its entry — the fail-safe direction.
-func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID) ([]workmgmt.GroomingDecision, *workmgmt.GroomingApplyResult) {
+//
+// A failure of the QUERY ITSELF is different in kind and is returned as an
+// error (#2240 fix-up): "this run recorded no dispositions" and "this run's
+// dispositions could not be read" are distinct states, and returning nil for
+// both let the caller treat the newest candidate as unsettled and walk on to
+// an OLDER run's dispositions — suppressing against superseded state.
+func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID) ([]workmgmt.GroomingDecision, *workmgmt.GroomingApplyResult, error) {
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, workmgmt.GroomingMutationAppliedCategory)
 	if err != nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("list %s entries for run %s: %w", workmgmt.GroomingMutationAppliedCategory, runID, err)
 	}
 	var decisions []workmgmt.GroomingDecision
 	applied := &workmgmt.GroomingApplyResult{}
@@ -596,5 +665,5 @@ func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID)
 			})
 		}
 	}
-	return decisions, applied
+	return decisions, applied, nil
 }

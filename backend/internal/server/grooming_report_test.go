@@ -563,17 +563,40 @@ type groomingRunRepo struct {
 	lastFilter run.ListRunsFilter
 }
 
-// ListRuns models the production query's REPO predicate only, deliberately.
-// The real ListRuns keeps rows whose account_id IS NULL regardless of the
-// AccountID filter (the untenanted-list contract, repository.go), so a fake
-// that filtered on account would hide exactly the leak the handler-side tenant
-// re-check exists to close.
+// ListRuns models the production query's REPO, WORKFLOW and LIMIT predicates,
+// and deliberately not the account one. The real ListRuns keeps rows whose
+// account_id IS NULL regardless of the AccountID filter (the untenanted-list
+// contract, repository.go), so a fake that filtered on account would hide
+// exactly the leak the handler-side tenant re-check exists to close.
+//
+// WorkflowID and Limit ARE modelled, because #2240's scan-window concern is
+// about them: the query's workflow_id equality (empty = no constraint)
+// followed by LIMIT, so a repo
+// whose history is dominated by non-grooming runs pushes the prior grooming
+// run out of an unscoped window.
+//
+// Truncation is applied in INSERTION order rather than after a newest-first
+// sort, even though production sorts before it. A fake that sorted would hand
+// groomingChurnBaseline an already-correct order and make that function's OWN
+// explicit newest-first sort untestable — the very control
+// TestGroomingIngest_MostRecentPriorRunWins exists to pin. Tests that care
+// about the window therefore choose insertion order explicitly.
 func (r *groomingRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	r.lastFilter = f
 	if r.listRunsErr != nil {
 		return nil, r.listRunsErr
 	}
-	return r.byRepo[f.Repo], nil
+	out := make([]*run.Run, 0, len(r.byRepo[f.Repo]))
+	for _, rn := range r.byRepo[f.Repo] {
+		if f.WorkflowID != "" && rn != nil && rn.WorkflowID != f.WorkflowID {
+			continue
+		}
+		out = append(out, rn)
+		if f.Limit > 0 && len(out) == f.Limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // churnFixture wires a server whose run belongs to a repo, with the plumbing
@@ -589,6 +612,11 @@ type churnFixture struct {
 }
 
 const churnRepo = "kuhlman-labs/example"
+
+// churnWorkflow is the grooming workflow every fixture run declares. The
+// baseline query is workflow-scoped (#2240 fix-up), so a candidate that does
+// not declare it is not in the scan window at all.
+const churnWorkflow = "backlog_grooming"
 
 // churnFixedTime keeps the fixture's generated_by.timestamp constant so two
 // marshals of the same report produce identical bytes — AC6's byte-identity is
@@ -615,7 +643,7 @@ func newChurnFixture(t *testing.T, runID, stageID uuid.UUID) *churnFixture {
 	au := newAuditFake()
 	base := newPromptRunRepo()
 	base.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
-	base.getRuns[runID] = &run.Run{ID: runID, Repo: churnRepo, WorkflowID: "backlog_grooming", CreatedAt: churnCurrentRunTime}
+	base.getRuns[runID] = &run.Run{ID: runID, Repo: churnRepo, WorkflowID: churnWorkflow, CreatedAt: churnCurrentRunTime}
 	base.stagesByRunID = map[uuid.UUID][]*run.Stage{}
 	rr := &groomingRunRepo{promptRunRepo: base, byRepo: map[string][]*run.Run{}}
 	s := New(Config{
@@ -645,7 +673,7 @@ func (f *churnFixture) seedPriorGroomingRun(t *testing.T, report *plan.GroomingR
 func (f *churnFixture) seedPriorGroomingRunAs(t *testing.T, tweak func(*run.Run), report *plan.GroomingReport, applied, rejected []string) uuid.UUID {
 	t.Helper()
 	priorRun, priorStage := uuid.New(), uuid.New()
-	pr := &run.Run{ID: priorRun, Repo: f.repo, WorkflowID: "backlog_grooming"}
+	pr := &run.Run{ID: priorRun, Repo: f.repo, WorkflowID: churnWorkflow}
 	if tweak != nil {
 		tweak(pr)
 	}
@@ -1513,7 +1541,7 @@ func TestGroomingIngest_ChurnDegradeModes(t *testing.T) {
 		runID, stageID := uuid.New(), uuid.New()
 		f := newChurnFixture(t, runID, stageID)
 		priorRun, priorStage := uuid.New(), uuid.New()
-		f.rr.getRuns[priorRun] = &run.Run{ID: priorRun, Repo: churnRepo}
+		f.rr.getRuns[priorRun] = &run.Run{ID: priorRun, Repo: churnRepo, WorkflowID: churnWorkflow}
 		f.rr.stagesByRunID[priorRun] = []*run.Stage{{ID: priorStage, RunID: priorRun, Type: run.StageTypePlan}}
 		f.rr.byRepo[churnRepo] = []*run.Run{f.rr.getRuns[priorRun]}
 		sv := plan.GroomingReportVersion
@@ -1530,6 +1558,11 @@ func TestGroomingIngest_ChurnDegradeModes(t *testing.T) {
 		if v.Summary.BaselineEntries != 0 || v.Summary.Proposed != 2 {
 			t.Errorf("baseline_entries=%d proposed=%v; an unreadable prior report must not become a suppressing baseline",
 				v.Summary.BaselineEntries, v.Summary.ProposedIDs)
+		}
+		// And it is NAMED: an unreadable input is a degrade, not the silent
+		// "no prior run" answer it is otherwise indistinguishable from.
+		if !churnDegradedHas(v.Degraded, "baseline_prior_report_unreadable") {
+			t.Errorf("degraded = %v, want baseline_prior_report_unreadable named", v.Degraded)
 		}
 	})
 
@@ -1668,13 +1701,233 @@ func TestGroomingIngest_RetryHealsAGappedChurnVerdict(t *testing.T) {
 		if !strings.Contains(gw.Body.String(), "heal grooming churn audit entry failed") {
 			t.Errorf("body = %s, want the heal-path churn failure", gw.Body.String())
 		}
-		// Attributable to the HEAL branch, not to the first-write one: both
-		// return 500, and only the message distinguishes which ran.
-		if msg := strings.Contains(gw.Body.String(), "heal grooming churn audit entry failed"); !msg {
-			t.Errorf("body = %s, want the heal-path churn failure", gw.Body.String())
-		}
 		if n := countChurnEntries(g.au); n != 0 {
 			t.Errorf("churn entries = %d, want 0 — the 500 must reflect a verdict that was NOT recorded", n)
+		}
+	})
+}
+
+// churnArtifactListFailFake fails ListForStage for ONE stage and delegates
+// everything else, so a single prior candidate becomes unreadable while the
+// current run's own ingest (GetByHash / Create) and every older candidate keep
+// working.
+type churnArtifactListFailFake struct {
+	*fakeArtifactRepo
+	failStage uuid.UUID
+}
+
+func (f *churnArtifactListFailFake) ListForStage(ctx context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	if stageID == f.failStage {
+		return nil, errors.New("artifact list boom")
+	}
+	return f.fakeArtifactRepo.ListForStage(ctx, stageID)
+}
+
+// churnAuditListFailFake fails the disposition query for ONE prior run and
+// delegates everything else — including AppendChained, so the verdict this
+// test reads still lands in the shared auditFake.
+type churnAuditListFailFake struct {
+	*auditFake
+	failRun uuid.UUID
+}
+
+func (f *churnAuditListFailFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == f.failRun && category == workmgmt.GroomingMutationAppliedCategory {
+		return nil, errors.New("audit list boom")
+	}
+	return f.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestGroomingIngest_AnUnreadableBaselineInputDoesNotFallBackToAnOlderRun is
+// the multi-candidate error path (#2240 fix-up). Every other degrade test has
+// exactly ONE candidate, where "failed to read" and "no baseline" are
+// indistinguishable in effect — both propose. With a SETTLED OLDER candidate
+// behind the failing one they diverge sharply: if a retrieval failure resolves
+// to "this run shipped nothing", the scan walks past it and adopts the older
+// run's dispositions, and the operator's since-superseded decisions suppress
+// the current report. That is a suppression decided by stale state, the one
+// direction this guard must never fail in.
+//
+// Both baseline inputs get the same treatment: the report retrieval and the
+// disposition query.
+func TestGroomingIngest_AnUnreadableBaselineInputDoesNotFallBackToAnOlderRun(t *testing.T) {
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// seedTwo installs the OLDER settled candidate (which would suppress the
+	// entire report if adopted) and a NEWER one, returning the newer run's id
+	// and its plan stage so the caller can break exactly one of its inputs.
+	seedTwo := func(t *testing.T, f *churnFixture) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(-48 * time.Hour)
+		}, report, ids, nil)
+		newer := f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+		}, report, ids, nil)
+		return newer, f.rr.stagesByRunID[newer][0].ID
+	}
+
+	// The positive control, asserted rather than assumed: with BOTH candidates
+	// readable this fixture suppresses everything. So the two subtests below
+	// cannot pass by proposing for some unrelated reason.
+	t.Run("control: both candidates readable suppresses everything", func(t *testing.T) {
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		seedTwo(t, f)
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if !v.Summary.NoChangesProposed || v.Summary.Proposed != 0 {
+			t.Fatalf("proposed=%v no_changes=%v; the control must suppress, or the failure subtests prove nothing",
+				v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
+		}
+	})
+
+	t.Run("an unreadable prior report stops the scan", func(t *testing.T) {
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		_, newerStage := seedTwo(t, f)
+		f.s.cfg.ArtifactRepo = &churnArtifactListFailFake{fakeArtifactRepo: f.ar, failStage: newerStage}
+
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201: an unreadable baseline input must not fail the ingest", code)
+		}
+		v := churnVerdict(t, f.au)
+		if !churnDegradedHas(v.Degraded, "baseline_prior_report_unreadable") {
+			t.Errorf("degraded = %v, want baseline_prior_report_unreadable named", v.Degraded)
+		}
+		if v.Summary.BaselineEntries != 0 || v.Summary.Proposed != len(ids) || v.Summary.NoChangesProposed {
+			t.Errorf("baseline_entries=%d proposed=%v no_changes=%v; an unreadable NEWER candidate must not resolve to the OLDER run's dispositions",
+				v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
+		}
+	})
+
+	t.Run("an unreadable disposition query stops the scan", func(t *testing.T) {
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		newerRun, _ := seedTwo(t, f)
+		f.s.cfg.AuditRepo = &churnAuditListFailFake{auditFake: f.au, failRun: newerRun}
+
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if !churnDegradedHas(v.Degraded, "baseline_dispositions_unreadable") {
+			t.Errorf("degraded = %v, want baseline_dispositions_unreadable named", v.Degraded)
+		}
+		if v.Summary.BaselineEntries != 0 || v.Summary.Proposed != len(ids) || v.Summary.NoChangesProposed {
+			t.Errorf("baseline_entries=%d proposed=%v no_changes=%v; a failed disposition query must not read as an unsettled run and fall back to an older baseline",
+				v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
+		}
+	})
+}
+
+// seedNonGroomingRuns fills the scan window with runs of ANOTHER workflow on
+// the SAME repo — the implement/review/deploy traffic a real repo is dominated
+// by. They are appended BEFORE the grooming candidate, so an unscoped window
+// truncates at the limit and never reaches it.
+func (f *churnFixture) seedNonGroomingRuns(n int) {
+	for i := 0; i < n; i++ {
+		id := uuid.New()
+		f.rr.byRepo[f.repo] = append(f.rr.byRepo[f.repo], &run.Run{
+			ID: id, Repo: f.repo, WorkflowID: "feature_change",
+			CreatedAt: churnCurrentRunTime.Add(-time.Duration(i+1) * time.Minute),
+		})
+	}
+}
+
+// TestGroomingIngest_BusyRepoDoesNotPushTheBaselineOutOfTheWindow pins the
+// scan-window scoping (#2240 fix-up). The window is capped as a runaway guard,
+// and a cap is only safe if what it bounds is dense in grooming runs — which
+// repo+account is NOT, because implement, review and deploy runs share the
+// repo string. Without the workflow predicate the prior grooming run falls off
+// the end of a busy repo's window and the whole unchanged backlog is
+// re-proposed: a silent loss of AC1/AC4 convergence.
+func TestGroomingIngest_BusyRepoDoesNotPushTheBaselineOutOfTheWindow(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	f := newChurnFixture(t, runID, stageID)
+
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// A full window's worth of non-grooming traffic, then the settled prior
+	// grooming run behind all of it.
+	f.seedNonGroomingRuns(groomingBaselineRunScanLimit)
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+	}, report, ids, nil)
+
+	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", code)
+	}
+	if got := f.rr.lastFilter.WorkflowID; got != churnWorkflow {
+		t.Errorf("ListRuns filter workflow_id = %q, want %q — the scan window must be workflow-scoped, not repo-only", got, churnWorkflow)
+	}
+	v := churnVerdict(t, f.au)
+	if v.Summary.BaselineEntries != len(ids) || !v.Summary.NoChangesProposed || v.Summary.Proposed != 0 {
+		t.Errorf("baseline_entries=%d proposed=%v no_changes=%v; %d intervening non-grooming runs pushed the prior grooming run out of the scan window",
+			v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed, groomingBaselineRunScanLimit)
+	}
+}
+
+// TestGroomingIngest_AFullScanWindowIsNamed pins the residual the workflow
+// scoping narrows but cannot remove: a repo with more grooming runs than the
+// cap can still hide its baseline behind the window. Resolving empty there is
+// the safe direction (everything proposed), but resolving empty SILENTLY is
+// not — it reads identically to "first-ever grooming run", and every other
+// input-resolution degrade in this function is named.
+func TestGroomingIngest_AFullScanWindowIsNamed(t *testing.T) {
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "")
+
+	t.Run("a full window without a baseline is named", func(t *testing.T) {
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		// Grooming-workflow runs that shipped no report: in the window, past
+		// the workflow predicate, and contributing no baseline — so the scan
+		// reaches the cap having resolved nothing.
+		for i := 0; i < groomingBaselineRunScanLimit; i++ {
+			f.rr.byRepo[churnRepo] = append(f.rr.byRepo[churnRepo], &run.Run{
+				ID: uuid.New(), Repo: churnRepo, WorkflowID: churnWorkflow,
+				CreatedAt: churnCurrentRunTime.Add(-time.Duration(i+1) * time.Minute),
+			})
+		}
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if !churnDegradedHas(v.Degraded, "baseline_scan_capped") {
+			t.Errorf("degraded = %v, want baseline_scan_capped named", v.Degraded)
+		}
+		if v.Summary.Proposed != 2 {
+			t.Errorf("proposed = %v, want everything: a capped scan resolves an empty baseline", v.Summary.ProposedIDs)
+		}
+	})
+
+	t.Run("a first-ever run is not called capped", func(t *testing.T) {
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if churnDegradedHas(v.Degraded, "baseline_scan_capped") {
+			t.Errorf("degraded = %v; an empty scan is the CORRECT first-run answer, not a capped window", v.Degraded)
 		}
 	})
 }
