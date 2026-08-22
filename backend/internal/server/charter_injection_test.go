@@ -185,6 +185,64 @@ workflows:
           schema: [unclosed
 `
 
+// chSyntaxBrokenTokenInline and chSyntaxBrokenTokenInProse are the RESIDUAL
+// fixtures for the non-decoding branch. groomingTokenInDataLines can only skip
+// a FULL-LINE comment — a line whose first non-blank byte is `#` is a comment
+// under any parse of that line. A token in a TRAILING comment, or in an
+// unrelated prose scalar, sits on a data line, so a corrupt NON-grooming spec
+// carrying it is still REFUSED. That is a documented non-grooming behaviour
+// change; it fails CLOSED (a refusal, never an unanchored serve) and reaches
+// only storage-corrupted specs, and these fixtures pin it as DELIBERATE so a
+// later edit to the fallback cannot silently widen or narrow it.
+const chSyntaxBrokenTokenInline = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan  # this stage no longer emits a grooming_report
+        produces:
+       - artifact: plan
+          schema: [unclosed
+`
+
+const chSyntaxBrokenTokenInProse = `version: "2"
+workflows:
+  feature_change:
+    description: "items ranked earlier in a grooming_report by hand"
+    stages:
+      - id: plan
+        type: plan
+        produces:
+       - artifact: plan
+          schema: [unclosed
+`
+
+// chSchemaInvalidReuseKeyOtherWorkflowGrooms is the RESIDUAL fixture for the
+// decoding branch's widening. yamlUsesSameDocumentReuse keys on the NAME of a
+// mapping key anywhere in the document, not on a resolvable inheritance edge,
+// so an unrelated `defaults` map (here a plain inputs default) widens the
+// search document-wide and ANOTHER workflow's grooming_report is then counted
+// against feature_change. Without the reuse key this exact document serves
+// unchanged (chSchemaInvalidOtherWorkflowGrooms / M8h). The widening is
+// deliberate — a real reuse edge can move a produces block into a workflow
+// from outside its subtree and a name-only check cannot tell the two apart —
+// and it fails CLOSED, so this fixture pins the over-approximation rather than
+// treating it as a defect.
+const chSchemaInvalidReuseKeyOtherWorkflowGrooms = `version: "2"
+workflows:
+  feature_change:
+    inputs:
+      defaults:
+        reviewer: someone
+    stages: "not-a-list"
+  backlog_grooming:
+    stages:
+      - id: groom
+        type: plan
+        produces:
+          - artifact: grooming_report
+`
+
 // chFetcher serves the charter keyed by ref. The SOFTENED text is seeded at
 // every mutable ref a broken implementation could reach — the default BRANCH
 // NAME, the empty ref, HEAD and the run's own branch — independently of the
@@ -934,6 +992,9 @@ func TestCharterFixtures_AreActuallyUnparseable(t *testing.T) {
 		{"syntax broken, token in a comment", chSyntaxBrokenTokenInComment, false},
 		{"syntax broken, token in data", chCorruptGroomingSpec, false},
 		{"syntax broken, no token", chCorruptPlainSpec, false},
+		{"syntax broken, token in a trailing comment", chSyntaxBrokenTokenInline, false},
+		{"syntax broken, token in an unrelated scalar", chSyntaxBrokenTokenInProse, false},
+		{"reuse key plus another workflow's artifact", chSchemaInvalidReuseKeyOtherWorkflowGrooms, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := spec.ParseBytes([]byte(tc.spec)); err == nil {
@@ -1000,6 +1061,12 @@ func TestSpecCouldBeGrooming_Attribution(t *testing.T) {
 		{"syntax-broken with the token in a comment", chSyntaxBrokenTokenInComment, "feature_change", false},
 		{"syntax-broken with the token in data", chCorruptGroomingSpec, "backlog_grooming", true},
 		{"syntax-broken with no token at all", chCorruptPlainSpec, "feature_change", false},
+		// The two documented RESIDUALS, pinned as deliberate. Both refuse a
+		// corrupt NON-grooming spec, so both are non-grooming behaviour
+		// changes; both fail CLOSED and reach only storage-corrupted specs.
+		{"syntax-broken residual: token in a trailing comment", chSyntaxBrokenTokenInline, "feature_change", true},
+		{"syntax-broken residual: token in an unrelated scalar", chSyntaxBrokenTokenInProse, "feature_change", true},
+		{"reuse-key residual: any defaults key widens past attribution", chSchemaInvalidReuseKeyOtherWorkflowGrooms, "feature_change", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := specCouldBeGrooming([]byte(tc.spec), tc.workflowID); got != tc.want {

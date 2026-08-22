@@ -362,6 +362,12 @@ spec; and a corruption that also destroys the token falls open on what may have 
 grooming run. Closing the second in general means refusing every plan prompt whose cached
 spec is corrupt — the repo-wide flip H4 rules out — and the cached bytes were validated at
 run-create, so a parse failure is storage corruption, not a normal or adversarial state.
+A third: `yamlUsesSameDocumentReuse` keys on the NAME of a `defaults` / `extends` mapping
+key ANYWHERE in the document rather than on a resolvable inheritance edge, so an unrelated
+`defaults` map widens the search document-wide and another workflow's `grooming_report` is
+then counted. All three refusals fail CLOSED and reach only storage-corrupted specs, and
+each is pinned as DELIBERATE by a row in `TestSpecCouldBeGrooming_Attribution` so a later
+edit to either branch cannot silently widen or narrow it.
 
 **Preview divergence (#2804).** `handleGetStagePromptRender` injects no documents at all
 (a pre-existing #2242 divergence), so L2 is deliberately NOT wired there — asserting on a
