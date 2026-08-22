@@ -572,6 +572,14 @@ func (f *boardSyncGHAPI) ListRepoIssues(_ context.Context, _ forge.CredentialSco
 	return nil, nil
 }
 
+// UpdateIssue satisfies the grooming-mutation capability's slice of the
+// workmgmt/github API interface (E54.5 / #2237). This fake exercises the
+// FILING and board-sync paths, which never edit an existing issue, so it is a
+// mechanical stub.
+func (f *boardSyncGHAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	return nil, nil
+}
+
 // TestBoardTransition_RealProviderNotApplicable_SuppressesAudit is the
 // CROSS-BOUNDARY test #2494 approval condition 3 requires: the
 // TransitionResult is produced by the REAL workmgmt/github provider — not a

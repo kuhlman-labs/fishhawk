@@ -790,6 +790,134 @@ func decodeLabelNames(raw []json.RawMessage) []string {
 	return names
 }
 
+// UpdateIssueParams is the field set an UpdateIssue call may write. Every
+// field is a POINTER and the marshalled body carries ONLY the non-nil ones —
+// an omitted key never reaches the wire.
+//
+// That is not a style choice, it is the safety property (E54.5 / #2237).
+// GitHub's PATCH replaces the `labels` array WHOLESALE rather than merging it,
+// so a value-typed `Labels []string` left at its zero value would serialize as
+// `"labels":null` (or `[]` with omitempty defeated by an intentional empty
+// set) and silently strip every label off an issue an unrelated body-only
+// update touched. With a pointer, "not set" and "set to empty" are DISTINCT
+// states and only the caller's explicit choice is transmitted.
+//
+// A caller that wants to ADD a label must therefore read the current set and
+// send the UNION; UpdateIssue does not merge, because merging would make
+// removing a label impossible.
+type UpdateIssueParams struct {
+	// Body replaces the issue body.
+	Body *string
+	// Labels REPLACES the issue's label set wholesale.
+	Labels *[]string
+	// State is "open" or "closed".
+	State *string
+	// StateReason is GitHub's issue `state_reason`: "completed",
+	// "not_planned", "duplicate" or "reopened".
+	StateReason *string
+}
+
+// fields renders the params as the request body map, carrying only the keys
+// the caller explicitly set. Returns an empty map when nothing was set, which
+// UpdateIssue refuses rather than sending a no-op PATCH.
+func (p UpdateIssueParams) fields() map[string]any {
+	out := map[string]any{}
+	if p.Body != nil {
+		out["body"] = *p.Body
+	}
+	if p.Labels != nil {
+		out["labels"] = *p.Labels
+	}
+	if p.State != nil {
+		out["state"] = *p.State
+	}
+	if p.StateReason != nil {
+		out["state_reason"] = *p.StateReason
+	}
+	return out
+}
+
+// UpdateIssue edits an existing issue's body, label set, state and/or
+// state_reason.
+//
+//	PATCH /repos/{owner}/{repo}/issues/{number}
+//
+// It is the write primitive the grooming apply layer's GitHub provider
+// dispatches label, epic-link, depends-on and close mutations through
+// (E54.5 / #2237). Only the fields the caller set on p are transmitted — see
+// UpdateIssueParams for why that is load-bearing.
+//
+// Requires the App to hold `issues:write`. Returns ErrNotFound when the issue
+// or repo isn't visible to the installation, ErrForbidden on auth issues, and
+// ErrValidation when GitHub rejects the payload (e.g. an unrecognized
+// state_reason). A params set with no field at all is refused locally rather
+// than sent, because a PATCH that writes nothing is a caller bug, not a no-op
+// worth a round trip.
+func (c *Client) UpdateIssue(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int, p UpdateIssueParams) (*Issue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	fields := p.fields()
+	if len(fields) == 0 {
+		return nil, errors.New("githubclient: update issue requires at least one field to write")
+	}
+
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal issue update: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)))
+
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: update issue: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("update issue", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		Number      int               `json:"number"`
+		Title       string            `json:"title"`
+		Body        string            `json:"body"`
+		State       string            `json:"state"`
+		StateReason string            `json:"state_reason"`
+		Labels      []json.RawMessage `json:"labels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode issue update: %w", err)
+	}
+	return &Issue{
+		Number:      body.Number,
+		Title:       body.Title,
+		Body:        body.Body,
+		State:       body.State,
+		StateReason: body.StateReason,
+		Labels:      decodeLabelNames(body.Labels),
+	}, nil
+}
+
 // GetBranchProtection fetches classic branch protection for a
 // branch.
 //

@@ -93,7 +93,35 @@ type fakeAPI struct {
 	// routing is assertable without the wire.
 	listRepoIssuesProjectsToken bool
 
+	// updateIssueCalls records every UpdateIssue call in order, so a grooming
+	// test asserts on COMMITTED STATE (what was actually written, and what was
+	// NOT written) rather than on a returned error — a containment check that
+	// fired and a mutation that silently did nothing return the same envelope.
+	updateIssueCalls  []fakeUpdateIssueCall
+	updateIssueResult *githubclient.Issue
+	updateIssueErr    error
+
 	projectsTokenConfigured bool
+}
+
+// fakeUpdateIssueCall is one recorded UpdateIssue dispatch: the issue number
+// and the params verbatim, so a test can assert BOTH what was set and — the
+// pointer-omission invariant — what was left nil.
+type fakeUpdateIssueCall struct {
+	number int
+	params githubclient.UpdateIssueParams
+}
+
+func (f *fakeAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	number int, p githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	f.updateIssueCalls = append(f.updateIssueCalls, fakeUpdateIssueCall{number: number, params: p})
+	if f.updateIssueErr != nil {
+		return nil, f.updateIssueErr
+	}
+	if f.updateIssueResult != nil {
+		return f.updateIssueResult, nil
+	}
+	return &githubclient.Issue{Number: number}, nil
 }
 
 func (f *fakeAPI) ListRepoIssues(ctx context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, opts githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error) {

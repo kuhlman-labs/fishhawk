@@ -1931,6 +1931,14 @@ func (f *fakeGithubAPI) ListRepoIssues(_ context.Context, _ forge.CredentialScop
 	return nil, nil
 }
 
+// UpdateIssue satisfies the grooming-mutation capability's slice of the
+// workmgmt/github API interface (E54.5 / #2237). This fake exercises the
+// FILING and board-sync paths, which never edit an existing issue, so it is a
+// mechanical stub.
+func (f *fakeGithubAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	return nil, nil
+}
+
 // TestFileWorkItem_DependsOn_EndToEnd is the binding-condition end-to-end
 // test: a SERIALIZED work-item filing request carrying relations.depends_on
 // flows request -> handleFileWorkItem/Apply -> the real github.Provider.File

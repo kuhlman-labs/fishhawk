@@ -460,3 +460,45 @@ const fileOnlyRegistryName = ProviderName + "_file_only_capability_test"
 type namedFileOnlyProvider struct{ *Provider }
 
 func (*namedFileOnlyProvider) Name() string { return fileOnlyRegistryName }
+
+// TestProvider_DoesNotImplementGroomingMutator is the executable proof that
+// the grooming-APPLY capability (E54.5 / #2237) was added as a SIXTH optional
+// capability interface and NOT folded into workmgmt.Provider. This File-only
+// provider does not satisfy it — and, decisively, this test would not COMPILE
+// had ApplyGroomingMutation been added to Provider, because New(&fakeAPI{})
+// would then fail to satisfy workmgmt.Provider on the very first line.
+//
+// It is the sibling of TestProvider_DoesNotImplementWorkItemReader above, and
+// it is the reason this package's fakeAPI did not have to grow a mutation
+// method: a widened Provider would have forced every registered fake in every
+// sibling package's tests to grow one.
+func TestProvider_DoesNotImplementGroomingMutator(t *testing.T) {
+	var p workmgmt.Provider = New(&fakeAPI{})
+	if _, ok := p.(workmgmt.GroomingMutator); ok {
+		t.Fatal("gitlab provider satisfies workmgmt.GroomingMutator; v0 is File-only — if a mutator was added deliberately, update the package doc and this test")
+	}
+}
+
+// TestMutatorFor_GitLabResolvesTypedUnavailable is the mutate-side sibling of
+// TestReaderFor_GitLabResolvesTypedUnavailable: resolving the grooming-apply
+// capability for a registered File-only provider yields a NIL mutator and a
+// typed *workmgmt.UnavailableError{Reason: ReasonNotImplemented} naming the
+// grooming capability — never a nil interface a caller could dispatch a
+// tracker write against.
+func TestMutatorFor_GitLabResolvesTypedUnavailable(t *testing.T) {
+	workmgmt.Register(&namedFileOnlyProvider{Provider: New(&fakeAPI{})})
+	m, err := workmgmt.MutatorFor(fileOnlyRegistryName)
+	if m != nil {
+		t.Errorf("mutator = %v, want nil alongside the unavailable error", m)
+	}
+	var ue *workmgmt.UnavailableError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if ue.Reason != workmgmt.ReasonNotImplemented {
+		t.Errorf("Reason = %q, want %q", ue.Reason, workmgmt.ReasonNotImplemented)
+	}
+	if ue.Capability != workmgmt.GroomingCapability {
+		t.Errorf("Capability = %q, want %q", ue.Capability, workmgmt.GroomingCapability)
+	}
+}
