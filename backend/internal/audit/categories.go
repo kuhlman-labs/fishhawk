@@ -82,7 +82,13 @@ import "sort"
 // E54.3 / #2235 added grooming_report_recorded, written once per ingested
 // grooming_report artifact on POST /v0/runs/{run_id}/plan (the plan-stage
 // discriminator's second additive sibling) carrying the artifact's content hash
-// and the per-class entry counts #2240's churn guard reads. When a new
+// and the per-class entry counts #2240's churn guard reads. E54.5 / #2237 added
+// the grooming APPLY pair — grooming_mutation_applied (one row per SETTLED
+// grooming mutation: applied, failed AND skipped alike, so one category filter
+// returns the whole apply) and grooming_apply_completed (the once-per-apply
+// summary) — declared as "…Category" constants in
+// backend/internal/workmgmt/grooming_apply.go, the shape the completeness AST
+// sweep collects. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -151,6 +157,8 @@ var KnownCategories = map[string]struct{}{
 	"escalation_fired":                        {},
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
+	"grooming_apply_completed":                {},
+	"grooming_mutation_applied":               {},
 	"grooming_report_recorded":                {},
 	"implement_review_backstop_elapsed":       {},
 	"implement_review_failed":                 {},

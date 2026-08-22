@@ -306,6 +306,48 @@ func TestKnownCategories_GroomingReportRecorded(t *testing.T) {
 // arm fishhawk_await_audit on their own refusal — and
 // categories_completeness_test.go's AST sweep would fail the build the
 // moment the emit site lands.
+// TestKnownCategories_GroomingMutationApplied pins E54.5 / #2237's per-mutation
+// apply category: workmgmt.ApplyGrooming records one entry per SETTLED
+// candidate — applied, failed AND skipped alike — so one category filter
+// returns the whole apply. An unregistered category is un-awaitable and
+// unfilterable via GET /v0/runs/{run_id}/audit?category=, and
+// categories_completeness_test.go's AST sweep fails the build on a category
+// backend code emits but the registry omits.
+func TestKnownCategories_GroomingMutationApplied(t *testing.T) {
+	if !IsKnownCategory("grooming_mutation_applied") {
+		t.Fatal("grooming_mutation_applied is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+	// SuggestCategories must reproduce it from a plausible near-miss.
+	var found bool
+	for _, c := range SuggestCategories("grooming_mutation_recorded", 5) {
+		if c == "grooming_mutation_applied" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface grooming_mutation_applied",
+			"grooming_mutation_recorded", SuggestCategories("grooming_mutation_recorded", 5))
+	}
+}
+
+// TestKnownCategories_GroomingApplyCompleted pins E54.5 / #2237's once-per-apply
+// summary category, carrying the applied/failed/skipped counts and entry ids.
+func TestKnownCategories_GroomingApplyCompleted(t *testing.T) {
+	if !IsKnownCategory("grooming_apply_completed") {
+		t.Fatal("grooming_apply_completed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+	var found bool
+	for _, c := range SuggestCategories("grooming_apply_complete", 5) {
+		if c == "grooming_apply_completed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface grooming_apply_completed",
+			"grooming_apply_complete", SuggestCategories("grooming_apply_complete", 5))
+	}
+}
+
 func TestKnownCategories_RunRejectedMissingCharter(t *testing.T) {
 	if !IsKnownCategory("run_rejected_missing_charter") {
 		t.Fatal("run_rejected_missing_charter is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")

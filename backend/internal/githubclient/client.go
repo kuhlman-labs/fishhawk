@@ -790,6 +790,211 @@ func decodeLabelNames(raw []json.RawMessage) []string {
 	return names
 }
 
+// UpdateIssueParams is the field set an UpdateIssue call may write. Every
+// field is a POINTER and the marshalled body carries ONLY the non-nil ones —
+// an omitted key never reaches the wire.
+//
+// That is not a style choice, it is the safety property (E54.5 / #2237).
+// GitHub's PATCH replaces the `labels` array WHOLESALE rather than merging it,
+// so a value-typed `Labels []string` left at its zero value would serialize as
+// `"labels":null` (or `[]` with omitempty defeated by an intentional empty
+// set) and silently strip every label off an issue an unrelated body-only
+// update touched. With a pointer, "not set" and "set to empty" are DISTINCT
+// states and only the caller's explicit choice is transmitted.
+//
+// A caller that wants to ADD a label must therefore read the current set and
+// send the UNION; UpdateIssue does not merge, because merging would make
+// removing a label impossible.
+type UpdateIssueParams struct {
+	// Body replaces the issue body.
+	Body *string
+	// Labels REPLACES the issue's label set wholesale.
+	Labels *[]string
+	// State is "open" or "closed".
+	State *string
+	// StateReason is GitHub's issue `state_reason`: "completed",
+	// "not_planned", "duplicate" or "reopened".
+	StateReason *string
+}
+
+// fields renders the params as the request body map, carrying only the keys
+// the caller explicitly set. Returns an empty map when nothing was set, which
+// UpdateIssue refuses rather than sending a no-op PATCH.
+func (p UpdateIssueParams) fields() map[string]any {
+	out := map[string]any{}
+	if p.Body != nil {
+		out["body"] = *p.Body
+	}
+	if p.Labels != nil {
+		out["labels"] = *p.Labels
+	}
+	if p.State != nil {
+		out["state"] = *p.State
+	}
+	if p.StateReason != nil {
+		out["state_reason"] = *p.StateReason
+	}
+	return out
+}
+
+// UpdateIssue edits an existing issue's body, label set, state and/or
+// state_reason.
+//
+//	PATCH /repos/{owner}/{repo}/issues/{number}
+//
+// It is the write primitive the grooming apply layer's GitHub provider
+// dispatches label, epic-link, depends-on and close mutations through
+// (E54.5 / #2237). Only the fields the caller set on p are transmitted — see
+// UpdateIssueParams for why that is load-bearing.
+//
+// Requires the App to hold `issues:write`. Returns ErrNotFound when the issue
+// or repo isn't visible to the installation, ErrForbidden on auth issues, and
+// ErrValidation when GitHub rejects the payload (e.g. an unrecognized
+// state_reason). A params set with no field at all is refused locally rather
+// than sent, because a PATCH that writes nothing is a caller bug, not a no-op
+// worth a round trip.
+func (c *Client) UpdateIssue(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int, p UpdateIssueParams) (*Issue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	fields := p.fields()
+	if len(fields) == 0 {
+		return nil, errors.New("githubclient: update issue requires at least one field to write")
+	}
+
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal issue update: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)))
+
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: update issue: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("update issue", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		Number      int               `json:"number"`
+		Title       string            `json:"title"`
+		Body        string            `json:"body"`
+		State       string            `json:"state"`
+		StateReason string            `json:"state_reason"`
+		Labels      []json.RawMessage `json:"labels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode issue update: %w", err)
+	}
+	return &Issue{
+		Number:      body.Number,
+		Title:       body.Title,
+		Body:        body.Body,
+		State:       body.State,
+		StateReason: body.StateReason,
+		Labels:      decodeLabelNames(body.Labels),
+	}, nil
+}
+
+// AddIssueLabels ADDS labels to an issue without touching the ones already on
+// it.
+//
+//	POST /repos/{owner}/{repo}/issues/{number}/labels
+//
+// This is the ADDITIVE counterpart to UpdateIssue's wholesale `labels`
+// replacement, and it exists because the replacement is a LOST-UPDATE
+// structure (E54.5 / #2237 review). An add-a-label caller built on PATCH must
+// read the current set and send the union; two such callers racing on one
+// issue each compute a union from the SAME pre-state, and the later PATCH
+// replaces the earlier one's label away. GitHub's dedicated labels endpoint
+// merges SERVER-SIDE, so there is no read-modify-write window to lose an
+// update in — the race is removed structurally rather than guarded against,
+// which is why a grooming label mutation dispatches through here and not
+// through UpdateIssue.
+//
+// Adding a label the issue already carries is a no-op on GitHub's side, so a
+// caller need not pre-filter for correctness (the grooming provider still
+// reads first, to report the pre-state and to skip a pointless round trip).
+//
+// Requires the App to hold `issues:write`. Returns the issue's resulting label
+// set. An empty labels slice is refused locally rather than sent: a POST that
+// adds nothing is a caller bug, not a no-op worth a round trip.
+func (c *Client) AddIssueLabels(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int, labels []string) ([]string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	if len(labels) == 0 {
+		return nil, errors.New("githubclient: add issue labels requires at least one label")
+	}
+
+	raw, err := json.Marshal(map[string]any{"labels": labels})
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal issue labels: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)) +
+		"/labels")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: add issue labels: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("add issue labels", resp); err != nil {
+		return nil, err
+	}
+
+	// The endpoint answers with the issue's FULL resulting label array, not
+	// just the added ones — decoded through the same decodeLabelNames helper
+	// GetIssue uses so the string/object label shapes cannot drift apart.
+	var body []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode issue labels: %w", err)
+	}
+	return decodeLabelNames(body), nil
+}
+
 // GetBranchProtection fetches classic branch protection for a
 // branch.
 //

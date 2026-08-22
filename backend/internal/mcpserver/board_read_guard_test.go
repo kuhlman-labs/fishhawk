@@ -19,6 +19,15 @@ package mcpserver
 //   - DIRECT symbol references. TestNoBoardReadSymbolsInMCPPackage fails if any
 //     non-test file in this package names a board-read symbol, naming
 //     file+symbol.
+//   - Board WRITES as well as reads (E54.5 / #2237). The grooming APPLY
+//     capability (workmgmt.GroomingMutator / MutatorFor / ApplyGrooming) mutates
+//     the tracker on an agent's proposal, so an agent tool that could dispatch a
+//     grooming mutation would be acting outside the very gate that layer exists
+//     to enforce — a strictly larger hazard than reading a stale column. The
+//     symbol list therefore carries the apply symbols by EXACT name; a bare
+//     "Grooming" substring is deliberately NOT banned, because handling a
+//     grooming REPORT (an artifact this surface legitimately ingests) is not
+//     dispatching a grooming MUTATION.
 //
 // What it does NOT establish, stated plainly rather than left implied:
 //
@@ -69,8 +78,10 @@ const repoModulePrefix = "github.com/kuhlman-labs/fishhawk/"
 // (backend/internal/mcpserver).
 const repoRoot = "../../.."
 
-// boardReadSymbols are the work-management read-capability identifiers no
-// non-test file in this package may name.
+// boardReadSymbols are the work-management board-capability identifiers no
+// non-test file in this package may name — the #2230 READ capability and the
+// #2237 grooming-APPLY capability. Matching is by prefix (see bannedSymbol),
+// so each entry also covers its request/result satellites.
 var boardReadSymbols = []string{
 	"WorkItemReader",
 	"ReadWorkItem",
@@ -79,6 +90,15 @@ var boardReadSymbols = []string{
 	"WorkItemPage",
 	"ReaderFor",
 	"ListRepoIssues",
+	// E54.5 / #2237 — the grooming-mutation (board WRITE) capability.
+	"GroomingMutator",
+	"ApplyGroomingMutation",
+	"MutatorFor",
+	"ApplyGrooming",
+	// "GroomingMutation" (not the bare "Grooming") covers the whole mutation
+	// vocabulary — Request, Result, Record, Kind — while leaving
+	// GroomingReport, which this surface legitimately ingests, alone.
+	"GroomingMutation",
 }
 
 // packageImports parses every non-test .go file in dir and returns the sorted
@@ -264,4 +284,39 @@ func bannedSymbol(name string) string {
 		}
 	}
 	return ""
+}
+
+// TestBannedSymbolCoversGroomingApplySymbols pins the #2237 extension at the
+// matcher itself: every grooming-apply symbol is banned, and the two
+// near-misses that must NOT be — a grooming REPORT artifact type and an
+// unrelated Apply — still resolve to "". Without the negative half the list
+// could be widened to a bare "Grooming"/"Apply" prefix and this file would
+// still pass while forbidding legitimate report ingestion.
+func TestBannedSymbolCoversGroomingApplySymbols(t *testing.T) {
+	banned := []string{
+		"GroomingMutator",
+		"ApplyGroomingMutation",
+		"MutatorFor",
+		"ApplyGrooming",
+		"GroomingMutationRequest",
+		"GroomingMutationResult",
+		"GroomingMutationRecord",
+	}
+	for _, name := range banned {
+		if bannedSymbol(name) == "" {
+			t.Errorf("bannedSymbol(%q) = \"\", want it banned: a grooming mutation dispatched from the MCP agent tool surface would bypass the apply gate (ADR-064 / #2237)", name)
+		}
+	}
+	allowed := []string{
+		"GroomingReport",
+		"ParseGroomingReport",
+		"ArtifactKindGroomingReport",
+		"Apply",
+		"ApplyFiling",
+	}
+	for _, name := range allowed {
+		if got := bannedSymbol(name); got != "" {
+			t.Errorf("bannedSymbol(%q) = %q, want \"\": ingesting a grooming REPORT is not dispatching a grooming MUTATION", name, got)
+		}
+	}
 }

@@ -59,6 +59,28 @@ type API interface {
 	// ProjectItemStatus (per-item board state) and ProjectFields (project node
 	// id) — all already members above, which is why this is the only addition.
 	ListRepoIssues(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, opts githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error)
+	// UpdateIssue edits an existing issue's body, label set, state and
+	// state_reason — the single REST write primitive the optional
+	// workmgmt.GroomingMutator capability dispatches its label, depends-on and
+	// close mutations through (E54.5 / #2237). Its params are POINTER-typed so
+	// an omitted key never reaches the wire and an unrelated body update cannot
+	// strip the issue's labels. Signature matches *githubclient.Client.UpdateIssue,
+	// so the production client satisfies it directly.
+	//
+	// The mutate capability's other paths reuse members already above:
+	// GetIssue (read-before-union / read-before-marker), IssueNodeID +
+	// AddSubIssue (epic link), and ProjectFields + AddProjectItem +
+	// ProjectItemStatus + SetProjectItemSingleSelect (board moves and field
+	// writes) — which is why this is the only addition.
+	UpdateIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, p githubclient.UpdateIssueParams) (*githubclient.Issue, error)
+	//
+	// The grooming label mutation needs one MORE primitive than this
+	// interface declares — the additive AddIssueLabels write — but it is
+	// declared as the OPTIONAL labelAdder extension in grooming.go rather
+	// than promoted in here, so the many API implementations that only
+	// exercise the filing and board-sync paths are not forced to carry a
+	// stub for a capability they never reach. *githubclient.Client
+	// satisfies both, so production dispatch is unaffected.
 	ProjectsTokenConfigured() bool
 }
 
@@ -78,12 +100,17 @@ type Provider struct {
 // ratified invariant that no board-read path is exposed through the MCP agent
 // tool surface is enforced by
 // backend/internal/mcpserver/board_read_guard_test.go.
+//
+// GroomingMutator (E54.5 / #2237) reserves the board-WRITE seam on the same
+// terms: implemented here (grooming.go), resolved by nothing in production,
+// and covered by the same MCP-surface guard, extended to the write symbols.
 var (
 	_ workmgmt.Transitioner               = (*Provider)(nil)
 	_ workmgmt.NumberDiscoverer           = (*Provider)(nil)
 	_ workmgmt.EpicChildrenQuerier        = (*Provider)(nil)
 	_ workmgmt.IssueSetDependencyResolver = (*Provider)(nil)
 	_ workmgmt.WorkItemReader             = (*Provider)(nil)
+	_ workmgmt.GroomingMutator            = (*Provider)(nil)
 )
 
 // New returns a Provider backed by api (in production *githubclient.Client).

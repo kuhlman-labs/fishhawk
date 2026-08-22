@@ -1570,6 +1570,36 @@ Notes:
   no-project / not-on-board result is logged at INFO and appends nothing.
   Listed here so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The grooming-apply kinds — `grooming_mutation_applied` and
+  `grooming_apply_completed` (E54.5 / #2237) — are **internal, audit-only
+  categories, not issue-comment surfaces**. Nothing in `issuecomment` posts
+  them; neither has a Notifier method. They are the two constants
+  `workmgmt.GroomingMutationAppliedCategory` /
+  `workmgmt.GroomingApplyCompletedCategory` declared in
+  `backend/internal/workmgmt/grooming_apply.go`, written through the
+  `workmgmt.GroomingAuditSink` interface that `ApplyGrooming` calls — the
+  apply layer defines the sink, it does not implement one, so **no backend
+  code writes either category yet**: #2237 reserves the apply seam and no HTTP
+  route, MCP tool or CLI verb resolves a `GroomingMutator`. They are
+  registered now because the completeness AST sweep collects the constants and
+  because an unregistered category is un-awaitable and unfilterable via GET
+  `/v0/runs/{run_id}/audit?category=`.
+  `grooming_mutation_applied` is written once per **SETTLED** candidate —
+  applied, failed AND skipped alike, so one category filter returns the whole
+  apply — carrying `{entry_id, class, report_class, kind, item_ref, before,
+  after, outcome, skip_reason | error, provider_response,
+  idempotence_checked}`. The name reflects the family, not the outcome; read
+  `outcome` to tell a landed mutation from a containment refusal, and
+  `skip_reason` (the closed set in `grooming_apply.go`: `not_approved`,
+  `mode_report_surface_only`, `destructive_not_authorized`, `already_applied`,
+  `manual_placement_preserved`, `icebox_column_unavailable`, …) to tell WHICH
+  rule refused it. `grooming_apply_completed` is written once per apply with
+  `{applied, failed, skipped, applied_ids, failed_ids, skipped_ids,
+  audit_errors}`. Neither write is best-effort in the silent sense: a sink
+  error is collected and surfaced as a `*GroomingAuditError` after the loop, so
+  the apply still completes (continue-and-report) but nothing is silently
+  unaudited. Listed here so a future reader grepping the audit categories
+  doesn't mistake them for comment surfaces.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an
   **internal, source-side audit-only category, not a run-thread comment
   surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It

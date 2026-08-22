@@ -54,6 +54,13 @@ type fakeAPI struct {
 	nodeIDNumber int
 	nodeIDErr    error
 	parentNode   string
+	// nodeIDs maps issue number -> node id, so a test can give the CHILD and
+	// the PARENT epic DISTINCT node ids and assert which one AddSubIssue
+	// received in which position. With one shared parentNode for every number,
+	// reversing AddSubIssue's arguments is unobservable (#2237 review). An
+	// absent number falls back to parentNode, so existing single-id fixtures
+	// are unaffected.
+	nodeIDs map[int]string
 
 	subParent, subChild string
 	subErr              error
@@ -93,7 +100,72 @@ type fakeAPI struct {
 	// routing is assertable without the wire.
 	listRepoIssuesProjectsToken bool
 
+	// updateIssueCalls records every UpdateIssue call in order, so a grooming
+	// test asserts on COMMITTED STATE (what was actually written, and what was
+	// NOT written) rather than on a returned error — a containment check that
+	// fired and a mutation that silently did nothing return the same envelope.
+	updateIssueCalls  []fakeUpdateIssueCall
+	updateIssueResult *githubclient.Issue
+	updateIssueErr    error
+
+	// addLabelsCalls records every AddIssueLabels call in order — the ADDITIVE
+	// label primitive the grooming label mutation writes through. Recording the
+	// call (rather than only the returned result) is what lets a test assert
+	// that a wholesale UpdateIssue(labels) PATCH was NOT sent instead.
+	addLabelsCalls []fakeAddLabelsCall
+	addLabelsErr   error
+
+	// addProjectItemProjectsToken / setFieldProjectsToken record whether the
+	// context each board WRITE was called with carried the projects-token
+	// opt-in, so the user-owned-board credential routing is assertable at the
+	// write and not only at the reads (#2237 review; the #1114 constraint).
+	addProjectItemProjectsToken bool
+	setFieldProjectsToken       bool
+
 	projectsTokenConfigured bool
+}
+
+// fakeAddLabelsCall is one recorded AddIssueLabels dispatch: the issue number
+// and the labels sent, so a test asserts that ONLY the new labels crossed the
+// wire — a union payload would mean the caller was still doing a
+// read-modify-write.
+type fakeAddLabelsCall struct {
+	number int
+	labels []string
+}
+
+func (f *fakeAPI) AddIssueLabels(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	number int, labels []string) ([]string, error) {
+	f.addLabelsCalls = append(f.addLabelsCalls, fakeAddLabelsCall{number: number,
+		labels: append([]string(nil), labels...)})
+	if f.addLabelsErr != nil {
+		return nil, f.addLabelsErr
+	}
+	existing := []string(nil)
+	if iss, ok := f.getIssues[number]; ok {
+		existing = append(existing, iss.Labels...)
+	}
+	return append(existing, labels...), nil
+}
+
+// fakeUpdateIssueCall is one recorded UpdateIssue dispatch: the issue number
+// and the params verbatim, so a test can assert BOTH what was set and — the
+// pointer-omission invariant — what was left nil.
+type fakeUpdateIssueCall struct {
+	number int
+	params githubclient.UpdateIssueParams
+}
+
+func (f *fakeAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	number int, p githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	f.updateIssueCalls = append(f.updateIssueCalls, fakeUpdateIssueCall{number: number, params: p})
+	if f.updateIssueErr != nil {
+		return nil, f.updateIssueErr
+	}
+	if f.updateIssueResult != nil {
+		return f.updateIssueResult, nil
+	}
+	return &githubclient.Issue{Number: number}, nil
 }
 
 func (f *fakeAPI) ListRepoIssues(ctx context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, opts githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error) {
@@ -118,6 +190,9 @@ func (f *fakeAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ gith
 	if f.nodeIDErr != nil {
 		return "", f.nodeIDErr
 	}
+	if id, ok := f.nodeIDs[number]; ok {
+		return id, nil
+	}
 	return f.parentNode, nil
 }
 
@@ -137,8 +212,9 @@ func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialScope, 
 	return f.itemStatus, nil
 }
 
-func (f *fakeAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
+func (f *fakeAPI) AddProjectItem(ctx context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
 	f.addItemContent = contentID
+	f.addProjectItemProjectsToken = githubclient.ProjectsTokenRequested(ctx)
 	_ = projectID
 	if f.addItemErr != nil {
 		return "", f.addItemErr
@@ -146,8 +222,9 @@ func (f *fakeAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, pro
 	return f.itemID, nil
 }
 
-func (f *fakeAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
+func (f *fakeAPI) SetProjectItemSingleSelect(ctx context.Context, _ forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
 	f.setProjectID, f.setItemID, f.setFieldID, f.setOptionID = projectID, itemID, fieldID, optionID
+	f.setFieldProjectsToken = githubclient.ProjectsTokenRequested(ctx)
 	return f.setErr
 }
 

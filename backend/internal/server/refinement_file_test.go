@@ -192,6 +192,14 @@ func (f *fakeGHAPI) ListRepoIssues(_ context.Context, _ forge.CredentialScope, _
 	return nil, nil
 }
 
+// UpdateIssue satisfies the grooming-mutation capability's slice of the
+// workmgmt/github API interface (E54.5 / #2237). This fake exercises the
+// FILING and board-sync paths, which never edit an existing issue, so it is a
+// mechanical stub.
+func (f *fakeGHAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	return nil, nil
+}
+
 // namedGHProvider wraps the real github provider with a unique registry name so
 // the integration test does not clobber the process-global github_projects
 // registration used by other tests. The embedded *Provider promotes File,

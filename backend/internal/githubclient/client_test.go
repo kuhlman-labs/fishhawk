@@ -4399,3 +4399,302 @@ func TestContextSleep_CompletesAndNoop(t *testing.T) {
 		t.Errorf("zero sleep: %v", err)
 	}
 }
+
+// --- UpdateIssue (E54.5 / #2237) ---
+
+// updateIssueServer stands up a PATCH-only httptest server that records the
+// method, path and RAW request body of the single call under test, so the
+// assertions below read the EXACT bytes that reached the wire rather than a
+// re-marshalled approximation.
+func updateIssueServer(t *testing.T) (*httptest.Server, *struct {
+	method, path, body string
+	calls              int
+}) {
+	t.Helper()
+	got := &struct {
+		method, path, body string
+		calls              int
+	}{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got.method, got.path, got.body = r.Method, r.URL.Path, string(raw)
+		got.calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":42,"title":"t","state":"closed","state_reason":"duplicate","labels":[{"name":"type:bug"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, got
+}
+
+func strPtr(s string) *string       { return &s }
+func slicePtr(s []string) *[]string { return &s }
+
+// TestUpdateIssue_RequestBodies is the transport pin: method, path and the
+// EXACT serialized request body per case. The load-bearing row is
+// "labels-only" paired with "body-only" — the pointer-omission invariant.
+// encoding/json marshals a map with sorted keys, so the expected bodies are
+// deterministic.
+func TestUpdateIssue_RequestBodies(t *testing.T) {
+	closed, dup := "closed", "duplicate"
+	for _, tc := range []struct {
+		name     string
+		params   UpdateIssueParams
+		wantBody string
+	}{
+		{
+			name:     "labels only",
+			params:   UpdateIssueParams{Labels: slicePtr([]string{"type:bug", "area:api"})},
+			wantBody: `{"labels":["type:bug","area:api"]}`,
+		},
+		{
+			name:     "close with state reason",
+			params:   UpdateIssueParams{State: &closed, StateReason: &dup},
+			wantBody: `{"state":"closed","state_reason":"duplicate"}`,
+		},
+		{
+			// The pointer-omission invariant: a body-only update carries NO
+			// labels key, so it cannot strip the issue's label set. A
+			// value-typed Labels []string would have serialized "labels":null
+			// here and wiped every label.
+			name:     "body only omits labels",
+			params:   UpdateIssueParams{Body: strPtr("new body")},
+			wantBody: `{"body":"new body"}`,
+		},
+		{
+			name:     "empty label set is transmitted (strip is a real choice)",
+			params:   UpdateIssueParams{Labels: slicePtr([]string{})},
+			wantBody: `{"labels":[]}`,
+		},
+		{
+			name: "every field set",
+			params: UpdateIssueParams{
+				Body: strPtr("b"), Labels: slicePtr([]string{"l"}),
+				State: &closed, StateReason: &dup,
+			},
+			wantBody: `{"body":"b","labels":["l"],"state":"closed","state_reason":"duplicate"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := updateIssueServer(t)
+			c, _ := newTestClient(t, srv, nil)
+
+			iss, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(9),
+				RepoRef{Owner: "x", Name: "y"}, 42, tc.params)
+			if err != nil {
+				t.Fatalf("UpdateIssue: %v", err)
+			}
+			if got.method != http.MethodPatch {
+				t.Errorf("method = %q, want PATCH", got.method)
+			}
+			if got.path != "/repos/x/y/issues/42" {
+				t.Errorf("path = %q", got.path)
+			}
+			if got.body != tc.wantBody {
+				t.Errorf("request body = %s, want %s", got.body, tc.wantBody)
+			}
+			if iss.Number != 42 || iss.StateReason != "duplicate" {
+				t.Errorf("decoded issue = %+v", iss)
+			}
+			if len(iss.Labels) != 1 || iss.Labels[0] != "type:bug" {
+				t.Errorf("labels = %v, want [type:bug]", iss.Labels)
+			}
+		})
+	}
+}
+
+// TestUpdateIssue_NoFieldsIsRefusedLocally pins the fail-closed guard: a
+// params set with no field at all never reaches the wire (calls stays 0), so a
+// caller bug is an error rather than a silent no-op round trip.
+func TestUpdateIssue_NoFieldsIsRefusedLocally(t *testing.T) {
+	srv, got := updateIssueServer(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(9),
+		RepoRef{Owner: "x", Name: "y"}, 42, UpdateIssueParams{})
+	if err == nil || !strings.Contains(err.Error(), "at least one field") {
+		t.Fatalf("err = %v, want an at-least-one-field refusal", err)
+	}
+	if got.calls != 0 {
+		t.Errorf("server saw %d calls, want 0 — the guard must refuse before dispatch", got.calls)
+	}
+}
+
+func TestUpdateIssue_ValidationErrors(t *testing.T) {
+	body := strPtr("b")
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, 1,
+		UpdateIssueParams{Body: body}); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if _, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 0, UpdateIssueParams{Body: body}); err == nil {
+		t.Errorf("expected error for zero issue number")
+	}
+	c2 := &Client{}
+	if _, err := c2.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 1, UpdateIssueParams{Body: body}); err == nil {
+		t.Errorf("expected error for missing TokenProvider")
+	}
+}
+
+// TestUpdateIssue_ForgeErrorsAreClassified pins the two error branches a
+// grooming close can hit: a 404 (issue gone) and a 422 (GitHub rejecting an
+// unrecognized state_reason — the residual the httptest fixtures CANNOT
+// otherwise prove, since a fixture always accepts what it is handed).
+func TestUpdateIssue_ForgeErrorsAreClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"not found", http.StatusNotFound, ErrNotFound},
+		{"validation", http.StatusUnprocessableEntity, ErrValidation},
+		{"forbidden", http.StatusForbidden, ErrForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"message":"nope"}`)
+			}))
+			t.Cleanup(srv.Close)
+			c, _ := newTestClient(t, srv, nil)
+			_, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(1),
+				RepoRef{Owner: "x", Name: "y"}, 42, UpdateIssueParams{Body: strPtr("b")})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateIssue_DecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `not json`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	if _, err := c.UpdateIssue(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 42, UpdateIssueParams{Body: strPtr("b")}); err == nil {
+		t.Fatalf("expected decode error")
+	}
+}
+
+// --- AddIssueLabels (E54.5 / #2237 review: the additive label primitive) ---
+
+// TestAddIssueLabels_RequestShape is the transport pin for the ADDITIVE label
+// endpoint: method, path and the EXACT serialized body. The load-bearing
+// assertion is the PATH — POST .../issues/42/labels, not PATCH .../issues/42 —
+// because that difference is the whole lost-update fix: the dedicated endpoint
+// merges server-side, so the payload carries only the labels being ADDED and
+// no client ever transmits the full set to clobber a concurrent add with.
+func TestAddIssueLabels_RequestShape(t *testing.T) {
+	var gotMethod, gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"name":"type:bug"},{"name":"area:api"}]`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+
+	labels, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(9),
+		RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, 42, []string{"area:api"})
+	if err != nil {
+		t.Fatalf("AddIssueLabels: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/repos/kuhlman-labs/fishhawk/issues/42/labels" {
+		t.Errorf("path = %q, want the additive labels sub-resource", gotPath)
+	}
+	if gotBody != `{"labels":["area:api"]}` {
+		t.Errorf("body = %q, want ONLY the added label", gotBody)
+	}
+	// The endpoint answers with the issue's FULL resulting set, decoded
+	// through the same helper GetIssue uses.
+	if strings.Join(labels, ",") != "type:bug,area:api" {
+		t.Errorf("labels = %v, want the resulting set", labels)
+	}
+}
+
+// TestAddIssueLabels_EmptyIsRefusedLocally pins the guard: a POST that adds
+// nothing never reaches the wire (calls stays 0), so a caller bug is an error
+// rather than a silent no-op round trip.
+func TestAddIssueLabels_EmptyIsRefusedLocally(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(9),
+		RepoRef{Owner: "x", Name: "y"}, 42, nil)
+	if err == nil || !strings.Contains(err.Error(), "at least one label") {
+		t.Fatalf("err = %v, want an at-least-one-label refusal", err)
+	}
+	if calls != 0 {
+		t.Errorf("server saw %d calls, want 0 — the guard must refuse before dispatch", calls)
+	}
+}
+
+func TestAddIssueLabels_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, 1,
+		[]string{"l"}); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 0, []string{"l"}); err == nil {
+		t.Errorf("expected error for zero issue number")
+	}
+	c2 := &Client{}
+	if _, err := c2.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 1, []string{"l"}); err == nil {
+		t.Errorf("expected error for missing TokenProvider")
+	}
+}
+
+// TestAddIssueLabels_ForgeErrorsAreClassified pins the error branches: a 404
+// (issue or label gone) and a 403 route through the same classifyStatus
+// chokepoint the rest of the client uses.
+func TestAddIssueLabels_ForgeErrorsAreClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"not found", http.StatusNotFound, ErrNotFound},
+		{"validation", http.StatusUnprocessableEntity, ErrValidation},
+		{"forbidden", http.StatusForbidden, ErrForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"message":"nope"}`)
+			}))
+			t.Cleanup(srv.Close)
+			c, _ := newTestClient(t, srv, nil)
+			_, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+				RepoRef{Owner: "x", Name: "y"}, 42, []string{"l"})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAddIssueLabels_DecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `not json`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 42, []string{"l"}); err == nil {
+		t.Fatalf("expected decode error")
+	}
+}
