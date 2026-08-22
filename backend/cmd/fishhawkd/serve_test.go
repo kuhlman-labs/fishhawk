@@ -3413,12 +3413,14 @@ type docWiringForge struct {
 	defaultBranch string
 	repoErr       error
 	gotScope      forge.CredentialScope
+	repoCalls     int
 	noFetch       bool
 }
 
 func (f *docWiringForge) Name() string { return f.name }
 
 func (f *docWiringForge) GetRepository(_ context.Context, scope forge.CredentialScope, _ forge.RepoRef) (*forge.Repository, error) {
+	f.repoCalls++
 	f.gotScope = scope
 	if f.repoErr != nil {
 		return nil, f.repoErr
@@ -3548,6 +3550,155 @@ func TestWireDocumentInjection_AllFourOrNone(t *testing.T) {
 		}
 		if scope != forge.FromRef(gitlabDeploymentScopeRef) {
 			t.Errorf("gitlab document scope = %v, want the deployment scope %q", scope, gitlabDeploymentScopeRef)
+		}
+	})
+}
+
+// docProviderResolver is a fixed-answer server.ProviderResolver keyed by
+// "owner/name". It is the COLLISION fixture: the same owner/name names a real,
+// readable repository on BOTH forges, and the accounts row is the only thing
+// that says which one the run actually belongs to.
+type docProviderResolver struct {
+	byRepo map[string]string
+	err    error
+}
+
+func (d docProviderResolver) ResolveProvider(_ context.Context, repo string) (string, bool, error) {
+	if d.err != nil {
+		return "", false, d.err
+	}
+	p, ok := d.byRepo[repo]
+	return p, ok, nil
+}
+
+// TestWireDocumentInjection_CrossForgeOwnershipGuard is the cross-repository
+// provenance control. Selecting github for a MIXED deployment does not by
+// itself stop a gitlab-hosted repo from resolving: forge.RepoRef carries only
+// owner/name, so `acme/widgets` on gitlab would be read as `acme/widgets` on
+// github and the prompt would carry THAT repository's charter — a wrong
+// document, not the refusal the mixed-forge guarantee claims.
+//
+// Every subtest drives the COLLISION directly: one owner/name, two forges.
+func TestWireDocumentInjection_CrossForgeOwnershipGuard(t *testing.T) {
+	ctx := context.Background()
+	ghScope := func(context.Context, string, string) (forge.CredentialScope, error) {
+		return forge.FromRef("github:1"), nil
+	}
+	// acme/widgets exists on BOTH forges. Note the github fake resolves this
+	// ref happily — the bad outcome is available BY CONSTRUCTION, so a missing
+	// guard shows up as a successful read of the wrong repository rather than
+	// as an unrelated transport error.
+	collision := forge.RepoRef{Owner: "acme", Name: "widgets"}
+
+	mixedRegistry := func() (map[string]forge.Forge, *docWiringForge) {
+		gh := &docWiringForge{name: "github", defaultBranch: "main"}
+		return map[string]forge.Forge{
+			"github": gh,
+			"gitlab": &docWiringForge{name: "gitlab", defaultBranch: "trunk"},
+		}, gh
+	}
+
+	t.Run("gitlab-owned repo is refused by the selected github forge", func(t *testing.T) {
+		reg, gh := mixedRegistry()
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{byRepo: map[string]string{"acme/widgets": "gitlab"}}
+		if id := wireDocumentInjection(&cfg, docGetter(reg), ghScope, docDeclarationsStub); id != "github" {
+			t.Fatalf("selected forge = %q, want github", id)
+		}
+		_, err := cfg.DocumentScope(ctx, collision)
+		if err == nil {
+			t.Fatal("a gitlab-registered repo resolved a github credential scope; owner/name does not identify a repository across forges")
+		}
+		if !strings.Contains(err.Error(), "gitlab") || !strings.Contains(err.Error(), "acme/widgets") {
+			t.Errorf("err = %v, want a message naming the owning forge and the repo", err)
+		}
+		// The default-branch lookup rides the same scope resolver, so it is
+		// refused too — and with ZERO calls into the github forge.
+		if _, err := cfg.DocumentBaseRef(ctx, collision); err == nil {
+			t.Error("the default-branch lookup resolved through github for a gitlab-registered repo")
+		}
+		if gh.repoCalls != 0 {
+			t.Errorf("github forge called %d times for a gitlab-registered repo, want 0", gh.repoCalls)
+		}
+	})
+
+	t.Run("github-owned repo with the identical owner/name still resolves", func(t *testing.T) {
+		reg, gh := mixedRegistry()
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{byRepo: map[string]string{"acme/widgets": "github"}}
+		wireDocumentInjection(&cfg, docGetter(reg), ghScope, docDeclarationsStub)
+		scope, err := cfg.DocumentScope(ctx, collision)
+		if err != nil {
+			t.Fatalf("a github-registered repo was refused by the github forge: %v", err)
+		}
+		if scope != forge.FromRef("github:1") {
+			t.Errorf("scope = %v, want the resolved github installation scope", scope)
+		}
+		ref, err := cfg.DocumentBaseRef(ctx, collision)
+		if err != nil || ref != "main" {
+			t.Errorf("base ref = %q, err = %v; want the github default branch", ref, err)
+		}
+		if gh.repoCalls != 1 {
+			t.Errorf("github forge called %d times, want 1", gh.repoCalls)
+		}
+	})
+
+	t.Run("gitlab selected refuses a github-registered repo", func(t *testing.T) {
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{byRepo: map[string]string{"acme/widgets": "github"}}
+		gl := &docWiringForge{name: "gitlab", defaultBranch: "trunk"}
+		if id := wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{"gitlab": gl}), nil, docDeclarationsStub); id != "gitlab" {
+			t.Fatalf("selected forge = %q, want gitlab", id)
+		}
+		if _, err := cfg.DocumentScope(ctx, collision); err == nil {
+			t.Fatal("a github-registered repo resolved through the gitlab forge")
+		}
+		if gl.repoCalls != 0 {
+			t.Errorf("gitlab forge called %d times for a github-registered repo, want 0", gl.repoCalls)
+		}
+	})
+
+	t.Run("ambiguous owner on a MIXED deployment is refused", func(t *testing.T) {
+		reg, _ := mixedRegistry()
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{byRepo: map[string]string{}} // found=false
+		wireDocumentInjection(&cfg, docGetter(reg), ghScope, docDeclarationsStub)
+		if _, err := cfg.DocumentScope(ctx, collision); err == nil {
+			t.Fatal("an unattributable repo resolved through github on a deployment where gitlab could own it")
+		}
+	})
+
+	t.Run("ambiguous owner on a SINGLE-forge deployment still resolves", func(t *testing.T) {
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{byRepo: map[string]string{}}
+		wireDocumentInjection(&cfg, docGetter(map[string]forge.Forge{
+			"github": &docWiringForge{name: "github", defaultBranch: "main"},
+		}), ghScope, docDeclarationsStub)
+		if _, err := cfg.DocumentScope(ctx, collision); err != nil {
+			t.Fatalf("the guard switched document injection off for a single-forge deployment with no accounts row: %v", err)
+		}
+	})
+
+	t.Run("no provider resolver on a MIXED deployment is refused", func(t *testing.T) {
+		reg, _ := mixedRegistry()
+		var cfg server.Config // RepoProviders nil (no database)
+		wireDocumentInjection(&cfg, docGetter(reg), ghScope, docDeclarationsStub)
+		if _, err := cfg.DocumentScope(ctx, collision); err == nil {
+			t.Fatal("a mixed deployment with no discriminator read a document through github anyway")
+		}
+	})
+
+	t.Run("provider resolution error fails closed", func(t *testing.T) {
+		reg, gh := mixedRegistry()
+		var cfg server.Config
+		cfg.RepoProviders = docProviderResolver{err: errors.New("db down")}
+		wireDocumentInjection(&cfg, docGetter(reg), ghScope, docDeclarationsStub)
+		_, err := cfg.DocumentScope(ctx, collision)
+		if err == nil || !strings.Contains(err.Error(), "db down") {
+			t.Fatalf("err = %v, want the discriminator failure surfaced as a refusal", err)
+		}
+		if gh.repoCalls != 0 {
+			t.Errorf("github forge called %d times after a discriminator failure, want 0", gh.repoCalls)
 		}
 	})
 }

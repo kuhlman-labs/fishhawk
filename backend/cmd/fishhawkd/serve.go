@@ -872,9 +872,14 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 // documentInjectionForgeIDs is the preference order the repo-document
 // injection seam selects a forge in: github first, gitlab as the single-forge
 // fallback. Config.DocumentResolver holds ONE Fetcher and ONE commit resolver,
-// so a mixed deployment reads every declared document through github and a
-// gitlab-hosted repo's charter fetch FAILS CLOSED — a refusal, never a wrong
-// or missing document. Routing per repo is a change to the shared mechanism
+// so a mixed deployment reads every declared document through the SELECTED
+// forge. That selection alone does NOT make a non-selected-forge repo fail:
+// forge.RepoRef carries only owner/name, so a gitlab-hosted `acme/widgets`
+// whose owner/name ALSO names an accessible github repository would resolve,
+// and the prompt would carry THAT repository's charter — a cross-repository
+// provenance failure, not the refusal the mixed-forge guarantee claims.
+// documentForgeOwnershipGuard is what actually enforces it; see there.
+// Routing per repo is a change to the shared mechanism
 // (backend/internal/repodoc), not to this wiring.
 var documentInjectionForgeIDs = []string{"github", "gitlab"}
 
@@ -889,12 +894,23 @@ type repositoryGetter interface {
 	GetRepository(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (*forge.Repository, error)
 }
 
-// selectDocumentForge returns the first registered forge that can read files,
-// in documentInjectionForgeIDs order, or ("", nil, nil) when none can.
-func selectDocumentForge(get forgeGetter) (forge.Forge, forge.FileFetcher, string) {
+// documentForge is one registered forge that can read files.
+type documentForge struct {
+	id      string
+	forge   forge.Forge
+	fetcher forge.FileFetcher
+}
+
+// fileCapableForges returns every registered forge that can read files, in
+// documentInjectionForgeIDs preference order. The LENGTH is load-bearing, not
+// just the head: a deployment with more than one file-capable forge is MIXED,
+// and an owner/name that resolves to no known provider is genuinely ambiguous
+// there (see documentForgeOwnershipGuard).
+func fileCapableForges(get forgeGetter) []documentForge {
 	if get == nil {
-		return nil, nil, ""
+		return nil
 	}
+	var out []documentForge
 	for _, id := range documentInjectionForgeIDs {
 		f, err := get(id)
 		if err != nil || f == nil {
@@ -904,9 +920,80 @@ func selectDocumentForge(get forgeGetter) (forge.Forge, forge.FileFetcher, strin
 		if !ok {
 			continue
 		}
-		return f, ff, id
+		out = append(out, documentForge{id: id, forge: f, fetcher: ff})
 	}
-	return nil, nil, ""
+	return out
+}
+
+// selectDocumentForge returns the first registered forge that can read files,
+// in documentInjectionForgeIDs order, or ("", nil, nil) when none can.
+func selectDocumentForge(get forgeGetter) (forge.Forge, forge.FileFetcher, string) {
+	candidates := fileCapableForges(get)
+	if len(candidates) == 0 {
+		return nil, nil, ""
+	}
+	return candidates[0].forge, candidates[0].fetcher, candidates[0].id
+}
+
+// documentForgeOwnershipGuard wraps the document credential-scope resolver so a
+// repo that does NOT live on the selected forge can never resolve through it.
+//
+// This is the cross-repository provenance control. The whole document read —
+// credential scope, default-branch lookup (documentBaseRefResolver calls this
+// same func) and the file fetch (resolveInjectedDocuments resolves the scope
+// before every repodoc.Resolve) — funnels through the scope resolver, so a
+// refusal here refuses all three with ZERO forge calls. Without it a gitlab
+// run whose owner/name also names an accessible github repository injects THAT
+// repository's charter: a wrong document served as if it were the repo's own,
+// which is worse than the refusal the mixed-forge guarantee promises.
+//
+// The provider discriminator is the same accounts.provider lookup the
+// conventions loader (E45.16 / #2022) and the repo-visibility cross-forge deny
+// (#2071) consult, and the posture is deliberately aligned with them:
+//
+//   - provider RESOLVED and it is not the selected forge → REFUSE. This is the
+//     collision case, and it is refused whether or not the deployment is mixed.
+//   - resolver ERROR → REFUSE. A transient DB fault must never silently select
+//     a different provider's repository.
+//   - AMBIGUOUS (no resolver wired, or found=false: owner unregistered, or
+//     registered under both providers) → refuse only on a MIXED deployment,
+//     where a second forge genuinely could own the repo. On a single-forge
+//     deployment there is no other forge to confuse it with and no accounts
+//     row is required to read a document, so this stays exactly the
+//     pre-guard posture rather than switching document injection off for every
+//     deployment without an accounts table.
+func documentForgeOwnershipGuard(
+	selectedID string,
+	mixed bool,
+	providers server.ProviderResolver,
+	inner func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error),
+) func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+	return func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+		if providers != nil {
+			provider, found, err := providers.ResolveProvider(ctx, repo.String())
+			if err != nil {
+				return forge.CredentialScope{}, fmt.Errorf("resolve the forge that owns %s before reading a declared "+
+					"document through %s: %w", repo, selectedID, err)
+			}
+			if found {
+				if provider != selectedID {
+					return forge.CredentialScope{}, fmt.Errorf("refusing to read a declared document for %s through "+
+						"the %s forge: that repository is registered on %s, and owner/name alone does not identify a "+
+						"repository across forges — reading it through %s could return a DIFFERENT repository's "+
+						"document", repo, selectedID, provider, selectedID)
+				}
+				return inner(ctx, repo)
+			}
+		}
+		if mixed {
+			return forge.CredentialScope{}, fmt.Errorf("refusing to read a declared document for %s through the %s "+
+				"forge: this deployment has more than one forge that can read files and no accounts row identifies "+
+				"which one owns %s, so owner/name could name a different repository on the other forge. Register the "+
+				"repository owner under its provider (accounts.provider) so the document read is attributable",
+				repo, selectedID, repo)
+		}
+		return inner(ctx, repo)
+	}
 }
 
 // documentBaseRefResolver adapts a forge into Config.DocumentBaseRef: the ref
@@ -962,16 +1049,22 @@ func documentBaseRefResolver(repos repositoryGetter,
 // value: a post-New assignment to cfg would never reach the constructed
 // Server. The Server-dependent members are supplied as closures the caller
 // binds to the srv variable server.New assigns (approval condition H3).
+//
+// The installed DocumentScope is wrapped by documentForgeOwnershipGuard, so a
+// repository that does not live on the selected forge is REFUSED rather than
+// read through it — the mixed-deployment cross-repository failure owner/name
+// alone cannot exclude.
 func wireDocumentInjection(
 	cfg *server.Config,
 	get forgeGetter,
 	githubScope func(ctx context.Context, owner, name string) (forge.CredentialScope, error),
 	declarations func(ctx context.Context, runRow *runpkg.Run, stage *runpkg.Stage) ([]repodoc.Declaration, string, error),
 ) string {
-	f, ff, id := selectDocumentForge(get)
-	if f == nil || declarations == nil {
+	candidates := fileCapableForges(get)
+	if len(candidates) == 0 || declarations == nil {
 		return ""
 	}
+	f, ff, id := candidates[0].forge, candidates[0].fetcher, candidates[0].id
 	var scope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error)
 	if id == "github" {
 		if githubScope == nil {
@@ -984,6 +1077,12 @@ func wireDocumentInjection(
 		static := forge.FromRef(gitlabDeploymentScopeRef)
 		scope = func(context.Context, forge.RepoRef) (forge.CredentialScope, error) { return static, nil }
 	}
+	// Cross-forge ownership guard, applied BEFORE the scope is handed to
+	// either consumer so the base-ref lookup and the file fetch are both
+	// covered. cfg.RepoProviders is already wired above (it needs only the
+	// pool), which is why this reads it off cfg rather than taking a
+	// parameter.
+	scope = documentForgeOwnershipGuard(id, len(candidates) > 1, cfg.RepoProviders, scope)
 	// forge.Forge declares GetBranchSHA, so the selected forge satisfies
 	// repodoc's commit-resolver view directly — repodoc pins the default
 	// branch to a commit itself.

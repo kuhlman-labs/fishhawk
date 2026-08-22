@@ -167,6 +167,21 @@ A pinned-SHA preference is verified here by fake seam
 (`TestResolve_ReadsFromPinnedBaseRef`, `TestGetStagePrompt_InjectedDocument_EndToEnd`,
 and the charter consumer's `TestGroomingPrompt_PinnedCommitBeatsBranchTip`).
 
+### `Request.Repo` does not identify a repository across forges (#2234)
+
+`forge.RepoRef` carries owner/name and nothing else, and this package resolves through
+whatever `Fetcher` / `Commits` the wiring handed it. So on a deployment with more than one
+file-capable forge, `acme/widgets` on one forge and `acme/widgets` on the other are
+indistinguishable HERE, and a document read routed to the wrong forge returns a real,
+well-formed document from the WRONG repository — worse than a refusal, because nothing in
+the resolve/hash/attribute path can tell.
+
+Selecting one forge is therefore not the control. The control is
+`documentForgeOwnershipGuard` in `cmd/fishhawkd`, which refuses a repo whose
+`accounts.provider` is not the selected forge before any forge call. E55's
+review-conventions consumer inherits this hazard unchanged — it is a property of the
+identifier, not of the charter.
+
 ### Preview divergence (#2804)
 
 `GET /v0/stages/{id}/prompt-render` — the unsigned preview surface — does not

@@ -338,12 +338,30 @@ reusable** by E55's review-conventions consumer, which still needs the per-run s
 **Non-grooming prompts are byte-identical.** The declarations func returns zero
 declarations for every other stage (and never touches the conventions loader), and
 `resolveInjectedDocuments` short-circuits on an empty set. The one place that could have
-leaked is a cached `WorkflowSpec` that cannot be re-parsed: the refusal is NARROWED to
-specs whose raw bytes carry the `grooming_report` token, because a document that never
-contains it cannot yield that artifact under any parse. A corrupt spec without the token
-falls OPEN exactly as `resolveImplementConstraints` and `resolveImplementRequiredOutcomes`
-do. Residual, stated: a corruption that also destroys the token falls open on what may
-have been a grooming run.
+leaked is a cached `WorkflowSpec` that cannot be re-parsed, where whether the stage is a
+grooming propose stage is undecidable. `specCouldBeGrooming` narrows the refusal, and the
+narrowing is ATTRIBUTED rather than a document-wide byte scan — a raw `bytes.Contains`
+refused a corrupt NON-grooming spec whose bytes carried `grooming_report` incidentally,
+which is exactly the non-grooming behaviour change H4 forbids:
+
+- **The document decodes as YAML** (the dominant corruption class: well-formed YAML that
+  fails schema validation). A decoded document has exactly ONE parse, so the test is
+  exact — some scalar or key EQUAL to the artifact kind, searched inside THIS run's
+  workflow subtree only. A comment is not a node; an unrelated prose scalar is not equal;
+  another workflow's `grooming_report` is outside the subtree. All three fall OPEN,
+  byte-identically. The search widens to the whole document when the run's workflow is
+  absent (nothing to attribute to) or the document uses workflow-v2 `defaults` / `extends`
+  reuse, where an inherited `produces` block can come from outside the subtree.
+- **The document does not decode at all** (YAML syntax corruption). No structure to
+  attribute against, so the fallback is the byte scan minus FULL-LINE comments.
+
+A spec with no grooming evidence falls OPEN exactly as `resolveImplementConstraints` and
+`resolveImplementRequiredOutcomes` do. Residuals, stated: in the non-decoding branch a
+token in an INLINE comment or an unrelated scalar still refuses a corrupt non-grooming
+spec; and a corruption that also destroys the token falls open on what may have been a
+grooming run. Closing the second in general means refusing every plan prompt whose cached
+spec is corrupt — the repo-wide flip H4 rules out — and the cached bytes were validated at
+run-create, so a parse failure is storage corruption, not a normal or adversarial state.
 
 **Preview divergence (#2804).** `handleGetStagePromptRender` injects no documents at all
 (a pre-existing #2242 divergence), so L2 is deliberately NOT wired there — asserting on a
@@ -353,16 +371,36 @@ prompt for the same stage therefore differ in exactly the security-relevant bloc
 **Wiring.** `cmd/fishhawkd`'s `wireDocumentInjection` installs the four `Config` members
 (resolver, scope, base ref, declarations) TOGETHER or leaves all four nil, because
 `resolveInjectedDocuments` treats a configured declaration seam with a nil resolver as a
-wiring defect and fails EVERY prompt request. Forge selection is github-then-gitlab; a
-mixed deployment reads through github and a gitlab-hosted repo's charter fetch fails
-closed. `Server.CharterDocumentDeclarations` is the exported entry point the wiring needs
+wiring defect and fails EVERY prompt request. Forge selection is github-then-gitlab, and
+selection ALONE does not make a non-selected-forge repo fail: `forge.RepoRef` carries only
+owner/name, so a gitlab-hosted `acme/widgets` whose owner/name also names an accessible
+github repository would resolve, and the prompt would carry THAT repository's charter — a
+cross-repository provenance failure, not the refusal the mixed-forge guarantee claims.
+`documentForgeOwnershipGuard` enforces it, wrapping `DocumentScope` (through which the
+credential scope, the default-branch lookup and every file fetch all pass, so a refusal
+costs ZERO forge calls). It consults the same `accounts.provider` discriminator the
+conventions loader and the repo-visibility cross-forge deny use: a resolved provider that
+is not the selected forge REFUSES; a resolver error REFUSES; an AMBIGUOUS repo (no
+resolver, or `found=false`) refuses only on a MIXED deployment, where a second forge could
+own it — a single-forge deployment keeps the pre-guard posture rather than switching
+document injection off wherever no accounts table exists.
+`Server.CharterDocumentDeclarations` is the exported entry point the wiring needs
 because `server.New` copies its `Config` by value, so the seam must be installed before
 construction while the implementation needs the constructed Server.
 
 Tests: `charter_injection_test.go` (cross-boundary end-to-end plus one behavioural test
 per refusal branch, each asserting the reason IDENTITY so a deleted branch reddens rather
-than passing on a neighbouring control), `cmd/fishhawkd/serve_test.go` (forge preference,
-the all-four-or-none invariant, the base-ref adapter).
+than passing on a neighbouring control; the M8 H4-boundary set — token in a comment, in an
+unrelated scalar, in ANOTHER workflow, and the same document read for the workflow that
+DOES declare it; `TestCharterFixtures_AreActuallyUnparseable`, which pins that each M8
+fixture is genuinely parser-rejected and which branch it drives; and
+`TestGroomingPrompt_L2Divergence_FailsClosed`, which drives a conventions loader that
+answers differently within one request — L2 re-resolves independently of L1 by design, so
+it must fail closed on a divergence), `cmd/fishhawkd/serve_test.go` (forge preference, the
+all-four-or-none invariant, the base-ref adapter, and the cross-forge collision: ONE
+owner/name registered on both forges, refused through the non-owning one with zero forge
+calls). The counterfactual RED observations for each control are recorded at the top of
+`charter_injection_test.go`.
 
 ## Per-repo work-management conventions loader (`conventions_loader.go`, E45.16 / #2022)
 

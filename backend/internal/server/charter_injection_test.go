@@ -12,15 +12,42 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
+// COUNTERFACTUAL EVIDENCE (observed, not reasoned). Each control below was
+// DELETED, the named test RUN, the RED observed, and the file restored
+// byte-identically; every RED was re-run WITHOUT -race and failed the same way
+// (these tests start no goroutines, so no RED here is a -race artifact). A
+// fix-up pass cannot rewrite the PR body, so the record lives here, in the
+// diff:
+//
+//   - specCouldBeGrooming attribution → raw document-wide bytes.Contains:
+//     M8f/M8g/M8h/M8j RED (`status = 500, want 200`, reason
+//     grooming_workflow_spec_unreadable) + 4 TestSpecCouldBeGrooming_Attribution
+//     rows RED.
+//   - specCouldBeGrooming call site → `if false` (H4 narrowing removed
+//     entirely): M8b RED alongside M8f/g/h/j — the repo-wide refusal H4 forbids.
+//   - the byte-scan fallback's bytes.Contains → deleted: M8a RED (a
+//     syntax-broken spec declaring the artifact in DATA fell open) +
+//     TestSpecCouldBeGrooming_Attribution/syntax-broken_with_the_token_in_data.
+//   - the reuse widening → `if false`: TestSpecCouldBeGrooming_ReuseWidensThe-
+//     Search RED ("a reuse-bearing document ... fell open").
+//   - L2's charter-identity loop → any-document-present: H2 RED and
+//     L2Divergence/L2_sees_a_different_charter_path RED.
+//   - documentForgeOwnershipGuard → unwrapped (cmd/fishhawkd): 5 of the 7
+//     TestWireDocumentInjection_CrossForgeOwnershipGuard subtests RED, the
+//     collision one on "a gitlab-registered repo resolved a github credential
+//     scope".
+//
 // This file is the behavioural proof for the CHARTER INJECTION CONSUMER
 // (E54.2 / #2234). The scope it must cover spans the work-management
 // conventions domain → the charter declaration → the forge fetch → repodoc's
@@ -104,6 +131,60 @@ workflows:
           schema: [unclosed
 `
 
+// The H4 BOUNDARY fixtures. Every one of these is YAML that DECODES but fails
+// spec.ParseBytes (the dominant corruption class), carrying the
+// grooming_report token somewhere that is NOT this run's workflow's produces
+// block. A raw bytes.Contains over the document refuses all of them — the
+// non-grooming behaviour change H4 forbids.
+
+// chSchemaInvalidTokenInComment: the token lives in a YAML COMMENT, which is
+// not a node in any parse of a decodable document.
+const chSchemaInvalidTokenInComment = `version: "2"
+# this workflow used to emit a grooming_report; it no longer does
+workflows:
+  feature_change:
+    stages: "not-a-list"
+`
+
+// chSchemaInvalidTokenInScalar: the token appears inside an unrelated prose
+// scalar, which is not an artifact declaration.
+const chSchemaInvalidTokenInScalar = `version: "2"
+workflows:
+  feature_change:
+    description: "items ranked earlier in a grooming_report by hand"
+    stages: "not-a-list"
+`
+
+// chSchemaInvalidOtherWorkflowGrooms: ANOTHER workflow in the same document
+// declares the artifact. Attribution decides this, not document-wide presence:
+// served unchanged for feature_change, REFUSED for backlog_grooming.
+const chSchemaInvalidOtherWorkflowGrooms = `version: "2"
+workflows:
+  feature_change:
+    stages: "not-a-list"
+  backlog_grooming:
+    stages:
+      - id: groom
+        type: plan
+        produces:
+          - artifact: grooming_report
+`
+
+// chSyntaxBrokenTokenInComment does NOT decode as YAML at all, so there is no
+// structure to attribute against — the fallback byte scan runs, and it must
+// still skip a FULL-LINE comment.
+const chSyntaxBrokenTokenInComment = `version: "2"
+# produces: grooming_report
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        produces:
+       - artifact: plan
+          schema: [unclosed
+`
+
 // chFetcher serves the charter keyed by ref. The SOFTENED text is seeded at
 // every mutable ref a broken implementation could reach — the default BRANCH
 // NAME, the empty ref, HEAD and the run's own branch — independently of the
@@ -172,6 +253,33 @@ func installConventions(t *testing.T, conv workmgmt.Conventions, err error) *int
 	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
 		calls++
 		return conv, err
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+	return &calls
+}
+
+// chConventionsAnswer is one scripted answer from the sequenced loader.
+type chConventionsAnswer struct {
+	conv workmgmt.Conventions
+	err  error
+}
+
+// installConventionsSeq swaps the process-wide loader for one that returns a
+// DIFFERENT answer per call, so a test can drive the L1/L2 divergence: L2
+// re-resolves the declared charter path independently of L1 (it must work on a
+// deployment where L1 never ran at all), so the two calls within one request
+// can disagree. The last answer is repeated once the script runs out.
+func installConventionsSeq(t *testing.T, answers ...chConventionsAnswer) *int {
+	t.Helper()
+	calls := 0
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		i := calls
+		calls++
+		if i >= len(answers) {
+			i = len(answers) - 1
+		}
+		return answers[i].conv, answers[i].err
 	}
 	t.Cleanup(func() { conventionsLoader = prev })
 	return &calls
@@ -772,6 +880,202 @@ func TestGroomingPrompt_M8e_NilWorkflowSpec_NotCharterRequiring(t *testing.T) {
 	if required {
 		t.Errorf("a legacy row with no cached spec was treated as charter-requiring")
 	}
+}
+
+// chServesUnchanged asserts that a spec serves a prompt BYTE-IDENTICAL to the
+// same spec with the whole feature disabled, writes no injection audit entry,
+// and never consults the conventions loader. This is the H4 claim, and the
+// three-way assertion is what makes it a counterfactual vehicle: widening the
+// grooming evidence back to a document-wide byte scan reddens the loader-call
+// assertion first and the refusal (a non-200) immediately after.
+func chServesUnchanged(t *testing.T, specYAML, workflowID string) {
+	t.Helper()
+	calls := installConventions(t, chConventions(chCharterPath), nil)
+
+	wired, runID, stageID, priv, ar := chWiredServer(t, specYAML, newCHFetcher(), 0)
+	off, offRun, offStage, offPriv, _ := newCharterServer(t, chServerOpts{
+		specYAML: specYAML, stageIsPlan: true,
+	})
+	if workflowID != "" {
+		wired.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowID = workflowID
+		off.cfg.RunRepo.(*promptRunRepo).getRuns[offRun].WorkflowID = workflowID
+	}
+
+	got := chDecodePrompt(t, wired, runID, stageID, priv)
+	want := chDecodePrompt(t, off, offRun, offStage, offPriv)
+	if got.Prompt != want.Prompt {
+		t.Errorf("a corrupt NON-grooming spec changed the served prompt:\n--- wired ---\n%s\n--- disabled ---\n%s",
+			got.Prompt, want.Prompt)
+	}
+	if cats := chAuditCategories(ar, runID); len(cats) != 0 {
+		t.Errorf("audit entries %v written for a corrupt non-grooming spec, want none", cats)
+	}
+	if *calls != 0 {
+		t.Errorf("the conventions loader was consulted %d times on a corrupt non-grooming spec, want 0", *calls)
+	}
+}
+
+// TestCharterFixtures_AreActuallyUnparseable is the PRECONDITION for every M8
+// test below it. Each fixture must be a spec the shipped parser REJECTS — if
+// one silently started parsing, its M8 test would take the ordinary structural
+// path and pass without exercising the unparseable-spec narrowing at all. It
+// also pins WHICH branch each fixture drives: `decodes` says whether the
+// document is well-formed YAML (the attribution branch) or not (the byte-scan
+// fallback).
+func TestCharterFixtures_AreActuallyUnparseable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		spec    string
+		decodes bool
+	}{
+		{"token in a comment", chSchemaInvalidTokenInComment, true},
+		{"token in an unrelated scalar", chSchemaInvalidTokenInScalar, true},
+		{"token in another workflow", chSchemaInvalidOtherWorkflowGrooms, true},
+		{"syntax broken, token in a comment", chSyntaxBrokenTokenInComment, false},
+		{"syntax broken, token in data", chCorruptGroomingSpec, false},
+		{"syntax broken, no token", chCorruptPlainSpec, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(tc.spec)); err == nil {
+				t.Fatalf("fixture parses cleanly; it must be REJECTED for its M8 test to mean anything:\n%s", tc.spec)
+			}
+			var raw any
+			decodes := yaml.Unmarshal([]byte(tc.spec), &raw) == nil
+			if decodes != tc.decodes {
+				t.Errorf("fixture decodes as YAML = %v, want %v — it drives the wrong specCouldBeGrooming branch", decodes, tc.decodes)
+			}
+		})
+	}
+}
+
+// M8f/g/h are approval condition H4's INCIDENTAL-TOKEN boundary, the case the
+// first cut of this check got wrong: a corrupt NON-grooming spec whose bytes
+// carry `grooming_report` in a comment, in an unrelated scalar, or in a
+// DIFFERENT workflow is still a non-grooming run, and its prompt must be
+// byte-identical to the feature-disabled build.
+func TestGroomingPrompt_M8f_TokenInComment_ServesUnchanged(t *testing.T) {
+	chServesUnchanged(t, chSchemaInvalidTokenInComment, "")
+}
+
+func TestGroomingPrompt_M8g_TokenInUnrelatedScalar_ServesUnchanged(t *testing.T) {
+	chServesUnchanged(t, chSchemaInvalidTokenInScalar, "")
+}
+
+func TestGroomingPrompt_M8h_TokenInAnotherWorkflow_ServesUnchanged(t *testing.T) {
+	chServesUnchanged(t, chSchemaInvalidOtherWorkflowGrooms, "feature_change")
+}
+
+// M8i is the other half of M8h and the reason attribution is not just "always
+// fall open": the SAME corrupt document, read for the workflow that actually
+// declares the artifact, is REFUSED.
+func TestGroomingPrompt_M8i_TokenInOwnWorkflow_Refused(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServer(t, chSchemaInvalidOtherWorkflowGrooms, newCHFetcher(), 0)
+	s.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowID = "backlog_grooming"
+
+	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
+}
+
+// M8j: the document does not decode as YAML at all, so there is no structure
+// to attribute against and the byte-scan fallback runs — it must still skip a
+// FULL-LINE comment. Its positive counterpart is M8a, whose token is in data.
+func TestGroomingPrompt_M8j_SyntaxBrokenTokenInComment_ServesUnchanged(t *testing.T) {
+	chServesUnchanged(t, chSyntaxBrokenTokenInComment, "")
+}
+
+// M8k pins specCouldBeGrooming directly, so the attribution branches are
+// readable one line at a time rather than only through an HTTP fixture.
+func TestSpecCouldBeGrooming_Attribution(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		spec       string
+		workflowID string
+		want       bool
+	}{
+		{"token in a comment is not a node", chSchemaInvalidTokenInComment, "feature_change", false},
+		{"token in an unrelated scalar is not an artifact", chSchemaInvalidTokenInScalar, "feature_change", false},
+		{"another workflow's artifact is not mine", chSchemaInvalidOtherWorkflowGrooms, "feature_change", false},
+		{"my own workflow's artifact is mine", chSchemaInvalidOtherWorkflowGrooms, "backlog_grooming", true},
+		{"an absent workflow cannot be attributed", chSchemaInvalidOtherWorkflowGrooms, "not_declared", true},
+		{"syntax-broken with the token in a comment", chSyntaxBrokenTokenInComment, "feature_change", false},
+		{"syntax-broken with the token in data", chCorruptGroomingSpec, "backlog_grooming", true},
+		{"syntax-broken with no token at all", chCorruptPlainSpec, "feature_change", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := specCouldBeGrooming([]byte(tc.spec), tc.workflowID); got != tc.want {
+				t.Errorf("specCouldBeGrooming = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSpecCouldBeGrooming_ReuseWidensTheSearch: workflow-v2 same-document reuse
+// (`defaults` / `extends`) can hand a workflow a produces block from OUTSIDE
+// its own subtree, so attribution to the subtree alone is unsound there and the
+// search widens to the whole document rather than falling open.
+func TestSpecCouldBeGrooming_ReuseWidensTheSearch(t *testing.T) {
+	const reuseSpec = `version: "2"
+defaults:
+  stage:
+    produces:
+      - artifact: grooming_report
+workflows:
+  feature_change:
+    stages: "not-a-list"
+`
+	if !specCouldBeGrooming([]byte(reuseSpec), "feature_change") {
+		t.Error("a reuse-bearing document whose defaults declare the artifact fell open; inheritance can move it into this workflow")
+	}
+}
+
+// TestGroomingPrompt_L2Divergence_FailsClosed pins what happens when the
+// process-wide conventions loader answers DIFFERENTLY within one request. L2
+// re-resolves the declared charter path independently of L1 — deliberately, so
+// it still refuses on a deployment where L1 never ran (M6) — which means the
+// two resolutions can disagree. The divergence direction must be fail-closed: a
+// false refusal, never an unanchored serve.
+func TestGroomingPrompt_L2Divergence_FailsClosed(t *testing.T) {
+	t.Run("L2 sees a different charter path", func(t *testing.T) {
+		// L1 declares (and the fetcher serves) .fishhawk/charter.md; L2 then
+		// re-resolves to a DIFFERENT path, so the injected set carries no
+		// document at the path L2 requires.
+		calls := installConventionsSeq(t,
+			chConventionsAnswer{conv: chConventions(chCharterPath)},
+			chConventionsAnswer{conv: chConventions(chOtherPath)},
+		)
+		ff := newCHFetcher()
+		ff.extra[chOtherPath] = chOtherContent
+		s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, ff, 0)
+
+		chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonCharterNotInjected)
+		if *calls != 2 {
+			t.Errorf("conventions loader calls = %d, want 2 (L1 declares, L2 re-resolves independently)", *calls)
+		}
+	})
+
+	t.Run("L2 sees the loader fail", func(t *testing.T) {
+		calls := installConventionsSeq(t,
+			chConventionsAnswer{conv: chConventions(chCharterPath)},
+			chConventionsAnswer{err: errors.New("conventions fetch failed between L1 and L2")},
+		)
+		s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+
+		chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonConventionsUnavailable)
+		if *calls != 2 {
+			t.Errorf("conventions loader calls = %d, want 2", *calls)
+		}
+	})
+
+	t.Run("a stable loader still serves", func(t *testing.T) {
+		// The control: the same fixture with an unchanging loader serves a
+		// prompt carrying the charter, so the two refusals above are the
+		// DIVERGENCE and not the fixture.
+		installConventionsSeq(t, chConventionsAnswer{conv: chConventions(chCharterPath)})
+		s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+		if resp := chDecodePrompt(t, s, runID, stageID, priv); !strings.Contains(resp.Prompt, chCharterPath) {
+			t.Errorf("the stable-loader control did not serve the charter:\n%s", resp.Prompt)
+		}
+	})
 }
 
 // M9 (AC4): an over-cap charter renders repodoc's loud truncation marker AND
