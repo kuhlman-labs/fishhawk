@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -74,6 +75,25 @@ var groomingFieldNames = map[workmgmt.GroomingMutationKind]string{
 var closeStateReasons = map[workmgmt.GroomingMutationKind]string{
 	workmgmt.GroomingKindCloseDuplicate:  "duplicate",
 	workmgmt.GroomingKindCloseNotPlanned: "not_planned",
+}
+
+// labelAdder is the ADDITIVE label primitive, declared as an OPTIONAL
+// extension of API rather than a member of it.
+//
+// Only this one mutation kind needs it. Promoting it into API would make it a
+// compile-time obligation for EVERY API implementation — including the filing
+// and board-sync fakes that never add a label to an existing issue — so each
+// would have to grow a stub for a capability it cannot reach. The optional
+// shape keeps the requirement where the requirement is.
+//
+// *githubclient.Client satisfies it (the signature matches
+// Client.AddIssueLabels exactly), so the production provider takes the write
+// path; an API that does not is refused with a typed
+// ReasonNotImplemented UnavailableError rather than silently degrading to a
+// wholesale UpdateIssue PATCH, which is the lost-update shape groomingSetLabels
+// exists to avoid.
+type labelAdder interface {
+	AddIssueLabels(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, labels []string) ([]string, error)
 }
 
 // groomingUnavailable builds the typed capability-unavailable error for the
@@ -144,22 +164,46 @@ func (p *Provider) groomingPreflight(req workmgmt.GroomingMutationRequest) (forg
 
 // groomingSetLabels adds the proposed labels to the item's set.
 //
-// GitHub's PATCH replaces `labels` WHOLESALE, so this reads the current set
-// and sends the UNION — never the proposed labels alone, which would strip
-// every other label off the issue. A union identical to the current set is a
-// provider-side SKIP rather than a wasted write.
+// IT DOES NOT SEND A UNION THROUGH UpdateIssue, and that is the point
+// (#2237 review). GitHub's PATCH replaces `labels` WHOLESALE, so an
+// add-a-label caller built on it must read the current set and PATCH the
+// union — a read-modify-write whose window two concurrent applies can both
+// enter: each reads the same pre-state, each computes a union missing the
+// other's label, and the later PATCH replaces the earlier one's label away.
+// No amount of local guarding closes that, because the losing write is a
+// perfectly well-formed request.
+//
+// So the write goes through AddIssueLabels (POST .../labels), which merges
+// SERVER-SIDE: the payload carries ONLY the labels being added, GitHub unions
+// them into whatever the issue currently holds, and a concurrent add cannot be
+// clobbered because no client ever transmits the full set. The race is removed
+// structurally rather than guarded — the additive endpoint is also exactly the
+// additive operation a hygiene label fix means.
+//
+// The pre-read survives for two NON-load-bearing reasons: it reports the
+// pre-state as Observed, and it turns an already-present label into a
+// provider-side SKIP rather than a wasted round trip. Neither is a correctness
+// dependency — a stale read costs at most one redundant additive POST, which
+// GitHub treats as a no-op.
 func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingMutationRequest,
 	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
+	// Checked BEFORE the pre-read: an API without the additive primitive can
+	// never complete this mutation, so refusing up front costs no round trip
+	// and cannot report a partial observation for a write that never happens.
+	adder, ok := p.api.(labelAdder)
+	if !ok {
+		return nil, groomingUnavailable(workmgmt.ReasonNotImplemented,
+			"api client does not implement the additive AddIssueLabels primitive; a label mutation must not fall back to a wholesale UpdateIssue PATCH", nil)
+	}
 	issue, err := p.api.GetIssue(ctx, req.Target.Scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: read labels of #%d: %w", number, err)
 	}
 	have := map[string]struct{}{}
-	union := append([]string(nil), issue.Labels...)
 	for _, l := range issue.Labels {
 		have[l] = struct{}{}
 	}
-	added := 0
+	var add []string
 	for _, l := range req.After.List {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -169,30 +213,64 @@ func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingM
 			continue
 		}
 		have[l] = struct{}{}
-		union = append(union, l)
-		added++
+		add = append(add, l)
 	}
 	observed := workmgmt.GroomingValue{List: append([]string(nil), issue.Labels...)}
-	if added == 0 {
+	if len(add) == 0 {
 		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "labels already present",
 			ProviderResponse: "no label added; the issue already carries every proposed label",
 			Observed:         observed}, nil
 	}
-	if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
-		githubclient.UpdateIssueParams{Labels: &union}); err != nil {
-		return nil, fmt.Errorf("workmgmt/github: set labels on #%d: %w", number, err)
+	if _, err := adder.AddIssueLabels(ctx, req.Target.Scope, repo, number, add); err != nil {
+		return nil, fmt.Errorf("workmgmt/github: add labels to #%d: %w", number, err)
 	}
 	return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
-		ProviderResponse: fmt.Sprintf("set labels on #%d to %s", number, strings.Join(union, ", "))}, nil
+		ProviderResponse: fmt.Sprintf("added labels %s to #%d", strings.Join(add, ", "), number)}, nil
 }
 
-// groomingLinkEpic links the item as a sub-issue of the proposed parent epic,
-// reusing the same IssueNodeID + AddSubIssue path File's linkEpic uses.
+// groomingLinkEpic links the item as a sub-issue of the proposed parent epic
+// AND stamps the `Parent epic: #N` body marker.
+//
+// BOTH writes, because the write and the pre-dispatch read must observe the
+// SAME persisted relationship (#2237 review). The sub-issue graph is the real
+// relationship, but it is not what the idempotence diff can see:
+// workmgmt.WorkItemRecord exposes labels, body, state and board column — no
+// parent edge — so groomingObserved reads the body marker. A write that
+// persisted the link ONLY through AddSubIssue would therefore be invisible to
+// the next apply's read, and a second apply would re-dispatch a link that
+// already exists — AC7 broken for this kind, with the audit row claiming a
+// mutation that changed nothing.
+//
+// So the marker is not decoration: it is the projection of the relationship
+// onto the surface the reader can observe, exactly as depends_on already does
+// (ADR-047 / #1437), and it matches the `Parent epic: #N` body convention this
+// repository's issue bodies already carry.
+//
+// ORDER IS DELIBERATE: link first, marker second. A marker written before a
+// failed link would claim a relationship that does not exist and would
+// SUPPRESS the retry — the silent-wrong-state outcome. This way a failure
+// between the two is loud (an error, candidate recorded failed) and the next
+// apply re-attempts; the residual is that the re-attempted AddSubIssue may be
+// refused by GitHub as a duplicate edge, which surfaces as a failed candidate
+// rather than as a false "applied".
 func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMutationRequest,
 	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
 	parent := strings.TrimSpace(req.After.Scalar)
 	if parent == "" {
 		return nil, &UnsupportedGroomingKindError{Kind: req.Kind, Detail: "no parent epic reference was proposed"}
+	}
+	issue, err := p.api.GetIssue(ctx, req.Target.Scope, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: read body of #%d: %w", number, err)
+	}
+	observed := workmgmt.GroomingValue{Scalar: parseParentEpicMarker(issue.Body)}
+	updated := ensureParentEpicMarker(issue.Body, parent)
+	if updated == issue.Body {
+		// The relationship is already recorded on the surface the next read
+		// observes, so re-linking would be a duplicate dispatch.
+		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present",
+			ProviderResponse: fmt.Sprintf("#%d already records a parent epic", number),
+			Observed:         observed}, nil
 	}
 	childNodeID, err := p.api.IssueNodeID(ctx, req.Target.Scope, repo, number)
 	if err != nil {
@@ -201,8 +279,59 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 	if err := p.linkEpic(ctx, req.Target.Scope, repo, parent, childNodeID); err != nil {
 		return nil, err
 	}
-	return &workmgmt.GroomingMutationResult{Applied: true,
-		ProviderResponse: fmt.Sprintf("linked #%d as a sub-issue of %s", number, parent)}, nil
+	if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
+		githubclient.UpdateIssueParams{Body: &updated}); err != nil {
+		return nil, fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, err)
+	}
+	return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
+		ProviderResponse: fmt.Sprintf("linked #%d as a sub-issue of %s and recorded the parent-epic marker", number, parent)}, nil
+}
+
+// parentEpicMarkerRE matches the `Parent epic:` body marker line and captures
+// the reference. Line-anchored and case-insensitive, like
+// dependsOnMarkerRE, so the marker is found wherever it sits in the body. It
+// is the single source of truth for the marker shape, paired with
+// renderParentEpicMarker so the write and the read cannot drift.
+var parentEpicMarkerRE = regexp.MustCompile(`(?im)^Parent epic:\s*(.+)$`)
+
+// renderParentEpicMarker renders the marker line for ref as
+// `Parent epic: #N`, normalizing a bare `N` to `#N` so a suggested fix written
+// either way persists in ONE shape. Returns "" for an empty ref.
+func renderParentEpicMarker(ref string) string {
+	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
+	if s == "" {
+		return ""
+	}
+	return "Parent epic: #" + s
+}
+
+// ensureParentEpicMarker appends the marker line to body when body does not
+// already carry one. Idempotent: a body that already has a `Parent epic:` line
+// is returned UNCHANGED, so re-applying never double-stamps it — and the
+// caller reads that unchanged return as the already-linked skip.
+func ensureParentEpicMarker(body, ref string) string {
+	marker := renderParentEpicMarker(ref)
+	if marker == "" {
+		return body
+	}
+	if parentEpicMarkerRE.MatchString(body) {
+		return body
+	}
+	if strings.TrimSpace(body) == "" {
+		return marker
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + marker
+}
+
+// parseParentEpicMarker returns the reference on the FIRST `Parent epic:` body
+// line, or "" when the body carries none. Paired with renderParentEpicMarker
+// as the single source of truth for the marker round trip.
+func parseParentEpicMarker(body string) string {
+	m := parentEpicMarkerRE.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
 }
 
 // groomingAddDependsOn records a depends_on edge on the item's body, reusing
@@ -321,6 +450,16 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "already at target column",
 			ProviderResponse: fmt.Sprintf("#%d is already at %q", number, column), Observed: observed}, nil
 	}
+	// The ORIGINAL ctx, not boardCtx, and that is correct: placeIssueOnBoard
+	// OWNS the projects-token routing for its own calls — it re-applies
+	// githubclient.WithProjectsToken itself for a user-owned board, because a
+	// GitHub App installation token cannot write user-owned Projects v2
+	// (#1114). Wrapping here would be redundant, not safer. Recorded at the
+	// call site because the asymmetry with groomingSetField (which threads its
+	// own wrapped ctx into its own write) reads as a bug from a diff, and has
+	// been raised as one. TestApplyGroomingMutation_BoardWriteUsesTheProjectsToken
+	// asserts the write actually receives the opt-in, so this is a covered
+	// claim rather than a comment asserting its own correctness.
 	if err := placeIssueOnBoard(ctx, p.api, req.Target.Scope, proj, column,
 		&githubclient.CreatedIssue{Number: number, NodeID: nodeID}); err != nil {
 		return nil, err

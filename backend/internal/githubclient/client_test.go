@@ -4578,3 +4578,123 @@ func TestUpdateIssue_DecodeError(t *testing.T) {
 		t.Fatalf("expected decode error")
 	}
 }
+
+// --- AddIssueLabels (E54.5 / #2237 review: the additive label primitive) ---
+
+// TestAddIssueLabels_RequestShape is the transport pin for the ADDITIVE label
+// endpoint: method, path and the EXACT serialized body. The load-bearing
+// assertion is the PATH — POST .../issues/42/labels, not PATCH .../issues/42 —
+// because that difference is the whole lost-update fix: the dedicated endpoint
+// merges server-side, so the payload carries only the labels being ADDED and
+// no client ever transmits the full set to clobber a concurrent add with.
+func TestAddIssueLabels_RequestShape(t *testing.T) {
+	var gotMethod, gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"name":"type:bug"},{"name":"area:api"}]`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+
+	labels, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(9),
+		RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, 42, []string{"area:api"})
+	if err != nil {
+		t.Fatalf("AddIssueLabels: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/repos/kuhlman-labs/fishhawk/issues/42/labels" {
+		t.Errorf("path = %q, want the additive labels sub-resource", gotPath)
+	}
+	if gotBody != `{"labels":["area:api"]}` {
+		t.Errorf("body = %q, want ONLY the added label", gotBody)
+	}
+	// The endpoint answers with the issue's FULL resulting set, decoded
+	// through the same helper GetIssue uses.
+	if strings.Join(labels, ",") != "type:bug,area:api" {
+		t.Errorf("labels = %v, want the resulting set", labels)
+	}
+}
+
+// TestAddIssueLabels_EmptyIsRefusedLocally pins the guard: a POST that adds
+// nothing never reaches the wire (calls stays 0), so a caller bug is an error
+// rather than a silent no-op round trip.
+func TestAddIssueLabels_EmptyIsRefusedLocally(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(9),
+		RepoRef{Owner: "x", Name: "y"}, 42, nil)
+	if err == nil || !strings.Contains(err.Error(), "at least one label") {
+		t.Fatalf("err = %v, want an at-least-one-label refusal", err)
+	}
+	if calls != 0 {
+		t.Errorf("server saw %d calls, want 0 — the guard must refuse before dispatch", calls)
+	}
+}
+
+func TestAddIssueLabels_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, 1,
+		[]string{"l"}); err == nil {
+		t.Errorf("expected error for empty repo")
+	}
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 0, []string{"l"}); err == nil {
+		t.Errorf("expected error for zero issue number")
+	}
+	c2 := &Client{}
+	if _, err := c2.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 1, []string{"l"}); err == nil {
+		t.Errorf("expected error for missing TokenProvider")
+	}
+}
+
+// TestAddIssueLabels_ForgeErrorsAreClassified pins the error branches: a 404
+// (issue or label gone) and a 403 route through the same classifyStatus
+// chokepoint the rest of the client uses.
+func TestAddIssueLabels_ForgeErrorsAreClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"not found", http.StatusNotFound, ErrNotFound},
+		{"validation", http.StatusUnprocessableEntity, ErrValidation},
+		{"forbidden", http.StatusForbidden, ErrForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"message":"nope"}`)
+			}))
+			t.Cleanup(srv.Close)
+			c, _ := newTestClient(t, srv, nil)
+			_, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+				RepoRef{Owner: "x", Name: "y"}, 42, []string{"l"})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAddIssueLabels_DecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `not json`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	if _, err := c.AddIssueLabels(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 42, []string{"l"}); err == nil {
+		t.Fatalf("expected decode error")
+	}
+}

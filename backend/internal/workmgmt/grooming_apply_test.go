@@ -207,6 +207,18 @@ func (f *fakeGroomingSink) RecordGroomingApplyCompleted(_ context.Context, sum G
 // statefulGroomingForge is BOTH reader and mutator over one mutable item set:
 // a mutation it applies is visible to the next read. It is what makes the
 // re-apply idempotence test a real round trip rather than a canned reply.
+//
+// EVERY write below must be one the REAL provider performs. That is not a
+// stylistic constraint: a fake that persists something production does not
+// manufactures the evidence that a defect is absent, which is exactly how the
+// epic-link idempotence gap survived the first pass (#2237 review) — the fake
+// appended a `Parent epic:` body marker the provider never wrote, so the
+// idempotence test passed on behaviour that existed only in the test. The
+// marker write is now real (github/grooming.go::groomingLinkEpic), and the
+// provider-side round trip is pinned independently by
+// github/grooming_test.go::TestApplyGroomingMutation_EpicLinkReapplyIsANoOp,
+// so this fake mirrors a shipped write rather than inventing one. Adding a
+// case here without a corresponding provider write reopens that hole.
 type statefulGroomingForge struct {
 	items map[string]*WorkItemRecord
 	calls []GroomingMutationRequest
@@ -236,7 +248,8 @@ func (f *statefulGroomingForge) ApplyGroomingMutation(_ context.Context, req Gro
 	case GroomingKindLabelSet:
 		it.Labels = append(it.Labels, req.After.List...)
 	case GroomingKindEpicLink:
-		it.Body += "\nParent epic: " + req.After.Scalar
+		// Normalized to `#N`, as renderParentEpicMarker does.
+		it.Body += "\nParent epic: #" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
 	case GroomingKindDependsOnAdd:
 		it.Body += "\nDepends on: " + req.After.Scalar
 	case GroomingKindBoardPlace, GroomingKindIcebox:
@@ -522,7 +535,8 @@ func TestApplyGrooming_EveryMutationIsAudited(t *testing.T) {
 			hygieneEntry(2, "missing_label_namespace", "area:cli"), // failed
 			hygieneEntry(3, "missing_label_namespace", "area:doc"), // skipped (rejected)
 		},
-		VisionDrift: []plan.VisionDriftFlag{visionDriftEntry(4)}, // skipped (finding)
+		VisionDrift:              []plan.VisionDriftFlag{visionDriftEntry(4)},           // skipped (finding)
+		DecompositionSuggestions: []plan.DecompositionSuggestion{decompositionEntry(5)}, // skipped (report mode)
 	}
 	mut := &fakeGroomingMutator{errOn: func(req GroomingMutationRequest) error {
 		if req.EntryID == report.HygieneDefects[1].ID {
@@ -531,7 +545,10 @@ func TestApplyGrooming_EveryMutationIsAudited(t *testing.T) {
 		return nil
 	}}
 	sink := &fakeGroomingSink{}
-	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#5": {Number: 5, State: "open", OnBoard: true, BoardColumn: "Backlog"},
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, sink, GroomingApplyRequest{
 		Target: groomingTarget(),
 		Report: report,
 		Decisions: []GroomingDecision{
@@ -539,15 +556,18 @@ func TestApplyGrooming_EveryMutationIsAudited(t *testing.T) {
 			{EntryID: report.HygieneDefects[1].ID, Verdict: GroomingApproved},
 			{EntryID: report.HygieneDefects[2].ID, Verdict: GroomingRejected},
 			{EntryID: report.VisionDrift[0].ID, Verdict: GroomingApproved},
+			{EntryID: report.DecompositionSuggestions[0].ID, Verdict: GroomingApproved},
 		},
-		Modes:  map[string]GroomingMode{"hygiene": GroomingModeAuto, "scoping": GroomingModeGated},
-		States: groomingStates(),
+		Modes:        map[string]GroomingMode{"hygiene": GroomingModeAuto, "scoping": GroomingModeReport},
+		GateApproved: map[string]bool{report.DecompositionSuggestions[0].ID: true},
+		States:       groomingStates(),
+		IceboxColumn: "Icebox",
 	})
 	if err != nil {
 		t.Fatalf("ApplyGrooming: %v", err)
 	}
-	if len(sink.records) != 4 {
-		t.Fatalf("sink got %d records, want one per candidate (4): %+v", len(sink.records), sink.records)
+	if len(sink.records) != 5 {
+		t.Fatalf("sink got %d records, want one per candidate (5): %+v", len(sink.records), sink.records)
 	}
 	byID := map[string]GroomingMutationRecord{}
 	for _, r := range sink.records {
@@ -569,14 +589,33 @@ func TestApplyGrooming_EveryMutationIsAudited(t *testing.T) {
 	if finding := byID[report.VisionDrift[0].ID]; finding.SkipReason != GroomingSkipFindingOnly {
 		t.Errorf("vision-drift record = %+v, want finding_only", finding)
 	}
+	// The AUDITED report-mode row carries BOTH sides. AC3 says every candidate
+	// produces a record; a record that surfaces a proposal with no current
+	// value is not an account of what would change (#2237 review). The card
+	// sits at Backlog and the proposal is Icebox, so the two are
+	// distinguishable — and the entry is ALSO gate-approved, so this row is
+	// simultaneously the I1 report-mode-beats-gate-approval case.
+	surfaced := byID[report.DecompositionSuggestions[0].ID]
+	if surfaced.SkipReason != GroomingSkipReportMode {
+		t.Errorf("report-mode record = %+v, want skip reason %q", surfaced, GroomingSkipReportMode)
+	}
+	if surfaced.Before.Scalar != "Backlog" {
+		t.Errorf("report-mode record Before = %+v, want the card's CURRENT column Backlog", surfaced.Before)
+	}
+	if surfaced.After.Scalar != "Icebox" {
+		t.Errorf("report-mode record After = %+v, want the proposed column Icebox", surfaced.After)
+	}
+	if surfaced.ItemRef != "#5" {
+		t.Errorf("report-mode record ItemRef = %q, want #5", surfaced.ItemRef)
+	}
 	if len(sink.summaries) != 1 {
 		t.Fatalf("sink got %d summaries, want exactly 1", len(sink.summaries))
 	}
 	sum := sink.summaries[0]
-	if sum.Applied != 1 || sum.Failed != 1 || sum.Skipped != 2 {
-		t.Errorf("summary = %+v, want 1 applied / 1 failed / 2 skipped", sum)
+	if sum.Applied != 1 || sum.Failed != 1 || sum.Skipped != 3 {
+		t.Errorf("summary = %+v, want 1 applied / 1 failed / 3 skipped", sum)
 	}
-	if res.Summary.Applied != 1 || len(res.Applied) != 1 || len(res.Failed) != 1 || len(res.Skipped) != 2 {
+	if res.Summary.Applied != 1 || len(res.Applied) != 1 || len(res.Failed) != 1 || len(res.Skipped) != 3 {
 		t.Errorf("result buckets = %+v, want them to mirror the summary", res.Summary)
 	}
 }
@@ -876,6 +915,128 @@ func TestApplyGrooming_ReportModeSurfacesAndDoesNotAct(t *testing.T) {
 	if rec.ItemRef != "#1" {
 		t.Errorf("record ItemRef = %q, want the resolved item so the proposal is actionable", rec.ItemRef)
 	}
+	// SURFACING IS BOTH SIDES. Before must carry the CURRENT value, read
+	// through the reader on the real apply path — a proposal an operator
+	// cannot diff is not a usable proposal (#2237 review; the requirement
+	// this slice inherited from #2236's AC7). The reader is seeded with
+	// type:bug and the proposal is area:api, so the two are distinguishable:
+	// an implementation that returned before the read leaves Before EMPTY and
+	// fails here.
+	if len(rec.Before.List) != 1 || rec.Before.List[0] != "type:bug" {
+		t.Errorf("record Before = %+v, want the CURRENT label set {type:bug} read on the report-mode path", rec.Before)
+	}
+	// Committed state, not just the record: the read happened and the write
+	// did not.
+	if len(reader.reads) != 1 || reader.reads[0].Ref != "#1" {
+		t.Errorf("reader reads = %+v, want exactly one read of #1 to populate Before", reader.reads)
+	}
+	// The read is NOT an idempotence diff — the mode settled this candidate,
+	// so the audit row must not claim a diff decided it.
+	if rec.IdempotenceChecked {
+		t.Error("IdempotenceChecked = true on a report-mode record; the MODE settled it, not a diff")
+	}
+}
+
+// TestApplyGrooming_ReportModeSurfacesBeforeDespiteAReadFailure pins the
+// degradation direction of that read: report mode dispatches nothing whatever
+// the reader says, so a reader failure must NOT fail the candidate — it leaves
+// Before empty and the proposal is still surfaced. Failing closed here would
+// convert a harmless read outage into a lost proposal.
+func TestApplyGrooming_ReportModeSurfacesBeforeDespiteAReadFailure(t *testing.T) {
+	report := &plan.GroomingReport{
+		HygieneDefects: []plan.HygieneDefect{hygieneEntry(1, "missing_label_namespace", "area:api")},
+	}
+	mut := &fakeGroomingMutator{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{err: errors.New("reader down")},
+		&fakeGroomingSink{}, GroomingApplyRequest{
+			Target:    groomingTarget(),
+			Report:    report,
+			Decisions: approveAll(report),
+			Modes:     map[string]GroomingMode{"hygiene": GroomingModeReport},
+			States:    groomingStates(),
+		})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, report.HygieneDefects[0].ID)
+	if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipReportMode {
+		t.Fatalf("record = %+v, want skipped/%s — a read failure must not fail a report-mode candidate", rec, GroomingSkipReportMode)
+	}
+	if len(rec.Before.List) != 0 || rec.Before.Scalar != "" {
+		t.Errorf("record Before = %+v, want empty when the read failed", rec.Before)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator dispatched %d, want 0", len(mut.calls))
+	}
+}
+
+// TestApplyGrooming_SurfacedRecordNamesItsSubjectWhenResolutionSkips is the
+// surfaced-but-unresolvable combination (#2237 review): a report-mode
+// candidate whose request resolution ALSO ends in a skip. The mode still
+// prevents dispatch, but the surfaced row must carry whatever resolution did
+// settle rather than dropping it — a proposal with no subject is not
+// actionable.
+//
+// The case is an ICEBOX candidate under report mode with NO icebox column
+// configured: the item ref resolves, the target column does not.
+func TestApplyGrooming_SurfacedRecordNamesItsSubjectWhenResolutionSkips(t *testing.T) {
+	ice := decompositionEntry(8)
+	report := &plan.GroomingReport{DecompositionSuggestions: []plan.DecompositionSuggestion{ice}}
+	mut := &fakeGroomingMutator{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, &fakeGroomingSink{},
+		GroomingApplyRequest{
+			Target:    groomingTarget(),
+			Report:    report,
+			Decisions: approveAll(report),
+			Modes:     map[string]GroomingMode{"scoping": GroomingModeReport},
+			States:    groomingStates(),
+			// IceboxColumn deliberately absent: resolution skips.
+		})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, ice.ID)
+	if rec.SkipReason != GroomingSkipReportMode {
+		t.Fatalf("skip reason = %q, want %q — report mode outranks the resolution skip", rec.SkipReason, GroomingSkipReportMode)
+	}
+	if rec.ItemRef != "#8" {
+		t.Errorf("record ItemRef = %q, want the resolved subject #8 even though resolution ended in a skip", rec.ItemRef)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator dispatched %d, want 0", len(mut.calls))
+	}
+}
+
+// TestApplyGrooming_RefusedRecordNamesItsSubjectToo is the same population
+// rule on the NON-report path: an icebox candidate refused for a missing
+// column is audited with its subject, so the operator reading the audit row
+// knows which item was not parked.
+func TestApplyGrooming_RefusedRecordNamesItsSubjectToo(t *testing.T) {
+	ice := decompositionEntry(8)
+	report := &plan.GroomingReport{DecompositionSuggestions: []plan.DecompositionSuggestion{ice}}
+	mut := &fakeGroomingMutator{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, &fakeGroomingSink{},
+		GroomingApplyRequest{
+			Target:       groomingTarget(),
+			Report:       report,
+			Decisions:    approveAll(report),
+			Modes:        map[string]GroomingMode{"scoping": GroomingModeAuto},
+			States:       groomingStates(),
+			GateApproved: map[string]bool{ice.ID: true},
+		})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, ice.ID)
+	if rec.SkipReason != GroomingSkipIceboxColumnUnavailable {
+		t.Fatalf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipIceboxColumnUnavailable)
+	}
+	if rec.ItemRef != "#8" {
+		t.Errorf("record ItemRef = %q, want the resolved subject #8 on a refused candidate", rec.ItemRef)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator dispatched %d, want 0", len(mut.calls))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1216,75 @@ func TestApplyGrooming_ReApplyingAnAppliedReportIsANoOp(t *testing.T) {
 		if !rec.IdempotenceChecked {
 			t.Errorf("%s: IdempotenceChecked = false, want the diff to have settled it", rec.EntryID)
 		}
+	}
+}
+
+// TestApplyGrooming_MarkerRefShapeDoesNotDefeatIdempotence pins the other half
+// of the epic-link idempotence fix (#2237 review): the write and the read must
+// agree not only on WHERE the relationship is persisted but on its SHAPE.
+//
+// The provider normalizes the marker it stamps to `#N`, so an agent that
+// suggested the parent as a bare `1437` produces an observed `#1437` against a
+// proposed `1437`. A raw string compare treats those as different and
+// re-dispatches a link that already exists — the same AC7 break, one layer up.
+// The corpus pairs an already-marked body with a bare-ref proposal for BOTH
+// body-marker kinds.
+func TestApplyGrooming_MarkerRefShapeDoesNotDefeatIdempotence(t *testing.T) {
+	epic := hygieneEntry(1, "unlinked_parent_epic", "1437") // bare, no '#'
+	dep := dependencyEntry(2, 3)
+	report := &plan.GroomingReport{
+		HygieneDefects:  []plan.HygieneDefect{epic},
+		DependencyEdges: []plan.DependencyEdge{dep},
+	}
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		// Already carrying the markers, in the '#N' shape the provider writes.
+		"#1": {Number: 1, State: "open", Body: "Summary\n\nParent epic: #1437"},
+		"#2": {Number: 2, State: "open", Body: "Summary\n\nDepends on: #3"},
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if len(mut.calls) != 0 {
+		t.Fatalf("dispatched %d mutations, want ZERO — both relationships are already recorded: %v", len(mut.calls), mut.kinds())
+	}
+	for _, id := range []string{epic.ID, dep.ID} {
+		if rec := recordFor(t, res, id); rec.SkipReason != GroomingSkipAlreadyApplied {
+			t.Errorf("%s: skip reason = %q, want %q", id, rec.SkipReason, GroomingSkipAlreadyApplied)
+		}
+	}
+}
+
+// TestGroomingNormalizeRef_LeavesNonRefsAlone is the over-broadness guard on
+// that normalization: it must collapse `1437` and `#1437` onto one value and
+// NOTHING else. A normalizer that mapped two genuinely different values
+// together would suppress a real mutation.
+func TestGroomingNormalizeRef_LeavesNonRefsAlone(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"1437", "#1437"},
+		{"#1437", "#1437"},
+		{"  #1437  ", "#1437"},
+		{"", ""},
+		{"#", "#"},
+		{"kuhlman-labs/fishhawk#1437", "kuhlman-labs/fishhawk#1437"},
+		{"1437a", "1437a"},
+		{"#12x", "#12x"},
+	}
+	for _, tc := range cases {
+		if got := groomingNormalizeRef(tc.in); got != tc.want {
+			t.Errorf("groomingNormalizeRef(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// The pair that must NOT collapse, stated as behaviour rather than shape.
+	if groomingNormalizeRef("1437") == groomingNormalizeRef("1438") {
+		t.Error("normalization collapsed two different issue numbers")
 	}
 }
 

@@ -36,8 +36,8 @@ Why a GitHub App installation token can't board Project #7:
 
 | Kind | Primitive | Notes |
 |---|---|---|
-| `label_set` | `GetIssue` → `UpdateIssue(labels)` | Sends the **union**. GitHub's PATCH replaces `labels` wholesale, so an add-one-label mutation must read the current set first. A label already present is a provider-side skip, not a write. |
-| `epic_link` | `IssueNodeID` ×2 → `AddSubIssue` | The same sub-issues path `File`'s `linkEpic` uses. Never a PATCH. |
+| `label_set` | `GetIssue` → `AddIssueLabels` (POST `.../labels`) | **Additive, not a union PATCH — see below.** The payload carries only the labels being added; GitHub merges server-side. A label already present is a provider-side skip, not a write. |
+| `epic_link` | `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | The sub-issues path `File`'s `linkEpic` uses, **plus** the `Parent epic: #N` body marker — see below. A body already carrying the marker is a skip. |
 | `depends_on_add` | `GetIssue` → `ensureDependsOnMarker` → `UpdateIssue(body)` | Reuses the existing idempotent body-marker helper; a body already carrying a marker is a skip. |
 | `close_duplicate` | `UpdateIssue(state=closed, state_reason=duplicate)` | **Destructive.** |
 | `close_not_planned` | `UpdateIssue(state=closed, state_reason=not_planned)` | **Destructive.** Never `completed`, which would misreport a descoped item as delivered work. |
@@ -46,6 +46,26 @@ Why a GitHub App installation token can't board Project #7:
 | `field_set` | `ProjectFields("Estimate")` → `SetProjectItemSingleSelect` | The `missing_estimate` hygiene defect's fix. |
 | `priority_set` | `ProjectFields("Priority")` → `SetProjectItemSingleSelect` | |
 | `rank_set` | `ProjectFields("Rank")` → `SetProjectItemSingleSelect` | **A field write, not a queue reorder — see below.** |
+
+### `label_set` is ADDITIVE because a union PATCH is a lost update
+
+GitHub's issue PATCH replaces `labels` **wholesale**. An add-a-label caller built on it must read the current set and PATCH the union — a read-modify-write whose window two concurrent applies can both enter: each reads the same pre-state, each computes a union missing the other's label, and the later PATCH replaces the earlier one's label away. No local guard closes that, because the losing write is a perfectly well-formed request.
+
+So the write goes through `githubclient.AddIssueLabels` (`POST /repos/{o}/{r}/issues/{n}/labels`), which merges **server-side**: only the added labels cross the wire, and no client ever transmits the full set. The race is removed structurally rather than guarded, and the additive endpoint is exactly the additive operation a hygiene label fix means. The surviving `GetIssue` pre-read is **not** a correctness dependency — it reports the pre-state as `Observed` and turns an already-present label into a skip; a stale read costs at most one redundant additive POST, which GitHub treats as a no-op.
+
+Pinned by `TestApplyGroomingMutation_CompetingLabelAddsBothSurvive`, whose fake models **both** write shapes and forces both racers to read before either writes, so reverting to the union PATCH turns it red on the committed label set — not on an error value.
+
+`AddIssueLabels` is declared as the **optional** `labelAdder` extension of this package's `API` interface, not as a member of it: only this one mutation kind needs the primitive, so promoting it would force every `API` implementation that exercises only the filing and board-sync paths to carry a stub for a capability it never reaches. `*githubclient.Client` satisfies both, so production dispatch is unaffected; an `API` that lacks it is refused before the pre-read with a typed `ReasonNotImplemented` `UnavailableError` rather than falling back to the union PATCH (`TestApplyGroomingMutation_LabelSetWithoutTheAdditivePrimitiveIsRefused`).
+
+### `epic_link` persists the sub-issue edge AND the body marker
+
+The sub-issue graph is the real relationship, but it is not what the idempotence diff can see: `workmgmt.WorkItemRecord` exposes labels, body, state and board column — **no parent edge** — so `groomingObserved` reads the `Parent epic:` body marker. A write that persisted the link only through `AddSubIssue` would be invisible to the next apply's read, and a second apply would re-dispatch a link that already exists (AC7 broken for this kind, with the audit row claiming a mutation that changed nothing). That was the shipped defect in #2237's first pass, and the workmgmt-layer fake hid it by appending the marker itself.
+
+So `groomingLinkEpic` writes both, and the marker is the projection of the relationship onto the surface the reader can observe — the same mechanism `depends_on` already uses (ADR-047 / #1437), matching the `Parent epic: #N` body convention this repository's issue bodies already carry. `renderParentEpicMarker` normalizes a bare `1437` to `#1437`, and `workmgmt.groomingSatisfied` compares the two marker kinds' refs normalized, so a suggested fix written either way still diffs equal.
+
+**Order is deliberate: link first, marker second.** A marker written before a failed link would claim a relationship that does not exist and would *suppress* the retry. This way a failure between the two is loud (an error, candidate recorded failed) and the next apply re-attempts; the residual is that the re-attempted `AddSubIssue` may be refused by GitHub as a duplicate edge, which surfaces as a failed candidate rather than as a false "applied".
+
+Pinned by `TestApplyGroomingMutation_EpicLinkReapplyIsANoOp`, a **real-provider** round trip: the first call's written body is fed back as the issue's body and the second call must dispatch nothing.
 
 ### `rank_set` and `priority_set` are FIELD writes, not positional reordering (I3)
 
@@ -68,7 +88,8 @@ Two distinct cases, both **typed refusals**, never a silent no-op and never a mi
 
 The `httptest` fixtures pin the **request shape this provider emits** — method, path, exact serialized body, call count, and which calls are *not* made. They do **not** prove the forge accepts that shape. Specifically:
 
-- **Verified locally:** the label union; the `duplicate` / `not_planned` state_reason values are the ones we *send*; the pointer-omission invariant; the board pre-check ordering; every typed refusal; and the end-to-end core → provider → transport seam (`TestApplyGrooming_EndToEndThroughGitHubProvider`), which asserts on the requests an httptest forge actually received.
-- **Requires live validation:** whether GitHub **honours** the proposed `state_reason` values on close, and whether a real board carries `Rank` / `Priority` / `Estimate` as single-select fields with the proposed option names. Neither is decidable against a fixture, which accepts whatever it is handed.
+- **Verified locally:** the additive label POST's method, path and exact payload; the `duplicate` / `not_planned` state_reason values are the ones we *send*; the pointer-omission invariant; the epic-link marker round trip; the board pre-check ordering; every typed refusal; and the end-to-end core → provider → transport seam (`TestApplyGrooming_EndToEndThroughGitHubProvider`), which asserts on the requests an httptest forge actually received.
+- **Verified against the fake, not the wire:** the projects-token credential routing on a board write. `groomingMoveCard` passes the *unwrapped* `ctx` to `placeIssueOnBoard`, which re-applies `WithProjectsToken` itself for a user-owned board (#1114) — an asymmetry with `groomingSetField` that reads as a bug from a diff and has been raised as one twice. The httptest fixture accepts either credential and cannot discriminate, so the claim is asserted where it *is* observable: `TestApplyGroomingMutation_BoardWriteUsesTheProjectsToken` reads the context flag recorded by the fake at `AddProjectItem` / `SetProjectItemSingleSelect`, paired with an org-owned case proving the opt-in is scoped rather than unconditional. What remains unproven is that the *real* transport attaches the right bearer for that flag — a `githubclient` property, not a grooming one.
+- **Requires live validation:** whether GitHub **honours** the proposed `state_reason` values on close; whether a real board carries `Rank` / `Priority` / `Estimate` as single-select fields with the proposed option names; and whether a re-attempted `AddSubIssue` on an already-linked child is refused or idempotent (the epic-link partial-failure residual above). None is decidable against a fixture, which accepts whatever it is handed.
 
 The acceptance stage cannot close that gap either: no run can select the grooming workflow (its non-diff trigger form matches nothing v0 mints), so an acceptance pass on this slice short-circuits with every criterion skipped, as it did on #2234. This section is the honest record in place of coverage that will not exist.

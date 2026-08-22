@@ -918,6 +918,83 @@ func (c *Client) UpdateIssue(ctx context.Context, scope forge.CredentialScope, r
 	}, nil
 }
 
+// AddIssueLabels ADDS labels to an issue without touching the ones already on
+// it.
+//
+//	POST /repos/{owner}/{repo}/issues/{number}/labels
+//
+// This is the ADDITIVE counterpart to UpdateIssue's wholesale `labels`
+// replacement, and it exists because the replacement is a LOST-UPDATE
+// structure (E54.5 / #2237 review). An add-a-label caller built on PATCH must
+// read the current set and send the union; two such callers racing on one
+// issue each compute a union from the SAME pre-state, and the later PATCH
+// replaces the earlier one's label away. GitHub's dedicated labels endpoint
+// merges SERVER-SIDE, so there is no read-modify-write window to lose an
+// update in — the race is removed structurally rather than guarded against,
+// which is why a grooming label mutation dispatches through here and not
+// through UpdateIssue.
+//
+// Adding a label the issue already carries is a no-op on GitHub's side, so a
+// caller need not pre-filter for correctness (the grooming provider still
+// reads first, to report the pre-state and to skip a pointless round trip).
+//
+// Requires the App to hold `issues:write`. Returns the issue's resulting label
+// set. An empty labels slice is refused locally rather than sent: a POST that
+// adds nothing is a caller bug, not a no-op worth a round trip.
+func (c *Client) AddIssueLabels(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int, labels []string) ([]string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	if len(labels) == 0 {
+		return nil, errors.New("githubclient: add issue labels requires at least one label")
+	}
+
+	raw, err := json.Marshal(map[string]any{"labels": labels})
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal issue labels: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/issues/" + url.PathEscape(fmt.Sprintf("%d", number)) +
+		"/labels")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: add issue labels: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("add issue labels", resp); err != nil {
+		return nil, err
+	}
+
+	// The endpoint answers with the issue's FULL resulting label array, not
+	// just the added ones — decoded through the same decodeLabelNames helper
+	// GetIssue uses so the string/object label shapes cannot drift apart.
+	var body []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode issue labels: %w", err)
+	}
+	return decodeLabelNames(body), nil
+}
+
 // GetBranchProtection fetches classic branch protection for a
 // branch.
 //

@@ -21,7 +21,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,12 +89,17 @@ func groomingRequest(kind workmgmt.GroomingMutationKind, after workmgmt.Grooming
 // Per-kind dispatch
 // ---------------------------------------------------------------------------
 
-// TestApplyGroomingMutation_LabelSetSendsTheUnion is the wholesale-replace
-// guard: GitHub's PATCH REPLACES the label array, so the provider must read
-// the current set and send the UNION. The fixture issue already carries
-// type:feature; the assertion is on the WRITTEN params, so a provider that
-// sent only the proposed label (silently stripping type:feature) fails here.
-func TestApplyGroomingMutation_LabelSetSendsTheUnion(t *testing.T) {
+// TestApplyGroomingMutation_LabelSetUsesTheAdditiveEndpoint is the
+// lost-update guard (#2237 review). The label write must go through
+// AddIssueLabels (POST .../labels), which merges SERVER-SIDE, and must NOT go
+// through a read-union-PATCH — the payload therefore carries ONLY the new
+// label, never the full set.
+//
+// Two committed-state assertions carry it: the additive call was made with
+// exactly the added label, and ZERO UpdateIssue PATCHes were sent. A provider
+// that reverted to the union PATCH fails the second even though its final
+// label set would look identical in a single-writer test.
+func TestApplyGroomingMutation_LabelSetUsesTheAdditiveEndpoint(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
 		groomingRequest(workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{"area:backend"}}))
@@ -102,26 +109,126 @@ func TestApplyGroomingMutation_LabelSetSendsTheUnion(t *testing.T) {
 	if !res.Applied {
 		t.Fatalf("result = %+v, want applied", res)
 	}
-	if len(api.updateIssueCalls) != 1 {
-		t.Fatalf("UpdateIssue calls = %d, want 1", len(api.updateIssueCalls))
+	if len(api.addLabelsCalls) != 1 {
+		t.Fatalf("AddIssueLabels calls = %d, want 1", len(api.addLabelsCalls))
 	}
-	call := api.updateIssueCalls[0]
+	call := api.addLabelsCalls[0]
 	if call.number != 2237 {
 		t.Errorf("number = %d, want 2237", call.number)
 	}
-	if call.params.Labels == nil {
-		t.Fatal("Labels param is nil; the label mutation must set it")
+	// ONLY the added label. A union payload here would mean the caller is
+	// still transmitting the whole set, which is the clobbering shape.
+	if got := strings.Join(call.labels, ","); got != "area:backend" {
+		t.Errorf("labels sent = %q, want ONLY the added area:backend — a union payload is the lost-update shape", got)
 	}
-	if got := strings.Join(*call.params.Labels, ","); got != "type:feature,area:backend" {
-		t.Errorf("labels written = %q, want the UNION type:feature,area:backend", got)
-	}
-	// The pointer-omission invariant at the provider layer: a label mutation
-	// must not also rewrite the body or the state.
-	if call.params.Body != nil || call.params.State != nil || call.params.StateReason != nil {
-		t.Errorf("label mutation also set body/state/state_reason: %+v", call.params)
+	if len(api.updateIssueCalls) != 0 {
+		t.Errorf("a label mutation sent %d wholesale UpdateIssue PATCH(es): %+v",
+			len(api.updateIssueCalls), api.updateIssueCalls)
 	}
 	if got := strings.Join(res.Observed.List, ","); got != "type:feature" {
 		t.Errorf("Observed = %v, want the pre-write label set", res.Observed.List)
+	}
+}
+
+// concurrentLabelAPI models the two candidate write shapes over one mutable
+// label set, with a BARRIER that forces both racers to complete their reads
+// before either writes — the interleaving that produces a lost update, made
+// deterministic instead of hoped for.
+//
+//   - AddIssueLabels UNIONS into the stored set (GitHub's server-side merge).
+//   - UpdateIssue REPLACES it (GitHub's PATCH semantics).
+//
+// Both are modelled so the test discriminates: the additive path keeps both
+// racers' labels, the replacing path keeps only the last writer's union.
+type concurrentLabelAPI struct {
+	*fakeAPI
+	mu      sync.Mutex
+	labels  []string
+	barrier *sync.WaitGroup
+}
+
+func (c *concurrentLabelAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	number int) (*githubclient.Issue, error) {
+	c.mu.Lock()
+	snapshot := append([]string(nil), c.labels...)
+	c.mu.Unlock()
+	// Both racers read BEFORE either writes. Without this the test would pass
+	// under either shape whenever the goroutines happened to serialize.
+	c.barrier.Done()
+	c.barrier.Wait()
+	return &githubclient.Issue{Number: number, State: "open", Labels: snapshot}, nil
+}
+
+func (c *concurrentLabelAPI) AddIssueLabels(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	_ int, labels []string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, l := range labels {
+		if !slices.Contains(c.labels, l) {
+			c.labels = append(c.labels, l)
+		}
+	}
+	return append([]string(nil), c.labels...), nil
+}
+
+func (c *concurrentLabelAPI) UpdateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef,
+	number int, p githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.Labels != nil {
+		c.labels = append([]string(nil), *p.Labels...)
+	}
+	return &githubclient.Issue{Number: number, Labels: append([]string(nil), c.labels...)}, nil
+}
+
+func (c *concurrentLabelAPI) current() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.labels...)
+}
+
+// TestApplyGroomingMutation_CompetingLabelAddsBothSurvive is the concurrency
+// control the review asked for (#2237 review): two applies adding DIFFERENT
+// labels to the SAME issue, forced to read the same pre-state, must both
+// survive.
+//
+// This is a genuine counterfactual vehicle rather than an assertion of intent:
+// the fake models BOTH write shapes, so swapping groomingSetLabels back to a
+// read-union-PATCH makes the later writer replace the earlier one's label and
+// this test goes red on committed state — the stored label set — not on an
+// error value.
+func TestApplyGroomingMutation_CompetingLabelAddsBothSurvive(t *testing.T) {
+	var barrier sync.WaitGroup
+	barrier.Add(2)
+	api := &concurrentLabelAPI{
+		fakeAPI: groomingAPI("Backlog", true),
+		labels:  []string{"type:feature"},
+		barrier: &barrier,
+	}
+	provider := New(api)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, label := range []string{"area:backend", "area:cli"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = provider.ApplyGroomingMutation(context.Background(),
+				groomingRequest(workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{label}}))
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent apply %d: %v", i, err)
+		}
+	}
+
+	got := api.current()
+	for _, want := range []string{"type:feature", "area:backend", "area:cli"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("label %q was lost; final set = %v — a concurrent add clobbered it", want, got)
+		}
 	}
 }
 
@@ -140,6 +247,41 @@ func TestApplyGroomingMutation_LabelSetAlreadyPresentSkips(t *testing.T) {
 	if len(api.updateIssueCalls) != 0 {
 		t.Errorf("UpdateIssue calls = %d, want 0 — an already-present label must not be written",
 			len(api.updateIssueCalls))
+	}
+}
+
+// noLabelAdderAPI satisfies API by embedding it, and deliberately does NOT
+// implement the optional labelAdder extension — the promoted method set is
+// exactly API's, and AddIssueLabels is no longer a member. The embedded value
+// is nil because no method is ever reached: the refusal is decided before the
+// pre-read.
+type noLabelAdderAPI struct{ API }
+
+// TestApplyGroomingMutation_LabelSetWithoutTheAdditivePrimitiveIsRefused pins
+// the optional-capability refusal. AddIssueLabels is an OPTIONAL extension of
+// API, so an implementation can lack it — and when it does, the label mutation
+// must fail LOUD with a typed not-implemented UnavailableError. The outcome
+// that must not be possible is a silent fallback to a wholesale
+// UpdateIssue(labels) PATCH, which is the lost-update shape
+// TestApplyGroomingMutation_CompetingLabelAddsBothSurvive guards against.
+func TestApplyGroomingMutation_LabelSetWithoutTheAdditivePrimitiveIsRefused(t *testing.T) {
+	res, err := New(&noLabelAdderAPI{}).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{"area:backend"}}))
+	if err == nil {
+		t.Fatalf("ApplyGroomingMutation = %+v, want a refusal", res)
+	}
+	if res != nil {
+		t.Errorf("result = %+v, want nil alongside the error", res)
+	}
+	var unavailable *workmgmt.UnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if unavailable.Reason != workmgmt.ReasonNotImplemented {
+		t.Errorf("Reason = %q, want %q", unavailable.Reason, workmgmt.ReasonNotImplemented)
+	}
+	if unavailable.Capability != workmgmt.GroomingCapability {
+		t.Errorf("Capability = %q, want %q", unavailable.Capability, workmgmt.GroomingCapability)
 	}
 }
 
@@ -182,9 +324,17 @@ func TestApplyGroomingMutation_CloseKinds(t *testing.T) {
 	}
 }
 
-// TestApplyGroomingMutation_EpicLinkUsesSubIssues pins the epic link to the
-// same IssueNodeID + AddSubIssue path File's linkEpic uses.
-func TestApplyGroomingMutation_EpicLinkUsesSubIssues(t *testing.T) {
+// TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker pins the
+// epic link to the IssueNodeID + AddSubIssue path File's linkEpic uses AND to
+// the `Parent epic: #N` body marker.
+//
+// BOTH, because the write and the pre-dispatch read must observe the same
+// persisted relationship (#2237 review). workmgmt.WorkItemRecord exposes no
+// parent edge, so the idempotence diff reads the body marker; a write that
+// persisted the link only through AddSubIssue is invisible to the next
+// apply's read and re-dispatches. The marker assertion is the proof that the
+// two agree.
+func TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
 		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
@@ -200,8 +350,150 @@ func TestApplyGroomingMutation_EpicLinkUsesSubIssues(t *testing.T) {
 	if api.nodeIDNumber != 1437 {
 		t.Errorf("last IssueNodeID number = %d, want the parent epic 1437", api.nodeIDNumber)
 	}
+	if len(api.updateIssueCalls) != 1 {
+		t.Fatalf("UpdateIssue calls = %d, want 1 — the marker write the next read observes", len(api.updateIssueCalls))
+	}
+	call := api.updateIssueCalls[0]
+	if call.params.Body == nil {
+		t.Fatal("Body param is nil; the epic link must persist the marker the read observes")
+	}
+	if !strings.Contains(*call.params.Body, "Parent epic: #1437") {
+		t.Errorf("body written = %q, want it to carry `Parent epic: #1437`", *call.params.Body)
+	}
+	// The pointer-omission invariant: a marker write must not touch labels or
+	// state.
+	if call.params.Labels != nil || call.params.State != nil || call.params.StateReason != nil {
+		t.Errorf("epic link also set labels/state/state_reason: %+v", call.params)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkReapplyIsANoOp is the REAL-PROVIDER
+// re-apply the review demanded (#2237 review). The first call's marker write
+// is fed back as the issue's body — a genuine round trip through the shipped
+// code, not a fake that appends a marker production never writes — and the
+// second call must dispatch NOTHING.
+//
+// The previous idempotence coverage lived only in workmgmt's stateful fake,
+// which stamped the marker itself. That did not merely miss the defect; it
+// manufactured the evidence that the defect was absent. This test cannot: it
+// reads the body the provider ACTUALLY wrote.
+func TestApplyGroomingMutation_EpicLinkReapplyIsANoOp(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	provider := New(api)
+	req := groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"})
+
+	first, err := provider.ApplyGroomingMutation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if !first.Applied {
+		t.Fatalf("first apply = %+v, want applied", first)
+	}
+	if len(api.updateIssueCalls) != 1 || api.updateIssueCalls[0].params.Body == nil {
+		t.Fatalf("first apply wrote no body: %+v", api.updateIssueCalls)
+	}
+
+	// Persist what the provider wrote — the round trip.
+	api.getIssues[2237].Body = *api.updateIssueCalls[0].params.Body
+	api.updateIssueCalls = nil
+	api.subParent, api.subChild = "", ""
+
+	second, err := provider.ApplyGroomingMutation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if !second.Skipped || second.Applied {
+		t.Errorf("second apply = %+v, want skipped — the relationship is already persisted", second)
+	}
 	if len(api.updateIssueCalls) != 0 {
-		t.Errorf("an epic link must not PATCH the issue: %+v", api.updateIssueCalls)
+		t.Errorf("re-apply PATCHed the issue again: %+v", api.updateIssueCalls)
+	}
+	if api.subParent != "" || api.subChild != "" {
+		t.Errorf("re-apply called AddSubIssue again (parent=%q child=%q); the link already exists",
+			api.subParent, api.subChild)
+	}
+	if second.Observed.Scalar != "#1437" {
+		t.Errorf("Observed = %+v, want the already-persisted parent #1437", second.Observed)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips seeds the
+// already-linked state BY CONSTRUCTION — the body carries the marker before
+// the first call — so the assertion that reddens when the pre-read skip is
+// removed is the BEHAVIOURAL one (nothing was written) rather than a fixture
+// step. It is the read half of the same write-and-read-must-agree property
+// TestApplyGroomingMutation_EpicLinkReapplyIsANoOp proves end to end.
+func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: #1437"
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if !res.Skipped || res.Applied {
+		t.Errorf("result = %+v, want skipped — the relationship is already recorded", res)
+	}
+	if len(api.updateIssueCalls) != 0 {
+		t.Errorf("an already-linked epic still PATCHed the issue: %+v", api.updateIssueCalls)
+	}
+	if api.subParent != "" || api.subChild != "" {
+		t.Errorf("an already-linked epic still called AddSubIssue (parent=%q child=%q)", api.subParent, api.subChild)
+	}
+	if res.Observed.Scalar != "#1437" {
+		t.Errorf("Observed = %+v, want the already-persisted parent #1437", res.Observed)
+	}
+}
+
+// TestApplyGroomingMutation_BoardWriteUsesTheProjectsToken closes the routing
+// gap two reviewers flagged and neither could decide from a diff (#2237
+// review): groomingMoveCard passes the ORIGINAL ctx to placeIssueOnBoard while
+// threading boardCtx through its reads, which reads as a wrong-credential bug.
+//
+// It is not one — placeIssueOnBoard re-applies WithProjectsToken itself for a
+// user-owned board (#1114) — but the claim was uncovered, so this asserts it
+// where it matters: at the WRITE. The fake records the context flag on
+// AddProjectItem and SetProjectItemSingleSelect, which the httptest fixture
+// (accepting either credential) cannot discriminate.
+func TestApplyGroomingMutation_BoardWriteUsesTheProjectsToken(t *testing.T) {
+	// Off-board card + empty expected-source set: the placement proceeds, so
+	// the write is genuinely reached.
+	api := groomingAPI("", false)
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindBoardPlace, workmgmt.GroomingValue{Scalar: "Backlog"}))
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if !res.Applied {
+		t.Fatalf("result = %+v, want applied — the write must be reached for this to mean anything", res)
+	}
+	if !api.addProjectItemProjectsToken {
+		t.Error("AddProjectItem ran WITHOUT the projects-token opt-in; a user-owned board cannot be written with the installation token (#1114)")
+	}
+	if !api.setFieldProjectsToken {
+		t.Error("SetProjectItemSingleSelect ran WITHOUT the projects-token opt-in")
+	}
+}
+
+// TestApplyGroomingMutation_OrgOwnedBoardWriteStaysOnTheInstallationToken is
+// the other side of that routing: the projects-token opt-in is scoped to
+// USER-owned boards. An org-owned board must stay on the installation token,
+// or the opt-in would be unconditional and the assertion above would prove
+// nothing about routing.
+func TestApplyGroomingMutation_OrgOwnedBoardWriteStaysOnTheInstallationToken(t *testing.T) {
+	api := groomingAPI("", false)
+	req := groomingRequest(workmgmt.GroomingKindBoardPlace, workmgmt.GroomingValue{Scalar: "Backlog"})
+	req.Target.Project.OwnerType = "organization"
+	res, err := New(api).ApplyGroomingMutation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if !res.Applied {
+		t.Fatalf("result = %+v, want applied", res)
+	}
+	if api.addProjectItemProjectsToken || api.setFieldProjectsToken {
+		t.Error("an ORG-owned board write took the projects-token opt-in; it is scoped to user-owned boards")
 	}
 }
 
@@ -600,7 +892,7 @@ func TestApplyGroomingMutation_ForgeErrorsSurface(t *testing.T) {
 		{"label read fails", workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{"x"}}, false,
 			func(a *fakeAPI) { a.getIssueErr = errors.New("boom") }},
 		{"label write fails", workmgmt.GroomingKindLabelSet, workmgmt.GroomingValue{List: []string{"x"}}, false,
-			func(a *fakeAPI) { a.updateIssueErr = errors.New("boom") }},
+			func(a *fakeAPI) { a.addLabelsErr = errors.New("boom") }},
 		{"close write fails", workmgmt.GroomingKindCloseDuplicate, workmgmt.GroomingValue{Scalar: "closed"}, false,
 			func(a *fakeAPI) { a.updateIssueErr = errors.New("boom") }},
 		{"depends_on read fails", workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#1"}, false,
@@ -609,6 +901,10 @@ func TestApplyGroomingMutation_ForgeErrorsSurface(t *testing.T) {
 			func(a *fakeAPI) { a.nodeIDErr = errors.New("boom") }},
 		{"epic sub-issue link fails", workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1"}, false,
 			func(a *fakeAPI) { a.subErr = errors.New("boom") }},
+		{"epic body read fails", workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1"}, false,
+			func(a *fakeAPI) { a.getIssueErr = errors.New("boom") }},
+		{"epic marker write fails", workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1"}, false,
+			func(a *fakeAPI) { a.updateIssueErr = errors.New("boom") }},
 		{"board fields resolution fails", workmgmt.GroomingKindBoardPlace, workmgmt.GroomingValue{Scalar: "Backlog"}, false,
 			func(a *fakeAPI) { a.fieldsErr = errors.New("boom") }},
 		{"board item read fails", workmgmt.GroomingKindBoardPlace, workmgmt.GroomingValue{Scalar: "Backlog"}, false,
@@ -641,6 +937,7 @@ func TestApplyGroomingMutation_ForgeErrorsSurface(t *testing.T) {
 // makes, so the assertions read the calls the forge ACTUALLY received.
 type groomingForge struct {
 	patches  []string // "<path> <body>", one per PATCH
+	posts    []string // "<path> <body>", one per non-GraphQL POST
 	graphql  []string // one operation name per GraphQL call
 	itemCols map[string]string
 }
@@ -664,6 +961,16 @@ func newGroomingForge(t *testing.T, currentColumn string) (*githubclient.Client,
 		fx.patches = append(fx.patches, r.URL.Path+" "+string(raw))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"number":1,"state":"open","labels":[{"name":"type:feature"}]}`)
+	})
+	// The ADDITIVE label endpoint. It is a DISTINCT route from the PATCH
+	// above, which is what lets the end-to-end assertions tell a server-side
+	// merge from a wholesale replacement rather than seeing one blurred
+	// "the labels changed".
+	mux.HandleFunc("POST /repos/{owner}/{repo}/issues/{number}/labels", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		fx.posts = append(fx.posts, r.URL.Path+" "+string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"name":"type:feature"},{"name":"area:backend"}]`)
 	})
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Query string }
@@ -795,20 +1102,20 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 		t.Fatalf("ApplyGrooming: %v", err)
 	}
 
-	// Exactly ONE PATCH reached the forge: the label union. No close.
-	if len(fx.patches) != 1 {
-		t.Fatalf("PATCH calls = %v, want exactly the label update", fx.patches)
+	// The label fix went out on the ADDITIVE endpoint carrying ONLY the new
+	// label, and ZERO PATCHes reached the forge — no wholesale label
+	// replacement and no close (#2237 review).
+	if len(fx.posts) != 1 {
+		t.Fatalf("additive label POSTs = %v, want exactly one", fx.posts)
 	}
-	if !strings.Contains(fx.patches[0], "/repos/kuhlman-labs/fishhawk/issues/2237") {
-		t.Errorf("PATCH path = %q, want the hygiene item", fx.patches[0])
+	if !strings.Contains(fx.posts[0], "/repos/kuhlman-labs/fishhawk/issues/2237/labels") {
+		t.Errorf("POST path = %q, want the hygiene item's labels endpoint", fx.posts[0])
 	}
-	if !strings.Contains(fx.patches[0], `"labels":["type:feature","area:backend"]`) {
-		t.Errorf("PATCH body = %q, want the label UNION", fx.patches[0])
+	if !strings.Contains(fx.posts[0], `{"labels":["area:backend"]}`) {
+		t.Errorf("POST body = %q, want ONLY the added label — a union payload is the lost-update shape", fx.posts[0])
 	}
-	for _, p := range fx.patches {
-		if strings.Contains(p, `"state":"closed"`) {
-			t.Errorf("a close reached the forge for a REJECTED duplicate: %q", p)
-		}
+	if len(fx.patches) != 0 {
+		t.Errorf("PATCH calls = %v, want none: the label write is additive and the duplicate close was REJECTED", fx.patches)
 	}
 	// The report-mode entry is the only board move in the report, so ZERO
 	// board writes proves report mode beat the gate approval (condition I1).

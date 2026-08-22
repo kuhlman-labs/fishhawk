@@ -608,10 +608,14 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	// not RETURNED until after the containment ladder below, so a resolution
 	// skip can never mask a higher-precedence refusal.
 	mreq, reason := resolveGroomingRequest(c, d, req)
-	if reason == "" {
-		rec.ItemRef = mreq.ItemRef
-		rec.After = mreq.After
-	}
+	// Populated from whatever resolution DID settle, even when it ended in a
+	// skip: a surfaced proposal missing its own subject is a poor proposal
+	// (#2237 review). resolveGroomingRequest returns its partial request
+	// alongside the reason, so ItemRef stays empty only when it genuinely
+	// could not be resolved, and After falls back to the derivation-time
+	// value rather than to nothing.
+	rec.ItemRef = mreq.ItemRef
+	rec.After = mreq.After
 
 	// Rule 3 (approval condition I1): report mode surfaces the proposal and
 	// acts on NOTHING. It is checked BEFORE the destructive gate's
@@ -620,6 +624,23 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	// stay on the record so the proposal is still visible.
 	mode := ResolveGroomingMode(req.Modes[c.class])
 	if mode == GroomingModeReport {
+		// SURFACING NEEDS BOTH SIDES. A record carrying only the proposed
+		// value is not a usable proposal: an operator reading it cannot see
+		// what would change. So report mode still performs the pre-dispatch
+		// READ to populate Before — a read is not a mutation, so it does not
+		// weaken the rule, and it is the whole point of a mode that reports
+		// instead of acting (#2236 AC7, whose runtime consumer this is).
+		//
+		// A read FAILURE is not a mutation either, so it degrades to an empty
+		// Before rather than failing the candidate: report mode dispatches
+		// nothing whatever the read says, so there is no blind-write risk to
+		// fail closed against. IdempotenceChecked stays FALSE — no diff
+		// decided this candidate, the mode did.
+		if reason == "" && (c.kind.IdempotenceObservable() || c.kind.BoardPlacement()) {
+			if observed, _, err := readGroomingObserved(ctx, reader, c, mreq.ItemRef, req); err == nil {
+				rec.Before = observed
+			}
+		}
 		return groomingSkipped(rec, GroomingSkipReportMode)
 	}
 
@@ -680,51 +701,56 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 // decision, and resolving the icebox column. It returns a skip reason instead
 // of a request when any of those cannot be resolved — never a guess.
 func resolveGroomingRequest(c groomingCandidate, d GroomingDecision, req GroomingApplyRequest) (GroomingMutationRequest, string) {
+	// Built up in place and returned WITH every skip reason, not discarded on
+	// one: the caller records whatever resolved so a surfaced (report-mode) or
+	// refused candidate still names its subject. A skip reason is always
+	// returned alongside, and the caller never dispatches a request that came
+	// back with one.
+	out := GroomingMutationRequest{
+		Target:       req.Target,
+		EntryID:      c.entryID,
+		Class:        c.class,
+		Kind:         c.kind,
+		After:        c.after,
+		ExpectedFrom: c.expectedFrom,
+		States:       req.States,
+	}
 	target := c.ref
 	if c.kind == GroomingKindCloseDuplicate {
 		chosen, reason := groomingCloseTarget(c.pair, d.CloseTarget)
 		if reason != "" {
-			return GroomingMutationRequest{}, reason
+			return out, reason
 		}
 		target = chosen
 	}
 
 	ref, reason := groomingResolveItemRef(target, req.Target)
 	if reason != "" {
-		return GroomingMutationRequest{}, reason
+		return out, reason
 	}
+	out.ItemRef = ref
 
-	after := c.after
 	switch c.kind {
 	case GroomingKindDependsOnAdd:
 		if len(c.pair) != 2 {
-			return GroomingMutationRequest{}, GroomingSkipItemRefUnresolvable
+			return out, GroomingSkipItemRefUnresolvable
 		}
 		toRef, r := groomingResolveItemRef(c.pair[1], req.Target)
 		if r != "" {
-			return GroomingMutationRequest{}, r
+			return out, r
 		}
-		after = GroomingValue{Scalar: toRef}
+		out.After = GroomingValue{Scalar: toRef}
 	case GroomingKindIcebox:
 		col := strings.TrimSpace(req.IceboxColumn)
 		if col == "" {
 			// Approval condition I5: an explicit, audited refusal — never a
 			// silent no-op and never a misroute to another column.
-			return GroomingMutationRequest{}, GroomingSkipIceboxColumnUnavailable
+			return out, GroomingSkipIceboxColumnUnavailable
 		}
-		after = GroomingValue{Scalar: col}
+		out.After = GroomingValue{Scalar: col}
 	}
 
-	return GroomingMutationRequest{
-		Target:       req.Target,
-		EntryID:      c.entryID,
-		Class:        c.class,
-		Kind:         c.kind,
-		ItemRef:      ref,
-		After:        after,
-		ExpectedFrom: c.expectedFrom,
-		States:       req.States,
-	}, ""
+	return out, ""
 }
 
 // readGroomingObserved performs the pre-dispatch read through the
@@ -796,7 +822,33 @@ func groomingSatisfied(kind GroomingMutationKind, observed, after GroomingValue)
 	if after.Scalar == "" && len(after.List) == 0 {
 		return false
 	}
+	// The two BODY-MARKER kinds compare NORMALIZED issue references. A
+	// suggested fix may name the parent as `1437` while the marker the
+	// provider persists is always `#1437`; a raw string compare would miss the
+	// layer's OWN write and re-dispatch on the next apply — the same
+	// write-and-read-must-agree property the marker exists to give (#2237
+	// review).
+	if kind == GroomingKindEpicLink || kind == GroomingKindDependsOnAdd {
+		return groomingNormalizeRef(observed.Scalar) == groomingNormalizeRef(after.Scalar)
+	}
 	return observed.Equal(after)
+}
+
+// groomingNormalizeRef normalizes an issue reference to the `#N` shape the
+// body markers persist, so `1437` and `#1437` compare equal. Anything that is
+// not a bare or hashed positive integer is returned trimmed but otherwise
+// UNCHANGED — normalization must never collapse two genuinely different values
+// into one.
+func groomingNormalizeRef(s string) string {
+	t := strings.TrimSpace(s)
+	digits := strings.TrimSpace(strings.TrimPrefix(t, "#"))
+	if digits == "" {
+		return t
+	}
+	if _, err := strconv.Atoi(digits); err != nil {
+		return t
+	}
+	return "#" + digits
 }
 
 // groomingBodyMarkerValue returns the value following the FIRST body line

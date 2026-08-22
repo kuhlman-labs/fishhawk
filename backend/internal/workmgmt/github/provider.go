@@ -73,6 +73,14 @@ type API interface {
 	// ProjectItemStatus + SetProjectItemSingleSelect (board moves and field
 	// writes) — which is why this is the only addition.
 	UpdateIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, p githubclient.UpdateIssueParams) (*githubclient.Issue, error)
+	//
+	// The grooming label mutation needs one MORE primitive than this
+	// interface declares — the additive AddIssueLabels write — but it is
+	// declared as the OPTIONAL labelAdder extension in grooming.go rather
+	// than promoted in here, so the many API implementations that only
+	// exercise the filing and board-sync paths are not forced to carry a
+	// stub for a capability they never reach. *githubclient.Client
+	// satisfies both, so production dispatch is unaffected.
 	ProjectsTokenConfigured() bool
 }
 
