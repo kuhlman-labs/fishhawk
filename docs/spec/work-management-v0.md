@@ -25,6 +25,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `transitions` | no | object: lifecycle event → canonical state | Run-lifecycle-event → canonical-state map (#1012). Keys from the closed set `run_started`/`pr_opened`/`run_failed`/`run_merged`, the campaign-scoped `campaign_started` (#1816), and the issue-lifecycle `issue_closed`/`issue_reopened` (#1817); each value must be a key declared in `states` (semantic check). |
 | `product_feedback` | no | object `{enabled: boolean}` | Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means enabled (the default). `enabled: false` → `POST /v0/runs/{id}/product-reports` returns 403 `product_feedback_disabled` and files nothing. Set it as the object form (`product_feedback:` / `  enabled: false`), **not** a bare string. |
 | `charter` | no | object `{path: string}` | Declares the repo-relative path of the checked-in charter document a backlog-grooming run reads (E54.1 / #2233), e.g. `.fishhawk/charter.md`. `path` is required and non-empty **when the block is present**; the block itself is optional. Schema-optional but **feature-mandatory**: `backlog_grooming` fails closed when no charter resolves, enforced in #2234/#2236 — never a fail-open. See [Charter](#charter). |
+| `grooming` | no | object `{thresholds: {...}}` | Operator-declarable controls on what a backlog-grooming run PROPOSES (E54.8 / #2240) — the churn guard ADR-065 names as the mitigation for its own sharpest adoption risk. Every field is optional and resolves to a conservative package default. See [Grooming churn thresholds](#grooming-churn-thresholds). |
 
 ### Per-type fields (`types.<name>`)
 
@@ -221,6 +222,79 @@ A ranking then reads "ranked here on **V1** and **R2**" — a claim a human can 
 `workmgmt.Parse` adds **no** `*SemanticError` rule for this block; the schema's `required: ["path"]` + `minLength: 1` is the whole declaration-time contract. This is a **design decision**, recorded here so the omission reads as intent rather than an oversight.
 
 Rejecting absolute and `..`-bearing paths at parse time would give an earlier error, and an earlier error is genuinely worth something. It is worth less than a single owner. `repodoc.validatePath` already enforces exactly that rule, fail-closed, at the only point where the declared path is used to fetch a document; a second copy in `workmgmt` would be a second owner of one invariant, free to drift from the one that actually gates the read — and the drifted copy would be the *permissive* one, since the enforcing copy is the one under test by the code that reads files. `TestParseCharterNoSemanticPathRule` pins this side of the behaviour explicitly — a traversal-, absolute-, or backslash-bearing declaration parses here without error — and `repodoc`'s own `validatePath` table pins the refusal at resolve time.
+
+## Grooming churn thresholds
+
+The `grooming` block (optional, additive within v0) declares the **significance bar** a computed difference must cross before a backlog-grooming run proposes it.
+
+```yaml
+grooming:
+  thresholds:
+    min_rank_movement: 2
+    min_score_delta: 0.05
+    # significant_hygiene_defects omitted => all six are significant
+```
+
+### Why the block exists
+
+A scoring agent re-run over a large backlog perturbs the ranking every time — item 14 and item 15 swap, a score moves by 0.02 — and none of it merits an operator's attention. Left unguarded, every run produces a long report of trivia and the operator learns to approve without reading. ADR-065 names that as its own sharpest adoption risk: at that point the grooming gate is decorative, and every other control in E54 rests on it.
+
+### The two ordering dimensions, combined with OR
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `min_rank_movement` | integer, minimum **1** | `2` | Minimum absolute rank delta (in positions, measured against the last **applied** ordering) that makes an ordering entry worth proposing. |
+| `min_score_delta` | number, exclusiveMinimum **0** | `0.05` | Minimum absolute score delta. |
+
+They combine with **OR**: either dimension crossing its bar surfaces the entry. OR rather than AND because over-proposing is the safe direction for a suppression control — a missed proposal is invisible, a surplus one is merely noise.
+
+Both defaults are chosen against #2240's own churn examples, so both of its named cases are suppressed and anything larger is proposed.
+
+The floors (`minimum: 1`, `exclusiveMinimum: 0`) exist because a non-positive bar would disable the guard, and a control that can be declared into a no-op is not a control. `Conventions.ResolveGroomingThresholds` carries a second line for a config constructed in Go rather than parsed from YAML: a sub-floor value is **clamped to the default and named in `Clamped`** — never silently accepted, and never silently substituted either.
+
+### The hygiene significance set
+
+`significant_hygiene_defects` is an array of `grooming-report-v1` hygiene `defect` enum values (`uniqueItems`, `minItems: 1`). **Absent means all six are significant** — the conservative direction.
+
+grooming-report-v1 carries **no per-defect severity field**, so #2240's "a hygiene defect at or above a severity" dimension is expressed as this operator-declared significance **set** rather than as an ordering over severities that does not exist.
+
+The bar is consulted **before** the run-over-run baseline lookup, so it governs a **new** finding exactly as it governs a repeat one. An operator who declares a defect class insignificant expects not to see it — not to see it once, on its first appearance, and only thereafter never again.
+
+### The three-state baseline
+
+Diffing against the last *proposed* report is the convergence trap #2240's own Notes name: a rejected proposal is re-derived and re-proposed every run, and the operator re-rejects it forever, which trains dismissal harder than plain churn does. The baseline therefore distinguishes three states:
+
+| State | Source | Effect |
+|---|---|---|
+| `applied` | an apply record with outcome `applied`, or a skip whose reason is `already_applied` | suppressed while unchanged |
+| `rejected` | an operator verdict of `rejected` or `amended` | suppressed while unchanged |
+| never proposed | **absence** from the baseline | proposed |
+
+Absence is the fail-safe: this guard suppresses, so every ambiguity resolves toward proposing. An entry whose apply **failed** is absent, not applied, so a mutation that did not land resurfaces next run — which is also exactly what "diff against the last applied state, not the last proposed one" requires.
+
+### The basis fingerprint excludes prose
+
+An already-decided entry is re-proposed only when its **structural basis** moved, and the resurface record names what changed. The fingerprint covers structural fields only, because the agent regenerates prose on every run and a prose-sensitive fingerprint would report "materially changed" for an unchanged backlog — defeating the guard outright.
+
+| Class | Fingerprinted | Deliberately excluded |
+|---|---|---|
+| `ordering` | sorted, lowercased `rubric_id` set | `rank`, `score` (compared numerically against the thresholds, not by equality), `rationale` |
+| `duplicate` | *nothing* — the pair identity is already the entry id | `basis` (prose), `confidence` (an agent-regenerated judgment; a `medium`→`high` flip is jitter of the same kind `score` is) |
+| `hygiene` | normalized `suggested_fix` — the value that would be written | `detail` |
+| `dependency` | `kind` — direction is already in the id | `basis` |
+| `vision_drift` | the `basis` enum | `detail`; `charter_ref_id` is already the id qualifier |
+| `decomposition` | the proposed-children **count** | child titles and scope hints |
+
+Two residuals, stated rather than implied: a rejected proposal whose **only** change is re-worded justification does not resurface, and two proposals to split the same item into the same number of children are treated as one proposal.
+
+### The charter-change lift
+
+A charter content-hash change lifts suppression for the **charter-anchored** classes (`ordering`, `vision_drift`) but not the objective ones (`hygiene`, `dependency`, `duplicate`, `decomposition`). A suppression computed under a charter revision that has since moved was made against a rubric that no longer holds; an applied label fix does not become un-applied because the charter was edited. An **absent** `charter_ref` on either side is *unknown*, not *different* — treating unknown as moved would lift every charter-anchored suppression on every report that omits it.
+
+### No semantic rule is added for `grooming`
+
+Like `charter`, the block adds no `*SemanticError` rule: structural validation (`additionalProperties: false` at both levels, the two numeric floors, the defect enum, `uniqueItems`, `minItems`) is its whole declaration-time contract.
+
 
 ## Validation
 

@@ -164,6 +164,49 @@
           "description": "Repo-relative path of the charter document, relative to the filing repo's root (e.g. .fishhawk/charter.md, the conventional location declared by the shipped default). Must be non-empty. Declaration-time validation is structural only — the path-shape rule (no absolute, no .. segment, no backslash, canonical spelling) is enforced fail-closed by repodoc.validatePath at the single point where the declared path is used to fetch the document, so this schema deliberately does not carry a second copy of it."
         }
       }
+    },
+    "grooming": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Operator-declarable controls on what a backlog-grooming run PROPOSES (E54.8 / #2240) — the mitigation ADR-065 names for its own sharpest adoption risk, report churn training operators to rubber-stamp. Absent means every field resolves to the conservative package default; see docs/spec/work-management-v0.md § \"Grooming churn thresholds\".",
+      "properties": {
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The significance bar a computed difference must cross to be PROPOSED. Sub-threshold differences are still computed and reported as suppressed — they are withheld from the proposal set, never discarded silently.",
+          "properties": {
+            "min_rank_movement": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Minimum ABSOLUTE rank delta (in positions, against the last applied ordering) that makes an ordering entry worth proposing. 1 means propose every one-position swap, i.e. no suppression at all. The floor is 1 rather than 0 because a non-positive bar would disable the guard, and a control that can be declared into a no-op is not a control."
+            },
+            "min_score_delta": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 0.05,
+              "description": "Minimum ABSOLUTE score delta that makes an ordering entry worth proposing. Combined with min_rank_movement by OR: EITHER dimension crossing its bar surfaces the entry. OR rather than AND because over-proposing is the safe direction for a suppression control — a missed proposal is invisible, a surplus one is merely noise. Exclusive minimum 0 for the same reason min_rank_movement floors at 1."
+            },
+            "significant_hygiene_defects": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "description": "The hygiene defect classes this repo considers worth proposing. ABSENT means all six are significant (the conservative default). grooming-report-v1 carries NO per-defect severity field, so #2240's \"a hygiene defect at or above a severity\" dimension is expressed as this operator-declared significance SET keyed on the defect enum rather than as an ordering over severities that does not exist. A defect outside the declared set is suppressed on EVERY appearance, including its first: an operator who declares a defect class insignificant expects not to see it, not to see it once.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "missing_label_namespace",
+                  "absent_done_means",
+                  "unlinked_parent_epic",
+                  "unboarded",
+                  "missing_parent_epic_link",
+                  "missing_estimate"
+                ]
+              }
+            }
+          }
+        }
+      }
     }
   },
 

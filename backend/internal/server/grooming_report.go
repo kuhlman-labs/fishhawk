@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // CategoryGroomingReportRecorded is the audit category appended when a
@@ -161,6 +163,14 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 				"heal grooming report audit entry failed", map[string]any{"error": herr.Error()})
 			return
 		}
+		// Heal the churn verdict on the same retry, for the same reason: a
+		// partial first write could have left the report durable and the guard's
+		// verdict absent.
+		if cerr := s.recordGroomingChurn(r, runID, stageID, existing.ID.String(), report); cerr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"heal grooming churn audit entry failed", map[string]any{"error": cerr.Error()})
+			return
+		}
 		s.writeJSON(w, r, http.StatusOK, planResponse{
 			ID:            existing.ID,
 			StageID:       existing.StageID,
@@ -195,6 +205,18 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 	if err := appendEntry(created.ID.String()); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append grooming report audit entry failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// The CHURN GUARD (E54.8 / #2240) runs here, on the real ingest path, and
+	// its outcome — including AC1's visible "no changes proposed" — is written
+	// to the audit chain. Same fail-closed contract as the report entry above:
+	// a failure 500s so the runner retries, and the retry HEALS it, because a
+	// guard whose verdict silently vanished is indistinguishable from a guard
+	// that never ran.
+	if err := s.recordGroomingChurn(r, runID, stageID, created.ID.String(), report); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"append grooming churn audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
 
@@ -234,4 +256,225 @@ func (s *Server) failGroomingStage(r *http.Request, runID, stageID uuid.UUID, re
 			slog.String("error", ferr.Error()))
 	}
 	s.advanceAfterFailure(r, runID, stageID)
+}
+
+// --- E54.8 / #2240: the churn guard, ON the real ingest path ----------------
+
+// groomingBaselineRunScanLimit bounds how far back the baseline search walks.
+// A grooming report is one per plan stage, so the prior grooming run is
+// normally the first or second hit; the cap is a runaway guard, not a tuning
+// knob. When the scan reaches the cap without finding a prior report the
+// baseline is EMPTY, which fails toward proposing — the safe direction for a
+// suppression control.
+const groomingBaselineRunScanLimit = 50
+
+// recordGroomingChurn runs the churn guard over the just-ingested report and
+// writes its verdict to the audit chain as one grooming_churn_filtered entry.
+//
+// It is idempotent via ensureGovernanceAuditEntry keyed on (category,
+// artifact_id), so a runner retry re-POSTing identical bytes heals a missing
+// verdict instead of writing a second one. The guard is PURE and the artifact
+// id keys the entry, so a re-run over the same report produces the same
+// verdict — re-emitting would be duplication, not correction.
+//
+// Returns a non-nil error only when the audit write (or its existence check)
+// failed. Every INPUT-resolution degrade — conventions unreadable, prior-run
+// lookup failing, prior report unparseable — resolves to the conservative
+// value (package-default thresholds, empty baseline) and is NAMED in the
+// emitted payload's `degraded` list rather than failing the ingest: the report
+// itself is valid and durable, and refusing to record a verdict computed from
+// a partial baseline would hide the guard's own uncertainty.
+func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, artifactID string, report *plan.GroomingReport) error {
+	ctx := r.Context()
+	var degraded []string
+
+	repo := ""
+	if rn, err := s.cfg.RunRepo.GetRun(ctx, runID); err == nil && rn != nil {
+		repo = rn.Repo
+	} else {
+		degraded = append(degraded, "run_lookup_failed")
+	}
+
+	// AC3: the significance bar is operator-declarable, read from THIS repo's
+	// work-management conventions through the process-wide loader seam. An
+	// unreadable config resolves the shipped conservative defaults.
+	conv := workmgmt.Default()
+	if repo != "" {
+		if loaded, err := conventionsLoader(ctx, repo); err == nil {
+			conv = loaded
+		} else {
+			degraded = append(degraded, "conventions_unreadable")
+		}
+	}
+	thresholds := conv.ResolveGroomingThresholds()
+
+	baseline, baselineDegraded := s.groomingChurnBaseline(ctx, runID, repo)
+	degraded = append(degraded, baselineDegraded...)
+
+	result := workmgmt.FilterGroomingChurn(report, baseline, thresholds)
+
+	payload, err := json.Marshal(map[string]any{
+		"run_id":      runID.String(),
+		"stage_id":    stageID.String(),
+		"artifact_id": artifactID,
+		"summary":     result.Summary,
+		"suppressed":  result.Suppressed,
+		"resurfaced":  result.Resurfaced,
+		"thresholds":  thresholds,
+		"degraded":    degraded,
+	})
+	if err != nil {
+		return err
+	}
+
+	systemKind := audit.ActorKind("system")
+	_, herr := s.ensureGovernanceAuditEntry(ctx, runID,
+		workmgmt.GroomingChurnFilteredCategory, artifactID, func() error {
+			_, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  workmgmt.GroomingChurnFilteredCategory,
+				ActorKind: &systemKind,
+				Payload:   payload,
+			})
+			return aerr
+		})
+	return herr
+}
+
+// groomingChurnBaseline assembles the three-state baseline (AC4: the last
+// approved AND APPLIED state, never the last proposed one) from the most
+// recent PRIOR run on the same repo that shipped a grooming report.
+//
+// It uses only query surfaces that already exist — ListRuns, ListStagesForRun,
+// artifact ListForStage, and the audit chain — so no new DB query, sqlc
+// regeneration, or repository-interface widening rides along.
+//
+// Dispositions come from the prior run's grooming_mutation_applied audit rows,
+// which the apply layer (#2237) writes once per SETTLED candidate. That single
+// category carries both halves of the baseline: an `applied` outcome (or a
+// skip whose reason is already_applied) is an APPLIED disposition, and a skip
+// whose reason is not_approved or amended is a REJECTED one. Anything else —
+// a failed apply, any other containment skip — records NO disposition, so the
+// entry is absent from the baseline and resurfaces. That is AC4's requirement
+// and the fail-safe direction in one rule.
+//
+// STATED GAP (#2240): nothing in production calls ApplyGrooming yet — #2237
+// shipped the apply layer with its seam deliberately unwired — so today no
+// grooming_mutation_applied row exists and every baseline resolves empty,
+// which correctly proposes everything. The wiring here is complete and reads
+// the real category, so dispositions populate the moment an apply consumer
+// lands, with no change to this function.
+//
+// Every failure degrades to a NAMED reason and an empty-or-partial baseline
+// rather than an error: a suppression control that cannot read its baseline
+// must propose, not suppress.
+func (s *Server) groomingChurnBaseline(ctx context.Context, currentRunID uuid.UUID, repo string) (workmgmt.GroomingBaseline, []string) {
+	empty := workmgmt.NewGroomingBaseline(nil, nil, nil)
+	if repo == "" {
+		return empty, []string{"baseline_repo_unknown"}
+	}
+	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{Repo: repo, Limit: groomingBaselineRunScanLimit})
+	if err != nil {
+		return empty, []string{"baseline_list_runs_failed"}
+	}
+
+	for _, rn := range runs {
+		if rn == nil || rn.ID == currentRunID {
+			continue
+		}
+		prior := s.priorGroomingReport(ctx, rn.ID)
+		if prior == nil {
+			continue
+		}
+		decisions, applied := s.priorGroomingDispositions(ctx, rn.ID)
+		return workmgmt.NewGroomingBaseline(prior, decisions, applied), nil
+	}
+	// No prior grooming run on this repo: the first-ever run. Not a degrade —
+	// an empty baseline is the CORRECT answer, and everything is proposed.
+	return empty, nil
+}
+
+// priorGroomingReport returns the grooming report a prior run shipped, or nil.
+// A stage-listing failure, an artifact-listing failure, or a report that no
+// longer parses all yield nil: an unreadable prior report must not be treated
+// as an empty one that would suppress nothing OR as a populated one that would
+// suppress wrongly — it simply is not a baseline.
+func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) *plan.GroomingReport {
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return nil
+	}
+	for _, st := range stages {
+		if st == nil || st.Type != run.StageTypePlan {
+			continue
+		}
+		arts, aerr := s.cfg.ArtifactRepo.ListForStage(ctx, st.ID)
+		if aerr != nil {
+			continue
+		}
+		for _, a := range arts {
+			if a == nil || a.Kind != artifact.KindGroomingReport {
+				continue
+			}
+			report, perr := plan.ParseGroomingReport(a.Content)
+			if perr != nil {
+				continue
+			}
+			return report
+		}
+	}
+	return nil
+}
+
+// priorGroomingDispositions reads the prior run's grooming_mutation_applied
+// audit rows and projects them back into the two inputs NewGroomingBaseline
+// takes: the operator's rejections and the apply's landed mutations.
+//
+// The payload is decoded through a TOLERANT projection carrying only the three
+// fields that matter (entry_id, outcome, skip_reason), so it reads a record
+// marshalled bare as well as one nested under the run/stage envelope the other
+// grooming categories use. An undecodable row is skipped, which contributes no
+// disposition and therefore resurfaces its entry — the fail-safe direction.
+func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID) ([]workmgmt.GroomingDecision, *workmgmt.GroomingApplyResult) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, workmgmt.GroomingMutationAppliedCategory)
+	if err != nil {
+		return nil, nil
+	}
+	var decisions []workmgmt.GroomingDecision
+	applied := &workmgmt.GroomingApplyResult{}
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var rec struct {
+			EntryID    string `json:"entry_id"`
+			Outcome    string `json:"outcome"`
+			SkipReason string `json:"skip_reason"`
+		}
+		if json.Unmarshal(e.Payload, &rec) != nil || rec.EntryID == "" {
+			continue
+		}
+		switch {
+		case rec.Outcome == string(workmgmt.GroomingOutcomeApplied):
+			applied.Applied = append(applied.Applied, workmgmt.GroomingMutationRecord{
+				EntryID: rec.EntryID, Outcome: workmgmt.GroomingOutcomeApplied,
+			})
+		case rec.SkipReason == workmgmt.GroomingSkipAlreadyApplied:
+			applied.Skipped = append(applied.Skipped, workmgmt.GroomingMutationRecord{
+				EntryID: rec.EntryID, Outcome: workmgmt.GroomingOutcomeSkipped,
+				SkipReason: workmgmt.GroomingSkipAlreadyApplied,
+			})
+		case rec.SkipReason == workmgmt.GroomingSkipNotApproved:
+			decisions = append(decisions, workmgmt.GroomingDecision{
+				EntryID: rec.EntryID, Verdict: workmgmt.GroomingRejected,
+			})
+		case rec.SkipReason == workmgmt.GroomingSkipAmended:
+			decisions = append(decisions, workmgmt.GroomingDecision{
+				EntryID: rec.EntryID, Verdict: workmgmt.GroomingAmended,
+			})
+		}
+	}
+	return decisions, applied
 }

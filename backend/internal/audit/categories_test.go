@@ -25,6 +25,7 @@ func TestIsKnownCategory(t *testing.T) {
 		"run_revived",
 		"merge_verdict_recorded",   // E48.7 / #1954 operator merge-verdict chain entry
 		"grooming_report_recorded", // E54.3 / #2235 grooming_report ingest entry
+		"grooming_churn_filtered",  // E54.8 / #2240 churn-guard verdict entry
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {
@@ -351,5 +352,28 @@ func TestKnownCategories_GroomingApplyCompleted(t *testing.T) {
 func TestKnownCategories_RunRejectedMissingCharter(t *testing.T) {
 	if !IsKnownCategory("run_rejected_missing_charter") {
 		t.Fatal("run_rejected_missing_charter is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_GroomingChurnFiltered pins E54.8 / #2240's churn-guard
+// category. It is written once per guard pass on the grooming-report ingest
+// path and carries #2240 AC1's visible "no changes proposed" outcome, so it is
+// the ONE surface an operator arms fishhawk_await_audit on to learn what a
+// grooming run actually proposes — as distinct from what the agent emitted. An
+// unregistered category is un-awaitable and would 400 a
+// GET /v0/runs/{run_id}/audit?category=grooming_churn_filtered.
+func TestKnownCategories_GroomingChurnFiltered(t *testing.T) {
+	if !IsKnownCategory("grooming_churn_filtered") {
+		t.Fatal("grooming_churn_filtered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+	var found bool
+	for _, c := range SuggestCategories("grooming_churn_filter", 5) {
+		if c == "grooming_churn_filtered" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface grooming_churn_filtered",
+			"grooming_churn_filter", SuggestCategories("grooming_churn_filter", 5))
 	}
 }
