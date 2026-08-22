@@ -556,9 +556,19 @@ type groomingRunRepo struct {
 	*promptRunRepo
 	byRepo      map[string][]*run.Run
 	listRunsErr error
+	// lastFilter records what the baseline search actually asked for, so the
+	// QUERY-level tenant scoping is assertable and not merely assumed from the
+	// handler-side re-check.
+	lastFilter run.ListRunsFilter
 }
 
+// ListRuns models the production query's REPO predicate only, deliberately.
+// The real ListRuns keeps rows whose account_id IS NULL regardless of the
+// AccountID filter (the untenanted-list contract, repository.go), so a fake
+// that filtered on account would hide exactly the leak the handler-side tenant
+// re-check exists to close.
 func (r *groomingRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	r.lastFilter = f
 	if r.listRunsErr != nil {
 		return nil, r.listRunsErr
 	}
@@ -616,8 +626,21 @@ func newChurnFixture(t *testing.T, runID, stageID uuid.UUID) *churnFixture {
 // groomingChurnBaseline projects back into dispositions.
 func (f *churnFixture) seedPriorGroomingRun(t *testing.T, report *plan.GroomingReport, applied, rejected []string) uuid.UUID {
 	t.Helper()
+	return f.seedPriorGroomingRunAs(t, nil, report, applied, rejected)
+}
+
+// seedPriorGroomingRunAs is seedPriorGroomingRun with the prior run row handed
+// to `tweak` before it is registered, so a test can vary the two properties a
+// repo string does not carry — the tenant (account / installation) and
+// created_at.
+func (f *churnFixture) seedPriorGroomingRunAs(t *testing.T, tweak func(*run.Run), report *plan.GroomingReport, applied, rejected []string) uuid.UUID {
+	t.Helper()
 	priorRun, priorStage := uuid.New(), uuid.New()
-	f.rr.getRuns[priorRun] = &run.Run{ID: priorRun, Repo: f.repo, WorkflowID: "backlog_grooming"}
+	pr := &run.Run{ID: priorRun, Repo: f.repo, WorkflowID: "backlog_grooming"}
+	if tweak != nil {
+		tweak(pr)
+	}
+	f.rr.getRuns[priorRun] = pr
 	f.rr.stagesByRunID[priorRun] = []*run.Stage{{ID: priorStage, RunID: priorRun, Type: run.StageTypePlan}}
 	f.rr.byRepo[f.repo] = append(f.rr.byRepo[f.repo], f.rr.getRuns[priorRun])
 
@@ -807,10 +830,17 @@ func TestGroomingIngest_UnchangedBacklogProposesNothing(t *testing.T) {
 		t.Errorf("degraded = %v, want none on the fully-wired path", v.Degraded)
 	}
 
-	// AC6 at the boundary: a second ingest of the SAME bytes takes the
-	// idempotent path and must HEAL rather than duplicate, leaving exactly one
-	// verdict whose payload is byte-identical to the first.
-	before := f.au.appended[len(f.au.appended)-1].Payload
+	// RETRY DEDUPLICATION — and nothing more. A second ingest of the SAME bytes
+	// takes the idempotent path and must leave exactly ONE verdict.
+	//
+	// This is deliberately NOT the AC6 assertion, and the earlier version of
+	// this block that claimed it was, was vacuous: the retry heals rather than
+	// appends, so `before` and the re-read payload were the same audit record
+	// and the comparison held even if two distinct runs produced different
+	// verdicts. Run-over-run byte identity is proved by
+	// TestGroomingIngest_DistinctRunsProduceIdenticalVerdict, which executes the
+	// guard in two separate runs and compares their serialized verdicts.
+	before := churnPayloadBytes(t, f.au)
 	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusOK {
 		t.Fatalf("retry status = %d, want 200", code)
 	}
@@ -818,8 +848,103 @@ func TestGroomingIngest_UnchangedBacklogProposesNothing(t *testing.T) {
 		t.Errorf("churn entries after a retry = %d, want 1 (heal, never duplicate)", n)
 	}
 	if string(before) != string(churnPayloadBytes(t, f.au)) {
-		t.Error("the healed verdict payload is not byte-identical to the first")
+		t.Error("the retry REWROTE the recorded verdict; the healed entry must be the original one")
 	}
+}
+
+// TestGroomingIngest_DistinctRunsProduceIdenticalVerdict is AC6's real proof:
+// two SEPARATE runs — separate run ids, stage ids, artifact rows and audit
+// chains — over the same backlog against the same applied baseline must
+// serialize the same verdict. The second run additionally ships the report's
+// arrays in a DIFFERENT order, which is the jitter AC6 exists to absorb: an
+// agent re-emitting the same findings in a different sequence must not change
+// the bytes.
+//
+// The identity fields (run_id, stage_id, artifact_id) necessarily differ and
+// are stripped before the comparison — and asserted to differ, so the test
+// cannot silently degenerate into comparing one record with itself, which is
+// exactly how the retry-path assertion above went vacuous.
+func TestGroomingIngest_DistinctRunsProduceIdenticalVerdict(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+
+	// One run of the guard, end to end, in its own fixture. reverse ships the
+	// same findings with the arrays walked backwards.
+	oneRun := func(t *testing.T, reverse bool) (core []byte, identity map[string]string) {
+		t.Helper()
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+
+		scores := []float64{9.50, 8.00, 7.00, 6.00, 5.00}
+		prior := churnReport([]int{1, 2, 3, 4, 5}, scores, "")
+		var ids []string
+		for _, e := range prior.Ordering {
+			ids = append(ids, e.ID)
+		}
+		f.seedPriorGroomingRun(t, prior, ids, nil)
+
+		// Entries 1 and 3 swap across two positions (both PROPOSED); entries 2,
+		// 4 and 5 hold (all SUPPRESSED); the hygiene defect is new (PROPOSED).
+		// MULTIPLE entries on each side is what makes the reversal below
+		// discriminating: with one proposal per list, array order could not
+		// change the serialized bytes whatever the guard did.
+		next := churnReport([]int{3, 2, 1, 4, 5}, scores, "missing_estimate")
+		if reverse {
+			for i, j := 0, len(next.Ordering)-1; i < j; i, j = i+1, j-1 {
+				next.Ordering[i], next.Ordering[j] = next.Ordering[j], next.Ordering[i]
+			}
+		}
+		if _, code := shipGrooming(t, f, runID, stageID, next); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		v := churnVerdict(t, f.au)
+		if v.Summary.Proposed < 2 || v.Summary.Suppressed < 2 {
+			t.Fatalf("fixture: proposed=%d suppressed=%d — the comparand must carry at least two of each for array order to matter",
+				v.Summary.Proposed, v.Summary.Suppressed)
+		}
+		return churnVerdictCore(t, f.au)
+	}
+
+	firstCore, firstID := oneRun(t, false)
+	secondCore, secondID := oneRun(t, true)
+
+	for _, k := range []string{"run_id", "stage_id", "artifact_id"} {
+		if firstID[k] == "" || firstID[k] == secondID[k] {
+			t.Fatalf("%s = %q / %q — the two verdicts are not from distinct runs, so the comparison below proves nothing",
+				k, firstID[k], secondID[k])
+		}
+	}
+	if string(firstCore) != string(secondCore) {
+		t.Errorf("two distinct runs over the same backlog serialized different verdicts:\n%s\n%s", firstCore, secondCore)
+	}
+}
+
+// churnVerdictCore splits the single recorded churn verdict into the
+// run-invariant part (everything the guard decided) and the per-run identity
+// fields, so run-over-run byte identity is assertable over the former.
+func churnVerdictCore(t *testing.T, au *auditFake) ([]byte, map[string]string) {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(churnPayloadBytes(t, au), &fields); err != nil {
+		t.Fatalf("decode churn payload: %v", err)
+	}
+	identity := map[string]string{}
+	for _, k := range []string{"run_id", "stage_id", "artifact_id"} {
+		var v string
+		if raw, ok := fields[k]; ok {
+			if err := json.Unmarshal(raw, &v); err != nil {
+				t.Fatalf("decode %s: %v", k, err)
+			}
+		}
+		identity[k] = v
+		delete(fields, k)
+	}
+	// encoding/json sorts map keys, so the re-marshal is itself deterministic;
+	// every retained value is the ORIGINAL raw JSON, not a re-encoding.
+	core, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("re-marshal verdict core: %v", err)
+	}
+	return core, identity
 }
 
 func churnPayloadBytes(t *testing.T, au *auditFake) []byte {
@@ -977,6 +1102,149 @@ func TestGroomingIngest_RejectedProposalDoesNotReappear(t *testing.T) {
 	}
 	if reason != workmgmt.GroomingSuppressPreviouslyRejected {
 		t.Errorf("reason = %q, want %q", reason, workmgmt.GroomingSuppressPreviouslyRejected)
+	}
+}
+
+// TestGroomingIngest_BaselineIsTenantScoped pins the tenant discriminator. A
+// repo STRING is not an identity: ADR-057's nullable account_id and
+// per-installation forge routing (GHES + github.com) both permit two different
+// tenants to own runs whose Repo is the same "owner/name". Without the
+// discriminator, ANOTHER tenant's dispositions decide this run's suppressions
+// and that tenant's entry ids land in this run's audit payload.
+//
+// The fake's ListRuns models the production query's repo predicate only —
+// which is honest, because the real query's account predicate deliberately
+// keeps account_id IS NULL rows visible — so the foreign runs below reach the
+// walk exactly as they would in production.
+func TestGroomingIngest_BaselineIsTenantScoped(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	const tenantA, tenantB = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	installA, installB := int64(1001), int64(2002)
+
+	// The BOUNDARY case, driven through the real signed ingest. The current run
+	// is UNTENANTED (account_id NULL), which is the sharpest version of the
+	// leak: ListRuns treats an empty AccountID as "no constraint", so the query
+	// returns every account's runs on this repo string and the handler-side
+	// discriminator is the ONLY thing standing between them and this run's
+	// suppressions. (A tenanted current run cannot be driven from here — the
+	// ownership middleware 403s a runner-signed POST whose identity carries no
+	// account — so the query-level half is asserted below.)
+	runID, stageID := uuid.New(), uuid.New()
+	f := newChurnFixture(t, runID, stageID)
+
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// Two foreign prior runs on the SAME repo string, each having applied every
+	// entry: adopting either would suppress this run's whole report and write
+	// the other tenant's entry ids into this run's audit payload.
+	newest := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.AccountID = tenantB // another tenant, same repo name
+		r.CreatedAt = newest
+	}, report, ids, nil)
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.InstallationID = &installB // another forge installation (GHES vs github.com)
+		r.CreatedAt = newest.Add(-time.Hour)
+	}, report, ids, nil)
+
+	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", code)
+	}
+	v := churnVerdict(t, f.au)
+	if v.Summary.BaselineEntries != 0 {
+		t.Errorf("baseline_entries = %d, want 0 — a run outside this tenant/installation became the baseline", v.Summary.BaselineEntries)
+	}
+	if v.Summary.Proposed != 3 || v.Summary.Suppressed != 0 {
+		t.Errorf("proposed=%v suppressed=%d; another tenant's dispositions suppressed this run's report",
+			v.Summary.ProposedIDs, v.Summary.Suppressed)
+	}
+
+	// The QUERY-level half, one call below the HTTP boundary because the
+	// middleware bars a tenanted runner-signed POST. Same fixture shape: a
+	// tenanted current run must (a) scope the query to its own account and (b)
+	// still ADOPT a prior run in that same account and installation — the
+	// positive control, without which "reject everything" would pass.
+	t.Run("query scoping and the same-tenant accept path", func(t *testing.T) {
+		curID, curStage := uuid.New(), uuid.New()
+		g := newChurnFixture(t, curID, curStage)
+		cur := g.rr.getRuns[curID]
+		cur.AccountID = tenantA
+		cur.InstallationID = &installA
+
+		// The foreign run is NEWEST and carries the OPPOSITE dispositions
+		// (rejected, not applied), so adopting it is visible in the assertion
+		// below rather than masked by an identical baseline.
+		g.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.AccountID = tenantB
+			r.InstallationID = &installA
+			r.CreatedAt = newest.Add(time.Hour)
+		}, report, nil, ids)
+		g.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.AccountID = tenantA
+			r.InstallationID = &installA
+			r.CreatedAt = newest
+		}, report, ids, nil)
+
+		base, degraded := g.s.groomingChurnBaseline(context.Background(), cur)
+		if len(degraded) != 0 {
+			t.Fatalf("degraded = %v, want none", degraded)
+		}
+		if g.rr.lastFilter.AccountID != tenantA || g.rr.lastFilter.Repo != churnRepo {
+			t.Errorf("ListRuns filter = {Repo:%q AccountID:%q}, want {%q, %q} — the query itself must be tenant-scoped, not only the walk",
+				g.rr.lastFilter.Repo, g.rr.lastFilter.AccountID, churnRepo, tenantA)
+		}
+		if len(base.Entries) != len(ids) {
+			t.Fatalf("baseline entries = %d, want %d from the SAME-tenant prior run", len(base.Entries), len(ids))
+		}
+		for _, id := range ids {
+			if base.Entries[id].Disposition != workmgmt.GroomingDispositionApplied {
+				t.Errorf("entry %s disposition = %q, want applied", id, base.Entries[id].Disposition)
+			}
+		}
+	})
+}
+
+// TestGroomingIngest_MostRecentPriorRunWins pins the RECENCY property the
+// baseline's contract claims. The two prior runs carry DIVERGENT dispositions
+// for the same entry — the older rejected it, the newer applied it — so the
+// suppression REASON identifies which baseline was adopted. Diffing against the
+// older one would suppress against stale dispositions, the unsafe direction for
+// a suppression control.
+//
+// The fake returns runs in insertion order (oldest first), so this discriminates
+// the explicit created_at sort rather than the query's ORDER BY convention.
+func TestGroomingIngest_MostRecentPriorRunWins(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	f := newChurnFixture(t, runID, stageID)
+
+	report := churnReport([]int{1}, []float64{9.5}, "missing_estimate")
+	entry := report.HygieneDefects[0].ID
+	older := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) { r.CreatedAt = older },
+		report, nil, []string{entry}) // rejected, seeded FIRST
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) { r.CreatedAt = older.Add(48 * time.Hour) },
+		report, []string{entry}, nil) // applied, seeded SECOND
+
+	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", code)
+	}
+	v := churnVerdict(t, f.au)
+	var reason string
+	for _, s := range v.Suppressed {
+		if s.EntryID == entry {
+			reason = s.Reason
+		}
+	}
+	if reason != workmgmt.GroomingSuppressAlreadyApplied {
+		t.Errorf("suppression reason = %q, want %q — the baseline came from the OLDER prior run, whose dispositions are stale",
+			reason, workmgmt.GroomingSuppressAlreadyApplied)
 	}
 }
 

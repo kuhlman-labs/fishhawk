@@ -143,10 +143,15 @@ The decision order, the three-state baseline, the per-class fingerprint table an
 
 - **The hygiene significance bar runs FIRST**, ahead of the baseline lookup, so it governs a NEW finding as well as a repeat one (#2240 approval condition J2). An operator who declares a defect class insignificant expects not to see it, not to see it once.
 - **Absence from the baseline is the third state.** This guard suppresses, so every ambiguity resolves toward proposing: a failed apply, a containment skip, an unrecognized class, an unrecognized disposition and an unreadable prior report all leave the entry proposed, with the anomaly named in the summary.
+- **Both baseline-integrity checks run ahead of EVERY suppression path.** The unrecognized-class and unrecognized-disposition checks sit together, before the basis comparison and before the ordering thresholds — not inside the disposition switch that names the final suppression. The ordering branch returns `below_ordering_threshold` without ever reading the disposition, so validating it only at the end suppressed a degraded record whenever its rank and score movement happened to be sub-threshold (#2240 fix-up).
 
 ### Production baseline assembly, and its stated gap
 
 `Server.groomingChurnBaseline` walks `ListRuns(repo)` → `ListStagesForRun` → `artifact.ListForStage` to find the most recent prior run's grooming report, then reads that run's `grooming_mutation_applied` audit rows for the dispositions. That one category carries both halves: an `applied` outcome (or a skip whose reason is `already_applied`) is an APPLIED disposition; a skip whose reason is `not_approved` or `amended` is a REJECTED one. No new DB query, sqlc regeneration, or repository-interface widening rides along.
+
+**A repo string is not an identity, so candidate selection is tenant-scoped twice (#2240 fix-up).** ADR-057 hangs a nullable `account_id` off every root entity and installations route to different `forge_base_url`s (GHES and github.com), so two tenants can legitimately own runs whose `Repo` is the same `owner/name`. Adopting one as another's baseline would both corrupt the verdict and copy that tenant's entry ids into this run's audit payload. The `ListRuns` filter therefore carries `AccountID`, AND every candidate is re-checked against the current run's account **and** installation before it can become a baseline — the second check is not redundant, because the query's account predicate deliberately keeps `account_id IS NULL` rows visible (right for a listing surface, wrong for a suppression control), and an untenanted current run constrains the query not at all. Tenant equality is exact, an unset installation included: an over-strict mismatch costs a baseline and therefore proposes, which is the fail-safe direction.
+
+**Recency is enforced here, not inherited.** The candidate set is sorted `created_at DESC, id DESC` in the function rather than trusting query order. The production `ListRuns` does declare that ORDER BY — but a suppression control that silently diffs against the OLDEST baseline if the clause ever changes fails in the unsafe direction (suppressing against stale dispositions), and nothing else binds this function to that clause.
 
 **The gap, stated rather than implied: nothing in production calls `ApplyGrooming` yet.** #2237 shipped the apply layer with its seam deliberately unwired, so no `grooming_mutation_applied` row exists today and every baseline currently resolves empty — which correctly proposes everything, since nothing has in fact been applied or rejected. The wiring above reads the real category, so dispositions populate the instant an apply consumer lands, with no change to this package or to the handler.
 
@@ -163,7 +168,10 @@ Every row below was run empirically (control deleted in the working tree, named 
 | the charter-change lift, and its restriction to the charter-anchored classes | `TestCharterChangeLiftsCharterAnchoredSuppressionOnly` |
 | "an absent `charter_ref` is unknown, not moved" | `TestCharterChangeLiftsCharterAnchoredSuppressionOnly` |
 | the deterministic proposal sort | `TestTwoRunsOverUnchangedBacklogAreByteIdentical` |
-| the resolve-time clamp; the nil-report guard; the unknown-class and unknown-disposition fail-opens | `TestFilterFailureModes` |
+| the resolve-time clamp; the nil-report guard; the unknown-class and unknown-disposition fail-opens; the disposition check's POSITION ahead of the ordering-threshold branch | `TestFilterFailureModes` (rows F5, F6, F6b) |
+| the deterministic proposal + suppression sort, ACROSS two separate runs | `TestGroomingIngest_DistinctRunsProduceIdenticalVerdict` |
+| the baseline tenant discriminator (account + installation), and the query-level `AccountID` scoping | `TestGroomingIngest_BaselineIsTenantScoped` |
+| the explicit newest-first candidate sort | `TestGroomingIngest_MostRecentPriorRunWins` |
 | the schema floors and both `additionalProperties: false` levels | `TestSchemaRejectsSubFloorThresholds` |
 | the guard INVOCATION on the ingest path; the baseline assembly; the current-run self-exclusion; the prior-report parse guard | `TestGroomingIngest_UnchangedBacklogProposesNothing` |
 | the churn-verdict fail-closed 500 | `TestGroomingIngest_ChurnAuditFailureIs500` |

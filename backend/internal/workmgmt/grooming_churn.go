@@ -102,6 +102,11 @@ const (
 	// class this build does not recognize. Fail OPEN toward proposing: an
 	// unreadable baseline record must never silently suppress.
 	GroomingResurfaceUnknownBaselineClass = "unknown_baseline_class"
+	// GroomingResurfaceUnknownBaselineDisposition marks a baseline entry
+	// carrying neither recorded disposition — a malformed record. Same fail-open
+	// direction, named distinctly from the class anomaly so an audit reader can
+	// tell an unreadable CLASS from an unreadable DECISION.
+	GroomingResurfaceUnknownBaselineDisposition = "unknown_baseline_disposition"
 )
 
 // GroomingBaselineEntry is one entry's record in the last decided-and-applied
@@ -420,16 +425,21 @@ type groomingChurnDecision struct {
 //     see it once, on its first appearance, and only then never again.
 //  2. absent from the baseline → PROPOSE. A finding that was never decided is
 //     not churn.
-//  3. structural basis differs from the baseline's → PROPOSE, recording a
+//  3. a baseline record whose class OR disposition this build cannot read →
+//     PROPOSE, recording the anomaly. BOTH integrity checks run here, ahead of
+//     EVERY suppression path, because the ordering-threshold branch at (5)
+//     never consults the disposition: validating it only at (6) let a
+//     degraded ordering record be suppressed on a sub-threshold move.
+//  4. structural basis differs from the baseline's → PROPOSE, recording a
 //     resurface that NAMES what changed (AC5's second half).
-//  4. charter-anchored class under a moved charter → PROPOSE, recording a
+//  5. charter-anchored class under a moved charter → PROPOSE, recording a
 //     charter_changed resurface.
-//  5. ordering whose |rank delta| >= MinRankMovement OR |score delta| >=
+//  6. ordering whose |rank delta| >= MinRankMovement OR |score delta| >=
 //     MinScoreDelta → PROPOSE; otherwise SUPPRESS below_ordering_threshold.
 //     The deltas are measured against the last APPLIED rank/score, so a
 //     crossing move is a genuinely different proposal even for a
 //     previously-rejected entry.
-//  6. otherwise SUPPRESS, naming the baseline disposition.
+//  7. otherwise SUPPRESS, naming the baseline disposition.
 func FilterGroomingChurn(report *plan.GroomingReport, baseline GroomingBaseline, th GroomingThresholds) GroomingChurnResult {
 	res := GroomingChurnResult{
 		Proposals: GroomingProposalSet{
@@ -542,13 +552,24 @@ func groomingDecide(
 		return groomingChurnDecision{propose: true}
 	}
 
-	// A baseline record this build cannot interpret must never suppress.
+	// (3) A baseline record this build cannot interpret must never suppress.
+	// Both integrity checks live HERE, ahead of every suppression path, rather
+	// than the disposition being validated by the switch at (6): the ordering
+	// branch at (5) returns below_ordering_threshold without ever reading the
+	// disposition, so a record carrying neither recorded disposition was
+	// SUPPRESSED whenever its rank and score deltas were sub-threshold —
+	// exactly the fail-toward-proposing direction this guard must never
+	// violate.
 	if !groomingKnownClasses[prev.Class] {
 		*anomalies = append(*anomalies, "unknown_baseline_class:"+id+":"+prev.Class)
 		return groomingChurnDecision{propose: true, reason: GroomingResurfaceUnknownBaselineClass, changedField: "class"}
 	}
+	if prev.Disposition != GroomingDispositionApplied && prev.Disposition != GroomingDispositionRejected {
+		*anomalies = append(*anomalies, "unknown_baseline_disposition:"+id+":"+string(prev.Disposition))
+		return groomingChurnDecision{propose: true, reason: GroomingResurfaceUnknownBaselineDisposition, changedField: "disposition"}
+	}
 
-	// (3) Structural basis moved → propose and say what changed.
+	// (4) Structural basis moved → propose and say what changed.
 	if prev.BasisHash != basis {
 		return groomingChurnDecision{
 			propose:      true,
@@ -557,12 +578,13 @@ func groomingDecide(
 		}
 	}
 
-	// (4) The charter this suppression was computed under has moved.
+	// (5) The charter this suppression was computed under has moved.
 	if charterChanged && groomingCharterAnchoredClasses[class] {
 		return groomingChurnDecision{propose: true, reason: GroomingResurfaceCharterChanged, changedField: "charter_ref.content_hash"}
 	}
 
-	// (5) Ordering movement against the last APPLIED position.
+	// (6) Ordering movement against the last APPLIED position. Reached only
+	// with a VALIDATED disposition, per (3).
 	if class == plan.GroomingClassOrdering {
 		rankDelta := rank - prev.Rank
 		if rankDelta < 0 {
@@ -578,18 +600,12 @@ func groomingDecide(
 		return groomingChurnDecision{propose: false, reason: GroomingSuppressBelowOrderingThreshold}
 	}
 
-	// (6) Unchanged and already decided.
-	switch prev.Disposition {
-	case GroomingDispositionApplied:
+	// (7) Unchanged and already decided. The disposition is one of exactly two
+	// values here — (3) proposed and returned for anything else.
+	if prev.Disposition == GroomingDispositionApplied {
 		return groomingChurnDecision{propose: false, reason: GroomingSuppressAlreadyApplied}
-	case GroomingDispositionRejected:
-		return groomingChurnDecision{propose: false, reason: GroomingSuppressPreviouslyRejected}
-	default:
-		// A baseline record carrying neither recorded disposition is a
-		// malformed record. Fail OPEN toward proposing, and say so.
-		*anomalies = append(*anomalies, "unknown_baseline_disposition:"+id+":"+string(prev.Disposition))
-		return groomingChurnDecision{propose: true, reason: GroomingResurfaceUnknownBaselineClass, changedField: "disposition"}
 	}
+	return groomingChurnDecision{propose: false, reason: GroomingSuppressPreviouslyRejected}
 }
 
 // groomingBasisFieldName names the structural field a class's fingerprint

@@ -272,6 +272,8 @@ Diffing against the last *proposed* report is the convergence trap #2240's own N
 
 Absence is the fail-safe: this guard suppresses, so every ambiguity resolves toward proposing. An entry whose apply **failed** is absent, not applied, so a mutation that did not land resurfaces next run — which is also exactly what "diff against the last applied state, not the last proposed one" requires.
 
+A baseline record whose **class** or **disposition** this build cannot read is a fourth case and takes the same direction: it is proposed, with the anomaly named in the verdict. Both integrity checks run **ahead of every suppression path**, not only ahead of the disposition-named suppressions — the `ordering` threshold branch decides on rank/score movement without consulting the disposition, so a degraded record whose movement was sub-threshold would otherwise be suppressed by it.
+
 ### The basis fingerprint excludes prose
 
 An already-decided entry is re-proposed only when its **structural basis** moved, and the resurface record names what changed. The fingerprint covers structural fields only, because the agent regenerates prose on every run and a prose-sensitive fingerprint would report "materially changed" for an unchanged backlog — defeating the guard outright.

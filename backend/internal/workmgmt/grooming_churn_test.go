@@ -778,6 +778,37 @@ func TestFilterFailureModes(t *testing.T) {
 		}
 	})
 
+	// The hygiene row above cannot reach the ordering-threshold branch, and that
+	// branch is the one that used to suppress a degraded record: it returned
+	// below_ordering_threshold without ever reading the disposition. So the
+	// SUB-THRESHOLD move is load-bearing here — a supra-threshold move would be
+	// proposed by the threshold branch itself and prove nothing.
+	t.Run("F6b unrecognized disposition on a SUB-THRESHOLD ordering entry still proposes", func(t *testing.T) {
+		ord := gcOrdering("1", 1, 0.90, "R1")
+		report := gcReport("h", func(gr *plan.GroomingReport) { gr.Ordering = []plan.OrderingEntry{ord} })
+		base := gcBaseline("h", map[string]GroomingBaselineEntry{
+			// Rank and score are IDENTICAL to the report's, so both deltas are 0
+			// — under every bar — and the basis hash matches, so the only thing
+			// standing between this entry and a silent suppression is the
+			// disposition check.
+			ord.ID: {Class: plan.GroomingClassOrdering, Disposition: GroomingDisposition(""),
+				BasisHash: groomingOrderingBasis(ord), Rank: 1, Score: 0.90},
+		})
+		res := FilterGroomingChurn(report, base, th)
+		if !containsID(proposedIDs(res), ord.ID) {
+			t.Fatalf("an ordering baseline entry with NO recorded disposition was suppressed as %q; a suppression control that cannot read its own record must PROPOSE",
+				suppressionReason(t, res, ord.ID))
+		}
+		rec, ok := resurfaceRecord(t, res, ord.ID)
+		if !ok || rec.Reason != GroomingResurfaceUnknownBaselineDisposition || rec.ChangedField != "disposition" {
+			t.Errorf("resurface record = %+v (found=%v), want reason %q on field disposition",
+				rec, ok, GroomingResurfaceUnknownBaselineDisposition)
+		}
+		if len(res.Summary.Anomalies) == 0 || !strings.Contains(res.Summary.Anomalies[0], "unknown_baseline_disposition") {
+			t.Errorf("anomalies = %v, want the unknown disposition named", res.Summary.Anomalies)
+		}
+	})
+
 	t.Run("F7 duplicate entry id stays deterministic rather than panicking", func(t *testing.T) {
 		e := gcOrdering("1", 1, 0.9, "R1")
 		report := gcReport("h", func(gr *plan.GroomingReport) { gr.Ordering = []plan.OrderingEntry{e, e} })

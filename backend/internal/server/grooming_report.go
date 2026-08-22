@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -288,8 +289,10 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 	ctx := r.Context()
 	var degraded []string
 
+	var current *run.Run
 	repo := ""
 	if rn, err := s.cfg.RunRepo.GetRun(ctx, runID); err == nil && rn != nil {
+		current = rn
 		repo = rn.Repo
 	} else {
 		degraded = append(degraded, "run_lookup_failed")
@@ -308,7 +311,7 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 	}
 	thresholds := conv.ResolveGroomingThresholds()
 
-	baseline, baselineDegraded := s.groomingChurnBaseline(ctx, runID, repo)
+	baseline, baselineDegraded := s.groomingChurnBaseline(ctx, current)
 	degraded = append(degraded, baselineDegraded...)
 
 	result := workmgmt.FilterGroomingChurn(report, baseline, thresholds)
@@ -345,11 +348,39 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 
 // groomingChurnBaseline assembles the three-state baseline (AC4: the last
 // approved AND APPLIED state, never the last proposed one) from the most
-// recent PRIOR run on the same repo that shipped a grooming report.
+// recent PRIOR run IN THE SAME TENANT on the same repo that shipped a grooming
+// report.
 //
 // It uses only query surfaces that already exist — ListRuns, ListStagesForRun,
 // artifact ListForStage, and the audit chain — so no new DB query, sqlc
 // regeneration, or repository-interface widening rides along.
+//
+// TENANCY (#2240 fix-up). A repo STRING is not an identity on a multi-tenant,
+// multi-forge surface: ADR-057 hangs a nullable account_id off every root
+// entity and installations route to different forge_base_urls (GHES and
+// github.com), so two tenants can legitimately own runs whose Repo is the same
+// "owner/name". Selecting a baseline on the repo string alone would let one
+// tenant's dispositions decide another's suppressions AND copy that tenant's
+// entry ids and counts into this run's audit payload. Scoping is therefore
+// applied TWICE: the query carries AccountID, and every candidate is
+// re-checked against the current run's account AND installation before it can
+// become a baseline. The second check is not redundant — ListRuns' account
+// predicate deliberately keeps account_id IS NULL rows visible (the untenanted
+// -list contract), which is right for a listing surface and wrong for a
+// suppression control.
+//
+// Tenant equality is EXACT, nil-installation included: a candidate whose
+// installation is unset does not match one whose installation is set. An
+// over-strict mismatch costs a baseline and therefore PROPOSES, which is this
+// guard's fail-safe direction; an under-strict match suppresses across a
+// tenant boundary, which is not recoverable by the operator.
+//
+// RECENCY is enforced HERE by an explicit created_at (id-tiebroken) sort
+// rather than inherited from query-order convention. The production ListRuns
+// does ORDER BY created_at DESC, id DESC — but a suppression control that
+// silently diffs against the OLDEST baseline if that ORDER BY ever changes is
+// failing in the unsafe direction against stale dispositions, and no
+// repository-level test binds this function to that clause.
 //
 // Dispositions come from the prior run's grooming_mutation_applied audit rows,
 // which the apply layer (#2237) writes once per SETTLED candidate. That single
@@ -370,20 +401,37 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 // Every failure degrades to a NAMED reason and an empty-or-partial baseline
 // rather than an error: a suppression control that cannot read its baseline
 // must propose, not suppress.
-func (s *Server) groomingChurnBaseline(ctx context.Context, currentRunID uuid.UUID, repo string) (workmgmt.GroomingBaseline, []string) {
+func (s *Server) groomingChurnBaseline(ctx context.Context, current *run.Run) (workmgmt.GroomingBaseline, []string) {
 	empty := workmgmt.NewGroomingBaseline(nil, nil, nil)
-	if repo == "" {
+	if current == nil || current.Repo == "" {
 		return empty, []string{"baseline_repo_unknown"}
 	}
-	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{Repo: repo, Limit: groomingBaselineRunScanLimit})
+	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		Repo:      current.Repo,
+		AccountID: current.AccountID,
+		Limit:     groomingBaselineRunScanLimit,
+	})
 	if err != nil {
 		return empty, []string{"baseline_list_runs_failed"}
 	}
 
+	candidates := make([]*run.Run, 0, len(runs))
 	for _, rn := range runs {
-		if rn == nil || rn.ID == currentRunID {
+		if rn == nil || rn.ID == current.ID || !sameGroomingTenant(rn, current) {
 			continue
 		}
+		candidates = append(candidates, rn)
+	}
+	// Newest first, id-tiebroken — the same total order the ListRuns query
+	// declares, asserted here rather than assumed.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if !candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			return candidates[i].CreatedAt.After(candidates[j].CreatedAt)
+		}
+		return candidates[i].ID.String() > candidates[j].ID.String()
+	})
+
+	for _, rn := range candidates {
 		prior := s.priorGroomingReport(ctx, rn.ID)
 		if prior == nil {
 			continue
@@ -391,9 +439,28 @@ func (s *Server) groomingChurnBaseline(ctx context.Context, currentRunID uuid.UU
 		decisions, applied := s.priorGroomingDispositions(ctx, rn.ID)
 		return workmgmt.NewGroomingBaseline(prior, decisions, applied), nil
 	}
-	// No prior grooming run on this repo: the first-ever run. Not a degrade —
-	// an empty baseline is the CORRECT answer, and everything is proposed.
+	// No prior grooming run in this tenant on this repo: the first-ever run.
+	// Not a degrade — an empty baseline is the CORRECT answer, and everything
+	// is proposed.
 	return empty, nil
+}
+
+// sameGroomingTenant reports whether a candidate prior run belongs to the same
+// tenant AND the same forge installation as the current one. Both comparands
+// are exact, an unset value included: "unset" is a distinct tenancy state, not
+// a wildcard that matches every account or every forge.
+func sameGroomingTenant(candidate, current *run.Run) bool {
+	if candidate.AccountID != current.AccountID {
+		return false
+	}
+	switch {
+	case candidate.InstallationID == nil && current.InstallationID == nil:
+		return true
+	case candidate.InstallationID == nil || current.InstallationID == nil:
+		return false
+	default:
+		return *candidate.InstallationID == *current.InstallationID
+	}
 }
 
 // priorGroomingReport returns the grooming report a prior run shipped, or nil.
