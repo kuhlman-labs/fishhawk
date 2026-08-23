@@ -2015,3 +2015,34 @@ func TestApplyGrooming_AuditCategoriesAreStable(t *testing.T) {
 		t.Errorf("summary category = %q", GroomingApplyCompletedCategory)
 	}
 }
+
+// TestGroomingActionClassFor pins the EXPORTED report-class -> action-class
+// mapping. It is not decoration: the server's groom-gate apply hook (E54.19 /
+// #2822) decides "may this entry be auto-applied?" by testing this function's
+// answer against spec's `hygiene`, so this table is the contract that keeps a
+// remap of `dependency` — or of anything else — out of the hygiene class from
+// silently widening what a single gate approval authorizes. A remap made HERE
+// fails HERE.
+func TestGroomingActionClassFor(t *testing.T) {
+	cases := []struct {
+		reportClass string
+		want        string
+	}{
+		{plan.GroomingClassHygiene, "hygiene"},
+		{plan.GroomingClassDependency, "hygiene"},
+		{plan.GroomingClassOrdering, "ordering"},
+		{plan.GroomingClassDuplicate, "dedup"},
+		{plan.GroomingClassDecomposition, "scoping"},
+		{plan.GroomingClassVisionDrift, "scoping"},
+		// An unrecognized class returns the EMPTY string, never a guess: an
+		// equality test against a named class is then false, so an unknown
+		// class can never test as hygiene.
+		{"not_a_grooming_class", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := GroomingActionClassFor(tc.reportClass); got != tc.want {
+			t.Errorf("GroomingActionClassFor(%q) = %q, want %q", tc.reportClass, got, tc.want)
+		}
+	}
+}
