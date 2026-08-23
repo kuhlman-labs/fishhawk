@@ -377,3 +377,28 @@ func TestKnownCategories_GroomingChurnFiltered(t *testing.T) {
 			"grooming_churn_filter", SuggestCategories("grooming_churn_filter", 5))
 	}
 }
+
+// TestKnownCategories_CampaignGroomingSourceResolved pins the E54.6 / #2238
+// registration of campaign_grooming_source_resolved — the audit copy of a
+// grooming-sourced campaign's provenance (source run/stage/artifact, report
+// content hash, ordered refs, exclusions, limit, acknowledged supersession).
+//
+// It matters even though the durable record is the campaigns.grooming_source
+// column: an unregistered category is UN-AWAITABLE, so
+// GET /v0/runs/{run_id}/audit?category=campaign_grooming_source_resolved would
+// 400 and an operator could not watch for the provenance row at all.
+func TestKnownCategories_CampaignGroomingSourceResolved(t *testing.T) {
+	if !IsKnownCategory("campaign_grooming_source_resolved") {
+		t.Fatal("campaign_grooming_source_resolved is not in KnownCategories; an audit wait armed on it would be rejected")
+	}
+	var found bool
+	for _, c := range SuggestCategories("campaign_grooming_source", 5) {
+		if c == "campaign_grooming_source_resolved" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface campaign_grooming_source_resolved",
+			"campaign_grooming_source", SuggestCategories("campaign_grooming_source", 5))
+	}
+}

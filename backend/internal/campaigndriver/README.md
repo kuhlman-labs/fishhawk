@@ -44,3 +44,28 @@ The driver ACTS on the `out.Paged` refusal in `Ticker.pageGate`:
 - It records a campaign-level `campaign_paused` marker (payload `{campaign_id, issue_ref, run_id, page_event, policy}`) on the global chain and fires the human page through the optional `Notifier` seam (`NotifyStatusUpdateForRun`, satisfied in `serve.go` by the existing `issuecomment` notifier — nil → observe-only, pause recorded but no page; the typed-nil interface trap is avoided by only assigning a non-nil notifier).
 - A campaign already `paused` is sticky — `deriveAndTransition` skips re-derivation so a sibling settling can never auto-unpause it, and the START pass is skipped once a tick leaves the campaign non-running.
 - Resuming is an explicit operator action (`POST /v0/campaigns/{id}/resume`, E25.7 Slice 3), never a derivation.
+
+## The ratified grooming order is read exactly once, and never here (E54.6 / #2238)
+
+A campaign can be created from an approved grooming run's ratified priority order
+(`POST /v0/campaigns` with `grooming_source`). That order is resolved ONCE, at
+campaign assembly, and written down durably — `campaign_items.queue_position` for
+the order itself and `campaigns.grooming_source` for its provenance (migration
+`0074`). **This package reads those rows and nothing else.**
+
+The invariant is not a preference. The order is a RATIFIED artifact: an operator
+approved that specific report at that specific content hash. A mid-campaign
+re-read would re-derive the queue from whatever the backlog looks like *now* — a
+second, unapproved source of truth for a decision the operator already made, and
+one that would change a running campaign's behaviour with no gate and no audit
+row.
+
+`no_grooming_read_test.go` enforces it technically: no non-test file in this
+package may name a grooming/board read symbol (`ParseGroomingReport`,
+`KindGroomingReport`, `OrderFromReport`, `ReorderByPriority`, `GroomingOrder`, …)
+or import `backend/internal/workmgmt`. It is a SOURCE-level check over this
+package only — tamper-evident within the repo, not a runtime capability boundary,
+and it bans the reading vocabulary rather than every conceivable spelling. The
+complementary behavioural control is the counting-fake test in
+`backend/internal/server`, which proves exactly one grooming-report artifact read
+per create and zero afterwards.

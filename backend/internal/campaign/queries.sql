@@ -4,8 +4,13 @@
 -- internal/run/queries.sql.
 
 -- name: CreateCampaign :one
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+-- grooming_source is the DURABLE provenance of a campaign built from an
+-- approved grooming order (E54.6 / #2238), written by this SAME single-row
+-- INSERT so a campaign can never exist unprovenanced — campaign.Persist is not
+-- transactional and the audit emit is best-effort after it. NULL for every
+-- epic_ref / explicit-items campaign.
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
 -- name: GetCampaign :one
@@ -50,19 +55,28 @@ UPDATE campaigns
 RETURNING *;
 
 -- name: CreateCampaignItem :one
-INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy)
-VALUES ($1, $2, $3, $4, $5, $6)
+-- queue_position is the item's 0-based place in the campaign queue (migration
+-- 0074). It is written EXPLICITLY rather than inferred from insertion sequence:
+-- every item of one campaign is inserted inside one transaction, so their
+-- now()-defaulted created_at values are IDENTICAL and (created_at, id) ordering
+-- collapses to the random-UUID tiebreak.
+INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy, queue_position)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: GetCampaignItem :one
 SELECT * FROM campaign_items WHERE id = $1;
 
 -- name: ListCampaignItemsForCampaign :many
--- Insertion order (created_at ASC + id tiebreak) so the campaign's items
--- render in the order they were assembled.
+-- QUEUE ORDER: queue_position ASC first (migration 0074), then the historical
+-- (created_at, id) tiebreak. queue_position is the durable assembled order —
+-- for a grooming-order campaign it IS the ratified rank order, and it is the
+-- order the engine's Eligible slice is built in. The (created_at, id) tiebreak
+-- is retained deliberately so every pre-0074 row, which carries the DEFAULT 0,
+-- lists in exactly its pre-0074 order rather than an undefined one.
 SELECT * FROM campaign_items
  WHERE campaign_id = $1
- ORDER BY created_at ASC, id ASC;
+ ORDER BY queue_position ASC, created_at ASC, id ASC;
 
 -- name: ListCampaignItemsForRun :many
 -- The reverse-discovery query ("which campaign owns this run") served by

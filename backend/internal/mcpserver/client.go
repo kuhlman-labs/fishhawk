@@ -2539,9 +2539,17 @@ type Campaign struct {
 	// on an unbound campaign (the unchanged default — each item run then needs
 	// its own working_dir, and a local one without either is refused). Mirrors
 	// Run.WorkingDir.
-	WorkingDir string    `json:"working_dir,omitempty" jsonschema:"the absolute checkout path bound to this campaign; every item run minted from it inherits this unless the per-item call overrides it. Absent when the campaign carries no binding"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"the absolute checkout path bound to this campaign; every item run minted from it inherits this unless the per-item call overrides it. Absent when the campaign carries no binding"`
+	// GroomingSource is the DURABLE provenance of a campaign created from an
+	// approved grooming run's ratified order (E54.6 / #2238), read back from the
+	// campaigns.grooming_source column — so it is present on every read of the
+	// campaign, not just the create response. Typed map[string]any for the same
+	// reason OperatorAgent is: the MCP SDK builds the output schema by
+	// reflection, and json.RawMessage would surface as type:array. Omitted on
+	// every epic_ref / explicit-items campaign.
+	GroomingSource map[string]any `json:"grooming_source,omitempty" jsonschema:"provenance of a campaign built from an approved grooming order: source_run_id, source_stage_id, report_artifact_id, report_content_hash, ordered_refs, excluded (with reasons), limit, omitted_by_limit, superseded_by. Absent unless the campaign was created from a grooming order"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
@@ -2638,6 +2646,27 @@ type campaignCreateRequest struct {
 	// an empty value so a campaign without a binding sends no working_dir key.
 	// The backend validates it is absolute (400 validation_failed otherwise).
 	WorkingDir string `json:"working_dir,omitempty"`
+	// GroomingSource is the OPTIONAL THIRD campaign source (E54.6 / #2238): an
+	// approved grooming run whose ratified priority order becomes the campaign
+	// queue. A nil pointer drops the key entirely, so a campaign created from an
+	// epic or an explicit item list sends a byte-identical body to pre-#2238.
+	// The backend refuses it in combination with epic_ref or items.
+	GroomingSource *campaignGroomingSource `json:"grooming_source,omitempty"`
+}
+
+// campaignGroomingSource is the grooming_source request block. It is a distinct
+// TYPE rather than three loose parameters so it cannot be transposed with the
+// existing string arguments at the call site.
+type campaignGroomingSource struct {
+	RunID string `json:"run_id"`
+	// Limit caps the batch to the top N convertible entries by rank; omitted
+	// (0) means no cap.
+	Limit int `json:"limit,omitempty"`
+	// AllowSuperseded explicitly acknowledges building from an order a NAMED
+	// newer approved grooming run has superseded — that case and no other. A
+	// scan that could not prove currency, or could not be run, is refused
+	// whatever this carries (K2).
+	AllowSuperseded bool `json:"allow_superseded,omitempty"`
 }
 
 // CreateCampaign assembles a campaign via `POST /v0/campaigns` (E25.4) and
@@ -2673,8 +2702,8 @@ type campaignCreateRequest struct {
 // every item run minted from the campaign inherits; empty omits the field (no
 // binding). It is the LAST parameter, appended after items []string, so it
 // cannot be transposed with another string argument at a call site.
-func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string, workingDir string) (*Campaign, error) {
-	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items, WorkingDir: workingDir})
+func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string, workingDir string, groomingSource *campaignGroomingSource) (*Campaign, error) {
+	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items, WorkingDir: workingDir, GroomingSource: groomingSource})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}

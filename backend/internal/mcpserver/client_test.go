@@ -105,7 +105,7 @@ func TestCreateCampaign_OperatorAgentBytes_OmittedWhenNil(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
-	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil, "")
+	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil, "", nil)
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "",
-		json.RawMessage(`{"may_waive":"solo_low"}`), nil, "")
+		json.RawMessage(`{"may_waive":"solo_low"}`), nil, "", nil)
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	}
 	r := newResolver(srv, nil)
 
-	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, wd)
+	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, wd, nil)
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	// Empty binding → no working_dir key on the wire at all.
 	fb2, srv2 := newFakeBackend(t)
 	r2 := newResolver(srv2, nil)
-	if _, err := r2.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, ""); err != nil {
+	if _, err := r2.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, "", nil); err != nil {
 		t.Fatalf("CreateCampaign (unbound): %v", err)
 	}
 	if fb2.createCampaignBody.WorkingDir != "" {
@@ -2185,5 +2185,36 @@ func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
 	}
 	if _, present := gotRaw["move_scope_files_to_slice"]; present {
 		t.Errorf("move_scope_files_to_slice present on a no-move approve body: %#v", gotRaw)
+	}
+}
+
+// TestCreateCampaign_GroomingSourceOnTheWire pins the client's REQUEST
+// encoding and its RESPONSE decoding for the #2238 block in one place: the
+// typed grooming_source rides the POST body, and the campaign's durable
+// grooming_source provenance decodes back off the response.
+func TestCreateCampaign_GroomingSourceOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignResp = Campaign{
+		ID:   "c1",
+		Repo: "x/y",
+		GroomingSource: map[string]any{
+			"source_run_id":       "r1",
+			"report_content_hash": "sha256:abc",
+			"ordered_refs":        []any{"issue:30", "issue:10"},
+		},
+	}
+	r := newResolver(srv, nil)
+
+	got, err := r.api.CreateCampaign(context.Background(), "x/y", "", "", nil, nil, "",
+		&campaignGroomingSource{RunID: "r1", Limit: 3, AllowSuperseded: true})
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	sent := fb.createCampaignBody.GroomingSource
+	if sent == nil || sent.RunID != "r1" || sent.Limit != 3 || !sent.AllowSuperseded {
+		t.Fatalf("POST body grooming_source = %+v, want run_id=r1 limit=3 allow_superseded=true", sent)
+	}
+	if got.GroomingSource["report_content_hash"] != "sha256:abc" {
+		t.Errorf("decoded Campaign.GroomingSource = %v, want the report content hash carried through", got.GroomingSource)
 	}
 }

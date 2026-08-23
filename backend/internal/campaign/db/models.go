@@ -65,19 +65,21 @@ type Campaign struct {
 	IdempotencyKey *string            `json:"idempotency_key"`
 	AccountID      *uuid.UUID         `json:"account_id"`
 	WorkingDir     string             `json:"working_dir"`
+	GroomingSource []byte             `json:"grooming_source"`
 }
 
 type CampaignItem struct {
-	ID          uuid.UUID          `json:"id"`
-	CampaignID  uuid.UUID          `json:"campaign_id"`
-	IssueRef    string             `json:"issue_ref"`
-	DependsOn   []byte             `json:"depends_on"`
-	RunID       *uuid.UUID         `json:"run_id"`
-	State       string             `json:"state"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	PauseReason []byte             `json:"pause_reason"`
-	Autonomy    string             `json:"autonomy"`
+	ID            uuid.UUID          `json:"id"`
+	CampaignID    uuid.UUID          `json:"campaign_id"`
+	IssueRef      string             `json:"issue_ref"`
+	DependsOn     []byte             `json:"depends_on"`
+	RunID         *uuid.UUID         `json:"run_id"`
+	State         string             `json:"state"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	PauseReason   []byte             `json:"pause_reason"`
+	Autonomy      string             `json:"autonomy"`
+	QueuePosition int32              `json:"queue_position"`
 }
 
 type McpToken struct {

@@ -68,6 +68,14 @@ type campaignResponse struct {
 	// no idempotent key — same convention as the ship-artifact endpoints
 	// (plan/pull-request/deployment).
 	Idempotent bool `json:"idempotent,omitempty"`
+	// GroomingSource is the DURABLE provenance of a campaign created from an
+	// approved grooming run's ratified order (E54.6 / #2238): the source
+	// run/stage/artifact, the report's content hash, the ordered refs, the named
+	// exclusions, the applied limit and any acknowledged supersession. Read back
+	// from the campaigns.grooming_source column, so it is carried by GET and
+	// list responses too — not just the create response. Omitted (omitempty) for
+	// every epic_ref / explicit-items campaign.
+	GroomingSource json.RawMessage `json:"grooming_source,omitempty"`
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -83,8 +91,13 @@ type campaignItemResponse struct {
 	// page event + run/stage/gate). Omitted (omitempty) unless the item is —
 	// or was — paused; mirrors the domain *PauseReason.
 	PauseReason *campaign.PauseReason `json:"pause_reason,omitempty"`
-	CreatedAt   time.Time             `json:"created_at"`
-	UpdatedAt   time.Time             `json:"updated_at"`
+	// Position is the item's 0-based place in the campaign queue
+	// (campaign_items.queue_position, migration 0074) — for a grooming-sourced
+	// campaign, its ratified rank. Always present: it is the field that makes
+	// the queue order legible without inferring it from the array index.
+	Position  int       `json:"position"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // campaignRollupPayload is the engine's readiness partition over a
@@ -164,6 +177,13 @@ type createCampaignRequest struct {
 	// item run then needs #2498's explicit per-item value (a local one is
 	// refused working_dir_required without either).
 	WorkingDir string `json:"working_dir,omitempty"`
+	// GroomingSource is the OPTIONAL THIRD campaign source (E54.6 / #2238): an
+	// approved grooming run whose ratified priority order becomes this
+	// campaign's queue. Its PRESENCE selects the source and it is MUTUALLY
+	// EXCLUSIVE with both epic_ref and items — silent precedence among three
+	// sources is how an operator gets a batch they did not ask for, so the
+	// combination is a 400 rather than a precedence rule.
+	GroomingSource *groomingSourceRequest `json:"grooming_source,omitempty"`
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
@@ -179,8 +199,13 @@ func toCampaignResponse(c *campaign.Campaign) campaignResponse {
 		// The campaign-level checkout binding (E48.87 / #2527). Empty → omitted,
 		// so an unbound campaign carries no working_dir key.
 		WorkingDir: c.WorkingDir,
-		CreatedAt:  c.CreatedAt,
-		UpdatedAt:  c.UpdatedAt,
+		// Durable grooming provenance, raw JSON passthrough (E54.6 / #2238):
+		// nil bytes → omitted. Read from the COLUMN, so a campaign names its
+		// source order for as long as the row exists — the create response is a
+		// convenience, not the system of record.
+		GroomingSource: json.RawMessage(c.GroomingSource),
+		CreatedAt:      c.CreatedAt,
+		UpdatedAt:      c.UpdatedAt,
 	}
 }
 
@@ -196,6 +221,7 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 		RunID:       it.RunID,
 		State:       string(it.State),
 		PauseReason: it.PauseReason,
+		Position:    it.Position,
 		CreatedAt:   it.CreatedAt,
 		UpdatedAt:   it.UpdatedAt,
 	}
@@ -417,10 +443,40 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// the epic-sweep + optional items-subset path byte-identical; epic_ref ABSENT
 	// with items present routes to the no-epic branch below.
 	epicRef := strings.TrimSpace(req.EpicRef)
-	if epicRef == "" && len(req.Items) == 0 {
+	if epicRef == "" && len(req.Items) == 0 && req.GroomingSource == nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"one of epic_ref or items is required", map[string]any{"field": "epic_ref"})
+			"one of epic_ref, items or grooming_source is required", map[string]any{"field": "epic_ref"})
 		return
+	}
+	// grooming_source is the THIRD source and is MUTUALLY EXCLUSIVE with the
+	// other two. Refusal, not precedence: three sources with a silent winner is
+	// how an operator gets a campaign they did not ask for. Validated HERE, with
+	// the other body checks and BEFORE the Idempotency-Key lookup and the
+	// installation resolution, so the conflict costs no forge round-trip.
+	if req.GroomingSource != nil {
+		if epicRef != "" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"grooming_source cannot be combined with epic_ref: an approved grooming order IS the item set",
+				map[string]any{"field": "grooming_source", "conflicts_with": "epic_ref"})
+			return
+		}
+		if len(req.Items) > 0 {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"grooming_source cannot be combined with items: an approved grooming order IS the item set",
+				map[string]any{"field": "grooming_source", "conflicts_with": "items"})
+			return
+		}
+		if strings.TrimSpace(req.GroomingSource.RunID) == "" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"grooming_source.run_id is required", map[string]any{"field": "grooming_source.run_id"})
+			return
+		}
+		if req.GroomingSource.Limit < 0 {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"grooming_source.limit must be >= 0 (0 means no cap)",
+				map[string]any{"field": "grooming_source.limit", "got": req.GroomingSource.Limit})
+			return
+		}
 	}
 	// pause_policy is optional; an empty value normalizes to pause_campaign in
 	// campaign.Persist. A non-empty value must be a recognized policy, caught
@@ -552,6 +608,32 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		Jira:    conv.Jira,
 	}
 
+	// THE THIRD SOURCE (E54.6 / #2238). Resolve the approved grooming order
+	// BEFORE the branch below, so its rank-ordered issue refs become the input
+	// to the EXISTING #2051 no-epic item path — no bespoke assembly, board write
+	// or dispatch path is added. The whole ladder runs against local
+	// run/artifact/approval state, so every refusal is reachable without a live
+	// forge. The order is read EXACTLY ONCE, here; nothing downstream re-reads a
+	// report or a board.
+	var groomingOrder *campaign.GroomingOrder
+	var groomingProvenance *campaignGroomingSourcePayload
+	itemRefs := req.Items
+	if req.GroomingSource != nil {
+		var gerr error
+		groomingOrder, groomingProvenance, gerr = s.resolveGroomingOrder(r.Context(), owner, name, req.Repo, req.GroomingSource)
+		if gerr != nil {
+			var gse *groomingSourceError
+			if errors.As(gerr, &gse) {
+				s.writeError(w, r, gse.Status, gse.Code, gse.Message, gse.Details)
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not resolve the grooming order", map[string]any{"error": gerr.Error()})
+			return
+		}
+		itemRefs = groomingOrder.Refs
+	}
+
 	// Resolve the epic-children (or no-epic item-set) result to assemble from.
 	// epic_ref PRESENT keeps the EpicChildrenQuerier sweep + optional
 	// FilterToSubset path byte-identical; epic_ref ABSENT + items present routes
@@ -610,11 +692,33 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err = resolver.ResolveDependencies(r.Context(), workmgmt.IssueSetRequest{
 			Target: target,
-			Items:  req.Items,
+			// itemRefs is req.Items for the #2051 no-epic variant and the
+			// grooming order's rank-ordered refs for the #2238 variant — one
+			// resolution path, two ways of naming the set.
+			Items: itemRefs,
 		})
 		if err != nil {
 			s.writeError(w, r, http.StatusBadGateway, "issue_set_resolution_failed",
 				"could not resolve the campaign's issue set",
+				map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	// PERMUTE THE RESOLVED CHILDREN INTO RATIFIED RANK ORDER. Assemble stamps
+	// each item's queue position from its index in res.Children, so this is what
+	// makes the approved order the order items are CREATED in and therefore the
+	// order ListCampaignItemsForCampaign (queue_position ASC) returns them and
+	// the engine's Eligible slice works. Edges/DroppedEdges are untouched:
+	// Assemble builds its index map from the actual Children order, so the DAG
+	// is invariant under the permutation. A set mismatch is a 500, not a 4xx —
+	// it means the provider returned a set the order did not name, which is a
+	// bug rather than operator input.
+	if groomingOrder != nil {
+		result, err = campaign.ReorderByPriority(result, groomingOrder.Numbers)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"the resolved issue set does not match the grooming order",
 				map[string]any{"error": err.Error()})
 			return
 		}
@@ -639,7 +743,7 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			// message (#2120). A defensively-wrapped dangling error (no typed
 			// form) still maps to the 422 with just epic_ref.
 			s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_dangling_dependency",
-				err.Error(), DanglingDependencyDetails(err, req.EpicRef))
+				err.Error(), groomingDanglingDetails(DanglingDependencyDetails(err, req.EpicRef), groomingOrder))
 			return
 		case errors.Is(err, campaign.ErrCycle):
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -671,11 +775,39 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		assembly.IdempotencyKey = &idempKey
 	}
 
+	// Thread the DURABLE grooming provenance onto the assembly so it rides the
+	// campaign's OWN single-row INSERT (E54.6 / #2238). This is why a
+	// grooming-sourced campaign can never exist unprovenanced: campaign.Persist
+	// is not transactional and the audit emit below is best-effort, so a
+	// provenance record written after the fact could be lost while the campaign
+	// survived.
+	if groomingProvenance != nil {
+		raw, merr := json.Marshal(groomingProvenance)
+		if merr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not encode the grooming provenance", map[string]any{"error": merr.Error()})
+			return
+		}
+		assembly.GroomingSource = raw
+	}
+
 	created, err := campaign.Persist(r.Context(), s.cfg.CampaignRepo, req.Repo, assembly)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"persist campaign failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// The audit entry is a SECOND copy of the provenance, for the chain. It is
+	// best-effort, exactly like every other campaign audit emit — which is
+	// precisely why it is not the system of record: the campaigns.grooming_source
+	// column above is.
+	if groomingProvenance != nil {
+		s.emitCampaignAudit(r.Context(), auditCampaignGroomingSourceResolved, map[string]any{
+			"campaign_id":     created.ID.String(),
+			"repo":            created.Repo,
+			"grooming_source": groomingProvenance,
+		})
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, toCampaignResponse(created))

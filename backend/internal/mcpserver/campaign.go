@@ -36,6 +36,15 @@ type StartCampaignInput struct {
 	// children; WITHOUT epic_ref it is the authoritative issue set the no-epic
 	// campaign assembles over.
 	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101' or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the campaign to — every item must be a child of the epic (a non-child fails campaign_item_not_child); omit to sweep every child. WITHOUT epic_ref: the authoritative issue set a no-epic campaign assembles over, resolving each issue's depends_on directly (#2051). In both modes an included item whose depends_on points at an issue OUTSIDE the set fails campaign_dangling_dependency (that dependency must run within the batch). One of epic_ref / items is required"`
+	// GroomingRunID selects the THIRD campaign source (E54.6 / #2238): an
+	// approved grooming run whose ratified priority order becomes the campaign
+	// queue. Deliberately a RUN ID and nothing more — no board column, no order
+	// content, and no pending-order render crosses this surface (ADR-064).
+	GroomingRunID string `json:"grooming_run_id,omitempty" jsonschema:"OPTIONAL the UUID of an APPROVED grooming run whose ratified priority order becomes this campaign's queue (#2238). Pass it INSTEAD of epic_ref and items — combining it with either is refused. The backend resolves that run's grooming_report artifact, verifies its plan stage's approval gate was granted, and creates one campaign item per ordered issue in rank order. Refusals you can act on: grooming_run_not_found (wrong id, or a run in another workspace account), grooming_order_not_approved (the report was never ratified, or its gate carries a rejection), grooming_order_absent (that run shipped no grooming report), grooming_order_superseded (a newer approved grooming run exists)"`
+	// GroomingOrderLimit caps the batch; GroomingAllowSuperseded acknowledges an
+	// order a newer approved run superseded.
+	GroomingLimit           int  `json:"grooming_order_limit,omitempty" jsonschema:"OPTIONAL with grooming_run_id: cap the campaign to the top N issues by ratified rank. Omit (or 0) to take every ordered issue in the target repo. The response's grooming_source block reports how many ranked issues the cap omitted, so a truncated batch is never silent"`
+	GroomingAllowSuperseded bool `json:"grooming_allow_superseded,omitempty" jsonschema:"OPTIONAL with grooming_run_id: build from this order even though a NEWER approved grooming run — one the backend POSITIVELY IDENTIFIED and names in the refusal — has superseded it. Default false REFUSES that case; prefer grooming the newer run. Set true only when you deliberately want the older ratified order; the choice is recorded in the campaign's durable provenance. It applies to a NAMED superseding run and to NOTHING ELSE: a supersession check that could not prove the order is current (grooming_order_supersession_undetermined) or could not be run at all (grooming_order_supersession_unreadable) is refused whatever this flag says, because an incomplete check names no run to acknowledge"`
 	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
 	// #2527): bound ONCE here, inherited by every item run.
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required"`
@@ -147,8 +156,24 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 	// epic_ref is OPTIONAL as of #2051; require epic_ref OR a non-empty items
 	// list (pass epic_ref to decompose an epic, or items alone for the no-epic
 	// variant). The server owns the branch decision — the client forwards both.
-	if strings.TrimSpace(in.EpicRef) == "" && len(in.Items) == 0 {
-		return nil, StartCampaignOutput{}, errors.New("one of epic_ref or items is required: pass epic_ref to decompose an epic, or items alone to assemble a no-epic campaign over an explicit issue list")
+	groomingRunID := strings.TrimSpace(in.GroomingRunID)
+	if strings.TrimSpace(in.EpicRef) == "" && len(in.Items) == 0 && groomingRunID == "" {
+		return nil, StartCampaignOutput{}, errors.New("one of epic_ref, items or grooming_run_id is required: pass epic_ref to decompose an epic, items alone to assemble a no-epic campaign over an explicit issue list, or grooming_run_id to build the queue from an approved grooming run's ratified order")
+	}
+	// The three sources are MUTUALLY EXCLUSIVE, refused CLIENT-SIDE before any
+	// backend call so the conflict costs no round-trip. Refusal, not precedence:
+	// a silent winner among three sources is how an operator gets a batch they
+	// did not ask for. The backend enforces the same rule independently.
+	if groomingRunID != "" {
+		if strings.TrimSpace(in.EpicRef) != "" {
+			return nil, StartCampaignOutput{}, errors.New("grooming_run_id cannot be combined with epic_ref: the approved grooming order IS the item set — pass grooming_run_id alone, or drop it and decompose the epic")
+		}
+		if len(in.Items) > 0 {
+			return nil, StartCampaignOutput{}, errors.New("grooming_run_id cannot be combined with items: the approved grooming order IS the item set — pass grooming_run_id alone, or drop it and name the items explicitly")
+		}
+		if in.GroomingLimit < 0 {
+			return nil, StartCampaignOutput{}, fmt.Errorf("grooming_order_limit %d must be >= 0 (0 means no cap)", in.GroomingLimit)
+		}
 	}
 
 	// working_dir guard (E48.87 / #2527), fired BEFORE the r.api round-trip so a
@@ -187,7 +212,18 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		operatorAgent = b
 	}
 
-	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent, in.Items, workingDir)
+	// The grooming source is a typed block, not three loose parameters, so it
+	// cannot be transposed with the string arguments above.
+	var groomingSource *campaignGroomingSource
+	if groomingRunID != "" {
+		groomingSource = &campaignGroomingSource{
+			RunID:           groomingRunID,
+			Limit:           in.GroomingLimit,
+			AllowSuperseded: in.GroomingAllowSuperseded,
+		}
+	}
+
+	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent, in.Items, workingDir, groomingSource)
 	if err != nil {
 		// Map the backend's gate codes onto operator-actionable tool errors.
 		var ae *apiError
@@ -206,6 +242,16 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 				// incomplete subset sibling names the include-in-items / omit-items
 				// remedy. Render both when both are present; fall back to the
 				// not_child wording when details are absent (older backend).
+				// A grooming-order batch has its OWN remedy pair, so branch on the
+				// provenance detail first: the operator cannot "fix the epic's
+				// edges" for a batch that has no epic — they widen the batch or
+				// drop the edge (#2238 AC7).
+				if src, _ := ae.Details["dangling_source"].(string); src == "grooming_order" {
+					edges, _ := ae.Details["dangling_not_child"].([]any)
+					return nil, StartCampaignOutput{}, fmt.Errorf(
+						"campaign_dangling_dependency: %s — the grooming order's batch (from run %v) contains an item whose depends_on targets an issue OUTSIDE the batch%s; either WIDEN the batch so the dependency is included (raise or drop grooming_order_limit, which is currently %v), or DROP the edge on the depending issue",
+						ae.Message, ae.Details["grooming_run_id"], formatDanglingEdges(edges), ae.Details["grooming_order_limit"])
+				}
 				_, notChild := ae.Details["dangling_not_child"]
 				_, excluded := ae.Details["dangling_excluded_incomplete"]
 				const notChildRemedy = "an epic child declares a depends_on that is not a fellow child of %s; fix the epic's dependency edges and retry"
@@ -221,6 +267,34 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 					return nil, StartCampaignOutput{}, fmt.Errorf(
 						"campaign_dangling_dependency: %s — "+notChildRemedy, ae.Message, in.EpicRef)
 				}
+			case "grooming_order_superseded":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_superseded: %s — a NEWER approved grooming run (%v) has superseded this order. Start the campaign from that run instead, or set grooming_allow_superseded=true to build from the older ratified order deliberately",
+					ae.Message, ae.Details["superseded_by"])
+			case "grooming_order_supersession_undetermined":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_supersession_undetermined: %s — the check could not PROVE that no newer approved grooming run exists, so it refused rather than silently building from a possibly-stale order. grooming_allow_superseded does NOT bypass this (it acknowledges a NAMED newer run, not a check that never finished): narrow the grooming workflow's run history so the scan can reach the end of it, then retry", ae.Message)
+			case "grooming_order_supersession_unreadable":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_supersession_unreadable: %s — a read the currency decision depends on failed: either the grooming run's own stages/artifacts/approvals or the supersession scan's candidate runs (the message names which). This is a backend read failure, not a stale order: retry, and do NOT reach for grooming_allow_superseded (it deliberately does not bypass this)", ae.Message)
+			case "grooming_order_not_approved":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_not_approved: %s — the grooming run's report was never ratified. Approve its groom stage's gate (or resolve the rejection on it) before feeding the order into a campaign", ae.Message)
+			case "grooming_order_absent":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_absent: %s — run %s shipped no grooming_report artifact, so it carries no priority order. Check the run id, or run the backlog_grooming workflow first", ae.Message, groomingRunID)
+			case "grooming_run_not_found":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_run_not_found: %s — no grooming run %s is visible to this token's workspace account. Check the id (a run in another account is reported identically to a missing one)", ae.Message, groomingRunID)
+			case "grooming_order_repo_mismatch":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_repo_mismatch: %s — that grooming run groomed a different repo than %s; a campaign can only be fed by an order for its own repo", ae.Message, repo)
+			case "grooming_order_empty":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_empty: %s — the ratified order names no issue in %s (every ordering entry was for another repo or another forge), so there is nothing to campaign", ae.Message, repo)
+			case "grooming_order_invalid":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"grooming_order_invalid: %s — the grooming run's report cannot be turned into a campaign order; re-run the grooming workflow to emit a well-formed report", ae.Message)
 			case "campaign_repo_unconfigured":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired, so campaigns cannot be created", ae.Message)
@@ -554,4 +628,24 @@ func (r *runResolver) cancelCampaign(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, CancelCampaignOutput{}, fmt.Errorf("cancel campaign: %w", err)
 	}
 	return nil, CancelCampaignOutput{Campaign: *updated}, nil
+}
+
+// formatDanglingEdges renders the campaign_dangling_dependency details' edge
+// list into the operator message. The details map is decoded JSON, so the edges
+// arrive as []any of strings; a missing or oddly-shaped list yields "" rather
+// than a panic or a misleading empty-bracket render.
+func formatDanglingEdges(edges []any) string {
+	if len(edges) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if s, ok := e.(string); ok {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }

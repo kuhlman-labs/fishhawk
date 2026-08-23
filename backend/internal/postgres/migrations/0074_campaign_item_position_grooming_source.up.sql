@@ -1,0 +1,52 @@
+-- 0074: campaign_items.queue_position + campaigns.grooming_source — the two
+-- DURABLE carriers the grooming-order campaign source (E54.6 / #2238) needs.
+--
+-- WHY queue_position EXISTS. A campaign's item order IS its queue: the engine
+-- partitions ListCampaignItemsForCampaign's result into the Eligible slice in
+-- the order it comes back. Before this migration that listing ordered by
+-- (created_at, id) while campaign.Persist inserted every item of one campaign
+-- inside a single transaction — and in PostgreSQL now() is the TRANSACTION
+-- timestamp, so every row of one campaign shares an IDENTICAL created_at and
+-- the order collapsed to the random-UUID `id` tiebreak. That is not a tie edge
+-- case; it scrambled the order on essentially every campaign. Once the campaign
+-- queue is meant to be a RATIFIED priority order, insertion sequence is no
+-- longer a usable ordering, so the order is written down explicitly.
+--
+-- The column is 0-based and dense (0,1,2,…) per campaign, assigned from the
+-- assembled item order. It is NOT UNIQUE: uniqueness would make a future
+-- reorder a multi-statement dance against the constraint, and nothing depends
+-- on positions being distinct — the listing keeps its (created_at, id)
+-- tiebreak behind queue_position, so equal positions degrade to exactly the
+-- pre-0074 order rather than to an undefined one.
+--
+-- ADDITIVE with a NOT NULL DEFAULT 0: every existing row takes position 0, so
+-- every pre-0074 campaign lists in (created_at, id) order exactly as it does
+-- today. No row is rewritten and no behaviour changes for a campaign created
+-- without a grooming order.
+--
+-- NAMED queue_position, NOT position: POSITION is a PostgreSQL non-reserved
+-- keyword that cannot be a function or type name, and an unqualified `position`
+-- in an ORDER BY reads ambiguously to a human even where the parser copes.
+-- queue_position also says what it is for.
+ALTER TABLE campaign_items
+    ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;
+
+-- WHY grooming_source EXISTS. A campaign built from an approved grooming
+-- order must be able to name that order FOREVER, not just in the create
+-- response. The audit chain is not sufficient on its own: campaign.Persist is
+-- not transactional and the audit emit is best-effort AFTER persistence, so an
+-- audit failure would leave a campaign whose source grooming run and report
+-- content hash are unrecoverable once the 201 body is gone.
+--
+-- Writing the provenance as a column on the campaigns row makes it atomic with
+-- the campaign's own single-row INSERT — there is no window in which a campaign
+-- exists unprovenanced. NULL means "not created from a grooming order", which
+-- is every pre-0074 campaign and every campaign created from an epic_ref or an
+-- explicit items list.
+--
+-- JSONB (not a set of scalar columns) because the block is a provenance RECORD
+-- read as a unit and never filtered on: run/stage/artifact ids, the report
+-- content hash, the ordered refs, the named exclusions, the applied limit and
+-- the acknowledged supersession.
+ALTER TABLE campaigns
+    ADD COLUMN grooming_source JSONB;

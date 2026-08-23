@@ -99,6 +99,17 @@ var boardReadSymbols = []string{
 	// vocabulary — Request, Result, Record, Kind — while leaving
 	// GroomingReport, which this surface legitimately ingests, alone.
 	"GroomingMutation",
+	// E54.6 / #2238 — the grooming ORDER derivation. The campaign source reads
+	// the ratified order EXACTLY ONCE, server-side at campaign assembly; the
+	// agent tool surface carries only a run ID. A tool that derived or rendered
+	// the pending order in-process would be a second, unaudited reader of the
+	// same stale-by-construction state this invariant exists to keep out.
+	// "GroomingOrder" covers the whole vocabulary (GroomingOrder,
+	// GroomingOrderExclusion, GroomingOrderError) while leaving GroomingReport —
+	// the artifact this surface legitimately ingests — alone.
+	"GroomingOrder",
+	"OrderFromReport",
+	"ReorderByPriority",
 }
 
 // packageImports parses every non-test .go file in dir and returns the sorted
@@ -317,6 +328,40 @@ func TestBannedSymbolCoversGroomingApplySymbols(t *testing.T) {
 	for _, name := range allowed {
 		if got := bannedSymbol(name); got != "" {
 			t.Errorf("bannedSymbol(%q) = %q, want \"\": ingesting a grooming REPORT is not dispatching a grooming MUTATION", name, got)
+		}
+	}
+}
+
+// TestBannedSymbolCoversGroomingOrderSymbols pins the #2238 extension at the
+// matcher, mirroring the #2237 test above: every order-derivation symbol is
+// banned, and the near-misses that must NOT be — the grooming REPORT vocabulary
+// this surface legitimately ingests, and unrelated Order/Reorder names — still
+// resolve to "". Without the negative half the list could be widened to a bare
+// "Order" and this file would still pass while forbidding legitimate code.
+func TestBannedSymbolCoversGroomingOrderSymbols(t *testing.T) {
+	banned := []string{
+		"GroomingOrder",
+		"GroomingOrderExclusion",
+		"GroomingOrderError",
+		"OrderFromReport",
+		"ReorderByPriority",
+	}
+	for _, name := range banned {
+		if bannedSymbol(name) == "" {
+			t.Errorf("bannedSymbol(%q) = \"\", want it banned: deriving the ratified grooming order in-process on the MCP agent tool surface would be a second reader of the order the campaign source reads exactly once (ADR-064 / #2238)", name)
+		}
+	}
+	allowed := []string{
+		"GroomingReport",
+		"ParseGroomingReport",
+		"GroomingReportVersion",
+		"OrderingEntry",
+		"Order",
+		"Reorder",
+	}
+	for _, name := range allowed {
+		if got := bannedSymbol(name); got != "" {
+			t.Errorf("bannedSymbol(%q) = %q, want \"\": ingesting a grooming REPORT, or naming an unrelated order, is not deriving the ratified campaign order", name, got)
 		}
 	}
 }

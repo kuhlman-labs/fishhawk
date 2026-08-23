@@ -13,9 +13,9 @@ import (
 
 const createCampaign = `-- name: CreateCampaign :one
 
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
 `
 
 type CreateCampaignParams struct {
@@ -27,6 +27,7 @@ type CreateCampaignParams struct {
 	OperatorAgent  []byte    `json:"operator_agent"`
 	IdempotencyKey *string   `json:"idempotency_key"`
 	WorkingDir     string    `json:"working_dir"`
+	GroomingSource []byte    `json:"grooming_source"`
 }
 
 // Campaign / campaign-item queries consumed by the postgres adapter for the
@@ -43,6 +44,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		arg.OperatorAgent,
 		arg.IdempotencyKey,
 		arg.WorkingDir,
+		arg.GroomingSource,
 	)
 	var i Campaign
 	err := row.Scan(
@@ -56,23 +58,25 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		&i.OperatorAgent,
 		&i.IdempotencyKey,
 		&i.WorkingDir,
+		&i.GroomingSource,
 	)
 	return i, err
 }
 
 const createCampaignItem = `-- name: CreateCampaignItem :one
-INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy, queue_position)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
 `
 
 type CreateCampaignItemParams struct {
-	ID         uuid.UUID `json:"id"`
-	CampaignID uuid.UUID `json:"campaign_id"`
-	IssueRef   string    `json:"issue_ref"`
-	DependsOn  []byte    `json:"depends_on"`
-	State      string    `json:"state"`
-	Autonomy   string    `json:"autonomy"`
+	ID            uuid.UUID `json:"id"`
+	CampaignID    uuid.UUID `json:"campaign_id"`
+	IssueRef      string    `json:"issue_ref"`
+	DependsOn     []byte    `json:"depends_on"`
+	State         string    `json:"state"`
+	Autonomy      string    `json:"autonomy"`
+	QueuePosition int32     `json:"queue_position"`
 }
 
 func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItemParams) (CampaignItem, error) {
@@ -83,6 +87,7 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 		arg.DependsOn,
 		arg.State,
 		arg.Autonomy,
+		arg.QueuePosition,
 	)
 	var i CampaignItem
 	err := row.Scan(
@@ -96,12 +101,13 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir FROM campaigns WHERE id = $1
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source FROM campaigns WHERE id = $1
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -119,6 +125,7 @@ func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, erro
 		&i.IdempotencyKey,
 		&i.AccountID,
 		&i.WorkingDir,
+		&i.GroomingSource,
 	)
 	return i, err
 }
@@ -139,7 +146,7 @@ func (q *Queries) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (*uuid
 }
 
 const getCampaignByIdempotencyKey = `-- name: GetCampaignByIdempotencyKey :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source FROM campaigns
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -167,12 +174,13 @@ func (q *Queries) GetCampaignByIdempotencyKey(ctx context.Context, arg GetCampai
 		&i.OperatorAgent,
 		&i.IdempotencyKey,
 		&i.WorkingDir,
+		&i.GroomingSource,
 	)
 	return i, err
 }
 
 const getCampaignItem = `-- name: GetCampaignItem :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy FROM campaign_items WHERE id = $1
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items WHERE id = $1
 `
 
 func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -189,14 +197,15 @@ func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignIt
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
 
 const listCampaignItemsForCampaign = `-- name: ListCampaignItemsForCampaign :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items
  WHERE campaign_id = $1
- ORDER BY created_at ASC, id ASC
+ ORDER BY queue_position ASC, created_at ASC, id ASC
 `
 
 // Insertion order (created_at ASC + id tiebreak) so the campaign's items
@@ -221,6 +230,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 			&i.UpdatedAt,
 			&i.PauseReason,
 			&i.Autonomy,
+			&i.QueuePosition,
 		); err != nil {
 			return nil, err
 		}
@@ -233,7 +243,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 }
 
 const listCampaignItemsForRun = `-- name: ListCampaignItemsForRun :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items
  WHERE run_id = $1
  ORDER BY created_at ASC, id ASC
 `
@@ -261,6 +271,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 			&i.UpdatedAt,
 			&i.PauseReason,
 			&i.Autonomy,
+			&i.QueuePosition,
 		); err != nil {
 			return nil, err
 		}
@@ -273,7 +284,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 }
 
 const listCampaigns = `-- name: ListCampaigns :many
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source FROM campaigns
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR state = $2)
    AND ($3::uuid IS NULL OR account_id = $3 OR account_id IS NULL)
@@ -321,6 +332,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 			&i.IdempotencyKey,
 			&i.AccountID,
 			&i.WorkingDir,
+			&i.GroomingSource,
 		); err != nil {
 			return nil, err
 		}
@@ -333,7 +345,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 }
 
 const lockCampaignForUpdate = `-- name: LockCampaignForUpdate :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir FROM campaigns WHERE id = $1 FOR UPDATE
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source FROM campaigns WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -350,12 +362,13 @@ func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Camp
 		&i.OperatorAgent,
 		&i.IdempotencyKey,
 		&i.WorkingDir,
+		&i.GroomingSource,
 	)
 	return i, err
 }
 
 const lockCampaignItemForUpdate = `-- name: LockCampaignItemForUpdate :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy FROM campaign_items WHERE id = $1 FOR UPDATE
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -372,6 +385,7 @@ func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
@@ -380,7 +394,7 @@ const setCampaignItemPause = `-- name: SetCampaignItemPause :one
 UPDATE campaign_items
    SET state = 'paused', pause_reason = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
 `
 
 type SetCampaignItemPauseParams struct {
@@ -405,6 +419,7 @@ func (q *Queries) SetCampaignItemPause(ctx context.Context, arg SetCampaignItemP
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
@@ -413,7 +428,7 @@ const setCampaignItemRun = `-- name: SetCampaignItemRun :one
 UPDATE campaign_items
    SET run_id = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
 `
 
 type SetCampaignItemRunParams struct {
@@ -438,6 +453,7 @@ func (q *Queries) SetCampaignItemRun(ctx context.Context, arg SetCampaignItemRun
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
@@ -446,7 +462,7 @@ const setCampaignItemAutonomy = `-- name: SetCampaignItemAutonomy :one
 UPDATE campaign_items
    SET autonomy = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
 `
 
 type SetCampaignItemAutonomyParams struct {
@@ -472,6 +488,7 @@ func (q *Queries) SetCampaignItemAutonomy(ctx context.Context, arg SetCampaignIt
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
@@ -480,7 +497,7 @@ const updateCampaignItemState = `-- name: UpdateCampaignItemState :one
 UPDATE campaign_items
    SET state = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
 `
 
 type UpdateCampaignItemStateParams struct {
@@ -502,6 +519,7 @@ func (q *Queries) UpdateCampaignItemState(ctx context.Context, arg UpdateCampaig
 		&i.UpdatedAt,
 		&i.PauseReason,
 		&i.Autonomy,
+		&i.QueuePosition,
 	)
 	return i, err
 }
@@ -510,7 +528,7 @@ const updateCampaignState = `-- name: UpdateCampaignState :one
 UPDATE campaigns
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
 `
 
 type UpdateCampaignStateParams struct {
@@ -532,6 +550,7 @@ func (q *Queries) UpdateCampaignState(ctx context.Context, arg UpdateCampaignSta
 		&i.OperatorAgent,
 		&i.IdempotencyKey,
 		&i.WorkingDir,
+		&i.GroomingSource,
 	)
 	return i, err
 }

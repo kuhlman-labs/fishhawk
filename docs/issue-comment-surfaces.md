@@ -1705,6 +1705,22 @@ Notes:
   Same GLOBAL chain, same system actor, still best-effort. They remain
   best-effort and are still NOT issue-comment surfaces. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for a comment surface.
+- The campaign **grooming-source provenance** marker —
+  `campaign_grooming_source_resolved` (E54.6 / #2238) — is an **INTERNAL,
+  audit-only category and NOT an issue-comment surface**, of the same family as
+  the campaign kinds above. It has no Notifier method, nothing in `issuecomment`
+  posts it, and it renders no comment on any issue. It is written ONCE per
+  campaign created from an approved grooming run's ratified order, by
+  `handleCreateCampaign` through `emitCampaignAudit`, on the GLOBAL chain
+  (payload `{campaign_id, repo, grooming_source:{source_run_id, source_stage_id,
+  report_artifact_id, report_content_hash, ordered_refs, ordered_count,
+  excluded, limit, omitted_by_limit, superseded_by}}`). **It is deliberately NOT the system of
+  record for that provenance**: like every campaign audit emit it is
+  best-effort and runs AFTER persistence, so the durable copy lives on the
+  `campaigns.grooming_source` column, written by the campaign row's own INSERT.
+  The audit entry exists so an operator can `fishhawk_await_audit` on the
+  category and so the chain carries the decision; a campaign whose append failed
+  is still created and still names its source on every read of the row.
 - The campaign **issue-restart** marker — `campaign_issue_restarted` (E32.9 /
   #1729) — is a fourth **system-actor GLOBAL-chain audit kind, NOT an
   issue-comment surface**, of the same family as the three above. The

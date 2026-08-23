@@ -50,6 +50,11 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
 		// #2527). Empty persists as the '' no-binding default.
 		WorkingDir: p.WorkingDir,
+		// GroomingSource is the OPTIONAL durable provenance of a grooming-order
+		// campaign (E54.6 / #2238), written by THIS insert so the campaign row and
+		// its provenance are created atomically — there is no window in which a
+		// grooming-sourced campaign exists unprovenanced. Nil persists as NULL.
+		GroomingSource: p.GroomingSource,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -181,6 +186,12 @@ func (r *postgresRepo) CreateCampaignItem(ctx context.Context, p CreateCampaignI
 		// Autonomy tier (#1551 / E32.4). Empty is the unknown/default tier; the
 		// column CHECK rejects any out-of-set value.
 		Autonomy: p.Autonomy,
+		// Queue position (migration 0074): the item's explicit place in the
+		// campaign queue. Written rather than inferred from insertion sequence,
+		// which is not an ordering — every item of one campaign shares one
+		// transaction timestamp. int -> int32 narrowing is safe: positions are
+		// dense indices over one campaign's item slice.
+		QueuePosition: int32(p.Position), //nolint:gosec // dense 0-based index over one campaign's items
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign item: %w", err)
@@ -571,6 +582,14 @@ func rowToCampaign(c campaigndb.Campaign) *Campaign {
 	// Nullable idempotency_key: a *string passthrough. NULL yields nil (no
 	// key) — the unchanged-behavior default.
 	out.IdempotencyKey = c.IdempotencyKey
+	// JSONB → raw []byte passthrough, same posture as OperatorAgent above: a
+	// NULL/empty column yields nil (NOT grooming-sourced) rather than an empty
+	// slice. This ONE mapper covers every campaign read path, so the durable
+	// provenance is visible wherever a campaign row is — including long after
+	// the create response is gone, which is the whole point of persisting it.
+	if len(c.GroomingSource) > 0 {
+		out.GroomingSource = c.GroomingSource
+	}
 	return out
 }
 
@@ -583,7 +602,10 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		State:      ItemState(i.State),
 		// Autonomy tier read straight back from the column (#1551 / E32.4).
 		// Empty is the unknown/default tier.
-		Autonomy:  i.Autonomy,
+		Autonomy: i.Autonomy,
+		// Queue position read straight back from the NOT NULL column
+		// (migration 0074). Every pre-0074 row carries the DEFAULT 0.
+		Position:  int(i.QueuePosition),
 		CreatedAt: i.CreatedAt.Time,
 		UpdatedAt: i.UpdatedAt.Time,
 	}

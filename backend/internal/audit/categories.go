@@ -93,7 +93,18 @@ import "sort"
 // resurfaced counts and entry ids, the charter_changed flag, and the
 // no_changes_proposed flag that IS #2240 AC1's visible "no changes proposed"
 // outcome — so an operator awaits this one category to learn what a grooming
-// run actually proposes, as distinct from what the agent emitted. When a new
+// run actually proposes, as distinct from what the agent emitted.
+// E54.6 / #2238 added campaign_grooming_source_resolved, written once per
+// campaign created from an approved grooming run's ratified order (the third
+// POST /v0/campaigns source): it carries the campaign id, the source
+// run/stage/artifact ids, the report's content hash, the rank-ordered issue
+// refs, the named exclusions, the applied limit and any acknowledged
+// supersession. It is a SECOND copy of that provenance and deliberately NOT the
+// system of record — the durable one is the campaigns.grooming_source column,
+// written by the campaign row's own INSERT, because this emit (like every
+// campaign audit emit) is best-effort AFTER persistence. It is an INTERNAL,
+// audit-only category: it renders no issue comment.
+// When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -124,6 +135,7 @@ var KnownCategories = map[string]struct{}{
 	"campaign_cancelled":                      {},
 	"campaign_gate_acted":                     {},
 	"campaign_gate_paged":                     {},
+	"campaign_grooming_source_resolved":       {},
 	"campaign_issue_restarted":                {},
 	"campaign_issue_settled":                  {},
 	"campaign_issue_started":                  {},

@@ -110,6 +110,12 @@ type Assembly struct {
 	// explicit per-item working_dir). The server sets it from the validated
 	// create request.
 	WorkingDir string
+	// GroomingSource is the OPTIONAL durable provenance block for a campaign
+	// created from an approved grooming order (E54.6 / #2238), threaded straight
+	// through Persist onto the campaign row's own INSERT. Nil = not
+	// grooming-sourced (every epic_ref / explicit-items campaign). The server
+	// marshals it; the campaign package never interprets these bytes.
+	GroomingSource []byte
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -123,6 +129,15 @@ type AssembledItem struct {
 	// Persist threads it onto CreateCampaignItemParams so it reaches the
 	// campaign_items.autonomy column (#1551 / E32.4).
 	Autonomy string
+	// Position is the item's 0-based place in the campaign queue, stamped by
+	// Assemble from the item's index in Items and threaded by Persist onto
+	// campaign_items.queue_position (migration 0074). Because Assemble preserves
+	// the ORDER of res.Children, a caller that permutes Children before
+	// assembling (campaign.ReorderByPriority, for the ratified grooming rank
+	// order) gets that permutation written down DURABLY here rather than left to
+	// insertion sequence — which is not an ordering, since every item of one
+	// campaign shares one transaction timestamp.
+	Position int
 }
 
 // issueRef formats a child issue number into the campaign `issue:N` ref
@@ -229,6 +244,11 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			// from any other source degrades to "" here rather than aborting the
 			// entire epic campaign with a CHECK violation at Persist.
 			Autonomy: normalizeAutonomy(c.Autonomy),
+			// Dense 0-based queue position from the assembled order (migration
+			// 0074). i is the index into res.Children, so this records exactly the
+			// order the caller handed in — including a ReorderByPriority
+			// permutation into ratified rank order.
+			Position: i,
 		}
 	}
 
@@ -274,6 +294,13 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// Thread the optional campaign-level checkout binding straight through
 		// (E48.87 / #2527): empty = no binding.
 		WorkingDir: a.WorkingDir,
+		// Thread the optional durable grooming provenance straight through
+		// (E54.6 / #2238). It rides the campaign's OWN single-row INSERT, so the
+		// campaign and its provenance are created atomically: this function is
+		// NOT transactional (one CreateCampaign then N CreateCampaignItem), so a
+		// provenance record written after the fact could be lost while the
+		// campaign survived. Nil = not grooming-sourced.
+		GroomingSource: a.GroomingSource,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)
@@ -286,6 +313,11 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 			// Thread the autonomy tier onto the persisted item so the engine can
 			// read it back for the HumanLed partition (#1551 / E32.4).
 			Autonomy: it.Autonomy,
+			// Thread the queue position onto the persisted item so the assembled
+			// order is DURABLE (migration 0074) rather than implied by insertion
+			// sequence — every insert below shares one transaction timestamp, so
+			// (created_at, id) ordering would collapse to the random-UUID tiebreak.
+			Position: it.Position,
 		}); err != nil {
 			return nil, fmt.Errorf("campaign: create item %s: %w", it.IssueRef, err)
 		}
