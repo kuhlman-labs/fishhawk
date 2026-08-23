@@ -155,6 +155,18 @@ var exportBaseline = []string{
 	"InitInput",
 	"InitOutput",
 	"Instructions",
+	// E54.7 / #2239: LOCAL decode-only mirrors of the backend's advisory
+	// intake-groom payload on the work-item filing response. Exported
+	// deliberately — they are reachable through FiledWorkItem.Intake, so a
+	// consumer must be able to name them — and deliberately NOT workmgmt
+	// types: ADR-064's board-read guard forbids workmgmt being reachable from
+	// this package at all, so mirroring the shape locally is the only way to
+	// surface intake without breaking that invariant.
+	"IntakeCitation",
+	"IntakeDuplicate",
+	"IntakeEpicSuggestion",
+	"IntakeScore",
+	"IntakeSignals",
 	"IntegrateWaveResult",
 	"IssueComment",
 	"IssueContext",

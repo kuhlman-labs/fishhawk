@@ -2624,3 +2624,33 @@ func TestFileWorkItem_ChildNumberConcurrentFilingsDistinct(t *testing.T) {
 		t.Errorf("filed titles = %v, want the distinct consecutive [E7.3] and [E7.4]", titles)
 	}
 }
+
+// TestFileWorkItem_NoIntakeObjectWhenHookProducesNothing pins the
+// backward-compatibility half of the #2239 response change: the `intake` key
+// is omitempty, so a deployment whose hook produced no Signals at all returns
+// the pre-#2239 payload verbatim.
+//
+// It is the response-side twin of
+// TestIntakeHook_DegradedFilingBodyIsUnchanged (which pins the BODY side). The
+// two together bound this change's blast radius: a degraded hook is invisible
+// to both the created issue and any existing response consumer.
+//
+// The bad state is seeded BY CONSTRUCTION — a nil signals value handed to the
+// response struct — rather than by driving a degradation, so the assertion
+// lands on the serialization rule itself.
+func TestFileWorkItem_NoIntakeObjectWhenHookProducesNothing(t *testing.T) {
+	raw, err := json.Marshal(workItemResponse{
+		Type:     "chore",
+		Title:    "[E22.7] Tidy the workspace file",
+		Number:   4242,
+		URL:      "https://example.test/4242",
+		Provider: workmgmt.Default().Provider,
+		Intake:   nil,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "\"intake\"") {
+		t.Errorf("a nil intake serialized an intake key, breaking the pre-#2239 payload shape: %s", raw)
+	}
+}

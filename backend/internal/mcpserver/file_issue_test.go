@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_file_issue (#1005) ---
@@ -305,5 +306,109 @@ func TestFileIssue_SchemaTitleVarsNamesAutoDerivedN(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(tv.Description), "auto-derived") {
 		t.Errorf("title_vars description must state {n} is auto-derived: %q", tv.Description)
+	}
+}
+
+// TestFileIssueToolDescribesIntakeAsAdvisory is a DONE-MEANS test for the
+// shipped tool description (#2239). The description is the agent's only
+// instruction about how to treat the new intake object, and its posture —
+// advisory, nothing was acted on, a degradation is normal — is a convention no
+// compiler enforces. A comment-only or no-op touch of file_issue.go would pass
+// a scope-presence check and fail here.
+//
+// The PAYLOAD boundary itself is pinned where the real bytes are: the server
+// package's TestFileWorkItem_IntakeSignalsEndToEnd decodes the handler's actual
+// 201 into mcpserver.FiledWorkItem with DisallowUnknownFields, so these local
+// decode-only mirrors are checked against ONE source of truth rather than a
+// second fixture that could drift (binding approval condition L3).
+func TestFileIssueToolDescribesIntakeAsAdvisory(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, cerr := client.Connect(ctx, clientTransport, nil)
+	if cerr != nil {
+		t.Fatalf("client connect: %v", cerr)
+	}
+	defer clientSession.Close()
+
+	res, lerr := clientSession.ListTools(ctx, nil)
+	if lerr != nil {
+		t.Fatalf("ListTools: %v", lerr)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_file_issue" {
+			desc = tool.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_file_issue is not registered")
+	}
+	for _, want := range []string{
+		"intake",
+		"ADVISORY",
+		"do NOT",
+		"degraded:true",
+		"degrade_reason",
+		"LEXICAL",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_file_issue description does not mention %q; the intake posture is not stated to the agent", want)
+		}
+	}
+	// Every degrade reason the backend can report must be enumerated, so an
+	// agent never sees an unexplained value.
+	for _, reason := range []string{
+		"reader_unavailable", "reader_error", "charter_undeclared", "charter_unresolved",
+		"charter_rubric_unparsed", "budget_exceeded", "hook_panic", "seam_unwired",
+	} {
+		if !strings.Contains(desc, reason) {
+			t.Errorf("degrade reason %q is not enumerated in the tool description", reason)
+		}
+	}
+}
+
+// TestFiledWorkItemDecodesIntakeShape pins the LOCAL decode-only mirrors
+// (ADR-064): they must decode the backend's field names and nesting. The
+// end-to-end drift check lives in the server package against real bytes; this
+// is the unit-level shape pin that keeps a rename here visible.
+func TestFiledWorkItemDecodesIntakeShape(t *testing.T) {
+	const payload = `{"type":"chore","title":"t","number":1,"url":"u","provider":"github_projects",
+"intake":{"duplicates":[{"number":7,"url":"x","title":"dup","score":0.7,"confidence":"high","basis":"a b","closed":true}],
+"epic_suggestion":{"number":22,"title":"[E22] e","score":0.5,"confidence":"medium","basis":"c"},
+"score":{"value":4.0,"citations":[{"rubric_id":"S2","quote":"q","note":"n"}],"unscored":false},
+"degraded":false,"scanned_items":3,"window_truncated":true,"duration_ms":12}}`
+
+	var out FiledWorkItem
+	dec := json.NewDecoder(strings.NewReader(payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Intake == nil {
+		t.Fatal("intake dropped")
+	}
+	if len(out.Intake.Duplicates) != 1 || out.Intake.Duplicates[0].Number != 7 ||
+		out.Intake.Duplicates[0].Confidence != "high" || !out.Intake.Duplicates[0].Closed {
+		t.Errorf("duplicates = %+v", out.Intake.Duplicates)
+	}
+	if out.Intake.EpicSuggestion == nil || out.Intake.EpicSuggestion.Number != 22 {
+		t.Errorf("epic_suggestion = %+v", out.Intake.EpicSuggestion)
+	}
+	if len(out.Intake.Score.Citations) != 1 || out.Intake.Score.Citations[0].RubricID != "S2" {
+		t.Errorf("citations = %+v", out.Intake.Score.Citations)
+	}
+	if !out.Intake.WindowTruncated || out.Intake.ScannedItems != 3 || out.Intake.DurationMS != 12 {
+		t.Errorf("window/scan/duration = %+v", out.Intake)
 	}
 }

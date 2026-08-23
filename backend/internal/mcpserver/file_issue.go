@@ -110,7 +110,26 @@ filed), and audited. It also reports label completeness (#1616):
 defaulted_labels lists every label the system added that you did not supply
 (namespace defaults like autonomy:medium, plus an area:* label derived from the
 parent epic), and missing_label_namespaces lists any required namespace still
-absent — reported loudly, never a filing rejection. Board placement / epic linking are best-effort and no
+absent — reported loudly, never a filing rejection.
+
+The response also carries an optional intake object: ADVISORY intake-groom
+signals the backend derived at filing time (#2239) — possible duplicate
+candidates (lexical title overlap, with a confidence band and the shared-token
+basis that makes a wrong candidate cheap to dismiss), a suggested parent epic
+when you declared none, and a provisional charter-anchored structural score
+citing the rubric lines your filing's own structure fires. Read them; do NOT
+act on them as decisions. NOTHING was closed, merged, relabelled or
+transitioned on the strength of a duplicate candidate — the dedup decision
+stays a human/workflow action, and the same signals are also appended to the
+created issue body as an advisory section. Duplicate matching is LEXICAL, not
+semantic, so false positives and false negatives are expected. When intake is
+absent, or present with degraded:true and a degrade_reason (reader_unavailable,
+reader_error, charter_undeclared, charter_unresolved, charter_rubric_unparsed,
+budget_exceeded, hook_panic, seam_unwired), that is NORMAL and not an error:
+grooming is best-effort, bounded by its own deadline, and never blocks, slows
+past its budget, or fails a filing. The item was filed either way.
+
+Board placement / epic linking are best-effort and no
 longer fail the filing; work_item_filing_failed (502) is reserved for a
 create-issue or installation-resolution failure (no durable issue exists),
 and the provider cause is surfaced in the tool error. Tool errors:
