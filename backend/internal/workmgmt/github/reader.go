@@ -126,6 +126,13 @@ func (p *Provider) preflight(target workmgmt.Target) (forge.RepoRef, error) {
 // to a canonical state through req.States. An item whose column maps to no
 // canonical state is EXCLUDED by a board-state filter and reports an empty
 // BoardState, never a guessed one. Limit is applied last, after filtering.
+//
+// req.Newest and req.MaxScanned ARE pushed down, unlike the board-state
+// filter: they become the client's newest-first ordering and MaxItems
+// pagination bound, so a bounded window costs bounded round trips instead of
+// enumerating the backlog and discarding most of it. A cut window is reported
+// as WorkItemPage.Truncated — the page is honest about being a window, never
+// silently partial.
 func (p *Provider) ListWorkItems(ctx context.Context, req workmgmt.ListWorkItemsRequest) (*workmgmt.WorkItemPage, error) {
 	repo, err := p.preflight(req.Target)
 	if err != nil {
@@ -147,6 +154,12 @@ func (p *Provider) ListWorkItems(ctx context.Context, req workmgmt.ListWorkItems
 		States:          states,
 		ProjectID:       board.projectID,
 		WantBoardStatus: board.want,
+		// The bounded-window opt-ins map one-to-one onto the client's own:
+		// newest-first becomes CREATED_AT/DESC, and MaxScanned becomes the
+		// MaxItems pagination push-down. Zero values leave the enumeration
+		// exactly as it was — unbounded, ordered by number ascending.
+		Newest:   req.Newest,
+		MaxItems: req.MaxScanned,
 	})
 	if err != nil {
 		if errors.Is(err, forge.ErrForbidden) {
@@ -198,7 +211,15 @@ func (p *Provider) ListWorkItems(ctx context.Context, req workmgmt.ListWorkItems
 			break
 		}
 	}
-	return &workmgmt.WorkItemPage{Items: items, BoardStateResolved: board.want}, nil
+	// Truncated reports the window was CUT rather than exhausted. It is decided
+	// on the ENUMERATED count, not the filtered one: the client stops the cursor
+	// walk at exactly MaxItems, so a full-window enumeration is the only
+	// observable evidence that more issues exist beyond it. The exact-fit case —
+	// a backlog holding exactly MaxScanned issues — over-reports, which is
+	// documented on workmgmt.WorkItemPage rather than hidden, and errs the safe
+	// way: "there may be more" is never wrong about a genuinely cut window.
+	truncated := req.MaxScanned > 0 && len(issues) >= req.MaxScanned
+	return &workmgmt.WorkItemPage{Items: items, BoardStateResolved: board.want, Truncated: truncated}, nil
 }
 
 // canonicalStateSet builds the board-state filter set, or nil when no filter

@@ -811,3 +811,162 @@ func TestProvider_ReaderFor_ResolvesGitHubProvider(t *testing.T) {
 		t.Fatalf("ReaderFor(%q) = %v / %v, want a usable reader", readerRegistryName, r, err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Bounded newest-first window (E54.7 / #2239)
+// ---------------------------------------------------------------------------
+
+// TestProvider_ListWorkItems_ForwardsBoundedWindow proves the request's
+// Newest/MaxScanned vocabulary is PUSHED DOWN onto the client options rather
+// than post-filtered here, and that leaving them unset forwards the
+// pre-#2239 shape byte-for-byte.
+func TestProvider_ListWorkItems_ForwardsBoundedWindow(t *testing.T) {
+	api := readerAPI()
+	req := listRequest()
+	req.Newest = true
+	req.MaxScanned = 300
+	if _, err := New(api).ListWorkItems(context.Background(), req); err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if got := api.listRepoIssuesOpts; !got.Newest || got.MaxItems != 300 {
+		t.Errorf("forwarded window = newest %v / maxItems %d, want true / 300", got.Newest, got.MaxItems)
+	}
+
+	// Unset is INERT: the default request forwards no ordering opt-in and no
+	// cap, so an existing caller's enumeration is unchanged.
+	plain := readerAPI()
+	if _, err := New(plain).ListWorkItems(context.Background(), listRequest()); err != nil {
+		t.Fatalf("ListWorkItems (default): %v", err)
+	}
+	if got := plain.listRepoIssuesOpts; got.Newest || got.MaxItems != 0 {
+		t.Errorf("default window = newest %v / maxItems %d, want false / 0 (both fields are opt-ins)", got.Newest, got.MaxItems)
+	}
+}
+
+// TestProvider_ListWorkItems_TruncatedReportsACutWindow pins the honest
+// Truncated report across its three cases: a full window (cut), a short one
+// (exhausted), and an unbounded request (never truncated no matter how large
+// the set). The exact-fit over-report is the FIRST case by construction — the
+// enumeration returns exactly MaxScanned — and is documented on
+// workmgmt.WorkItemPage as erring toward "there may be more".
+func TestProvider_ListWorkItems_TruncatedReportsACutWindow(t *testing.T) {
+	issues := func(n int) []githubclient.RepoIssue {
+		out := make([]githubclient.RepoIssue, 0, n)
+		for i := 1; i <= n; i++ {
+			out = append(out, githubclient.RepoIssue{Number: i, State: "OPEN", OnBoard: true, BoardStatus: "Backlog"})
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name       string
+		maxScanned int
+		enumerated int
+		want       bool
+	}{
+		{"window filled to the cap is truncated", 3, 3, true},
+		{"window short of the cap is exhausted", 3, 2, false},
+		{"unbounded request is never truncated", 0, 50, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := readerAPI()
+			api.listRepoIssues = issues(tc.enumerated)
+			req := listRequest()
+			req.MaxScanned = tc.maxScanned
+			page, err := New(api).ListWorkItems(context.Background(), req)
+			if err != nil {
+				t.Fatalf("ListWorkItems: %v", err)
+			}
+			if page.Truncated != tc.want {
+				t.Errorf("Truncated = %v, want %v (%d enumerated under a cap of %d)",
+					page.Truncated, tc.want, tc.enumerated, tc.maxScanned)
+			}
+		})
+	}
+}
+
+// TestProvider_ListWorkItems_TruncatedIsDecidedOnTheENUMERATEDCount proves
+// Truncated reports what the PROVIDER walked, not what survived the caller's
+// filters: a filtered-to-one page off a cut window is still a cut window, and
+// reporting otherwise would tell a caller its single result came from a
+// complete scan.
+func TestProvider_ListWorkItems_TruncatedIsDecidedOnTheENUMERATEDCount(t *testing.T) {
+	api := readerAPI()
+	api.listRepoIssues = []githubclient.RepoIssue{
+		{Number: 1, State: "OPEN", OnBoard: true, BoardStatus: "Backlog"},
+		{Number: 2, State: "OPEN", OnBoard: true, BoardStatus: "In Progress"},
+		{Number: 3, State: "OPEN", OnBoard: true, BoardStatus: "Backlog"},
+	}
+	req := listRequest()
+	req.MaxScanned = 3
+	req.BoardStates = []string{workmgmt.CanonicalStateInProgress}
+	page, err := New(api).ListWorkItems(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("items = %d, want 1 after the board-state filter", len(page.Items))
+	}
+	if !page.Truncated {
+		t.Error("Truncated = false; the window WAS cut at 3 even though one item survived filtering")
+	}
+}
+
+// TestProvider_ListWorkItems_BoundedWindowEndToEndOverHTTP drives the bounded
+// window through a REAL *githubclient.Client so the push-down is proven at the
+// wire, not just at the fake's argument recorder: the emitted document orders
+// CREATED_AT/DESC, the page size is narrowed to the window, and the cut window
+// comes back as Truncated.
+func TestProvider_ListWorkItems_BoundedWindowEndToEndOverHTTP(t *testing.T) {
+	c, fx := newRepoIssuesClient(t, 50, "pat_projects")
+	req := listRequest()
+	req.Newest = true
+	req.MaxScanned = 5
+	page, err := New(c).ListWorkItems(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if len(page.Items) != 5 {
+		t.Fatalf("items = %d, want the 5-item window out of a 50-issue backlog", len(page.Items))
+	}
+	if !page.Truncated {
+		t.Error("Truncated = false, want true — the 50-issue backlog was cut at 5")
+	}
+	if !strings.Contains(fx.listQuery, "CREATED_AT") || !strings.Contains(fx.listQuery, "DESC") {
+		t.Errorf("query must order newest-first, got:\n%s", fx.listQuery)
+	}
+	if got := fx.listVars["first"]; got != float64(5) {
+		t.Errorf("first = %v, want 5 (the window narrows the page size)", got)
+	}
+	if fx.listReqs != 1 {
+		t.Errorf("enumeration requests = %d, want 1 (a bounded window costs bounded round trips)", fx.listReqs)
+	}
+}
+
+// TestListWorkItems_DegradationsSurviveTheBoundedWindow re-runs two enumerated
+// failure modes with the new request fields SET, proving the bounded window
+// did not open a path where a degradation returns an empty page instead of a
+// typed nil: a caller must never read a permissions refusal as "no matches in
+// the window".
+func TestListWorkItems_DegradationsSurviveTheBoundedWindow(t *testing.T) {
+	t.Run("forbidden enumeration", func(t *testing.T) {
+		api := readerAPI()
+		api.listRepoIssuesErr = fmt.Errorf("list issues: %w", forge.ErrForbidden)
+		req := listRequest()
+		req.Newest, req.MaxScanned = true, 25
+		page, err := New(api).ListWorkItems(context.Background(), req)
+		if page != nil {
+			t.Errorf("page = %+v, want NIL — a refusal is not an empty window", page)
+		}
+		assertUnavailable(t, err, workmgmt.ReasonForbidden)
+	})
+	t.Run("no installation scope", func(t *testing.T) {
+		req := listRequest()
+		req.Target.Scope = forge.CredentialScope{}
+		req.Newest, req.MaxScanned = true, 25
+		page, err := New(readerAPI()).ListWorkItems(context.Background(), req)
+		if page != nil {
+			t.Errorf("page = %+v, want NIL", page)
+		}
+		assertUnavailable(t, err, workmgmt.ReasonNoInstallation)
+	})
+}
