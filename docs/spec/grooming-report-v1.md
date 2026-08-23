@@ -197,7 +197,7 @@ lowercase by construction (they are the schema enum values).
 5. **The `ordering` ranks are exactly the permutation `1..N`.** A duplicated or
    gapped rank is not an applicable proposal.
 
-When the report carries a `milestone_scope`, seven further rules run — see
+When the report carries a `milestone_scope`, eight further rules run — see
 [Milestone scoping](#milestone-scoping-milestone_scope) below.
 
 ## Milestone scoping (`milestone_scope`)
@@ -281,7 +281,17 @@ returning a `*SemanticError` naming the offending JSON pointer:
    byte-identical output. `critical_path` is the one array **not** sorted: its
    order is its content. `plan.CanonicalizeMilestoneScope` produces the canonical
    form; `plan.MilestoneScopeFingerprint` is a class-tagged sha256 over the
-   canonical structural fields for a cheap run-over-run comparison.
+   canonical structural fields for a cheap run-over-run comparison. It
+   fingerprints a **deep copy**, so it never mutates the supplied scope and is
+   safe to call concurrently with a reader of the same scope.
+8. **R8 — included/excluded disjointness.** An item may not appear in both
+   `included` and `excluded`. The two derived ids differ by class prefix
+   (`milestone_inclusion:<key>` vs `milestone_exclusion:<key>`), so report-wide
+   id uniqueness does not catch the contradiction. This runs **before** the
+   dependency rules: `checkMilestoneDependencies` resolves an `includedWave` hit
+   before the `excludedKeys` branch, so a dependency on a dual-membership item
+   would otherwise be treated as an ordinary in-scope edge and R4 would silently
+   never fire for it.
 
 ## Workflow declaration
 

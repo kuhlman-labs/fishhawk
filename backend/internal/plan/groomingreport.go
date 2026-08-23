@@ -62,7 +62,7 @@ type GroomingReport struct {
 	DecompositionSuggestions []DecompositionSuggestion `json:"decomposition_suggestions"`
 	// MilestoneScope is present only when the report scopes a release milestone
 	// (E54.9 / #2309). Additive-optional: its absence means an ordinary grooming
-	// report. Its typed domain and the seven semantic rules the schema cannot
+	// report. Its typed domain and the eight semantic rules the schema cannot
 	// express live in groomingmilestone.go.
 	MilestoneScope *MilestoneScope `json:"milestone_scope,omitempty"`
 }
@@ -287,11 +287,12 @@ func GroomingEntryID(class string, qualifier string, refs ...ItemRef) string {
 //   - the ordering ranks are exactly the permutation 1..N — a duplicated or
 //     gapped rank is not an applicable proposal.
 //
-// When the report carries a milestone_scope (#2309), seven further rules run
+// When the report carries a milestone_scope (#2309), eight further rules run
 // (see checkMilestoneScope): wave contiguity, dependency resolvability, strict
 // wave monotonicity across in-scope edges, an out-of-scope dependency requiring
 // a declined call, critical-path connectivity, declined-call referential
-// integrity, and canonical ordering of every array.
+// integrity, canonical ordering of every array, and included/excluded key-set
+// disjointness.
 //
 // The returned error is *ParseError, *SchemaError, or *SemanticError. The
 // semantic checks live HERE, not only in ParseGroomingReport, so an invalid

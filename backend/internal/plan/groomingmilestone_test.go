@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -319,6 +320,21 @@ func TestMilestoneScope_DanglingOpenQuestionID_Rejected(t *testing.T) {
 	requireMilestoneRejection(t, ms, "/milestone_scope/included/1/open_question_ids/0", "matches no declined_calls")
 }
 
+// TestMilestoneScope_ItemInIncludedAndExcluded_Rejected is R8: the same item key
+// appears in BOTH `included` and `excluded`. The two derived ids differ by class
+// prefix so report-wide id uniqueness does not catch it; R8 rejects the
+// contradiction with a pointer-bearing SemanticError. Seeded by construction:
+// app#1 is placed in both sets, every other field valid, so the RED lands on the
+// disjointness check and not another rule. It must reject BEFORE the dependency
+// rules resolve the item to its included interpretation (which would suppress R4).
+func TestMilestoneScope_ItemInIncludedAndExcluded_Rejected(t *testing.T) {
+	ms := msScope(
+		[]plan.MilestoneInclusion{msInc("acme/app#1", 0, nil, nil)},
+		[]plan.MilestoneExclusion{msExc("acme/app#1")},
+		nil, nil)
+	requireMilestoneRejection(t, ms, "/milestone_scope/excluded/0", "also appears in `included`", "DISJOINT")
+}
+
 // TestMilestoneScope_UnsortedInclusions_Rejected is R7: included out of (wave,
 // key) order. Reversing the order leaves R1–R6 valid (all order-independent),
 // so the RED lands on the canonical-order check.
@@ -592,6 +608,79 @@ func TestMilestoneScopeFingerprint_StableAcrossIdenticalInput(t *testing.T) {
 	// Empty in, empty out.
 	if plan.MilestoneScopeFingerprint(nil) != "" {
 		t.Error("nil scope must fingerprint to the empty string")
+	}
+}
+
+// milestoneScopeWithUnsortedNested builds a valid scope whose nested arrays are
+// supplied OUT of canonical order (depends_on reversed, rubric_citations
+// reversed), so a fingerprint that canonicalizes in place — rather than on a
+// deep copy — would visibly reorder the caller's slices.
+func milestoneScopeWithUnsortedNested() *plan.MilestoneScope {
+	inc3 := plan.MilestoneInclusion{
+		ID:      plan.GroomingEntryID(plan.GroomingClassMilestoneInclusion, "", msRef("acme/app#3")),
+		ItemRef: msRef("acme/app#3"),
+		Reason:  "in scope: acme/app#3",
+		Wave:    2,
+		// Reversed: canonical order is (app#1, app#2).
+		DependsOn: []string{msKey("acme/app#2"), msKey("acme/app#1")},
+		// Reversed: canonical order is (U1, U2).
+		RubricCitations: []plan.RubricCitation{{RubricID: "U2"}, {RubricID: "U1"}},
+	}
+	return msScope(
+		[]plan.MilestoneInclusion{
+			msInc("acme/app#1", 0, nil, nil),
+			msInc("acme/app#2", 1, []string{msKey("acme/app#1")}, nil),
+			inc3,
+		},
+		[]plan.MilestoneExclusion{msExc("acme/app#9")},
+		nil,
+		[]string{msKey("acme/app#1"), msKey("acme/app#2"), msKey("acme/app#3")},
+	)
+}
+
+// TestMilestoneScopeFingerprint_DoesNotMutateInput is the concern-1 immutability
+// proof (no -race needed): fingerprinting a scope whose nested arrays are out of
+// canonical order must leave those arrays in their supplied order. With a shallow
+// top-level copy the in-place canonicalization sorts the caller's shared nested
+// backing arrays; the deep copy prevents it. RED lands on the behavioral
+// assertion below when the deep copy is removed.
+func TestMilestoneScopeFingerprint_DoesNotMutateInput(t *testing.T) {
+	ms := milestoneScopeWithUnsortedNested()
+	_ = plan.MilestoneScopeFingerprint(ms)
+	// The reversed depends_on must be untouched (canonical order would put app#1
+	// first).
+	if got := ms.Included[2].DependsOn; got[0] != msKey("acme/app#2") || got[1] != msKey("acme/app#1") {
+		t.Errorf("fingerprint mutated the caller's depends_on: got %v, want it left reversed", got)
+	}
+	// The reversed rubric_citations must be untouched (canonical order would put
+	// U1 first).
+	if got := ms.Included[2].RubricCitations; got[0].RubricID != "U2" || got[1].RubricID != "U1" {
+		t.Errorf("fingerprint mutated the caller's rubric_citations: got %v, want it left reversed", got)
+	}
+}
+
+// TestMilestoneScopeFingerprint_ConcurrentUseNoRace is the concern-1 concurrency
+// proof: many goroutines fingerprint the SAME scope at once. With a shallow copy
+// they concurrently sort the shared nested backing arrays in production code,
+// which the race detector flags; the deep copy gives each call its own arrays.
+// This is discrimination in the code under test (not the scaffolding), so it
+// reddens under -race with the deep copy removed. Run the whole suite under
+// -race (scripts/test does) to exercise it.
+func TestMilestoneScopeFingerprint_ConcurrentUseNoRace(t *testing.T) {
+	ms := milestoneScopeWithUnsortedNested()
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = plan.MilestoneScopeFingerprint(ms)
+		}()
+	}
+	wg.Wait()
+	// Post-condition: the shared input is still in its supplied order — no
+	// goroutine mutated it.
+	if got := ms.Included[2].DependsOn; got[0] != msKey("acme/app#2") {
+		t.Errorf("a concurrent fingerprint mutated the shared depends_on: got %v", got)
 	}
 }
 

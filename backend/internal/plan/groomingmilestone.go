@@ -22,7 +22,7 @@ import (
 // The three new entry classes reuse #2235's derived-entry-id contract, so
 // run-over-run identity stays mechanical. Their ids live under the same
 // report-wide uniqueness / class-prefix / recomposition rules as the six
-// existing arrays (collectGroomingEntries appends them); the SEVEN rules the
+// existing arrays (collectGroomingEntries appends them); the EIGHT rules the
 // schema cannot express are machine-checked here by checkMilestoneScope.
 
 // The three milestone entry classes. Each is the leading segment of a derived
@@ -111,7 +111,7 @@ type MilestoneEdgeConfidence struct {
 	Basis string `json:"basis"`
 }
 
-// checkMilestoneScope enforces the seven rules the schema cannot express, each
+// checkMilestoneScope enforces the eight rules the schema cannot express, each
 // returning a *SemanticError naming the offending JSON pointer. A no-op when
 // the report carries no milestone_scope.
 func checkMilestoneScope(gr *GroomingReport) error {
@@ -132,6 +132,12 @@ func checkMilestoneScope(gr *GroomingReport) error {
 	}
 
 	if err := checkMilestoneWaveContiguity(ms); err != nil {
+		return err
+	}
+	// R8 runs BEFORE the dependency rules: a dual-membership item would otherwise
+	// be resolved to its included interpretation by checkMilestoneDependencies
+	// (which tests includedWave before excludedKeys), silently suppressing R4.
+	if err := checkMilestoneMembershipDisjoint(ms, includedWave); err != nil {
 		return err
 	}
 	if err := checkMilestoneDependencies(ms, includedWave, excludedKeys); err != nil {
@@ -166,6 +172,27 @@ func checkMilestoneWaveContiguity(ms *MilestoneScope) error {
 			return &SemanticError{Message: fmt.Sprintf(
 				"/milestone_scope/included: wave %d is missing; waves must be the contiguous set 0..%d with no gaps (a gap means the layering is not an executable sequence)",
 				w, maxWave)}
+		}
+	}
+	return nil
+}
+
+// checkMilestoneMembershipDisjoint is R8: the `included` and `excluded` key sets
+// must be disjoint — an item cannot be simultaneously scoped in and out of the
+// milestone. Report-wide id uniqueness does NOT catch this, because the two
+// derived ids differ by class prefix (milestone_inclusion:<key> vs
+// milestone_exclusion:<key>); and without this rule checkMilestoneDependencies
+// would resolve a dependency on a dual-membership item to its includedWave hit
+// before the excludedKeys branch, so R4's out-of-scope-requires-a-declined-call
+// rule would silently never fire for the contradictory input a validator exists
+// to reject.
+func checkMilestoneMembershipDisjoint(ms *MilestoneScope, includedWave map[string]int) error {
+	for i, exc := range ms.Excluded {
+		key := itemKey(exc.ItemRef)
+		if _, both := includedWave[key]; both {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/milestone_scope/excluded/%d: %q also appears in `included`; the included and excluded key sets must be DISJOINT — an item cannot be simultaneously scoped in and out of the milestone",
+				i, key)}
 		}
 	}
 	return nil
@@ -403,21 +430,52 @@ func sortRubricCitations(cs []RubricCitation) {
 	sort.SliceStable(cs, func(i, j int) bool { return rubricCitationLess(cs[i], cs[j]) })
 }
 
+// cloneMilestoneScope returns a DEEP copy of ms: every nested slice
+// (depends_on, open_question_ids, rubric_citations, declined-call options and
+// item_refs, and critical_path) is freshly allocated. A shallow top-level copy
+// is not enough — the copied entry structs still share their nested slice
+// backing arrays with the original, so an in-place CanonicalizeMilestoneScope of
+// the copy would sort the CALLER's slices, changing its subsequent serialization
+// and racing any goroutine that reads or validates the same scope concurrently.
+func cloneMilestoneScope(ms *MilestoneScope) MilestoneScope {
+	c := *ms
+	c.Included = make([]MilestoneInclusion, len(ms.Included))
+	for i, inc := range ms.Included {
+		inc.DependsOn = append([]string(nil), inc.DependsOn...)
+		inc.OpenQuestionIDs = append([]string(nil), inc.OpenQuestionIDs...)
+		inc.RubricCitations = append([]RubricCitation(nil), inc.RubricCitations...)
+		c.Included[i] = inc
+	}
+	c.Excluded = make([]MilestoneExclusion, len(ms.Excluded))
+	for i, exc := range ms.Excluded {
+		exc.RubricCitations = append([]RubricCitation(nil), exc.RubricCitations...)
+		c.Excluded[i] = exc
+	}
+	c.DeclinedCalls = make([]MilestoneDeclinedCall, len(ms.DeclinedCalls))
+	for i, dc := range ms.DeclinedCalls {
+		dc.Options = append([]string(nil), dc.Options...)
+		dc.ItemRefs = append([]ItemRef(nil), dc.ItemRefs...)
+		dc.RubricCitations = append([]RubricCitation(nil), dc.RubricCitations...)
+		c.DeclinedCalls[i] = dc
+	}
+	c.CriticalPath = append([]string(nil), ms.CriticalPath...)
+	return c
+}
+
 // MilestoneScopeFingerprint is a class-tagged sha256 over the canonical
 // structural fields of a milestone scope: the definition text, the framing
 // statement, each inclusion's key+wave+reason, each exclusion's key+reason, each
 // declined question_id, the critical path, and the confidence level. It reuses
 // workmgmt's basis-hash envelope shape, so a caller can compare two runs without
-// diffing the whole document. It operates on a canonicalized copy, so array
-// order does not move the hash.
+// diffing the whole document. It operates on a DEEP-COPIED, canonicalized scope
+// (cloneMilestoneScope), so array order does not move the hash AND the supplied
+// scope is never mutated — safe to call concurrently with a reader of the same
+// scope.
 func MilestoneScopeFingerprint(ms *MilestoneScope) string {
 	if ms == nil {
 		return ""
 	}
-	c := *ms
-	c.Included = append([]MilestoneInclusion(nil), ms.Included...)
-	c.Excluded = append([]MilestoneExclusion(nil), ms.Excluded...)
-	c.DeclinedCalls = append([]MilestoneDeclinedCall(nil), ms.DeclinedCalls...)
+	c := cloneMilestoneScope(ms)
 	CanonicalizeMilestoneScope(&c)
 
 	fields := []string{
