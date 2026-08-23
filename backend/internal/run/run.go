@@ -291,11 +291,63 @@ type TriggerSource string
 
 // Trigger sources for v0. Linear and Jira land under v0.x per
 // MVP_SPEC §7.1.
+//
+// TriggerOnDemand (E54.22 / #2826) is the OPERATOR-INITIATED NON-DIFF form:
+// the producer for `applies_to: {trigger: [scheduled, on_demand]}` routing,
+// which ADR-065's backlog groomer declares and which had no producer until
+// this value existed. It is deliberately ISSUE-ANCHORED — the groom stage
+// declares `inputs: [{source: github_issue, required: true}]`, so an
+// on-demand grooming run carries an `issue:N` TriggerRef exactly as a
+// github_issue run does (see IsIssueAnchored). `scheduled` is deliberately
+// ABSENT: no scheduler exists to mint it, and an unreachable enum member
+// would re-create the dead-surface defect #2826 exists to close.
+//
+// NOTE (visible modelling debt, #2826): trigger_source now carries BOTH the
+// run's ORIGIN and its routing FORM. github_issue/cli/ui name where a run
+// came from; on_demand names the shape of the change it routes as. The two
+// were conflated deliberately — all four admission sites funnel through
+// appliesto.AdmissionChange(string(triggerSource), labels), so one value
+// reaches every site and cannot drift — rather than adding a second column
+// and a signature change at four call sites. See
+// backend/internal/appliesto for the mapping.
 const (
 	TriggerGitHubIssue TriggerSource = "github_issue"
 	TriggerCLI         TriggerSource = "cli"
 	TriggerUI          TriggerSource = "ui"
+	TriggerOnDemand    TriggerSource = "on_demand"
 )
+
+// ValidTriggerSources is the closed set of accepted trigger sources, in
+// declaration order. It is the SINGLE source of truth every consumer renders
+// from — the server's POST /v0/runs validation and its 400 message, and the
+// MCP start_run mirror — so the accepted set and the message an operator
+// reads cannot drift apart. Mirrors the ValidRunnerKinds idiom in this
+// package (a slice rather than a map because the message rendering needs a
+// stable order).
+//
+// A new member here must also be added to the runs_trigger_source_check
+// CHECK constraint (see backend/internal/postgres/migrations), or the INSERT
+// is rejected at the storage layer.
+func ValidTriggerSources() []TriggerSource {
+	return []TriggerSource{TriggerGitHubIssue, TriggerCLI, TriggerUI, TriggerOnDemand}
+}
+
+// IsIssueAnchored reports whether this run's trigger source is one that
+// carries an `issue:N` TriggerRef — github_issue (the webhook/CLI issue path)
+// and on_demand (the operator-started grooming run, whose groom stage
+// REQUIRES a github_issue input).
+//
+// It is deliberately a SOURCE-LEVEL predicate only: it says the source is one
+// that MAY be issue-anchored, never that this particular run has a usable
+// issue reference. Every caller still independently checks TriggerRef and
+// InstallationID afterwards — widening the source check must not widen the
+// ref requirement (#2826).
+func (r *Run) IsIssueAnchored() bool {
+	if r == nil {
+		return false
+	}
+	return r.TriggerSource == TriggerGitHubIssue || r.TriggerSource == TriggerOnDemand
+}
 
 // Run is the persisted record of a workflow execution.
 type Run struct {

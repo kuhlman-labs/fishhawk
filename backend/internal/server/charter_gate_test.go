@@ -441,12 +441,18 @@ const groomingExampleFromServer = "../../../docs/spec/examples/workflow-v2-backl
 // startShippedGroomingRun creates a run governed by the shipped grooming
 // declaration and returns its id plus its three stages (groom/apply/confirm).
 //
-// The audited applies_to override is required and honest: the declaration
-// routes on `trigger: [scheduled, on_demand]` and no producer emits either
-// form yet (appliesto.TriggerFormForSource maps every source to `diff`), so
-// admission would otherwise refuse before the run-state path under test is
-// reachable. The override bypasses ROUTING only — it touches no autonomy
-// resolution and no action-class mode.
+// NO applies_to_override (E54.22 / #2826). This helper previously carried an
+// audited override whose stated reason was that no producer emitted the
+// non-diff trigger forms, so admission would refuse before the run-state path
+// under test was reachable. `on_demand` IS that producer now, so the run is
+// admitted on the declaration's own terms — which converts a standing
+// workaround into a REGRESSION TEST: if TriggerFormForSource stops mapping
+// on_demand to spec.TriggerOnDemand, every TestShippedGrooming* case using
+// this helper fails at admission with a 422, against the SHIPPED declaration
+// read from disk rather than a fixture.
+//
+// The issue_context is what makes the run issue-anchored, matching the
+// declaration's required github_issue input.
 func startShippedGroomingRun(t *testing.T, s *Server, repo *autoDriveRepo) (uuid.UUID, []*run.Stage) {
 	t.Helper()
 	raw, err := os.ReadFile(groomingExampleFromServer)
@@ -455,12 +461,12 @@ func startShippedGroomingRun(t *testing.T, s *Server, repo *autoDriveRepo) (uuid
 	}
 	w := createRunViaHandler(t, s, map[string]any{
 		"repo": "x/y", "workflow_id": "backlog_grooming", "workflow_sha": "abc",
-		"trigger_source": "cli", "workflow_spec": string(raw),
-		"applies_to_override":        true,
-		"applies_to_override_reason": "no producer emits the scheduled/on_demand trigger form yet; exercising the run-state path",
+		"trigger_source": string(run.TriggerOnDemand), "workflow_spec": string(raw),
+		"trigger_ref":   "issue:2826",
+		"issue_context": issueCtx(),
 	})
 	if w.Code != 201 {
-		t.Fatalf("create status = %d, want 201:\n%s", w.Code, w.Body.String())
+		t.Fatalf("create status = %d, want 201 — the shipped declaration routes on trigger: [scheduled, on_demand] and on_demand is its producer:\n%s", w.Code, w.Body.String())
 	}
 	var created runResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {

@@ -854,7 +854,7 @@ components:
           description: Git SHA of `.fishhawk/workflows.yaml` at run time.
         trigger_source:
           type: string
-          enum: [github_issue, cli, ui]
+          enum: [github_issue, cli, ui, on_demand]
         trigger_ref:
           type: [string, "null"]
           example: "issue:1247"
@@ -6045,7 +6045,23 @@ paths:
                   type: string
                 trigger_source:
                   type: string
-                  enum: [github_issue, cli, ui]
+                  enum: [github_issue, cli, ui, on_demand]
+                  description: |
+                    Where the run originated, and — for `on_demand`
+                    — the routing FORM it carries.
+                    `github_issue`, `cli` and `ui` each produce a
+                    code diff. `on_demand` (E54.22 / #2826) is the
+                    OPERATOR-INITIATED NON-DIFF form: it is what a
+                    workflow declaring
+                    `applies_to: {trigger: [scheduled, on_demand]}`
+                    (ADR-065's `backlog_grooming`) routes on, and
+                    without it that declaration matches no run. An
+                    `on_demand` run is ISSUE-ANCHORED by design —
+                    the groom stage requires a `github_issue` input
+                    — so it carries an `issue:N` `trigger_ref` and
+                    may carry an `issue_context`. `scheduled` is
+                    deliberately NOT accepted: no scheduler exists
+                    to mint it.
                 trigger_ref:
                   type: [string, "null"]
                 runner_kind:
@@ -6109,9 +6125,11 @@ paths:
                     GitHub issue's title, body, url, and number so
                     the backend's prompt builder reads from the row
                     instead of needing an installation_id to fetch
-                    from GitHub. Only valid with
-                    `trigger_source: github_issue` — a 400 fires
-                    when shipped with any other trigger source.
+                    from GitHub. Only valid with an
+                    ISSUE-ANCHORED `trigger_source` —
+                    `github_issue` or `on_demand` (E54.22 / #2826)
+                    — a 400 fires when shipped with `cli` or `ui`,
+                    which carry no originating issue.
                     Webhook-dispatched runs leave this empty and
                     the backend falls back to the existing
                     GitHub-fetch path.

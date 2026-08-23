@@ -286,11 +286,13 @@ const (
 	// gap: DerivedOperatorAgent maps only the five run-driving classes
 	// onto may_* knobs, so a `hygiene: {mode: auto}` class derives an
 	// EMPTY OperatorAgent knob block and therefore delegates NOTHING at
-	// any enforcement site. The posture is the one
-	// `trigger: [scheduled, on_demand]` already ships with — no producer
-	// emits a non-diff trigger form either (see
-	// backend/internal/appliesto.TriggerFormForSource), and both are
-	// accepted as declarable grammar rather than rejected.
+	// any enforcement site. The posture is the one `scheduled` still
+	// ships with — no producer emits that trigger form (see
+	// backend/internal/appliesto.TriggerFormForSource), and it is
+	// accepted as declarable grammar rather than rejected. NOTE
+	// (E54.22 / #2826): the sibling `on_demand` form is no longer in
+	// that class — run.TriggerOnDemand is its producer — so `scheduled`
+	// alone carries the precedent now.
 	ConditionObjectiveReversible DelegationCondition = "objective_reversible"
 )
 

@@ -2970,3 +2970,158 @@ func TestPRReview_UndecodablePayloadSkipped(t *testing.T) {
 		t.Errorf("no dedup row for a skipped verdict; got %d", got)
 	}
 }
+
+// --- E54.22 / #2826: the suppression guard is ISSUE-ANCHORED, not github_issue-only ---
+
+// notifierForSource builds the notifier over a run with the given trigger
+// source and trigger ref (nil ref = an anchored source with nothing to anchor
+// TO), plus the two stages NotifyStatusUpdateForRun / NotifyPageClassForRun
+// need. Mirrors happyDepsWithStages, varying only what the table varies.
+func notifierForSource(t *testing.T, source run.TriggerSource, ref *string) (uuid.UUID, *fakeGitHub, *fakeAudit, *issuecomment.Notifier) {
+	t.Helper()
+	runID := uuid.New()
+	stages := []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: uuid.New(), RunID: runID, Sequence: 2, Type: run.StageTypeImplement, State: run.StageStateRunning},
+	}
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:             runID,
+			Repo:           "x/y",
+			WorkflowID:     "backlog_grooming",
+			TriggerSource:  source,
+			TriggerRef:     ref,
+			InstallationID: int64Ptr(99),
+			State:          run.StateRunning,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        repoRuns,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier nil")
+	}
+	return runID, gh, au, n
+}
+
+// TestNotify_IssueAnchoredSuppression is the focused table over the notifier
+// entry points whose suppression guard this change widened (E54.22 / #2826).
+// Three rows, one per behaviour the guard must have:
+//
+//   - on_demand + issue:N + an installation POSTS. Without this an on-demand
+//     grooming run would receive NO comments on the very issue it is about,
+//     including the approval-gate comment the live walk depends on.
+//   - cli does NOT post — the RETAINED control. This is the row that
+//     distinguishes "widened correctly" from "guard removed": a change that
+//     made everything post would satisfy the first row alone. Replace
+//     IsIssueAnchored with `true` in notifier.go and this row goes RED while
+//     the on_demand row stays green.
+//   - on_demand with a NIL TriggerRef does NOT post — proving the widened
+//     SOURCE check did not swallow the independent ref requirement one line
+//     below it.
+//
+// Each entry point is driven through its EXPORTED function and the assertion
+// reads the fake GitHub's recorded calls after the call returns, not a return
+// value: the observable effect of the guard is a comment that did or did not
+// get posted.
+func TestNotify_IssueAnchoredSuppression(t *testing.T) {
+	issueRef := "issue:42"
+
+	// entryPoints drives each of the five REACHABLE guard sites. (The sixth,
+	// contextFor, has no caller in the tree — see the PR notes.) Each returns
+	// the number of GitHub calls the notifier made.
+	entryPoints := map[string]func(t *testing.T, source run.TriggerSource, ref *string) int{
+		"NotifyCIRetry": func(t *testing.T, source run.TriggerSource, ref *string) int {
+			t.Helper()
+			runID, gh, _, n := notifierForSource(t, source, ref)
+			if err := n.NotifyCIRetry(context.Background(), runID, uuid.New(), "ci/build", 1, 1); err != nil {
+				t.Fatalf("NotifyCIRetry: %v", err)
+			}
+			return len(gh.calls) + len(gh.updateCalls)
+		},
+		"NotifyBudgetAlert": func(t *testing.T, source run.TriggerSource, ref *string) int {
+			t.Helper()
+			runID, gh, _, n := notifierForSource(t, source, ref)
+			if _, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload()); err != nil {
+				t.Fatalf("NotifyBudgetAlert: %v", err)
+			}
+			return len(gh.calls) + len(gh.updateCalls)
+		},
+		"NotifyStatusUpdate": func(t *testing.T, source run.TriggerSource, ref *string) int {
+			t.Helper()
+			runID, gh, _, n := notifierForSource(t, source, ref)
+			if err := n.NotifyStatusUpdate(context.Background(), runID, "status v1"); err != nil {
+				t.Fatalf("NotifyStatusUpdate: %v", err)
+			}
+			return len(gh.calls) + len(gh.updateCalls)
+		},
+		"NotifyStatusUpdateForRun": func(t *testing.T, source run.TriggerSource, ref *string) int {
+			t.Helper()
+			runID, gh, _, n := notifierForSource(t, source, ref)
+			if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+				t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+			}
+			return len(gh.calls) + len(gh.updateCalls)
+		},
+		"NotifyPageClassForRun": func(t *testing.T, source run.TriggerSource, ref *string) int {
+			t.Helper()
+			runID, gh, au, n := notifierForSource(t, source, ref)
+			au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+			if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+				t.Fatalf("NotifyPageClassForRun: %v", err)
+			}
+			return len(gh.calls) + len(gh.updateCalls)
+		},
+	}
+
+	rows := []struct {
+		name     string
+		source   run.TriggerSource
+		ref      *string
+		wantPost bool
+		why      string
+	}{
+		{"on_demand anchored to an issue POSTS", run.TriggerOnDemand, &issueRef, true,
+			"an on-demand grooming run is issue-anchored by design; its gate comments must land on that issue"},
+		// The cli row is IDENTICAL to the on_demand row in every field but the
+		// trigger source — including an `issue:N`-parsable ref. That is
+		// load-bearing: the tree's PRE-EXISTING cli suppression tests give the
+		// cli run a `cli:adhoc` ref, so the downstream parseIssueRef check
+		// suppresses the post whether or not the SOURCE guard exists, and
+		// deleting IsIssueAnchored leaves them GREEN. Pairing the cli source
+		// with an anchorable ref isolates the source guard as the only thing
+		// that can refuse the post.
+		{"cli does NOT post", run.TriggerCLI, &issueRef, false,
+			"RETAINED CONTROL: a cli run must not post even when its ref would parse; deleting IsIssueAnchored reddens exactly this row"},
+		{"on_demand with a nil trigger_ref does NOT post", run.TriggerOnDemand, nil, false,
+			"the widened SOURCE check must not swallow the independent TriggerRef requirement"},
+	}
+
+	for name, drive := range entryPoints {
+		for _, row := range rows {
+			t.Run(name+"/"+row.name, func(t *testing.T) {
+				got := drive(t, row.source, row.ref)
+				if row.wantPost && got == 0 {
+					t.Errorf("%s posted nothing for trigger_source=%s ref=%v — %s", name, row.source, derefRef(row.ref), row.why)
+				}
+				if !row.wantPost && got != 0 {
+					t.Errorf("%s posted %d comment(s) for trigger_source=%s ref=%v — %s", name, got, row.source, derefRef(row.ref), row.why)
+				}
+			})
+		}
+	}
+}
+
+func derefRef(r *string) string {
+	if r == nil {
+		return "<nil>"
+	}
+	return *r
+}

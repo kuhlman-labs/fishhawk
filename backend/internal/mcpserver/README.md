@@ -1453,6 +1453,22 @@ than a shared package (the cli → backend import direction precludes the invers
 is defaulted (empty) and an issue resolves via `issue` or `trigger_ref=issue:N`, the MCP server flips it to
 `github_issue`; an explicit `trigger_source` is preserved.
 
+**`trigger_source` accepts four values** — `github_issue`, `cli`, `ui`, `on_demand` — enumerated from
+`run.ValidTriggerSources()` so this mirror and the server's own set cannot drift; the tool's invalid-value error is
+rendered from the same accessor.
+
+- **`on_demand` (E54.22 / [#2826](https://github.com/kuhlman-labs/fishhawk/issues/2826)) starts a NON-DIFF run.** It is
+  the producer for `applies_to: {trigger: [scheduled, on_demand]}` routing — ADR-065's `backlog_grooming` declaration —
+  which had no producer before it and was therefore unselectable. Pass it EXPLICITLY together with `issue` (or
+  `issue_context`): the auto-flip only fills an OMITTED value, so the explicit `on_demand` survives while the issue
+  payload is still fetched and shipped. That combination is the intended path, not a conflict: an on-demand grooming run
+  is ISSUE-ANCHORED by design, because the groom stage declares `inputs: [{source: github_issue, required: true}]`, and
+  the run's approval-gate / status comments land on that issue.
+- `issue_context` is valid with an **issue-anchored** source (`github_issue` or `on_demand`). Pairing it with `cli` or
+  `ui` is refused locally with a clean tool error rather than round-tripped to a backend 400.
+- `scheduled` is deliberately NOT accepted: no scheduler exists to mint it, and a persistable-but-unmintable value is
+  the dead surface #2826 closes.
+
 ### `applies_to` routing and its audited override (E53.3 / [#2226](https://github.com/kuhlman-labs/fishhawk/issues/2226))
 
 A workflow may declare `applies_to:` — a predicate saying which changes may be routed through it. `fishhawk_start_run`

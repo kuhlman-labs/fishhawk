@@ -47,6 +47,22 @@ of `server/applies_to.go`. So it is its own package, imported symmetrically.
 - `AdmissionChange(triggerSource, labels)` / `TriggerFormForSource(src)` — build
   the `spec.Change` evaluated at admission. A nil/empty label set is an EMPTY
   label set (fail-closed against a `labels` criterion), never match-all.
+  `TriggerFormForSource` maps the three ORIGIN sources (`github_issue`, `cli`,
+  `ui`) and every unrecognized value to `diff`, and `on_demand` to `on_demand`
+  (E54.22 / #2826). `scheduled` is UNPRODUCED — no scheduler exists to mint it
+  — so a predicate declaring only `scheduled` matches nothing; one declaring
+  `[scheduled, on_demand]` (the shipped `backlog_grooming` declaration) is
+  satisfied through the on-demand form.
+- **Known modelling trade-off (#2826): `trigger_source` carries BOTH origin and
+  routing form.** `github_issue`/`cli`/`ui` name where a run came from;
+  `on_demand` names the shape of the change it routes as. A separate
+  `trigger_form` field would keep them apart, at the cost of a run column, a
+  `CreateRunParams` field, and a signature change to `AdmissionChange` plus an
+  edit at each of its four call sites. The conflation was chosen because all
+  four admission sites already funnel through
+  `AdmissionChange(string(triggerSource), labels)`, so a new source value
+  reaches every one of them BY CONSTRUCTION rather than by four parallel edits
+  that could drift. Recorded here as visible debt rather than left silent.
 
 ## Load-bearing invariants
 

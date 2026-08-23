@@ -309,6 +309,109 @@ func TestCreateRun_BadTriggerSource(t *testing.T) {
 	}
 }
 
+// TestCreateRun_BadTriggerSourceMessageNamesEverySource is AC5 (E54.22 /
+// #2826): the 400 body must name EVERY accepted source, asserted by iterating
+// run.ValidTriggerSources() rather than against a hard-coded literal — so the
+// message and the enforced set cannot drift apart. A hand-written literal here
+// would go stale in exactly the way the message it guards does.
+func TestCreateRun_BadTriggerSourceMessageNamesEverySource(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs",
+		strings.NewReader(`{"repo":"r","workflow_id":"w","workflow_sha":"s","trigger_source":"bogus"}`))
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, ts := range run.ValidTriggerSources() {
+		if !strings.Contains(body, string(ts)) {
+			t.Errorf("400 body does not name accepted trigger source %q:\n%s", ts, body)
+		}
+	}
+}
+
+// TestCreateRun_OnDemandWithIssueContext is the on-demand producer at the HTTP
+// seam (E54.22 / #2826): an on_demand run carrying an issue_context is
+// ACCEPTED and persisted with trigger_source=on_demand. The issue context is
+// the point — ADR-065's groom stage declares a REQUIRED github_issue input, so
+// a refusal here would make the grooming run unstartable.
+func TestCreateRun_OnDemandWithIssueContext(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "backlog_grooming",
+		"workflow_sha": "abc123",
+		"trigger_source": "on_demand",
+		"trigger_ref": "issue:2826",
+		"issue_context": {"number": 2826, "title": "groom the backlog", "url": "https://github.com/kuhlman-labs/fishhawk/issues/2826"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.TriggerSource != string(run.TriggerOnDemand) {
+		t.Errorf("TriggerSource = %q, want on_demand", got.TriggerSource)
+	}
+	// Read the PERSISTED row, not just the echoed response: the accepted set is
+	// enforced at the storage layer too (runs_trigger_source_check).
+	persisted, ok := repo.runs[got.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", got.ID)
+	}
+	if persisted.TriggerSource != run.TriggerOnDemand {
+		t.Errorf("persisted TriggerSource = %q, want on_demand", persisted.TriggerSource)
+	}
+	if !persisted.IsIssueAnchored() {
+		t.Error("a persisted on_demand run must report IsIssueAnchored() — the issuecomment gate comments depend on it")
+	}
+}
+
+// TestCreateRun_IssueContextRejectedOnNonAnchoredSource is the RETAINED
+// control (counterfactual (a), E54.22 / #2826): relaxing the issue_context
+// coupling to the issue-anchored set must NOT make it accept cli or ui. Delete
+// the refusal block in runs.go and this test goes RED.
+func TestCreateRun_IssueContextRejectedOnNonAnchoredSource(t *testing.T) {
+	for _, src := range []run.TriggerSource{run.TriggerCLI, run.TriggerUI} {
+		t.Run(string(src), func(t *testing.T) {
+			repo := newFakeRepo()
+			s := newServer(t, repo)
+			body := `{
+				"repo": "kuhlman-labs/fishhawk",
+				"workflow_id": "feature_change",
+				"workflow_sha": "abc123",
+				"trigger_source": "` + string(src) + `",
+				"issue_context": {"number": 42, "title": "t", "url": "https://example.invalid/42"}
+			}`
+			req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.handleCreateRun(w, withAuth(req))
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for issue_context on trigger_source=%s:\n%s", w.Code, src, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "issue_context") {
+				t.Errorf("400 body does not name the issue_context field:\n%s", w.Body.String())
+			}
+			// No run may be created by a refused request.
+			if len(repo.runs) != 0 {
+				t.Errorf("refused request created %d runs, want 0", len(repo.runs))
+			}
+		})
+	}
+}
+
 func TestCreateRun_RepoError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.createErr = errors.New("disk full")

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -206,12 +207,74 @@ func TestFirstFailingCriterion_NamesTheCriterion(t *testing.T) {
 }
 
 // TestTriggerFormForSource pins the documented trigger_source→TriggerForm
-// mapping the M5 cases exercise through the handler.
+// mapping the M5 cases exercise through the handler, over the WHOLE source
+// vocabulary (E54.22 / #2826). The mapping is a value correspondence that
+// compilation does not enforce, so it is asserted exhaustively:
+//
+//   - the three ORIGIN sources and the empty value map to diff;
+//   - on_demand maps to on_demand — the producer that makes ADR-065's
+//     `trigger: [scheduled, on_demand]` grooming declaration selectable;
+//   - an UNRECOGNIZED source stays diff-shaped (the conservative default arm:
+//     every existing predicate is written against a diff-form change).
 func TestTriggerFormForSource(t *testing.T) {
-	for _, src := range []string{"github_issue", "cli", "ui", ""} {
-		if got := TriggerFormForSource(src); got != spec.TriggerDiff {
-			t.Errorf("TriggerFormForSource(%q) = %q, want diff — every v0 trigger source produces a code diff", src, got)
+	cases := []struct {
+		source string
+		want   spec.TriggerForm
+	}{
+		{"github_issue", spec.TriggerDiff},
+		{"cli", spec.TriggerDiff},
+		{"ui", spec.TriggerDiff},
+		{"", spec.TriggerDiff},
+		{"nonsense", spec.TriggerDiff},
+		// `scheduled` has NO producer, so no trigger_source maps to it; the
+		// string is not a trigger source at all and takes the default arm.
+		{"scheduled", spec.TriggerDiff},
+		{"on_demand", spec.TriggerOnDemand},
+	}
+	for _, tc := range cases {
+		if got := TriggerFormForSource(tc.source); got != tc.want {
+			t.Errorf("TriggerFormForSource(%q) = %q, want %q", tc.source, got, tc.want)
 		}
+	}
+	// The mapping is keyed off the run package's constants, not string
+	// literals that could drift from them.
+	if got := TriggerFormForSource(string(run.TriggerOnDemand)); got != spec.TriggerOnDemand {
+		t.Errorf("TriggerFormForSource(run.TriggerOnDemand) = %q, want on_demand", got)
+	}
+}
+
+// TestAdmissionChange_OnDemandMatchesNonDiffPredicate is AC1 + AC2 asserted
+// through the Change BUILDER rather than by reading a constant: the shipped
+// grooming declaration's predicate must MATCH an on-demand run and must NOT
+// match a cli run. Both directions, because a mapping that made everything
+// match would satisfy a one-sided test.
+func TestAdmissionChange_OnDemandMatchesNonDiffPredicate(t *testing.T) {
+	groomingPredicate := spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerScheduled, spec.TriggerOnDemand}}
+
+	onDemand := AdmissionChange(string(run.TriggerOnDemand), nil)
+	if onDemand.Trigger != spec.TriggerOnDemand {
+		t.Fatalf("AdmissionChange(on_demand).Trigger = %q, want on_demand", onDemand.Trigger)
+	}
+	if ok, err := groomingPredicate.Match(onDemand); err != nil || !ok {
+		t.Errorf("(%v, %v): trigger:[scheduled, on_demand] must MATCH an on_demand run — this is what makes the grooming workflow selectable", ok, err)
+	}
+
+	cli := AdmissionChange(string(run.TriggerCLI), nil)
+	if ok, err := groomingPredicate.Match(cli); err != nil || ok {
+		t.Errorf("(%v, %v): trigger:[scheduled, on_demand] must NOT match a cli run", ok, err)
+	}
+
+	// The converse invariance (AC3): a diff-only predicate keeps admitting the
+	// three origin sources and now REFUSES on_demand. Widening the vocabulary
+	// must not quietly re-route existing declarations.
+	diffOnly := spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerDiff}}
+	for _, src := range []run.TriggerSource{run.TriggerGitHubIssue, run.TriggerCLI, run.TriggerUI} {
+		if ok, err := diffOnly.Match(AdmissionChange(string(src), nil)); err != nil || !ok {
+			t.Errorf("(%v, %v): trigger:[diff] must still admit %q", ok, err, src)
+		}
+	}
+	if ok, err := diffOnly.Match(onDemand); err != nil || ok {
+		t.Errorf("(%v, %v): trigger:[diff] must REFUSE an on_demand run", ok, err)
 	}
 }
 
@@ -233,5 +296,17 @@ func TestAdmissionChange_EmptyLabelSetIsNotMatchAll(t *testing.T) {
 	c = AdmissionChange("github_issue", []string{"docs"})
 	if len(c.Labels) != 1 || c.Labels[0] != "docs" {
 		t.Errorf("labels = %v, want [docs]", c.Labels)
+	}
+	// The fail-closed reading must not change with the new on_demand source
+	// (#2826): it carries the new trigger FORM and still an EMPTY label set.
+	c = AdmissionChange(string(run.TriggerOnDemand), nil)
+	if c.Trigger != spec.TriggerOnDemand {
+		t.Errorf("AdmissionChange(on_demand).Trigger = %q, want on_demand", c.Trigger)
+	}
+	if len(c.Labels) != 0 {
+		t.Errorf("labels = %v, want empty for an on_demand run with no issue context", c.Labels)
+	}
+	if ok, err := (spec.Predicate{Labels: []string{"chore"}}).Match(c); err != nil || ok {
+		t.Errorf("(%v, %v): an on_demand run's EMPTY label set must NOT satisfy a labels criterion", ok, err)
 	}
 }

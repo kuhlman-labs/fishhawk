@@ -7,7 +7,13 @@
  */
 
 export type RunState = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
-export type TriggerSource = 'github_issue' | 'cli' | 'ui';
+// 'on_demand' is the operator-initiated NON-DIFF trigger form (E54.22 / #2826):
+// the producer for a workflow declaring
+// `applies_to: {trigger: [scheduled, on_demand]}`. Display sites render
+// `run.trigger_source` verbatim, so widening the union is the only change
+// needed; a future switch over this type will fail typecheck until it handles
+// the new member, which is the desired direction.
+export type TriggerSource = 'github_issue' | 'cli' | 'ui' | 'on_demand';
 
 export interface Run {
   id: string;

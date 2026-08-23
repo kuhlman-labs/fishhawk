@@ -665,11 +665,31 @@ type createRunRequest struct {
 // validTriggerSources is the closed set per the workflow-spec and
 // OpenAPI surface. New sources land in v0.x and require an explicit
 // schema bump (see MVP_SPEC §7.1).
-var validTriggerSources = map[string]struct{}{
-	string(run.TriggerGitHubIssue): {},
-	string(run.TriggerCLI):         {},
-	string(run.TriggerUI):          {},
-}
+//
+// DERIVED from run.ValidTriggerSources() rather than hand-written
+// (E54.22 / #2826): the membership check AND the 400 message
+// (validTriggerSourcesMessage) are both rendered from that one accessor, so
+// adding a source there cannot leave this set — or the message an operator
+// reads — behind.
+var validTriggerSources = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		m[string(ts)] = struct{}{}
+	}
+	return m
+}()
+
+// validTriggerSourcesMessage is the 400 body for an unrecognized
+// trigger_source, rendered from the SAME accessor the membership check is
+// built from so the message can never name a different set than the one
+// enforced.
+var validTriggerSourcesMessage = func() string {
+	names := make([]string, 0, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		names = append(names, string(ts))
+	}
+	return "trigger_source must be one of " + strings.Join(names, ", ")
+}()
 
 // handleCreateRun implements POST /v0/runs. Validates the request
 // body, calls into the run repository, and returns the canonical
@@ -712,7 +732,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := validTriggerSources[req.TriggerSource]; !ok {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"trigger_source must be one of github_issue, cli, ui",
+			validTriggerSourcesMessage,
 			map[string]any{"field": "trigger_source", "got": req.TriggerSource})
 		return
 	}
@@ -737,14 +757,20 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IssueContext is only meaningful for issue-triggered runs
-	// (#415). Reject the field on non-issue triggers up front so
-	// the shape stays narrow — better a clear 400 now than a
-	// prompt-time surprise when the cached payload turns out to
+	// IssueContext is only meaningful for ISSUE-ANCHORED runs (#415,
+	// widened E54.22 / #2826). Reject the field on non-issue-anchored
+	// triggers up front so the shape stays narrow — better a clear 400 now
+	// than a prompt-time surprise when the cached payload turns out to
 	// refer to nothing the prompt template will reference.
-	if req.IssueContext != nil && req.TriggerSource != string(run.TriggerGitHubIssue) {
+	//
+	// on_demand is admitted alongside github_issue because it is anchored BY
+	// DESIGN: ADR-065's groom stage declares
+	// `inputs: [{source: github_issue, required: true}]`, so the run an
+	// operator starts on-demand is exactly a run that must carry an issue
+	// context. cli and ui still 400 — they carry no issue at all.
+	if req.IssueContext != nil && !(&run.Run{TriggerSource: run.TriggerSource(req.TriggerSource)}).IsIssueAnchored() {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"issue_context is only valid with trigger_source=github_issue",
+			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand)",
 			map[string]any{"field": "issue_context", "trigger_source": req.TriggerSource})
 		return
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
@@ -2432,11 +2433,27 @@ func (r *runResolver) findMostRecent(ctx context.Context, f listRunsFilter) (*Ru
 // validStartRunTriggerSources mirrors `server/runs.go::validTriggerSources`.
 // Kept narrow because the MCP tool sets a sensible default; agents
 // passing a bad value get a clean tool error before the HTTP call.
-var validStartRunTriggerSources = map[string]struct{}{
-	"github_issue": {},
-	"cli":          {},
-	"ui":           {},
-}
+//
+// DERIVED from run.ValidTriggerSources() (E54.22 / #2826) so this MIRROR
+// cannot drift from the server's set: both sides read the one accessor, and
+// the tool error below is rendered from it too.
+var validStartRunTriggerSources = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		m[string(ts)] = struct{}{}
+	}
+	return m
+}()
+
+// validStartRunTriggerSourcesMessage renders the accepted set for the tool
+// error, from the same accessor the membership check is built from.
+var validStartRunTriggerSourcesMessage = func() string {
+	names := make([]string, 0, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		names = append(names, string(ts))
+	}
+	return strings.Join(names, ", ")
+}()
 
 // StartRunInput is the fishhawk_start_run tool's input schema
 // (E22.1 / #390, extended in #426). Mirrors `POST /v0/runs`'s body
@@ -2454,7 +2471,7 @@ type StartRunInput struct {
 	Repo           string `json:"repo" jsonschema:"GitHub repo as owner/name; the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
 	WorkflowID     string `json:"workflow_id" jsonschema:"workflow key in .fishhawk/workflows.yaml (e.g. 'feature_change')"`
 	WorkflowSHA    string `json:"workflow_sha,omitempty" jsonschema:"blob SHA of the spec file; auto-computed from the discovered spec when omitted and working_dir resolves a checkout"`
-	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui'; defaults to 'cli' when omitted, auto-flips to 'github_issue' when issue or issue_context is set"`
+	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui', 'on_demand'; defaults to 'cli' when omitted, auto-flips to 'github_issue' when issue or issue_context is set. Pass 'on_demand' explicitly to start a NON-DIFF run (e.g. backlog_grooming, whose applies_to declares trigger: [scheduled, on_demand]); an explicit value is never overridden by the auto-flip, so 'on_demand' can be combined with issue/issue_context"`
 	TriggerRef     string `json:"trigger_ref,omitempty" jsonschema:"optional reference (e.g. 'issue:42') threading the run to its trigger; auto-derived from issue when omitted"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"E8.2 idempotency token; a second call with the same (repo, key) returns the existing run with Idempotent=true instead of fresh-creating"`
 
@@ -2494,7 +2511,7 @@ type StartRunInput struct {
 	// Only valid with trigger_source=github_issue (or auto-flip
 	// from Issue). Agents that want the MCP server to fetch this
 	// themselves pass Issue instead.
-	IssueContext *IssueContext `json:"issue_context,omitempty" jsonschema:"pre-fetched issue payload; valid only with trigger_source=github_issue. Most callers pass issue instead and let the MCP server fetch via gh."`
+	IssueContext *IssueContext `json:"issue_context,omitempty" jsonschema:"pre-fetched issue payload; valid only with an issue-anchored trigger_source (github_issue or on_demand). Most callers pass issue instead and let the MCP server fetch via gh."`
 
 	// Issue is a convenience alternative to IssueContext: the MCP
 	// server shells to `gh issue view` and fills the
@@ -2768,7 +2785,7 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 	if _, ok := validStartRunTriggerSources[triggerSource]; !ok {
-		return nil, StartRunOutput{}, fmt.Errorf("trigger_source %q is not one of cli, github_issue, ui", triggerSource)
+		return nil, StartRunOutput{}, fmt.Errorf("trigger_source %q is not one of %s", triggerSource, validStartRunTriggerSourcesMessage)
 	}
 
 	// Normalize trigger_ref to the canonical issue:N form when
@@ -2804,9 +2821,14 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// (7) Validate the trigger_source / issue_context pairing.
 	// Mirrors the backend handler's check — better to fail here
 	// with a clear tool error than round-trip to a 422.
-	if issueContext != nil && triggerSource != "github_issue" {
+	//
+	// Widened to the ISSUE-ANCHORED set (E54.22 / #2826): on_demand runs are
+	// issue-anchored by design (ADR-065's groom stage requires a github_issue
+	// input), so they carry an issue context exactly as github_issue runs do.
+	// cli and ui still error here — the retained control.
+	if issueContext != nil && !(&run.Run{TriggerSource: run.TriggerSource(triggerSource)}).IsIssueAnchored() {
 		return nil, StartRunOutput{}, fmt.Errorf(
-			"issue_context is only valid with trigger_source=github_issue (got %q)", triggerSource)
+			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand) (got %q)", triggerSource)
 	}
 
 	// Validate upstream_run_id locally so a malformed value surfaces a

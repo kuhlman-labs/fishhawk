@@ -7623,27 +7623,110 @@ func TestStartRun_IssueContextInline_NoFetch(t *testing.T) {
 }
 
 // TestStartRun_IssueContextRequiresGithubIssueSource mirrors the
-// backend validation: issue_context only valid with
-// trigger_source=github_issue. The MCP server fails locally with
-// a clean message instead of round-tripping to a 422.
+// backend validation: issue_context is only valid with an ISSUE-ANCHORED
+// trigger_source. The MCP server fails locally with a clean message instead of
+// round-tripping to a 422.
+//
+// This is the RETAINED control (counterfactual (b), E54.22 / #2826): widening
+// the coupling from github_issue-only to the issue-anchored set must NOT make
+// it accept cli or ui. Delete the step-(7) check in tools.go and this test
+// goes RED — and the backend is never called, which is asserted so a "failed
+// locally" claim is not confused with a round-trip refusal.
 func TestStartRun_IssueContextRequiresGithubIssueSource(t *testing.T) {
+	for _, src := range []runpkg.TriggerSource{runpkg.TriggerUI, runpkg.TriggerCLI} {
+		t.Run(string(src), func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+
+			_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+				Repo:          "x/y",
+				WorkflowID:    "trivial",
+				WorkflowSpec:  validTrivialSpec,
+				TriggerSource: string(src),
+				IssueContext: &IssueContext{
+					Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
+				},
+			})
+			if err == nil {
+				t.Fatalf("expected error for issue_context on trigger_source=%s", src)
+			}
+			if !strings.Contains(err.Error(), "issue_context") {
+				t.Errorf("err should mention issue_context: %v", err)
+			}
+			if fb.createRunBody.Repo != "" {
+				t.Errorf("backend was called despite the local refusal: %+v", fb.createRunBody)
+			}
+		})
+	}
+}
+
+// TestStartRun_InvalidTriggerSourceNamesEverySource is AC5 at the MCP mirror
+// (E54.22 / #2826): the tool error must name EVERY member of
+// runpkg.ValidTriggerSources(), asserted by iterating the accessor rather than a
+// literal, so this mirror and the server's set cannot drift apart.
+func TestStartRun_InvalidTriggerSourceNamesEverySource(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+		TriggerSource: "bogus",
+	})
+	if err == nil {
+		t.Fatal("expected a validation error for trigger_source=bogus")
+	}
+	for _, ts := range runpkg.ValidTriggerSources() {
+		if !strings.Contains(err.Error(), string(ts)) {
+			t.Errorf("error %v does not name accepted trigger source %q", err, ts)
+		}
+	}
+}
+
+// TestStartRun_OnDemandWithIssueContext_PassesThrough pins two things at once
+// (E54.22 / #2826):
+//
+//   - an EXPLICIT trigger_source survives the step-(5) auto-flip even when an
+//     issue/issue_context is present — the flip only fills an OMITTED value,
+//     which is exactly what lets an operator start an issue-anchored on-demand
+//     grooming run;
+//   - the widened step-(7) pairing check admits issue_context on on_demand.
+func TestStartRun_OnDemandWithIssueContext_PassesThrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeGh(t, `{"title":"Groom","body":"Groom the backlog.","url":"https://github.com/x/y/issues/2826","number":2826}`)
 
 	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
 		Repo:          "x/y",
 		WorkflowID:    "trivial",
 		WorkflowSpec:  validTrivialSpec,
-		TriggerSource: "ui",
-		IssueContext: &IssueContext{
-			Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
-		},
+		TriggerSource: string(runpkg.TriggerOnDemand),
+		Issue:         "2826",
 	})
-	if err == nil {
-		t.Fatal("expected error")
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
 	}
-	if !strings.Contains(err.Error(), "issue_context") {
-		t.Errorf("err should mention issue_context: %v", err)
+	if fb.createRunBody.TriggerSource != string(runpkg.TriggerOnDemand) {
+		t.Errorf("TriggerSource = %q, want on_demand — an explicit value must NOT be overridden by the issue auto-flip", fb.createRunBody.TriggerSource)
+	}
+	if fb.createRunBody.IssueContext == nil || fb.createRunBody.IssueContext.Number != 2826 {
+		t.Errorf("IssueContext not forwarded: %+v", fb.createRunBody.IssueContext)
+	}
+	if fb.createRunBody.TriggerRef == nil || *fb.createRunBody.TriggerRef != "issue:2826" {
+		t.Errorf("TriggerRef = %v, want issue:2826 — the on-demand grooming run is issue-anchored", fb.createRunBody.TriggerRef)
+	}
+
+	// Inline issue_context (no gh hop) takes the same path.
+	fb2, srv2 := newFakeBackend(t)
+	r2 := newResolver(srv2, nil)
+	if _, _, err := r2.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+		TriggerSource: string(runpkg.TriggerOnDemand),
+		IssueContext:  &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1},
+	}); err != nil {
+		t.Fatalf("startRun with inline issue_context on on_demand: %v", err)
+	}
+	if fb2.createRunBody.IssueContext == nil {
+		t.Error("inline IssueContext not forwarded on an on_demand run")
 	}
 }
 

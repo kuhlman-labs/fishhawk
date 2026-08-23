@@ -569,7 +569,7 @@ func (n *Notifier) contextForCIRetry(ctx context.Context, runID uuid.UUID, attem
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	if !runRow.IsIssueAnchored() {
 		return commentContext{}, false, nil
 	}
 	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
@@ -716,7 +716,7 @@ func (n *Notifier) contextForBudgetAlert(ctx context.Context, runID uuid.UUID, p
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	if !runRow.IsIssueAnchored() {
 		return commentContext{}, false, nil
 	}
 	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
@@ -894,7 +894,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil {
 		return fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	if !runRow.IsIssueAnchored() {
 		return nil
 	}
 	stages, err := n.runs.ListStagesForRun(ctx, runID)
@@ -981,7 +981,7 @@ func (n *Notifier) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) e
 	if err != nil {
 		return fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	if !runRow.IsIssueAnchored() {
 		return nil
 	}
 	stages, err := n.runs.ListStagesForRun(ctx, runID)
@@ -1371,7 +1371,7 @@ func (n *Notifier) contextForStatus(ctx context.Context, runID uuid.UUID) (comme
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	if !runRow.IsIssueAnchored() {
 		return commentContext{}, false, nil
 	}
 	// Local-runner runs (#416) carry no installation_id by design:
@@ -2136,7 +2136,23 @@ func (n *Notifier) contextFor(ctx context.Context, runID uuid.UUID, kind Kind) (
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if runRow.TriggerSource != run.TriggerGitHubIssue {
+	// ISSUE-ANCHORED, not github_issue-only (E54.22 / #2826). This and the
+	// five sibling entry points (contextForCIRetry, contextForBudgetAlert,
+	// NotifyStatusUpdateForRun, NotifyPageClassForRun, contextForStatus) each
+	// suppress comment posting for a run that has no issue to post to. An
+	// ON-DEMAND grooming run IS anchored to an issue by design — ADR-065's
+	// groom stage declares `inputs: [{source: github_issue, required: true}]`
+	// — so it must receive its gate comments (approval, status, budget) on
+	// that issue exactly as a github_issue run does. Suppressing it would
+	// make the operator's approval gate invisible on the very issue the run
+	// is about.
+	//
+	// This widens the SOURCE check ONLY. Every one of the six sites still
+	// requires a non-nil InstallationID and an `issue:N`-parsable TriggerRef
+	// immediately afterwards, so an on_demand run with no issue reference
+	// still short-circuits one line later — see run.Run.IsIssueAnchored's
+	// contract.
+	if !runRow.IsIssueAnchored() {
 		return commentContext{}, false, nil
 	}
 	if runRow.InstallationID == nil {

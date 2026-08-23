@@ -63,10 +63,12 @@
 #
 # THE TRIGGER FORM. `applies_to: {trigger: [scheduled, on_demand]}` is the
 # non-diff routing declaration (ADR-067): a grooming run arrives periodically or
-# on operator demand and carries no diff, so it must not be routed as one. No
-# producer emits a non-diff trigger form yet (appliesto.TriggerFormForSource
-# maps every source to `diff`), which is why this is declarable grammar today
-# and enforcement rather than aspiration tomorrow.
+# on operator demand and carries no diff, so it must not be routed as one.
+# `on_demand` HAS a producer as of E54.22 / #2826 — a run started with
+# `trigger_source: on_demand`, which appliesto.TriggerFormForSource maps to
+# spec.TriggerOnDemand — so this declaration is ENFORCED against real runs
+# today, not merely declarable. `scheduled` still has none (no scheduler
+# exists), so the declaration is satisfied only through the on-demand form.
 
 version: "2"
 
@@ -78,8 +80,8 @@ workflows:
     auto_advance: true
 
     # Non-diff routing (ADR-067): a grooming run is periodic or operator-
-    # initiated and carries no paths. See the header for why this is the
-    # declarable form today.
+    # initiated and carries no paths. Satisfied today by a run started with
+    # trigger_source: on_demand (E54.22 / #2826); see the header.
     applies_to:
       trigger: [scheduled, on_demand]
 
