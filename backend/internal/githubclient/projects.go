@@ -885,6 +885,33 @@ type ListRepoIssuesOptions struct {
 	States          []string
 	ProjectID       string
 	WantBoardStatus bool
+	// Newest orders the enumeration NEWEST-FIRST — orderBy {field: CREATED_AT,
+	// direction: DESC} — instead of the default {field: NUMBER, direction:
+	// ASC}. It is an OPT-IN: an options value that leaves it false emits the
+	// byte-identical default document, so no existing caller changes shape.
+	//
+	// CREATED_AT is deliberate rather than flipping NUMBER's direction.
+	// GitHub's IssueOrderField documents CREATED_AT, UPDATED_AT and COMMENTS
+	// (https://docs.github.com/en/graphql/reference/input-objects#issueorder);
+	// NUMBER is not among them, so the untouched default ordering has never
+	// been exercised against live GitHub (#2230 states nothing in production
+	// calls this yet). This opt-in therefore uses a DOCUMENTED member, which is
+	// also the semantics a bounded intake window actually wants: the most
+	// recently filed issues, not the highest-numbered ones.
+	Newest bool
+	// MaxItems bounds the enumeration to at most that many issues — a
+	// PAGINATION PUSH-DOWN, not a post-filter: the page size is narrowed to
+	// MaxItems when that is smaller than a full page, and the cursor walk stops
+	// as soon as MaxItems nodes have accumulated, so the extra round trips are
+	// never paid. 0 (the default) means no cap and preserves the existing
+	// paginate-to-exhaustion loop with its fail-closed listRepoIssuesMaxPages
+	// branch intact.
+	//
+	// A capped enumeration is a WINDOW, not a complete set: the caller is
+	// asking for a bounded read and gets exactly that. The uncapped path keeps
+	// the complete-or-error contract; a capped one cannot, which is why the cap
+	// is opt-in and why workmgmt reports a bounded page as Truncated.
+	MaxItems int
 }
 
 // listRepoIssuesFirst is the repository-issues connection page size (#2230),
@@ -961,6 +988,14 @@ func (e *BoardMembershipUndecidableError) Error() string {
 // page) and ListRepoIssues fails closed with a typed
 // *BoardMembershipUndecidableError rather than reporting OnBoard=false.
 //
+// opts.Newest and opts.MaxItems are the BOUNDED-WINDOW opt-ins: newest-first
+// ordering (CREATED_AT/DESC) and a pagination push-down that stops the cursor
+// walk at MaxItems. Both default to the pre-existing behaviour byte-for-byte —
+// an options value that sets neither emits the identical document and runs the
+// identical paginate-to-exhaustion, fail-closed loop. A capped read is a
+// WINDOW and is not subject to the complete-or-error contract above; the
+// caller asked for a bound and gets one.
+//
 // Honors the user-owned-projects token opt-in (WithProjectsToken) like the
 // other GraphQL calls, since it routes through doGraphQL. Returns ErrForbidden
 // on auth issues, ErrValidation when GraphQL reports an application error.
@@ -973,12 +1008,12 @@ func (c *Client) ListRepoIssues(ctx context.Context, scope forge.CredentialScope
 		return nil, errors.New("githubclient: repo owner and name required")
 	}
 	wantBoard := opts.WantBoardStatus && opts.ProjectID != ""
-	query := listRepoIssuesQuery(wantBoard)
+	query := listRepoIssuesQuery(wantBoard, opts.Newest)
 
 	vars := map[string]any{
 		"owner":       repo.Owner,
 		"name":        repo.Name,
-		"first":       listRepoIssuesFirst,
+		"first":       listRepoIssuesPageSize(opts.MaxItems),
 		"labelsFirst": listSubIssuesLabelsFirst,
 		// A nil variable is GraphQL null, which both `states:` and `labels:`
 		// treat as "no filter" — so an unfiltered call needs no separate query.
@@ -1077,6 +1112,15 @@ func (c *Client) ListRepoIssues(ctx context.Context, scope forge.CredentialScope
 				}
 			}
 			results = append(results, issue)
+			// The MaxItems window is CLOSED here, inside the node loop, rather
+			// than by truncating a fully-walked slice: stopping at the cap is
+			// what makes the option a pagination push-down (the remaining
+			// cursor pages are never fetched) instead of a cosmetic post-slice.
+			// Returning at exactly the cap also means the result is never
+			// longer than MaxItems, so no separate truncation is needed.
+			if opts.MaxItems > 0 && len(results) >= opts.MaxItems {
+				return results, nil
+			}
 		}
 		if !data.Repository.Issues.PageInfo.HasNextPage {
 			break
@@ -1096,12 +1140,38 @@ func (c *Client) ListRepoIssues(ctx context.Context, scope forge.CredentialScope
 // work-management provider passes to ProjectFields/ProjectItemStatus.
 const statusFieldNameGraphQL = "Status"
 
+// listRepoIssuesOrderDefault / listRepoIssuesOrderNewest are the two orderBy
+// clauses the enumeration document can carry. The default is left EXACTLY as
+// it was (#2230) — changing it would change every existing caller's walk order
+// — and the newest-first opt-in uses CREATED_AT/DESC, a documented
+// IssueOrderField member and the recency semantics a bounded window wants.
+const (
+	listRepoIssuesOrderDefault = "orderBy: {field: NUMBER, direction: ASC}"
+	listRepoIssuesOrderNewest  = "orderBy: {field: CREATED_AT, direction: DESC}"
+)
+
+// listRepoIssuesPageSize narrows the connection page size to the caller's
+// MaxItems cap when that is smaller than a full page, so a small bounded
+// window does not fetch (and decode) 100 nodes to keep 10. An uncapped call
+// (maxItems 0) and any cap at or above the page size both request full pages,
+// unchanged.
+func listRepoIssuesPageSize(maxItems int) int {
+	if maxItems > 0 && maxItems < listRepoIssuesFirst {
+		return maxItems
+	}
+	return listRepoIssuesFirst
+}
+
 // listRepoIssuesQuery composes the enumeration document. The per-issue
 // projectItems selection is included ONLY when board status was requested, so
 // a caller that does not need it pays neither the extra selection nor the
 // Projects (v2) permission surface it implies.
-func listRepoIssuesQuery(wantBoard bool) string {
+func listRepoIssuesQuery(wantBoard, newest bool) string {
 	head := `query ListRepoIssues($owner: String!, $name: String!, $first: Int!, $after: String, $labelsFirst: Int!, $states: [IssueState!], $labels: [String!]`
+	order := listRepoIssuesOrderDefault
+	if newest {
+		order = listRepoIssuesOrderNewest
+	}
 	boardSelection := ""
 	if wantBoard {
 		head += `, $projectItemsFirst: Int!, $field: String!`
@@ -1117,7 +1187,7 @@ func listRepoIssuesQuery(wantBoard bool) string {
 	}
 	return head + `) {
   repository(owner: $owner, name: $name) {
-    issues(first: $first, after: $after, states: $states, labels: $labels, orderBy: {field: NUMBER, direction: ASC}) {
+    issues(first: $first, after: $after, states: $states, labels: $labels, ` + order + `) {
       pageInfo {
         hasNextPage
         endCursor

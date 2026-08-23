@@ -209,3 +209,73 @@ func TestCanonicalStateForOption(t *testing.T) {
 		}
 	}
 }
+
+// readerBoundedProvider is a reader whose ListWorkItems HONOURS the bounded
+// window: it truncates its corpus at MaxScanned and reports Truncated when it
+// did. It is a second double rather than a flag on readerCapableProvider so
+// the bounded-window contract reads on its own.
+type readerBoundedProvider struct {
+	name   string
+	corpus []WorkItemRecord
+	gotReq ListWorkItemsRequest
+}
+
+func (f *readerBoundedProvider) Name() string { return f.name }
+
+func (f *readerBoundedProvider) File(_ context.Context, _ ProviderRequest) (*CreatedItem, error) {
+	return &CreatedItem{Provider: f.name, Number: 3, URL: "https://example/3"}, nil
+}
+
+func (f *readerBoundedProvider) ReadWorkItem(_ context.Context, _ ReadWorkItemRequest) (*WorkItemRecord, error) {
+	return &WorkItemRecord{Number: 2239}, nil
+}
+
+func (f *readerBoundedProvider) ListWorkItems(_ context.Context, req ListWorkItemsRequest) (*WorkItemPage, error) {
+	f.gotReq = req
+	items := f.corpus
+	truncated := false
+	if req.MaxScanned > 0 && len(items) > req.MaxScanned {
+		items, truncated = items[:req.MaxScanned], true
+	}
+	return &WorkItemPage{Items: items, Truncated: truncated}, nil
+}
+
+// TestReaderFor_CarriesTheBoundedWindowVocabulary pins the E54.7 / #2239
+// read-request vocabulary at the ABSTRACTION layer: the bounded-window fields
+// reach the provider through the ReaderFor chokepoint verbatim, and a cut
+// window comes back reported as such. Without Truncated a caller cannot tell
+// "nothing in the backlog" from "nothing in the part I paid to look at".
+func TestReaderFor_CarriesTheBoundedWindowVocabulary(t *testing.T) {
+	fp := &readerBoundedProvider{name: "reader-bounded"}
+	for i := 1; i <= 10; i++ {
+		fp.corpus = append(fp.corpus, WorkItemRecord{Number: i})
+	}
+	Register(fp)
+	r, err := ReaderFor("reader-bounded")
+	if err != nil {
+		t.Fatalf("ReaderFor: %v", err)
+	}
+	page, err := r.ListWorkItems(context.Background(), ListWorkItemsRequest{Newest: true, MaxScanned: 4})
+	if err != nil {
+		t.Fatalf("ListWorkItems: %v", err)
+	}
+	if !fp.gotReq.Newest || fp.gotReq.MaxScanned != 4 {
+		t.Errorf("provider got newest %v / maxScanned %d, want true / 4", fp.gotReq.Newest, fp.gotReq.MaxScanned)
+	}
+	if len(page.Items) != 4 || !page.Truncated {
+		t.Errorf("page = %d items / truncated %v, want 4 items reported as a CUT window", len(page.Items), page.Truncated)
+	}
+
+	// The unbounded request is the pre-#2239 shape: no window, and a page that
+	// never claims truncation.
+	all, err := r.ListWorkItems(context.Background(), ListWorkItemsRequest{})
+	if err != nil {
+		t.Fatalf("ListWorkItems (unbounded): %v", err)
+	}
+	if fp.gotReq.Newest || fp.gotReq.MaxScanned != 0 {
+		t.Errorf("unbounded request carried newest %v / maxScanned %d, want the zero-value opt-outs", fp.gotReq.Newest, fp.gotReq.MaxScanned)
+	}
+	if len(all.Items) != 10 || all.Truncated {
+		t.Errorf("unbounded page = %d items / truncated %v, want the whole corpus and no truncation claim", len(all.Items), all.Truncated)
+	}
+}

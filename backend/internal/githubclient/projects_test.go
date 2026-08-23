@@ -1126,3 +1126,144 @@ func TestListRepoIssues_ProjectsTokenOptIn(t *testing.T) {
 		t.Errorf("Authorization = %q, want the static projects token", pf.gotGraphQLAuth)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Bounded newest-first window (E54.7 / #2239)
+// ---------------------------------------------------------------------------
+
+// repoIssuePage renders one repository.issues page holding `count` nodes
+// numbered from `from`, with the given hasNextPage flag.
+func repoIssuePage(from, count int, hasNext bool) string {
+	var nodes []string
+	for n := from; n < from+count; n++ {
+		nodes = append(nodes, repoIssueNode(n, ""))
+	}
+	return fmt.Sprintf(`{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":%t,"endCursor":"C%d"},"nodes":[%s]}}}}`,
+		hasNext, from, strings.Join(nodes, ","))
+}
+
+// TestListRepoIssues_DefaultOptionsKeepNumberAscAndFullWalk is the REGRESSION
+// PIN for the pre-#2239 behaviour: an options value that opts into neither
+// bounded-window field must emit the IDENTICAL document (NUMBER/ASC, never
+// CREATED_AT), request FULL pages, and walk to exhaustion. Both new options
+// are additive opt-ins, and this is what says so executably.
+func TestListRepoIssues_DefaultOptionsKeepNumberAscAndFullWalk(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListRepoIssues"] = func(vars map[string]any) string {
+		if after, _ := vars["after"].(string); after == "C1" {
+			return repoIssuePage(101, 20, false)
+		}
+		return repoIssuePage(1, 100, true)
+	}
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 120 {
+		t.Fatalf("issues = %d, want the full 120-issue walk (the default is unbounded)", len(issues))
+	}
+	q := pf.gotGraphQLQuery["ListRepoIssues"]
+	if !strings.Contains(q, listRepoIssuesOrderDefault) {
+		t.Errorf("default query must keep %q, got:\n%s", listRepoIssuesOrderDefault, q)
+	}
+	if strings.Contains(q, "CREATED_AT") {
+		t.Errorf("default query must NOT order by CREATED_AT (that is the Newest opt-in), got:\n%s", q)
+	}
+	if got := pf.gotGraphQLVars["ListRepoIssues"]["first"]; got != float64(listRepoIssuesFirst) {
+		t.Errorf("first = %v, want the full page size %d when uncapped", got, listRepoIssuesFirst)
+	}
+	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != 2 {
+		t.Errorf("requests = %d, want 2 (the cursor walk runs to exhaustion)", got)
+	}
+}
+
+// TestListRepoIssues_NewestUsesCreatedAtDesc pins the newest-first opt-in on
+// the emitted DOCUMENT, which is the only place the ordering is observable
+// from a fixture. CREATED_AT is asserted specifically, not merely "DESC": a
+// future edit that reintroduces NUMBER on this path (an undocumented
+// IssueOrderField member — see the option's doc comment) must fail here.
+func TestListRepoIssues_NewestUsesCreatedAtDesc(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = repoIssuePage(1, 2, false)
+	if _, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{Newest: true}); err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	q := pf.gotGraphQLQuery["ListRepoIssues"]
+	if !strings.Contains(q, listRepoIssuesOrderNewest) {
+		t.Errorf("newest-first query must order by %q, got:\n%s", listRepoIssuesOrderNewest, q)
+	}
+	if strings.Contains(q, "field: NUMBER") {
+		t.Errorf("newest-first query must NOT order by NUMBER (undocumented IssueOrderField member), got:\n%s", q)
+	}
+}
+
+// TestListRepoIssues_MaxItemsStopsPagination is the COUNTERFACTUAL VEHICLE for
+// the push-down: the fake serves an ENDLESS connection (hasNextPage is always
+// true), so the cap is the only thing that can stop the walk. Deleting the
+// MaxItems break turns this from "2 round trips, 150 issues" into the
+// 100-page fail-closed cap error, which reddens both assertions.
+func TestListRepoIssues_MaxItemsStopsPagination(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	page := 0
+	pf.graphqlByOpFn["ListRepoIssues"] = func(map[string]any) string {
+		page++
+		return repoIssuePage((page-1)*100+1, 100, true)
+	}
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{MaxItems: 150})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 150 {
+		t.Fatalf("issues = %d, want exactly the 150-item cap from an endless connection", len(issues))
+	}
+	if issues[149].Number != 150 {
+		t.Errorf("last issue = #%d, want #150 (the window is cut at the cap, mid-page)", issues[149].Number)
+	}
+	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != 2 {
+		t.Errorf("requests = %d, want 2 — the cap is a PAGINATION push-down, not a post-slice of a full walk", got)
+	}
+}
+
+// TestListRepoIssues_SmallMaxItemsNarrowsThePageSize proves the push-down
+// reaches the connection's `first` argument: a 10-item window must not fetch
+// (and decode) a 100-node page to keep 10.
+func TestListRepoIssues_SmallMaxItemsNarrowsThePageSize(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListRepoIssues"] = func(map[string]any) string { return repoIssuePage(1, 10, true) }
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{MaxItems: 10})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 10 {
+		t.Fatalf("issues = %d, want 10", len(issues))
+	}
+	if got := pf.gotGraphQLVars["ListRepoIssues"]["first"]; got != float64(10) {
+		t.Errorf("first = %v, want 10 (the cap narrows the page size below %d)", got, listRepoIssuesFirst)
+	}
+	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != 1 {
+		t.Errorf("requests = %d, want 1", got)
+	}
+}
+
+// TestListRepoIssues_MaxItemsAboveAvailableReturnsEverything proves the cap is
+// a ceiling, not a demand: a window wider than the backlog returns the whole
+// set, with NO extra round trip probing for items that do not exist.
+func TestListRepoIssues_MaxItemsAboveAvailableReturnsEverything(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListRepoIssues"] = repoIssuePage(1, 3, false)
+	issues, err := c.ListRepoIssues(context.Background(), forge.FromGitHubInstallationID(7),
+		RepoRef{Owner: "o", Name: "r"}, ListRepoIssuesOptions{MaxItems: 500, Newest: true})
+	if err != nil {
+		t.Fatalf("ListRepoIssues: %v", err)
+	}
+	if len(issues) != 3 {
+		t.Fatalf("issues = %d, want the whole 3-issue set", len(issues))
+	}
+	if got := pf.gotGraphQLReqs["ListRepoIssues"]; got != 1 {
+		t.Errorf("requests = %d, want 1 (no extra probe past the end of the connection)", got)
+	}
+}

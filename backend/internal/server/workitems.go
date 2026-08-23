@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/intakegroom"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
@@ -123,6 +124,15 @@ type workItemResponse struct {
 	// namespace is reported, never a rejection (fail-open). Both omitempty.
 	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
 	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
+	// Intake carries the ADVISORY intake-groom signals derived at filing time
+	// (#2239): duplicate candidates, a parent-epic suggestion and a provisional
+	// charter-anchored structural score. NOTHING was acted on — no item was
+	// closed, merged, relabelled or transitioned — and a `degraded` object
+	// carrying a `degrade_reason` is NORMAL, not an error: grooming is
+	// best-effort and never blocks or fails a filing. Omitempty, so a
+	// deployment whose hook produced nothing returns the pre-#2239 payload
+	// verbatim.
+	Intake *intakegroom.Signals `json:"intake,omitempty"`
 }
 
 // handleFileWorkItem implements POST /v0/work-items.
@@ -342,13 +352,13 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		target.Scope = scope
 	}
 
-	item, created, werr := s.applyAndFileWorkItem(r.Context(), filing, conv, target, owner, name)
+	item, created, werr, signals := s.applyAndFileWorkItemWithIntake(r.Context(), filing, conv, target, owner, name)
 	if werr != nil {
 		s.writeError(w, r, werr.status, werr.code, werr.msg, werr.details)
 		return
 	}
 
-	audited := s.auditWorkItemFiling(r, activeRun, *item, created, id.Subject)
+	audited := s.auditWorkItemFiling(r, activeRun, *item, created, id.Subject, signals)
 
 	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
 		Type:                   item.Type,
@@ -367,6 +377,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Audited:                audited,
 		DefaultedLabels:        item.Classification.DefaultedLabels,
 		MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
+		Intake:                 signals,
 	})
 }
 
@@ -399,6 +410,27 @@ type workItemError struct {
 // defer handler resolves its already-authorized run's installation into
 // the target itself.
 func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (*workmgmt.WorkItem, *workmgmt.CreatedItem, *workItemError) {
+	item, created, werr, _ := s.applyAndFileWorkItemWithIntake(ctx, filing, conv, target, owner, name)
+	return item, created, werr
+}
+
+// applyAndFileWorkItemWithIntake is applyAndFileWorkItem plus the intake
+// signals the hook derived (#2239). It exists as a separate entry point rather
+// than as a fourth return value on the shared core because FIVE call sites
+// share that core — handleFileWorkItem, defer-concern filing, live-validation
+// filing, refinement filing and split filing — and only the HTTP handler has
+// anywhere to put the signals. Widening the shared signature would have forced
+// a `_` at four sites that gain nothing from it, one of which (split_filing.go)
+// is outside this change's scope; the plan's inventory named only three.
+//
+// The grooming itself is NOT gated on which entry point was used: it happens
+// inside this function, which every path reaches, so defer-concern, refinement,
+// live-validation and split filings all carry the rendered advisory section on
+// their created issue exactly as an HTTP filing does. They simply do not read
+// the returned Signals back. That is the shared-core claim, and
+// TestDeferConcern_IntakeSignalsRenderedThroughSharedCore pins it behaviourally
+// through one of those secondary paths (binding approval condition L5).
+func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (*workmgmt.WorkItem, *workmgmt.CreatedItem, *workItemError, *intakegroom.Signals) {
 	// Auto-derive the {epic} title placeholder from the parent_epic relation
 	// (#1184) before Apply renders the title, so a child type need only supply
 	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
@@ -420,7 +452,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 		defer unlockChildNumber()
 	}
 	if werr != nil {
-		return nil, nil, werr
+		return nil, nil, werr, nil
 	}
 
 	// Derive the area:* label from the parent epic when the type wants an area
@@ -438,7 +470,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// filing closed here, and a provider without the capability falls through to
 	// Apply's existing #1265 fail-closed 422.
 	if werr := s.discoverExistingNumbers(ctx, &filing, conv, target); werr != nil {
-		return nil, nil, werr
+		return nil, nil, werr, nil
 	}
 
 	item, number, err := workmgmt.Apply(filing, conv)
@@ -456,13 +488,13 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 			return nil, nil, &workItemError{
 				status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 				msg: sem.Error(), details: details,
-			}
+			}, nil
 		}
 		return nil, nil, &workItemError{
 			status: http.StatusInternalServerError, code: "internal_error",
 			msg:     "could not apply work-management conventions",
 			details: map[string]any{"error": err.Error()},
-		}
+		}, nil
 	}
 
 	// The handler-derived area labels are system-added (the caller did not
@@ -494,14 +526,28 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 				status: http.StatusNotImplemented, code: "provider_unimplemented",
 				msg:     unk.Error(),
 				details: map[string]any{"provider": unk.ID, "registered": unk.Known},
-			}
+			}, nil
 		}
 		return nil, nil, &workItemError{
 			status: http.StatusInternalServerError, code: "internal_error",
 			msg:     "could not resolve work-item provider",
 			details: map[string]any{"error": err.Error()},
-		}
+		}, nil
 	}
+
+	// INTAKE GROOM (#2239 / E54.7). Runs AFTER Apply — so it evaluates the
+	// rendered title, labels and body a reader will actually see — and BEFORE
+	// File, so the rendered advisory section lands on the created issue itself
+	// rather than needing a second write.
+	//
+	// runIntakeGroom cannot fail: every error mode inside it becomes a typed
+	// degrade reason and a WARN log. See intake_hook.go for WHY filing degrades
+	// here while the rest of E54 fails closed on a missing charter.
+	signals := s.runIntakeGroom(ctx, conv, target, intakeFilingFor(filing, item))
+	// RenderBody is a no-op when the signals carry no findings, so a degraded
+	// hook leaves the body byte-identical to what this core produced before
+	// #2239.
+	item.Body = intakegroom.RenderBody(item.Body, signals)
 
 	created, err := provider.File(ctx, workmgmt.ProviderRequest{
 		Item:   item,
@@ -513,7 +559,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 			status: http.StatusBadGateway, code: "work_item_filing_failed",
 			msg:     "provider could not file the work item",
 			details: map[string]any{"error": err.Error()},
-		}
+		}, nil
 	}
 
 	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
@@ -531,7 +577,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 		)
 	}
 
-	return &item, created, nil
+	return &item, created, nil, &signals
 }
 
 // discoverExistingNumbers fills filing.ExistingNumbers for a numbered type
@@ -900,11 +946,11 @@ func parseEpicRef(ref string) (int, error) {
 // missing audit repo, a terminal/absent run, or an append error never
 // fails the response — the function logs and returns false. Returns true
 // only when an entry was written.
-func (s *Server) auditWorkItemFiling(r *http.Request, activeRun *run.Run, item workmgmt.WorkItem, created *workmgmt.CreatedItem, subject string) bool {
+func (s *Server) auditWorkItemFiling(r *http.Request, activeRun *run.Run, item workmgmt.WorkItem, created *workmgmt.CreatedItem, subject string, signals *intakegroom.Signals) bool {
 	if s.cfg.AuditRepo == nil || activeRun == nil || activeRun.State.IsTerminal() {
 		return false
 	}
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"type":                     item.Type,
 		"title":                    item.Title,
 		"provider":                 created.Provider,
@@ -915,7 +961,16 @@ func (s *Server) auditWorkItemFiling(r *http.Request, activeRun *run.Run, item w
 		"status":                   created.Status,
 		"defaulted_labels":         item.Classification.DefaultedLabels,
 		"missing_label_namespaces": item.Classification.MissingLabelNamespaces,
-	})
+	}
+	// A COMPACT intake summary folded into the EXISTING work_item_filed
+	// payload (#2239) — deliberately not a new audit category, so the
+	// issue-comment surface inventory is untouched. It records what the
+	// advisory hook saw, which is what makes a later "why was this filed as a
+	// duplicate?" answerable from the chain.
+	if signals != nil {
+		fields["intake"] = intakeAuditSummary(*signals)
+	}
+	payload, _ := json.Marshal(fields)
 	kind := actorKindForSubject(subject)
 	subj := subject
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
