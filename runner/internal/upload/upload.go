@@ -1111,12 +1111,92 @@ func TruncateReason(s string, max int) string {
 	return s[:head] + marker + s[len(s)-tail:]
 }
 
+// agentOutputInvalidCodes is the set of backend 400 error codes that mean
+// "the AGENT's output is bad", as opposed to "the request was bad". Every one
+// of them is already a category-B stage failure on the backend side — the
+// handler transitions the stage to failed-B BEFORE writing the 400 — so the
+// runner must agree, or the two halves of one event disagree on the category.
+//
+// Sources (backend): plan_invalid and clarification_request_invalid in
+// backend/internal/server/plan.go; grooming_report_invalid and
+// grooming_report_stage_invalid in backend/internal/server/grooming_report.go.
+// All four arrive on the SAME endpoint — POST /v0/runs/{run_id}/plan routes by
+// the artifact's top-level "kind" discriminator (#2833).
+//
+// This is a NAMED list, not a blanket: an unlisted 400 (validation_failed on a
+// malformed path or query) stays a generic error and maps to category-C.
+var agentOutputInvalidCodes = map[string]struct{}{
+	"plan_invalid":                  {},
+	"grooming_report_invalid":       {},
+	"grooming_report_stage_invalid": {},
+	"clarification_request_invalid": {},
+}
+
+// isAgentOutputInvalid reports whether a 400 response body names one of the
+// agent-output-invalid codes.
+//
+// It EXACT-MATCHES the code out of the backend's error envelope
+// ({"error":{"code":…,"message":…}}, backend/internal/server/errors.go) rather
+// than substring-scanning the whole body, because `message` is FREE TEXT: a
+// validation_failed response whose human-readable message merely mentions
+// plan_invalid would otherwise be misclassified permanent-B and never retried.
+//
+// FALLBACK: when the body does not decode into that envelope with a non-empty
+// code — a truncated body, a proxy-injected error page, or an older/flat
+// {"code":…} shape — it degrades to the historical substring check. The
+// fallback exists so a classification never gets WEAKER than it was before
+// exact-match landed: losing category-B on a genuinely-invalid artifact would
+// turn a permanent failure into a retry loop against a backend that already
+// failed the stage. It is the strictly-less-precise path and only runs when
+// the precise one has nothing to read.
+func isAgentOutputInvalid(body string) bool {
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err == nil && env.Error.Code != "" {
+		_, ok := agentOutputInvalidCodes[env.Error.Code]
+		return ok
+	}
+	for code := range agentOutputInvalidCodes {
+		if strings.Contains(body, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyBodyLimit bounds the body read used for error-code classification.
+// It is larger than briefBodyLimit because the envelope's `message` and
+// `details` sit between the code and the closing brace: a 256-byte read
+// truncates a verbose rejection mid-JSON, which would fail the decode and push
+// every such response onto the substring fallback.
+const classifyBodyLimit = 8 << 10
+
+// briefBodyLimit is the excerpt length surfaced in client error messages.
+const briefBodyLimit = 256
+
+// readClassifiableBody reads up to classifyBodyLimit bytes of resp.Body and
+// returns (brief, full). brief is the trimmed first briefBodyLimit bytes —
+// byte-identical to readBriefBody's output, so error-message shape is
+// unchanged. full is the larger read, used ONLY for decoding the error
+// envelope. Caller is responsible for closing resp.Body.
+func readClassifiableBody(resp *http.Response) (brief, full string) {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, classifyBodyLimit))
+	head := b
+	if len(head) > briefBodyLimit {
+		head = head[:briefBodyLimit]
+	}
+	return string(bytes.TrimSpace(head)), string(bytes.TrimSpace(b))
+}
+
 // readBriefBody returns the first 256 bytes of resp.Body as a
 // string, useful for surfacing backend error envelopes in client
 // errors without unbounded log lines. Caller is responsible for
 // closing resp.Body.
 func readBriefBody(resp *http.Response) string {
-	r := io.LimitReader(resp.Body, 256)
+	r := io.LimitReader(resp.Body, briefBodyLimit)
 	b, _ := io.ReadAll(r)
 	return string(bytes.TrimSpace(b))
 }
@@ -1323,14 +1403,16 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 			}
 			return &out, nil
 		case resp.StatusCode == http.StatusBadRequest:
-			detail := readBriefBody(resp)
+			brief, full := readClassifiableBody(resp)
 			_ = resp.Body.Close()
-			// 400s are permanent; the body distinguishes plan_invalid
-			// (schema fail) from validation_failed (path/query issues).
-			if strings.Contains(detail, "plan_invalid") {
-				return nil, fmt.Errorf("%w: %s", ErrPlanInvalid, detail)
+			// 400s are permanent; the body's error CODE distinguishes an
+			// agent-output-invalid rejection (ErrPlanInvalid → runner
+			// category-B) from everything else (validation_failed on a
+			// path/query issue and friends → category-C).
+			if isAgentOutputInvalid(full) {
+				return nil, fmt.Errorf("%w: %s", ErrPlanInvalid, brief)
 			}
-			return nil, fmt.Errorf("upload: ship plan: 400: %s", detail)
+			return nil, fmt.Errorf("upload: ship plan: 400: %s", brief)
 		case resp.StatusCode == http.StatusUnauthorized:
 			detail := readBriefBody(resp)
 			_ = resp.Body.Close()

@@ -21,6 +21,40 @@ versa. There is exactly one owner of that routing —
 `plan.DetectArtifactKind` / `plan.ValidateArtifact` — and this artifact is its
 second additive sibling, following `clarification_request`.
 
+## Runner routing
+
+The runner does **not** validate a grooming report — it has no embedded copy of
+this schema, by design (see the embedded-mirror line above and the explicit
+routing comment in `scripts/sync-schemas`). The `runner` module declares no
+dependency on the backend module, so `plan.DetectArtifactKind` /
+`plan.ValidateArtifact` are unreachable from it; mirroring the schema plus the
+semantic rules across that module wall is exactly what the no-mirror split
+refuses.
+
+What the runner does instead is **recognize the kind and get out of the way**
+(#2833). `detectPlanSibling` in `runner/cmd/fishhawk-runner/main.go` peeks the
+top-level `kind` against `planSiblingKinds` — the runner-side mirror of
+`plan.ArtifactKindClarificationRequest` / `plan.ArtifactKindGroomingReport` —
+and on a hit:
+
+- the recognized sibling **wins over structured-output adoption**, so a plan
+  captured from the agent's `structured_output` never overwrites the report on
+  disk before it is uploaded;
+- `plan.TryCoerce` and `plan.Validate` are **skipped**, so the report is neither
+  rewritten by standard_v1-shaped coercion nor demoted to category-B for failing
+  a schema it was never meant to satisfy;
+- the clarification-only property stripper stays **kind-gated** — its allowlists
+  are clarification-shaped and would strip every legitimate grooming property.
+
+`uploadPlan` then re-reads the file and ships those exact bytes to
+`POST /v0/runs/{run_id}/plan`, where `handleGroomingReport` validates them. On a
+400 carrying `grooming_report_invalid` or `grooming_report_stage_invalid` the
+runner maps the failure to **category-B**, matching the category the backend
+handler has already recorded on the stage.
+
+A THIRD sibling kind is one entry in `planSiblingKinds` plus the backend's own
+routing — a known, documented residual of the module wall, not a solved problem.
+
 ## Top-level fields
 
 | Field | Required | Notes |
