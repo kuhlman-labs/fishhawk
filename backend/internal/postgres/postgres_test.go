@@ -10,13 +10,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // startContainer spins up a throwaway Postgres 16 container and
@@ -1152,8 +1155,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0073 (#2235, E54.3; widens artifacts_kind_check to admit
-	// 'grooming_report') is now the latest migration. Roll it back FIRST, then
+	// 0075 (#2826, E54.22; widens runs_trigger_source_check to admit
+	// 'on_demand') is now the latest migration. Roll it back FIRST, then 0074
+	// (#2238, E54.6; campaign_items.queue_position + campaigns.grooming_source),
+	// then 0073 (#2235, E54.3; widens artifacts_kind_check to admit
+	// 'grooming_report'), then
 	// 0072 (#2744, E67.69; adds stages.dispatched_at + its transition trigger),
 	// then 0071 (#2527, E48.87;
 	// adds campaigns.working_dir), then 0070 (#2541, E48.96; adds the
@@ -1169,7 +1175,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// audit_entries_merge_verdict_recorded_once_idx partial unique index,
 	// index-only), then 0061 (users.provider), so this test's historical
 	// assertions, which pin 0060 as the one-step-rollback target, stay valid.
-	// 0073's own up/down reversal is pinned by
+	// 0075's own up/down reversal is pinned by
+	// TestMigrateDown_RunsTriggerSourceOnDemandReversal, 0073's by
 	// TestMigrateDown_ArtifactGroomingReportReversal, 0072's by
 	// TestMigrateDown_StagesDispatchedAtReversal, 0071's by
 	// TestMigrateDown_CampaignsWorkingDirReversal, 0070's by
@@ -1184,7 +1191,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2065,11 +2075,16 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 	// (oauth_clients.provider drop), 0063 (the OAuth AS storage tables) and 0062
 	// (the index-only merge-verdict uniqueness) first so the next one-step down
 	// targets 0061 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2185,11 +2200,16 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir), 0064
 	// (oauth_clients.provider drop) and 0063 (the OAuth AS storage tables) first
 	// so the next one-step down targets 0062 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2294,11 +2314,16 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 
 	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
 	// first so the next one-step down targets 0067 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2393,11 +2418,16 @@ func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
 
 	// One MigrateDown drops exactly that index (index-only rollback); 0068 is
 	// the head, so no preparatory step-downs are needed.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2468,7 +2498,10 @@ func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeyless
 	// absent, and phase 2 re-applies nothing over the seeded rows: the test
 	// would still PASS while asserting nothing.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2644,11 +2677,16 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir) and 0064
 	// (oauth_clients.provider drop) first so the next one-step down targets
 	// 0063 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2809,11 +2847,16 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes) and 0065 (runs.working_dir) first so the
 	// next one-step down targets 0064 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2904,11 +2947,16 @@ func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
 	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
 	// and 0067 (the index-only parent-awaiting-child uniqueness) first so the
 	// next one-step down targets 0066 — the reversal under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -2982,11 +3030,16 @@ func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes) first so the next one-step down targets
 	// 0065 — the reversal under test. Exactly one MigrateDown then drops the
 	// column.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3075,7 +3128,10 @@ func TestMigrateDown_StagesProgressReversal(t *testing.T) {
 	// 0072 (#2744) and 0071 (#2527) sit above 0070; roll them back first so the
 	// next one-step down targets 0070 — the reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3104,6 +3160,226 @@ func TestMigrateDown_StagesProgressReversal(t *testing.T) {
 	}
 }
 
+// runsTriggerSourceCheckDefSQL reads the runs trigger_source CHECK expression,
+// whose admitted-value set 0075 (#2826) widens with 'on_demand'.
+const runsTriggerSourceCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+	  WHERE conname = 'runs_trigger_source_check'`
+
+// TestMigrateDown_RunsTriggerSourceOnDemandReversal pins 0075 (#2826, E54.22)
+// in BOTH directions, and is the ONLY place the domain constant
+// run.TriggerOnDemand and the storage CHECK constraint are proven to agree
+// against a real PostgreSQL.
+//
+// The ladder is written to model the operator action 0075's down migration
+// REQUIRES rather than to dodge it (approval condition C1): re-adding the
+// narrower CHECK VALIDATES existing rows, so a live on_demand run makes the
+// rollback fail with SQLSTATE 23514. The sequence is therefore:
+//
+//  1. after MigrateUp, an on_demand run INSERT SUCCEEDS;
+//  2. a rollback attempted WHILE that row is live is REFUSED with SQLSTATE
+//     23514, and the widened constraint survives the refusal intact — the two
+//     guarantees the down migration's header makes, neither of which a ladder
+//     that clears the rows first would establish;
+//  3. DELETE the on_demand rows — exactly what the down migration's header
+//     tells an operator to do, so the delete is honest, not a workaround;
+//  4. roll 0075 back;
+//  5. the same on_demand INSERT is now REJECTED (23514) while a 'cli' INSERT
+//     still succeeds — proving the constraint was RESTORED, not just dropped
+//     off the on_demand value.
+//
+// The 'nonsense' row is rejected in BOTH states. That assertion is what
+// distinguishes RELAXED from DROPPED, and it is the counterfactual target for
+// the up migration's re-ADD: delete the ADD CONSTRAINT from
+// 0075_...up.sql and the post-MigrateUp 'nonsense' assertion goes RED, because
+// a table with no constraint admits every string.
+//
+// 0075 is the latest migration, so no preparatory step-downs.
+func TestMigrateDown_RunsTriggerSourceOnDemandReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	// An ABSENT constraint reads as the empty string rather than a fatal: a
+	// migration that DROPped without re-ADDing must fail on the BEHAVIOURAL
+	// assertions below ('nonsense' is no longer rejected), which is what
+	// distinguishes relaxed from dropped — not on a query error that would
+	// mask which property broke.
+	constraintDef := func() string {
+		var def string
+		switch err := pool.QueryRow(ctx, runsTriggerSourceCheckDefSQL).Scan(&def); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ""
+		case err != nil:
+			t.Fatalf("query runs_trigger_source_check constraint def: %v", err)
+		}
+		return def
+	}
+
+	// schemaVersion reads golang-migrate's bookkeeping row so a REFUSED
+	// migration step's dirty flag can be restored afterwards (the `migrate
+	// force` an operator runs after a failed step).
+	schemaVersion := func() (int64, bool) {
+		t.Helper()
+		var version int64
+		var dirty bool
+		if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty); err != nil {
+			t.Fatalf("read schema_migrations: %v", err)
+		}
+		return version, dirty
+	}
+
+	// A real run row is what the CHECK actually governs, so every assertion
+	// below INSERTs one rather than grepping the rendered constraint text: a
+	// CHECK that merely MENTIONS 'on_demand' (in a negated or misspelled
+	// clause) would satisfy a text search while still rejecting the row the
+	// product must write.
+	insertRun := func(triggerSource string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+			 VALUES ($1, 'kuhlman-labs/fishhawk', 'backlog_grooming', 'sha', $2, 'pending', 'local')`,
+			uuid.New(), triggerSource)
+		return err
+	}
+	// rejectedBy reports the SQLSTATE/constraint of a refused insert. A
+	// SUCCESSFUL insert is the interesting failure — it means no constraint
+	// refused the row — so it is reported as such rather than as a type
+	// assertion mishap.
+	rejectedBy := func(err error) *pgconn.PgError {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("insert SUCCEEDED, want a CHECK-constraint rejection — the constraint was dropped rather than relaxed/restored")
+		}
+		var checkErr *pgconn.PgError
+		if !errors.As(err, &checkErr) {
+			t.Fatalf("insert returned %v, want a *pgconn.PgError from the CHECK constraint", err)
+		}
+		return checkErr
+	}
+
+	// ---- state 1: 0075 applied ----
+	if def := constraintDef(); !strings.Contains(def, "on_demand") {
+		t.Errorf("runs_trigger_source_check after MigrateUp does not admit 'on_demand': %s", def)
+	}
+	if err := insertRun(string(run.TriggerOnDemand)); err != nil {
+		t.Fatalf("insert trigger_source=%q after MigrateUp: %v — 0075 must make the row insertable, not merely name it in the CHECK",
+			run.TriggerOnDemand, err)
+	}
+	// RELAXED, NOT DROPPED: an unrecognized source must still be refused while
+	// the widened constraint is in force. This is the assertion the up
+	// migration's re-ADD is the control for.
+	if e := rejectedBy(insertRun("nonsense")); e.Code != "23514" || e.ConstraintName != "runs_trigger_source_check" {
+		t.Errorf("insert trigger_source='nonsense' after MigrateUp: SQLSTATE %s constraint %q, want 23514 runs_trigger_source_check — 0075 must RELAX the CHECK, not drop it",
+			e.Code, e.ConstraintName)
+	}
+	// The three v0 sources are undisturbed by the widening.
+	for _, ts := range []run.TriggerSource{run.TriggerGitHubIssue, run.TriggerCLI, run.TriggerUI} {
+		if err := insertRun(string(ts)); err != nil {
+			t.Errorf("insert trigger_source=%q after MigrateUp: %v — 0075 must disturb no pre-existing member", ts, err)
+		}
+	}
+
+	// ---- the down migration's DOCUMENTED refusal, exercised ----
+	// 0075's down header promises two things about a rollback attempted while
+	// an on_demand run is live: it FAILS LOUDLY (rather than deleting run
+	// history to satisfy the narrower CHECK), and it fails ATOMICALLY (the
+	// widened constraint survives, rather than the DROP landing without the
+	// re-ADD and leaving the table unconstrained). A ladder that clears the
+	// rows first establishes NEITHER, so exercise the path here while the
+	// state-1 on_demand row is still live.
+	cleanVersion, cleanDirty := schemaVersion()
+	downErr := postgres.MigrateDown(url)
+	if downErr == nil {
+		t.Fatalf("MigrateDown with a live on_demand run SUCCEEDED, want a refusal — 0075's down re-adds a CHECK that row violates, and its header promises the rollback fails rather than destroying run history")
+	}
+	// Error IDENTITY, not merely non-nil: a dirty-version complaint, a
+	// connection blip or a missing-constraint error would each also be
+	// non-nil while proving nothing about the documented guarantee. The
+	// refusal must be PostgreSQL validating the re-added CHECK (23514).
+	// golang-migrate's database.Error carries no Unwrap, so reach its
+	// OrigErr explicitly instead of errors.As-ing straight to *pgconn.PgError.
+	var migrateErr database.Error
+	if !errors.As(downErr, &migrateErr) {
+		t.Fatalf("MigrateDown returned %v, want a golang-migrate database.Error carrying the CHECK violation", downErr)
+	}
+	var downCheckErr *pgconn.PgError
+	if !errors.As(migrateErr.OrigErr, &downCheckErr) {
+		t.Fatalf("MigrateDown error %v carries OrigErr %v, want a *pgconn.PgError", downErr, migrateErr.OrigErr)
+	}
+	if downCheckErr.Code != "23514" || !strings.Contains(downCheckErr.Message, "runs_trigger_source_check") {
+		t.Errorf("MigrateDown with a live on_demand run failed with SQLSTATE %s (%s), want 23514 naming runs_trigger_source_check — the refusal must be the narrower CHECK validating existing rows, not an unrelated failure",
+			downCheckErr.Code, downCheckErr.Message)
+	}
+	// ATOMIC: the refused rollback left the WIDENED constraint in force. Read
+	// the STATE after the call returns, not just the error — a down migration
+	// whose DROP committed and whose re-ADD failed returns a byte-identical
+	// error while leaving the table admitting every string.
+	if def := constraintDef(); !strings.Contains(def, "on_demand") {
+		t.Errorf("runs_trigger_source_check after the REFUSED rollback: %q — the failed down migration must leave the widened constraint intact", def)
+	}
+	if err := insertRun(string(run.TriggerOnDemand)); err != nil {
+		t.Errorf("insert trigger_source=%q after the REFUSED rollback: %v — a refused rollback must leave on_demand still accepted", run.TriggerOnDemand, err)
+	}
+	if e := rejectedBy(insertRun("nonsense")); e.Code != "23514" || e.ConstraintName != "runs_trigger_source_check" {
+		t.Errorf("insert trigger_source='nonsense' after the REFUSED rollback: SQLSTATE %s constraint %q, want 23514 runs_trigger_source_check — the failed down migration must not have left the table unconstrained",
+			e.Code, e.ConstraintName)
+	}
+	// golang-migrate marks the version dirty BEFORE running a step, so the
+	// refused rollback leaves dirty=true and every later migrate call refuses
+	// with ErrDirty before touching SQL. Restoring the pre-attempt row is
+	// exactly the `migrate force <version>` an operator runs after a failed
+	// step, and it is honest here rather than a fudge: the DDL itself rolled
+	// back, so 0075 genuinely is still the applied version.
+	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET version = $1, dirty = $2`, cleanVersion, cleanDirty); err != nil {
+		t.Fatalf("force schema_migrations back to version=%d dirty=%v after the refused rollback: %v", cleanVersion, cleanDirty, err)
+	}
+
+	// ---- the operator action the down migration requires ----
+	// 0075's down re-adds a CHECK these rows would violate, and its header
+	// states plainly that the rollback FAILS LOUDLY rather than deleting run
+	// history — as just demonstrated. Deleting the rows here models that
+	// operator decision explicitly. Two rows: the state-1 seed and the one the
+	// atomicity probe above inserted through the surviving widened constraint.
+	tag, err := pool.Exec(ctx, `DELETE FROM runs WHERE trigger_source = 'on_demand'`)
+	if err != nil {
+		t.Fatalf("clear on_demand runs before rollback: %v", err)
+	}
+	if tag.RowsAffected() != 2 {
+		t.Fatalf("DELETE removed %d on_demand runs, want 2 — both the seeded row and the atomicity probe's row must actually have persisted", tag.RowsAffected())
+	}
+
+	// ---- state 2: 0075 rolled back ----
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+
+	def := constraintDef()
+	if strings.Contains(def, "on_demand") {
+		t.Errorf("runs_trigger_source_check after rollback still admits 'on_demand': %s", def)
+	}
+	if e := rejectedBy(insertRun(string(run.TriggerOnDemand))); e.Code != "23514" || e.ConstraintName != "runs_trigger_source_check" {
+		t.Errorf("insert trigger_source=%q after rollback: SQLSTATE %s constraint %q, want 23514 runs_trigger_source_check",
+			run.TriggerOnDemand, e.Code, e.ConstraintName)
+	}
+	// RESTORED, not merely dropped-off-on_demand: 'cli' still inserts and
+	// 'nonsense' is still refused. Without the down migration's re-ADD the
+	// second of these would pass any string.
+	if err := insertRun(string(run.TriggerCLI)); err != nil {
+		t.Errorf("insert trigger_source=%q after rollback: %v — the rollback must restore the three-value set, not drop the constraint", run.TriggerCLI, err)
+	}
+	if e := rejectedBy(insertRun("nonsense")); e.Code != "23514" || e.ConstraintName != "runs_trigger_source_check" {
+		t.Errorf("insert trigger_source='nonsense' after rollback: SQLSTATE %s constraint %q, want 23514 runs_trigger_source_check",
+			e.Code, e.ConstraintName)
+	}
+}
+
 // artifactsKindCheckDefSQL reads the artifacts kind CHECK expression, whose
 // admitted-value set 0073 (#2235) widens with 'grooming_report'.
 const artifactsKindCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -3117,7 +3393,8 @@ const artifactsKindCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_const
 // exactly the five-value set, disturbing no earlier widening. This is also the
 // real-DB proof of the PostgreSQL constraint fact 0073 rests on: a CHECK
 // expression cannot be altered in place, so the migration DROPs and re-ADDs.
-// 0073 is the latest migration, so no preparatory step-downs.
+// 0074 (#2238) and 0075 (#2826) now sit above 0073, so two preparatory
+// step-downs are taken before the step under test.
 func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -3182,10 +3459,15 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 		t.Fatalf("clear grooming_report artifacts before rollback: %v", err)
 	}
 
-	// Two MigrateDown steps reach 0073: 0074 (campaign_items.queue_position +
-	// campaigns.grooming_source, E54.6 / #2238) is now the tip.
+	// Three MigrateDown steps reach 0073: 0075 (the runs_trigger_source_check
+	// widening, E54.22 / #2826) is now the tip, above 0074
+	// (campaign_items.queue_position + campaigns.grooming_source, E54.6 /
+	// #2238).
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3269,7 +3551,10 @@ func TestMigrateDown_StagesDispatchedAtReversal(t *testing.T) {
 
 	// Exactly one MigrateDown reverses 0072.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3313,7 +3598,10 @@ func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
 	// Step back to the pre-0072 schema: stages exists WITHOUT dispatched_at and
 	// WITHOUT the stamp trigger, so the seeded dispatched row predates the column.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3470,7 +3758,10 @@ func TestMigrateDown_ConcernNewEvidenceReversal(t *testing.T) {
 	// rollbacks are needed before the next one-step down targets 0069 — the
 	// reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3535,7 +3826,10 @@ func TestMigrateDown_CampaignsWorkingDirReversal(t *testing.T) {
 	}
 
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3582,7 +3876,10 @@ func TestMigrateUp_ConcernNewEvidenceDefaultsExistingRows(t *testing.T) {
 	// and are unrelated to review_concerns — then 0069, so review_concerns is in
 	// its pre-0069 shape.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3734,11 +4031,16 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -3891,11 +4193,16 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -4067,7 +4374,10 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// assertions here — now sit above them all, so the ladder starts three steps
 	// higher.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -4168,11 +4478,16 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0072 (#2744), 0071 (#2527), 0070 (#2541) and 0069 (#2353) all sit above
-	// this migration, so four extra rollbacks are needed before the ladder below
-	// reaches its target.
+	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
+	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// the ladder below steps down through each of them before reaching its
+	// target. The named steps in the t.Fatalf strings are the authority on the
+	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
@@ -4380,7 +4695,10 @@ func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T
 
 	// Exactly one MigrateDown reverses 0074 — it is the tip.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074): %v", err)
 	}
 
 	if n, _, _ := column("campaign_items", "queue_position"); n != 0 {

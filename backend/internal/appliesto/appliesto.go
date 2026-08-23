@@ -314,15 +314,36 @@ func normalizeTriggerForm(t spec.TriggerForm) spec.TriggerForm {
 }
 
 // TriggerFormForSource maps a run's trigger_source onto the predicate's
-// TriggerForm vocabulary. Every trigger source v0 mints — github_issue, cli,
-// ui — produces a code diff, so all three map to TriggerDiff. The non-diff
-// forms (scheduled, on_demand) have NO producer today: ADR-065's groomer and
-// ADR-053's incident intake will emit them. A predicate declaring only a
-// non-diff form therefore matches nothing yet, which is documented rather than
-// rejected because — unlike change_kind — `trigger: [diff, scheduled]` is
-// partially usable against real runs today.
+// TriggerForm vocabulary. The three ORIGIN sources — github_issue, cli, ui —
+// each produce a code diff, so all three map to TriggerDiff. `on_demand`
+// (E54.22 / #2826) maps to TriggerOnDemand: it HAS a producer, namely a run
+// an operator explicitly starts as on-demand, which is what makes ADR-065's
+// `applies_to: {trigger: [scheduled, on_demand]}` grooming declaration
+// selectable at all.
+//
+// `scheduled` still has NO producer — no scheduler exists to mint it — so a
+// predicate declaring only `scheduled` matches nothing. That is documented
+// rather than rejected because `trigger: [scheduled, on_demand]` IS usable
+// against real runs today.
+//
+// The DEFAULT arm returns TriggerDiff, so an unrecognized source stays
+// diff-shaped. That is the conservative reading: every existing predicate is
+// written against a diff-form change, and a source the server admitted but
+// this mapping does not know about must not silently become non-diff.
+//
+// MODELLING DEBT, RECORDED RATHER THAN HIDDEN (#2826): trigger_source now
+// carries BOTH origin (where the run came from) and routing form (what shape
+// of change it is). A separate `trigger_form` field would have kept the two
+// apart, at the cost of a run column, a CreateRunParams field, and a signature
+// change to AdmissionChange plus an edit at each of its four call sites. The
+// conflation was chosen because all four admission sites already funnel
+// through AdmissionChange(string(triggerSource), labels), so a new source
+// value reaches every one of them BY CONSTRUCTION rather than by four
+// parallel edits that could drift.
 func TriggerFormForSource(triggerSource string) spec.TriggerForm {
 	switch triggerSource {
+	case string(run.TriggerOnDemand):
+		return spec.TriggerOnDemand
 	case string(run.TriggerGitHubIssue), string(run.TriggerCLI), string(run.TriggerUI):
 		return spec.TriggerDiff
 	default:

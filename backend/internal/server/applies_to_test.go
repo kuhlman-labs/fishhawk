@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -324,6 +325,119 @@ func TestAppliesTo_M5b_NonDiffTriggerForms_RouteCorrectly(t *testing.T) {
 				t.Errorf("a %s-only predicate matched a diff change", tc.form)
 			}
 		})
+	}
+}
+
+// --- M5c: on_demand is the PRODUCER for the non-diff forms (E54.22 / #2826) ---
+//
+// This is the load-bearing CROSS-BOUNDARY test of the change: one call through
+// the REAL POST /v0/runs handler crosses request validation, the trigger-source
+// set, appliesto.AdmissionChange, the predicate matcher and the run
+// repository. Its paired negative (identical body, trigger_source=cli) is what
+// makes it a DISCRIMINATION test rather than one a match-everything change
+// would also satisfy. No applies_to_override is used — the point is that the
+// declaration now accepts the run on its own terms.
+
+func TestAppliesTo_M5c_OnDemandRun_AdmittedByNonDiffDeclaration(t *testing.T) {
+	const groomingGuard = "    applies_to:\n      trigger:\n        - scheduled\n        - on_demand\n"
+
+	for _, tc := range []struct {
+		name          string
+		triggerSource string
+		want          int
+	}{
+		{"on_demand is ADMITTED", string(run.TriggerOnDemand), http.StatusCreated},
+		{"cli is REFUSED", string(run.TriggerCLI), http.StatusUnprocessableEntity},
+		{"github_issue is REFUSED", string(run.TriggerGitHubIssue), http.StatusUnprocessableEntity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := newDelegationServer(t)
+			body := guardedRunBody(groomingGuard)
+			body["trigger_source"] = tc.triggerSource
+			// A cli run cannot carry an issue_context (that is the retained
+			// coupling control), so attach one only where the source is
+			// issue-anchored — otherwise this case would 400 on the coupling
+			// before ever reaching the applies_to gate under test.
+			if (&run.Run{TriggerSource: run.TriggerSource(tc.triggerSource)}).IsIssueAnchored() {
+				body["issue_context"] = issueCtx("bug")
+			}
+			w := createRunViaHandler(t, s, body)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d for trigger_source=%s:\n%s", w.Code, tc.want, tc.triggerSource, w.Body.String())
+			}
+			if tc.want != http.StatusCreated {
+				env := decodeErrorEnvelope(t, w)
+				if env.Code != "workflow_not_applicable" {
+					t.Errorf("error code = %q, want workflow_not_applicable", env.Code)
+				}
+				if !strings.Contains(env.Message, "trigger") {
+					t.Errorf("message %q must name the failed criterion (trigger)", env.Message)
+				}
+				return
+			}
+			var created runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+				t.Fatal(err)
+			}
+			if created.TriggerSource != string(run.TriggerOnDemand) {
+				t.Errorf("TriggerSource = %q, want on_demand", created.TriggerSource)
+			}
+		})
+	}
+}
+
+// TestAppliesTo_M5c_DiffDeclaration_StillRefusesOnDemand is AC3's converse
+// invariance: widening the vocabulary must not quietly re-route the existing
+// declarations. A `trigger: [diff]` workflow keeps admitting cli and
+// github_issue and now REFUSES an on_demand run.
+func TestAppliesTo_M5c_DiffDeclaration_StillRefusesOnDemand(t *testing.T) {
+	const diffGuard = "    applies_to:\n      trigger:\n        - diff\n"
+	for _, tc := range []struct {
+		triggerSource string
+		want          int
+	}{
+		{string(run.TriggerCLI), http.StatusCreated},
+		{string(run.TriggerGitHubIssue), http.StatusCreated},
+		{string(run.TriggerUI), http.StatusCreated},
+		{string(run.TriggerOnDemand), http.StatusUnprocessableEntity},
+	} {
+		t.Run(tc.triggerSource, func(t *testing.T) {
+			s, _, _, _ := newDelegationServer(t)
+			body := guardedRunBody(diffGuard)
+			body["trigger_source"] = tc.triggerSource
+			// ui/cli cannot carry an issue_context; only attach one where the
+			// source is issue-anchored.
+			if (&run.Run{TriggerSource: run.TriggerSource(tc.triggerSource)}).IsIssueAnchored() {
+				body["issue_context"] = issueCtx("bug")
+			}
+			w := createRunViaHandler(t, s, body)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d for trigger_source=%s:\n%s", w.Code, tc.want, tc.triggerSource, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestAppliesTo_M5c_AdmissionAndPlanGateAgreeOnOnDemand is AC4 asserted
+// BEHAVIOURALLY, on top of the structural guarantee that all four admission
+// sites call appliesto.AdmissionChange and only that function changed: the
+// plan gate's re-derivation from the persisted run row
+// (runAdmissionChange) must equal the admission-time derivation field for
+// field. A disagreement between the two — the drift the package comments warn
+// about — reddens here.
+func TestAppliesTo_M5c_AdmissionAndPlanGateAgreeOnOnDemand(t *testing.T) {
+	labels := []string{"chore", "dependencies"}
+	r := &run.Run{
+		TriggerSource: run.TriggerOnDemand,
+		IssueContext:  &run.IssueContext{Labels: labels},
+	}
+	fromRow := runAdmissionChange(r)
+	atAdmission := appliesto.AdmissionChange(string(run.TriggerOnDemand), labels)
+	if !reflect.DeepEqual(fromRow, atAdmission) {
+		t.Errorf("plan-gate re-derivation %+v != admission-time derivation %+v — the two enforcement points would reach different answers about one run", fromRow, atAdmission)
+	}
+	if fromRow.Trigger != spec.TriggerOnDemand {
+		t.Errorf("re-derived Trigger = %q, want on_demand", fromRow.Trigger)
 	}
 }
 

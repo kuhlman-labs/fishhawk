@@ -56,3 +56,72 @@ func TestRunnerKindGitLabCI_Membership(t *testing.T) {
 		t.Error("ValidRunnerKinds must not admit an out-of-set kind")
 	}
 }
+
+// TestValidTriggerSources_ClosedSet pins the accepted trigger-source set
+// (E54.22 / #2826) as the SINGLE source of truth every consumer renders from:
+// the server's POST /v0/runs membership check and its 400 message, and the MCP
+// start_run mirror. Both the CONTENTS and the ORDER are asserted, and the
+// LENGTH separately — so adding a fifth source without updating the consumers
+// that iterate this accessor reddens HERE first, next to the declaration,
+// rather than in a handler test a package away.
+func TestValidTriggerSources_ClosedSet(t *testing.T) {
+	want := []TriggerSource{TriggerGitHubIssue, TriggerCLI, TriggerUI, TriggerOnDemand}
+	got := ValidTriggerSources()
+	if len(got) != len(want) {
+		t.Fatalf("ValidTriggerSources() has %d members %v, want %d %v — a new member must be reflected in every consumer that renders this set",
+			len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ValidTriggerSources()[%d] = %q, want %q (declaration order is binding: the 400 message is rendered from it)", i, got[i], want[i])
+		}
+	}
+	// The wire values are forever: they are persisted on the runs row and
+	// enumerated by the runs_trigger_source_check CHECK constraint.
+	if string(TriggerOnDemand) != "on_demand" {
+		t.Errorf("TriggerOnDemand = %q, want on_demand", TriggerOnDemand)
+	}
+	// A caller must not be able to mutate the shared set through the accessor.
+	ValidTriggerSources()[0] = "mutated"
+	if ValidTriggerSources()[0] != TriggerGitHubIssue {
+		t.Error("ValidTriggerSources() must return a fresh slice; a caller mutated the set")
+	}
+	// `scheduled` is deliberately NOT a member: no producer could mint it, and
+	// an unmintable enum member is the dead surface #2826 exists to close.
+	for _, ts := range ValidTriggerSources() {
+		if ts == "scheduled" {
+			t.Error("ValidTriggerSources() must not admit 'scheduled' — no producer can mint it")
+		}
+	}
+}
+
+// TestRunIsIssueAnchored pins the source-level predicate the issue_context
+// coupling (server + MCP) and the six issuecomment suppression sites are
+// written against (E54.22 / #2826). github_issue and on_demand are anchored;
+// cli, ui, an unknown value and the empty value are not.
+func TestRunIsIssueAnchored(t *testing.T) {
+	cases := []struct {
+		source TriggerSource
+		want   bool
+	}{
+		{TriggerGitHubIssue, true},
+		{TriggerOnDemand, true},
+		{TriggerCLI, false},
+		{TriggerUI, false},
+		{TriggerSource("scheduled"), false},
+		{TriggerSource("nonsense"), false},
+		{TriggerSource(""), false},
+	}
+	for _, tc := range cases {
+		r := &Run{TriggerSource: tc.source}
+		if got := r.IsIssueAnchored(); got != tc.want {
+			t.Errorf("Run{TriggerSource: %q}.IsIssueAnchored() = %v, want %v", tc.source, got, tc.want)
+		}
+	}
+	// Nil-safe: the predicate is called on rows loaded from storage, and a
+	// nil receiver must not panic a notifier path into a 500.
+	var nilRun *Run
+	if nilRun.IsIssueAnchored() {
+		t.Error("(*Run)(nil).IsIssueAnchored() = true, want false")
+	}
+}
