@@ -214,6 +214,12 @@ type igReadProvider struct {
 	// deliberately cancellation-COOPERATIVE: see the L1 note on
 	// TestIntakeHook_WedgedReaderDegradesWithinBudget.
 	wedge time.Duration
+	// delay, when > 0, makes a SUCCEEDING ListWorkItems take at least that
+	// long before returning its window. It exists so the healthy-path latency
+	// test has a nontrivial, known floor to hold the reported DurationMS
+	// against — see TestIntakeHook_MeasuredAddedLatencyWithinBudget. It stays
+	// cancellation-cooperative so it can never outlive the hook's budget.
+	delay time.Duration
 
 	gotRequest workmgmt.ListWorkItemsRequest
 	listCalls  int
@@ -236,6 +242,7 @@ func (p *igReadProvider) ListWorkItems(ctx context.Context, req workmgmt.ListWor
 	p.listCalls++
 	p.gotRequest = req
 	panicOnList, wedge, listErr := p.panicOnList, p.wedge, p.listErr
+	delay := p.delay
 	items, truncated := p.items, p.truncated
 	p.mu.Unlock()
 
@@ -250,6 +257,13 @@ func (p *igReadProvider) ListWorkItems(ctx context.Context, req workmgmt.ListWor
 			// The wedge outlasted the hook's deadline. Reaching here means the
 			// deadline never fired, which is exactly the counterfactual RED.
 			return nil, errors.New("wedge elapsed without the hook's deadline firing")
+		}
+	}
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
 		}
 	}
 	if listErr != nil {
@@ -897,6 +911,19 @@ func TestIntakeHook_WedgedReaderDegradesWithinBudget(t *testing.T) {
 	if elapsed > elapsedBound {
 		t.Errorf("filing took %s, want <= %s (the hook's deadline did not bound the read)", elapsed, elapsedBound)
 	}
+	// The TIMED-OUT filing must report its latency too, and a degraded hook is
+	// the case where the operator most needs the number. The read ran until the
+	// hook's deadline fired, so the measurement cannot be shorter than that
+	// deadline — an assertion, not a log line, because a logged value pins
+	// nothing: deleting the DurationMS assignment leaves a zero here.
+	if got, want := resp.Intake.DurationMS, intakegroom.DefaultDeadline.Milliseconds(); got < want {
+		t.Errorf("duration_ms = %d, want >= %d — the read ran to the hook's deadline, so this is not a real measurement",
+			got, want)
+	}
+	if resp.Intake.DurationMS > elapsed.Milliseconds() {
+		t.Errorf("duration_ms = %d exceeds the whole request's %d ms; the reported value is not this hook's elapsed time",
+			resp.Intake.DurationMS, elapsed.Milliseconds())
+	}
 	// L4's TIMEOUT case: the reason must be logged, not only reported.
 	igAssertDegradeLogged(t, sink, intakegroom.DegradeReasonBudgetExceeded)
 	t.Logf("MEASURED wedged-reader filing: elapsed=%s reported duration_ms=%d bound=%s wedge=%s",
@@ -906,9 +933,24 @@ func TestIntakeHook_WedgedReaderDegradesWithinBudget(t *testing.T) {
 // TestIntakeHook_MeasuredAddedLatencyWithinBudget reports the healthy-path
 // added latency rather than merely asserting it (acceptance criterion 6). The
 // wedged half is measured and logged by the test above.
+//
+// The DurationMS assertion is LOAD-BEARING, which an earlier `>= 0` was not:
+// deleting runIntakeGroom's `sig.DurationMS = time.Since(start)` assignment
+// leaves the zero value, and a non-negativity check passes on zero — so the
+// blocking requirement that filing latency be MEASURED and reported was
+// pinned by nothing. The reader is therefore given a deliberately nontrivial
+// delay, and the reported measurement must be at least that long.
+//
+// igLatencyFloor is NOT timescale-derived on purpose, even though it competes
+// with the hook's deadline in the abstract. It is a FLOOR: a loaded runner can
+// only make the measured duration larger, never smaller, so scaling it would
+// buy no stability while pushing a healthy-path sleep toward the shipped 3s
+// budget the same test asserts the filing stays inside.
 func TestIntakeHook_MeasuredAddedLatencyWithinBudget(t *testing.T) {
+	const igLatencyFloor = 250 * time.Millisecond
+
 	p := igHealthyProvider(t)
-	_ = p
+	p.delay = igLatencyFloor
 	igInstallCharterConventions(t)
 	s := New(igCharterConfig(igCharterDoc, false))
 
@@ -931,11 +973,22 @@ func TestIntakeHook_MeasuredAddedLatencyWithinBudget(t *testing.T) {
 	if elapsed > bound {
 		t.Errorf("healthy filing took %s, want <= %s", elapsed, bound)
 	}
-	if resp.Intake.DurationMS < 0 {
-		t.Errorf("duration_ms = %d, want a non-negative measurement", resp.Intake.DurationMS)
+	// The hook's measurement window strictly CONTAINS the reader's delay
+	// (start is taken before the reader is dialed), and Go's timers never fire
+	// early, so the floor holds without slack. With the DurationMS assignment
+	// removed this reads 0 and the test goes red.
+	if got, want := resp.Intake.DurationMS, igLatencyFloor.Milliseconds(); got < want {
+		t.Errorf("duration_ms = %d, want >= %d — the reader was held for %s, so this is not a real measurement of the hook",
+			got, want, igLatencyFloor)
 	}
-	t.Logf("MEASURED healthy filing: elapsed=%s reported duration_ms=%d bound=%s",
-		elapsed, resp.Intake.DurationMS, bound)
+	// ...and the hook cannot have taken longer than the whole request did, so
+	// a measurement inflated from some other clock reads red here.
+	if resp.Intake.DurationMS > elapsed.Milliseconds() {
+		t.Errorf("duration_ms = %d exceeds the whole request's %d ms; the reported value is not this hook's elapsed time",
+			resp.Intake.DurationMS, elapsed.Milliseconds())
+	}
+	t.Logf("MEASURED healthy filing: elapsed=%s reported duration_ms=%d floor=%s bound=%s",
+		elapsed, resp.Intake.DurationMS, igLatencyFloor, bound)
 }
 
 // TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline is the assertion
