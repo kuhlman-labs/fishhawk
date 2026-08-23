@@ -39,11 +39,17 @@ package server
 // conditional bound the real one: the GitHub work-item reader reaches the forge
 // through githubclient, which builds every request with
 // http.NewRequestWithContext, and Go's HTTP client returns at a context
-// deadline. TestIntakeHook_ProductionReadPathIsCancellationCooperative pins
-// that property at the source level, and the wedged-reader tests use a
-// ctx-respecting fake — which honestly tests this plumbing rather than
-// pretending to test preemption. Option (b) (running the read on a goroutine
-// and selecting on the deadline) was the alternative; it was not taken because
+// deadline. TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline pins
+// that BEHAVIOURALLY — it drives the real reader through the real client
+// against a hanging HTTP server and asserts the server's own in-flight request
+// is cancelled at the caller's deadline, so a future edit that stopped
+// threading the context anywhere in that chain reddens it. (An earlier version
+// grepped githubclient for the http.NewRequestWithContext constructor, which
+// stayed green as long as any file in the package mentioned it and so could not
+// see that regression at all.) The wedged-reader tests use a ctx-respecting
+// fake — which honestly tests this plumbing rather than pretending to test
+// preemption. Option (b) (running the read on a goroutine and selecting on the
+// deadline) was the alternative; it was not taken because
 // it buys a hard bound only by leaking a goroutine of unbounded lifetime
 // holding an abandoned result, whose later panic would be unrecoverable by this
 // frame's recover() — a worse failure mode than the one it removes, on a path
@@ -207,8 +213,9 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		if err != nil {
 			detail = err.Error()
 		}
-		s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonCharterUnresolved, detail)
-		return intakegroom.Charter{Path: path}, intakegroom.DegradeReasonCharterUnresolved
+		reason := intakeCharterFailureReason(ctx, err)
+		s.logIntakeDegrade(ctx, target, reason, detail)
+		return intakegroom.Charter{Path: path}, reason
 	}
 
 	// The document read acts under the same credential scope the filing does,
@@ -217,8 +224,9 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 	if s.cfg.DocumentScope != nil {
 		resolved, serr := s.cfg.DocumentScope(ctx, repo)
 		if serr != nil {
-			s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonCharterUnresolved, serr.Error())
-			return intakegroom.Charter{Path: path}, intakegroom.DegradeReasonCharterUnresolved
+			reason := intakeCharterFailureReason(ctx, serr)
+			s.logIntakeDegrade(ctx, target, reason, serr.Error())
+			return intakegroom.Charter{Path: path}, reason
 		}
 		scope = resolved
 	}
@@ -237,10 +245,7 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		if err != nil {
 			detail = err.Error()
 		}
-		reason := intakegroom.DegradeReasonCharterUnresolved
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			reason = intakegroom.DegradeReasonBudgetExceeded
-		}
+		reason := intakeCharterFailureReason(ctx, err)
 		s.logIntakeDegrade(ctx, target, reason, detail)
 		return intakegroom.Charter{Path: path}, reason
 	}
@@ -258,6 +263,28 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		return charter, intakegroom.DegradeReasonCharterRubricUnparsed
 	}
 	return charter, ""
+}
+
+// intakeCharterFailureReason classifies ONE charter-seam failure into the
+// degrade reason that names its actual cause.
+//
+// Deadline expiry is BUDGET EXHAUSTION, not an unresolvable charter, and it
+// must classify the same way at EVERY seam the budget can expire in. The
+// candidate scan runs first and shares the same hook budget, so it can consume
+// most or all of it before the charter read starts — which means any of the
+// three charter seams (base-ref resolution, credential-scope resolution, the
+// document read) can be the one that observes the deadline, not just the
+// document read. Classifying two of them as charter_unresolved sends an
+// operator hunting a charter-path misconfiguration for what is a slow forge.
+//
+// It reads BOTH the returned error and ctx.Err(): a seam may wrap the
+// cancellation into an opaque error of its own, in which case the context is
+// the only honest witness that the budget is what ran out.
+func intakeCharterFailureReason(ctx context.Context, err error) intakegroom.DegradeReason {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return intakegroom.DegradeReasonBudgetExceeded
+	}
+	return intakegroom.DegradeReasonCharterUnresolved
 }
 
 // logIntakeDegrade WARN-logs one degradation. It is a single funnel so every

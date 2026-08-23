@@ -96,6 +96,14 @@ that it is would be a claim about a fiction. The hook slice's wedged-reader
 test therefore uses a ctx-respecting fake and tests the plumbing, which is
 what is actually there.
 
+Because the bound is conditional on that production property, the property is
+pinned behaviourally rather than asserted in prose:
+`TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline` drives the real
+`workmgmt/github` reader through the real `githubclient` against a hanging HTTP
+server and asserts the server's own in-flight request is cancelled at the
+caller's deadline. An edit that stopped threading the context anywhere in that
+chain reddens it.
+
 ## The recency approximation, and what it misses
 
 The duplicate window is the newest `DefaultMaxScanned` items by **creation**
