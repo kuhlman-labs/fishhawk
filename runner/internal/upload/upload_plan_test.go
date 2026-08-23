@@ -200,6 +200,314 @@ func TestShipPlan_PlanInvalid_400(t *testing.T) {
 	}
 }
 
+// TestShipPlan_AgentOutputInvalid_400 is the #2833 widening: every backend
+// error code that means "the AGENT's output is bad" maps to ErrPlanInvalid
+// (runner category-B), and every other 400 stays a generic error
+// (category-C). All four codes arrive on this one endpoint because POST
+// /v0/runs/{run_id}/plan routes by the artifact's "kind" discriminator.
+//
+// The control rows are the point:
+//   - "unrelated code" proves the widening is a NAMED list, not a blanket;
+//   - "message mentions a listed code" proves the classification EXACT-MATCHES
+//     error.code and does not substring-scan the free-text message. That row
+//     goes green under a substring implementation only by misclassifying a
+//     retryable failure as permanent-B, which is exactly the hazard the
+//     envelope decode exists to close.
+func TestShipPlan_AgentOutputInvalid_400(t *testing.T) {
+	// envelope renders the backend's real error shape
+	// (backend/internal/server/errors.go errorEnvelope).
+	envelope := func(code, message string) string {
+		b, err := json.Marshal(map[string]any{
+			"error": map[string]any{"code": code, "message": message},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	cases := []struct {
+		name       string
+		body       string
+		wantB      bool
+		wantReason string
+	}{
+		{
+			name:       "plan_invalid",
+			body:       envelope("plan_invalid", "plan does not validate against standard_v1"),
+			wantB:      true,
+			wantReason: "the pre-#2833 code, unchanged",
+		},
+		{
+			name:       "grooming_report_invalid",
+			body:       envelope("grooming_report_invalid", "grooming_report does not validate against grooming-report-v1"),
+			wantB:      true,
+			wantReason: "backend failGroomingStage already transitioned the stage to failed-B",
+		},
+		{
+			name:       "grooming_report_stage_invalid",
+			body:       envelope("grooming_report_stage_invalid", "grooming_report may only be shipped from a plan stage"),
+			wantB:      true,
+			wantReason: "the stage type is a property of the run — re-shipping cannot help",
+		},
+		{
+			name:       "clarification_request_invalid",
+			body:       envelope("clarification_request_invalid", "clarification_request does not validate against clarification-request-v1"),
+			wantB:      true,
+			wantReason: "backend plan.go fails that stage category-B too",
+		},
+		{
+			name:       "unrelated code",
+			body:       envelope("validation_failed", "stage_id is not a uuid"),
+			wantB:      false,
+			wantReason: "a request-shape 400 is NOT the agent's output — stays category-C",
+		},
+		{
+			name:       "message mentions a listed code",
+			body:       envelope("validation_failed", "stage_id is not a uuid (this is not a plan_invalid or grooming_report_invalid rejection)"),
+			wantB:      false,
+			wantReason: "free-text message must not drive classification — error.code is exact-matched",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, srv := newPlanFakeBackend(t)
+			pf.status = http.StatusBadRequest
+			pf.body = tc.body
+			c := quickPlanClient(srv)
+			priv, _ := makePlanKey(t)
+
+			_, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+				RunID:      "r",
+				StageID:    "s",
+				Plan:       []byte(`{"kind":"grooming_report"}`),
+				PrivateKey: priv,
+			})
+			if err == nil {
+				t.Fatal("ShipPlan = nil error, want a 400 failure")
+			}
+			if got := errors.Is(err, ErrPlanInvalid); got != tc.wantB {
+				t.Errorf("errors.Is(err, ErrPlanInvalid) = %t, want %t (%s)\n  err: %v",
+					got, tc.wantB, tc.wantReason, err)
+			}
+			if pf.calls != 1 {
+				t.Errorf("calls = %d, want 1 (no retry on 400)", pf.calls)
+			}
+		})
+	}
+}
+
+// TestShipPlan_AgentOutputInvalid_UndecodableBodyFallsBackToSubstring pins the
+// documented degrade: when the body is NOT the backend error envelope (a
+// truncated body, a proxy error page, or the flat {"code":…} shape older
+// fixtures use), classification falls back to the historical substring check
+// rather than losing category-B on a genuinely-invalid artifact.
+func TestShipPlan_AgentOutputInvalid_UndecodableBodyFallsBackToSubstring(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		wantB bool
+	}{
+		{name: "flat code shape", body: `{"code":"grooming_report_invalid","message":"bad"}`, wantB: true},
+		{name: "not json at all", body: `502 Bad Gateway: plan_invalid`, wantB: true},
+		{name: "no listed code", body: `502 Bad Gateway from the proxy`, wantB: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, srv := newPlanFakeBackend(t)
+			pf.status = http.StatusBadRequest
+			pf.body = tc.body
+			c := quickPlanClient(srv)
+			priv, _ := makePlanKey(t)
+
+			_, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+				RunID: "r", StageID: "s",
+				Plan: []byte(`{"plan_version":"standard_v1"}`), PrivateKey: priv,
+			})
+			if err == nil {
+				t.Fatal("ShipPlan = nil error, want a 400 failure")
+			}
+			if got := errors.Is(err, ErrPlanInvalid); got != tc.wantB {
+				t.Errorf("errors.Is(err, ErrPlanInvalid) = %t, want %t\n  err: %v", got, tc.wantB, err)
+			}
+		})
+	}
+}
+
+// TestShipPlan_AgentOutputInvalid_LongMessageStillExactMatched guards the
+// classifyBodyLimit split. The envelope is longer than the 256-byte excerpt
+// surfaced in the error string, so a classifier reading only that excerpt
+// would fail the JSON decode mid-body and fall back to the substring scan —
+// and the message here MENTIONS plan_invalid inside the first 256 bytes while
+// error.code is validation_failed, so that fallback returns the WRONG answer.
+// Shrinking classifyBodyLimit to briefBodyLimit reddens this test.
+func TestShipPlan_AgentOutputInvalid_LongMessageStillExactMatched(t *testing.T) {
+	long, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "validation_failed",
+			"message": "stage_id is not a uuid; this is not a plan_invalid rejection " + strings.Repeat("x", 2000),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf, srv := newPlanFakeBackend(t)
+	pf.status = http.StatusBadRequest
+	pf.body = string(long)
+	c := quickPlanClient(srv)
+	priv, _ := makePlanKey(t)
+
+	_, shipErr := c.ShipPlan(context.Background(), ShipPlanArgs{
+		RunID: "r", StageID: "s",
+		Plan: []byte(`{"plan_version":"standard_v1"}`), PrivateKey: priv,
+	})
+	if shipErr == nil {
+		t.Fatal("ShipPlan = nil error, want a 400 failure")
+	}
+	if errors.Is(shipErr, ErrPlanInvalid) {
+		t.Errorf("validation_failed misclassified as ErrPlanInvalid: %v", shipErr)
+	}
+	if len(shipErr.Error()) > 1024 {
+		t.Errorf("error message not bounded by the brief excerpt: %d bytes", len(shipErr.Error()))
+	}
+}
+
+// TestShipPlan_AgentOutputInvalid_EnvelopeExceedingClassifyLimit pins the
+// guarantee that a VALID envelope is classified from its exact error.code
+// REGARDLESS of the total response length.
+//
+// The bodies here run well past classifyBodyLimit, so a classifier that needs a
+// complete document (json.Unmarshal over the truncated read) decodes nothing
+// and degrades to the substring scan. Both rows are built so that degrade gives
+// the WRONG answer:
+//
+//   - "colliding message": error.code is validation_failed — a transient,
+//     retryable request-shape rejection — while its free text mentions
+//     plan_invalid INSIDE the first classifyBodyLimit bytes. The substring
+//     fallback returns category-B and the stage is never retried. This is the
+//     exact hole the streaming token walk closes.
+//   - "listed code": the mirror image — a genuinely-invalid artifact whose
+//     oversized message must NOT cost it its category-B.
+//
+// Replacing errorEnvelopeCode's token walk with json.Unmarshal reddens the
+// first row.
+func TestShipPlan_AgentOutputInvalid_EnvelopeExceedingClassifyLimit(t *testing.T) {
+	// Comfortably past classifyBodyLimit (8 KiB) once marshalled.
+	const padding = 32 << 10
+
+	cases := []struct {
+		name  string
+		code  string
+		wantB bool
+	}{
+		{name: "colliding message", code: "validation_failed", wantB: false},
+		{name: "listed code", code: "grooming_report_invalid", wantB: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"code": tc.code,
+					// Mentions a LISTED code in the free text, ahead of the
+					// padding, so it lands inside the classification window.
+					"message": "rejected; this is not a plan_invalid rejection " +
+						strings.Repeat("x", padding),
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(body) <= classifyBodyLimit {
+				t.Fatalf("fixture body is %d bytes, want > classifyBodyLimit (%d)",
+					len(body), classifyBodyLimit)
+			}
+
+			pf, srv := newPlanFakeBackend(t)
+			pf.status = http.StatusBadRequest
+			pf.body = string(body)
+			c := quickPlanClient(srv)
+			priv, _ := makePlanKey(t)
+
+			_, shipErr := c.ShipPlan(context.Background(), ShipPlanArgs{
+				RunID: "r", StageID: "s",
+				Plan: []byte(`{"plan_version":"standard_v1"}`), PrivateKey: priv,
+			})
+			if shipErr == nil {
+				t.Fatal("ShipPlan = nil error, want a 400 failure")
+			}
+			if got := errors.Is(shipErr, ErrPlanInvalid); got != tc.wantB {
+				t.Errorf("errors.Is(err, ErrPlanInvalid) = %t, want %t\n  err: %v",
+					got, tc.wantB, shipErr)
+			}
+			if len(shipErr.Error()) > 1024 {
+				t.Errorf("error message not bounded by the brief excerpt: %d bytes",
+					len(shipErr.Error()))
+			}
+		})
+	}
+}
+
+// TestErrorEnvelopeCode covers the token walk's own contract directly: which
+// bodies yield an exact code (so the fallback is skipped) and which yield none
+// (so the caller degrades). The truncation rows are the ones that matter — they
+// are what a body larger than classifyBodyLimit looks like by the time the
+// classifier sees it.
+func TestErrorEnvelopeCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantCode string
+		wantOK   bool
+	}{
+		{
+			name:     "complete envelope",
+			body:     `{"error":{"code":"plan_invalid","message":"bad"}}`,
+			wantCode: "plan_invalid",
+			wantOK:   true,
+		},
+		{
+			name:     "truncated mid-message",
+			body:     `{"error":{"code":"validation_failed","message":"mentions plan_invalid then stops`,
+			wantCode: "validation_failed",
+			wantOK:   true,
+		},
+		{
+			name:     "truncated before the code arrives",
+			body:     `{"error":{"details":{"field":"stage_`,
+			wantCode: "",
+			wantOK:   false,
+		},
+		{
+			name:     "code after a nested details object",
+			body:     `{"error":{"details":{"a":[1,2,{"b":null}]},"code":"grooming_report_invalid"}}`,
+			wantCode: "grooming_report_invalid",
+			wantOK:   true,
+		},
+		{
+			name:     "error member after another top-level member",
+			body:     `{"trace_id":"abc","error":{"code":"plan_invalid"}}`,
+			wantCode: "plan_invalid",
+			wantOK:   true,
+		},
+		{name: "flat code shape", body: `{"code":"plan_invalid"}`, wantOK: false},
+		{name: "not json", body: `502 Bad Gateway: plan_invalid`, wantOK: false},
+		{name: "empty code", body: `{"error":{"code":""}}`, wantOK: false},
+		{name: "non-string code", body: `{"error":{"code":42}}`, wantOK: false},
+		{name: "error is not an object", body: `{"error":"plan_invalid"}`, wantOK: false},
+		{name: "empty body", body: ``, wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, ok := errorEnvelopeCode(tc.body)
+			if ok != tc.wantOK || code != tc.wantCode {
+				t.Errorf("errorEnvelopeCode(%q) = (%q, %t), want (%q, %t)",
+					tc.body, code, ok, tc.wantCode, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestShipPlan_SignatureRejected_401(t *testing.T) {
 	pf, srv := newPlanFakeBackend(t)
 	pf.status = http.StatusUnauthorized

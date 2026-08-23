@@ -1605,49 +1605,63 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// the historical behavior: operator's --plan-out flag drives
 		// validation directly.
 		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
-			// Adoption precedence (#1325): clarification(file) > structured_output
-			// > agent-written file, then the existing TryCoerce+validate gate.
-			if isClarif, ev := detectClarificationRequest(cfg.planOut); isClarif {
-				// (1) The planner parked: it emitted a clarification_request sibling
-				// (#1057) instead of a plan because the issue is not yet
-				// plannable. Clarification ALWAYS wins — ignore any
-				// structured_output the (schema-constrained) invocation may also
-				// have produced. It is NOT a plan, so skip plan-schema validation
-				// (which would wrongly demote it to category-B) and leave res.OK
-				// true. uploadPlan ships the bytes as-is; the backend ingests the
-				// sibling, persists it, and parks the stage at awaiting_input.
+			// Adoption precedence (#1325, generalized by #2833):
+			// recognized-sibling(file) > structured_output > agent-written file,
+			// then the existing TryCoerce+validate gate.
+			if siblingKind, isSibling, ev := detectPlanSibling(cfg.planOut); isSibling {
+				// (1) The stage emitted a recognized standard_v1 SIBLING at the
+				// plan-out path instead of a plan: a clarification_request (#1057,
+				// the planner parked because the issue is not yet plannable) or a
+				// grooming_report (#2235, a backlog-grooming propose stage). ANY
+				// recognized sibling ALWAYS wins — ignore any structured_output the
+				// (schema-constrained) invocation may also have produced, since
+				// adopting it would DESTROY the sibling before uploadPlan ever reads
+				// the file. It is NOT a plan, so skip plan-schema validation (which
+				// would wrongly demote it to category-B) and leave res.OK true.
+				// uploadPlan re-reads the file and ships those exact bytes; the
+				// backend ingests the sibling — parking the stage at awaiting_input
+				// for a clarification_request, persisting an artifact row for a
+				// grooming_report — and owns its own validation and category-B
+				// failure on a bad one.
 				//
 				// Before shipping, strip undeclared properties from the
 				// clarification artifact (#1837): the backend strict-validates it
 				// against clarification-request-v1 (additionalProperties:false), so
 				// a benign extra field an agent emitted (observed:
 				// recommended_default_choice on a question) would 400
-				// clarification_request_invalid and fail the stage category-C —
-				// losing the plan generation. StripUnknownClarificationProps
-				// coerces the bytes clean against the schema-derived allowlists.
-				// Best-effort, mirroring adoptStructuredOutput below: on a write
-				// error, log a policy_event and leave the original file. res.OK
-				// stays true (non-demoting coercion); a parse failure or no-strip
-				// leaves file + events unchanged.
-				if data, rerr := os.ReadFile(cfg.planOut); rerr == nil {
-					cleaned, warnings, serr := plan.StripUnknownClarificationProps(data)
-					if serr == nil && len(warnings) > 0 {
-						if werr := os.WriteFile(cfg.planOut, cleaned, 0o600); werr != nil {
-							res.Events = append(res.Events, agent.Event{
-								Kind: "policy_event",
-								Payload: agent.MakePayload(map[string]string{
-									"check": "plan_validation", "outcome": "clarification_strip_write_failed",
-									"path": cfg.planOut, "error": werr.Error(),
-								}),
-							})
-						} else {
-							res.Events = append(res.Events, agent.Event{
-								Kind: "policy_event",
-								Payload: agent.MakePayload(map[string]string{
-									"check": "plan_validation", "outcome": "clarification_props_stripped",
-									"path": cfg.planOut, "stripped": strings.Join(warnings, "; "),
-								}),
-							})
+				// clarification_request_invalid and fail the stage — losing the plan
+				// generation. StripUnknownClarificationProps coerces the bytes clean
+				// against the schema-derived allowlists. Best-effort, mirroring
+				// adoptStructuredOutput below: on a write error, log a policy_event
+				// and leave the original file. res.OK stays true (non-demoting
+				// coercion); a parse failure or no-strip leaves file + events
+				// unchanged.
+				//
+				// KIND-GATED (#2833): the stripper's allowlists are
+				// clarification-shaped (questions[] / ticket_reference /
+				// generated_by) and have no grooming equivalent, so running it on a
+				// grooming_report would strip every legitimate grooming property.
+				if siblingKind == "clarification_request" {
+					if data, rerr := os.ReadFile(cfg.planOut); rerr == nil {
+						cleaned, warnings, serr := plan.StripUnknownClarificationProps(data)
+						if serr == nil && len(warnings) > 0 {
+							if werr := os.WriteFile(cfg.planOut, cleaned, 0o600); werr != nil {
+								res.Events = append(res.Events, agent.Event{
+									Kind: "policy_event",
+									Payload: agent.MakePayload(map[string]string{
+										"check": "plan_validation", "outcome": "clarification_strip_write_failed",
+										"path": cfg.planOut, "error": werr.Error(),
+									}),
+								})
+							} else {
+								res.Events = append(res.Events, agent.Event{
+									Kind: "policy_event",
+									Payload: agent.MakePayload(map[string]string{
+										"check": "plan_validation", "outcome": "clarification_props_stripped",
+										"path": cfg.planOut, "stripped": strings.Join(warnings, "; "),
+									}),
+								})
+							}
 						}
 					}
 				}
@@ -3687,44 +3701,70 @@ func parseDiffNumstat(output string) (insertions, deletions int) {
 	return
 }
 
-// validatePlan reads the plan artifact at path and validates it
-// against the standard_v1 schema. The first return is a policy_event
-// suitable for the trace bundle: kind=policy_event, payload describes
-// the validation outcome. The second return is non-nil ONLY on
-// validation failure — it carries the reason for callers wiring up
-// category-B failure handling per MVP_SPEC §6.
-// detectClarificationRequest peeks the plan-out file's top-level "kind"
-// discriminator (#1057). A clarification_request is the additive standard_v1
-// sibling the planner emits when an issue is not yet plannable — it is shipped
-// as-is (the backend ingests it and parks the stage at awaiting_input) rather
-// than validated as a plan, so the runner must NOT demote it to category-B.
-// Mirrors backend/internal/plan.DetectArtifactKind: a plan artifact carries no
-// "kind" field (it has plan_version), so only an explicit
-// kind == "clarification_request" routes here.
+// planSiblingKinds is the runner-side recognized set of additive standard_v1
+// SIBLING artifact kinds a plan-typed stage may emit instead of a plan. It
+// mirrors the backend's plan.ArtifactKindClarificationRequest (#1057) and
+// plan.ArtifactKindGroomingReport (#2235) — the runner module cannot import
+// backend/internal/plan (runner/go.mod declares no backend dependency), so the
+// set is a deliberate module-wall duplicate. A THIRD sibling is one entry here
+// plus the backend's own routing; TestDetectPlanSibling asserts the shipped
+// per-kind behavior so the list cannot silently drift into a no-op.
 //
-// Returns (false, zero Event) on any read/parse error so the caller falls
-// through to validatePlan, where a genuinely-missing or malformed plan is
-// demoted as before. On a hit it returns a policy_event recording the
-// detection in the trace bundle.
-func detectClarificationRequest(path string) (bool, agent.Event) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, agent.Event{}
-	}
+// The runner does NOT validate a sibling: neither schema is embedded here
+// (scripts/sync-schemas mirrors both into the backend only), so the backend
+// validates on ingest and fails the stage category-B itself.
+var planSiblingKinds = map[string]struct{}{
+	"clarification_request": {},
+	"grooming_report":       {},
+}
+
+// siblingKindOf peeks the top-level "kind" discriminator in data and returns
+// the kind when it names a recognized plan sibling, or "" otherwise. A plan
+// artifact carries no "kind" (it has plan_version), so a plan, an unrecognized
+// kind, and malformed JSON all return "". Single source of the kind table for
+// both detectPlanSibling and validatePlan.
+func siblingKindOf(data []byte) string {
 	var disc struct {
 		Kind string `json:"kind"`
 	}
 	if err := json.Unmarshal(data, &disc); err != nil {
-		return false, agent.Event{}
+		return ""
 	}
-	if disc.Kind != "clarification_request" {
-		return false, agent.Event{}
+	if _, ok := planSiblingKinds[disc.Kind]; !ok {
+		return ""
 	}
-	return true, agent.Event{
+	return disc.Kind
+}
+
+// detectPlanSibling peeks the plan-out file's top-level "kind" discriminator
+// (#1057, generalized by #2833). A recognized sibling — clarification_request
+// (the planner parked) or grooming_report (a backlog-grooming propose stage) —
+// is shipped as-is: the backend ingests it and either parks the stage or
+// persists the artifact, so the runner must NOT validate it as a plan and must
+// NOT let structured-output adoption overwrite it.
+//
+// Returns ("", false, zero Event) on every not-a-sibling path — read error,
+// missing file, empty file, non-JSON body, absent kind (a standard_v1 plan),
+// and an UNRECOGNIZED kind — so the caller falls through to validatePlan,
+// where a genuinely-missing or malformed plan is demoted as before. On a hit
+// it returns the detected kind plus a policy_event recording the detection in
+// the trace bundle, with outcome set to the kind string (so the pre-existing
+// clarification_request outcome assertions keep working unchanged and a
+// grooming_report emits outcome=grooming_report).
+func detectPlanSibling(path string) (string, bool, agent.Event) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, agent.Event{}
+	}
+	kind := siblingKindOf(data)
+	if kind == "" {
+		return "", false, agent.Event{}
+	}
+	return kind, true, agent.Event{
 		Kind: "policy_event",
 		Payload: agent.MakePayload(map[string]string{
 			"check":   "plan_validation",
-			"outcome": "clarification_request",
+			"outcome": kind,
 			"path":    path,
 		}),
 	}
@@ -3755,6 +3795,22 @@ func adoptStructuredOutput(path string, out []byte) agent.Event {
 	}
 }
 
+// validatePlan reads the plan artifact at path and validates it
+// against the standard_v1 schema. The first return is a policy_event
+// suitable for the trace bundle: kind=policy_event, payload describes
+// the validation outcome. The second return is non-nil ONLY on
+// validation failure — it carries the reason for callers wiring up
+// category-B failure handling per MVP_SPEC §6.
+//
+// Sibling gate (#2833), defense in depth: when the bytes are a recognized plan
+// sibling (see planSiblingKinds), validatePlan returns a policy_event and a nil
+// error WITHOUT running plan.TryCoerce and WITHOUT running plan.Validate. Both
+// are standard_v1-shaped — TryCoerce REWRITES the file in place when it fires,
+// so an ungated run against a grooming_report can corrupt an otherwise-valid
+// report, and Validate would demote it to category-B. Sibling validation is the
+// backend's job on ingest; the runner embeds neither sibling schema. The
+// precedence block in run() normally never reaches here for a sibling, so this
+// gate covers any other caller (a local replay driven only by --plan-out).
 func validatePlan(path string) (agent.Event, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -3762,6 +3818,22 @@ func validatePlan(path string) (agent.Event, error) {
 			Kind:    "policy_event",
 			Payload: agent.MakePayload(map[string]string{"check": "plan_validation", "outcome": "missing", "path": path, "error": err.Error()}),
 		}, fmt.Errorf("plan: read %s: %w", path, err)
+	}
+
+	// Recognized-sibling gate (#2833). A clarification_request or
+	// grooming_report is NOT a plan: skip both TryCoerce (which would rewrite
+	// the file in place with standard_v1-shaped fixes) and plan.Validate
+	// (which would demote a perfectly good sibling to category-B). The bytes
+	// are left byte-identical for uploadPlan to ship; the backend validates
+	// the sibling on ingest and owns the category-B transition itself.
+	if kind := siblingKindOf(data); kind != "" {
+		return agent.Event{
+			Kind: "policy_event",
+			Payload: agent.MakePayload(map[string]string{
+				"check": "plan_validation", "outcome": kind, "path": path,
+				"note": "sibling artifact — plan-schema validation deferred to backend ingest",
+			}),
+		}, nil
 	}
 
 	// Attempt structural coercion (#537) for the known string-elision

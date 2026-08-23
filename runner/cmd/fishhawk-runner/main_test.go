@@ -1564,6 +1564,377 @@ func TestRun_PlanStage_ClarificationWinsOverStructuredOutput(t *testing.T) {
 	}
 }
 
+// planStageArgs is the minimal plan-stage argv the #2833 precedence tests
+// share: no --fetch-prompt and no --upload-trace, so run() exercises the
+// precedence block and the trace bundle without touching a backend.
+func planStageArgs(promptPath, planPath, bundlePath string) []string {
+	return []string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}
+}
+
+// groomingPlanStageFixture writes a prompt and a grooming_report at the
+// plan-out path and returns (argv, planPath, bundlePath).
+func groomingPlanStageFixture(t *testing.T, report string) ([]string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return planStageArgs(promptPath, planPath, bundlePath), planPath, bundlePath
+}
+
+// bundleEventsForTest opens the written trace bundle and returns its events.
+func bundleEventsForTest(t *testing.T, bundlePath string) []bundle.Line {
+	t.Helper()
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// TestRun_PlanStage_GroomingReportWinsOverStructuredOutput is the #2833
+// done-means at the run() seam and the counterfactual vehicle for the
+// recognized-sibling branch: a grooming_report written to the plan-out file
+// must survive a plan-stage invocation that ALSO produced a structured_output.
+//
+// Before the fix, adoption ran unconditionally for any non-clarification
+// artifact, so the structured_output plan OVERWROTE the report on disk before
+// uploadPlan ever read the file — the report was destroyed, not merely
+// mis-validated. Deleting the sibling-wins branch reddens the byte-identity
+// assertion below, which reads COMMITTED STATE from disk after run() returns
+// rather than an error value.
+func TestRun_PlanStage_GroomingReportWinsOverStructuredOutput(t *testing.T) {
+	report := validGroomingReportJSON()
+	args, planPath, bundlePath := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{
+		// structured_output ALSO carries a (throwaway) plan — the sibling must win.
+		canned: agent.Result{OK: true, StructuredOutput: []byte(validPlanJSON())},
+	})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != report {
+		t.Errorf("plan-out file = %q, want the untouched grooming_report %q", onDisk, report)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "grooming_report") {
+		t.Errorf("missing grooming_report policy_event:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("structured_output was adopted but the grooming_report should have won:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "invalid") {
+		t.Errorf("grooming_report was mis-validated against standard_v1:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_GroomingReportNotStripped pins the kind gate on the
+// clarification-only post-processing: StripUnknownClarificationProps carries
+// hand-derived, clarification-shaped allowlists, so running it on a
+// grooming_report would strip every legitimate grooming property. The report
+// here carries properties no clarification allowlist knows.
+func TestRun_PlanStage_GroomingReportNotStripped(t *testing.T) {
+	report := validGroomingReportJSON()
+	args, planPath, bundlePath := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != report {
+		t.Errorf("grooming_report was rewritten:\n got %q\nwant %q", onDisk, report)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if bundleHasPolicyOutcome(events, "clarification_props_stripped") {
+		t.Errorf("clarification prop-stripping ran on a grooming_report:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "clarification_strip_write_failed") {
+		t.Errorf("clarification prop-stripping ran on a grooming_report:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_ClarificationPropsStripped is the positive half of the
+// kind gate that TestRun_PlanStage_GroomingReportNotStripped guards
+// negatively: on the ONE kind whose allowlists apply, the #1837 prop-stripping
+// still runs. A clarification_request carrying an undeclared property is
+// rewritten clean and emits clarification_props_stripped.
+func TestRun_PlanStage_ClarificationPropsStripped(t *testing.T) {
+	dirty := `{"kind":"clarification_request","summary":"need direction","questions":[{"id":"q1","question":"which?","what_i_can_infer":"x","recommended_default":"y","tradeoffs":"z","recommended_default_choice":"undeclared"}]}`
+	args, planPath, bundlePath := groomingPlanStageFixture(t, dirty)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(onDisk), "recommended_default_choice") {
+		t.Errorf("undeclared property survived the strip: %s", onDisk)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "clarification_props_stripped") {
+		t.Errorf("missing clarification_props_stripped policy_event:\n%+v", events)
+	}
+	if !bundleHasPolicyOutcome(events, "clarification_request") {
+		t.Errorf("missing clarification_request policy_event:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_ClarificationStripWriteFailureDegrades pins the
+// best-effort degrade on the strip path: when the cleaned bytes cannot be
+// written back, the runner logs clarification_strip_write_failed, leaves the
+// ORIGINAL file in place, and does NOT fail the stage — the artifact still
+// ships (the backend may reject it, which is a better outcome than losing the
+// plan generation to a local write fault).
+func TestRun_PlanStage_ClarificationStripWriteFailureDegrades(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a read-only file is still writable")
+	}
+	dirty := `{"kind":"clarification_request","summary":"need direction","questions":[{"id":"q1","question":"which?","what_i_can_infer":"x","recommended_default":"y","tradeoffs":"z","recommended_default_choice":"undeclared"}]}`
+	args, planPath, bundlePath := groomingPlanStageFixture(t, dirty)
+	// Readable (so the strip runs) but not writable (so the write-back fails).
+	if err := os.Chmod(planPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(planPath, 0o600) })
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a strip write fault must not fail the stage):\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != dirty {
+		t.Errorf("original file not preserved on a write fault:\n got %q\nwant %q", onDisk, dirty)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "clarification_strip_write_failed") {
+		t.Errorf("missing clarification_strip_write_failed policy_event:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "clarification_props_stripped") {
+		t.Errorf("strip reported success despite the write fault:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_UnknownKindRoutesToPlanPath is the fail-closed control for
+// the widened detector: an UNRECOGNIZED kind is not a recognized sibling, so it
+// falls through to the plan path and a plan-invalid body is still demoted to
+// category-B. Without it, "widen the set" could quietly become "accept any
+// artifact that carries a kind field".
+func TestRun_PlanStage_UnknownKindRoutesToPlanPath(t *testing.T) {
+	args, _, bundlePath := groomingPlanStageFixture(t, `{"kind":"something_else","summary":"not a plan"}`)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure for an unrecognized kind:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B demotion for an unrecognized kind:\n%s", stderr.String())
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "invalid") {
+		t.Errorf("missing invalid policy_event for an unrecognized kind:\n%+v", events)
+	}
+}
+
+// TestValidatePlan_GroomingReportByteIdentical is the counterfactual vehicle
+// for validatePlan's sibling gate. The fixture's generated_by is a BARE STRING
+// — a registered string-elision coercion path — so an ungated validatePlan runs
+// TryCoerce, which REWRITES the file in place. The assertion therefore reads
+// committed state from disk after the call returns: deleting the gate reddens
+// it on the rewritten bytes, not on an error value.
+func TestValidatePlan_GroomingReportByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.json")
+	report := `{"kind":"grooming_report","report_version":"grooming_report_v1","generated_by":"claude-opus-5","ordering":[{"id":"ord-1","issue":2833,"rank":1,"rationale":"r"}]}`
+	if err := os.WriteFile(path, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ev, err := validatePlan(path)
+	// Errorf, NOT Fatalf: the load-bearing assertion is the byte-identity
+	// read from disk BELOW, and a Fatalf here would short-circuit it — the
+	// counterfactual must land on committed state, not on an error value.
+	if err != nil {
+		t.Errorf("validatePlan on a grooming_report = %v, want nil (validation is the backend's job)", err)
+	}
+	if !strings.Contains(string(ev.Payload), `"outcome":"grooming_report"`) {
+		t.Errorf("event missing outcome=grooming_report: %s", ev.Payload)
+	}
+	onDisk, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) != report {
+		t.Errorf("validatePlan rewrote the grooming_report (TryCoerce ran):\n got %q\nwant %q", onDisk, report)
+	}
+}
+
+// TestValidatePlan_ClarificationByteIdentical is the same gate for the other
+// recognized kind — the sibling set has two members and both must skip the
+// coerce+validate path.
+func TestValidatePlan_ClarificationByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.json")
+	clar := validClarificationJSON()
+	if err := os.WriteFile(path, []byte(clar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ev, err := validatePlan(path)
+	// Errorf, NOT Fatalf: the load-bearing assertion is the byte-identity
+	// read from disk BELOW, and a Fatalf here would short-circuit it — the
+	// counterfactual must land on committed state, not on an error value.
+	if err != nil {
+		t.Errorf("validatePlan on a clarification_request = %v, want nil", err)
+	}
+	if !strings.Contains(string(ev.Payload), `"outcome":"clarification_request"`) {
+		t.Errorf("event missing outcome=clarification_request: %s", ev.Payload)
+	}
+	onDisk, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) != clar {
+		t.Errorf("validatePlan rewrote the clarification_request:\n got %q\nwant %q", onDisk, clar)
+	}
+}
+
+// TestUploadPlan_ShipsGroomingReportBytes is the transport-boundary half of the
+// done-means: uploadPlan re-reads the plan-out file immediately before signing,
+// so the bytes the fake client captures ARE the payload that crosses the wire.
+// Asserting them directly (rather than the on-disk file) closes the "validates
+// in isolation but never reaches the backend" seam the issue describes.
+func TestUploadPlan_ShipsGroomingReportBytes(t *testing.T) {
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	report := validGroomingReportJSON()
+	if err := os.WriteFile(planPath, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fu := newFakeUploader(t)
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		planOut:    planPath,
+		backendURL: "https://api.fishhawk.test",
+		workingDir: dir,
+	}
+	var stderr strings.Builder
+	if err := uploadPlan(context.Background(), cfg, &stderr, fu, nil); err != nil {
+		t.Fatalf("uploadPlan: %v", err)
+	}
+	if fu.gotPlanArgs == nil {
+		t.Fatal("ShipPlan not called — the grooming_report never reached the transport")
+	}
+	if string(fu.gotPlanArgs.Plan) != report {
+		t.Errorf("shipped bytes = %q, want the grooming_report byte-identical %q",
+			fu.gotPlanArgs.Plan, report)
+	}
+}
+
+// TestRun_UploadPlan_GroomingReportInvalid_CategoryB closes the category-B path
+// END TO END through the handler that maps the transport error to a failure
+// category (binding condition C3). The two halves — ShipPlan classifying the
+// backend's grooming_report_invalid envelope as ErrPlanInvalid, and run()'s
+// upload error handler mapping ErrPlanInvalid to category-B — can drift while
+// each half's own test still passes, so this drives BOTH over real HTTP: the
+// REAL upload.Client against a server returning the REAL backend error
+// envelope, asserted on the runner_completed category the stage reports.
+func TestRun_UploadPlan_GroomingReportInvalid_CategoryB(t *testing.T) {
+	report := validGroomingReportJSON()
+	args, _, _ := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	runID := "11111111-2222-3333-4444-555555555555"
+	stageID := "22222222-3333-4444-5555-666666666666"
+
+	var shipped []byte
+	pub, priv, kerr := ed25519.GenerateKey(rand.Reader)
+	if kerr != nil {
+		t.Fatal(kerr)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"run_id":      runID,
+			"private_key": base64.StdEncoding.EncodeToString(priv),
+			"public_key":  base64.StdEncoding.EncodeToString(pub),
+			"issued_at":   time.Now().UTC(),
+			"expires_at":  time.Now().UTC().Add(time.Hour),
+		})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/trace", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "t", "content_hash": "h"})
+	})
+	// The backend's real handleGroomingReport reject: it has ALREADY
+	// transitioned the stage to failed-B before writing these bytes.
+	mux.HandleFunc("POST /v0/runs/{run_id}/plan", func(w http.ResponseWriter, r *http.Request) {
+		shipped, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"code":    "grooming_report_invalid",
+			"message": "grooming_report does not validate against grooming-report-v1",
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	origClient := newUploadClient
+	newUploadClient = func(baseURL string) uploadClient { return upload.New(baseURL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+
+	args = append(args, "--stage-id", stageID, "--upload-trace")
+	args[1] = runID // --run-id must be a uuid for the backend path
+	args[3] = srv.URL
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if string(shipped) != report {
+		t.Errorf("backend received %q, want the grooming_report byte-identical %q", shipped, report)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B for a backend grooming_report_invalid reject:\n%s", stderr.String())
+	}
+}
+
 // TestRun_PlanStage_FallbackWhenNoStructuredOutput is the branch-fallback
 // precedence test: with no structured_output, the runner keeps the
 // agent-written (coerce-needing) file and the existing TryCoerce+validate path
@@ -16208,13 +16579,25 @@ func validClarificationJSON() string {
 }`
 }
 
-// TestDetectClarificationRequest pins the runner-side top-level "kind" peek
-// (#1057 slice 3): a clarification_request sibling is detected and yields a
-// policy_event carrying outcome=clarification_request so the runner skips
-// plan-schema validation and ships it as-is; a plan, a non-JSON blob, and a
-// missing file all return false with a zero Event so the normal validatePlan
-// path runs.
-func TestDetectClarificationRequest(t *testing.T) {
+// validGroomingReportJSON is a minimal grooming_report sibling. The runner
+// never validates it (the schema is embedded in the BACKEND only, by design —
+// see scripts/sync-schemas), so this fixture only needs the top-level "kind"
+// discriminator plus enough body to prove byte-identity.
+func validGroomingReportJSON() string {
+	return `{"kind":"grooming_report","report_version":"grooming_report_v1","generated_by":{"agent":"claude","model":"opus"},"ordering":[{"id":"ord-1","issue":2833,"rank":1,"rationale":"unblocks the grooming walk"}]}`
+}
+
+// TestDetectPlanSibling pins the runner-side top-level "kind" peek (#1057
+// slice 3, generalized to a recognized-sibling SET by #2833): a
+// clarification_request or a grooming_report is detected and yields a
+// policy_event whose outcome IS the detected kind, so the runner skips
+// plan-schema validation and ships it as-is. Every other input — a plan, an
+// UNRECOGNIZED kind, a non-JSON blob, an empty file, a missing file — returns
+// ("", false, zero Event) so the normal validatePlan path runs.
+//
+// The recognized set is a config-shaped list compilation cannot check, so this
+// asserts the SHIPPED per-kind behavior rather than the symbol's existence.
+func TestDetectPlanSibling(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) string {
 		t.Helper()
@@ -16225,44 +16608,56 @@ func TestDetectClarificationRequest(t *testing.T) {
 		return p
 	}
 
-	clarPath := write("clar.json", validClarificationJSON())
-	planPath := write("plan.json", validPlanJSON())
-	junkPath := write("junk.json", "not json at all")
+	hits := []struct {
+		name string
+		path string
+		kind string
+	}{
+		{"clarification_request", write("clar.json", validClarificationJSON()), "clarification_request"},
+		{"grooming_report", write("groom.json", validGroomingReportJSON()), "grooming_report"},
+	}
+	for _, tc := range hits {
+		t.Run(tc.name+" detected", func(t *testing.T) {
+			kind, ok, ev := detectPlanSibling(tc.path)
+			if !ok {
+				t.Fatalf("detectPlanSibling = false, want true for a %s", tc.kind)
+			}
+			if kind != tc.kind {
+				t.Errorf("kind = %q, want %q", kind, tc.kind)
+			}
+			if ev.Kind != "policy_event" {
+				t.Errorf("event kind = %q, want policy_event", ev.Kind)
+			}
+			if want := `"outcome":"` + tc.kind + `"`; !strings.Contains(string(ev.Payload), want) {
+				t.Errorf("event missing %s: %s", want, ev.Payload)
+			}
+		})
+	}
 
-	t.Run("clarification_request detected", func(t *testing.T) {
-		ok, ev := detectClarificationRequest(clarPath)
-		if !ok {
-			t.Fatal("detectClarificationRequest = false, want true for a clarification_request")
-		}
-		if ev.Kind != "policy_event" {
-			t.Errorf("event kind = %q, want policy_event", ev.Kind)
-		}
-		if !strings.Contains(string(ev.Payload), `"outcome":"clarification_request"`) {
-			t.Errorf("event missing outcome=clarification_request: %s", ev.Payload)
-		}
-	})
-
-	t.Run("plan not detected", func(t *testing.T) {
-		ok, ev := detectClarificationRequest(planPath)
-		if ok {
-			t.Error("detectClarificationRequest = true, want false for a standard_v1 plan")
-		}
-		if ev.Kind != "" {
-			t.Errorf("event kind = %q, want zero Event for a plan", ev.Kind)
-		}
-	})
-
-	t.Run("non-JSON not detected", func(t *testing.T) {
-		if ok, _ := detectClarificationRequest(junkPath); ok {
-			t.Error("detectClarificationRequest = true, want false for non-JSON")
-		}
-	})
-
-	t.Run("missing file not detected", func(t *testing.T) {
-		if ok, _ := detectClarificationRequest(filepath.Join(dir, "nope.json")); ok {
-			t.Error("detectClarificationRequest = true, want false for a missing file")
-		}
-	})
+	misses := []struct {
+		name string
+		path string
+	}{
+		{"standard_v1 plan (no kind)", write("plan.json", validPlanJSON())},
+		{"unrecognized kind", write("unknown.json", `{"kind":"something_else","summary":"x"}`)},
+		{"non-JSON", write("junk.json", "not json at all")},
+		{"empty file", write("empty.json", "")},
+		{"missing file", filepath.Join(dir, "nope.json")},
+	}
+	for _, tc := range misses {
+		t.Run(tc.name+" not detected", func(t *testing.T) {
+			kind, ok, ev := detectPlanSibling(tc.path)
+			if ok {
+				t.Errorf("detectPlanSibling = true, want false for %s", tc.name)
+			}
+			if kind != "" {
+				t.Errorf("kind = %q, want empty for %s", kind, tc.name)
+			}
+			if ev.Kind != "" {
+				t.Errorf("event kind = %q, want zero Event for %s", ev.Kind, tc.name)
+			}
+		})
+	}
 }
 
 // TestRun_ClarificationRequest_NotDemotedToCategoryB is the slice-3 seam at the

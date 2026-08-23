@@ -105,6 +105,122 @@ In practice a TERMed runner exits gracefully and its deferred release removes th
 
 Shape lockstep (schema ↔ runner validator ↔ backend validator) is guarded by `TestAcceptanceVerdictSchema_LockstepWithValidator`.
 
+## Plan-stage sibling artifacts ([#2833](https://github.com/kuhlman-labs/fishhawk/issues/2833))
+
+A `plan`-typed stage may emit an additive **standard_v1 sibling** at the
+`--plan-out` path instead of a plan. The runner recognizes two kinds, held in
+`planSiblingKinds` (`main.go`):
+
+| `kind` | Emitted by | Backend outcome |
+|---|---|---|
+| `clarification_request` | the planner's step-zero plannability check ([#1057](https://github.com/kuhlman-labs/fishhawk/issues/1057)) | stage parks at `awaiting_input` |
+| `grooming_report` | a backlog-grooming **propose** stage ([#2235](https://github.com/kuhlman-labs/fishhawk/issues/2235)) | artifact row persisted, decided at the plan gate |
+
+That set is a deliberate duplicate of the backend's
+`plan.ArtifactKindClarificationRequest` / `plan.ArtifactKindGroomingReport`: the
+runner module declares **no** dependency on the backend module, so the backend's
+discriminator is unreachable here. A third sibling is one entry in this set plus
+the backend's own routing — a documented residual, not a solved problem.
+`TestDetectPlanSibling` asserts the shipped per-kind behavior so the list cannot
+silently drift into a no-op.
+
+**Adoption precedence** is `recognized-sibling(file) > structured_output >
+agent-written file`. `detectPlanSibling` peeks only the top-level `kind`
+discriminator; every not-a-sibling path (a plan, which carries `plan_version`
+and no `kind`; an UNRECOGNIZED kind; malformed JSON; an empty or missing file)
+falls through to the normal coerce+validate gate, where a genuinely-bad plan is
+demoted to category-B as before.
+
+On a hit the runner does three things and no more:
+
+1. **The sibling wins over structured-output adoption.** This is the control
+   that closes the destroy-before-upload window: adopting the invocation's
+   `structured_output` plan would overwrite the sibling on disk *before*
+   `uploadPlan` re-reads the file, so the artifact would be lost rather than
+   merely mis-reported.
+2. **`plan.TryCoerce` and `plan.Validate` are skipped**, in the precedence block
+   and again inside `validatePlan` as defense in depth for any other caller (a
+   local replay driven only by `--plan-out`). Both are standard_v1-shaped:
+   `TryCoerce` REWRITES the file in place when it fires, so an ungated run can
+   corrupt an otherwise-valid report, and `Validate` would demote it to
+   category-B for failing a schema it was never meant to satisfy.
+3. **Clarification-only post-processing stays kind-gated.**
+   `StripUnknownClarificationProps` carries hand-derived, clarification-shaped
+   allowlists (`questions[]` / `ticket_reference` / `generated_by`) with no
+   grooming equivalent; running it on a `grooming_report` would strip every
+   legitimate grooming property.
+
+**Sibling validation is the BACKEND's job.** Neither sibling schema is embedded
+in the runner — `scripts/sync-schemas` routes both to
+`backend/internal/plan/schemas/` only, by an explicit comment — so the runner
+writes the artifact and the backend validates it on ingest. See
+[`docs/spec/grooming-report-v1.md`](../../../docs/spec/grooming-report-v1.md)
+and
+[`docs/spec/clarification-request-v1.md`](../../../docs/spec/clarification-request-v1.md).
+
+### 400 error code → failure category
+
+All four artifact kinds ship to the same endpoint (`POST
+/v0/runs/{run_id}/plan`, routed by `kind`), so `upload.ShipPlan` classifies the
+400 by the backend's error **code**, held in `agentOutputInvalidCodes`
+(`runner/internal/upload/upload.go`):
+
+| Code | Category | Backend source |
+|---|---|---|
+| `plan_invalid` | **B** — `upload.ErrPlanInvalid` | `backend/internal/server/plan.go` |
+| `clarification_request_invalid` | **B** | `backend/internal/server/plan.go` |
+| `grooming_report_invalid` | **B** | `backend/internal/server/grooming_report.go` |
+| `grooming_report_stage_invalid` | **B** | `backend/internal/server/grooming_report.go` |
+| anything else (e.g. `validation_failed`) | **C** — generic error | — |
+
+Each B code is one the backend handler has ALREADY transitioned the stage to
+`failed`-B on before writing the 400, so the runner must agree or the two halves
+of one event disagree on the category. The list is NAMED, not a blanket: a
+request-shape 400 stays category-C and is not the agent's fault.
+
+The code is **exact-matched** out of the backend's error envelope
+(`{"error":{"code":…,"message":…}}`) rather than substring-scanned, because
+`message` is free text — a `validation_failed` response whose human-readable
+message merely mentions `plan_invalid` would otherwise be classified
+permanent-B and never retried.
+
+**The match is made by a STREAMING token walk (`upload.errorEnvelopeCode`), not
+by `json.Unmarshal`, and that distinction is the control.** `Unmarshal` needs a
+complete, well-formed document, so it fails on any body the classification read
+truncated — and `readClassifiableBody` caps that read at `classifyBodyLimit`
+(8 KiB). A *valid* envelope whose `message` or `details` runs past the cap would
+therefore decode to nothing and drop onto the substring fallback, re-opening the
+exact collision the exact match exists to close: a `validation_failed` envelope
+mentioning `plan_invalid` in its first 8 KiB classified permanent-B and never
+retried. The token walk instead stops the instant it has read `error.code`, so a
+valid envelope is classified from its exact code **regardless of the total
+response length**. Only the code member has to land inside the window, and it
+always does — the backend declares `Code` as `errorBody`'s first field
+(`backend/internal/server/errors.go`) and `encoding/json` emits struct fields in
+declaration order. `TestShipPlan_AgentOutputInvalid_EnvelopeExceedingClassifyLimit`
+drives a 32 KiB envelope through both directions (colliding message → C, listed
+code → B) and reddens if the walk is replaced by `Unmarshal`; `TestErrorEnvelopeCode`
+pins the walk's own truncation contract.
+
+When the body yields no envelope code at all (a proxy error page, an older flat
+`{"code":…}` shape, a body truncated *before* `code` arrived), classification
+**falls back** to the historical substring check. That fallback exists so
+classification never gets *weaker* than it was before exact-match landed: losing
+category-B on a genuinely-invalid artifact would turn a permanent failure into a
+retry loop against a backend that has already failed the stage. It is the
+strictly-less-precise path and runs only when the precise one has nothing to
+read.
+
+**Known residual (accepted, not a defect).** On that fallback path any
+undecodable 400 whose free text merely *contains* a listed code is classified
+permanent-B — `TestShipPlan_AgentOutputInvalid_UndecodableBodyFallsBackToSubstring`
+pins `502 Bad Gateway: plan_invalid` as `wantB=true`. A proxy-injected 400 whose
+prose coincidentally names a code is therefore never retried. This is the
+deliberate trade above, chosen because the alternative failure (retrying forever
+against a stage the backend already failed) is worse. Retiring it is an operator
+decision, available once no flat-`{"code":…}` producers remain; it is not a
+change to make from the runner side alone.
+
 ## Committed-tree verify-fix loop (#651)
 
 `main.go::runVerifyFixLoop` — the bounded evaluator-optimizer fix loop on the implement push path, enabled by `executor.verify.max_iterations > 0` (default 0 = the single-shot #441 working-tree gate behavior).

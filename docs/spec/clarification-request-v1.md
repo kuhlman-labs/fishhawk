@@ -1,7 +1,7 @@
 # Clarification request artifact (standard_v1 sibling)
 
 Canonical schema: [`clarification-request-v1.schema.json`](clarification-request-v1.schema.json).
-Embedded copies: `backend/internal/plan/schemas/`, `runner/internal/plan/schemas/` (kept in lockstep by `scripts/sync-schemas`).
+Embedded copy: `backend/internal/plan/schemas/` only (mirrored by `scripts/sync-schemas`, which routes this schema to the backend by an explicit comment). The runner does **not** embed it — the runner WRITES the artifact and recognizes it by `kind`; the backend validates it on ingest (same split as [`grooming-report-v1`](grooming-report-v1.md)).
 
 ## What it is
 
@@ -16,12 +16,14 @@ The clarification artifact intentionally omits `plan_version` and the plan artif
 
 ## Discrimination and validation
 
-`backend/internal/plan` and `runner/internal/plan` expose the routing:
+`backend/internal/plan` exposes the routing and **all** the validation — the `runner` module declares no dependency on the backend module, so none of these symbols is reachable from the runner:
 
-- `DetectArtifactKind(data)` — peeks at the top-level `kind` and returns `ArtifactKindClarificationRequest` or `ArtifactKindPlan` (the default).
+- `DetectArtifactKind(data)` — peeks at the top-level `kind` and returns `ArtifactKindClarificationRequest`, `ArtifactKindGroomingReport`, or `ArtifactKindPlan` (the default).
 - `ValidateArtifact(data)` — discriminates, then validates against the matching schema.
 - `ValidateClarificationRequest(data)` — schema-validates **and** enforces that question `id`s are unique (see below).
-- `ParseClarificationRequest(data)` (backend only) — `ValidateClarificationRequest` plus a typed decode into `*ClarificationRequest`.
+- `ParseClarificationRequest(data)` — `ValidateClarificationRequest` plus a typed decode into `*ClarificationRequest`.
+
+`runner/internal/plan` exposes only `Validate` (plan-only), `TryCoerce`, `StripUnknownClarificationProps` and `StructuredOutputSchema`. The runner's own routing is a KIND DETECTOR, not a validator: `detectPlanSibling` in `runner/cmd/fishhawk-runner/main.go` peeks the same top-level `kind` against the `planSiblingKinds` set, and on a hit ships the bytes byte-identically — skipping `TryCoerce` and plan-schema validation — for the backend to validate on ingest (#2833).
 
 `Validate` (plan-only) is unchanged, so a `standard_v1` plan still validates exactly as before.
 
