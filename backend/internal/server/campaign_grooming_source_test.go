@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1214,5 +1217,219 @@ func TestCreateCampaign_GroomingSource_BoardSweepFiresOverTheRatifiedQueue(t *te
 	// The sweep walks the queue in its persisted (ratified) order.
 	if fmt.Sprint(gotNumbers) != "[101 202]" {
 		t.Fatalf("swept issue numbers = %v, want [101 202] in ratified rank order", gotNumbers)
+	}
+}
+
+// TestCreateCampaign_GroomingSource_RepoCauseNeverReachesTheCaller is the
+// call-site behavioural proof that the grooming ladder's REPOSITORY errors ride
+// the non-client-facing internalCauseKey channel (E67.15 / #2587) rather than a
+// plain `error` detail key. A repository error renders storage, query and
+// infrastructure text; an agent-facing authenticated caller has no business
+// reading it, while the operator must keep all of it.
+//
+// It drives the REAL handleCreateCampaign once per edited call site — GetRun,
+// the source run's stage/artifact/approval read, and the supersession scan's
+// ListRuns — and asserts both halves of the join:
+//
+//   - the client body carries the static message and error_ref and NEITHER the
+//     cause text NOR the literal "__cause" channel key;
+//   - ONE operator log record carries that SAME error_ref together with the
+//     full cause.
+//
+// COUNTERFACTUAL NOTE: the body half alone would NOT discriminate. writeError's
+// 5xx allow-list drops a non-admitted `error` key anyway, so reverting the call
+// sites leaves the body assertions green — the LOG-cause assertion is the one
+// that goes red, which is exactly the hole the key-based allow-list leaves.
+func TestCreateCampaign_GroomingSource_RepoCauseNeverReachesTheCaller(t *testing.T) {
+	tests := []struct {
+		name       string
+		sentinel   string
+		mutate     func(f *groomingSourceFixture, injected error)
+		wantStatus int
+		wantMsg    string
+	}{
+		{
+			name:     "get run",
+			sentinel: "pgx: SQLSTATE 08006 host=grooming-db-01 dial failed",
+			mutate: func(f *groomingSourceFixture, injected error) {
+				f.runs.getRunErr = injected
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantMsg:    "could not read the grooming run",
+		},
+		{
+			name:     "source run stage read",
+			sentinel: "pgx: SQLSTATE 42P01 relation \"stages\" does not exist",
+			mutate: func(f *groomingSourceFixture, injected error) {
+				f.runs.stagesErr = injected
+			},
+			wantStatus: http.StatusBadGateway,
+			wantMsg:    "could not read the grooming run's stages, artifacts or approvals",
+		},
+		{
+			name:     "supersession scan candidate list",
+			sentinel: "pgx: SQLSTATE 53300 too many connections for role \"fishhawk\"",
+			mutate: func(f *groomingSourceFixture, injected error) {
+				f.runs.listRuns = func(run.ListRunsFilter) ([]*run.Run, error) { return nil, injected }
+			},
+			wantStatus: http.StatusBadGateway,
+			wantMsg:    "could not determine whether a newer approved grooming run supersedes this order",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const reqID = "grooming-cause-ref"
+			f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 20, 10)
+			tc.mutate(f, fmt.Errorf("%s", tc.sentinel))
+
+			var logBuf bytes.Buffer
+			f.server.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			req := httptest.NewRequest(http.MethodPost, "/v0/campaigns",
+				strings.NewReader(groomingSourceBody(f.runID, "")))
+			req.Header.Set("Content-Type", "application/json")
+			req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+			w := httptest.NewRecorder()
+			f.server.handleCreateCampaign(w, withAuth(req))
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+
+			// (a) The client body: no repository cause, no internal channel key.
+			body := w.Body.String()
+			if strings.Contains(body, tc.sentinel) {
+				t.Errorf("the repository cause leaked into the client body: %s", body)
+			}
+			if strings.Contains(body, internalCauseKey) {
+				t.Errorf("the internal cause key leaked into the client body: %s", body)
+			}
+			var env errorEnvelope
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode body: %v (%s)", err, body)
+			}
+			if _, present := env.Error.Details[internalCauseKey]; present {
+				t.Errorf("details still carry %q: %v", internalCauseKey, env.Error.Details)
+			}
+			if env.Error.Message != tc.wantMsg {
+				t.Errorf("message = %q, want the static literal %q", env.Error.Message, tc.wantMsg)
+			}
+			if env.Error.ErrorRef != reqID {
+				t.Fatalf("body error_ref = %q, want %q — the caller's only correlation handle", env.Error.ErrorRef, reqID)
+			}
+
+			// (b) ONE operator log record joins the SAME ref with the full cause.
+			rec := soleLogRecord(t, &logBuf, "http error response")
+			if rec["error_ref"] != reqID {
+				t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
+			}
+			cause, _ := rec["cause"].(string)
+			if !strings.Contains(cause, tc.sentinel) {
+				t.Errorf("log cause = %v, want it to carry the repository cause %q joined to the ref", rec["cause"], tc.sentinel)
+			}
+
+			if n := f.campaigns.countCampaigns(); n != 0 {
+				t.Fatalf("%d campaign(s) persisted behind the read failure, want 0", n)
+			}
+		})
+	}
+}
+
+// TestCreateCampaign_GroomingSource_SupersededFoundOnALaterPage covers the
+// scan's SUCCESSFUL multi-page path, which neither the short-first-page fixture
+// nor the perpetually-full-page cap case reaches: a FULL first page of
+// irrelevant runs, then a later SHORT page carrying the superseding approved
+// run. Without it, broken offset handling or a scan that only ever inspected
+// its first page would pass while missing a known superseding run.
+//
+// The two failure modes discriminate in opposite directions, which is what
+// makes this a real vehicle: a scan that never advanced its offset would read
+// the FULL page forever and refuse UNDETERMINED, while a scan that stopped
+// after page one would find no superseding run and return 201.
+func TestCreateCampaign_GroomingSource_SupersededFoundOnALaterPage(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 20, 10)
+	newerID := f.seedNewerApprovedGroomingRun(t, time.Now())
+	src := f.runs.runs[f.runID]
+	newer := f.runs.runs[newerID]
+
+	// Page 0 is FULL and carries only runs OLDER than the source, so nothing on
+	// it can supersede and the scan must keep paging. Page 1 is SHORT — the
+	// end-of-list proof — and is where the superseding run actually lives.
+	firstPage := make([]*run.Run, groomingSupersessionPageSize)
+	for i := range firstPage {
+		firstPage[i] = &run.Run{
+			ID: uuid.New(), Repo: src.Repo, WorkflowID: src.WorkflowID,
+			AccountID: src.AccountID, CreatedAt: src.CreatedAt.Add(-time.Hour),
+		}
+	}
+	var offsets []int
+	f.runs.listRuns = func(filter run.ListRunsFilter) ([]*run.Run, error) {
+		offsets = append(offsets, filter.Offset)
+		switch filter.Offset {
+		case 0:
+			return firstPage, nil
+		case groomingSupersessionPageSize:
+			return []*run.Run{newer}, nil
+		default:
+			return nil, fmt.Errorf("scan requested offset %d; it must walk pages in order", filter.Offset)
+		}
+	}
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — the superseding run lives on the SECOND page and must still be found (body=%s)",
+			w.Code, w.Body.String())
+	}
+	code, details := decodeGroomingErr(t, w.Body.Bytes())
+	if code != codeGroomingSuperseded {
+		t.Fatalf("code = %q, want %q (body=%s)", code, codeGroomingSuperseded, w.Body.String())
+	}
+	if details["superseded_by"] != newerID.String() {
+		t.Errorf("details.superseded_by = %v, want %s", details["superseded_by"], newerID)
+	}
+	// The scan walked BOTH pages, in order, and stopped at the short one.
+	if fmt.Sprint(offsets) != fmt.Sprint([]int{0, groomingSupersessionPageSize}) {
+		t.Errorf("scan offsets = %v, want [0 %d] — one full page then the short page that ends the list",
+			offsets, groomingSupersessionPageSize)
+	}
+	if n := f.campaigns.countCampaigns(); n != 0 {
+		t.Fatalf("%d campaign(s) persisted from an order a later page proved superseded, want 0", n)
+	}
+}
+
+// TestCreateCampaign_GroomingSource_ZeroTimestampedReportIsNotAbsent pins the
+// latest-report selection against a report artifact whose CreatedAt is the ZERO
+// time. time.Time{}.UnixNano() is a large NEGATIVE number, so a numeric-floor
+// sentinel treated such an artifact as absent and a run that DID ship a report
+// surfaced as 422 grooming_order_absent. The selection must key on FIRST HIT,
+// not on a wall-clock floor.
+func TestCreateCampaign_GroomingSource_ZeroTimestampedReportIsNotAbsent(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 20, 10)
+	// Seeded BY CONSTRUCTION: the artifact is stamped with the zero time before
+	// any request runs, so the RED lands on the behavioural assertion.
+	f.artifacts.byStage[f.stageID][0].CreatedAt = time.Time{}
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusCreated {
+		code, _ := decodeGroomingErr(t, w.Body.Bytes())
+		t.Fatalf("status = %d code = %q, want 201 — a zero-timestamped report artifact is PRESENT, not absent (body=%s)",
+			w.Code, code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// COMMITTED STATE: the order this report carried is the queue that landed.
+	items, err := f.campaigns.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var gotRefs []string
+	for _, it := range items {
+		gotRefs = append(gotRefs, it.IssueRef)
+	}
+	if fmt.Sprint(gotRefs) != "[issue:20 issue:10]" {
+		t.Fatalf("persisted queue order = %v, want [issue:20 issue:10]", gotRefs)
 	}
 }

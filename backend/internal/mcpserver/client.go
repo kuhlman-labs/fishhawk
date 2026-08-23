@@ -2662,9 +2662,10 @@ type campaignGroomingSource struct {
 	// Limit caps the batch to the top N convertible entries by rank; omitted
 	// (0) means no cap.
 	Limit int `json:"limit,omitempty"`
-	// AllowSuperseded explicitly acknowledges building from an order a newer
-	// approved grooming run has superseded, or one the supersession scan could
-	// not prove is current. Both are REFUSED without it.
+	// AllowSuperseded explicitly acknowledges building from an order a NAMED
+	// newer approved grooming run has superseded — that case and no other. A
+	// scan that could not prove currency, or could not be run, is refused
+	// whatever this carries (K2).
 	AllowSuperseded bool `json:"allow_superseded,omitempty"`
 }
 

@@ -9623,8 +9623,10 @@ paths:
             could not query the epic's children (epic_ref path);
             `issue_set_resolution_failed` — the provider could not resolve the
             named issue set (no-epic `items`-only path);
-            `grooming_order_supersession_unreadable` (E54.6 / #2238) — the
-            supersession check could not read its candidate runs. That last one
+            `grooming_order_supersession_unreadable` (E54.6 / #2238) — a read
+            the currency decision depends on failed. It covers BOTH such reads:
+            the SOURCE run's own stages/artifacts/approvals and the supersession
+            scan's CANDIDATE runs (the message names which). That last one
             fails CLOSED and is deliberately NOT bypassable with
             `grooming_source.allow_superseded`: an operator can knowingly accept
             a stale order, but nobody can acknowledge a read that did not happen.

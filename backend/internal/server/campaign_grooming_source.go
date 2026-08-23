@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -108,10 +109,14 @@ const (
 	// it — because "the scan was capped" is not evidence of absence, and a
 	// caller-set flag cannot stand in for a check that never completed.
 	codeGroomingSupersessionUndetermined = "grooming_order_supersession_undetermined"
-	// codeGroomingSupersessionUnreadable is the infrastructure sibling: the scan
-	// could not be RUN (a run/stage/artifact read failed). Distinct from
-	// undetermined because allow_superseded does NOT bypass it — an operator can
-	// acknowledge a known-stale order, but nobody can acknowledge a read failure.
+	// codeGroomingSupersessionUnreadable is the infrastructure sibling: a read
+	// the currency decision depends on FAILED. It covers BOTH such reads — the
+	// SOURCE run's own stages/artifacts/approvals and the supersession scan's
+	// CANDIDATE runs — because the operator remedy is identical (a backend read
+	// failure to retry, not a stale order), and the two messages already name
+	// which read failed. Distinct from undetermined because allow_superseded
+	// does NOT bypass it — an operator can acknowledge a known-stale order, but
+	// nobody can acknowledge a read failure.
 	codeGroomingSupersessionUnreadable = "grooming_order_supersession_unreadable"
 )
 
@@ -149,6 +154,8 @@ const (
 //     (a cross-tenant run is INDISTINGUISHABLE from a missing one)
 //  3. the run's repo == the campaign's repo         -> 422 grooming_order_repo_mismatch
 //  4. a plan stage carries a grooming_report        -> 422 grooming_order_absent
+//     (an UNREADABLE source run is 502 grooming_order_supersession_unreadable:
+//     one code covers both currency-deciding reads — see its declaration)
 //  5. that stage's approval gate was GRANTED        -> 422 grooming_order_not_approved
 //  6. the report parses                             -> 422 grooming_order_invalid
 //  7. the supersession scan COMPLETED                -> 422 grooming_order_supersession_undetermined
@@ -191,9 +198,16 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 		return nil, nil, notFound
 	}
 	if err != nil {
+		// THE CAUSE RIDES internalCauseKey, NEVER A PLAIN DETAIL KEY (E67.15 /
+		// #2587). A repository error renders storage, query and infrastructure
+		// text that an agent-facing authenticated caller has no business
+		// reading; writeError strips this channel from the body at ANY status
+		// and folds it into the ONE operator log record keyed by error_ref. The
+		// client keeps the static message and the product-owned run_id.
 		return nil, nil, &groomingSourceError{
 			Status: http.StatusInternalServerError, Code: "internal_error",
-			Message: "could not read the grooming run", Details: map[string]any{"error": err.Error()},
+			Message: "could not read the grooming run",
+			Details: map[string]any{"run_id": runID.String(), internalCauseKey: err.Error()},
 		}
 	}
 	// TENANT SCOPING RETURNS THE SAME 404 AS A MISSING RUN. A distinct code (or
@@ -223,8 +237,8 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	if err != nil {
 		return nil, nil, &groomingSourceError{
 			Status: http.StatusBadGateway, Code: codeGroomingSupersessionUnreadable,
-			Message: "could not read the grooming run's stages or artifacts",
-			Details: map[string]any{"run_id": runID.String(), "error": err.Error()},
+			Message: "could not read the grooming run's stages, artifacts or approvals",
+			Details: map[string]any{"run_id": runID.String(), internalCauseKey: err.Error()},
 		}
 	}
 	if found == nil {
@@ -348,7 +362,13 @@ func (s *Server) approvedGroomingReport(ctx context.Context, runID uuid.UUID) (*
 		return nil, fmt.Errorf("list stages for run %s: %w", runID, err)
 	}
 	var best *groomingReportHit
-	var bestAt = int64(-1)
+	// FIRST-HIT SENTINEL, NOT A NUMERIC FLOOR. A prior `bestAt int64 = -1` +
+	// `a.CreatedAt.UnixNano() <= bestAt` skipped an artifact whose CreatedAt is
+	// the ZERO time, because time.Time{}.UnixNano() is a large NEGATIVE number:
+	// a run that DID ship a report surfaced as 422 grooming_order_absent. The
+	// `best != nil &&` prefix makes the FIRST candidate win unconditionally, so
+	// no wall-clock value can be mistaken for an absence.
+	var bestAt time.Time
 	for _, st := range stages {
 		if st == nil || st.Type != run.StageTypePlan {
 			continue
@@ -361,7 +381,7 @@ func (s *Server) approvedGroomingReport(ctx context.Context, runID uuid.UUID) (*
 			if a == nil || a.Kind != artifact.KindGroomingReport {
 				continue
 			}
-			if a.CreatedAt.UnixNano() <= bestAt {
+			if best != nil && !a.CreatedAt.After(bestAt) {
 				continue
 			}
 			approvals, perr := s.cfg.ApprovalRepo.ListForStage(ctx, st.ID)
@@ -387,7 +407,7 @@ func (s *Server) approvedGroomingReport(ctx context.Context, runID uuid.UUID) (*
 			// alongside a grant is NOT ratified: the gate was contested, and a
 			// contested order is exactly the one an operator must re-decide.
 			hit.approved = hit.approveCount > 0 && hit.rejectCount == 0
-			best, bestAt = hit, a.CreatedAt.UnixNano()
+			best, bestAt = hit, a.CreatedAt
 		}
 	}
 	return best, nil
@@ -416,7 +436,7 @@ func (s *Server) newerApprovedGroomingRun(ctx context.Context, source *run.Run) 
 		return &groomingSourceError{
 			Status: http.StatusBadGateway, Code: codeGroomingSupersessionUnreadable,
 			Message: "could not determine whether a newer approved grooming run supersedes this order",
-			Details: map[string]any{"source_run_id": source.ID.String(), "error": err.Error()},
+			Details: map[string]any{"source_run_id": source.ID.String(), internalCauseKey: err.Error()},
 		}
 	}
 

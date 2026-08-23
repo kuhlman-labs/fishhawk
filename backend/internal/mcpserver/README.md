@@ -1769,7 +1769,9 @@ acknowledgement; `grooming_order_supersession_undetermined` says the
 acknowledgement does NOT bypass it (an incomplete scan names no run to
 acknowledge) and points at narrowing the run history;
 `grooming_order_supersession_unreadable` likewise says explicitly NOT to reach
-for it (it is a read failure, not a stale order);
+for it (it is a read failure, not a stale order — one code covering BOTH
+currency-deciding reads, the source run's own stages/artifacts/approvals and the
+scan's candidate runs, whose messages name which);
 `grooming_order_not_approved` names the gate to approve; `grooming_order_absent`
 names the `backlog_grooming` workflow. A `campaign_dangling_dependency` carrying
 `dangling_source: grooming_order` gets its own remedy — widen the batch (raise or
