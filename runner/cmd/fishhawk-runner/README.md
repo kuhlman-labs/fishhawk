@@ -182,14 +182,44 @@ The code is **exact-matched** out of the backend's error envelope
 (`{"error":{"code":…,"message":…}}`) rather than substring-scanned, because
 `message` is free text — a `validation_failed` response whose human-readable
 message merely mentions `plan_invalid` would otherwise be classified
-permanent-B and never retried. When the body does not decode into that envelope
-with a non-empty code (a truncated body, a proxy error page, an older flat
-`{"code":…}` shape), classification **falls back** to the historical substring
-check. That fallback exists so classification never gets *weaker* than it was
-before exact-match landed: losing category-B on a genuinely-invalid artifact
-would turn a permanent failure into a retry loop against a backend that has
-already failed the stage. It is the strictly-less-precise path and runs only
-when the precise one has nothing to read.
+permanent-B and never retried.
+
+**The match is made by a STREAMING token walk (`upload.errorEnvelopeCode`), not
+by `json.Unmarshal`, and that distinction is the control.** `Unmarshal` needs a
+complete, well-formed document, so it fails on any body the classification read
+truncated — and `readClassifiableBody` caps that read at `classifyBodyLimit`
+(8 KiB). A *valid* envelope whose `message` or `details` runs past the cap would
+therefore decode to nothing and drop onto the substring fallback, re-opening the
+exact collision the exact match exists to close: a `validation_failed` envelope
+mentioning `plan_invalid` in its first 8 KiB classified permanent-B and never
+retried. The token walk instead stops the instant it has read `error.code`, so a
+valid envelope is classified from its exact code **regardless of the total
+response length**. Only the code member has to land inside the window, and it
+always does — the backend declares `Code` as `errorBody`'s first field
+(`backend/internal/server/errors.go`) and `encoding/json` emits struct fields in
+declaration order. `TestShipPlan_AgentOutputInvalid_EnvelopeExceedingClassifyLimit`
+drives a 32 KiB envelope through both directions (colliding message → C, listed
+code → B) and reddens if the walk is replaced by `Unmarshal`; `TestErrorEnvelopeCode`
+pins the walk's own truncation contract.
+
+When the body yields no envelope code at all (a proxy error page, an older flat
+`{"code":…}` shape, a body truncated *before* `code` arrived), classification
+**falls back** to the historical substring check. That fallback exists so
+classification never gets *weaker* than it was before exact-match landed: losing
+category-B on a genuinely-invalid artifact would turn a permanent failure into a
+retry loop against a backend that has already failed the stage. It is the
+strictly-less-precise path and runs only when the precise one has nothing to
+read.
+
+**Known residual (accepted, not a defect).** On that fallback path any
+undecodable 400 whose free text merely *contains* a listed code is classified
+permanent-B — `TestShipPlan_AgentOutputInvalid_UndecodableBodyFallsBackToSubstring`
+pins `502 Bad Gateway: plan_invalid` as `wantB=true`. A proxy-injected 400 whose
+prose coincidentally names a code is therefore never retried. This is the
+deliberate trade above, chosen because the alternative failure (retrying forever
+against a stage the backend already failed) is worse. Retiring it is an operator
+decision, available once no flat-`{"code":…}` producers remain; it is not a
+change to make from the runner side alone.
 
 ## Committed-tree verify-fix loop (#651)
 

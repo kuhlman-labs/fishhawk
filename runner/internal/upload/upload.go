@@ -1141,23 +1141,18 @@ var agentOutputInvalidCodes = map[string]struct{}{
 // validation_failed response whose human-readable message merely mentions
 // plan_invalid would otherwise be misclassified permanent-B and never retried.
 //
-// FALLBACK: when the body does not decode into that envelope with a non-empty
-// code — a truncated body, a proxy-injected error page, or an older/flat
-// {"code":…} shape — it degrades to the historical substring check. The
-// fallback exists so a classification never gets WEAKER than it was before
-// exact-match landed: losing category-B on a genuinely-invalid artifact would
-// turn a permanent failure into a retry loop against a backend that already
-// failed the stage. It is the strictly-less-precise path and only runs when
-// the precise one has nothing to read.
+// FALLBACK: when the body yields no envelope code at all — a proxy-injected
+// error page, an older/flat {"code":…} shape, a body whose `error` member never
+// arrived — it degrades to the historical substring check. The fallback exists
+// so a classification never gets WEAKER than it was before exact-match landed:
+// losing category-B on a genuinely-invalid artifact would turn a permanent
+// failure into a retry loop against a backend that already failed the stage. It
+// is the strictly-less-precise path and only runs when the precise one has
+// nothing to read.
 func isAgentOutputInvalid(body string) bool {
-	var env struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(body), &env); err == nil && env.Error.Code != "" {
-		_, ok := agentOutputInvalidCodes[env.Error.Code]
-		return ok
+	if code, ok := errorEnvelopeCode(body); ok {
+		_, listed := agentOutputInvalidCodes[code]
+		return listed
 	}
 	for code := range agentOutputInvalidCodes {
 		if strings.Contains(body, code) {
@@ -1167,11 +1162,137 @@ func isAgentOutputInvalid(body string) bool {
 	return false
 }
 
-// classifyBodyLimit bounds the body read used for error-code classification.
-// It is larger than briefBodyLimit because the envelope's `message` and
-// `details` sit between the code and the closing brace: a 256-byte read
-// truncates a verbose rejection mid-JSON, which would fail the decode and push
-// every such response onto the substring fallback.
+// errorEnvelopeCode extracts error.code from the backend's error envelope
+// ({"error":{"code":…,"message":…}}) with a STREAMING token walk, and reports
+// whether it found one.
+//
+// It does NOT use json.Unmarshal, and that is the whole point. Unmarshal needs
+// a COMPLETE, well-formed document, so it fails on any body the classification
+// read truncated — and truncation is exactly the case that matters here. A
+// rejection whose free-text `message` (or `details`) runs past
+// classifyBodyLimit decodes to nothing under Unmarshal and falls through to the
+// substring scan, re-opening the very collision the exact match exists to
+// close: a validation_failed envelope whose message merely MENTIONS
+// plan_invalid gets classified permanent-B and is never retried (#2833 fix-up).
+//
+// The token walk stops the instant it has read error.code, so a valid envelope
+// is classified from its exact code REGARDLESS of the total response length —
+// only the code member has to land inside the read window, and it always does:
+// the backend declares Code as errorBody's FIRST field
+// (backend/internal/server/errors.go) and encoding/json emits struct fields in
+// declaration order, so `code` is the leading member of the `error` object with
+// nothing ahead of it that could push it past the limit.
+//
+// Returns ("", false) when the body is not that envelope at all, or when the
+// code member did not arrive inside the window — the caller then degrades to
+// the substring fallback.
+func errorEnvelopeCode(body string) (string, bool) {
+	dec := json.NewDecoder(strings.NewReader(body))
+	if !consumeObjectStart(dec) {
+		return "", false
+	}
+	for {
+		key, ok := nextObjectKey(dec)
+		if !ok {
+			return "", false
+		}
+		if key != "error" {
+			if !skipJSONValue(dec) {
+				return "", false
+			}
+			continue
+		}
+		if !consumeObjectStart(dec) {
+			return "", false
+		}
+		for {
+			member, ok := nextObjectKey(dec)
+			if !ok {
+				return "", false
+			}
+			if member != "code" {
+				if !skipJSONValue(dec) {
+					return "", false
+				}
+				continue
+			}
+			tok, err := dec.Token()
+			if err != nil {
+				return "", false
+			}
+			code, ok := tok.(string)
+			if !ok || code == "" {
+				return "", false
+			}
+			return code, true
+		}
+	}
+}
+
+// consumeObjectStart reads one token and reports whether it opened an object.
+func consumeObjectStart(dec *json.Decoder) bool {
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	d, ok := tok.(json.Delim)
+	return ok && d == '{'
+}
+
+// nextObjectKey reads the next member name of the object being walked. It
+// reports false at the object's closing '}' and on any error — including the
+// io.ErrUnexpectedEOF a truncated body produces, which is a normal outcome
+// here rather than a defect.
+func nextObjectKey(dec *json.Decoder) (string, bool) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	name, ok := tok.(string)
+	return name, ok
+}
+
+// skipJSONValue consumes the value at the decoder's cursor, descending through
+// nested objects and arrays, so the walk resumes on the next member name.
+func skipJSONValue(dec *json.Decoder) bool {
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return true // a scalar is consumed whole
+	}
+	if d != '{' && d != '[' {
+		return false
+	}
+	for depth := 1; depth > 0; {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return true
+}
+
+// classifyBodyLimit bounds the body read used for error-code classification,
+// so a pathological response can never be buffered whole.
+//
+// It is larger than briefBodyLimit because a 256-byte read can truncate the
+// envelope BEFORE its `code` member on a body that pads the head (and because
+// the brief excerpt is deliberately short for error messages). It does NOT have
+// to hold the WHOLE envelope: errorEnvelopeCode walks tokens and stops at
+// error.code, so a message or details field running past this limit is simply
+// never read rather than failing a decode. What the limit must contain is the
+// code member alone, which the backend emits first.
 const classifyBodyLimit = 8 << 10
 
 // briefBodyLimit is the excerpt length surfaced in client error messages.
