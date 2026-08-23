@@ -1320,6 +1320,21 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 	// unwinds the approval.
 	if advanced.Type == run.StageTypePlan {
 		s.notifyPlanReady(ctx, advanced.RunID, advanced)
+		// On-approval grooming apply (E54.19 / #2822): when the approved plan
+		// stage carries a grooming_report, apply its HYGIENE-class mutations
+		// through workmgmt.ApplyGrooming — the production caller that seam was
+		// reserved for. Best-effort like the block above: the gate already
+		// passed and its approval row is in place, so a failure logs and never
+		// unwinds the approval.
+		//
+		// THE PLACEMENT IS DELIBERATE AND IS ITSELF PART OF THE CONTROL. This
+		// is the TYPE-only plan block, not the DecisionApprove block above, and
+		// the decision is PASSED rather than implied — so "a rejected report
+		// applies nothing" lives in applyApprovedGrooming as a guard whose
+		// deletion is observable on the reject path. Nesting the call inside the
+		// approve-only block would make that governance property structurally
+		// untestable, and therefore unproven.
+		s.applyApprovedGrooming(ctx, advanced, p.Decision)
 	}
 
 	// Sticky status comment (E20.4 / #330). Every approval changes the run's

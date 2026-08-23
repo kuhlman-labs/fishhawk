@@ -47,9 +47,20 @@ package workmgmt
 //	                   an audit record, and a sink error surfaces AFTER the loop
 //	                   so nothing is silently unaudited. AC3.
 //
-// NOTHING IN PRODUCTION CALLS THIS YET. #2237 reserves the apply seam; no HTTP
-// route, MCP tool, CLI verb, env var, config field or migration calls
-// ApplyGrooming.
+// THE PRODUCTION CALLER IS THE SERVER'S GROOM-GATE APPROVAL HOOK (E54.19 /
+// #2822): backend/internal/server/grooming_apply.go's applyApprovedGrooming
+// runs on the approval of a plan stage carrying a grooming_report, with no
+// agent in the loop. #2237 reserved this seam; #2822 wired it.
+//
+// THAT CALLER AUTHORIZES THE HYGIENE CLASS ONLY. It synthesizes an approved
+// GroomingDecision for the report's hygiene defects and dependency edges — both
+// of which groomingActionClass routes to `hygiene` — and NONE for the ordering,
+// duplicate, decomposition or vision-drift entries, which therefore reach rule 2
+// with no decision and are recorded skipped with GroomingSkipNoDecision.
+// Ordering, dedup and scoping stay PROPOSAL-ONLY until a per-entry
+// decision-capture surface exists to carry a real operator verdict for them; a
+// caller that wants to widen that must supply the decisions, not weaken a rule
+// here.
 
 import (
 	"context"
@@ -317,6 +328,21 @@ var groomingActionClass = map[string]string{
 	plan.GroomingClassDuplicate:     "dedup",
 	plan.GroomingClassDecomposition: "scoping",
 	plan.GroomingClassVisionDrift:   "scoping",
+}
+
+// GroomingActionClassFor maps a REPORT entry class onto the ACTION class the
+// resolved autonomy matrix keys on, returning "" for a class this package does
+// not recognize.
+//
+// It is EXPORTED so a consumer deciding "is this entry hygiene?" — the server's
+// groom-gate apply hook is the one that exists (E54.19 / #2822) — answers it
+// through the SAME map the derivation uses instead of duplicating the mapping.
+// A duplicate would let the two drift, and the direction that drift fails in is
+// a consumer auto-applying a class this package has since reclassified as
+// destructive. Unknown returns the empty string rather than a guess, so an
+// equality test against a named class is false for anything unrecognized.
+func GroomingActionClassFor(reportClass string) string {
+	return groomingActionClass[reportClass]
 }
 
 // groomingHygieneKinds maps each hygiene defect in grooming-report-v1's closed

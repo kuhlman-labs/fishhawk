@@ -467,12 +467,21 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 // entry is absent from the baseline and resurfaces. That is AC4's requirement
 // and the fail-safe direction in one rule.
 //
-// STATED GAP (#2240): nothing in production calls ApplyGrooming yet — #2237
-// shipped the apply layer with its seam deliberately unwired — so today no
-// grooming_mutation_applied row exists and every baseline resolves empty,
-// which correctly proposes everything. The wiring here is complete and reads
-// the real category, so dispositions populate the moment an apply consumer
-// lands, with no change to this function.
+// THE PRODUCTION WRITER IS THE GROOM-GATE APPROVAL HOOK (E54.19 / #2822):
+// grooming_apply.go's applyApprovedGrooming calls workmgmt.ApplyGrooming on the
+// approval of a plan stage carrying a grooming_report, and its audit sink is
+// what writes the grooming_mutation_applied rows this function reads. The
+// wiring here needed NO change when that landed — it already read the real
+// category off the real payload shape, which is the whole point of having
+// shipped it complete.
+//
+// WHAT THAT CHANGES IN PRACTICE, stated rather than implied: only HYGIENE-class
+// entries carry a decision today, so an applied hygiene entry now yields a real
+// disposition and correctly stops resurfacing, while every ordering, duplicate,
+// decomposition and vision-drift entry receives NO decision, contributes NO
+// disposition, and correctly resurfaces on the next run. A degrade path in the
+// hook writes no grooming_mutation_applied row at all, so a failed apply also
+// leaves its entries proposing.
 //
 // Every failure degrades to a NAMED reason and an empty-or-partial baseline
 // rather than an error: a suppression control that cannot read its baseline

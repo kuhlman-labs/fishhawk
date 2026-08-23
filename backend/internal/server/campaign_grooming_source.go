@@ -163,14 +163,21 @@ const (
 //     and named no newer approved grooming run       -> 422 grooming_order_superseded
 //  8. the order names at least one target-repo issue -> 422 grooming_order_empty
 //
-// STEP 5 IS THE RATIFICATION CHECK. #2237 shipped workmgmt.ApplyGrooming with
-// its seam deliberately unwired, so no production path writes a
-// grooming_mutation_applied row and a per-entry disposition read would resolve
-// empty for every report. The shipped ratification mechanism is the
+// STEP 5 IS THE RATIFICATION CHECK. The ratification mechanism is the
 // backlog_grooming workflow's `groom` stage approval gate
 // (.fishhawk/workflows.yaml: type approval, count 1, not [author, agent]), so an
 // approved order is defined here as: the grooming_report artifact of a plan
 // stage carrying at least one approval.DecisionApprove and NO DecisionReject.
+//
+// THAT GATE APPROVAL IS NOW BOTH THE RATIFICATION SIGNAL AND THE APPLY TRIGGER
+// (E54.19 / #2822): grooming_apply.go's applyApprovedGrooming fires on the same
+// approval and re-reads the SAME predicate (>= 1 grant, 0 rejections) before it
+// dispatches a single hygiene mutation. Keeping the two surfaces on one
+// predicate is deliberate — a campaign built from a report and an apply of that
+// report must agree on what "ratified" means, and two independently-drifting
+// definitions would let one act on an order the other refuses. Tightening both
+// to a real gate-satisfaction count (they coincide only under `count: 1`) is a
+// follow-up that must move them together.
 func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFullName string, gs *groomingSourceRequest) (*campaign.GroomingOrder, *campaignGroomingSourcePayload, error) {
 	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.ApprovalRepo == nil {
 		return nil, nil, &groomingSourceError{
