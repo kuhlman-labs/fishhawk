@@ -89,6 +89,26 @@ type ReadWorkItemRequest struct {
 // the Conventions.States canonical -> provider-option map. IncludeClosed adds
 // closed items to the enumeration (open-only otherwise). Limit caps the
 // returned item count AFTER filtering; 0 means no caller cap.
+//
+// Newest and MaxScanned are the BOUNDED-WINDOW opt-ins. Both default to zero
+// values that leave the enumeration exactly as it was: unbounded, in the
+// provider's default order.
+//
+// MaxScanned is NOT another Limit, and the distinction is the whole reason it
+// is a separate field. Limit is a CALLER cap applied after client-side
+// filtering — the provider still enumerates the complete set, so a Limit of 10
+// over a 4000-issue backlog still walks 40 pages. MaxScanned is a PUSH-DOWN:
+// it bounds what the PROVIDER enumerates, so the round trips beyond the window
+// are never made. A caller that wants a cheap read wants MaxScanned; a caller
+// that wants at most N results out of a complete scan wants Limit. Setting
+// both is meaningful (bound the scan, then cap the filtered result).
+//
+// Newest asks the provider to enumerate NEWEST-FIRST, which is what makes a
+// MaxScanned window useful rather than arbitrary: a bounded read of the
+// provider's default order is a bounded read of the OLDEST items, which is
+// almost never the intent. Providers that cannot order newest-first are free
+// to ignore it — the field is a request, and WorkItemPage carries no claim
+// that it was honoured.
 type ListWorkItemsRequest struct {
 	Target            Target
 	Labels            []string
@@ -97,6 +117,8 @@ type ListWorkItemsRequest struct {
 	States            map[string]string
 	IncludeClosed     bool
 	Limit             int
+	Newest            bool
+	MaxScanned        int
 }
 
 // WorkItemRecord is one read work item in provider-neutral vocabulary.
@@ -138,9 +160,24 @@ type WorkItemRecord struct {
 // board state was actually resolved for the items — false when the caller did
 // not ask for it, so an empty BoardState on every record is unambiguously "not
 // asked" rather than "asked and nothing found".
+//
+// Truncated states honestly that the provider's enumeration was CUT at the
+// request's MaxScanned window rather than exhausted, so a caller can tell "no
+// match in the whole backlog" apart from "no match in the part I paid to
+// look at" — the same not-asked/asked-and-empty distinction
+// BoardStateResolved draws, one layer out. It is always false for an
+// unbounded request.
+//
+// It is an HONEST OVER-REPORT in the exact-fit case: a provider decides it by
+// observing that the enumeration came back holding exactly MaxScanned items,
+// which is also what a backlog of exactly MaxScanned items produces. That
+// ambiguity is stated rather than papered over, and it errs the safe way — a
+// caller that treats Truncated as "there may be more" is never wrong about a
+// genuinely truncated window, only over-cautious about a perfectly-sized one.
 type WorkItemPage struct {
 	Items              []WorkItemRecord
 	BoardStateResolved bool
+	Truncated          bool
 }
 
 // UnavailableReason is the closed set of reasons a work-management capability
