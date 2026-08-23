@@ -13635,14 +13635,22 @@ paths:
           grooming_report_v1`, and recorded with a chained
           `grooming_report_recorded` audit entry carrying the content hash
           and the per-class entry counts. Valid only from a `plan`-typed
-          stage — the PROPOSE stage per ADR-067 §2.
+          stage — the PROPOSE stage per ADR-067 §2. On a successful ingest
+          the plan stage is SETTLED via the same terminal transition the
+          plan artifact takes (#2837): `running → awaiting_approval` when
+          the stage is gated, or `running → succeeded` plus an orchestrator
+          advance when it is not. An invalid or wrong-stage-type report
+          fails the stage category-B and NEVER reaches the gate; every
+          storage 500 leaves the stage in `running` for the runner's retry.
 
         Idempotent on (stage_id, content_hash): re-uploading the same
         bytes returns 200 with the existing artifact rather than inserting
         a duplicate row. For a grooming report that idempotent path also
         VERIFIES the paired audit entry exists and appends it when missing,
         so a retry after a partial write cannot leave the artifact durable
-        and the chain silent.
+        and the chain silent — and it RE-SETTLES the stage, so a retry
+        after a partial first write cannot leave a settled report's stage
+        stranded in `running`.
       tags: [runner]
       security: []
       parameters:

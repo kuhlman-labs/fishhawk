@@ -243,15 +243,23 @@ func TestHandleGroomingReport_OrdinaryReport_CensusOmitsMilestoneKeys(t *testing
 
 // TestHandleShipPlan_GroomingReport_Idempotent: a runner retry re-POSTs the same
 // bytes and gets 200 idempotent with exactly one artifact row and one audit
-// entry.
+// entry — AND the retry ALSO settles the stage (#2837). A runner whose first
+// POST 500'd after Create re-POSTs the same bytes; without the settle on the
+// retry path that retry would re-strand the stage in running, so the retry is
+// asserted to leave the stage settled at its gate, not just deduped.
 func TestHandleShipPlan_GroomingReport_Idempotent(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
-	s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	s, sf, ar, au, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
 	priv, _ := sf.issue(t, runID)
 	body := validGroomingReportBytes(t)
 
 	if w := shipPlanRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
 		t.Fatalf("first upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after first upload: stage state = %q, want awaiting_approval", got)
 	}
 	w2 := shipPlanRequest(t, s, runID, stageID, priv, body, "")
 	if w2.Code != http.StatusOK {
@@ -267,6 +275,11 @@ func TestHandleShipPlan_GroomingReport_Idempotent(t *testing.T) {
 	}
 	if n := len(groomingAuditEntries(au)); n != 1 {
 		t.Errorf("grooming_report_recorded entries = %d, want 1 (no second append)", n)
+	}
+	// The retry re-settled the stage: it is still at its gate (the same-state
+	// re-application is a valid no-op), never re-stranded in running.
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("after retry: stage state = %q, want awaiting_approval — the retry must re-settle, not re-strand", got)
 	}
 }
 
@@ -615,7 +628,9 @@ func TestHandleShipPlan_GroomingReport_StorageFailures_500(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, stageID := uuid.New(), uuid.New()
-			s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+			s, sf, ar, au, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+			rr.getStages[stageID].State = run.StageStateRunning
+			rr.getStages[stageID].RequiresApproval = true
 			priv, _ := sf.issue(t, runID)
 			tc.inject(ar, au)
 
@@ -626,7 +641,178 @@ func TestHandleShipPlan_GroomingReport_StorageFailures_500(t *testing.T) {
 			if !bytes.Contains(w.Body.Bytes(), []byte(tc.wantMsg)) {
 				t.Errorf("body should name %q: %s", tc.wantMsg, w.Body.String())
 			}
+			// NO SETTLE on a 500 (#2837): the stage must stay in running so the
+			// runner's retry can heal it. Advancing a not-durable report to the
+			// gate would turn a failed ingest into an approvable one.
+			if got := rr.getStages[stageID].State; got != run.StageStateRunning {
+				t.Errorf("stage state = %q, want running — a storage 500 must not settle the stage", got)
+			}
+			if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 0 {
+				t.Errorf("transitions to awaiting_approval = %d, want 0 on a storage failure", n)
+			}
 		})
+	}
+}
+
+// --- E54.29 / #2837: terminal settle of the grooming plan stage -------------
+
+// groomingTransitionsTo counts how many recorded TransitionStage calls targeted
+// `to`, so a settle to the gate is assertable independently of the final state.
+func groomingTransitionsTo(rr *promptRunRepo, to run.StageState) int {
+	n := 0
+	for _, c := range rr.transitionStageCalls {
+		if c.To == to {
+			n++
+		}
+	}
+	return n
+}
+
+// TestHandleShipPlan_GroomingReport_GatedStageAdvancesToApprovalGate is the
+// DONE-MEANS behavioral test (#2837): a valid grooming_report shipped from a
+// gated plan stage must SETTLE the stage to awaiting_approval, not leave it in
+// running. It asserts the shipped observable transition (exactly one transition
+// to awaiting_approval, and the post-call stage no longer running), so a
+// scope-touch that edits only comments in grooming_report.go still fails.
+func TestHandleShipPlan_GroomingReport_GatedStageAdvancesToApprovalGate(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validGroomingReportBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 1 {
+		t.Errorf("transitions to awaiting_approval = %d, want exactly 1; transitions=%+v", n, rr.transitionStageCalls)
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("final stage state = %q, want awaiting_approval — the ingest must settle the stage, not leave it running", got)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+}
+
+// TestHandleShipPlan_GroomingReport_GatelessStageSucceedsAndAdvancesRun covers
+// the gateless arm the operator required not hang either (#2837). The shipped
+// backlog_grooming groom stage IS gated, so this arm is test-only: a
+// spec-expressible gateless grooming stage must settle to succeeded AND fire
+// the orchestrator's Advance, proven by the run rolling up to succeeded with
+// its only stage complete. It uses the real orchestrator via
+// newPlanSequenceServer.
+func TestHandleShipPlan_GroomingReport_GatelessStageSucceedsAndAdvancesRun(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	s, rr, _, sf, _ := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	stage.RequiresApproval = false // gateless
+	priv, _ := sf.issue(t, runRow.ID)
+
+	w := shipPlanRequest(t, s, runRow.ID, stage.ID, priv, validGroomingReportBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if !rr.sawTransitionTo(run.StageStateSucceeded) {
+		t.Errorf("stage never transitioned to succeeded; transitions=%+v", rr.stageTransitions)
+	}
+	if got := rr.stagesByID[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("final stage state = %q, want succeeded", got)
+	}
+	// Proof Advance was invoked: with the only stage succeeded, the orchestrator
+	// completes the run. A missing Advance would leave the run non-terminal.
+	rn, err := rr.GetRun(context.Background(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if rn.State != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded — the gateless settle must fire the orchestrator's Advance", rn.State)
+	}
+}
+
+// TestHandleShipPlan_GroomingReport_InvalidReport_DoesNotReachGate is the
+// FAIL-CLOSED control the operator flagged as the half that matters (#2837 C4).
+// A semantically invalid report must still fail category-B and must NOT reach
+// awaiting_approval; a change that settled every ingest unconditionally would
+// turn a rejected artifact into an approvable one — a governance defect. The
+// bad state is seeded BY CONSTRUCTION (a report that fails grooming-report-v1
+// outright), so the RED lands on the gate assertion, not on fixture setup.
+//
+// Counterfactual vehicle: hoisting the advancePlanStageTerminal call above the
+// validation guard turns this RED on the awaiting_approval transition count.
+func TestHandleShipPlan_GroomingReport_InvalidReport_DoesNotReachGate(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
+	priv, _ := sf.issue(t, runID)
+
+	body := []byte(`{"kind":"grooming_report","report_version":"not_a_version"}`)
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("grooming_report_invalid")) {
+		t.Errorf("error code missing grooming_report_invalid: %s", w.Body.String())
+	}
+	if !sawFailureCategoryB(rr) {
+		t.Errorf("stage did not fail category-B; transitions=%+v", rr.transitionStageCalls)
+	}
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 0 {
+		t.Errorf("transitions to awaiting_approval = %d, want 0 — an invalid report must never reach the gate", n)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 — an invalid report must not persist", len(ar.all))
+	}
+}
+
+// TestHandleShipPlan_GroomingReport_WrongStageType_DoesNotReachGate is the
+// sibling fail-closed control: a report shipped from a non-plan stage fails
+// category-B and must NOT reach the gate (#2837 C4).
+func TestHandleShipPlan_GroomingReport_WrongStageType_DoesNotReachGate(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, rr := newGroomingServer(t, runID, stageID, run.StageTypeImplement)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validGroomingReportBytes(t), "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("grooming_report_stage_invalid")) {
+		t.Errorf("error code missing grooming_report_stage_invalid: %s", w.Body.String())
+	}
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 0 {
+		t.Errorf("transitions to awaiting_approval = %d, want 0 — a report from a non-plan stage must never reach the gate", n)
+	}
+}
+
+// TestHandleShipPlan_GroomingReport_TransitionFailure_StillReturns201 pins the
+// best-effort contract the operator asked to confirm at pre-flight (#2837 C3):
+// advancePlanStageTerminal returns only *run.Stage and WARN-logs a transition
+// error, so a settle failure must NOT unwind the durable ingest. The 201 and
+// the persisted artifact are unaffected; the settle is attempted (recorded)
+// then errors.
+func TestHandleShipPlan_GroomingReport_TransitionFailure_StillReturns201(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
+	rr.transitionStageErr = errors.New("transition boom")
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validGroomingReportBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a best-effort settle must not unwind the durable ingest:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 — a transition failure must not lose the persisted report", len(ar.all))
+	}
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 1 {
+		t.Errorf("settle attempts to awaiting_approval = %d, want 1 (recorded before the error)", n)
 	}
 }
 

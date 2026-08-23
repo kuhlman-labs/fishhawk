@@ -6,7 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1440,6 +1444,87 @@ func TestDetectArtifactKind(t *testing.T) {
 	}
 	if _, err := plan.DetectArtifactKind([]byte("{ not json")); !errors.As(err, &perr) {
 		t.Errorf("malformed: err = %v, want *ParseError", err)
+	}
+}
+
+// TestAllArtifactKinds_EnumeratesEveryDeclaredConst is the structural guard
+// behind AllArtifactKinds' promise (#2837 C2): a new plan-stage sibling cannot
+// be declared without entering the enumeration the cross-sibling settle table
+// drives. It parses THIS package's own non-test source — every .go file, not
+// just plan.go — so a kind declared in a different file of the package is still
+// caught; a single-file scan would fail silently the day the const block is
+// split, which is the worst way for a guard to fail.
+//
+// It fails naming the exact const and the exact file it was found in, so a
+// future reader sees what to add to AllArtifactKinds() rather than a bare
+// regexp mismatch.
+func TestAllArtifactKinds_EnumeratesEveryDeclaredConst(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+
+	// Collect every `Ident ArtifactKind = "value"` const declaration's string
+	// value across all non-test .go files, mapping value -> declaring file so a
+	// failure can name where to look. Enumerating files directly (rather than
+	// parser.ParseDir, deprecated in Go 1.25) still covers the whole package.
+	fset := token.NewFileSet()
+	declared := map[string]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		for _, decl := range file.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				id, ok := vs.Type.(*ast.Ident)
+				if !ok || id.Name != "ArtifactKind" || len(vs.Values) == 0 {
+					continue
+				}
+				lit, ok := vs.Values[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("ArtifactKind const %v has a non-string-literal value in %s; the guard cannot resolve its kind string", vs.Names, name)
+				}
+				val, uerr := strconv.Unquote(lit.Value)
+				if uerr != nil {
+					t.Fatalf("unquote ArtifactKind literal %q in %s: %v", lit.Value, name, uerr)
+				}
+				declared[val] = name
+			}
+		}
+	}
+	if len(declared) == 0 {
+		t.Fatal("found no ArtifactKind const declarations; the parser or the type name drifted")
+	}
+
+	enumerated := map[string]bool{}
+	for _, k := range plan.AllArtifactKinds() {
+		enumerated[string(k)] = true
+	}
+
+	// Every declared const must be enumerated.
+	for val, fileName := range declared {
+		if !enumerated[val] {
+			t.Errorf("ArtifactKind %q declared in %s is missing from plan.AllArtifactKinds(); a new sibling must declare the state its ingest settles to (#2837)", val, fileName)
+		}
+	}
+	// And no enumerated member may lack a declaring const.
+	for _, k := range plan.AllArtifactKinds() {
+		if _, ok := declared[string(k)]; !ok {
+			t.Errorf("plan.AllArtifactKinds() lists %q but no `ArtifactKind = %q` const declares it in the package source", k, string(k))
+		}
 	}
 }
 
