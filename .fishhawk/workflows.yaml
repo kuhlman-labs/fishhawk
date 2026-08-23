@@ -516,7 +516,15 @@ workflows:
         type: plan
         executor:
           agent: claude-code
-          timeout: 20m
+          # 45m, not 20m. A real grooming pass over this repository's backlog
+          # measured 1408s (~23.5m) of stage time on run e96bd014 — it scans a
+          # ~300-item window, reads the charter, and writes a ~43KB report with
+          # a rubric citation per ordering entry. The original 20m was set
+          # before any live run existed and was guesswork; it is now measured.
+          # Overrunning is not a cheap failure: on e96bd014 the artifact was
+          # ingested and the churn guard ran, and the stage was still stranded
+          # in `running` with no gate (#2837), so the margin has to be real.
+          timeout: 45m
         inputs:
           - source: github_issue
             required: true
