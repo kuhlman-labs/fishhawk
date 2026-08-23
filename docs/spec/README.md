@@ -8,11 +8,11 @@ Machine-readable schemas and reference docs for the v0 surfaces that span the ru
 |---|---|---|---|
 | Workflow spec v0 (`.fishhawk/workflows.yaml`) | [`workflow-v0.md`](workflow-v0.md) | [`workflow-v0.schema.json`](workflow-v0.schema.json) | [`examples/workflow-v0-feature-change.yaml`](examples/workflow-v0-feature-change.yaml), [`examples/workflow-v0-routine-change.yaml`](examples/workflow-v0-routine-change.yaml) |
 | Workflow spec v1 (`.fishhawk/workflows.yaml`, ADR-046) | [`workflow-v1.md`](workflow-v1.md) | [`workflow-v1.schema.json`](workflow-v1.schema.json) | [`examples/workflow-v1-acceptance.yaml`](examples/workflow-v1-acceptance.yaml) (feature_change with a v1.3 acceptance stage — the verbatim operator companion-commit stanza); base grammar in [`workflow-v0.md`](workflow-v0.md) |
-| Workflow spec v2 (`.fishhawk/workflows.yaml`, ADR-067) | [`workflow-v2.md`](workflow-v2.md) — the **complete standalone** reference for major 2 (E52.9 / #2221); no earlier major is needed to look up a v2 field | [`workflow-v2.schema.json`](workflow-v2.schema.json) | [`examples/workflow-v2-backlog-grooming.yaml`](examples/workflow-v2-backlog-grooming.yaml) (the SHIPPED backlog-grooming declaration: a NON-code-change workflow on the plan/implement/review types — propose → gate → apply, producing no diff (E52.7 / #2219), carrying the non-diff `applies_to: {trigger: […]}` routing form, `autonomy: low` plus the four-class grooming action matrix, and a forge-neutral `approvals` gate per gated stage (E54.4 / #2236); read from disk and asserted by `TestShippedGroomingExample_*`), [`examples/workflow-v2-reuse.yaml`](examples/workflow-v2-reuse.yaml) + its generated resolved form [`examples/workflow-v2-reuse.resolved.json`](examples/workflow-v2-reuse.resolved.json) (`defaults` / `extends`; E52.4 / #2216) |
+| Workflow spec v2 (`.fishhawk/workflows.yaml`, ADR-067) | [`workflow-v2.md`](workflow-v2.md) — the **complete standalone** reference for major 2 (E52.9 / #2221); no earlier major is needed to look up a v2 field | [`workflow-v2.schema.json`](workflow-v2.schema.json) | [`examples/workflow-v2-backlog-grooming.yaml`](examples/workflow-v2-backlog-grooming.yaml) (the SHIPPED backlog-grooming declaration: a NON-code-change workflow on the plan/implement/review types — propose → gate → apply, producing no diff (E52.7 / #2219), carrying the non-diff `applies_to: {trigger: […]}` routing form, `autonomy: low` plus the four-class grooming action matrix, and a forge-neutral `approvals` gate per gated stage (E54.4 / #2236); read from disk and asserted by `TestShippedGroomingExample_*`), [`examples/workflow-v2-milestone-scoping.yaml`](examples/workflow-v2-milestone-scoping.yaml) (the illustrative milestone-scoping grooming variant declaring the non-delegable `milestone` action class at `mode: report`; E54.9 / #2309), [`examples/workflow-v2-reuse.yaml`](examples/workflow-v2-reuse.yaml) + its generated resolved form [`examples/workflow-v2-reuse.resolved.json`](examples/workflow-v2-reuse.resolved.json) (`defaults` / `extends`; E52.4 / #2216) |
 | workflow-v1 → workflow-v2 migration (`fishhawk migrate-spec`, E52.8 / #2220) | [`workflow-migration.md`](workflow-migration.md) | — (translates between the v1 and v2 schemas above) | golden fixture pair in `cli/internal/spec/testdata/migrate/` |
 | Plan artifact `standard_v1` | [`plan-standard-v1.md`](plan-standard-v1.md) | [`plan-standard-v1.schema.json`](plan-standard-v1.schema.json) | [`examples/plan-standard-v1-example.json`](examples/plan-standard-v1-example.json) |
 | Clarification request artifact (`standard_v1` sibling) | [`clarification-request-v1.md`](clarification-request-v1.md) | [`clarification-request-v1.schema.json`](clarification-request-v1.schema.json) | inline in [`clarification-request-v1.md`](clarification-request-v1.md#example) |
-| Grooming report artifact (plan-stage sibling, ADR-065 §3) | [`grooming-report-v1.md`](grooming-report-v1.md) | [`grooming-report-v1.schema.json`](grooming-report-v1.schema.json) | [`examples/grooming-report-v1-example.json`](examples/grooming-report-v1-example.json) |
+| Grooming report artifact (plan-stage sibling, ADR-065 §3) | [`grooming-report-v1.md`](grooming-report-v1.md) | [`grooming-report-v1.schema.json`](grooming-report-v1.schema.json) | [`examples/grooming-report-v1-example.json`](examples/grooming-report-v1-example.json), [`examples/grooming-report-v1-milestone-example.json`](examples/grooming-report-v1-milestone-example.json) (the optional `milestone_scope` variant — a scoped, sequenced release milestone with the calls it declined to make, E54.9 / #2309) |
 | Operator role spec v0 (shipped default + `.fishhawk/operator.yaml` overlay, ADR-040) | [`operator-role.md`](operator-role.md) | [`operator-role.schema.json`](operator-role.schema.json), [`operator-role-overlay.schema.json`](operator-role-overlay.schema.json) | [`operator-role-default.yaml`](operator-role-default.yaml) (shipped default — a product artifact, synced like the schemas), [`examples/operator-role-overlay-example.yaml`](examples/operator-role-overlay-example.yaml) |
 
 All schemas are JSON Schema Draft 2020-12.
@@ -40,7 +40,8 @@ check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \
 
 # a v2 spec declares version: "2" — the dotted minor form is rejected.
 check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
-    docs/spec/examples/workflow-v2-backlog-grooming.yaml
+    docs/spec/examples/workflow-v2-backlog-grooming.yaml \
+    docs/spec/examples/workflow-v2-milestone-scoping.yaml
 
 # NOT examples/workflow-v2-reuse.yaml: v2 `defaults` / `extends` are resolved
 # BEFORE schema validation, so the schema only ever sees the RESOLVED document
@@ -52,7 +53,8 @@ check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \
     docs/spec/examples/plan-standard-v1-example.json
 
 check-jsonschema --schemafile docs/spec/grooming-report-v1.schema.json \
-    docs/spec/examples/grooming-report-v1-example.json
+    docs/spec/examples/grooming-report-v1-example.json \
+    docs/spec/examples/grooming-report-v1-milestone-example.json
 
 check-jsonschema --schemafile docs/spec/operator-role.schema.json \
     docs/spec/operator-role-default.yaml

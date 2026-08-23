@@ -73,6 +73,10 @@
       "type": "array",
       "items": { "$ref": "#/$defs/decomposition-suggestion" },
       "description": "Items the groomer proposes splitting into children. Required as an array; empty states 'none found'."
+    },
+    "milestone_scope": {
+      "$ref": "#/$defs/milestone-scope",
+      "description": "OPTIONAL (E54.9 / #2309). Present only when the report scopes a release milestone against a human-supplied release definition: the selected, sequenced and excluded backlog items plus the calls it declined to make. Its ABSENCE means this is an ordinary grooming report — additive within the frozen grooming_report_v1 major, so an existing report validates unchanged. A milestone_scope proposes no tracker mutation."
     }
   },
 
@@ -183,8 +187,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 512,
-      "pattern": "^(ordering|duplicate|hygiene|dependency|vision_drift|decomposition):[a-z0-9][a-z0-9._/#+-]*(:[a-z0-9][a-z0-9._-]*)?$",
-      "description": "A stable entry id, DERIVED (never minted per run) as `<class>:<item-key>` or `<class>:<item-key>:<qualifier>` or `<class>:<key-a>+<key-b>`. Lowercase throughout, including the qualifier segment — see grooming-report-v1.md § Entry-id derivation for the normative rules, which the validator machine-checks by recomposing each id from the entry's own fields."
+      "pattern": "^(ordering|duplicate|hygiene|dependency|vision_drift|decomposition|milestone_inclusion|milestone_exclusion|milestone_declined):[a-z0-9][a-z0-9._/#+-]*(:[a-z0-9][a-z0-9._-]*)?$",
+      "description": "A stable entry id, DERIVED (never minted per run) as `<class>:<item-key>` or `<class>:<item-key>:<qualifier>` or `<class>:<key-a>+<key-b>`, plus the ZERO-REF form `<class>:<qualifier>` a milestone declined call uses (an ambiguous scope question is not necessarily anchored to one item). Lowercase throughout, including the qualifier segment — see grooming-report-v1.md § Entry-id derivation for the normative rules, which the validator machine-checks by recomposing each id from the entry's own fields."
     },
 
     "rubric-citation": {
@@ -380,6 +384,223 @@
             }
           },
           "description": "At least two children — a 'split' into one is not a split."
+        }
+      }
+    },
+
+    "milestone-scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_definition",
+        "framing",
+        "included",
+        "excluded",
+        "declined_calls",
+        "critical_path",
+        "edge_confidence"
+      ],
+      "description": "A scoped, sequenced release milestone (E54.9 / #2309). The class takes a human-supplied release definition and produces the selected items (each with a membership reason and a wave index), the excluded items (each with a reason), the calls it declined to make, a critical path, and its confidence in the prose-derived dependency edges. Seven semantic rules the schema cannot express are machine-checked by plan.ValidateGroomingReport (wave contiguity, dependency resolvability, strict wave monotonicity, out-of-scope dependencies requiring a declined call, critical-path connectivity, declined-call referential integrity, and canonical ordering of every array so identical input yields byte-identical output). Proposes no tracker mutation.",
+      "properties": {
+        "release_definition": { "$ref": "#/$defs/release-definition" },
+        "framing": { "$ref": "#/$defs/milestone-framing" },
+        "included": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/milestone-inclusion" },
+          "description": "The items scoped INTO the milestone, each with a membership reason and a wave index. minItems:0 — an empty scoped set is a real, different claim from an absent milestone_scope key. Sorted by (wave, item key) — canonical ordering, enforced semantically."
+        },
+        "excluded": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/milestone-exclusion" },
+          "description": "The items scoped OUT, each with a reason and a rubric citation. Sorted by item key (enforced semantically)."
+        },
+        "declined_calls": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/milestone-declined-call" },
+          "description": "The ambiguous scope questions the class REFUSED to resolve, surfaced for an operator rather than guessed. REQUIRED and may be empty: an empty array states 'nothing was ambiguous', an absent key states nothing at all. Sorted by question_id (enforced semantically)."
+        },
+        "critical_path": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/item-key" },
+          "description": "The longest dependency chain through the milestone, as an ORDERED sequence of item keys. Each consecutive pair MUST be connected by a declared depends_on edge (element i+1 depends on element i), so the sequence is a real path through the graph rather than unrelated items in increasing waves — enforced semantically. Order is meaningful, so this array is NOT canonicalized by sorting."
+        },
+        "edge_confidence": { "$ref": "#/$defs/edge-confidence" }
+      }
+    },
+
+    "release-definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "text", "source"],
+      "description": "The human-supplied release definition the milestone is scoped against. The class must NEVER invent this — the only admitted provenance names the human.",
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short human name for the milestone (e.g. \"alpha\", \"v0.3\")."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The release definition as the operator supplied it — the fuzzy prose the class scopes against."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["operator_input"],
+          "description": "Provenance. Single-value enum: the release definition is a human input, never derived, so the only admitted source names the operator."
+        }
+      }
+    },
+
+    "milestone-framing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement", "basis"],
+      "description": "How the class framed the milestone: the step most likely to be plausible-and-wrong, so it is stated explicitly and grounded.",
+      "properties": {
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The framing the class adopted — what it took the milestone to mean before scoping items into it."
+        },
+        "basis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The architectural anchor for the framing — an ADR, an architecture-doc section, or a charter line — so a reviewer can check the framing against something concrete."
+        }
+      }
+    },
+
+    "milestone-inclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "reason", "wave", "rubric_citations"],
+      "description": "One item scoped INTO the milestone. `reason` and `rubric_citations` are the legibility control (criteria 1 and 3): a bare list is unexpressible.",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this item is in the milestone. Non-empty by construction."
+        },
+        "wave": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The 0-based DAG layer this item sits in. Waves across `included` must be exactly the contiguous set 0..K (enforced semantically), so the assignment describes an executable sequence."
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/item-key" },
+          "description": "Item keys this inclusion depends on. Each must resolve to an item in `included` or `excluded` (enforced semantically). Sorted (canonical ordering, enforced semantically)."
+        },
+        "open_question_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "The declined_calls[].question_id values this inclusion is contingent on — e.g. when it depends on an out-of-scope item, the ambiguity that was declined rather than resolved silently. Each must match some declined_calls[].question_id (enforced semantically). Sorted (canonical ordering)."
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubric-citation" },
+          "description": "At least one charter rubric line grounding the inclusion — the same citation control #2235 applies to ordering entries. REQUIRED with minItems:1. Sorted by rubric_id (canonical ordering)."
+        }
+      }
+    },
+
+    "milestone-exclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "reason", "rubric_citations"],
+      "description": "One item scoped OUT of the milestone. `rubric_citations` is REQUIRED on the SAME terms as an inclusion: \"why is E61 out of alpha\" needs the same grounding as why something is in, or the exclusion is the taste argument the charter rubric exists to prevent (approval condition C2).",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this item is excluded. Non-empty by construction."
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubric-citation" },
+          "description": "At least one charter rubric line grounding the exclusion. REQUIRED with minItems:1 (C2). Sorted by rubric_id (canonical ordering)."
+        }
+      }
+    },
+
+    "milestone-declined-call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "question_id", "question", "why_ambiguous", "rubric_citations"],
+      "description": "One ambiguous scope question the class REFUSED to resolve. Mirrors the clarification_request question shape so an operator can answer it. `rubric_citations` is REQUIRED on the same terms as inclusions/exclusions (C2).",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "question_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "A stable id for the question. This value, LOWERCASED, is the entry id's zero-ref qualifier (`milestone_declined:<lowercased question_id>`), so it must be case-insensitively unique across declined_calls."
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The ambiguous question, phrased for an operator to answer."
+        },
+        "why_ambiguous": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the class could not resolve it from the release definition alone. Non-empty by construction."
+        },
+        "recommended_default": {
+          "type": "string",
+          "description": "Optional. The answer the class would pick if forced, so an operator can accept it in one step."
+        },
+        "options": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional. The candidate answers. Sorted (canonical ordering)."
+        },
+        "item_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/item-ref" },
+          "description": "Optional. The backlog items the question bears on. Sorted by item key (canonical ordering)."
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubric-citation" },
+          "description": "At least one charter rubric line grounding why this call matters. REQUIRED with minItems:1 (C2). Sorted by rubric_id (canonical ordering)."
+        }
+      }
+    },
+
+    "item-key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[a-z0-9][a-z0-9._/#+-]*$",
+      "description": "A derived, lowercased item key of the form `<provider>/<id>` (e.g. `github/kuhlman-labs/fishhawk#2235`) — the same key plan.itemKey derives from an item_ref. Used as a graph reference in a milestone's depends_on and critical_path."
+    },
+
+    "edge-confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "basis"],
+      "description": "The class's confidence in the dependency edges it derived, since a milestone's edges are typically read out of prose rather than declared.",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["high", "medium", "low"],
+          "description": "How much to trust the edges: high (declared depends_on), medium (strongly implied by prose), low (inferred)."
+        },
+        "basis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why that confidence level — e.g. \"edges read from issue bodies, not declared depends_on links\"."
         }
       }
     }

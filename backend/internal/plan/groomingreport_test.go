@@ -62,6 +62,40 @@ func TestValidateGroomingReport_Minimal(t *testing.T) {
 	}
 }
 
+// TestValidateGroomingReport_MilestoneScopeAbsentIsAdditiveOptional is the
+// additive-optional proof for the milestone_scope field (E54.9 / #2309): the
+// pre-existing minimal and example fixtures — neither of which carries a
+// milestone_scope — still validate unchanged, and the typed decode leaves
+// MilestoneScope nil, so the field's addition cannot alter the existing
+// artifact contract. The six-array census is unchanged (an ordinary report has
+// no milestone entries), asserted here so a regression that started counting
+// milestone entries for a non-milestone report reddens.
+func TestValidateGroomingReport_MilestoneScopeAbsentIsAdditiveOptional(t *testing.T) {
+	for name, body := range map[string][]byte{
+		"minimal": groomingMinimal(),
+		"example": func() []byte {
+			b, err := os.ReadFile("../../../docs/spec/examples/grooming-report-v1-example.json")
+			if err != nil {
+				t.Fatalf("read canonical example: %v", err)
+			}
+			return b
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(string(body), "milestone_scope") {
+				t.Fatalf("%s fixture unexpectedly declares milestone_scope", name)
+			}
+			gr, err := plan.ParseGroomingReport(body)
+			if err != nil {
+				t.Fatalf("ParseGroomingReport(%s): %v", name, err)
+			}
+			if gr.MilestoneScope != nil {
+				t.Errorf("%s decoded a non-nil MilestoneScope from a report that declares none", name)
+			}
+		})
+	}
+}
+
 // TestValidateGroomingReport_Example round-trips the canonical example through
 // BOTH the validator and the typed parser, asserting the decoded per-class
 // counts and that every ordering entry decodes at least one rubric citation —

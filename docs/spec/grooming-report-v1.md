@@ -197,6 +197,102 @@ lowercase by construction (they are the schema enum values).
 5. **The `ordering` ranks are exactly the permutation `1..N`.** A duplicated or
    gapped rank is not an applicable proposal.
 
+When the report carries a `milestone_scope`, eight further rules run — see
+[Milestone scoping](#milestone-scoping-milestone_scope) below.
+
+## Milestone scoping (`milestone_scope`)
+
+`milestone_scope` is an **optional** top-level object (E54.9 / #2309). Present
+only when the report scopes a release milestone; its absence means an ordinary
+grooming report. It is additive within the frozen `grooming_report_v1` major, so
+an existing report validates unchanged.
+
+**The class consumes the release definition and must never invent it.**
+`release_definition` carries the operator's fuzzy prose and a `source` whose only
+admitted value is `operator_input` — the class scopes *against* the definition, it
+does not derive one. The derivation itself (which items are in the milestone and
+why) is an **agent judgment task** performed by the groom-stage agent; this
+artifact ships the *contract* that judgment must satisfy — schema, typed domain,
+semantic rules, ingest — exactly as #2235 did for the six existing arrays.
+
+### Fields
+
+| Field | Required | Notes |
+|---|---|---|
+| `release_definition` | yes | `{label, text, source}`; `source` is `operator_input` only. The human input, never invented. |
+| `framing` | yes | `{statement, basis}` — the framing the class adopted and its architectural anchor (an ADR / architecture-doc section). The step most likely to be plausible-and-wrong, stated and grounded. |
+| `included` | yes, `minItems: 0` | Items scoped IN, each with a `reason`, a `wave` index, at least one `rubric_citation`, and optional `depends_on` / `open_question_ids`. Empty is a real, different claim from an absent `milestone_scope`. |
+| `excluded` | yes, `minItems: 0` | Items scoped OUT, each with a `reason` and at least one `rubric_citation`. |
+| `declined_calls` | **yes, may be empty** | The ambiguous scope questions the class refused to resolve. An empty array states "nothing was ambiguous"; an absent key states nothing. |
+| `critical_path` | yes | An **ordered** sequence of item keys — the longest dependency chain. |
+| `edge_confidence` | yes | `{level, basis}` — confidence in the prose-derived edges. |
+
+**Rubric citations on every entry class (C2).** `included`, `excluded` **and**
+`declined_calls` each require at least one `rubric_citation`, on the same terms
+`#2235` applies to ordering entries. "Why is E61 out of alpha" needs the same
+charter grounding as why something is in — an exclusion carrying a bare reason is
+the taste argument the rubric exists to prevent.
+
+### Entry-id forms
+
+Three new derived classes reuse the `#2235` contract:
+
+| Class | Id form | Derived from |
+|---|---|---|
+| `milestone_inclusion` | `milestone_inclusion:<item-key>` | the item ref |
+| `milestone_exclusion` | `milestone_exclusion:<item-key>` | the item ref |
+| `milestone_declined` | `milestone_declined:<qualifier>` | the **zero-ref** form — `question_id`, lowercased |
+
+The zero-ref form exists because an ambiguous scope question is not necessarily
+anchored to one item, so a declined call derives its id from its `question_id`
+rather than from an item ref. `question_id` must therefore be case-insensitively
+unique across `declined_calls`.
+
+### Semantic rules the schema cannot express
+
+`plan.checkMilestoneScope` runs these after the report-wide id rules, each
+returning a `*SemanticError` naming the offending JSON pointer:
+
+1. **R1 — wave contiguity.** Waves across `included` are exactly the contiguous
+   set `0..K`; a gap means the layering is not an executable sequence.
+2. **R2 — dependency resolvability.** Every `depends_on` key resolves to an
+   `included` or `excluded` item; a dependency on a missing item cannot be
+   sequenced.
+3. **R3 — strict wave monotonicity.** An in-scope dependency sits in a strictly
+   earlier wave than its dependent, which makes the wave assignment a valid
+   topological layering and **rejects a cycle by construction** (no strict
+   layering exists for one).
+4. **R4 — out-of-scope dependencies are declined, not resolved silently.** An
+   in-scope item depending on an **excluded** one must carry a non-empty
+   `open_question_ids` — the ambiguous call criterion 4 forbids resolving
+   silently.
+5. **R5 — a critical path is a PATH (C3).** Every element is an `included` item,
+   elements are distinct, waves strictly increase, **and each consecutive pair is
+   connected by a declared `depends_on` edge** (element *i+1* depends on element
+   *i*) — so three unrelated items in waves 0/1/2 are rejected, not accepted as a
+   "critical path".
+6. **R6 — declined-call referential integrity.** Every `open_question_ids` id
+   matches some `declined_calls[].question_id`, so a flagged ambiguity is always
+   readable.
+7. **R7 — canonical ordering (C4).** `included` is sorted by `(wave, item key)`,
+   `excluded` by item key, `declined_calls` by `question_id`, and **every nested
+   array** (`depends_on`, `open_question_ids`, `rubric_citations`, declined-call
+   `options` and `item_refs`) is sorted too — so identical logical input yields
+   byte-identical output. `critical_path` is the one array **not** sorted: its
+   order is its content. `plan.CanonicalizeMilestoneScope` produces the canonical
+   form; `plan.MilestoneScopeFingerprint` is a class-tagged sha256 over the
+   canonical structural fields for a cheap run-over-run comparison. It
+   fingerprints a **deep copy**, so it never mutates the supplied scope and is
+   safe to call concurrently with a reader of the same scope.
+8. **R8 — included/excluded disjointness.** An item may not appear in both
+   `included` and `excluded`. The two derived ids differ by class prefix
+   (`milestone_inclusion:<key>` vs `milestone_exclusion:<key>`), so report-wide
+   id uniqueness does not catch the contradiction. This runs **before** the
+   dependency rules: `checkMilestoneDependencies` resolves an `includedWave` hit
+   before the `excludedKeys` branch, so a dependency on a dual-membership item
+   would otherwise be treated as an ordinary in-scope edge and R4 would silently
+   never fire for it.
+
 ## Workflow declaration
 
 `grooming_report` is a `produces` artifact at **workflow-v2 only** (v0 and v1 are

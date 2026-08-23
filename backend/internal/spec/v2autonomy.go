@@ -98,12 +98,12 @@ const (
 	ActionMerge   = "merge"
 )
 
-// The four BACKLOG-GROOMING action classes (ADR-065 / E54.4 / #2236).
-// They are registered as KNOWN grooming classes so the grammar can say
-// something specific about each, but they are deliberately NOT added to
-// knownActionOrder: that slice drives resolveBlock's always-emit-a-gated-
-// default loop and DerivedOperatorAgent's knob switch, so registering
-// them there would attach four permanently-gated entries to EVERY
+// The five BACKLOG-GROOMING action classes (ADR-065 / E54.4 / #2236;
+// milestone added by E54.9 / #2309). They are registered as KNOWN grooming
+// classes so the grammar can say something specific about each, but they are
+// deliberately NOT added to knownActionOrder: that slice drives resolveBlock's
+// always-emit-a-gated-default loop and DerivedOperatorAgent's knob switch, so
+// registering them there would attach permanently-gated entries to EVERY
 // workflow's resolved matrix and to every run-status delegation block for
 // no safety gain. Extension-ordered rendering already surfaces them
 // (sorted by name) whenever a workflow declares them.
@@ -117,6 +117,12 @@ const (
 	ActionGroomDedup = "dedup"
 	// ActionGroomScoping decomposes, iceboxes or closes items. Non-delegable.
 	ActionGroomScoping = "scoping"
+	// ActionGroomMilestone scopes a release milestone: it selects, sequences
+	// and excludes backlog items against a human-supplied release definition
+	// (E54.9 / #2309). Non-delegable — its output is a release plan whose
+	// framing is a judgment call, not an objectively reversible mutation, so
+	// no backend-evaluable condition exists or may be added for it.
+	ActionGroomMilestone = "milestone"
 )
 
 // nonDelegableGroomingClasses are the grooming classes that can NEVER
@@ -141,9 +147,10 @@ const (
 // Each control therefore has its own delete/flip-observe-red proof; neither
 // masks the other's.
 var nonDelegableGroomingClasses = map[string]string{
-	ActionGroomOrdering: "re-ranks the backlog",
-	ActionGroomDedup:    "closes items as duplicates",
-	ActionGroomScoping:  "decomposes, iceboxes or closes items",
+	ActionGroomOrdering:  "re-ranks the backlog",
+	ActionGroomDedup:     "closes items as duplicates",
+	ActionGroomScoping:   "decomposes, iceboxes or closes items",
+	ActionGroomMilestone: "scopes a release milestone against a human-supplied release definition",
 }
 
 // MsgNonDelegableGroomingClassAuto renders the non-delegable-grooming-class

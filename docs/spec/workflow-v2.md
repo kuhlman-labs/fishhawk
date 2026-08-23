@@ -989,7 +989,7 @@ Four documents are rejected with a message naming the class:
 - `mode: auto` with **no** `when`,
 - `mode: auto` whose `when` is another class's condition,
 - `mode: auto` on an **extension** class (below), which has no backend-evaluable condition at all,
-- `mode: auto` on a **non-delegable backlog-grooming** class (`ordering`, `dedup`, `scoping` — below), which is refused by its own branch, with a message naming the class and why it can never be delegated,
+- `mode: auto` on a **non-delegable backlog-grooming** class (`ordering`, `dedup`, `scoping`, `milestone` — below), which is refused by its own branch, with a message naming the class and why it can never be delegated,
 - `mode: report` that declares a `when` which is **not that class's own condition** (a foreign condition, or any `when` on an extension class). A bare `report` with no `when` is always accepted; a declared `when` must name the class's own condition, so a proposal the report arm cannot evaluate is refused at validation rather than silently dropped at fire time.
 
 These rules are enforced by the **backend**, not by JSON Schema: the class-name set is open, so no schema keyword can bind a condition to a class the schema does not enumerate. A raw `check-jsonschema` run therefore accepts a document the backend rejects.
@@ -1002,7 +1002,7 @@ A class the backend *does* name but deliberately gives no condition is a stronge
 
 ### Backlog-grooming action classes
 
-Four classes extend the open set for backlog grooming (ADR-065 / E54.4 / #2236). They are a **registry**, not a convention: what a destructive class may resolve to is decided at parse time, not by a default a later refactor can drift.
+Five classes extend the open set for backlog grooming (ADR-065 / E54.4 / #2236; `milestone` added by E54.9 / #2309). They are a **registry**, not a convention: what a destructive class may resolve to is decided at parse time, not by a default a later refactor can drift.
 
 | Class | The action | Delegable? |
 |---|---|---|
@@ -1010,8 +1010,9 @@ Four classes extend the open set for backlog grooming (ADR-065 / E54.4 / #2236).
 | `ordering` | re-ranks the backlog | **no** |
 | `dedup` | closes items as duplicates | **no** |
 | `scoping` | decomposes, iceboxes or closes items | **no** |
+| `milestone` | scopes a release milestone against a human-supplied release definition — selects, sequences and excludes items and records the calls it declined to make | **no** |
 
-`hygiene` is the only one for which a backend-evaluable condition exists. The other three carry **no condition at all**, and `mode: auto` on any of them is **rejected at parse time** with a message naming the class — not defaulted away. Both are declarable at `mode: gated` and at `mode: report`.
+`hygiene` is the only one for which a backend-evaluable condition exists. The other four carry **no condition at all**, and `mode: auto` on any of them is **rejected at parse time** with a message naming the class — not defaulted away. Both are declarable at `mode: gated` and at `mode: report`.
 
 Two independent controls refuse `<non-delegable>: auto`: the explicit branch above, and the class's absence from the condition registry (which makes the extension-class rule the second refusal). Each is pinned by its own test, so neither masks the other's removal.
 
@@ -1157,7 +1158,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - A `deploy` stage uses `executor.delegate`; no other stage type may.
 - The `deployment` artifact and the three pre-flight constraint kinds are deploy-only; the `acceptance` artifact and the `egress` block are acceptance-only.
 - A post-hoc diff constraint requires the `pull_request` artifact; `diff_coverage` additionally requires stage type `implement`.
-- `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`) may not be `auto`.
+- `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`, `milestone`) may not be `auto`.
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
