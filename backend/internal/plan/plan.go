@@ -240,6 +240,26 @@ const (
 	ArtifactKindGroomingReport ArtifactKind = "grooming_report"
 )
 
+// AllArtifactKinds returns every ArtifactKind the plan stage can produce.
+//
+// EVERY ArtifactKind const declared in this package MUST appear here. This is
+// not a convenience list: it is the enumeration the cross-sibling settle table
+// test drives (backend/internal/server: TestShipPlan_EverySiblingSettlesItsStage),
+// so a new plan-stage sibling cannot land without declaring the stage state its
+// ingest settles to. The guard behind that promise is
+// TestAllArtifactKinds_EnumeratesEveryDeclaredConst, which parses this
+// package's OWN non-test source and fails when a declared ArtifactKind const is
+// absent here (or a member here has no declaring const) — so the two cannot
+// silently drift, even if a future kind is declared in a different file of this
+// package (#2837).
+func AllArtifactKinds() []ArtifactKind {
+	return []ArtifactKind{
+		ArtifactKindPlan,
+		ArtifactKindClarificationRequest,
+		ArtifactKindGroomingReport,
+	}
+}
+
 // ClarificationRequest is a parsed and schema-validated clarification_request
 // artifact — the additive standard_v1 sibling the plan stage emits when an
 // issue is not yet plannable (lacks a non-derivable fact or needs an operator

@@ -173,6 +173,15 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 				"heal grooming churn audit entry failed", map[string]any{"error": cerr.Error()})
 			return
 		}
+		// Settle on the retry too (#2837): a runner whose first POST 500'd AFTER
+		// Create re-POSTs the same bytes and reaches this idempotent branch;
+		// without the settle here that retry would re-strand the stage in
+		// `running`. Same shared helper as the fresh-create path — a same-state
+		// re-application is a valid no-op (ValidStageTransition returns true when
+		// from == to), so a stage already settled on the first POST is unaffected.
+		// The returned settled stage is unused here (grooming does not call
+		// notifyPlanReadyIfReady — see the fresh-create path), so discard it.
+		s.advancePlanStageTerminal(r, runID, stage)
 		s.writeJSON(w, r, http.StatusOK, planResponse{
 			ID:            existing.ID,
 			StageID:       existing.StageID,
@@ -221,6 +230,29 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 			"append grooming churn audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
+
+	// TERMINAL SETTLE (#2837). The report is now ingested, persisted, audited and
+	// churn-checked; advance the plan stage to its gate the SAME way the plan
+	// artifact does — via the SHARED advancePlanStageTerminal helper, not a
+	// hand-rolled third copy — which owns both the gated (running →
+	// awaiting_approval) and gateless (running → succeeded + orchestrator Advance)
+	// arms plus the sticky status-comment notify. Without this the stage sits in
+	// `running` forever and its approval gate never opens.
+	//
+	// Placement is load-bearing: it is AFTER every fail-closed guard and every 500
+	// return above, so an artifact-create, audit-append or churn-append failure
+	// leaves the stage in `running` for the runner's retry to heal rather than
+	// advancing a not-durable report to an approvable state.
+	//
+	// Deliberately NOT notifyPlanReadyIfReady: notifyPlanReady resolves the run's
+	// PLAN artifact through tryLoadPlanForRun, which filters a.Kind !=
+	// artifact.KindPlan (prompt.go), so on a grooming run it finds no plan and
+	// no-ops. advancePlanStageTerminal's own notifyStatusUpdate is the
+	// operator-visible surface for this settle; a grooming-specific report-ready
+	// comment is a candidate follow-up, not built here. The returned settled
+	// stage is unused (no notifyPlanReadyIfReady on the grooming path), so discard
+	// it rather than reassigning `stage`.
+	s.advancePlanStageTerminal(r, runID, stage)
 
 	s.writeJSON(w, r, http.StatusCreated, planResponse{
 		ID:            created.ID,

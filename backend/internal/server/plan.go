@@ -1256,17 +1256,28 @@ func (s *Server) notifyPlanReadyIfReady(r *http.Request, runID uuid.UUID, stage 
 	s.notifyPlanReady(r.Context(), runID, stage)
 }
 
-// advancePlanStageTerminal drives the plan stage's terminal transition
-// once a valid plan artifact has landed (#603). The trace handler leaves
-// plan stages in running until a plan exists, so this handler owns the
-// running → awaiting_approval (gated) or running → succeeded (gateless)
-// transition.
+// advancePlanStageTerminal is THE shared terminal settle for every plan-stage
+// artifact sibling that settles to the approval gate — today the plan artifact
+// (#603) and the grooming_report (#2837) — driving the plan stage's terminal
+// transition once its artifact has landed. The trace handler leaves plan
+// stages in running until an artifact exists, so this owns the running →
+// awaiting_approval (gated) or running → succeeded (gateless) transition.
+//
+// It is deliberately named for the plan STAGE's settle, not the plan ARTIFACT:
+// a new sibling whose ingest settles to the gate MUST reuse this rather than
+// hand-roll a copy. #2837 exists because handleGroomingReport never called it
+// and its stage sat in running forever, reproducing exactly the class #2833
+// hit when the clarification_request sibling was special-cased by name — the
+// clarification_request sibling is the deliberate EXCEPTION, settling instead
+// at awaiting_input, owned by handleClarificationRequest.
 //
 // Idempotent: the state machine treats same-state re-application as a
-// no-op, so a future runner reordering where the trace handler already
-// advanced the stage (plan-first ordering) does not double-fault. On the
-// gateless path it fires the orchestrator's Advance so the next stage is
-// picked up, mirroring advanceStageAfterTrace.
+// no-op (ValidStageTransition returns true when from == to), so a future
+// runner reordering where the trace handler already advanced the stage
+// (plan-first ordering), or a grooming retry that re-settles an
+// already-settled stage, does not double-fault. On the gateless path it fires
+// the orchestrator's Advance so the next stage is picked up, mirroring
+// advanceStageAfterTrace.
 //
 // Best-effort: transition / advance / notify errors are WARN-logged and
 // never unwind the upload response. Returns the post-transition stage

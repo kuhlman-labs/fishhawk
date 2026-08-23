@@ -28,6 +28,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // recordingOrchestratorRepo wraps orchestratorRepo to record every
@@ -4664,6 +4665,62 @@ func TestShipPlan_ClarificationRequest_ParksAwaitingInput(t *testing.T) {
 	}
 	if !sawPark {
 		t.Errorf("stage was not parked at awaiting_input; transitions=%v", rr.transitionStageCalls)
+	}
+}
+
+// TestShipPlan_EverySiblingSettlesItsStage is the CROSS-BOUNDARY cross-sibling
+// guard (#2837): this defect lived entirely in the seam between a correct
+// ingest layer and a correct state machine that never spoke to each other, so
+// the test crosses request → discriminator → sibling handler → stage state in
+// one pass. It drives a SIGNED POST through the real router for EVERY kind in
+// plan.AllArtifactKinds() and asserts each one leaves `running` at its declared
+// settle.
+//
+// It iterates the ENUMERATION, not the table's own keys, and t.Fatalf's on a
+// kind with no row — so a fourth sibling reaching AllArtifactKinds() without a
+// declared settle fails HERE. Together with
+// TestAllArtifactKinds_EnumeratesEveryDeclaredConst (which forces a new const
+// into the enumeration), the two layers make a future sibling declare the
+// state its ingest settles to rather than reproduce this bug by omission.
+func TestShipPlan_EverySiblingSettlesItsStage(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+
+	type settleRow struct {
+		fixture func(*testing.T) []byte
+		want    run.StageState
+	}
+	rows := map[plan.ArtifactKind]settleRow{
+		plan.ArtifactKindPlan:                 {validPlanBytes, run.StageStateAwaitingApproval},
+		plan.ArtifactKindClarificationRequest: {validClarificationBytes, run.StageStateAwaitingInput},
+		plan.ArtifactKindGroomingReport:       {validGroomingReportBytes, run.StageStateAwaitingApproval},
+	}
+
+	for _, kind := range plan.AllArtifactKinds() {
+		row, ok := rows[kind]
+		if !ok {
+			t.Fatalf("ArtifactKind %q has no settle row — a new plan-stage sibling must declare the state its ingest settles to (#2837)", kind)
+		}
+		t.Run(string(kind), func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, _, _, rr := newPlanServer(t, runID, stageID)
+			rr.getStages[stageID] = &run.Stage{
+				ID: stageID, RunID: runID, Type: run.StageTypePlan,
+				State: run.StageStateRunning, RequiresApproval: true,
+			}
+			priv, _ := sf.issue(t, runID)
+
+			w := shipPlanRequest(t, s, runID, stageID, priv, row.fixture(t), "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			got := rr.getStages[stageID].State
+			if got == run.StageStateRunning {
+				t.Fatalf("stage still running after %s ingest — the sibling never settled its stage", kind)
+			}
+			if got != row.want {
+				t.Errorf("stage settled to %q, want %q", got, row.want)
+			}
+		})
 	}
 }
 
