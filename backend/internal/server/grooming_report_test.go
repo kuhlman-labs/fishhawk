@@ -281,6 +281,77 @@ func TestHandleShipPlan_GroomingReport_Idempotent(t *testing.T) {
 	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
 		t.Errorf("after retry: stage state = %q, want awaiting_approval — the retry must re-settle, not re-strand", got)
 	}
+	// DISCRIMINATOR (#2837 fix-up): the final-state check above is vacuous on its
+	// own — the FIRST POST already settled the stage, so it would stay
+	// awaiting_approval even if the retry did nothing. Each POST that settles
+	// records one TransitionStage call to awaiting_approval (a same-state
+	// re-application is still recorded by the fake), so two settling POSTs must
+	// record exactly two. Deleting the idempotent-branch advancePlanStageTerminal
+	// call drops this to 1, which nothing else in this test would catch.
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 2 {
+		t.Errorf("transitions to awaiting_approval = %d, want 2 (one per POST — the second POST itself must attempt the settle); transitions=%+v", n, rr.transitionStageCalls)
+	}
+}
+
+// TestHandleShipPlan_GroomingReport_RetrySettlesStrandedStage pins the retry-path
+// settle DIRECTLY (#2837 fix-up), constructing the exact scenario the settle
+// exists for: the first POST 500'd AFTER Create, so the artifact is durable and
+// the stage is STILL running when the byte-identical retry arrives. The retry
+// reaches the idempotent branch and MUST settle the stranded stage to its gate.
+//
+// This is the discriminating counterfactual vehicle the Idempotent test could
+// not be: there, the first POST fully succeeds and settles the stage, so the
+// retry finds it already settled and a deleted retry-settle leaves the state
+// unchanged. Here the settle can ONLY come from the retry path — the stage is
+// seeded running and no prior POST touched it — so deleting the idempotent-branch
+// advancePlanStageTerminal call reddens this test on the transition assertion.
+func TestHandleShipPlan_GroomingReport_RetrySettlesStrandedStage(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, rr := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	rr.getStages[stageID].State = run.StageStateRunning
+	rr.getStages[stageID].RequiresApproval = true
+	priv, _ := sf.issue(t, runID)
+	body := validGroomingReportBytes(t)
+
+	// Seed the stranded state BY CONSTRUCTION: artifact durable (as if the first
+	// POST's Create landed), stage still running (the first POST 500'd before the
+	// settle). The audit entry is absent, exactly as a create-then-append gap
+	// leaves it; the retry's heal restores it, but that is orthogonal to the
+	// settle the transition assertion below pins.
+	schemaVersion := groomingReportSchemaVersion
+	if _, err := ar.Create(t.Context(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindGroomingReport,
+		SchemaVersion: &schemaVersion,
+		Content:       json.RawMessage(body),
+		ContentHash:   sha256Hex(body),
+	}); err != nil {
+		t.Fatalf("seed artifact: %v", err)
+	}
+
+	// The byte-identical retry reaches the idempotent branch.
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp planResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if !resp.Idempotent {
+		t.Error("retry should be marked idempotent=true")
+	}
+	// The DISCRIMINATING assertion: the retry settled the stranded stage. The
+	// stage started running and no first POST settled it, so this transition can
+	// only be the idempotent-branch advancePlanStageTerminal call.
+	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 1 {
+		t.Errorf("transitions to awaiting_approval = %d, want 1 — the retry must settle the stranded stage; transitions=%+v", n, rr.transitionStageCalls)
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("final stage state = %q, want awaiting_approval — the retry must settle the stranded stage, not leave it running", got)
+	}
+	// No duplicate artifact row was inserted by the retry.
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
 }
 
 // TestHandleShipPlan_GroomingReport_HealsMissingAuditEntry is binding condition
@@ -732,6 +803,64 @@ func TestHandleShipPlan_GroomingReport_GatelessStageSucceedsAndAdvancesRun(t *te
 	}
 }
 
+// TestHandleShipPlan_GroomingReport_GatelessIdempotentRetry covers the gateless
+// idempotent-retry path the first-POST test does not (#2837 fix-up,
+// untested-path concern). On a gateless stage whose first POST fully succeeded
+// (stage → succeeded, orchestrator Advance fired), a byte-identical retry reaches
+// the idempotent branch and calls advancePlanStageTerminal AGAIN — the gateless
+// arm: a same-state succeeded→succeeded no-op transition plus a SECOND
+// orchestrator Advance. Re-firing Advance against an already-completed run must
+// be safe: the run and stage stay succeeded, the retry returns 200 idempotent,
+// and no duplicate artifact row appears. It drives the real orchestrator via
+// newPlanSequenceServer so the re-fired Advance runs against the true state
+// machine, not a stub.
+func TestHandleShipPlan_GroomingReport_GatelessIdempotentRetry(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	s, rr, ar, sf, _ := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	stage.RequiresApproval = false // gateless
+	priv, _ := sf.issue(t, runRow.ID)
+	body := validGroomingReportBytes(t)
+
+	// First POST fully succeeds: stage → succeeded, orchestrator Advance fires,
+	// the run rolls up to succeeded.
+	if w := shipPlanRequest(t, s, runRow.ID, stage.ID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first upload status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stagesByID[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("after first upload: stage state = %q, want succeeded", got)
+	}
+
+	// Byte-identical retry: reaches the idempotent branch and re-fires the
+	// gateless settle (a succeeded→succeeded no-op plus a second Advance).
+	w2 := shipPlanRequest(t, s, runRow.ID, stage.ID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var resp planResponse
+	_ = json.NewDecoder(w2.Body).Decode(&resp)
+	if !resp.Idempotent {
+		t.Error("retry should be marked idempotent=true")
+	}
+	// Re-firing Advance against an already-completed run is a safe no-op: the
+	// stage and run stay succeeded, with no duplicate advancement observable.
+	if got := rr.stagesByID[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("after retry: stage state = %q, want succeeded — the gateless retry must not disturb the settled stage", got)
+	}
+	rn, err := rr.GetRun(context.Background(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if rn.State != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded — the gateless retry's re-fired Advance must be idempotent", rn.State)
+	}
+	// No duplicate artifact row from the retry.
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (the retry must dedup, not fork the row)", len(ar.all))
+	}
+}
+
 // TestHandleShipPlan_GroomingReport_InvalidReport_DoesNotReachGate is the
 // FAIL-CLOSED control the operator flagged as the half that matters (#2837 C4).
 // A semantically invalid report must still fail category-B and must NOT reach
@@ -784,6 +913,13 @@ func TestHandleShipPlan_GroomingReport_WrongStageType_DoesNotReachGate(t *testin
 	}
 	if !bytes.Contains(w.Body.Bytes(), []byte("grooming_report_stage_invalid")) {
 		t.Errorf("error code missing grooming_report_stage_invalid: %s", w.Body.String())
+	}
+	// FAIL-CLOSED (#2837 C4 fix-up): asserting only the 400 and the absence of a
+	// gate transition is not enough — the handler could stop failing the stage
+	// category-B and still pass those. Assert the category-B failure DIRECTLY, so
+	// deleting the failGroomingStage call reddens this test.
+	if !sawFailureCategoryB(rr) {
+		t.Errorf("stage did not fail category-B — the wrong-stage path must fail closed, not merely refuse the gate; transitions=%+v", rr.transitionStageCalls)
 	}
 	if n := groomingTransitionsTo(rr, run.StageStateAwaitingApproval); n != 0 {
 		t.Errorf("transitions to awaiting_approval = %d, want 0 — a report from a non-plan stage must never reach the gate", n)
