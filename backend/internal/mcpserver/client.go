@@ -2898,6 +2898,77 @@ type FiledWorkItem struct {
 	// missing namespace is reported, never a rejection.
 	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
 	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
+	// Intake carries the ADVISORY intake-groom signals the backend derived at
+	// filing time (#2239). Absent when the deployment produced none.
+	Intake *IntakeSignals `json:"intake,omitempty"`
+}
+
+// IntakeSignals and its satellites are LOCAL, DECODE-ONLY mirrors of the
+// backend's intake payload. They are deliberately NOT the backend's
+// intakegroom (or workmgmt) types, and that is a structural requirement rather
+// than a style choice: ADR-064 / #2230 forbids any board-READ path from
+// reaching the MCP agent tool surface, and
+// backend/internal/mcpserver/board_read_guard_test.go enforces it by banning
+// both a transitive workmgmt import and a set of board-read symbol names in
+// this package's non-test code. The reads that produce these signals happen
+// SERVER-side, where the capability already lives; this package only decodes
+// the JSON the 201 already carried. Mirroring the shape locally keeps that
+// guard green while still surfacing the result to the filing agent.
+//
+// Everything here is ADVISORY. Nothing was closed, merged, relabelled or
+// transitioned on the strength of it, and Degraded is a normal outcome.
+type IntakeSignals struct {
+	Duplicates      []IntakeDuplicate     `json:"duplicates,omitempty"`
+	EpicSuggestion  *IntakeEpicSuggestion `json:"epic_suggestion,omitempty"`
+	Score           IntakeScore           `json:"score"`
+	Degraded        bool                  `json:"degraded"`
+	DegradeReason   string                `json:"degrade_reason,omitempty"`
+	ScannedItems    int                   `json:"scanned_items"`
+	WindowTruncated bool                  `json:"window_truncated"`
+	DurationMS      int64                 `json:"duration_ms"`
+}
+
+// IntakeDuplicate is one possible duplicate of the filed item — a CANDIDATE
+// for a human, never a decision. Closed candidates are surfaced too: a closed
+// duplicate is often the resolution.
+type IntakeDuplicate struct {
+	Number     int     `json:"number"`
+	URL        string  `json:"url,omitempty"`
+	Title      string  `json:"title"`
+	Score      float64 `json:"score"`
+	Confidence string  `json:"confidence"`
+	Basis      string  `json:"basis"`
+	Closed     bool    `json:"closed"`
+}
+
+// IntakeEpicSuggestion is the suggested parent epic for a filing that declared
+// none. It is a suggestion; no relation was created.
+type IntakeEpicSuggestion struct {
+	Number     int     `json:"number"`
+	URL        string  `json:"url,omitempty"`
+	Title      string  `json:"title"`
+	Score      float64 `json:"score"`
+	Confidence string  `json:"confidence"`
+	Basis      string  `json:"basis"`
+}
+
+// IntakeScore is the provisional charter-anchored structural score. Value is
+// advisory only — the citations are what a reviewer reads. Unscored with a
+// CharterGap means no rubric line could be cited from the filing's structure,
+// which is reported as a finding rather than papered over with an invented
+// citation.
+type IntakeScore struct {
+	Value      float64          `json:"value"`
+	Citations  []IntakeCitation `json:"citations,omitempty"`
+	Unscored   bool             `json:"unscored"`
+	CharterGap string           `json:"charter_gap,omitempty"`
+}
+
+// IntakeCitation is one charter rubric line the score cites.
+type IntakeCitation struct {
+	RubricID string `json:"rubric_id"`
+	Quote    string `json:"quote"`
+	Note     string `json:"note"`
 }
 
 // FileWorkItem files a provider-agnostic work item via

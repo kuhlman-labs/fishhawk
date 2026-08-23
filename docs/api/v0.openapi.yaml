@@ -445,6 +445,133 @@ components:
             after merge, derivation, and defaulting (#1616). Reported loudly, NEVER a rejection —
             a filing is never failed on labels alone. Absent/empty when every required namespace
             is present.
+        intake:
+          $ref: '#/components/schemas/IntakeSignals'
+
+    IntakeSignals:
+      type: object
+      required: [score, degraded, scanned_items, window_truncated, duration_ms]
+      description: >-
+        ADVISORY intake-groom signals derived at filing time (#2239, E54.7): possible duplicate
+        candidates, a suggested parent epic when the filing declared none, and a provisional
+        charter-anchored structural score. The same signals are also appended to the created
+        item body as a rendered advisory section plus a hidden `<!-- fishhawk-intake:v1 … -->`
+        marker, so a later grooming sweep reads the analysis back instead of redoing it.
+
+        NOTHING WAS ACTED ON. No item was closed, merged, relabelled or transitioned on the
+        strength of a duplicate candidate; the dedup decision stays a human/workflow action.
+        Duplicate matching is LEXICAL (token overlap), not semantic, so false positives and
+        false negatives are expected — the confidence band and the rendered basis are what
+        make a wrong candidate cheap to dismiss.
+
+        DEGRADATION IS NORMAL, NOT AN ERROR, and the asymmetry is deliberate: elsewhere a
+        missing charter fails closed, but work-item filing is a load-bearing write path and
+        making it depend on grooming health would convert an advisory enhancement into a new
+        failure mode. Grooming therefore runs under its own deadline and scan cap, swallows
+        every failure into `degrade_reason`, and recovers a panic — a filing NEVER fails, and
+        never slows beyond its budget, because grooming was unavailable. The whole object is
+        OPTIONAL: absent when the deployment produced no signals at all.
+
+        The latency bound is stated honestly: the hook derives its own context deadline and
+        hands it to the reader, which bounds a CANCELLATION-RESPECTING reader (the production
+        forge read is one — every request is built with the request context). It is not a
+        preemptive bound against a reader that ignores cancellation.
+      properties:
+        duplicates:
+          type: array
+          description: Possible duplicates, best first, capped at 3. Candidates only — nothing was merged or closed.
+          items:
+            type: object
+            required: [number, title, score, confidence, basis, closed]
+            properties:
+              number: { type: integer, description: The candidate item's tracker number. }
+              url: { type: string }
+              title: { type: string }
+              score: { type: number, description: "Lexical similarity in [0,1]." }
+              confidence:
+                type: string
+                enum: [high, medium, low]
+                description: The band `score` falls in. Read the band, not the float.
+              basis: { type: string, description: "The shared tokens, rendered — what makes a wrong candidate cheap to dismiss." }
+              closed: { type: boolean, description: Whether the candidate is already closed. A closed duplicate is often the resolution. }
+        epic_suggestion:
+          type: object
+          description: >-
+            The single best parent-epic candidate, present only when the filing declared no
+            `relations.parent_epic` and something scored above threshold. A suggestion — no
+            relation was created.
+          required: [number, title, score, confidence, basis]
+          properties:
+            number: { type: integer }
+            url: { type: string }
+            title: { type: string }
+            score: { type: number }
+            confidence: { type: string, enum: [high, medium, low] }
+            basis: { type: string }
+        score:
+          type: object
+          required: [value, unscored]
+          description: >-
+            The provisional charter-anchored structural score. `value` is ADVISORY ONLY — it
+            exists to sort a list, not to justify a ranking; the citations are what a reviewer
+            reads. Scoring is deliberately STRUCTURAL: it cites only rubric lines decidable from
+            the filing's own structure, and only ids that actually exist in the repo's declared
+            charter.
+          properties:
+            value: { type: number, description: Summed weight of the surviving citations. Advisory only. }
+            citations:
+              type: array
+              items:
+                type: object
+                required: [rubric_id, quote, note]
+                properties:
+                  rubric_id: { type: string, description: "The charter rubric line id (e.g. S2, S4, U4)." }
+                  quote: { type: string, description: "The rubric line's text, as parsed from the charter." }
+                  note: { type: string, description: What about this filing fired the line. }
+            unscored:
+              type: boolean
+              description: >-
+                True when no citation survived. Reported as a finding rather than satisfied with
+                an invented citation — a rule whose rubric id is absent from the declared charter
+                drops its citation instead of fabricating one.
+            charter_gap: { type: string, description: Explains the `unscored` verdict. }
+        degraded:
+          type: boolean
+          description: True when grooming did not complete. The item was filed regardless.
+        degrade_reason:
+          type: string
+          enum:
+            - reader_unavailable
+            - reader_error
+            - charter_undeclared
+            - charter_unresolved
+            - charter_rubric_unparsed
+            - budget_exceeded
+            - hook_panic
+            - seam_unwired
+          description: >-
+            The closed set of reasons grooming produced no signals, so a degradation is always
+            attributable to a named cause rather than an unexplained empty result.
+            `reader_unavailable` — the provider does not implement the work-item read capability
+            (a File-only provider). `reader_error` — the reader refused (forbidden, rate limited,
+            transport failure). `charter_undeclared` — the repo's conventions declare no charter.
+            `charter_unresolved` — a charter is declared but could not be resolved at the pinned
+            base ref. `charter_rubric_unparsed` — the charter resolved but carries no parsable
+            rubric ids. `budget_exceeded` — the hook's deadline elapsed before the read completed.
+            `hook_panic` — a panic inside the hook was recovered. `seam_unwired` — a seam the hook
+            needs (document resolver, base ref) is not configured on this deployment.
+        scanned_items:
+          type: integer
+          description: How many existing items the filing was compared against.
+        window_truncated:
+          type: boolean
+          description: >-
+            True when the newest-first scan window was CUT at its cap rather than exhausted, so a
+            duplicate older than the window would be missed. Stated rather than hidden: recency is
+            approximated by creation order, so an old item closed recently can fall outside it.
+        duration_ms:
+          type: integer
+          description: The hook's measured wall clock, so the latency claim is reported rather than assumed.
 
     EpicDraft:
       type: object
