@@ -143,3 +143,21 @@ spill the rest of the payload into the rendered body. `ParseBody` reads the
 LAST marker in the body (so a body quoting an earlier one cannot shadow the
 real one) and returns `ok=false` — never a partial value — for a missing,
 unterminated, or undecodable marker.
+
+Read-back acceptance is EXACT, not best-effort, because an issue body is
+mutable user-editable input and this marker is what #2236 reads instead of
+redoing the analysis. A marker is accepted only when its payload is exactly
+one complete JSON object with no second value and no trailing non-whitespace
+after it; it names every field the renderer always emits (`score`,
+`degraded`, `scanned_items`, `window_truncated`, `duration_ms`) and no field
+the shape does not declare; and the decoded `Signals` satisfies the
+invariants every rendered `Signals` satisfies — a non-negative count,
+duration and score value, `degraded` set together with a `degrade_reason`
+from the closed set, `unscored` exactly when no citation survived (with the
+gap stated), a rubric id and quote on every citation, at most
+`MaxDuplicates` duplicates, and a 1-based tracker number, non-empty title,
+`(0,1]` score and known confidence band on every duplicate and epic
+suggestion. Anything short of that is rejected: a hand-edited `{}`, a
+truncated candidate object or a payload with a second JSON value appended
+returns `ok=false` rather than a partially-populated analysis a consumer
+would trust.

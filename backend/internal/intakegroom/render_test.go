@@ -60,6 +60,10 @@ func TestRenderBody_RoundTripsATitleContainingTheCommentTerminator(t *testing.T)
 			Confidence: ConfidenceHigh,
 			Basis:      "marker",
 		}},
+		// A score is Unscored with a stated gap or it cites — ScoreFiling
+		// never emits a scored-but-uncited verdict, and ParseBody now
+		// enforces that invariant on read-back, so the fixture states it.
+		Score:        Score{Unscored: true, CharterGap: "no decidable structural rubric line fires for this filing"},
 		ScannedItems: 1,
 	}
 
@@ -77,6 +81,55 @@ func TestRenderBody_RoundTripsATitleContainingTheCommentTerminator(t *testing.T)
 	}
 }
 
+// validPayload is the minimal marker payload ParseBody accepts: every field
+// marker() always emits, no field it does not, and a Signals that satisfies
+// every invariant this package's producers establish.
+//
+// Every malformed fixture below is derived from THIS string by a single
+// targeted replacement rather than written independently, so a rejection can
+// only be attributed to the one edit — a fixture that differed from the
+// accepted payload in some second, incidental way would be refused with or
+// without the control it claims to exercise.
+const validPayload = `{"score":{"value":0,"unscored":true,"charter_gap":"none"},` +
+	`"degraded":false,"scanned_items":0,"window_truncated":false,"duration_ms":0}`
+
+// validDupPayload is validPayload carrying one well-formed duplicate
+// candidate — the base for the per-candidate invariant fixtures.
+var validDupPayload = mutate(validPayload, `"degraded":false`,
+	`"duplicates":[{"number":7,"title":"a real duplicate","score":0.8,"confidence":"high","basis":"real","closed":false}],"degraded":false`)
+
+// mutate returns base with the single occurrence of old replaced by new,
+// failing loudly at init time if old is not present (a fixture that silently
+// stopped mutating anything would be a vacuous test case).
+func mutate(base, old, new string) string {
+	if !strings.Contains(base, old) {
+		panic("fixture base does not contain " + old)
+	}
+	return strings.Replace(base, old, new, 1)
+}
+
+// markerBody wraps a raw payload in a marker inside an ordinary body.
+func markerBody(payload string) string {
+	return "body\n" + MarkerPrefix + payload + MarkerSuffix
+}
+
+// TestParseBody_AcceptsTheWellFormedFixtureBases proves the two bases the
+// rejection fixtures are derived from are themselves ACCEPTED. Without this,
+// every rejection below could be passing for a reason unrelated to its edit.
+func TestParseBody_AcceptsTheWellFormedFixtureBases(t *testing.T) {
+	for name, payload := range map[string]string{
+		"minimal":            validPayload,
+		"with a duplicate":   validDupPayload,
+		"with a trailing NL": validPayload + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ParseBody(markerBody(payload)); !ok {
+				t.Fatalf("the fixture base must parse, got ok=false:\n%s", payload)
+			}
+		})
+	}
+}
+
 func TestParseBody_RejectsMalformedMarkers(t *testing.T) {
 	tests := []struct {
 		name string
@@ -84,11 +137,66 @@ func TestParseBody_RejectsMalformedMarkers(t *testing.T) {
 	}{
 		{"no marker at all", "just a body\n"},
 		{"unterminated marker", "body\n" + MarkerPrefix + `{"scanned_items":1}`},
-		{"payload is not json", "body\n" + MarkerPrefix + "{not json}" + MarkerSuffix},
+		{"payload is not json", markerBody("{not json}")},
 		{"payload is empty", "body\n" + MarkerPrefix + MarkerSuffix},
-		{"payload is a bare string", "body\n" + MarkerPrefix + `"nope"` + MarkerSuffix},
-		{"payload carries an unknown field", "body\n" + MarkerPrefix + `{"scanned_items":1,"invented":true}` + MarkerSuffix},
-		{"payload is truncated json", "body\n" + MarkerPrefix + `{"scanned_items":` + MarkerSuffix},
+		{"payload is a bare string", markerBody(`"nope"`)},
+		{"payload is truncated json", markerBody(`{"scanned_items":`)},
+		{"payload carries an unknown field", markerBody(
+			mutate(validPayload, `"degraded":false`, `"degraded":false,"invented":true`))},
+
+		// EXACTLY ONE VALUE. A json.Decoder stops at the end of the first
+		// value, so both of these decode a complete, valid Signals first and
+		// are only rejected by the EOF check.
+		{"a second JSON value follows the payload", markerBody(validPayload + " " + validPayload)},
+		{"a second JSON value of another type follows", markerBody(validPayload + " 42")},
+		{"trailing non-whitespace junk follows", markerBody(validPayload + " junk")},
+
+		// FIELD PRESENCE. Each of these decodes into a Signals without
+		// error, so only the payload's raw key set can reject it. The two
+		// omit-a-scalar cases are attained by the presence check ALONE; the
+		// empty object and the omitted score additionally violate a Signals
+		// invariant, so they are refused twice over.
+		{"payload is an empty object", markerBody("{}")},
+		{"payload omits duration_ms", markerBody(mutate(validPayload, `,"duration_ms":0`, ""))},
+		{"payload omits score", markerBody(mutate(validPayload,
+			`"score":{"value":0,"unscored":true,"charter_gap":"none"},`, ""))},
+		{"payload omits scanned_items", markerBody(mutate(validPayload, `"scanned_items":0,`, ""))},
+
+		// SIGNALS INVARIANTS. Each decodes into a well-typed Signals that no
+		// producer path in this package can emit.
+		{"negative scanned_items", markerBody(mutate(validPayload, `"scanned_items":0`, `"scanned_items":-1`))},
+		{"negative duration_ms", markerBody(mutate(validPayload, `"duration_ms":0`, `"duration_ms":-1`))},
+		{"degraded with no reason", markerBody(mutate(validPayload, `"degraded":false`, `"degraded":true`))},
+		{"a reason without the degraded flag", markerBody(mutate(validPayload,
+			`"degraded":false`, `"degraded":false,"degrade_reason":"reader_error"`))},
+		{"a degrade reason outside the closed set", markerBody(mutate(validPayload,
+			`"degraded":false`, `"degraded":true,"degrade_reason":"invented_reason"`))},
+		{"unscored while citing a rubric line", markerBody(mutate(validPayload,
+			`"unscored":true`, `"unscored":true,"citations":[{"rubric_id":"S2","quote":"q","note":"n"}]`))},
+		{"scored with no citation at all", markerBody(mutate(validPayload,
+			`"unscored":true,"charter_gap":"none"`, `"unscored":false`))},
+		{"unscored with no stated gap", markerBody(mutate(validPayload, `"charter_gap":"none"`, `"charter_gap":"  "`))},
+		{"a citation with no rubric id", markerBody(mutate(validPayload,
+			`"unscored":true,"charter_gap":"none"`, `"unscored":false,"citations":[{"rubric_id":"","quote":"q","note":"n"}]`))},
+		{"a citation quoting nothing", markerBody(mutate(validPayload,
+			`"unscored":true,"charter_gap":"none"`, `"unscored":false,"citations":[{"rubric_id":"S2","quote":"","note":"n"}]`))},
+		{"a negative score value", markerBody(mutate(validPayload, `"value":0`, `"value":-3`))},
+
+		// PER-CANDIDATE INVARIANTS, derived from validDupPayload.
+		{"a duplicate that is an empty object", markerBody(mutate(validDupPayload,
+			`{"number":7,"title":"a real duplicate","score":0.8,"confidence":"high","basis":"real","closed":false}`, "{}"))},
+		{"a duplicate with no tracker number", markerBody(mutate(validDupPayload, `"number":7`, `"number":0`))},
+		{"a duplicate with an untitled item", markerBody(mutate(validDupPayload, `"title":"a real duplicate"`, `"title":""`))},
+		{"a duplicate scoring above 1", markerBody(mutate(validDupPayload, `"score":0.8`, `"score":1.5`))},
+		{"a duplicate with an unknown confidence band", markerBody(mutate(validDupPayload, `"confidence":"high"`, `"confidence":"certain"`))},
+		{"more duplicates than MaxDuplicates", markerBody(mutate(validDupPayload, `"duplicates":[`,
+			`"duplicates":[{"number":1,"title":"a","score":0.5,"confidence":"medium","basis":"a"},`+
+				`{"number":2,"title":"b","score":0.5,"confidence":"medium","basis":"b"},`+
+				`{"number":3,"title":"c","score":0.5,"confidence":"medium","basis":"c"},`))},
+		{"an epic suggestion with no tracker number", markerBody(mutate(validPayload, `"degraded":false`,
+			`"epic_suggestion":{"number":0,"title":"an epic","score":0.4,"confidence":"low","basis":"e"},"degraded":false`))},
+		{"an epic suggestion with an unknown band", markerBody(mutate(validPayload, `"degraded":false`,
+			`"epic_suggestion":{"number":54,"title":"an epic","score":0.4,"confidence":"probably","basis":"e"},"degraded":false`))},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

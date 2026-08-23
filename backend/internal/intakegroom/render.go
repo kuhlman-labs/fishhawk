@@ -3,7 +3,9 @@ package intakegroom
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -144,11 +146,30 @@ func citedIDs(s Score) []string {
 	return out
 }
 
+// markerRequiredFields are the payload keys marker() ALWAYS emits, because
+// their Signals fields carry no omitempty. A payload missing any of them was
+// not written by this package.
+//
+// They are checked by NAME rather than by decoded value because a
+// json.Decoder fills only the fields a payload names: {} and
+// {"scanned_items":0} decode into the same Signals, so an absent field is
+// indistinguishable from a zero one after decoding.
+var markerRequiredFields = []string{
+	"score", "degraded", "scanned_items", "window_truncated", "duration_ms",
+}
+
 // ParseBody recovers the Signals from a body's hidden marker, so #2236's
 // periodic sweep can read intake analysis back instead of redoing it.
 //
-// A body with no marker, an unterminated marker, or a payload that is not
-// decodable Signals returns ok=false and the zero Signals — never a partial
+// ACCEPTANCE IS EXACT, NOT BEST-EFFORT, because an issue body is mutable
+// user-editable input and this marker is the input to a later grooming
+// consumer. A marker is read back only when all four hold: the body carries a
+// terminated marker; its payload is EXACTLY ONE complete JSON object with no
+// second value and no trailing non-whitespace after it; that object names
+// every field this package always emits and no field it does not know; and
+// the decoded Signals satisfies validSignals. Anything else — a missing,
+// unterminated, undecodable, truncated, trailing-data, incomplete or
+// incoherent marker — returns ok=false and the ZERO Signals, never a partial
 // value a caller could mistake for a real analysis.
 func ParseBody(body string) (Signals, bool) {
 	start := strings.LastIndex(body, MarkerPrefix)
@@ -161,11 +182,119 @@ func ParseBody(body string) (Signals, bool) {
 		return Signals{}, false
 	}
 	payload := strings.TrimSpace(rest[:end])
+
+	// Field-presence check, over the payload's raw key set.
+	//
+	// This deliberately uses a json.Decoder rather than json.Unmarshal:
+	// Unmarshal rejects trailing input as a side effect, which would make
+	// the explicit exactly-one-value check below unreachable and therefore
+	// untestable. Rejecting trailing input stays that check's single job.
+	var fields map[string]json.RawMessage
+	if err := json.NewDecoder(strings.NewReader(payload)).Decode(&fields); err != nil {
+		return Signals{}, false
+	}
+	for _, f := range markerRequiredFields {
+		if _, ok := fields[f]; !ok {
+			return Signals{}, false
+		}
+	}
+
 	var s Signals
 	dec := json.NewDecoder(strings.NewReader(payload))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&s); err != nil {
 		return Signals{}, false
 	}
+	// EXACTLY ONE value. A Decoder stops at the end of the first value it
+	// reads, so `{...} {...}` and `{...} junk` both decode without error —
+	// the stream must be at EOF for the payload to be the single object
+	// marker() wrote.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return Signals{}, false
+	}
+	if !validSignals(s) {
+		return Signals{}, false
+	}
 	return s, true
+}
+
+// validSignals reports whether s satisfies the invariants EVERY Signals this
+// package renders satisfies.
+//
+// Structural decodability is not enough: a hand-edited marker can decode into
+// a well-typed but incoherent Signals (a duplicate with no tracker number, a
+// score both Unscored and citing, a degradation with no reason from the
+// closed set), and a later consumer reading that back would be trusting
+// tampered intake data. Each check below names a property a producer path in
+// this package establishes, so none of them can reject a marker this package
+// wrote.
+func validSignals(s Signals) bool {
+	// Counts and the summed advisory weight are never negative.
+	if s.ScannedItems < 0 || s.DurationMS < 0 || s.Score.Value < 0 {
+		return false
+	}
+	// Degrade and the hook set Degraded and DegradeReason together, from the
+	// closed set — a degradation is always attributable to a named cause.
+	if s.Degraded != (s.DegradeReason != "") {
+		return false
+	}
+	if s.Degraded && !validDegradeReason(s.DegradeReason) {
+		return false
+	}
+	// A gap is a finding: ScoreFiling reports Unscored with a stated gap
+	// exactly when no citation survived, and never both a verdict and a
+	// citation list.
+	if s.Score.Unscored != (len(s.Score.Citations) == 0) {
+		return false
+	}
+	if s.Score.Unscored && strings.TrimSpace(s.Score.CharterGap) == "" {
+		return false
+	}
+	// No fabricated citation: every citation carries the rubric id it cites
+	// and the charter line it quotes.
+	for _, c := range s.Score.Citations {
+		if strings.TrimSpace(c.RubricID) == "" || strings.TrimSpace(c.Quote) == "" {
+			return false
+		}
+	}
+	if len(s.Duplicates) > MaxDuplicates {
+		return false
+	}
+	for _, d := range s.Duplicates {
+		if !validCandidateFields(d.Number, d.Title, d.Score, d.Confidence) {
+			return false
+		}
+	}
+	if e := s.EpicSuggestion; e != nil {
+		if !validCandidateFields(e.Number, e.Title, e.Score, e.Confidence) {
+			return false
+		}
+	}
+	return true
+}
+
+// validCandidateFields checks the fields a duplicate candidate and an epic
+// suggestion share. Both are only ever emitted for a real scanned item: a
+// tracker number is 1-based, a title that tokenizes to nothing scores 0 and
+// is dropped before it becomes a candidate, and a similarity score reaching
+// this point is in (0,1] with a band from the closed set.
+func validCandidateFields(number int, title string, score float64, c Confidence) bool {
+	if number <= 0 || strings.TrimSpace(title) == "" {
+		return false
+	}
+	if score <= 0 || score > 1 {
+		return false
+	}
+	return c == ConfidenceHigh || c == ConfidenceMedium || c == ConfidenceLow
+}
+
+// validDegradeReason reports whether reason is in the closed DegradeReason
+// set, which DegradeReasons enumerates.
+func validDegradeReason(reason DegradeReason) bool {
+	for _, r := range DegradeReasons() {
+		if r == reason {
+			return true
+		}
+	}
+	return false
 }
