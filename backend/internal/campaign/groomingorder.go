@@ -51,16 +51,14 @@ type GroomingOrder struct {
 	// conflating the two would make this number uncomputable (K4).
 	Limit          int
 	OmittedByLimit int
-	// SupersededBy is set ONLY when the caller explicitly acknowledged a newer
-	// approved grooming run via allow_superseded. Nil means the order was not
-	// superseded (or supersession was refused before this point).
+	// SupersededBy is set ONLY when the caller explicitly acknowledged a NAMED
+	// newer approved grooming run via allow_superseded. Nil means the order was
+	// not superseded (or supersession was refused before this point).
+	//
+	// There is no companion "undetermined" field: a supersession scan that could
+	// not PROVE absence refuses the create unconditionally, so no resolved order
+	// can carry that state.
 	SupersededBy *uuid.UUID
-	// SupersessionUndetermined is set ONLY when the caller explicitly
-	// acknowledged (via allow_superseded) that the supersession scan could not
-	// PROVE no newer approved grooming run exists. Without that acknowledgement
-	// an undetermined scan REFUSES the create: reporting that a scan was capped
-	// is not the same as establishing absence, it just relabels the silence.
-	SupersessionUndetermined bool
 }
 
 // GroomingOrderExclusion is one ordering entry that could not be converted

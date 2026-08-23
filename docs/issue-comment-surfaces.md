@@ -1714,8 +1714,7 @@ Notes:
   `handleCreateCampaign` through `emitCampaignAudit`, on the GLOBAL chain
   (payload `{campaign_id, repo, grooming_source:{source_run_id, source_stage_id,
   report_artifact_id, report_content_hash, ordered_refs, ordered_count,
-  excluded, limit, omitted_by_limit, superseded_by,
-  supersession_scan_undetermined}}`). **It is deliberately NOT the system of
+  excluded, limit, omitted_by_limit, superseded_by}}`). **It is deliberately NOT the system of
   record for that provenance**: like every campaign audit emit it is
   best-effort and runs AFTER persistence, so the durable copy lives on the
   `campaigns.grooming_source` column, written by the campaign row's own INSERT.

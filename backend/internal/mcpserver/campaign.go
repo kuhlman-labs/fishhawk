@@ -273,7 +273,7 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 					ae.Message, ae.Details["superseded_by"])
 			case "grooming_order_supersession_undetermined":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
-					"grooming_order_supersession_undetermined: %s — the check could not PROVE that no newer approved grooming run exists, so it refused rather than silently building from a possibly-stale order. Set grooming_allow_superseded=true to build from this order deliberately", ae.Message)
+					"grooming_order_supersession_undetermined: %s — the check could not PROVE that no newer approved grooming run exists, so it refused rather than silently building from a possibly-stale order. grooming_allow_superseded does NOT bypass this (it acknowledges a NAMED newer run, not a check that never finished): narrow the grooming workflow's run history so the scan can reach the end of it, then retry", ae.Message)
 			case "grooming_order_supersession_unreadable":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"grooming_order_supersession_unreadable: %s — the supersession check could not read its candidates. This is a backend read failure, not a stale order: retry, and do NOT reach for grooming_allow_superseded (it deliberately does not bypass this)", ae.Message)

@@ -1765,9 +1765,11 @@ REPORT stays legitimate; DERIVING the ratified campaign order in-process does no
 
 The tool maps each backend refusal onto an operator ACTION rather than echoing
 the code: `grooming_order_superseded` names the newer run and the
-acknowledgement; `grooming_order_supersession_undetermined` points at the
-acknowledgement; `grooming_order_supersession_unreadable` says explicitly NOT to
-reach for it (it is a read failure, not a stale order);
+acknowledgement; `grooming_order_supersession_undetermined` says the
+acknowledgement does NOT bypass it (an incomplete scan names no run to
+acknowledge) and points at narrowing the run history;
+`grooming_order_supersession_unreadable` likewise says explicitly NOT to reach
+for it (it is a read failure, not a stale order);
 `grooming_order_not_approved` names the gate to approve; `grooming_order_absent`
 names the `backlog_grooming` workflow. A `campaign_dangling_dependency` carrying
 `dangling_source: grooming_order` gets its own remedy — widen the batch (raise or

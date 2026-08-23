@@ -149,13 +149,18 @@ on the create response.
 ### Supersession fails closed, in two distinguishable ways
 
 An order that a NEWER approved grooming run of the same workflow has superseded
-is REFUSED `422 grooming_order_superseded`, naming the newer run. The scan pages
-the workflow-scoped run list until it sees a SHORT page — positive proof it
-reached the end — and only then reports absence. If it exhausts its page budget
-first it reports `422 grooming_order_supersession_undetermined`: reporting that a
-scan was capped on a SUCCESSFUL create would merely relabel the silence, so it
-refuses instead. `allow_superseded` converts both into an explicit, RECORDED
-acknowledgement.
+is REFUSED `422 grooming_order_superseded`, naming the newer run.
+`allow_superseded` converts THAT refusal — and only that one — into an explicit,
+RECORDED acknowledgement, because it names a run the operator can look at and
+decide about.
+
+The scan pages the workflow-scoped run list until it sees a SHORT page — positive
+proof it reached the end — and only then reports absence. If it exhausts its page
+budget first it reports `422 grooming_order_supersession_undetermined`, and that
+refusal is UNCONDITIONAL: `allow_superseded` does not reach it. An incomplete
+scan names nothing to acknowledge, so letting a caller-set request flag stand in
+for it would turn the flag into a bypass of an authorization-shaped check rather
+than an acknowledgement of a known state.
 
 A read FAILURE is a third, distinct outcome: `502
 grooming_order_supersession_unreadable`, which `allow_superseded` deliberately

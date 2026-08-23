@@ -29,10 +29,11 @@ type groomingSourceRequest struct {
 	// 0 (or omitted) means no cap. Negative is a validation failure.
 	Limit int `json:"limit,omitempty"`
 	// AllowSuperseded explicitly acknowledges building from an order that a
-	// newer approved grooming run has superseded, or that the supersession scan
-	// could not prove is current. Default false REFUSES both — an operator can
-	// act on a refusal; they cannot act on a campaign silently built from an
-	// order they did not ratify.
+	// NAMED newer approved grooming run has superseded. Default false refuses —
+	// an operator can act on a refusal; they cannot act on a campaign silently
+	// built from an order they did not ratify. It does NOT reach an undetermined
+	// scan: that refusal is unconditional (K2), because acknowledging a check
+	// that never completed acknowledges nothing.
 	AllowSuperseded bool `json:"allow_superseded,omitempty"`
 }
 
@@ -71,12 +72,11 @@ type campaignGroomingSourcePayload struct {
 	// SupersededBy names the newer approved grooming run whose order this
 	// campaign deliberately did NOT use, set only when the caller passed
 	// allow_superseded. Omitted otherwise.
+	//
+	// There is deliberately NO companion field for an undetermined scan: an
+	// incomplete scan is an unconditional refusal (K2), so no created campaign
+	// can carry that state and a field recording it could only ever be false.
 	SupersededBy *uuid.UUID `json:"superseded_by,omitempty"`
-	// SupersessionScanUndetermined records that the supersession scan could not
-	// PROVE no newer approved run exists and the caller acknowledged it with
-	// allow_superseded. Omitted otherwise — without the acknowledgement the
-	// create is refused, so this can never be a silent degrade.
-	SupersessionScanUndetermined bool `json:"supersession_scan_undetermined,omitempty"`
 }
 
 // groomingSourceError is a typed refusal from the grooming-source resolution
@@ -104,8 +104,9 @@ const (
 	codeGroomingSuperseded   = "grooming_order_superseded"
 	// codeGroomingSupersessionUndetermined is the K2 fail-closed refusal: the
 	// bounded scan could not establish that no newer approved grooming run
-	// exists. It is a REFUSAL, not a note on a successful create — "the scan was
-	// capped" is not evidence of absence.
+	// exists. It is an UNCONDITIONAL refusal — allow_superseded does not reach
+	// it — because "the scan was capped" is not evidence of absence, and a
+	// caller-set flag cannot stand in for a check that never completed.
 	codeGroomingSupersessionUndetermined = "grooming_order_supersession_undetermined"
 	// codeGroomingSupersessionUnreadable is the infrastructure sibling: the scan
 	// could not be RUN (a run/stage/artifact read failed). Distinct from
@@ -150,9 +151,9 @@ const (
 //  4. a plan stage carries a grooming_report        -> 422 grooming_order_absent
 //  5. that stage's approval gate was GRANTED        -> 422 grooming_order_not_approved
 //  6. the report parses                             -> 422 grooming_order_invalid
-//  7. no newer approved grooming run supersedes it  -> 422 grooming_order_superseded
-//     / grooming_order_supersession_undetermined
+//  7. the supersession scan COMPLETED                -> 422 grooming_order_supersession_undetermined
 //     / 502 grooming_order_supersession_unreadable
+//     and named no newer approved grooming run       -> 422 grooming_order_superseded
 //  8. the order names at least one target-repo issue -> 422 grooming_order_empty
 //
 // STEP 5 IS THE RATIFICATION CHECK. #2237 shipped workmgmt.ApplyGrooming with
@@ -201,9 +202,13 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	// (enforceCampaignAccount) can afford to do on an id the caller already
 	// holds, but this endpoint cannot: here the run id is CALLER-SUPPLIED.
 	//
-	// An untenanted run (NULL account_id) stays visible to any caller, the same
-	// #1829 NULL-allow window every other tenancy gate in this package honours.
-	if sourceRun.AccountID != "" && sourceRun.AccountID != IdentityFrom(ctx).AccountID {
+	// THE MATCH IS EXACT, INCLUDING AN EMPTY SOURCE ACCOUNT. The #1829
+	// NULL-allow window other gates honour is for an id the caller ALREADY
+	// holds; here the run id is caller-supplied, so allowing an untenanted run
+	// would let any authenticated tenant name an arbitrary untenanted run and
+	// consume its approved order. An untenanted run is reachable only by an
+	// untenanted caller (both sides empty).
+	if sourceRun.AccountID != IdentityFrom(ctx).AccountID {
 		return nil, nil, notFound
 	}
 	if sourceRun.Repo != repoFullName {
@@ -252,18 +257,24 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	if serr != nil {
 		return nil, nil, serr
 	}
+	// AN UNDETERMINED SCAN IS AN UNCONDITIONAL REFUSAL — allow_superseded does
+	// NOT reach it. The flag acknowledges a POSITIVELY IDENTIFIED superseding
+	// run, which an operator can look at and decide about; an incomplete scan
+	// gives them nothing to decide about, so treating the flag as an
+	// acknowledgement of it would turn a caller-controlled request field into a
+	// bypass of an authorization-shaped check (K2).
+	if undetermined {
+		return nil, nil, &groomingSourceError{
+			Status: http.StatusUnprocessableEntity, Code: codeGroomingSupersessionUndetermined,
+			Message: "the supersession scan could not establish that no newer approved grooming run exists; narrow the workflow's run history so the scan can reach the end of it",
+			Details: map[string]any{"source_run_id": runID.String(), "scanned_pages": groomingSupersessionMaxPages},
+		}
+	}
 	if superseded != nil && !gs.AllowSuperseded {
 		return nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingSuperseded,
 			Message: "a newer approved grooming run has superseded this order; groom from the newer run, or pass allow_superseded to build from this one deliberately",
 			Details: map[string]any{"source_run_id": runID.String(), "superseded_by": superseded.String()},
-		}
-	}
-	if undetermined && !gs.AllowSuperseded {
-		return nil, nil, &groomingSourceError{
-			Status: http.StatusUnprocessableEntity, Code: codeGroomingSupersessionUndetermined,
-			Message: "the supersession scan could not establish that no newer approved grooming run exists; narrow the workflow's run history, or pass allow_superseded to build from this order deliberately",
-			Details: map[string]any{"source_run_id": runID.String(), "scanned_pages": groomingSupersessionMaxPages},
 		}
 	}
 
@@ -285,7 +296,6 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	order.ContentHash = found.contentHash
 	if gs.AllowSuperseded {
 		order.SupersededBy = superseded
-		order.SupersessionUndetermined = undetermined
 	}
 	return order, groomingSourcePayload(order), nil
 }
@@ -299,17 +309,16 @@ func groomingSourcePayload(o *campaign.GroomingOrder) *campaignGroomingSourcePay
 		refs = []string{}
 	}
 	return &campaignGroomingSourcePayload{
-		SourceRunID:                  o.RunID,
-		SourceStageID:                o.StageID,
-		ReportArtifactID:             o.ArtifactID,
-		ReportContentHash:            o.ContentHash,
-		OrderedRefs:                  refs,
-		OrderedCount:                 len(refs),
-		Excluded:                     o.Excluded,
-		Limit:                        o.Limit,
-		OmittedByLimit:               o.OmittedByLimit,
-		SupersededBy:                 o.SupersededBy,
-		SupersessionScanUndetermined: o.SupersessionUndetermined,
+		SourceRunID:       o.RunID,
+		SourceStageID:     o.StageID,
+		ReportArtifactID:  o.ArtifactID,
+		ReportContentHash: o.ContentHash,
+		OrderedRefs:       refs,
+		OrderedCount:      len(refs),
+		Excluded:          o.Excluded,
+		Limit:             o.Limit,
+		OmittedByLimit:    o.OmittedByLimit,
+		SupersededBy:      o.SupersededBy,
 	}
 }
 
@@ -395,8 +404,9 @@ func (s *Server) approvedGroomingReport(ctx context.Context, runID uuid.UUID) (*
 // a SHORT page — positive proof it reached the end of the workflow-scoped run
 // list — and only then reports absence. If it burns through
 // groomingSupersessionMaxPages full pages without reaching the end, it reports
-// UNDETERMINED, which the caller turns into a refusal unless the operator
-// explicitly acknowledged it.
+// UNDETERMINED, which the caller turns into an unconditional refusal — the
+// operator acknowledgement covers a NAMED superseding run, never a scan that
+// did not finish.
 //
 // Any read failure (ListRuns, or a candidate's stages/artifacts/approvals) is a
 // hard refusal that allow_superseded does NOT bypass: an operator can knowingly

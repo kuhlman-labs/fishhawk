@@ -1865,9 +1865,9 @@ func TestStartCampaign_GroomingRefusalRemedies(t *testing.T) {
 			422, "99999999-9999-9999-9999-999999999999",
 		},
 		{
-			"undetermined points at the acknowledgement, not a retry",
+			"undetermined says the acknowledgement does NOT bypass it",
 			`{"error":{"code":"grooming_order_supersession_undetermined","message":"scan could not prove absence"}}`,
-			422, "grooming_allow_superseded=true",
+			422, "grooming_allow_superseded does NOT bypass this",
 		},
 		{
 			"unreadable says explicitly NOT to reach for the acknowledgement",

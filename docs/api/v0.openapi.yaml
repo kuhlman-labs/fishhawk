@@ -2115,14 +2115,6 @@ components:
                 `allow_superseded`; without that acknowledgement the create is
                 refused `grooming_order_superseded`, so a superseded order is
                 never used silently.
-            supersession_scan_undetermined:
-              type: boolean
-              description: |
-                `true` when the supersession scan could not PROVE that no newer
-                approved grooming run exists and the caller acknowledged it with
-                `allow_superseded`. Without the acknowledgement the create is
-                refused `grooming_order_supersession_undetermined`, so this can
-                never mark a silent degrade.
         idempotent:
           type: boolean
           description: |
@@ -9523,17 +9515,20 @@ paths:
                     allow_superseded:
                       type: boolean
                       description: |
-                        OPTIONAL acknowledgement that this order may not be the
-                        current one. Default `false` REFUSES two cases: a NEWER
-                        approved grooming run exists
-                        (`422 grooming_order_superseded`), or the bounded
-                        supersession scan could not PROVE that none does
-                        (`422 grooming_order_supersession_undetermined`).
-                        Setting it `true` proceeds and RECORDS the choice in the
-                        campaign's durable provenance. It deliberately does NOT
-                        bypass `502 grooming_order_supersession_unreadable` — an
-                        operator can knowingly accept a stale order, but nobody
-                        can acknowledge a read that did not happen.
+                        OPTIONAL acknowledgement that a NAMED newer approved
+                        grooming run has superseded this order. Default `false`
+                        refuses that case (`422 grooming_order_superseded`);
+                        setting it `true` proceeds and RECORDS the superseding
+                        run in the campaign's durable provenance.
+
+                        It reaches ONLY that case. A bounded supersession scan
+                        that could not PROVE no newer approved run exists
+                        (`422 grooming_order_supersession_undetermined`) and a
+                        scan that could not be RUN
+                        (`502 grooming_order_supersession_unreadable`) are both
+                        refused regardless of this flag — an operator can
+                        knowingly accept a NAMED stale order, but nobody can
+                        acknowledge a check that never completed.
                 working_dir:
                   type: string
                   description: >-
@@ -9609,10 +9604,11 @@ paths:
             order names one issue twice; `grooming_order_empty` — the order
             names no issue in the target repo, so there is nothing to campaign;
             `grooming_order_superseded` — a newer approved grooming run exists
-            (details name `superseded_by`); `grooming_order_supersession_undetermined`
-            — the bounded scan could not establish that none does. The last two
-            are converted into an explicit, RECORDED acknowledgement by
-            `grooming_source.allow_superseded`.
+            (details name `superseded_by`), converted into an explicit, RECORDED
+            acknowledgement by `grooming_source.allow_superseded`;
+            `grooming_order_supersession_undetermined` — the bounded scan could
+            not establish that none does, which `allow_superseded` does NOT
+            bypass.
         '501':
           description: |
             `provider_unimplemented` — the conventions name an unregistered

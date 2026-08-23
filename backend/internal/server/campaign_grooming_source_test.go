@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -210,10 +211,17 @@ type groomingSourceFixture struct {
 	runs      *groomingSourceRunRepo
 	artifacts *groomingSourceArtifactRepo
 	approvals *groomingSourceApprovalRepo
-	provider  *fakeIssueSetProvider
-	runID     uuid.UUID
-	stageID   uuid.UUID
-	reportID  uuid.UUID
+	// audit captures the GLOBAL-chain appends so the
+	// campaign_grooming_source_resolved EMISSION is asserted behaviourally
+	// rather than inferred from its category registration. It reuses this
+	// package's campaignAuditRecorder (campaigns_test.go) — nothing shared is
+	// extended, and every fixture wires it, so deleting the emit reddens the
+	// audit tests instead of leaving them green.
+	audit    *campaignAuditRecorder
+	provider *fakeIssueSetProvider
+	runID    uuid.UUID
+	stageID  uuid.UUID
+	reportID uuid.UUID
 }
 
 type groomingSourceOpts struct {
@@ -224,8 +232,13 @@ type groomingSourceOpts struct {
 	badReport bool
 	// repo overrides the grooming run's repo (for the mismatch case).
 	repo string
-	// accountID sets the grooming run's tenant account.
+	// accountID sets the grooming run's tenant account. Empty means "the
+	// caller's own account" (the ordinary same-tenant fixture); use
+	// untenantedRun to build a run with NO account at all.
 	accountID string
+	// untenantedRun ships a source run whose AccountID is EMPTY, the case a
+	// NULL-allow tenancy check would wave through for any authenticated caller.
+	untenantedRun bool
 	// children is the resolver result; nil builds one from rankedNumbers.
 	children *workmgmt.EpicChildrenResult
 }
@@ -236,6 +249,7 @@ func newGroomingSourceFixture(t *testing.T, opts groomingSourceOpts, rankedNumbe
 	repoFull := owner + "/" + name
 
 	f := &groomingSourceFixture{
+		audit:     &campaignAuditRecorder{},
 		campaigns: newFakeCampaignRepo(),
 		runs:      &groomingSourceRunRepo{runs: map[uuid.UUID]*run.Run{}, stages: map[uuid.UUID][]*run.Stage{}},
 		artifacts: &groomingSourceArtifactRepo{byStage: map[uuid.UUID][]*artifact.Artifact{}},
@@ -247,9 +261,19 @@ func newGroomingSourceFixture(t *testing.T, opts groomingSourceOpts, rankedNumbe
 	if runRepo == "" {
 		runRepo = repoFull
 	}
+	// The default source run belongs to the CALLER's account: the tenancy match
+	// is exact, so an untenanted run is not visible to the tenanted test
+	// operator (see TestCreateCampaign_GroomingSource_UntenantedRunNotFound).
+	runAccount := opts.accountID
+	if runAccount == "" && !opts.untenantedRun {
+		runAccount = testOperatorAccountID
+	}
+	if opts.untenantedRun {
+		runAccount = ""
+	}
 	f.runs.runs[f.runID] = &run.Run{
 		ID: f.runID, Repo: runRepo, WorkflowID: "backlog_grooming",
-		AccountID: opts.accountID, CreatedAt: time.Now().Add(-time.Hour),
+		AccountID: runAccount, CreatedAt: time.Now().Add(-time.Hour),
 	}
 	f.runs.stages[f.runID] = []*run.Stage{{ID: f.stageID, RunID: f.runID, Type: run.StageTypePlan}}
 	if !opts.omitReport {
@@ -293,6 +317,7 @@ func newGroomingSourceFixture(t *testing.T, opts groomingSourceOpts, rankedNumbe
 	f.server = New(Config{
 		CampaignRepo: f.campaigns, RunRepo: f.runs,
 		ArtifactRepo: f.artifacts, ApprovalRepo: f.approvals,
+		AuditRepo: f.audit,
 	})
 	return f
 }
@@ -389,6 +414,219 @@ func TestCreateCampaign_GroomingSource_EndToEnd(t *testing.T) {
 	if respProv.SourceRunID != prov.SourceRunID || respProv.ReportContentHash != prov.ReportContentHash {
 		t.Errorf("response provenance %+v disagrees with the persisted row %+v", respProv, prov)
 	}
+
+	// (d) THE AUDIT LAYER FIRED. The chain's second copy of the provenance is
+	// best-effort by design, but it IS shipped behaviour (an operator can
+	// fishhawk_await_audit on the category), so the emission is asserted rather
+	// than inferred from the category registration: exactly one entry, naming
+	// the campaign AND carrying the same identifiers the row does.
+	entries := f.audit.entriesFor(auditCampaignGroomingSourceResolved)
+	if len(entries) != 1 {
+		t.Fatalf("%s audit entries = %d, want exactly 1", auditCampaignGroomingSourceResolved, len(entries))
+	}
+	aud := decodeGroomingAudit(t, entries[0])
+	if aud.CampaignID != created.ID.String() {
+		t.Errorf("audit campaign_id = %q, want %s", aud.CampaignID, created.ID)
+	}
+	if aud.Repo != created.Repo {
+		t.Errorf("audit repo = %q, want %q", aud.Repo, created.Repo)
+	}
+	if aud.GroomingSource.SourceRunID != f.runID || aud.GroomingSource.SourceStageID != f.stageID ||
+		aud.GroomingSource.ReportArtifactID != f.reportID {
+		t.Errorf("audit provenance ids = %+v, want run=%s stage=%s artifact=%s",
+			aud.GroomingSource, f.runID, f.stageID, f.reportID)
+	}
+	if aud.GroomingSource.ReportContentHash != "sha256:test-report-hash" {
+		t.Errorf("audit report_content_hash = %q, want the artifact's hash", aud.GroomingSource.ReportContentHash)
+	}
+	if fmt.Sprint(aud.GroomingSource.OrderedRefs) != fmt.Sprint(want) || aud.GroomingSource.OrderedCount != len(want) {
+		t.Errorf("audit ordered_refs = %v (count %d), want %v", aud.GroomingSource.OrderedRefs, aud.GroomingSource.OrderedCount, want)
+	}
+}
+
+// groomingAuditEntry is the decoded campaign_grooming_source_resolved payload:
+// the campaign it names plus the SAME provenance type the row and the response
+// carry, so a drift between the three cannot pass unnoticed.
+type groomingAuditEntry struct {
+	CampaignID     string                        `json:"campaign_id"`
+	Repo           string                        `json:"repo"`
+	GroomingSource campaignGroomingSourcePayload `json:"grooming_source"`
+}
+
+func decodeGroomingAudit(t *testing.T, p audit.GlobalChainAppendParams) groomingAuditEntry {
+	t.Helper()
+	var out groomingAuditEntry
+	if err := json.Unmarshal(p.Payload, &out); err != nil {
+		t.Fatalf("decode %s payload %s: %v", p.Category, p.Payload, err)
+	}
+	return out
+}
+
+// entriesFor returns every recorded append in the given category, so a test can
+// assert the ENTRY (not merely a count).
+func (a *campaignAuditRecorder) entriesFor(category string) []audit.GlobalChainAppendParams {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []audit.GlobalChainAppendParams
+	for _, e := range a.entries {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestCreateCampaign_GroomingSource_AuditCarriesTheFullProvenance covers the
+// audit payload fields the happy path cannot reach: the applied limit and its
+// omitted count, a NAMED exclusion, and an acknowledged supersession. Together
+// with the end-to-end test's ids/hash/ordering assertions, every field of the
+// emitted entry is pinned — and deleting the emitCampaignAudit call reddens both.
+func TestCreateCampaign_GroomingSource_AuditCarriesTheFullProvenance(t *testing.T) {
+	// Rank 1 is an issue in ANOTHER repo (an exclusion), then three in-repo
+	// issues of which the limit takes two — so one convertible entry is dropped
+	// by the cap and one entry is excluded, and the two counts stay distinct.
+	f := newGroomingSourceFixture(t, groomingSourceOpts{
+		approvals: []approval.Decision{approval.DecisionApprove},
+		children:  &workmgmt.EpicChildrenResult{Children: []workmgmt.EpicChild{{Number: 101}, {Number: 303}}},
+	}, 303, 101, 202)
+	spliceForeignOrderingEntry(t, f, "other/repo#77")
+	newerID := f.seedNewerApprovedGroomingRun(t, time.Now())
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, `,"limit":2,"allow_superseded":true`))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	entries := f.audit.entriesFor(auditCampaignGroomingSourceResolved)
+	if len(entries) != 1 {
+		t.Fatalf("%s audit entries = %d, want exactly 1", auditCampaignGroomingSourceResolved, len(entries))
+	}
+	aud := decodeGroomingAudit(t, entries[0])
+	if aud.CampaignID != created.ID.String() {
+		t.Fatalf("audit campaign_id = %q, want %s", aud.CampaignID, created.ID)
+	}
+	gsrc := aud.GroomingSource
+	if gsrc.Limit != 2 || gsrc.OmittedByLimit != 1 {
+		t.Errorf("audit limit=%d omitted_by_limit=%d, want 2 and 1", gsrc.Limit, gsrc.OmittedByLimit)
+	}
+	if len(gsrc.Excluded) != 1 || gsrc.Excluded[0].Ref != "other/repo#77" ||
+		gsrc.Excluded[0].Reason != campaign.ExclusionOtherRepo {
+		t.Errorf("audit excluded = %+v, want exactly one other_repo exclusion naming other/repo#77", gsrc.Excluded)
+	}
+	if gsrc.SupersededBy == nil || *gsrc.SupersededBy != newerID {
+		t.Errorf("audit superseded_by = %v, want %s — the acknowledged supersession rides the chain copy too", gsrc.SupersededBy, newerID)
+	}
+	// The chain copy agrees with the system of record.
+	stored, err := f.campaigns.GetCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	var row campaignGroomingSourcePayload
+	if err := json.Unmarshal(stored.GroomingSource, &row); err != nil {
+		t.Fatalf("decode persisted provenance: %v", err)
+	}
+	if fmt.Sprint(row) != fmt.Sprint(gsrc) {
+		t.Fatalf("audit provenance %+v disagrees with the persisted row %+v", gsrc, row)
+	}
+}
+
+// TestCreateCampaign_GroomingSource_UntenantedRunNotFound is the dedicated
+// counterfactual vehicle for the EXACT tenancy match. The source run carries NO
+// account — the case a NULL-allow check waves through for any authenticated
+// caller — and the run id here is CALLER-SUPPLIED, so allowing it would let any
+// tenant consume an untenanted run's ratified order. It must be reported
+// identically to a missing run, and nothing may be persisted from it.
+func TestCreateCampaign_GroomingSource_UntenantedRunNotFound(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{
+		approvals:     []approval.Decision{approval.DecisionApprove},
+		untenantedRun: true,
+	}, 20, 10)
+	if got := f.runs.runs[f.runID].AccountID; got != "" {
+		t.Fatalf("fixture source run AccountID = %q, want empty — this test needs an UNTENANTED run", got)
+	}
+	if testOperatorAccountID == "" {
+		t.Fatal("the test operator identity carries no account; this case would be a same-account match, not a cross-tenant one")
+	}
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", w.Code, w.Body.String())
+	}
+	if code, _ := decodeGroomingErr(t, w.Body.Bytes()); code != codeGroomingRunNotFound {
+		t.Fatalf("code = %q, want %q — an UNTENANTED run must be indistinguishable from a missing one",
+			code, codeGroomingRunNotFound)
+	}
+	if n := f.campaigns.countCampaigns(); n != 0 {
+		t.Fatalf("%d campaign(s) persisted from an untenanted run's order, want 0", n)
+	}
+	if f.provider.resolveCalled {
+		t.Error("the provider was dialed for a run outside the caller's account")
+	}
+}
+
+// TestCreateCampaign_GroomingSource_UndeterminedIsNotAcknowledgeable is K2's
+// second half and the counterfactual vehicle for the UNCONDITIONAL undetermined
+// refusal: allow_superseded acknowledges a NAMED newer run, and an incomplete
+// scan names none. A flag the caller controls must not stand in for a check that
+// never finished, so the create is refused even WITH the acknowledgement.
+func TestCreateCampaign_GroomingSource_UndeterminedIsNotAcknowledgeable(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 20, 10)
+	// Every page comes back FULL, so the scan never reaches the end of the list
+	// within its page budget. Seeded BY CONSTRUCTION — nothing here calls the
+	// control — so the RED lands on the behavioural assertion.
+	f.runs.listRuns = func(run.ListRunsFilter) ([]*run.Run, error) {
+		out := make([]*run.Run, groomingSupersessionPageSize)
+		for i := range out {
+			out[i] = &run.Run{ID: uuid.New(), CreatedAt: time.Now().Add(-2 * time.Hour)}
+		}
+		return out, nil
+	}
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, `,"allow_superseded":true`))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s) — allow_superseded must NOT bypass an undetermined scan", w.Code, w.Body.String())
+	}
+	if code, _ := decodeGroomingErr(t, w.Body.Bytes()); code != codeGroomingSupersessionUndetermined {
+		t.Fatalf("code = %q, want %q", code, codeGroomingSupersessionUndetermined)
+	}
+	// COMMITTED STATE: the refusal is what matters, and a bypassed control
+	// returns a 201 with a campaign behind it.
+	if n := f.campaigns.countCampaigns(); n != 0 {
+		t.Fatalf("%d campaign(s) persisted from an order whose currency was never established, want 0", n)
+	}
+	if n := len(f.audit.entriesFor(auditCampaignGroomingSourceResolved)); n != 0 {
+		t.Fatalf("%d grooming-source audit entries behind the refusal, want 0", n)
+	}
+}
+
+// spliceForeignOrderingEntry appends an ordering entry for an issue in ANOTHER
+// repo, ranked last, so the derived order carries exactly one NAMED exclusion.
+func spliceForeignOrderingEntry(t *testing.T, f *groomingSourceFixture, ref string) {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(f.artifacts.byStage[f.stageID][0].Content, &doc); err != nil {
+		t.Fatalf("decode fixture report: %v", err)
+	}
+	ordering := doc["ordering"].([]any)
+	ordering = append(ordering, map[string]any{
+		"id":    plan.GroomingEntryID(plan.GroomingClassOrdering, "", plan.ItemRef{Type: "github_issue", ID: ref}),
+		"rank":  len(ordering) + 1,
+		"score": 1.0,
+		"item_ref": map[string]any{
+			"type": "github_issue", "id": ref, "url": "https://github.test/" + ref,
+		},
+		"rubric_citations": []any{map[string]any{"rubric_id": "V1"}},
+	})
+	doc["ordering"] = ordering
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	f.artifacts.byStage[f.stageID][0].Content = raw
 }
 
 // TestCreateCampaign_GroomingSource_ReadOnce pins AC3 behaviourally: exactly
@@ -523,7 +761,9 @@ func TestCreateCampaign_GroomingSource_Refusals(t *testing.T) {
 		{
 			// K2: the bounded scan could not PROVE absence. Reporting "the scan
 			// was capped" on a successful create would relabel the silence, so it
-			// REFUSES.
+			// REFUSES — unconditionally; see
+			// TestCreateCampaign_GroomingSource_UndeterminedIsNotAcknowledgeable
+			// for the allow_superseded half.
 			name: "supersession scan cannot prove absence",
 			opts: groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}},
 			mutate: func(f *groomingSourceFixture) {
@@ -763,27 +1003,8 @@ func TestCreateCampaign_GroomingSource_ExclusionsReported(t *testing.T) {
 		approvals: []approval.Decision{approval.DecisionApprove},
 		children:  &workmgmt.EpicChildrenResult{Children: []workmgmt.EpicChild{{Number: 10}}},
 	}, 10)
-	// Splice in an ordering entry for ANOTHER repo, ranked first.
-	var doc map[string]any
-	if err := json.Unmarshal(f.artifacts.byStage[f.stageID][0].Content, &doc); err != nil {
-		t.Fatalf("decode fixture report: %v", err)
-	}
-	ordering := doc["ordering"].([]any)
-	ordering = append(ordering, map[string]any{
-		"id":    plan.GroomingEntryID(plan.GroomingClassOrdering, "", plan.ItemRef{Type: "github_issue", ID: "other/repo#77"}),
-		"rank":  2,
-		"score": 1.0,
-		"item_ref": map[string]any{
-			"type": "github_issue", "id": "other/repo#77", "url": "https://github.test/other/repo/issues/77",
-		},
-		"rubric_citations": []any{map[string]any{"rubric_id": "V1"}},
-	})
-	doc["ordering"] = ordering
-	raw, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	f.artifacts.byStage[f.stageID][0].Content = raw
+	// Splice in an ordering entry for ANOTHER repo.
+	spliceForeignOrderingEntry(t, f, "other/repo#77")
 
 	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
 	if w.Code != http.StatusCreated {
