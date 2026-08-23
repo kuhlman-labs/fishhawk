@@ -1129,7 +1129,7 @@ func TestValidateAutonomy_GroomingHygieneAutoForeignWhen(t *testing.T) {
 // validateAutonomy and this test goes RED on the message (the extension-class
 // branch rejects with different text).
 func TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto(t *testing.T) {
-	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping, ActionGroomMilestone} {
 		t.Run(class, func(t *testing.T) {
 			// `when` is declared too: a non-delegable class must be refused for
 			// WHAT IT IS, not for a missing condition it could never satisfy.
@@ -1165,7 +1165,7 @@ func TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto(t *testing.T) {
 // destructive class is exactly the refactor drift the registry design exists
 // to make impossible, and this is the assertion that catches it.
 func TestGroomingRegistry_NonDelegableClassesCarryNoCondition(t *testing.T) {
-	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping, ActionGroomMilestone} {
 		if _, nonDelegable := nonDelegableGroomingClasses[class]; !nonDelegable {
 			t.Errorf("%q is missing from nonDelegableGroomingClasses; the explicit refusal branch would not fire for it", class)
 		}
@@ -1183,11 +1183,40 @@ func TestGroomingRegistry_NonDelegableClassesCarryNoCondition(t *testing.T) {
 	}
 }
 
+// TestGroomingRegistry_MilestoneClassNotInKnownActionOrder pins that the
+// fifth grooming class follows the same rule as the other four: it is absent
+// from knownActionOrder, so a workflow that does NOT declare it emits no
+// entry for it in its resolved matrix and its derived delegation block is
+// byte-identical to today. Registering it in knownActionOrder would attach a
+// permanently-gated milestone entry to every workflow for no safety gain.
+func TestGroomingRegistry_MilestoneClassNotInKnownActionOrder(t *testing.T) {
+	for _, name := range knownActionOrder {
+		if name == ActionGroomMilestone {
+			t.Fatalf("knownActionOrder must not contain %q — a grooming class attaches a permanently-gated entry to every workflow's matrix", ActionGroomMilestone)
+		}
+	}
+	// An ordinary workflow declaring only a tier resolves NO milestone entry.
+	s := mustParse(t, v2Doc("    autonomy: medium\n"))
+	wf := s.Workflows["feature_change"]
+	rm := ResolveAutonomy(&wf, nil)
+	for _, a := range rm.Actions {
+		if a.Action == ActionGroomMilestone {
+			t.Errorf("resolved matrix carries a %q entry (%+v) for a workflow that never declared it", ActionGroomMilestone, a)
+		}
+	}
+	// Declared explicitly, it IS surfaced — the class is known, just not default.
+	s2 := mustParse(t, groomingMatrixDoc(ActionGroomMilestone, "        mode: report\n"))
+	wf2 := s2.Workflows["feature_change"]
+	if got := resolvedFor(t, ResolveAutonomy(&wf2, nil), ActionGroomMilestone); got.Mode != ModeReport {
+		t.Errorf("declared milestone mode = %q, want report", got.Mode)
+	}
+}
+
 // TestValidateAutonomy_GroomingClassesAcceptGatedAndReport is the second
 // non-vacuity control: the non-delegable classes are KNOWN and declarable, so
 // a refusal-of-everything implementation fails here.
 func TestValidateAutonomy_GroomingClassesAcceptGatedAndReport(t *testing.T) {
-	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping, ActionGroomMilestone} {
 		for _, mode := range []ActionMode{ModeGated, ModeReport} {
 			t.Run(class+"/"+string(mode), func(t *testing.T) {
 				s := mustParse(t, groomingMatrixDoc(class, "        mode: "+string(mode)+"\n"))

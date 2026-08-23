@@ -150,6 +150,97 @@ func TestHandleShipPlan_GroomingReport_PersistsAndAudits(t *testing.T) {
 	}
 }
 
+// validMilestoneReportBytes returns the shipped milestone example, so the ingest
+// test and the schema reference cannot drift apart.
+func validMilestoneReportBytes(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile("../../../docs/spec/examples/grooming-report-v1-milestone-example.json")
+	if err != nil {
+		t.Fatalf("read canonical milestone example: %v", err)
+	}
+	return b
+}
+
+// TestHandleGroomingReport_MilestoneScope_RecordsExtendedCensus is the
+// HTTP-boundary half of the cross-layer test (E54.9 / #2309): a signed POST of a
+// milestone report from a plan stage persists the artifact and records the three
+// EXTENDED census counts alongside the six existing ones.
+//
+// It ALSO carries approval condition C5's observable proof — a milestone report
+// proposes no mutation. The apply layer's landed-mutation seam emits
+// grooming_mutation_applied audit rows; this ingest reaches NO such seam, so
+// that category must be absent after the POST (a never-dialed-seam assertion in
+// the spirit of the ones used elsewhere in this epic). The milestone_scope
+// carries no tracker write, and the inherited gating is stated in the PR notes.
+func TestHandleGroomingReport_MilestoneScope_RecordsExtendedCensus(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	priv, _ := sf.issue(t, runID)
+	body := validMilestoneReportBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts = %d, want 1", len(ar.all))
+	}
+
+	entries := groomingAuditEntries(au)
+	if len(entries) != 1 {
+		t.Fatalf("grooming_report_recorded entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		EntryCounts map[string]int `json:"entry_counts"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	want := map[string]int{
+		"ordering": 1, "duplicates": 0, "hygiene_defects": 1,
+		"dependency_edges": 0, "vision_drift": 0, "decomposition_suggestions": 0,
+		"milestone_inclusions": 4, "milestone_exclusions": 2, "milestone_declined_calls": 1,
+	}
+	for k, v := range want {
+		if payload.EntryCounts[k] != v {
+			t.Errorf("entry_counts[%s] = %d, want %d", k, payload.EntryCounts[k], v)
+		}
+	}
+
+	// C5: no mutation seam was dialed. The apply layer emits
+	// grooming_mutation_applied rows; a milestone report proposes no mutation, so
+	// none must exist after ingest.
+	if n := countAuditCategory(au, workmgmt.GroomingMutationAppliedCategory); n != 0 {
+		t.Errorf("grooming_mutation_applied entries = %d, want 0 — a milestone report reaches no mutation seam", n)
+	}
+}
+
+// TestHandleGroomingReport_OrdinaryReport_CensusOmitsMilestoneKeys is the
+// additive-optional proof at the ingest boundary: an ordinary grooming report's
+// audit census carries NONE of the three milestone keys, so the existing audit
+// payload contract is byte-identical to before this slice.
+func TestHandleGroomingReport_OrdinaryReport_CensusOmitsMilestoneKeys(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validGroomingReportBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	entries := groomingAuditEntries(au)
+	if len(entries) != 1 {
+		t.Fatalf("grooming_report_recorded entries = %d, want 1", len(entries))
+	}
+	for _, k := range []string{"milestone_inclusions", "milestone_exclusions", "milestone_declined_calls"} {
+		if bytes.Contains(entries[0].Payload, []byte(k)) {
+			t.Errorf("ordinary report audit payload carries %q; the census must omit milestone keys when no milestone_scope is present", k)
+		}
+	}
+}
+
 // TestHandleShipPlan_GroomingReport_Idempotent: a runner retry re-POSTs the same
 // bytes and gets 200 idempotent with exactly one artifact row and one audit
 // entry.

@@ -60,6 +60,11 @@ type GroomingReport struct {
 	DependencyEdges          []DependencyEdge          `json:"dependency_edges"`
 	VisionDrift              []VisionDriftFlag         `json:"vision_drift"`
 	DecompositionSuggestions []DecompositionSuggestion `json:"decomposition_suggestions"`
+	// MilestoneScope is present only when the report scopes a release milestone
+	// (E54.9 / #2309). Additive-optional: its absence means an ordinary grooming
+	// report. Its typed domain and the seven semantic rules the schema cannot
+	// express live in groomingmilestone.go.
+	MilestoneScope *MilestoneScope `json:"milestone_scope,omitempty"`
 }
 
 // GroomingCharterRef identifies the charter revision a report was scored
@@ -221,6 +226,7 @@ func itemKey(ref ItemRef) string {
 //	hygiene / vision_drift     → "<class>:<item-key>:<qualifier>"
 //	duplicate                  → "<class>:<key-a>+<key-b>"   (keys SORTED)
 //	dependency                 → "<class>:<from-key>+<to-key>" (keys NOT sorted)
+//	milestone_declined         → "<class>:<qualifier>"       (ZERO-REF form, #2309)
 //
 // WHY duplicate SORTS AND dependency DOES NOT (#2235 condition F1): a duplicate
 // pair is an UNORDERED relation — "A and B overlap" is the same proposal as "B
@@ -239,6 +245,14 @@ func itemKey(ref ItemRef) string {
 // two charter ids differing only by case map to one qualifier — means charter
 // line ids must be case-insensitively unique (documented in the reference doc).
 func GroomingEntryID(class string, qualifier string, refs ...ItemRef) string {
+	// ZERO-REF form (E54.9 / #2309): with no item refs the id is
+	// `<class>:<lowercased qualifier>` — the form a milestone declined call
+	// needs, since an ambiguous scope question is not necessarily anchored to
+	// one item. Handled first so the empty join below never yields a "<class>::"
+	// double-colon for a ref-less entry.
+	if len(refs) == 0 {
+		return class + ":" + strings.ToLower(qualifier)
+	}
 	keys := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		keys = append(keys, itemKey(ref))
@@ -272,6 +286,12 @@ func GroomingEntryID(class string, qualifier string, refs ...ItemRef) string {
 //     nothing an operator could act on;
 //   - the ordering ranks are exactly the permutation 1..N — a duplicated or
 //     gapped rank is not an applicable proposal.
+//
+// When the report carries a milestone_scope (#2309), seven further rules run
+// (see checkMilestoneScope): wave contiguity, dependency resolvability, strict
+// wave monotonicity across in-scope edges, an out-of-scope dependency requiring
+// a declined call, critical-path connectivity, declined-call referential
+// integrity, and canonical ordering of every array.
 //
 // The returned error is *ParseError, *SchemaError, or *SemanticError. The
 // semantic checks live HERE, not only in ParseGroomingReport, so an invalid
@@ -373,7 +393,15 @@ func groomingSemanticCheck(gr *GroomingReport) error {
 	}
 
 	// Rule (d): ordering ranks are exactly the permutation 1..N.
-	return checkGroomingRanks(gr.Ordering)
+	if err := checkGroomingRanks(gr.Ordering); err != nil {
+		return err
+	}
+
+	// Milestone-scope rules (E54.9 / #2309). Run LAST, after the report-wide id
+	// rules above, so a malformed milestone id is reported as a malformed id
+	// rather than as a milestone-rule violation. A no-op when the report carries
+	// no milestone_scope.
+	return checkMilestoneScope(gr)
 }
 
 // collectGroomingEntries flattens the six typed arrays into the class-agnostic
@@ -436,6 +464,36 @@ func collectGroomingEntries(gr *GroomingReport) []groomingEntry {
 			derivedID:  GroomingEntryID(GroomingClassDecomposition, "", e.ItemRef),
 			field:      fmt.Sprintf("/decomposition_suggestions/%d/id", i),
 		})
+	}
+	// Milestone entries (#2309) inherit the report-wide id rules unchanged:
+	// uniqueness, class-prefix routing and recomposition. Inclusion/exclusion
+	// derive from their own item_ref; a declined call derives from its
+	// question_id via the ZERO-REF form.
+	if gr.MilestoneScope != nil {
+		for i, e := range gr.MilestoneScope.Included {
+			out = append(out, groomingEntry{
+				declaredID: e.ID,
+				class:      GroomingClassMilestoneInclusion,
+				derivedID:  GroomingEntryID(GroomingClassMilestoneInclusion, "", e.ItemRef),
+				field:      fmt.Sprintf("/milestone_scope/included/%d/id", i),
+			})
+		}
+		for i, e := range gr.MilestoneScope.Excluded {
+			out = append(out, groomingEntry{
+				declaredID: e.ID,
+				class:      GroomingClassMilestoneExclusion,
+				derivedID:  GroomingEntryID(GroomingClassMilestoneExclusion, "", e.ItemRef),
+				field:      fmt.Sprintf("/milestone_scope/excluded/%d/id", i),
+			})
+		}
+		for i, e := range gr.MilestoneScope.DeclinedCalls {
+			out = append(out, groomingEntry{
+				declaredID: e.ID,
+				class:      GroomingClassMilestoneDeclined,
+				derivedID:  GroomingEntryID(GroomingClassMilestoneDeclined, e.QuestionID),
+				field:      fmt.Sprintf("/milestone_scope/declined_calls/%d/id", i),
+			})
+		}
 	}
 	return out
 }

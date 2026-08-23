@@ -1,0 +1,211 @@
+{
+  "kind": "grooming_report",
+  "report_version": "grooming_report_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/2309",
+    "id": "kuhlman-labs/fishhawk#2309"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-5",
+    "timestamp": "2026-08-23T09:15:00Z"
+  },
+  "summary": "Scoped the alpha milestone against the operator's release definition: three waves, two exclusions, and one call declined (is the web UI in alpha?). Surfaces one hygiene defect found along the way.",
+  "charter_ref": {
+    "path": ".fishhawk/charter.md",
+    "content_hash": "3726dca74f7729cbe084869f755e3ffff92812011e61fe13084faf603fd13561",
+    "ref": "main"
+  },
+  "ordering": [
+    {
+      "id": "ordering:github/kuhlman-labs/fishhawk#2388",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2388",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2388"
+      },
+      "rank": 1,
+      "score": 9.5,
+      "rubric_citations": [
+        {
+          "rubric_id": "U1",
+          "note": "The OAuth AS keystone blocks the rest of the alpha slice."
+        }
+      ]
+    }
+  ],
+  "duplicates": [],
+  "hygiene_defects": [
+    {
+      "id": "hygiene:github/kuhlman-labs/fishhawk#2391:unboarded",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2391",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2391"
+      },
+      "defect": "unboarded",
+      "detail": "Not present on the phase board, so it is invisible to the kanban view — found while scoping the milestone.",
+      "suggested_fix": "Add the item to the phase board and set Status=Backlog."
+    }
+  ],
+  "dependency_edges": [],
+  "vision_drift": [],
+  "decomposition_suggestions": [],
+  "milestone_scope": {
+    "release_definition": {
+      "label": "alpha",
+      "text": "The alpha milestone is the first externally usable slice: OAuth-authenticated MCP access to a single tenant, with the GitLab identity path stubbed. The hosted web UI is out.",
+      "source": "operator_input"
+    },
+    "framing": {
+      "statement": "Alpha = the OAuth AS keystone (#2388) plus the two consumers that make authenticated MCP access usable end to end, sequenced behind it. The web UI and the second tenant are deferred.",
+      "basis": "ADR-076 §2 (the OAuth authorization-server slice) and ARCHITECTURE.md §10 'Where to look' for the /mcp route."
+    },
+    "included": [
+      {
+        "id": "milestone_inclusion:github/kuhlman-labs/fishhawk#2388",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2388",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2388"
+        },
+        "reason": "The OAuth authorization-server keystone: every authenticated MCP call depends on it, so it is wave 0.",
+        "wave": 0,
+        "rubric_citations": [
+          {
+            "rubric_id": "U1",
+            "note": "Blocks the entire alpha critical path."
+          }
+        ]
+      },
+      {
+        "id": "milestone_inclusion:github/kuhlman-labs/fishhawk#2389",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2389",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2389"
+        },
+        "reason": "The /mcp route that consumes the AS token — the first thing an external client touches.",
+        "wave": 1,
+        "depends_on": ["github/kuhlman-labs/fishhawk#2388"],
+        "rubric_citations": [
+          {
+            "rubric_id": "U2",
+            "note": "On the alpha critical path, immediately behind the keystone."
+          }
+        ]
+      },
+      {
+        "id": "milestone_inclusion:github/kuhlman-labs/fishhawk#2390",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2390",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2390"
+        },
+        "reason": "The single-tenant scoping the AS token carries. Its coupling to the web UI is the one call this scope declined to make.",
+        "wave": 1,
+        "depends_on": [
+          "github/kuhlman-labs/fishhawk#2388",
+          "github/kuhlman-labs/fishhawk#2500"
+        ],
+        "open_question_ids": ["web-ui-in-alpha"],
+        "rubric_citations": [
+          {
+            "rubric_id": "R4",
+            "note": "Cheaper to scope the tenant boundary now than to retrofit it per consumer."
+          }
+        ]
+      },
+      {
+        "id": "milestone_inclusion:github/kuhlman-labs/fishhawk#2408",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2408",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2408"
+        },
+        "reason": "The extracted MCP tool library the route serves — the last link that makes the slice usable.",
+        "wave": 2,
+        "depends_on": ["github/kuhlman-labs/fishhawk#2389"],
+        "rubric_citations": [
+          {
+            "rubric_id": "U2",
+            "note": "Completes the authenticated-access path."
+          }
+        ]
+      }
+    ],
+    "excluded": [
+      {
+        "id": "milestone_exclusion:github/kuhlman-labs/fishhawk#2391",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2391",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2391"
+        },
+        "reason": "The GitLab identity path is stubbed for alpha per the release definition; the full path is a post-alpha slice.",
+        "rubric_citations": [
+          {
+            "rubric_id": "V5",
+            "note": "Real value, wrong phase — out of alpha and said so."
+          }
+        ]
+      },
+      {
+        "id": "milestone_exclusion:github/kuhlman-labs/fishhawk#2500",
+        "item_ref": {
+          "type": "github_issue",
+          "id": "kuhlman-labs/fishhawk#2500",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2500"
+        },
+        "reason": "The hosted web UI is named as out of alpha by the release definition.",
+        "rubric_citations": [
+          {
+            "rubric_id": "NG2",
+            "note": "The charter names a hosted control plane as a current-phase non-goal."
+          }
+        ]
+      }
+    ],
+    "declined_calls": [
+      {
+        "id": "milestone_declined:web-ui-in-alpha",
+        "question_id": "web-ui-in-alpha",
+        "question": "Does single-tenant scoping (#2390) need any of the web UI (#2500) in alpha, or is the API surface enough?",
+        "why_ambiguous": "The release definition puts the web UI out of alpha, but #2390's body references a settings page that only the UI exposes — the two cannot both be true without an operator call.",
+        "recommended_default": "API surface only; defer the settings page to the post-alpha web UI slice.",
+        "options": [
+          "API surface only",
+          "Include the minimal settings page from #2500"
+        ],
+        "item_refs": [
+          {
+            "type": "github_issue",
+            "id": "kuhlman-labs/fishhawk#2390",
+            "url": "https://github.com/kuhlman-labs/fishhawk/issues/2390"
+          },
+          {
+            "type": "github_issue",
+            "id": "kuhlman-labs/fishhawk#2500",
+            "url": "https://github.com/kuhlman-labs/fishhawk/issues/2500"
+          }
+        ],
+        "rubric_citations": [
+          {
+            "rubric_id": "U3",
+            "note": "The answer changes the tenant boundary's surface, so it must be decided before #2390 lands."
+          }
+        ]
+      }
+    ],
+    "critical_path": [
+      "github/kuhlman-labs/fishhawk#2388",
+      "github/kuhlman-labs/fishhawk#2389",
+      "github/kuhlman-labs/fishhawk#2408"
+    ],
+    "edge_confidence": {
+      "level": "medium",
+      "basis": "Edges read from issue bodies and ADR-076, not from declared depends_on links."
+    }
+  }
+}

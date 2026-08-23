@@ -235,7 +235,7 @@ func (s *Server) handleGroomingReport(w http.ResponseWriter, r *http.Request, ru
 // the cheap run-over-run signal #2240's churn guard reads before fetching the
 // report body by content hash.
 func groomingEntryCounts(gr *plan.GroomingReport) map[string]int {
-	return map[string]int{
+	counts := map[string]int{
 		"ordering":                  len(gr.Ordering),
 		"duplicates":                len(gr.Duplicates),
 		"hygiene_defects":           len(gr.HygieneDefects),
@@ -243,6 +243,15 @@ func groomingEntryCounts(gr *plan.GroomingReport) map[string]int {
 		"vision_drift":              len(gr.VisionDrift),
 		"decomposition_suggestions": len(gr.DecompositionSuggestions),
 	}
+	// Milestone counts (E54.9 / #2309) are emitted ONLY when the report carries
+	// a milestone_scope, so an ordinary grooming report's audit payload is
+	// byte-identical to before this slice.
+	if gr.MilestoneScope != nil {
+		counts["milestone_inclusions"] = len(gr.MilestoneScope.Included)
+		counts["milestone_exclusions"] = len(gr.MilestoneScope.Excluded)
+		counts["milestone_declined_calls"] = len(gr.MilestoneScope.DeclinedCalls)
+	}
+	return counts
 }
 
 // failGroomingStage transitions the stage to failed-B and walks the run to

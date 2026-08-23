@@ -1,0 +1,94 @@
+# Workflow-v2 example — the milestone-scoping backlog-grooming variant
+# (E54.9 / #2309).
+#
+# ILLUSTRATIVE, not the repo's own spec. The repo's `.fishhawk/workflows.yaml`
+# is a forbidden path for this slice; the operator authors the repo's own spec
+# change separately (see the PR notes). This file lives under docs/spec/examples/
+# and is validated against ../workflow-v2.schema.json and parsed end to end by
+# TestShippedMilestoneExample_MilestoneResolvesToReport in backend/internal/spec,
+# so a schema-invalid or drifted example reddens that test rather than only a
+# manual check-jsonschema run.
+#
+# WHAT IT SHOWS. The `milestone` grooming class (E54.9 / #2309), declared
+# alongside the four existing grooming classes. Like `scoping`, `milestone` is
+# NON-DELEGABLE: a release plan's framing is a judgment call, not an objectively
+# reversible mutation, so it may only ever `report` (surface a proposal) or be
+# `gated` (the human acts). `mode: auto` on it is REFUSED AT PARSE TIME by the
+# backend — no backend-evaluable condition exists or may be added for it — the
+# same two independent controls the other three non-delegable classes carry.
+#
+# The PROPOSE stage emits a grooming_report whose optional milestone_scope
+# object carries the scoped, sequenced release plan and the calls the class
+# DECLINED to make. Nothing here mutates a tracker at any stage.
+#
+# THE TRIGGER FORM. `applies_to: {trigger: [scheduled, on_demand]}` is the
+# non-diff routing declaration (ADR-067): a milestone-scoping run arrives on
+# operator demand and carries no diff. No producer emits a non-diff trigger form
+# yet, so this is declarable grammar today and enforcement tomorrow (#2822).
+
+version: "2"
+
+workflows:
+  milestone_scoping:
+    description: >-
+      Scope a release milestone against a human-supplied release definition:
+      propose a scoped, sequenced grooming report, gate it on a human approval,
+      then confirm. Produces no code diff at any stage.
+    auto_advance: true
+
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    # The five run-driving classes: nothing delegated.
+    autonomy: low
+
+    # The five backlog-grooming classes. Disjoint from the tier above.
+    actions:
+      hygiene:
+        mode: auto
+        when: objective_reversible
+      ordering:
+        mode: gated
+      dedup:
+        mode: gated
+      scoping:
+        mode: report
+      # The milestone class — non-delegable, surfaced as a proposal only.
+      milestone:
+        mode: report
+
+    stages:
+      # PROPOSE. A `plan`-typed stage emits the grooming report carrying the
+      # milestone_scope. It declares its schema for the same
+      # forward-compatibility reason a plan declares standard_v1.
+      - id: scope
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      # GATE. A `review`-typed stage is the human decision on the scoped
+      # milestone. Review stages emit no artifact in any major.
+      - id: confirm
+        type: review
+        executor:
+          human: true
+        needs: [scope]
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              not: [agent]

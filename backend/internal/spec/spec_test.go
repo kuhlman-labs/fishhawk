@@ -6687,6 +6687,62 @@ func TestShippedGroomingExample_MatrixDefaults(t *testing.T) {
 	}
 }
 
+// milestoneExampleRelPath is the E54.9 / #2309 illustrative declaration, read
+// from disk so the test exercises the SHIPPED example rather than a copy.
+const milestoneExampleRelPath = "../../../docs/spec/examples/workflow-v2-milestone-scoping.yaml"
+
+// TestShippedMilestoneExample_MilestoneResolvesToReport is the DONE-MEANS
+// behavioural assertion for acceptance criterion 6 at the document level: the
+// illustrative milestone-scoping declaration parses, and its `milestone`
+// grooming class resolves to `report`. The sibling case flips it to `auto` and
+// asserts the parse is REJECTED with the non-delegable-class message — the same
+// two independent controls the other non-delegable classes carry, exercised
+// here through a real document.
+//
+// The class registration is config-shaped, so a comment-only touch of
+// v2autonomy.go would pass the scope gate; this test fails unless `milestone`
+// is genuinely registered as a non-delegable grooming class.
+func TestShippedMilestoneExample_MilestoneResolvesToReport(t *testing.T) {
+	raw, err := os.ReadFile(milestoneExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", milestoneExampleRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", milestoneExampleRelPath, err)
+	}
+	wf, ok := s.Workflows["milestone_scoping"]
+	if !ok {
+		t.Fatalf("workflows = %v, want a milestone_scoping workflow", s.Workflows)
+	}
+	rm := spec.ResolveAutonomy(&wf, nil)
+	got := resolvedGroomingAction(t, rm, spec.ActionGroomMilestone)
+	if got.Mode != spec.ModeReport {
+		t.Errorf("milestone mode = %q, want EXACTLY report — a non-delegable class only ever reports or is gated", got.Mode)
+	}
+	if got.Condition != "" {
+		t.Errorf("milestone condition = %q, want empty — milestone carries no backend-evaluable condition", got.Condition)
+	}
+
+	// Sibling: flipping the same class to auto is REFUSED at parse time with the
+	// non-delegable-class message. Seeded by a targeted string replacement, so
+	// the RED lands on the rejection rather than on a hand-built document.
+	flipped := strings.Replace(string(raw),
+		"      milestone:\n        mode: report\n",
+		"      milestone:\n        mode: auto\n        when: objective_reversible\n", 1)
+	if flipped == string(raw) {
+		t.Fatal("fixture: the milestone block was not found to flip; the example drifted")
+	}
+	_, err = spec.ParseBytes([]byte(flipped))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("ParseBytes(milestone at auto) = %v (%T), want *ValidationError", err, err)
+	}
+	if want := spec.MsgNonDelegableGroomingClassAuto(spec.ActionGroomMilestone); ve.Message != want {
+		t.Errorf("Message = %q,\nwant the non-delegable-class message %q", ve.Message, want)
+	}
+}
+
 // TestShippedGroomingExample_ReportModeDerivesNoAuthorityOrGate is AC7's
 // second half (approval condition G2): a report-mode class surfaces a proposal
 // and does nothing else — it derives no may_* knob, adds no gate, and adds no
