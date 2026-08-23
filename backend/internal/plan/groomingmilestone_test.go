@@ -824,8 +824,18 @@ func TestValidateGroomingReport_MilestoneExample(t *testing.T) {
 	if defects == 0 {
 		t.Error("milestone example carries no entry in any existing defect-bearing array (C6)")
 	}
-	// The fingerprint is stable across a re-parse of the same bytes.
-	if plan.MilestoneScopeFingerprint(ms) != plan.MilestoneScopeFingerprint(gr.MilestoneScope) {
-		t.Error("fingerprint not stable across identical scope")
+	// The fingerprint is stable across a re-parse of the same bytes: parse the
+	// SAME bytes a SECOND time into an independent report and fingerprint that
+	// separately-constructed scope, so the comparison is between two distinct
+	// pointers rather than one aliased to itself.
+	gr2, err := plan.ParseGroomingReport(body)
+	if err != nil {
+		t.Fatalf("ParseGroomingReport(milestone example, second parse): %v", err)
+	}
+	if gr2.MilestoneScope == ms {
+		t.Fatal("second parse aliased the first scope — the re-parse assertion would be vacuous")
+	}
+	if plan.MilestoneScopeFingerprint(ms) != plan.MilestoneScopeFingerprint(gr2.MilestoneScope) {
+		t.Error("fingerprint not stable across a re-parse of the same bytes")
 	}
 }
