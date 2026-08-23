@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,8 +137,13 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 		// thread it onto the assembly is caught here rather than masked by a fake
 		// that drops the field.
 		WorkingDir: p.WorkingDir,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// The durable grooming provenance (E54.6 / #2238) is carried verbatim for
+		// the same reason WorkingDir is: a fake that dropped the field would let a
+		// handler that never threaded it onto the assembly pass, which is exactly
+		// the unprovenanced-campaign hole binding condition K3 forbids.
+		GroomingSource: p.GroomingSource,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
@@ -383,9 +389,13 @@ func (f *fakeCampaignRepo) CreateCampaignItem(_ context.Context, p campaign.Crea
 		CampaignID: p.CampaignID,
 		IssueRef:   p.IssueRef,
 		DependsOn:  p.DependsOn,
+		Autonomy:   p.Autonomy,
 		State:      campaign.ItemStatePending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		// Queue position (migration 0074) carried verbatim, so a handler that
+		// failed to permute into ratified rank order is caught here.
+		Position:  p.Position,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	f.itemsByCmp[p.CampaignID] = append(f.itemsByCmp[p.CampaignID], it)
 	return it, nil
@@ -465,6 +475,11 @@ func (f *fakeCampaignRepo) ListCampaignItemsForCampaign(_ context.Context, id uu
 	}
 	out := make([]*campaign.Item, len(f.itemsByCmp[id]))
 	copy(out, f.itemsByCmp[id])
+	// MIRROR THE REAL LISTING ORDER (queue_position ASC, then insertion), so a
+	// server test asserting a campaign's queue order is asserting the same thing
+	// Postgres does. A fake that returned bare insertion order would mask a lost
+	// queue position — the failure binding condition K1 exists to catch.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Position < out[j].Position })
 	return out, nil
 }
 

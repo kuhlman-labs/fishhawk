@@ -2043,6 +2043,86 @@ components:
             binding — each item run then needs its own `working_dir`, and a
             `local` one with neither is refused `working_dir_required`.
           example: /Users/op/checkouts/fishhawk
+        grooming_source:
+          type: object
+          description: |
+            DURABLE provenance of a campaign created from an approved grooming
+            run's ratified order (E54.6 / #2238) — the third campaign source.
+            Persisted on the campaign ROW by the same INSERT that creates the
+            campaign, so it is present on every read (GET and list, not just the
+            create response) and a grooming-sourced campaign can never exist
+            unprovenanced. Omitted for every `epic_ref` / explicit-`items`
+            campaign.
+          required: [source_run_id, source_stage_id, report_artifact_id, report_content_hash, ordered_refs, ordered_count, omitted_by_limit]
+          properties:
+            source_run_id:
+              $ref: '#/components/schemas/UUID'
+              description: The approved grooming run whose order became this queue.
+            source_stage_id:
+              $ref: '#/components/schemas/UUID'
+              description: The plan stage carrying the ratified `grooming_report`.
+            report_artifact_id:
+              $ref: '#/components/schemas/UUID'
+              description: The `grooming_report` artifact row.
+            report_content_hash:
+              type: string
+              description: |
+                Content hash of the report the campaign was built from — what
+                makes the provenance reproducible (WHICH report text, not merely
+                which run).
+              example: "sha256:6b2f…"
+            ordered_refs:
+              type: array
+              items: { type: string }
+              description: |
+                The campaign's issue refs in ratified rank order. This IS the
+                queue order the items were created in.
+              example: ["issue:2238", "issue:2240"]
+            ordered_count:
+              type: integer
+              description: Length of `ordered_refs`.
+            excluded:
+              type: array
+              description: |
+                Ordering entries that did NOT become campaign items, each with a
+                named reason — never dropped silently, so a truncated batch is
+                always visible.
+              items:
+                type: object
+                required: [ref, type, rank, reason]
+                properties:
+                  ref: { type: string, description: "The report's `item_ref.id`." }
+                  type: { type: string, description: "The `item_ref.type` discriminator." }
+                  rank: { type: integer }
+                  reason:
+                    type: string
+                    enum: [not_github_issue, other_repo, unparseable_id]
+            limit:
+              type: integer
+              description: |
+                The applied cap, when one was requested. Omitted when uncapped.
+            omitted_by_limit:
+              type: integer
+              description: |
+                How many CONVERTIBLE ranked entries the cap dropped. Distinct
+                from `excluded`: a capped entry WAS convertible, so conflating
+                the two would make this count underivable.
+            superseded_by:
+              $ref: '#/components/schemas/UUID'
+              description: |
+                The NEWER approved grooming run whose order this campaign
+                deliberately did not use. Present only when the create passed
+                `allow_superseded`; without that acknowledgement the create is
+                refused `grooming_order_superseded`, so a superseded order is
+                never used silently.
+            supersession_scan_undetermined:
+              type: boolean
+              description: |
+                `true` when the supersession scan could not PROVE that no newer
+                approved grooming run exists and the caller acknowledged it with
+                `allow_superseded`. Without the acknowledgement the create is
+                refused `grooming_order_supersession_undetermined`, so this can
+                never mark a silent degrade.
         idempotent:
           type: boolean
           description: |
@@ -2061,9 +2141,18 @@ components:
         refs this item waits on (the campaign DAG edges); `run_id` is the
         nullable link to the run executing the item, absent until a run is
         assigned.
-      required: [id, issue_ref, depends_on, state, created_at, updated_at]
+      required: [id, issue_ref, depends_on, state, position, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
+        position:
+          type: integer
+          description: |
+            The item's 0-based place in the campaign queue (E54.6 / #2238,
+            migration 0074). Items are listed in this order, and for a
+            grooming-sourced campaign it IS the ratified rank. It is written
+            explicitly rather than implied by insertion sequence, which is not
+            an ordering.
+          example: 0
         issue_ref:
           type: string
           example: "issue:1441"
@@ -9330,12 +9419,17 @@ paths:
               type: object
               required: [repo]
               description: |
-                `repo` is always required, plus ONE of `epic_ref` / `items`.
-                Pass `epic_ref` to decompose an epic's children (optionally
-                narrowed by `items`), OR omit `epic_ref` and pass `items` alone
-                to assemble a NO-EPIC campaign over exactly that issue list
-                (#2051). An empty request (neither `epic_ref` nor `items`) fails
-                `400 validation_failed`.
+                `repo` is always required, plus EXACTLY ONE of `epic_ref` /
+                `items` / `grooming_source`. Pass `epic_ref` to decompose an
+                epic's children (optionally narrowed by `items`); omit
+                `epic_ref` and pass `items` alone to assemble a NO-EPIC campaign
+                over exactly that issue list (#2051); or pass `grooming_source`
+                alone to build the queue from an APPROVED grooming run's
+                ratified priority order (E54.6 / #2238). An empty request fails
+                `400 validation_failed`, and so does any COMBINATION of
+                `grooming_source` with `epic_ref` or `items` — a refusal, not a
+                precedence rule, because a silent winner among three sources is
+                how an operator gets a batch they did not ask for.
               properties:
                 repo:
                   type: string
@@ -9391,6 +9485,55 @@ paths:
                     out-of-set target — it does not apply the #2120
                     completion-satisfied refinement.
                   example: ["issue:1440", "issue:1441"]
+                grooming_source:
+                  type: object
+                  description: |
+                    OPTIONAL THIRD campaign source (E54.6 / #2238): an APPROVED
+                    grooming run whose ratified priority order becomes this
+                    campaign's queue. Its PRESENCE selects the source, and it is
+                    MUTUALLY EXCLUSIVE with `epic_ref` and `items` (either
+                    combination is `400 validation_failed`).
+
+                    The backend resolves that run's `grooming_report` artifact,
+                    verifies its plan stage's approval gate was GRANTED (at
+                    least one approve and no reject), derives the rank-ordered
+                    issue set for this repo, and creates one campaign item per
+                    ordered issue — in rank order. The order is read EXACTLY
+                    ONCE, at assembly; nothing afterwards re-reads a report or a
+                    board.
+                  required: [run_id]
+                  properties:
+                    run_id:
+                      $ref: '#/components/schemas/UUID'
+                      description: |
+                        The approved grooming run. A run in another workspace
+                        account is reported IDENTICALLY to a missing one
+                        (`404 grooming_run_not_found`), so the id space is not
+                        an existence oracle.
+                    limit:
+                      type: integer
+                      minimum: 0
+                      description: |
+                        OPTIONAL cap: take only the top N issues by ratified
+                        rank. `0` (or omitted) means no cap; a negative value is
+                        `400 validation_failed`. The response's
+                        `grooming_source.omitted_by_limit` reports how many
+                        ranked issues the cap dropped, so a truncated batch is
+                        never silent.
+                    allow_superseded:
+                      type: boolean
+                      description: |
+                        OPTIONAL acknowledgement that this order may not be the
+                        current one. Default `false` REFUSES two cases: a NEWER
+                        approved grooming run exists
+                        (`422 grooming_order_superseded`), or the bounded
+                        supersession scan could not PROVE that none does
+                        (`422 grooming_order_supersession_undetermined`).
+                        Setting it `true` proceeds and RECORDS the choice in the
+                        campaign's durable provenance. It deliberately does NOT
+                        bypass `502 grooming_order_supersession_unreadable` — an
+                        operator can knowingly accept a stale order, but nobody
+                        can acknowledge a read that did not happen.
                 working_dir:
                   type: string
                   description: >-
@@ -9422,8 +9565,11 @@ paths:
               schema: { $ref: '#/components/schemas/Campaign' }
         '400':
           description: |
-            `validation_failed` — `repo` not in owner/name form, NEITHER
-            `epic_ref` NOR `items` provided, `pause_policy` not a recognized
+            `validation_failed` — `repo` not in owner/name form, NONE of
+            `epic_ref` / `items` / `grooming_source` provided,
+            `grooming_source` combined with `epic_ref` or with `items`,
+            `grooming_source.run_id` empty or not a UUID,
+            `grooming_source.limit` negative, `pause_policy` not a recognized
             value, `operator_agent` not a valid operator-agent block (malformed
             or an unknown knob), `working_dir` non-empty but not absolute
             (E48.87 / #2527), body malformed / unknown field, or a dependency
@@ -9432,6 +9578,11 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '404':
+          description: |
+            `grooming_run_not_found` — no grooming run with that id is visible
+            to the caller's workspace account. A run owned by ANOTHER account is
+            reported identically to a missing one, deliberately.
         '422':
           description: |
             `repo_not_installed` — the GitHub App is not installed on the
@@ -9441,8 +9592,27 @@ paths:
             also covers an `items` subset that includes an item whose
             `depends_on` points at an EXCLUDED item that is not yet complete (an
             excluded closed-and-completed target is a satisfied dependency and
-            assembles, #2120); `campaign_item_not_child` — an `items` entry is
-            not a child of the epic.
+            assembles, #2120) — for a `grooming_source` batch the details
+            additionally carry `dangling_source: grooming_order`,
+            `grooming_run_id` and `grooming_order_limit` so the remedy can name
+            the widen-the-batch / drop-the-edge choice;
+            `campaign_item_not_child` — an `items` entry is not a child of the
+            epic.
+
+            E54.6 / #2238 `grooming_source` refusals, each actionable:
+            `grooming_order_repo_mismatch` — that grooming run groomed a
+            different repo; `grooming_order_absent` — the run shipped no
+            `grooming_report` artifact; `grooming_order_not_approved` — the
+            report was never ratified (its plan stage carries no granted
+            approval, or carries a rejection alongside one);
+            `grooming_order_invalid` — the report does not parse, or the derived
+            order names one issue twice; `grooming_order_empty` — the order
+            names no issue in the target repo, so there is nothing to campaign;
+            `grooming_order_superseded` — a newer approved grooming run exists
+            (details name `superseded_by`); `grooming_order_supersession_undetermined`
+            — the bounded scan could not establish that none does. The last two
+            are converted into an explicit, RECORDED acknowledgement by
+            `grooming_source.allow_superseded`.
         '501':
           description: |
             `provider_unimplemented` — the conventions name an unregistered
@@ -9456,7 +9626,12 @@ paths:
             the App installation; `epic_children_query_failed` — the provider
             could not query the epic's children (epic_ref path);
             `issue_set_resolution_failed` — the provider could not resolve the
-            named issue set (no-epic `items`-only path).
+            named issue set (no-epic `items`-only path);
+            `grooming_order_supersession_unreadable` (E54.6 / #2238) — the
+            supersession check could not read its candidate runs. That last one
+            fails CLOSED and is deliberately NOT bypassable with
+            `grooming_source.allow_superseded`: an operator can knowingly accept
+            a stale order, but nobody can acknowledge a read that did not happen.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
 

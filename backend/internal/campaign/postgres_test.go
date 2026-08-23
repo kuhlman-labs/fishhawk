@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -1917,5 +1918,181 @@ func TestReopenCampaignForItemRestart_NotFound(t *testing.T) {
 	}
 	if fresh, _ := repo.GetCampaignItem(ctx, items["issue:500"].ID); fresh.State != campaign.ItemStateFailed {
 		t.Errorf("item state = %q, want failed (unchanged)", fresh.State)
+	}
+}
+
+// TestPostgres_Persist_QueueOrderSurvivesRealPostgres is THE assertion behind
+// binding condition K1, and it must run against REAL Postgres — a fake whose
+// map or slice iteration happened to preserve insertion order would pass here
+// while production scrambled the queue. It asserts COMMITTED state (a read-back
+// through the repository), because a scrambled order still returns a successful
+// create.
+//
+// WHAT THE ORDERING COLUMN ACTUALLY FIXES, stated from what the tree does
+// rather than from assumption. campaign.Persist is NOT transactional (one
+// CreateCampaign, then a loop of CreateCampaignItem, each its own implicit
+// transaction), so the pre-0074 (created_at, id) listing did NOT collapse to
+// one transaction timestamp — it depended on each statement's now() being
+// strictly increasing. That is a timing accident, not a guarantee: two inserts
+// landing in the same clock tick share a created_at and the order is then
+// decided by a RANDOM UUID. A campaign queue that is meant to carry a ratified
+// priority order cannot rest on that, so the order is written down explicitly.
+// TestPostgres_QueueOrderBeatsInsertionOrder below is the discriminating half —
+// it constructs positions that CONTRADICT insertion order, so a listing that
+// still ordered by (created_at, id) would fail it.
+func TestPostgres_Persist_QueueOrderSurvivesRealPostgres(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	// Ranked in the reverse of numeric order, which is also the order a
+	// ReorderByPriority permutation produces from a ratified grooming order.
+	res := &workmgmt.EpicChildrenResult{Children: []workmgmt.EpicChild{
+		{Number: 903}, {Number: 901}, {Number: 905}, {Number: 902}, {Number: 904},
+	}}
+	assembly, err := campaign.Assemble("", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	created, err := campaign.Persist(context.Background(), repo, "kuhlman-labs/fishhawk", assembly)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var gotRefs []string
+	for _, it := range items {
+		gotRefs = append(gotRefs, it.IssueRef)
+	}
+	want := []string{"issue:903", "issue:901", "issue:905", "issue:902", "issue:904"}
+	if !reflect.DeepEqual(gotRefs, want) {
+		t.Fatalf("persisted queue order = %v, want %v (the assembled order, read back from Postgres)", gotRefs, want)
+	}
+	for i, it := range items {
+		if it.Position != i {
+			t.Fatalf("items[%d].Position = %d, want %d (dense 0-based queue position)", i, it.Position, i)
+		}
+	}
+
+}
+
+// TestPostgres_QueueOrderBeatsInsertionOrder is the DISCRIMINATING half of K1:
+// it writes items whose queue positions CONTRADICT their insertion order, so
+// the read-back can only come out right if the listing genuinely orders by
+// queue_position. Against the pre-0074 (created_at, id) clause the expected and
+// actual orders are exact reverses of each other, so this test cannot pass by
+// accident of timing.
+func TestPostgres_QueueOrderBeatsInsertionOrder(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	c := makeCampaign(t, repo)
+
+	// Insert ascending by issue number, assigning DESCENDING queue positions.
+	for i, n := range []int{910, 911, 912} {
+		if _, err := repo.CreateCampaignItem(context.Background(), campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   "issue:" + strconv.Itoa(n),
+			Position:   2 - i,
+		}); err != nil {
+			t.Fatalf("create item %d: %v", n, err)
+		}
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var gotRefs []string
+	for _, it := range items {
+		gotRefs = append(gotRefs, it.IssueRef)
+	}
+	want := []string{"issue:912", "issue:911", "issue:910"}
+	if !reflect.DeepEqual(gotRefs, want) {
+		t.Fatalf("listing order = %v, want %v — the listing must order by queue_position, not by insertion (created_at, id)",
+			gotRefs, want)
+	}
+}
+
+// TestPostgres_QueueOrder_EqualPositionsKeepInsertionOrder pins the DEFAULT-0
+// compatibility path: every pre-0074 row carries queue_position 0, so the
+// retained (created_at, id) tiebreak must still decide their order. Without
+// that tiebreak an all-zero campaign would list in an undefined order — a
+// silent behaviour change for every campaign that already exists.
+func TestPostgres_QueueOrder_EqualPositionsKeepInsertionOrder(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	c := makeCampaign(t, repo)
+
+	for _, n := range []int{920, 921, 922} {
+		if _, err := repo.CreateCampaignItem(context.Background(), campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   "issue:" + strconv.Itoa(n),
+			// Position left at the zero value: exactly what a pre-0074 row has.
+		}); err != nil {
+			t.Fatalf("create item %d: %v", n, err)
+		}
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var gotRefs []string
+	for _, it := range items {
+		gotRefs = append(gotRefs, it.IssueRef)
+		if it.Position != 0 {
+			t.Fatalf("item %s Position = %d, want the 0 default", it.IssueRef, it.Position)
+		}
+	}
+	if want := []string{"issue:920", "issue:921", "issue:922"}; !reflect.DeepEqual(gotRefs, want) {
+		t.Fatalf("all-zero-position listing = %v, want insertion order %v", gotRefs, want)
+	}
+}
+
+// TestPostgres_Campaign_GroomingSourceRoundTrip is binding condition K3's
+// COMMITTED-STATE assertion: the provenance must be readable back off the
+// campaign ROW, not merely echoed in a create response. It is written by the
+// campaigns INSERT itself, so there is no window in which a grooming-sourced
+// campaign exists unprovenanced — and no dependency on the best-effort audit
+// emit that happens after persistence.
+func TestPostgres_Campaign_GroomingSourceRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	provenance := []byte(`{"source_run_id":"11111111-1111-1111-1111-111111111111","report_content_hash":"sha256:abc","ordered_refs":["issue:903","issue:901"]}`)
+	created, err := repo.CreateCampaign(context.Background(), campaign.CreateCampaignParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		EpicRef:        "",
+		GroomingSource: provenance,
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	if !jsonEqual(t, created.GroomingSource, provenance) {
+		t.Fatalf("create returned grooming_source %s, want %s", created.GroomingSource, provenance)
+	}
+
+	got, err := repo.GetCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if !jsonEqual(t, got.GroomingSource, provenance) {
+		t.Fatalf("read-back grooming_source = %s, want %s", got.GroomingSource, provenance)
+	}
+
+	// A campaign created WITHOUT a grooming source stays nil (NULL column), so
+	// the unchanged epic/items paths carry no provenance key at all.
+	plainCampaign := makeCampaign(t, repo)
+	if plainCampaign.GroomingSource != nil {
+		t.Fatalf("non-grooming campaign carries grooming_source %s, want nil", plainCampaign.GroomingSource)
+	}
+	plainRead, err := repo.GetCampaign(context.Background(), plainCampaign.ID)
+	if err != nil {
+		t.Fatalf("get plain campaign: %v", err)
+	}
+	if plainRead.GroomingSource != nil {
+		t.Fatalf("read-back non-grooming grooming_source = %s, want nil", plainRead.GroomingSource)
 	}
 }

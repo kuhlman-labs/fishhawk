@@ -1743,3 +1743,34 @@ acceptance prompt as contested context with a skip-not-fail instruction, so the
 validator judges subjecthood where it can read both the criterion and the
 observed behaviour. Use this channel for the unambiguous cases; you do not need
 it merely because a path was dropped.
+
+### `fishhawk_start_campaign` can start from an approved grooming order — a RUN ID only ([E54.6 / #2238](https://github.com/kuhlman-labs/fishhawk/issues/2238))
+
+`fishhawk_start_campaign` gains a third source alongside `epic_ref` and `items`:
+`grooming_run_id`, the UUID of an APPROVED grooming run whose ratified priority
+order becomes the campaign queue, plus `grooming_order_limit` (cap the batch by
+rank) and `grooming_allow_superseded` (acknowledge an order a newer approved run
+superseded). The three sources are mutually exclusive and the combination is
+refused CLIENT-SIDE, before any backend round-trip.
+
+**What crosses this surface is a run ID and nothing more.** No board column, no
+order content, and no render of the pending order — the backend resolves the
+report, checks the gate, and derives the order server-side. That is the
+[ADR-064](https://github.com/kuhlman-labs/fishhawk/issues/2230) boundary, and
+`board_read_guard_test.go` now bans the order-derivation vocabulary
+(`GroomingOrder*`, `OrderFromReport`, `ReorderByPriority`) alongside the existing
+board-read and grooming-apply symbols, with a paired negative assertion so the
+list cannot be widened to a bare `Order` and still pass. Ingesting a grooming
+REPORT stays legitimate; DERIVING the ratified campaign order in-process does not.
+
+The tool maps each backend refusal onto an operator ACTION rather than echoing
+the code: `grooming_order_superseded` names the newer run and the
+acknowledgement; `grooming_order_supersession_undetermined` points at the
+acknowledgement; `grooming_order_supersession_unreadable` says explicitly NOT to
+reach for it (it is a read failure, not a stale order);
+`grooming_order_not_approved` names the gate to approve; `grooming_order_absent`
+names the `backlog_grooming` workflow. A `campaign_dangling_dependency` carrying
+`dangling_source: grooming_order` gets its own remedy — widen the batch (raise or
+drop `grooming_order_limit`) or drop the edge — because "fix the epic's edges" is
+meaningless for a batch that has no epic. The epic wording is unchanged when that
+detail is absent.

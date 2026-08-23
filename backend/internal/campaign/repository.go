@@ -57,6 +57,12 @@ type CreateCampaignParams struct {
 	// the '' no-binding default. Carried verbatim: absolute-path validation is
 	// the caller's (the REST handler / MCP tool), not this package's.
 	WorkingDir string
+	// GroomingSource is the OPTIONAL durable provenance block for a campaign
+	// created from an approved grooming order (E54.6 / #2238), carried as raw
+	// JSONB bytes and written by the campaigns INSERT itself so the campaign row
+	// and its provenance are created atomically. Nil persists as NULL — not
+	// grooming-sourced. The campaign package never interprets these bytes.
+	GroomingSource []byte
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign
@@ -73,6 +79,12 @@ type CreateCampaignItemParams struct {
 	// tier plus the three known tiers, so an out-of-set value fails closed at
 	// write time.
 	Autonomy string
+	// Position is the item's 0-based place in the campaign queue, persisted to
+	// campaign_items.queue_position (migration 0074). The caller assigns dense
+	// ascending positions from the assembled item order; the column is not
+	// unique, so a duplicate position degrades to the retained (created_at, id)
+	// tiebreak rather than failing the insert.
+	Position int
 }
 
 // ListCampaignsFilter scopes a ListCampaigns query. Empty strings mean "no
@@ -132,8 +144,11 @@ type Repository interface {
 	CreateCampaignItem(ctx context.Context, p CreateCampaignItemParams) (*Item, error)
 	GetCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error)
 
-	// ListCampaignItemsForCampaign returns every item of a campaign,
-	// ordered created_at ASC with an id tiebreak (insertion order).
+	// ListCampaignItemsForCampaign returns every item of a campaign in QUEUE
+	// ORDER: queue_position ASC, then the historical (created_at, id) tiebreak.
+	// queue_position is the durable assembled order (migration 0074) — for a
+	// grooming-sourced campaign it is the ratified rank order — and this is the
+	// order the engine's readiness partition is built in.
 	ListCampaignItemsForCampaign(ctx context.Context, campaignID uuid.UUID) ([]*Item, error)
 
 	// ListCampaignItemsForRun returns every campaign item linked to a run

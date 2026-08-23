@@ -384,8 +384,8 @@ func TestStartCampaign_NeitherEpicRefNorItems_FailsLocally(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y"})
-	if err == nil || !strings.Contains(err.Error(), "one of epic_ref or items is required") {
-		t.Fatalf("err = %v, want local one-of-epic_ref-or-items validation", err)
+	if err == nil || !strings.Contains(err.Error(), "one of epic_ref, items or grooming_run_id is required") {
+		t.Fatalf("err = %v, want local one-of-epic_ref/items/grooming_run_id validation", err)
 	}
 	if fb.createCampaignBody.Repo != "" {
 		t.Errorf("backend was called despite neither epic_ref nor items: %+v", fb.createCampaignBody)
@@ -1771,5 +1771,175 @@ func TestStartCampaignItemRun_FloorTier_BoundedThroughHandler(t *testing.T) {
 	}
 	if !saw {
 		t.Errorf("no item.depends_on floor entry crossed the handler boundary: %s", structured)
+	}
+}
+
+// TestStartCampaign_GroomingRunID_Forwarded pins the E54.6 / #2238 wire seam:
+// a grooming_run_id (plus its cap and supersession acknowledgement) reaches the
+// backend as the typed grooming_source block, and epic_ref/items stay empty.
+func TestStartCampaign_GroomingRunID_Forwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	const runID = "11111111-2222-3333-4444-555555555555"
+	if _, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:                    "kuhlman-labs/fishhawk",
+		GroomingRunID:           runID,
+		GroomingLimit:           5,
+		GroomingAllowSuperseded: true,
+	}); err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	gs := fb.createCampaignBody.GroomingSource
+	if gs == nil {
+		t.Fatal("POST body carried no grooming_source block")
+	}
+	if gs.RunID != runID || gs.Limit != 5 || !gs.AllowSuperseded {
+		t.Errorf("grooming_source = %+v, want run_id=%s limit=5 allow_superseded=true", gs, runID)
+	}
+	if fb.createCampaignBody.EpicRef != "" || len(fb.createCampaignBody.Items) != 0 {
+		t.Errorf("grooming-sourced create sent epic_ref=%q items=%v, want both empty",
+			fb.createCampaignBody.EpicRef, fb.createCampaignBody.Items)
+	}
+}
+
+// TestStartCampaign_GroomingSourceOmittedWhenUnused proves the unchanged-path
+// guarantee: an epic campaign sends NO grooming_source key at all, so a
+// pre-#2238 backend sees a byte-identical body.
+func TestStartCampaign_GroomingSourceOmittedWhenUnused(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	if _, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "#25",
+	}); err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	if fb.createCampaignBody.GroomingSource != nil {
+		t.Errorf("epic campaign sent grooming_source %+v, want none", fb.createCampaignBody.GroomingSource)
+	}
+}
+
+// TestStartCampaign_GroomingSourceConflicts is the CLIENT-SIDE mutual-exclusion
+// refusal — one case per conflicting source, each asserting the backend was
+// never dialed (the point of refusing locally).
+func TestStartCampaign_GroomingSourceConflicts(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      StartCampaignInput
+		wantSub string
+	}{
+		{"with epic_ref", StartCampaignInput{Repo: "x/y", GroomingRunID: "r", EpicRef: "#25"}, "cannot be combined with epic_ref"},
+		{"with items", StartCampaignInput{Repo: "x/y", GroomingRunID: "r", Items: []string{"101"}}, "cannot be combined with items"},
+		{"negative limit", StartCampaignInput{Repo: "x/y", GroomingRunID: "r", GroomingLimit: -1}, "must be >= 0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			_, _, err := r.startCampaign(context.Background(), nil, tc.in)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.wantSub)
+			}
+			if fb.createCampaignBody.Repo != "" {
+				t.Errorf("backend was dialed despite a local refusal: %+v", fb.createCampaignBody)
+			}
+		})
+	}
+}
+
+// TestStartCampaign_GroomingRefusalRemedies asserts, one case per backend
+// refusal code, that the operator message names the ACTION rather than echoing
+// the code. Each case drives the real handler against the fake backend's error
+// body, so the mapping is exercised end to end rather than asserted by
+// inspection.
+func TestStartCampaign_GroomingRefusalRemedies(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		status  int
+		wantSub string
+	}{
+		{
+			"superseded names the newer run and the acknowledgement",
+			`{"error":{"code":"grooming_order_superseded","message":"newer order exists","details":{"superseded_by":"99999999-9999-9999-9999-999999999999"}}}`,
+			422, "99999999-9999-9999-9999-999999999999",
+		},
+		{
+			"undetermined points at the acknowledgement, not a retry",
+			`{"error":{"code":"grooming_order_supersession_undetermined","message":"scan could not prove absence"}}`,
+			422, "grooming_allow_superseded=true",
+		},
+		{
+			"unreadable says explicitly NOT to reach for the acknowledgement",
+			`{"error":{"code":"grooming_order_supersession_unreadable","message":"list runs failed"}}`,
+			502, "do NOT reach for grooming_allow_superseded",
+		},
+		{
+			"not approved names the gate",
+			`{"error":{"code":"grooming_order_not_approved","message":"no approval"}}`,
+			422, "Approve its groom stage's gate",
+		},
+		{
+			"absent names the grooming workflow",
+			`{"error":{"code":"grooming_order_absent","message":"no report"}}`,
+			422, "run the backlog_grooming workflow first",
+		},
+		{
+			"not found explains the cross-account indistinguishability",
+			`{"error":{"code":"grooming_run_not_found","message":"missing"}}`,
+			404, "another account is reported identically",
+		},
+		{
+			"repo mismatch names the repo",
+			`{"error":{"code":"grooming_order_repo_mismatch","message":"other repo"}}`,
+			422, "only be fed by an order for its own repo",
+		},
+		{
+			"empty explains why nothing was campaignable",
+			`{"error":{"code":"grooming_order_empty","message":"no issues"}}`,
+			422, "names no issue in",
+		},
+		{
+			"invalid points at re-running the grooming workflow",
+			`{"error":{"code":"grooming_order_invalid","message":"bad report"}}`,
+			422, "re-run the grooming workflow",
+		},
+		{
+			"grooming-flavored dangling names the widen/drop remedy",
+			`{"error":{"code":"campaign_dangling_dependency","message":"edge outside batch","details":{"dangling_source":"grooming_order","dangling_not_child":["issue:5->issue:9"],"grooming_run_id":"abc","grooming_order_limit":3}}}`,
+			422, "WIDEN the batch",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			fb.createCampaignStatus = tc.status
+			fb.createCampaignErr = tc.body
+			r := newResolver(srv, nil)
+			_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+				Repo: "kuhlman-labs/fishhawk", GroomingRunID: "11111111-2222-3333-4444-555555555555",
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestStartCampaign_GroomingDanglingDoesNotStealEpicRemedy pins the branch
+// ORDER: a dangling failure WITHOUT the grooming provenance detail must keep
+// the pre-#2238 epic wording. Without this, adding the grooming branch could
+// silently retarget every epic campaign's remedy.
+func TestStartCampaign_GroomingDanglingDoesNotStealEpicRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = 422
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"bad edge","details":{"dangling_not_child":["issue:5->issue:9"]}}}`
+	r := newResolver(srv, nil)
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil || !strings.Contains(err.Error(), "fix the epic's dependency edges") {
+		t.Fatalf("err = %v, want the unchanged epic remedy", err)
+	}
+	if strings.Contains(err.Error(), "WIDEN the batch") {
+		t.Fatalf("epic campaign got the grooming-order remedy: %v", err)
 	}
 }

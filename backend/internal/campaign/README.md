@@ -66,3 +66,112 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 
 - `NextEligible([]*Item) Eligibility` partitions items into eligible/blocked/running/done/failed from each item's `State`, `DependsOn`, and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
 - `DeriveState([]*Item) State` reduces item states to the campaign state, emitting only `pending`/`running`/`succeeded`/`failed` — `cancelled` (and the proposal's `paused`) are operator-set overlays owned by Track C, never derived.
+
+## The third campaign source: an approved grooming order (E54.6 / #2238)
+
+`POST /v0/campaigns` accepts three mutually-exclusive sources: an `epic_ref` to
+decompose, an explicit `items` list (#2051), and — new here — a
+`grooming_source` naming an **approved grooming run** whose ratified priority
+order becomes the campaign queue. The combination of `grooming_source` with
+either of the others is a `400`, not a precedence rule: a silent winner among
+three sources is how an operator gets a batch they did not ask for.
+
+**The derivation is pure, and it lives here.** `groomingorder.go` holds
+`OrderFromReport` (report → rank-ordered issue numbers) and `ReorderByPriority`
+(permute a resolved `EpicChildrenResult` into that order) — no I/O, no provider,
+no clock, the same two-layer split `grooming_apply.go` uses. The server-side
+ladder (run/artifact/approval reads, tenancy, ratification, supersession) lives
+in `backend/internal/server/campaign_grooming_source.go`.
+
+`OrderFromReport` sorts ASCENDING by rank, and converts an entry only when its
+`item_ref.type` is `github_issue` and its id parses as `<owner>/<repo>#<number>`
+matching the target repo case-insensitively. Every other entry is EXCLUDED with
+a NAMED reason (`not_github_issue`, `other_repo`, `unparseable_id`) carried on
+the result — never dropped silently, because an invisibly-truncated batch is the
+failure this surface exists to prevent. Two entries resolving to one issue number
+fail closed. `limit` caps the CONVERTIBLE entries and records `OmittedByLimit`
+separately from `Excluded`: a capped entry WAS convertible, so conflating the two
+would make the omitted count underivable.
+
+### Ratification is the stage approval gate, not a per-entry decision set
+
+#2237 shipped `workmgmt.ApplyGrooming` with its seam deliberately unwired, so no
+production path writes a `grooming_mutation_applied` row and a per-entry
+disposition read would resolve empty for every report. The shipped ratification
+mechanism is the `backlog_grooming` workflow's `groom` stage approval gate. An
+APPROVED order is therefore: the `grooming_report` artifact of a plan stage
+carrying at least one `approval.DecisionApprove` and ZERO `DecisionReject`. A
+rejection alongside an approval is a CONTESTED gate, not a ratified one.
+
+### Rank order becomes queue order, durably
+
+This is the headline behaviour, and it needed a schema change to be true.
+
+`campaign.Assemble` stamps each item's `Position` from its index in
+`res.Children`, `Persist` threads it onto `campaign_items.queue_position`
+(migration `0074`), and `ListCampaignItemsForCampaign` orders by that column
+first. So permuting `Children` with `ReorderByPriority` before assembly is what
+makes the ratified order the order items are CREATED in — and therefore the order
+the engine's `Eligible` slice, the `#1816` `campaign_started` → Up Next board
+sweep, and every later read see.
+
+**Insertion sequence is not an ordering.** Before `0074` the listing ordered by
+`(created_at, id)` while `Persist` inserted every item with a `now()`-defaulted
+timestamp. `Persist` is not transactional, so those timestamps were not identical
+— but they were only *usually* increasing: two inserts inside one clock tick share
+a `created_at` and the order is then decided by a RANDOM UUID. A queue meant to
+carry a ratified priority order cannot rest on that, so the order is written down.
+The column is not unique and the `(created_at, id)` tiebreak is retained, so every
+pre-`0074` row (which carries the `DEFAULT 0`) lists in exactly its prior order.
+`campaign/postgres_test.go` proves this against REAL Postgres — including a case
+whose queue positions CONTRADICT insertion order, so it cannot pass by timing luck.
+
+Permuting `Children` does NOT perturb the DAG: `Assemble` builds its child-index
+map by iterating the actual slice rather than assuming ascending numbers, so a
+permutation changes only the creation order (`TestReorderByPriority_PreservesWaves`).
+
+### Provenance is on the campaign row, not only on the audit chain
+
+Every grooming-sourced campaign carries `campaigns.grooming_source` (JSONB,
+migration `0074`): source run/stage/artifact ids, the report content hash, the
+ordered refs, the named exclusions, the applied limit and any acknowledged
+supersession. It is written by the campaign's OWN single-row INSERT, so there is
+no window in which such a campaign exists unprovenanced.
+
+That placement is deliberate. `Persist` is not transactional (one
+`CreateCampaign`, then N `CreateCampaignItem`), and the
+`campaign_grooming_source_resolved` audit emit is best-effort and runs AFTER
+persistence — so an audit-only record could be lost while the campaign survived.
+The audit entry still exists (an operator can await the category), but the column
+is the system of record, and it is echoed on every read of the campaign, not just
+on the create response.
+
+### Supersession fails closed, in two distinguishable ways
+
+An order that a NEWER approved grooming run of the same workflow has superseded
+is REFUSED `422 grooming_order_superseded`, naming the newer run. The scan pages
+the workflow-scoped run list until it sees a SHORT page — positive proof it
+reached the end — and only then reports absence. If it exhausts its page budget
+first it reports `422 grooming_order_supersession_undetermined`: reporting that a
+scan was capped on a SUCCESSFUL create would merely relabel the silence, so it
+refuses instead. `allow_superseded` converts both into an explicit, RECORDED
+acknowledgement.
+
+A read FAILURE is a third, distinct outcome: `502
+grooming_order_supersession_unreadable`, which `allow_superseded` deliberately
+does NOT bypass. An operator can knowingly accept a stale order; nobody can
+acknowledge a read that did not happen.
+
+This is the opposite posture to `groomingChurnBaseline`, and deliberately so:
+that guard is a SUPPRESSOR, so an unreadable baseline makes it propose. This one
+is authorization-shaped, so it refuses.
+
+### The order is read exactly once
+
+At assembly, and nowhere else. Nothing in the campaign engine or the campaign
+driver re-reads a grooming report or a board afterwards — a mid-campaign re-read
+would silently re-derive a queue the operator already ratified, with no gate and
+no audit row. Two independent controls pin it: a counting-fake test in the server
+package (exactly one artifact read and one approval list per create, zero across
+a later status read and engine partition), and an AST guard over
+`backend/internal/campaigndriver`'s non-test sources.

@@ -177,8 +177,25 @@ type Campaign struct {
 	// tool: it is transport- and runner-kind-conditional, so the column carries
 	// the value verbatim.
 	WorkingDir string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// GroomingSource is the DURABLE provenance of a campaign created from an
+	// approved grooming run's ratified order (E54.6 / #2238): the raw JSONB
+	// block naming the source run/stage/artifact, the report's content hash, the
+	// ordered refs, the named exclusions, the applied limit and any acknowledged
+	// supersession. Nil (NULL column) means the campaign was NOT created from a
+	// grooming order — every epic_ref and explicit-items campaign, and every
+	// pre-#2238 row.
+	//
+	// It lives on the campaign ROW, not only on the audit chain, because
+	// campaign.Persist is not transactional and the audit emit is best-effort
+	// AFTER persistence: an audit failure would otherwise leave a campaign whose
+	// source order is unrecoverable once the create response is gone. Written by
+	// the campaigns INSERT itself, so there is no window in which a
+	// grooming-sourced campaign exists unprovenanced. Stored opaquely as raw
+	// bytes here — the campaign package stays server-shape-free, mirroring
+	// OperatorAgent.
+	GroomingSource []byte
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Item is one issue within a campaign.
@@ -203,6 +220,19 @@ type Item struct {
 	// PauseReason carries why a paused item was handed off to a human. Nil
 	// unless the item is (or was) paused. Persisted as JSONB.
 	PauseReason *PauseReason
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Position is the item's 0-based place in the campaign queue
+	// (campaign_items.queue_position, migration 0074) — the DURABLE assembled
+	// order, and for a grooming-sourced campaign the ratified rank order itself.
+	//
+	// It exists because insertion sequence is not an ordering: every item of one
+	// campaign is inserted inside one transaction, so their now()-defaulted
+	// created_at values are IDENTICAL and the pre-0074 (created_at, id) listing
+	// order collapsed to the random-UUID tiebreak. ListCampaignItemsForCampaign
+	// orders by this column first, so it is what makes the assembled order — and
+	// therefore the engine's Eligible slice — reproducible. Every pre-0074 row
+	// carries the DEFAULT 0 and so keeps its exact prior order via the retained
+	// (created_at, id) tiebreak.
+	Position  int
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

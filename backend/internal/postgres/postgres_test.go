@@ -1184,7 +1184,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2066,7 +2069,10 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2183,7 +2189,10 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2289,7 +2298,10 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2385,7 +2397,10 @@ func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2453,7 +2468,10 @@ func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeyless
 	// absent, and phase 2 re-applies nothing over the seeded rows: the test
 	// would still PASS while asserting nothing.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072 to reach 0068): %v", err)
@@ -2630,7 +2648,10 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2792,7 +2813,10 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2884,7 +2908,10 @@ func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -2959,7 +2986,10 @@ func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3045,7 +3075,10 @@ func TestMigrateDown_StagesProgressReversal(t *testing.T) {
 	// 0072 (#2744) and 0071 (#2527) sit above 0070; roll them back first so the
 	// next one-step down targets 0070 — the reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3149,7 +3182,11 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 		t.Fatalf("clear grooming_report artifacts before rollback: %v", err)
 	}
 
-	// Exactly one MigrateDown reverses 0073.
+	// Two MigrateDown steps reach 0073: 0074 (campaign_items.queue_position +
+	// campaigns.grooming_source, E54.6 / #2238) is now the tip.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
@@ -3232,7 +3269,10 @@ func TestMigrateDown_StagesDispatchedAtReversal(t *testing.T) {
 
 	// Exactly one MigrateDown reverses 0072.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3273,7 +3313,10 @@ func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
 	// Step back to the pre-0072 schema: stages exists WITHOUT dispatched_at and
 	// WITHOUT the stamp trigger, so the seeded dispatched row predates the column.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072 to reach the pre-0072 schema): %v", err)
@@ -3427,7 +3470,10 @@ func TestMigrateDown_ConcernNewEvidenceReversal(t *testing.T) {
 	// rollbacks are needed before the next one-step down targets 0069 — the
 	// reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3489,7 +3535,10 @@ func TestMigrateDown_CampaignsWorkingDirReversal(t *testing.T) {
 	}
 
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3533,7 +3582,10 @@ func TestMigrateUp_ConcernNewEvidenceDefaultsExistingRows(t *testing.T) {
 	// and are unrelated to review_concerns — then 0069, so review_concerns is in
 	// its pre-0069 shape.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072 to reach 0069): %v", err)
@@ -3686,7 +3738,10 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -3840,7 +3895,10 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -4009,7 +4067,10 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// assertions here — now sit above them all, so the ladder starts three steps
 	// higher.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072 to reach 0053): %v", err)
@@ -4111,7 +4172,10 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	// this migration, so four extra rollbacks are needed before the ladder below
 	// reaches its target.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0073, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0073): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0072): %v", err)
@@ -4248,5 +4312,92 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 func TestMigrateDown_MalformedURL(t *testing.T) {
 	if err := postgres.MigrateDown("not-a-url"); err == nil {
 		t.Fatal("expected error on malformed URL")
+	}
+}
+
+// TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal pins 0074
+// (E54.6 / #2238) in BOTH directions: campaign_items.queue_position and
+// campaigns.grooming_source EXIST after MigrateUp and are GONE after exactly
+// one MigrateDown, with both tables surviving (0074 is a pair of ALTERs, not a
+// drop). Without this the down-migration is shipped untested — every other
+// rollback ladder in this file merely STEPS OVER 0074 to reach its own target,
+// which proves the down file runs but asserts nothing about what it reverted.
+//
+// It also asserts the column DEFAULTS the additive migration promises, because
+// those are what make 0074 safe on a populated table: queue_position is NOT
+// NULL DEFAULT 0 (so every pre-0074 row keeps its exact prior (created_at, id)
+// order through the retained tiebreak) and grooming_source is NULLABLE (so a
+// campaign not built from a grooming order carries no provenance at all).
+func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// column reports (count, is_nullable, column_default) so the assertions can
+	// distinguish "present" from "present with the right additive shape".
+	column := func(table, col string) (int, string, string) {
+		var n int
+		var nullable, def *string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*), max(is_nullable), max(column_default) FROM information_schema.columns
+			  WHERE table_name = $1 AND column_name = $2`, table, col).Scan(&n, &nullable, &def); err != nil {
+			t.Fatalf("query %s.%s: %v", table, col, err)
+		}
+		var nullableStr, defStr string
+		if nullable != nil {
+			nullableStr = *nullable
+		}
+		if def != nil {
+			defStr = *def
+		}
+		return n, nullableStr, defStr
+	}
+
+	n, nullable, def := column("campaign_items", "queue_position")
+	if n != 1 {
+		t.Errorf("campaign_items.queue_position count after MigrateUp = %d, want 1 (0074 added it)", n)
+	}
+	if nullable != "NO" {
+		t.Errorf("campaign_items.queue_position is_nullable = %q, want NO (the queue order is never absent)", nullable)
+	}
+	if !strings.Contains(def, "0") {
+		t.Errorf("campaign_items.queue_position default = %q, want a 0 default so every pre-0074 row keeps its prior order", def)
+	}
+
+	n, nullable, _ = column("campaigns", "grooming_source")
+	if n != 1 {
+		t.Errorf("campaigns.grooming_source count after MigrateUp = %d, want 1 (0074 added it)", n)
+	}
+	if nullable != "YES" {
+		t.Errorf("campaigns.grooming_source is_nullable = %q, want YES (NULL = not created from a grooming order)", nullable)
+	}
+
+	// Exactly one MigrateDown reverses 0074 — it is the tip.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0074, the latest migration): %v", err)
+	}
+
+	if n, _, _ := column("campaign_items", "queue_position"); n != 0 {
+		t.Errorf("campaign_items.queue_position count after MigrateDown = %d, want 0 (0074 reverted)", n)
+	}
+	if n, _, _ := column("campaigns", "grooming_source"); n != 0 {
+		t.Errorf("campaigns.grooming_source count after MigrateDown = %d, want 0 (0074 reverted)", n)
+	}
+	// The rollback is a pair of ALTERs, not drops — both tables survive.
+	for _, table := range []string{"campaign_items", "campaigns"} {
+		var got int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.tables WHERE table_name = $1`, table).Scan(&got); err != nil {
+			t.Fatalf("query %s table: %v", table, err)
+		}
+		if got != 1 {
+			t.Errorf("%q table count after MigrateDown = %d, want 1 (0074 is an ALTER)", table, got)
+		}
 	}
 }

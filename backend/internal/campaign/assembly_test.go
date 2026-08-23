@@ -45,11 +45,14 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 		t.Errorf("waves = %v, want %v", a.Waves, wantWaves)
 	}
 
+	// Position is the DENSE 0-based queue position (migration 0074), stamped from
+	// each item's index in res.Children — distinct from Wave, which is the
+	// topological depth. Two items can share a wave and never a position.
 	wantItems := []campaign.AssembledItem{
-		{IssueRef: "issue:41", DependsOn: nil, Wave: 0},
-		{IssueRef: "issue:42", DependsOn: nil, Wave: 0},
-		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1},
-		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2},
+		{IssueRef: "issue:41", DependsOn: nil, Wave: 0, Position: 0},
+		{IssueRef: "issue:42", DependsOn: nil, Wave: 0, Position: 1},
+		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1, Position: 2},
+		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2, Position: 3},
 	}
 	if !reflect.DeepEqual(a.Items, wantItems) {
 		t.Errorf("items = %+v, want %+v", a.Items, wantItems)
@@ -441,5 +444,80 @@ func TestPersist_CreateItemError(t *testing.T) {
 	_, err := campaign.Persist(context.Background(), persistItemErrFake{}, "repo", a)
 	if !errors.Is(err, campaign.ErrNotFound) {
 		t.Fatalf("Persist err = %v, want wrapped ErrNotFound from item insert", err)
+	}
+}
+
+// itemCapturingFake records the item params Persist writes, in order, so the
+// queue-position threading is asserted at the seam rather than inferred.
+type itemCapturingFake struct {
+	campaign.BaseFake
+	campaignGot campaign.CreateCampaignParams
+	itemsGot    []campaign.CreateCampaignItemParams
+}
+
+func (f *itemCapturingFake) CreateCampaign(_ context.Context, p campaign.CreateCampaignParams) (*campaign.Campaign, error) {
+	f.campaignGot = p
+	return &campaign.Campaign{EpicRef: p.EpicRef}, nil
+}
+
+func (f *itemCapturingFake) CreateCampaignItem(_ context.Context, p campaign.CreateCampaignItemParams) (*campaign.Item, error) {
+	f.itemsGot = append(f.itemsGot, p)
+	return &campaign.Item{IssueRef: p.IssueRef, Position: p.Position}, nil
+}
+
+// TestPersist_ThreadsQueuePosition asserts the K1 seam: Assemble stamps a dense
+// 0-based position from the order of res.Children, and Persist carries it onto
+// the item params. The children are handed in a DELIBERATELY non-ascending
+// order (what ReorderByPriority produces for a ratified rank order), so a
+// Persist that dropped Position would show up as all-zero positions rather than
+// as a silently-still-correct sequence.
+func TestPersist_ThreadsQueuePosition(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{Children: []workmgmt.EpicChild{
+		{Number: 30}, {Number: 10}, {Number: 20},
+	}}
+	a, err := campaign.Assemble("", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	f := &itemCapturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk", a); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	wantRefs := []string{"issue:30", "issue:10", "issue:20"}
+	if len(f.itemsGot) != len(wantRefs) {
+		t.Fatalf("persisted %d items, want %d", len(f.itemsGot), len(wantRefs))
+	}
+	for i, want := range wantRefs {
+		if f.itemsGot[i].IssueRef != want {
+			t.Errorf("item %d ref = %q, want %q", i, f.itemsGot[i].IssueRef, want)
+		}
+		if f.itemsGot[i].Position != i {
+			t.Errorf("item %d (%s) Position = %d, want %d", i, f.itemsGot[i].IssueRef, f.itemsGot[i].Position, i)
+		}
+	}
+}
+
+// TestPersist_ThreadsGroomingSource is binding condition K3's seam assertion:
+// the provenance block must reach the CAMPAIGN's create params, so it rides the
+// campaign row's own single-row INSERT rather than a separate write that could
+// be lost. A nil block stays nil — the unchanged epic/items path persists NULL.
+func TestPersist_ThreadsGroomingSource(t *testing.T) {
+	fNone := &itemCapturingFake{}
+	if _, err := campaign.Persist(context.Background(), fNone, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:2238"}); err != nil {
+		t.Fatalf("Persist (no grooming source): %v", err)
+	}
+	if fNone.campaignGot.GroomingSource != nil {
+		t.Errorf("non-grooming campaign persisted GroomingSource %s, want nil", fNone.campaignGot.GroomingSource)
+	}
+
+	provenance := []byte(`{"source_run_id":"abc","report_content_hash":"sha256:deadbeef"}`)
+	f := &itemCapturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "", GroomingSource: provenance}); err != nil {
+		t.Fatalf("Persist (grooming source): %v", err)
+	}
+	if string(f.campaignGot.GroomingSource) != string(provenance) {
+		t.Errorf("GroomingSource persisted as %s, want %s", f.campaignGot.GroomingSource, provenance)
 	}
 }
