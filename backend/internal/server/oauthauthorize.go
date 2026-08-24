@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 )
@@ -196,13 +197,7 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	// sign in; a malformed request got its RFC error above, at their own client.
 	id := IdentityFrom(r.Context())
 	if id.SessionID == "" {
-		if s.cfg.GitHubOAuth == nil {
-			s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
-				"forge sign-in is not configured on this deployment", nil)
-			return
-		}
-		next := r.URL.Path + "?" + r.URL.RawQuery
-		http.Redirect(w, r, "/v0/auth/github/login?next="+url.QueryEscape(next), http.StatusFound)
+		s.startFederatedSignIn(w, r)
 		return
 	}
 
@@ -410,5 +405,91 @@ var consentTmpl = template.Must(template.New("oauth-consent").Parse(`<!DOCTYPE h
 <button type="submit" name="action" value="approve">Approve</button>
 <button type="submit" name="action" value="deny">Deny</button>
 </form>
+</body>
+</html>`))
+
+// signInForges lists the BROWSER sign-in legs this deployment has
+// configured, in a deterministic github-then-gitlab order (E66.4 / #2392).
+//
+// This is deliberately INDEPENDENT of the device-flow enumeration in
+// configuredIdentityProviders: the browser leg is gated on the Confidential
+// application's OAuth trio (client_id + secret + callback), the device leg
+// on a NON-Confidential application's client id alone, and a deployment may
+// configure either, both, or neither. Reading one from the other would make
+// a half-configured deployment render a sign-in link to a 503 route.
+func (s *Server) signInForges() []string {
+	var forges []string
+	if s.cfg.GitHubOAuth != nil {
+		forges = append(forges, identity.ProviderGitHub)
+	}
+	if s.cfg.GitLabOAuth != nil {
+		forges = append(forges, identity.ProviderGitLab)
+	}
+	return forges
+}
+
+// startFederatedSignIn is the authorization endpoint's federated-login
+// step for a signed-out user with an already-valid request.
+//
+// Zero configured forges keeps the pre-#2392 503 oauth_unconfigured. EXACTLY
+// ONE redirects straight to it — byte-identical to the previous unconditional
+// /v0/auth/github/login redirect on a GitHub-only deployment. TWO renders a
+// minimal provider-choice page: a LINK per forge, each carrying the same
+// next= value in its query string (there is no form and no hidden field —
+// the page is a pure navigation choice).
+func (s *Server) startFederatedSignIn(w http.ResponseWriter, r *http.Request) {
+	forges := s.signInForges()
+	if len(forges) == 0 {
+		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
+			"forge sign-in is not configured on this deployment", nil)
+		return
+	}
+	next := r.URL.Path + "?" + r.URL.RawQuery
+	if len(forges) == 1 {
+		http.Redirect(w, r, forgeLoginURL(forges[0], next), http.StatusFound)
+		return
+	}
+	choices := make([]forgeChoice, 0, len(forges))
+	for _, forge := range forges {
+		choices = append(choices, forgeChoice{Provider: forge, LoginURL: forgeLoginURL(forge, next)})
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if err := forgeChoiceTmpl.Execute(w, forgeChoiceView{Forges: choices}); err != nil {
+		s.cfg.Logger.Error("render forge choice page", "error", err.Error())
+	}
+}
+
+// forgeLoginURL builds the per-forge sign-in URL with the return target
+// query-escaped, the same shape the single-forge redirect has always used.
+func forgeLoginURL(forge, next string) string {
+	return "/v0/auth/" + forge + "/login?next=" + url.QueryEscape(next)
+}
+
+// forgeChoice / forgeChoiceView are the choice page's template model. The
+// LoginURL is already query-escaped; html/template additionally applies
+// URL-context escaping inside the href and HTML escaping to the visible
+// text, so a `next` carrying a quote or an angle bracket cannot break out
+// of the attribute (pinned by TestOAuthAuthorize_ChoicePage_EscapesNext).
+type forgeChoice struct {
+	Provider string
+	LoginURL string
+}
+
+type forgeChoiceView struct {
+	Forges []forgeChoice
+}
+
+// forgeChoiceTmpl is a deliberately minimal, unstyled sign-in chooser,
+// matching consentTmpl's template hygiene: every dynamic value crosses the
+// boundary through html/template, never through string concatenation.
+var forgeChoiceTmpl = template.Must(template.New("oauth-forge-choice").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Sign in</title></head>
+<body>
+<h1>Sign in to continue</h1>
+<p>Choose the forge to sign in with.</p>
+<ul>{{range .Forges}}<li><a href="{{.LoginURL}}">{{.Provider}}</a></li>{{end}}</ul>
 </body>
 </html>`))

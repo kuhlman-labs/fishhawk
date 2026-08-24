@@ -5816,11 +5816,18 @@ paths:
       operationId: tokenLoginDiscovery
       summary: OAuth token-login discovery
       description: |
-        Returns the GitHub OAuth App `client_id` the CLI drives the device
-        flow with, so `fishhawk token login` can authenticate a user
-        without a pre-shared token (E39.3). Unauthenticated — this is the
-        entry point of the login flow. `503 tokens_unconfigured` when no
-        OAuth client_id is wired.
+        Returns one entry per configured federated identity provider, each
+        carrying the DEVICE-flow `client_id` the CLI drives an RFC 8628
+        device flow with, so `fishhawk token login` can authenticate a user
+        without a pre-shared token (E39.3, forge-agnostic in E66.4).
+        Unauthenticated — this is the entry point of the login flow.
+
+        `providers` is ordered `github`, then `gitlab`, then any other name
+        sorted. The top-level `provider`/`client_id` are RETAINED and mirror
+        the FIRST entry, so a CLI predating the array keeps working.
+
+        `503 tokens_unconfigured` when no identity provider is configured, or
+        when the only configured entry has no device client_id.
       tags: [auth]
       security: []
       responses:
@@ -5830,29 +5837,64 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [provider, client_id]
+                required: [provider, client_id, providers]
                 properties:
                   provider:
                     type: string
-                    description: The identity provider (v0 always `github`).
+                    description: |
+                      Legacy field: the FIRST entry of `providers`. Retained
+                      for CLIs predating the array.
                   client_id:
                     type: string
-                    description: The GitHub OAuth App client_id for the device flow.
+                    description: |
+                      Legacy field: the FIRST entry's device `client_id`.
+                  providers:
+                    type: array
+                    description: |
+                      Every configured federated identity provider.
+                    items:
+                      type: object
+                      required: [provider, client_id]
+                      properties:
+                        provider:
+                          type: string
+                          enum: [github, gitlab]
+                          description: The identity provider this entry configures.
+                        client_id:
+                          type: string
+                          description: |
+                            The client_id of the NON-Confidential application
+                            registered for the DEVICE flow — not the
+                            Confidential browser-sign-in client_id. For GitLab
+                            these are two separate applications with no
+                            fallback between them.
+                        base_url:
+                          type: string
+                          description: |
+                            The instance root the CLI appends
+                            `/oauth/authorize_device` and `/oauth/token` to.
+                            Omitted for `github` (the CLI knows github.com's
+                            device endpoints); present for `gitlab`, which may
+                            be SaaS or any self-managed host.
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
     post:
       operationId: tokenLoginMint
       summary: Mint a user-bound token from an OAuth device-flow access token
       description: |
-        The CLI drives the GitHub device flow itself (using the `client_id`
-        from the discovery endpoint) and posts the resulting user access
-        token here. The backend re-verifies the token server-side to a
-        provider-qualified subject (`github:<login>`), enforces mint authz —
-        the subject must hold at least the configured minimum permission on
-        the operator repo AND request only scopes within the operator
-        default set — then mints a token stamped `auth_method=oauth`,
-        `provider=github` and returns the plaintext ONCE (E39.3). The access
-        token in the body IS the credential; the endpoint is unauthenticated
-        at the bearer layer.
+        The CLI drives the forge's device flow itself (using the per-provider
+        `client_id` from the discovery endpoint) and posts the resulting user
+        access token here. The backend re-verifies the token server-side
+        against the SELECTED provider to a provider-qualified subject
+        (`github:<login>` or `gitlab:<username>`), enforces mint authz — the
+        subject must hold at least the configured minimum permission on the
+        operator repo AND request only scopes within the operator default set
+        — then mints a token stamped `auth_method=oauth` and the RESOLVED
+        `provider`, and returns the plaintext ONCE (E39.3, forge-agnostic in
+        E66.4). The access token in the body IS the credential; the endpoint
+        is unauthenticated at the bearer layer.
+
+        A verified subject whose provider qualifier disagrees with the
+        selected provider is refused `401` rather than minted.
       tags: [auth]
       security: []
       requestBody:
@@ -5865,7 +5907,18 @@ paths:
               properties:
                 access_token:
                   type: string
-                  description: The GitHub user access token obtained by the CLI's device flow.
+                  description: The forge user access token obtained by the CLI's device flow.
+                provider:
+                  type: string
+                  enum: [github, gitlab]
+                  description: |
+                    Which configured provider verifies `access_token`. Must
+                    name a CONFIGURED provider; an unknown or unconfigured
+                    name is refused `400` naming the configured set. Omitted
+                    defaults to the SOLE configured provider when exactly one
+                    is configured (so a GitLab-only deployment is drivable by
+                    a client that never sends the field), and to `github`
+                    otherwise.
                 scopes:
                   type: array
                   items: { type: string }
@@ -5892,7 +5945,8 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401':
           description: |
-            The presented access token could not be verified
+            The presented access token could not be verified, or the verified
+            subject's provider qualifier disagrees with the selected provider
             (`error: token_verification_failed`).
           content:
             application/json:

@@ -1141,6 +1141,58 @@ func resolveIdentityProvider(oauthClientID string, token func(context.Context) (
 	return identity.NewGitHubIdentityProvider(oauthClientID, token, opts...)
 }
 
+// resolveGitLabIdentityProvider is the BOTH-OR-NEITHER config gate for the
+// GitLab federated identity provider (E66.4 / #2392), mirroring
+// resolveIdentityProvider's extract-the-gate-so-it-is-unit-testable shape
+// and resolveGitLabClient's both-or-neither posture.
+//
+// It needs the instance base URL (the device endpoints and /api/v4 both hang
+// off it, and GitLab may be SaaS or any self-managed host) AND the
+// NON-Confidential device application's client_id. With either missing there
+// is no drivable device flow, so it returns nil and no gitlab entry is
+// advertised. There is NO fallback from the device client id to the
+// Confidential browser-leg client id (binding constraint 7): a Confidential
+// application cannot serve the client_id-only device grant, so falling back
+// would advertise an id the CLI cannot use.
+//
+// token is the optional deployment-credential accessor for the members reads
+// (nil → anonymous, the stated fail-closed degrade). It returns the INTERFACE
+// and an untyped nil for the same reason resolveRepoVisibility does: a typed
+// nil would be a non-nil interface whose every call fails.
+func resolveGitLabIdentityProvider(baseURL, deviceClientID string, token func(context.Context) (string, error)) identity.IdentityProvider {
+	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(deviceClientID) == "" {
+		return nil
+	}
+	return identity.NewGitLabIdentityProvider(baseURL, deviceClientID, token)
+}
+
+// gitlabIdentityWarnings returns the boot warnings for the GitLab federated
+// identity leg (E66.4 / #2392). Extracted as a pure decision so both
+// asymmetric half-configurations are assertable without booting a server —
+// a WARN that silently stopped firing is exactly the operator-facing
+// regression an inline log line makes untestable.
+//
+// Two independent conditions, each its own warning:
+//   - a configured device leg with NO FISHHAWKD_GITLAB_TOKEN: the members
+//     reads go anonymous, and GitLab answers an unauthenticated read on a
+//     private project's members endpoint 404, so the mint's permission gate
+//     denies every user. Fail-closed, but non-functional for the common
+//     private-repo case.
+//   - a base URL with NO device client id: the device flow stays
+//     unconfigured. The Confidential browser-leg client id is deliberately
+//     NOT a fallback (binding constraint 7), so this state is silent
+//     otherwise.
+func gitlabIdentityWarnings(baseURL, deviceClientID, deploymentToken string) []string {
+	var warnings []string
+	if strings.TrimSpace(baseURL) != "" && strings.TrimSpace(deviceClientID) != "" && strings.TrimSpace(deploymentToken) == "" {
+		warnings = append(warnings, "gitlab identity-provider REST reads stay anonymous: FISHHAWKD_GITLAB_TOKEN is not set, so the token-mint authz gate (fishhawk token login --provider gitlab) will deny every user on a private operator repo (GitLab answers an unauthenticated members read 404)")
+	}
+	if strings.TrimSpace(baseURL) != "" && strings.TrimSpace(deviceClientID) == "" {
+		warnings = append(warnings, "gitlab device flow unconfigured: FISHHAWKD_GITLAB_BASE_URL is set but FISHHAWKD_GITLAB_DEVICE_CLIENT_ID is not; register a NON-Confidential GitLab application for the device flow (FISHHAWKD_GITLAB_OAUTH_CLIENT_ID is the Confidential browser-sign-in application and is deliberately NOT used as a fallback)")
+	}
+	return warnings
+}
+
 // resolveRepoVisibility is the BOTH-REQUIRED config gate for the per-identity
 // repo-ACL mirror (ADR-057 Amendment A2, E44.10 / #2071), extracted from the
 // wiring for the same reason resolveIdentityProvider is: the gate is the
@@ -1595,6 +1647,18 @@ func runServe(args []string, logSink io.Writer) int {
 	gitlabOAuthCallbackURL := fs.String("gitlab-oauth-callback-url",
 		envOr("FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL", ""),
 		"public URL of /v0/auth/gitlab/callback; required when --gitlab-oauth-client-id is set")
+	// GitLab DEVICE-flow application (E66.4 / #2392, binding constraint 7).
+	// This is a SEPARATE, non-Confidential GitLab application from the
+	// browser-sign-in trio above, and there is deliberately NO fallback
+	// between them: the browser leg sends a client_secret in ExchangeCode
+	// (which requires a Confidential application) while RFC 8628 §3.4
+	// specifies the device access-token request as client_id-only for a
+	// public client. No citable GitLab documentation was found stating that
+	// ONE application serves both, so the no-fallback design rests on the
+	// absence of that citation rather than on a positive finding.
+	gitlabDeviceClientID := fs.String("gitlab-device-client-id",
+		envOr("FISHHAWKD_GITLAB_DEVICE_CLIENT_ID", ""),
+		"client_id of a NON-Confidential GitLab application for the RFC 8628 device flow (`fishhawk token login --provider gitlab`); distinct from --gitlab-oauth-client-id, which must be Confidential; requires --gitlab-base-url")
 	operatorRepo := fs.String("oauth-operator-repo",
 		envOr("FISHHAWKD_OPERATOR_REPO", ""),
 		"owner/name repository the OAuth token-mint gate (POST /v0/tokens/login, E39.3 / #1708) reads a "+
@@ -2608,6 +2672,46 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("callback_url", *gitlabOAuthCallbackURL),
 			slog.String("base_url", *gitlabBaseURL),
 			slog.Bool("membership_resolver", cfg.AuthMembership != nil))
+	}
+
+	// GitLab federated identity provider (E66.4 / #2392). Wired AFTER both
+	// OAuth blocks and gated on its OWN config pair — base URL + device
+	// client id — so a GitLab-only or a device-only deployment reaches it
+	// without the GitHub OAuth trio. The github entry of these maps is
+	// seeded by server.New from cfg.IdentityProvider + cfg.OAuthClientID, so
+	// only the gitlab entry is added here.
+	//
+	// The REST accessor reuses the EXISTING deployment credential
+	// FISHHAWKD_GITLAB_TOKEN (no new variable), wrapped in a closure over an
+	// immutable captured string — concurrency-safe by construction, with no
+	// refresh and no mutable state, deliberately unlike GitHub's
+	// operatorRepoToken which performs a network round-trip per call. It
+	// gates ONLY the members reads; VerifyAccessToken never sees it
+	// (binding condition BC1, enforced inside the provider).
+	var gitlabRESTToken func(context.Context) (string, error)
+	if *gitlabToken != "" {
+		tok := *gitlabToken
+		gitlabRESTToken = func(context.Context) (string, error) { return tok, nil }
+	}
+	if glIdentity := resolveGitLabIdentityProvider(*gitlabBaseURL, *gitlabDeviceClientID, gitlabRESTToken); glIdentity != nil {
+		if cfg.IdentityProviders == nil {
+			cfg.IdentityProviders = map[string]identity.IdentityProvider{}
+		}
+		if cfg.IdentityDeviceClientIDs == nil {
+			cfg.IdentityDeviceClientIDs = map[string]string{}
+		}
+		if cfg.IdentityBaseURLs == nil {
+			cfg.IdentityBaseURLs = map[string]string{}
+		}
+		cfg.IdentityProviders[identity.ProviderGitLab] = glIdentity
+		cfg.IdentityDeviceClientIDs[identity.ProviderGitLab] = *gitlabDeviceClientID
+		cfg.IdentityBaseURLs[identity.ProviderGitLab] = *gitlabBaseURL
+		logger.Info("gitlab federated identity provider configured (fishhawk token login --provider gitlab)",
+			slog.String("base_url", *gitlabBaseURL),
+			slog.Bool("rest_read_token", gitlabRESTToken != nil))
+	}
+	for _, warning := range gitlabIdentityWarnings(*gitlabBaseURL, *gitlabDeviceClientID, *gitlabToken) {
+		logger.Warn(warning)
 	}
 
 	// GitHub App manifest-flow client (E4.7). No credentials needed —

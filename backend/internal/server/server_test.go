@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1587,6 +1588,139 @@ func TestObserveParkedReview_AcceptanceUndecidable_StampsAwaitingMerge(t *testin
 		}
 		if a.To == "acceptance_triage" {
 			t.Error("an undecidable verdict must NOT park in acceptance_triage — it routes no triage disposition to arbitrate (#2512)")
+		}
+	}
+}
+
+// -------- forge-keyed identity provider enumeration (E66.4 / #2392,
+// binding constraint 8) --------
+
+// TestNew_NilIdentityProvidersMap_ExcludesNoOp drives the NIL-map path
+// SPECIFICALLY — Config{} and Config{OAuthClientID: …} with
+// IdentityProviders LEFT NIL, which is a different branch in New than an
+// explicitly-empty map. A bare server must enumerate ZERO providers and
+// answer GET /v0/tokens/login 503 tokens_unconfigured: the NoOp installed
+// by New's nil-provider default is deny-by-default precisely BECAUSE no
+// forge is configured, so advertising it would advertise a provider that
+// cannot authenticate anyone.
+func TestNew_NilIdentityProvidersMap_ExcludesNoOp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"bare", Config{Addr: "127.0.0.1:0"}},
+		{"client id without provider", Config{Addr: "127.0.0.1:0", OAuthClientID: "Iv1.abc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			if got := s.configuredIdentityProviders(); len(got) != 0 {
+				t.Fatalf("configuredIdentityProviders() = %v, want empty", got)
+			}
+			w := tokenRequest(t, s, http.MethodGet, "/v0/tokens/login", "", nil)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("GET /v0/tokens/login status = %d, want 503:\n%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "tokens_unconfigured") {
+				t.Errorf("body missing tokens_unconfigured:\n%s", w.Body.String())
+			}
+		})
+	}
+}
+
+// TestNew_EmptyIdentityProvidersMap_ExcludesNoOp is the sibling for the
+// explicitly-EMPTY map, which takes a different branch in New's seeding
+// (the range copies nothing but the map is non-nil), plus the positive
+// case: a real non-NoOp provider WITH a device client id IS enumerated.
+func TestNew_EmptyIdentityProvidersMap_ExcludesNoOp(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0",
+		IdentityProviders:       map[string]identity.IdentityProvider{},
+		IdentityDeviceClientIDs: map[string]string{},
+	})
+	if got := s.configuredIdentityProviders(); len(got) != 0 {
+		t.Fatalf("configuredIdentityProviders() = %v, want empty", got)
+	}
+
+	// An explicitly-wired NoOp is excluded too — the type check, not the
+	// seeding order, is what rejects this one.
+	sNoOp := New(Config{Addr: "127.0.0.1:0",
+		IdentityProviders:       map[string]identity.IdentityProvider{identity.ProviderGitHub: identity.NewNoOp()},
+		IdentityDeviceClientIDs: map[string]string{identity.ProviderGitHub: "Iv1.abc"},
+	})
+	if got := sNoOp.configuredIdentityProviders(); len(got) != 0 {
+		t.Fatalf("explicitly-wired NoOp enumerated: %v, want empty", got)
+	}
+
+	// Positive control: a real provider with a device client id IS configured.
+	sReal := New(Config{Addr: "127.0.0.1:0",
+		IdentityProvider: &fakeIdentityProvider{subject: "github:octocat"},
+		OAuthClientID:    "Iv1.abc",
+	})
+	if got := sReal.configuredIdentityProviders(); len(got) != 1 {
+		t.Fatalf("configuredIdentityProviders() = %v, want exactly github", got)
+	}
+}
+
+// TestNew_ProviderWithoutDeviceClientID_NotConfigured pins the SECOND
+// exclusion in configuredIdentityProviders: discovery exists to tell the
+// CLI which client_id to drive the device flow with, so a provider it
+// cannot drive must not be advertised.
+func TestNew_ProviderWithoutDeviceClientID_NotConfigured(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0",
+		IdentityProviders: map[string]identity.IdentityProvider{
+			identity.ProviderGitLab: &fakeIdentityProvider{subject: "gitlab:alice"},
+		},
+	})
+	if got := s.configuredIdentityProviders(); len(got) != 0 {
+		t.Fatalf("provider without a device client id enumerated: %v", got)
+	}
+}
+
+// TestNew_RawIdentityProvidersMap_NeverContainsNoOp isolates the SEEDING
+// ORDER invariant, which the filtered enumeration cannot observe (BC3): a
+// NoOp seeded after the default is excluded by type, so
+// TestNew_NilIdentityProvidersMap_ExcludesNoOp stays green either way.
+// This reads the RAW, UNFILTERED cfg.IdentityProviders map instead — moving
+// New's seeding block after the nil-provider default makes cfg.IdentityProvider
+// non-nil (the freshly installed NoOp) at seeding time, so the map gains a
+// github→NoOp entry and this assertion goes red. It is the only observation
+// in the suite that distinguishes the two layers.
+func TestNew_RawIdentityProvidersMap_NeverContainsNoOp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"bare", Config{Addr: "127.0.0.1:0"}},
+		{"client id without provider", Config{Addr: "127.0.0.1:0", OAuthClientID: "Iv1.abc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			if len(s.cfg.IdentityProviders) != 0 {
+				t.Fatalf("raw IdentityProviders = %#v, want no entry at all: the NoOp default must never be seeded", s.cfg.IdentityProviders)
+			}
+		})
+	}
+}
+
+// TestConfiguredIdentityProviderNames_DeterministicOrder pins the
+// github-then-gitlab order the discovery response and its legacy
+// first-entry mirror depend on, against Go's randomized map iteration.
+func TestConfiguredIdentityProviderNames_DeterministicOrder(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0",
+		IdentityProviders: map[string]identity.IdentityProvider{
+			identity.ProviderGitLab:  &fakeIdentityProvider{subject: "gitlab:alice"},
+			identity.ProviderGitHub:  &fakeIdentityProvider{subject: "github:octocat"},
+			"zzz-future-forge-still": &fakeIdentityProvider{subject: "zzz:bob"},
+		},
+		IdentityDeviceClientIDs: map[string]string{
+			identity.ProviderGitLab:  "gl-device",
+			identity.ProviderGitHub:  "Iv1.abc",
+			"zzz-future-forge-still": "zz-device",
+		},
+	})
+	want := []string{identity.ProviderGitHub, identity.ProviderGitLab, "zzz-future-forge-still"}
+	for i := 0; i < 20; i++ {
+		if got := s.configuredIdentityProviderNames(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredIdentityProviderNames() = %v, want %v", got, want)
 		}
 	}
 }

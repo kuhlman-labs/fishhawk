@@ -536,8 +536,14 @@ func newFakeLoginServer(t *testing.T, idp identity.IdentityProvider, mut func(*C
 	return New(cfg)
 }
 
+// A GitHub-only deployment: the legacy top-level fields are byte-identical
+// to the pre-#2392 response and the providers array carries exactly one
+// entry. The IdentityProvider is a non-NoOp fake because a client_id backed
+// by a NoOp is no longer advertised (binding constraint 8) - see the
+// nil-provider sibling below.
 func TestTokenLoginDiscovery_HappyPath(t *testing.T) {
-	s := New(Config{Addr: "127.0.0.1:0", OAuthClientID: "Iv1.abc123"})
+	s := New(Config{Addr: "127.0.0.1:0", OAuthClientID: "Iv1.abc123",
+		IdentityProvider: &fakeIdentityProvider{subject: "github:octocat"}})
 	w := tokenRequest(t, s, http.MethodGet, "/v0/tokens/login", "", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
@@ -551,6 +557,29 @@ func TestTokenLoginDiscovery_HappyPath(t *testing.T) {
 	}
 	if resp.Provider != "github" {
 		t.Errorf("provider = %q, want github", resp.Provider)
+	}
+	if len(resp.Providers) != 1 || resp.Providers[0].Provider != "github" ||
+		resp.Providers[0].ClientID != "Iv1.abc123" {
+		t.Fatalf("providers = %+v, want one github entry carrying the device client id", resp.Providers)
+	}
+	if resp.Providers[0].BaseURL != "" {
+		t.Errorf("github base_url = %q, want omitted", resp.Providers[0].BaseURL)
+	}
+}
+
+// The deliberate behavior TIGHTENING of binding constraint 8: a client_id
+// advertised WITHOUT a real provider behind it is the "advertises a provider
+// that cannot authenticate anyone" state, so it now 503s where it previously
+// returned 200. Production-neutral - serve.go gates cfg.OAuthClientID and
+// cfg.IdentityProvider on the same *oauthClientID != "" condition.
+func TestTokenLoginDiscovery_ClientIDWithNilProvider_503(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", OAuthClientID: "Iv1.abc123"})
+	w := tokenRequest(t, s, http.MethodGet, "/v0/tokens/login", "", nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "tokens_unconfigured") {
+		t.Errorf("body missing tokens_unconfigured:\n%s", w.Body.String())
 	}
 }
 
@@ -802,5 +831,270 @@ func TestIdentity_IsAnonymous(t *testing.T) {
 		if got := c.id.IsAnonymous(); got != c.want {
 			t.Errorf("IsAnonymous(%+v) = %v, want %v", c.id, got, c.want)
 		}
+	}
+}
+
+// -------- multi-provider discovery + mint (E66.4 / #2392) --------
+
+// dualForgeConfig is a deployment with BOTH device legs configured: the
+// github entry New seeds from the single IdentityProvider + OAuthClientID
+// fields, plus an explicitly wired gitlab one.
+func dualForgeConfig(mut func(*Config)) Config {
+	cfg := Config{
+		Addr:             "127.0.0.1:0",
+		OAuthClientID:    "Iv1.abc123",
+		IdentityProvider: &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin},
+		IdentityProviders: map[string]identity.IdentityProvider{
+			identity.ProviderGitLab: &fakeIdentityProvider{subject: "gitlab:alice", perm: identity.PermissionAdmin},
+		},
+		IdentityDeviceClientIDs: map[string]string{identity.ProviderGitLab: "gl-device-id"},
+		IdentityBaseURLs:        map[string]string{identity.ProviderGitLab: "https://gitlab.example.test"},
+	}
+	if mut != nil {
+		mut(&cfg)
+	}
+	return cfg
+}
+
+func discover(t *testing.T, s *Server) tokenLoginDiscoveryResponse {
+	t.Helper()
+	w := tokenRequest(t, s, http.MethodGet, "/v0/tokens/login", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp tokenLoginDiscoveryResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// BC2: the gitlab entry must carry the CONFIGURED instance base URL — not a
+// default and not an empty string — because the CLI reaches
+// {base}/oauth/authorize_device and {base}/oauth/token through it. A
+// device-only GitLab deployment is undrivable without this field.
+func TestTokenLoginDiscovery_AdvertisesGitLabBaseURL(t *testing.T) {
+	resp := discover(t, New(dualForgeConfig(nil)))
+	var gitlab *tokenLoginProviderEntry
+	for i := range resp.Providers {
+		if resp.Providers[i].Provider == identity.ProviderGitLab {
+			gitlab = &resp.Providers[i]
+		}
+	}
+	if gitlab == nil {
+		t.Fatalf("providers = %+v, want a gitlab entry", resp.Providers)
+	}
+	if gitlab.BaseURL != "https://gitlab.example.test" {
+		t.Errorf("gitlab base_url = %q, want the configured https://gitlab.example.test", gitlab.BaseURL)
+	}
+	if gitlab.ClientID != "gl-device-id" {
+		t.Errorf("gitlab client_id = %q, want the DEVICE client id gl-device-id", gitlab.ClientID)
+	}
+}
+
+// The array order is github-then-gitlab and the legacy top-level fields
+// mirror the FIRST entry, so a CLI predating the array keeps driving GitHub
+// byte-compatibly on a dual-forge deployment.
+func TestTokenLoginDiscovery_DualForge_OrderAndLegacyMirror(t *testing.T) {
+	resp := discover(t, New(dualForgeConfig(nil)))
+	if len(resp.Providers) != 2 ||
+		resp.Providers[0].Provider != identity.ProviderGitHub ||
+		resp.Providers[1].Provider != identity.ProviderGitLab {
+		t.Fatalf("providers = %+v, want [github gitlab]", resp.Providers)
+	}
+	if resp.Provider != resp.Providers[0].Provider || resp.ClientID != resp.Providers[0].ClientID {
+		t.Errorf("legacy top-level %q/%q does not mirror first entry %+v",
+			resp.Provider, resp.ClientID, resp.Providers[0])
+	}
+}
+
+// BC5, direction 1: the GitLab DEVICE leg is configured but the Confidential
+// BROWSER trio is not. Discovery advertises both providers (the device flow
+// is drivable) while the authorization endpoint still renders the GitHub-only
+// redirect (the browser leg is not). The two enumerations are independent on
+// purpose — reading one from the other would link a sign-in to a 503 route.
+func TestHalfConfiguredGitLab_DeviceWithoutBrowser(t *testing.T) {
+	_, gh := stubGitHubOAuthServer(t)
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
+	s := New(dualForgeConfig(func(c *Config) {
+		c.OAuthASIssuer = testIssuer
+		c.OAuthStore = store
+		c.OAuthCIMDFetcher = newCIMDFetcher(newCIMD())
+		c.GitHubOAuth = gh // no GitLabOAuth: browser leg unconfigured
+	}))
+	if got := len(discover(t, s).Providers); got != 2 {
+		t.Errorf("discovery providers = %d, want 2 (the device leg IS configured)", got)
+	}
+	rr := getAuthorize(s, authorizeQuery(nil), nil)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d, want 302:\n%s", rr.Code, rr.Body.String())
+	}
+	if loc := rr.Header().Get("Location"); !strings.HasPrefix(loc, "/v0/auth/github/login?next=") {
+		t.Errorf("Location = %q, want the byte-identical GitHub-only redirect", loc)
+	}
+}
+
+// BC5, direction 2: the Confidential BROWSER trio is configured but the
+// device client id is NOT (the no-fallback rule). Discovery advertises only
+// github, while the authorize endpoint offers BOTH sign-in choices.
+func TestHalfConfiguredGitLab_BrowserWithoutDevice(t *testing.T) {
+	s := New(dualForgeConfig(func(c *Config) {
+		c.IdentityProviders = nil
+		c.IdentityDeviceClientIDs = nil
+		c.IdentityBaseURLs = nil
+		_, gh := stubGitHubOAuthServer(t)
+		c.GitHubOAuth = gh
+		c.GitLabOAuth = testGitLabOAuth()
+	}))
+	resp := discover(t, s)
+	if len(resp.Providers) != 1 || resp.Providers[0].Provider != identity.ProviderGitHub {
+		t.Errorf("providers = %+v, want github only: no device client id means no gitlab device flow", resp.Providers)
+	}
+	if got := s.signInForges(); len(got) != 2 {
+		t.Errorf("signInForges() = %v, want both browser legs", got)
+	}
+}
+
+// BC4: on a GitLab-ONLY deployment an omitted provider must default to the
+// sole configured entry rather than to a hardcoded github, or an old CLI (and
+// any plain POST) is locked out with 400 on the one deployment shape the
+// forge-agnostic mint exists to serve.
+func TestTokenLoginMint_GitLabOnly_OmittedProviderDefaultsToSole(t *testing.T) {
+	idp := &fakeIdentityProvider{subject: "gitlab:alice", perm: identity.PermissionAdmin}
+	s := New(Config{
+		Addr:                    "127.0.0.1:0",
+		APITokenRepo:            newFakeTokenRepo(),
+		IdentityProviders:       map[string]identity.IdentityProvider{identity.ProviderGitLab: idp},
+		IdentityDeviceClientIDs: map[string]string{identity.ProviderGitLab: "gl-device-id"},
+		OperatorRepo:            "group/project",
+		OperatorMinPermission:   identity.PermissionWrite,
+		OperatorDefaultScopes:   []string{"read:runs", "write:runs"},
+	})
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "glpat_cli"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created apiTokenCreatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Provider != identity.ProviderGitLab || created.Subject != "gitlab:alice" {
+		t.Errorf("minted provider/subject = %q/%q, want gitlab/gitlab:alice", created.Provider, created.Subject)
+	}
+}
+
+// With MORE than one provider configured an omitted provider keeps
+// defaulting to github — the pre-#2392 implicit behavior.
+func TestTokenLoginMint_DualForge_OmittedProviderDefaultsToGitHub(t *testing.T) {
+	s := New(dualForgeConfig(func(c *Config) {
+		c.APITokenRepo = newFakeTokenRepo()
+		c.OperatorRepo = "kuhlman-labs/fishhawk"
+		c.OperatorMinPermission = identity.PermissionWrite
+		c.OperatorDefaultScopes = []string{"read:runs", "write:runs"}
+	}))
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "gho_cli"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created apiTokenCreatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Provider != identity.ProviderGitHub {
+		t.Errorf("minted provider = %q, want github", created.Provider)
+	}
+}
+
+// A posted provider that is not CONFIGURED on this deployment is refused
+// server-side, and the refusal names the configured set.
+func TestTokenLoginMint_UnconfiguredProvider_400NamesConfiguredSet(t *testing.T) {
+	s := newFakeLoginServer(t, &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin}, nil)
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "gho_cli", "provider": "gitlab"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "unsupported provider") || !strings.Contains(body, "github") {
+		t.Errorf("body should refuse and name the configured set:\n%s", body)
+	}
+}
+
+// Defence in depth: a provider implementation that hands back a subject
+// qualified for a DIFFERENT forge (or an unqualified one) must never produce
+// a mis-stamped row. The refusal is 401, not a mint.
+func TestTokenLoginMint_SubjectProviderMismatch_401(t *testing.T) {
+	for _, tc := range []struct{ name, subject string }{
+		{"foreign provider", "gitlab:alice"},
+		{"unqualified", "octocat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newFakeLoginServer(t, &fakeIdentityProvider{subject: tc.subject, perm: identity.PermissionAdmin}, nil)
+			w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+				map[string]any{"access_token": "gho_cli", "provider": "github"})
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// CROSS-BOUNDARY (request → handler → apitoken → Postgres → projection): a
+// GitLab mint must persist provider='gitlab' on the real row, not the
+// hardcoded 'github' the deleted oauthProvider constant stamped.
+func TestTokenLoginMint_PersistsGitLabOAuthRow(t *testing.T) {
+	url := pgtest.NewURL(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	repo := apitoken.NewPostgresRepository(pool)
+
+	s := New(dualForgeConfig(func(c *Config) {
+		c.APITokenRepo = repo
+		c.OperatorRepo = "group/project"
+		c.OperatorMinPermission = identity.PermissionWrite
+		c.OperatorDefaultScopes = []string{"read:runs", "write:runs"}
+	}))
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "glpat_cli", "provider": "gitlab", "scopes": []string{"read:runs"}})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created apiTokenCreatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := repo.Authenticate(context.Background(), created.Token)
+	if err != nil {
+		t.Fatalf("Authenticate minted token: %v", err)
+	}
+	if persisted.AuthMethod != "oauth" || persisted.Provider != "gitlab" {
+		t.Errorf("persisted auth_method/provider = %q/%q, want oauth/gitlab",
+			persisted.AuthMethod, persisted.Provider)
+	}
+	if persisted.Subject != "gitlab:alice" {
+		t.Errorf("persisted subject = %q, want gitlab:alice", persisted.Subject)
+	}
+
+	lw := tokenRequest(t, s, http.MethodGet, "/v0/tokens", created.Token, nil)
+	if lw.Code != http.StatusOK {
+		t.Fatalf("GET /v0/tokens status = %d, want 200:\n%s", lw.Code, lw.Body.String())
+	}
+	var list struct {
+		Items []apiTokenResponse `json:"items"`
+	}
+	if err := json.Unmarshal(lw.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 || list.Items[0].Provider != "gitlab" {
+		t.Errorf("projection = %+v, want one gitlab-provider token", list.Items)
 	}
 }
