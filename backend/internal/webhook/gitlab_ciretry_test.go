@@ -1029,9 +1029,30 @@ func TestGitLabCIRetry_PipelineTriggerFails_ChildPersistsUndispatched(t *testing
 		t.Errorf("trigger scope = %q, want the PARENT's credential ref %q", calls[0].Scope, want)
 	}
 
-	// The stage exists but was not advanced.
+	// The stage exists but was not advanced. Asserted BOTH ways: no transition
+	// was attempted, and the child's persisted stage row still READS pending.
+	// The row is what a recovery verb acts on, and the stub mutates it on
+	// transition, so this is a state assertion and not a restatement of the
+	// transition log.
 	if len(runs.transitions) != 0 {
 		t.Errorf("transitions = %+v, want none (nothing was dispatched)", runs.transitions)
+	}
+	runs.mu.Lock()
+	stages := append([]*run.Stage(nil), runs.createdStages...)
+	runs.mu.Unlock()
+	childStages := 0
+	for _, st := range stages {
+		if st.RunID != child.ID {
+			continue
+		}
+		childStages++
+		if st.State != run.StageStatePending {
+			t.Errorf("child stage %s state = %q, want %q; a stage marked dispatched when no "+
+				"pipeline was created leaves the retry waiting forever", st.ID, st.State, run.StageStatePending)
+		}
+	}
+	if childStages == 0 {
+		t.Error("child has no stage rows; the retry stages must persist for recovery to act on")
 	}
 	// The audit records the failure rather than a dispatch.
 	if cats := auditCategories(au); len(cats) != 1 || cats[0] != "ci_failure_retry_dispatched" {

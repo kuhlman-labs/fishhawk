@@ -354,9 +354,23 @@ func TestHandle_GitLabTrigger_PipelineTriggerFails_PersistsAndAuditsFailure(t *t
 	if len(runs.createdStages) != 1 {
 		t.Errorf("stages created = %d, want 1", len(runs.createdStages))
 	}
-	// But the stage was NOT advanced.
+	// But the stage was NOT advanced. Both halves are asserted: that no
+	// transition was ATTEMPTED, and that the persisted stage row still READS
+	// pending. The second is the one that matters to a recovery verb — it acts
+	// on stage state, not on the transition log — and the stub mutates the row
+	// on transition, so a row left at pending is a genuine state assertion
+	// rather than a restatement of the line above.
 	if len(runs.transitions) != 0 {
 		t.Errorf("transitions = %+v, want none (nothing was dispatched)", runs.transitions)
+	}
+	runs.mu.Lock()
+	stages := append([]*run.Stage(nil), runs.createdStages...)
+	runs.mu.Unlock()
+	for _, st := range stages {
+		if st.RunID == runs.created[0].ID && st.State != run.StageStatePending {
+			t.Errorf("stage %s state = %q, want %q; a stage marked dispatched when no pipeline "+
+				"was created leaves the run waiting forever", st.ID, st.State, run.StageStatePending)
+		}
 	}
 	// And the audit says so.
 	if cats := auditCategories(au); len(cats) != 1 || cats[0] != "run_dispatched" {
