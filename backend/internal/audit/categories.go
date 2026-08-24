@@ -147,6 +147,7 @@ var KnownCategories = map[string]struct{}{
 	"ci_failure_retry_dispatched":             {},
 	"ci_green":                                {},
 	"ci_retry_exhausted":                      {},
+	"ci_retry_skipped":                        {},
 	"clarification_answered":                  {},
 	"clarification_requested":                 {},
 	"concern_addressed_by_condition":          {},

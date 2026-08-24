@@ -196,6 +196,13 @@ type Match struct {
 	// the audit-row payload.
 	CheckRunRef *CheckRunRef
 
+	// PipelineRef carries the bits of a GitLab Pipeline Hook payload the
+	// GitLab CI-retry handler needs (E45.22 / #2043). Set when Action is
+	// MatchActionCIFailureRetry AND the event came from GitLab; the GitHub
+	// path sets CheckRunRef instead. Handle routes on Event.Forge, so the
+	// two are never both populated.
+	PipelineRef *PipelineRef
+
 	// Repositories is the set of "owner/name" repos an installation /
 	// installation_repositories event added to the App (ADR-048 / E29.7).
 	// Set only for MatchActionScaffold — handleInstallation opens one
@@ -212,6 +219,23 @@ type CheckRunRef struct {
 	HeadSHA    string
 	CheckName  string
 	Conclusion string
+}
+
+// PipelineRef is the subset of a GitLab Pipeline Hook payload the
+// GitLab CI-retry path needs (E45.22 / #2043), mirroring CheckRunRef.
+//
+// Ref and SHA are the CORRELATION inputs: the retry handler resolves a
+// failing pipeline to its Fishhawk run by matching Ref against the run's
+// ADR-035 sole-writer run branch AND SHA against the run's recorded head
+// SHA. MergeRequestIID only NARROWS the candidate set — a retry lineage
+// produces MULTIPLE runs per merge request by construction, so the iid
+// alone cannot select one. PipelineID is provenance for the audit payload.
+type PipelineRef struct {
+	PipelineID      int
+	Ref             string
+	SHA             string
+	Status          string
+	MergeRequestIID int
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -780,8 +804,10 @@ var gitLabBotUsername = regexp.MustCompile(`^(project|group)_\d+_bot`)
 //   - object_kind "merge_request" skips — the MR lifecycle is consumed
 //     server-side (the receiver's merge/close consumer drives the
 //     review stage), not via the dispatcher.
-//   - object_kind "pipeline" / "build" skip with a reason naming the
-//     E45.8 / #1861 CI-dispatch consumer.
+//   - object_kind "pipeline" classifies a FAILED pipeline as
+//     MatchActionCIFailureRetry (E45.22 / #2043); object_kind "build"
+//     (the Job Hook GitLab emits for the SAME failure) is skipped so one
+//     failing job drives at most one retry — see matchGitLabCIFailure.
 //   - Everything else is acknowledged and skipped.
 func MatchGitLabEvent(ev Event) Match {
 	if ev.CredentialRef == "" {
@@ -800,8 +826,7 @@ func MatchGitLabEvent(ev Event) Match {
 	case "merge_request":
 		return Match{Skip: true, Reason: "MR lifecycle consumed server-side"}
 	case "pipeline", "build":
-		return Match{Skip: true,
-			Reason: fmt.Sprintf("%s event recognized; run creation from GitLab triggers is the E45.8/#1861 CI-dispatch consumer", ev.Type)}
+		return matchGitLabCIFailure(ev)
 	default:
 		return Match{Skip: true,
 			Reason: fmt.Sprintf("unrecognized gitlab object_kind %q", ev.Type)}
@@ -902,6 +927,89 @@ func matchGitLabNote(ev Event) Match {
 		m.WorkflowID = DefaultWorkflowID
 	}
 	return m
+}
+
+// gitLabCIFailureKindBuild is the object_kind GitLab stamps on a Job Hook.
+// GitLab emits BOTH a Pipeline Hook (object_kind "pipeline") and a Job Hook
+// (object_kind "build") for the same failing job, and both payloads carry the
+// ref / sha / pipeline id this classifier reads — so without an explicit
+// arm, one failure would classify TWICE and drive two retry attempts
+// (E45.22 / #2043, HIGH 3).
+const gitLabCIFailureKindBuild = "build"
+
+// gitLabPipelineFailedStatus is the object_attributes.status /
+// build_status value that marks a failed GitLab pipeline or job.
+const gitLabPipelineFailedStatus = "failed"
+
+// matchGitLabCIFailure classifies a GitLab Pipeline Hook (object_kind
+// "pipeline") or Job Hook (object_kind "build") for the CI-failure retry
+// path (E45.22 / #2043). Pure: correlation and cap enforcement live in
+// handleGitLabCIRetry.
+//
+// THE BUILD SKIP IS A CONTROL, not a parse failure. GitLab emits a Pipeline
+// Hook AND a Job Hook for the same failing job, and the Job Hook payload
+// carries top-level `ref`, `sha`, `build_status` and `pipeline_id` — every
+// correlation input the pipeline payload carries under object_attributes. The
+// union decode below therefore classifies a build payload just as happily as a
+// pipeline one, and the pipeline hook is elected the SINGLE retry trigger by
+// the explicit arm here. Delete the arm and a combined delivery drives two
+// retry attempts; the build-only isolation test is the counterfactual vehicle.
+//
+// Everything else skips with a reason: a non-failed status, and a payload
+// missing the ref or sha the correlation contract requires.
+func matchGitLabCIFailure(ev Event) Match {
+	if ev.Type == gitLabCIFailureKindBuild {
+		return Match{Skip: true,
+			Reason: "gitlab build (job) event skipped: the pipeline hook for the same failure is the single retry trigger (E45.22/#2043)"}
+	}
+	var payload struct {
+		ObjectAttributes struct {
+			ID     int    `json:"id"`
+			Ref    string `json:"ref"`
+			SHA    string `json:"sha"`
+			Status string `json:"status"`
+		} `json:"object_attributes"`
+		// The Job Hook carries the same fields at the TOP level. Decoded so
+		// the build arm above is a real control rather than a decode accident.
+		Ref          string `json:"ref"`
+		SHA          string `json:"sha"`
+		BuildStatus  string `json:"build_status"`
+		PipelineID   int    `json:"pipeline_id"`
+		MergeRequest struct {
+			IID int `json:"iid"`
+		} `json:"merge_request"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "gitlab pipeline payload parse failed"}
+	}
+	pr := PipelineRef{
+		PipelineID:      payload.ObjectAttributes.ID,
+		Ref:             payload.ObjectAttributes.Ref,
+		SHA:             payload.ObjectAttributes.SHA,
+		Status:          payload.ObjectAttributes.Status,
+		MergeRequestIID: payload.MergeRequest.IID,
+	}
+	if pr.PipelineID == 0 {
+		pr.PipelineID = payload.PipelineID
+	}
+	if pr.Ref == "" {
+		pr.Ref = payload.Ref
+	}
+	if pr.SHA == "" {
+		pr.SHA = payload.SHA
+	}
+	if pr.Status == "" {
+		pr.Status = payload.BuildStatus
+	}
+	if pr.Status != gitLabPipelineFailedStatus {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab %s status %q is not a failure", ev.Type, pr.Status)}
+	}
+	if pr.Ref == "" || pr.SHA == "" {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab %s payload missing ref or sha; cannot correlate to a run", ev.Type)}
+	}
+	return Match{Action: MatchActionCIFailureRetry, PipelineRef: &pr}
 }
 
 // gitLabLabel is the subset of a GitLab label object the matcher reads.
@@ -1149,6 +1257,14 @@ type Dispatcher struct {
 	// treated as UTC by CheckBlockingBudget.
 	BudgetLocation *time.Location
 
+	// GitLabFiles reads the workflow spec for a GitLab-triggered run
+	// (E45.22 / #2043). It is the forge-neutral FileFetcher rather than
+	// GitHubAPI because the GitHub client's scope parse rejects a
+	// "gitlab:<project_id>" credential ref outright. Nil leaves GitLab run
+	// creation off: an admitted GitLab trigger logs and skips rather than
+	// minting a run whose spec was never validated.
+	GitLabFiles forge.FileFetcher
+
 	// Accounts resolves the event's App installation to its owning tenant
 	// workspace account so the dispatcher's run-less audit entries
 	// (run_rejected_misconfigured / run_rejected_budget — no run row exists
@@ -1212,28 +1328,25 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	case MatchActionRunnerActionFailed:
 		return d.handleRunnerActionFailed(ctx, ev, m)
 	case MatchActionCIFailureRetry:
+		// Route by source forge: a GitLab Pipeline Hook correlates on
+		// (ref, sha) against the run branch (E45.22 / #2043), a GitHub
+		// check_run on (pull_request_url, check name).
+		if ev.Forge == ForgeGitLab {
+			return d.handleGitLabCIRetry(ctx, ev, m)
+		}
 		return d.handleCIFailureRetry(ctx, ev, m)
 	case MatchActionScaffold:
 		return d.handleInstallation(ctx, ev, m)
 	}
 
-	// DELIBERATE BOUNDARY (E45.6 / #1860): a GitLab MatchActionRun
-	// parks fail-closed here, BEFORE the spec-fetch step. Actual run
-	// CREATION from a GitLab trigger is the CI/dispatch phase's work
-	// per ADR-058 (E45.8 / #1861): the forge.Forge interface has no
-	// workflow-spec read, comment-backs are GitHub-only, and no
-	// gitlab_ci runner_kind exists yet. Falling through would hand a
-	// "gitlab:<project_id>" scope to d.GitHub (the GitHub client),
-	// whose installation-id parse would fail into a 5xx retry loop, so
-	// we log the reason and return nil (202) instead.
+	// GitLab run creation (E45.22 / #2043) UNPARKS the E45.6 / #1860
+	// boundary that used to return here. A GitLab-sourced MatchActionRun
+	// takes its own create path: the spec is read through the forge-neutral
+	// FileFetcher (the GitHub client's installation-id parse cannot accept a
+	// "gitlab:<project_id>" scope), and the run is stamped
+	// runner_kind=gitlab_ci with a "gitlab:" installation_ref.
 	if ev.Forge == ForgeGitLab {
-		d.logger().LogAttrs(ctx, slog.LevelInfo,
-			"gitlab run trigger parked: run creation is the E45.8/#1861 CI-dispatch consumer",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("repo", ev.Repo),
-			slog.String("trigger_ref", m.TriggerRef),
-		)
-		return nil
+		return d.handleGitLabCreateRun(ctx, ev, m, now)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -1823,10 +1936,10 @@ var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-re
 //     required_checks_snapshot (#251). A non-required check failing
 //     isn't a merge blocker, so it isn't a retry trigger.
 //
-//  3. Skip if a Fishhawk run already has this head_sha. The runner's
-//     fresh commit produces a new head_sha each retry; an event for
-//     a SHA we already wrote a run against is a redelivery / racing
-//     event.
+//  3. (E45.22 / #2043) Dedup is the runs_retry_child_once_idx CONSTRAINT
+//     at step 6's insert, not a read-then-write lookup: a redelivery or a
+//     concurrently-racing delivery derives the same retry_attempt from the
+//     same parent and loses the unique_violation benignly.
 //
 //  4. Read on_ci_failure.max_retries from the parent's cached
 //     workflow spec (#283 / #277), defaulting to DefaultMaxRetries
@@ -1884,22 +1997,12 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		return nil
 	}
 
-	// Step 3: dedup against existing runs on this head_sha.
-	dup, err := d.runOnHeadSHAExists(ctx, ev.Repo, ref.PRNumber, ref.HeadSHA)
-	if err != nil {
-		d.logger().LogAttrs(ctx, slog.LevelWarn,
-			"ci_failure_retry: dedup lookup failed",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("error", err.Error()))
-		return nil
-	}
-	if dup {
-		d.logger().LogAttrs(ctx, slog.LevelInfo,
-			"ci_failure_retry: a Fishhawk run already exists on this head_sha",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("head_sha", ref.HeadSHA))
-		return nil
-	}
+	// Step 3 (was: a read-then-write head_sha lookup) is now the
+	// runs_retry_child_once_idx CONSTRAINT at the CreateRun below — see
+	// the note there. A read-then-write guard cannot serialize two
+	// concurrent deliveries; the partial unique index can, and dedups the
+	// same-parent case the head_sha lookup covered (both deliveries derive
+	// retry_attempt from the SAME parent row, so both inserts collide).
 
 	// Step 4: resolve the retry cap from the cached spec.
 	workflow, maxRetries, ok := d.resolveRetryPolicy(ctx, parent)
@@ -1956,7 +2059,23 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 	if installationID != 0 {
 		params.InstallationID = &installationID
 	}
+	// ATOMIC DEDUP (E45.22 / #2043, C1): runs_retry_child_once_idx is a
+	// partial unique index on (parent_run_id, retry_attempt). Two racing
+	// deliveries for the same parent both derive retry_attempt from the
+	// PARENT row (line above) — never from the latest existing CHILD, which
+	// would make the two inserts disagree and the index never fire — so the
+	// loser trips a unique_violation on that index. That is the benign
+	// "someone else won" outcome, NOT a failure: return nil without a 5xx so
+	// the forge does not redeliver. Every other error stays a hard error.
 	child, err := d.Runs.CreateRun(ctx, params)
+	if run.IsRetryChildDuplicate(err) {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: concurrent delivery already created this retry child",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.Int("retry_attempt", params.RetryAttempt))
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("dispatcher: create retry run: %w", err)
 	}
@@ -2135,47 +2254,41 @@ func checkInSnapshot(r *run.Run, name string) bool {
 	return false
 }
 
-// runOnHeadSHAExists reports whether some Fishhawk run on this PR
-// already records the given head_sha — either as a direct PR
-// artifact head or as an ancestor in the chain. Used by the dedup
-// guard so a redelivery on the same head_sha doesn't spawn a second
-// retry.
-func (d *Dispatcher) runOnHeadSHAExists(ctx context.Context, repo string, prNumber int, headSHA string) (bool, error) {
-	if d.Runs == nil || d.Artifacts == nil || headSHA == "" {
-		return false, nil
+// runHeadSHA returns the head SHA a run recorded on its implement-stage
+// pull_request artifact, or "" when the run has none yet (no implement
+// stage, no artifact, or Artifacts unwired). It is the run-side half of the
+// GitLab correlation contract (E45.22 / #2043): a failing pipeline's SHA
+// must equal this value for the pipeline to belong to the run.
+//
+// An error is returned only for a genuine repository fault; a run with no
+// recorded SHA is ("", nil) so the caller can treat it as "not this run"
+// rather than as a lookup failure.
+func (d *Dispatcher) runHeadSHA(ctx context.Context, runID uuid.UUID) (string, error) {
+	if d.Runs == nil || d.Artifacts == nil {
+		return "", nil
 	}
-	prURL := pullRequestURLFor(repo, prNumber)
-	runs, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{
-		PullRequestURL: &prURL,
-		Limit:          25,
-	})
+	stages, err := d.Runs.ListStagesForRun(ctx, runID)
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	for _, r := range runs {
-		stages, err := d.Runs.ListStagesForRun(ctx, r.ID)
-		if err != nil {
-			return false, err
+	for _, s := range stages {
+		if s.Type != run.StageTypeImplement {
+			continue
 		}
-		for _, s := range stages {
-			if s.Type != run.StageTypeImplement {
+		arts, err := d.Artifacts.ListForStage(ctx, s.ID)
+		if err != nil {
+			return "", err
+		}
+		for _, a := range arts {
+			if a.Kind != artifact.KindPullRequest {
 				continue
 			}
-			arts, err := d.Artifacts.ListForStage(ctx, s.ID)
-			if err != nil {
-				return false, err
-			}
-			for _, a := range arts {
-				if a.Kind != artifact.KindPullRequest {
-					continue
-				}
-				if sha := decodeArtifactHeadSHA(a.Content); sha != "" && sha == headSHA {
-					return true, nil
-				}
+			if sha := decodeArtifactHeadSHA(a.Content); sha != "" {
+				return sha, nil
 			}
 		}
 	}
-	return false, nil
+	return "", nil
 }
 
 // decodeArtifactHeadSHA pulls head_sha out of a pull_request

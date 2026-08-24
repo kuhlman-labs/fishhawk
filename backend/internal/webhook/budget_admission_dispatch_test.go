@@ -205,3 +205,47 @@ func TestHandle_BlockingBudget_CapabilityAbsent_Admits(t *testing.T) {
 		t.Fatalf("runs created = %d, want 1 (capability-absent admits)", len(runs.created))
 	}
 }
+
+// TestHandle_BlockingBudget_GitLabTrigger_RefusesNewRun pins that the GitLab
+// creation path (E45.22 / #2043) runs the SAME blocking-budget admission gate
+// the GitHub path does. The gate is not forge-aware, so a GitLab trigger over
+// an exhausted budget must be refused before CreateRun with the same
+// run_rejected_budget entry — not admitted through a forge-specific bypass.
+func TestHandle_BlockingBudget_GitLabTrigger_RefusesNewRun(t *testing.T) {
+	d, _, runs, au := newBudgetDispatcher(t, blockingBudgetDispatchSpec("50"), 100)
+	d.GitLabFiles = &stubFileFetcher{
+		content: []byte(blockingBudgetDispatchSpec("50")),
+		sha:     "g1t1absha",
+	}
+
+	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs created = %d, want 0 (refused before CreateRun)", len(runs.created))
+	}
+	if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 1 {
+		t.Errorf("run_rejected_budget audits = %d, want 1", n)
+	}
+}
+
+// TestHandle_BlockingBudget_GitLabTrigger_UnderLimit_CreatesRun is the paired
+// control: the same GitLab trigger under the limit creates the gitlab_ci run,
+// so the refusal above cannot be satisfied by a path that never creates runs.
+func TestHandle_BlockingBudget_GitLabTrigger_UnderLimit_CreatesRun(t *testing.T) {
+	d, _, runs, au := newBudgetDispatcher(t, blockingBudgetDispatchSpec("50"), 10)
+	d.GitLabFiles = &stubFileFetcher{
+		content: []byte(blockingBudgetDispatchSpec("50")),
+		sha:     "g1t1absha",
+	}
+
+	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("runs created = %d, want 1 (under limit admits)", len(runs.created))
+	}
+	if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 0 {
+		t.Errorf("run_rejected_budget audits = %d, want 0 under limit", n)
+	}
+}

@@ -100,3 +100,23 @@ writes it into the project's default branch as `.gitlab-ci.yml`.
   counterpart this template mirrors.
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §10 — the "Where to look" row for
   the GitLab CI onboarding template and the surrounding GitLab forge surface.
+
+## Go-live: GitLab-triggered runs (E45.22 / #2043)
+
+Run creation from a GitLab trigger is live as of #2043. To turn it on for a deployment:
+
+1. **Register the GitLab forge.** Set the GitLab base URL and token so `forge.Get("gitlab")` resolves (see `resolveGitLabForge` in `backend/cmd/fishhawkd/serve.go`; the config gate is both-or-neither). The dispatcher's spec reader is `registeredFileFetcher("gitlab")` — with GitLab unconfigured, an admitted GitLab trigger logs `no GitLab file reader configured` and creates no run.
+2. **Configure the GitLab webhook secret** (`X-Gitlab-Token`) so deliveries authenticate, and enable at minimum the **Issue**, **Comment**, and **Pipeline** hooks. The **Job** hook may be enabled; Fishhawk skips it deliberately so one failing job drives at most one retry.
+3. **Commit `.fishhawk/workflows.yaml`** to the project's default branch. Fishhawk reads it through the GitLab Repository Files API at the deployment's default ref.
+4. **Label an issue `fishhawk`** (or comment `/fishhawk run`) to trigger.
+
+### `installation_ref` format
+
+A GitLab-created run persists `runs.installation_ref = "gitlab:<project_id>"` — the numeric project id, matching the credential-scope ref the GitLab forge's `projectIDFromScope` parses. A GitHub run persists the BARE base-10 installation id (no `github:` prefix), which is `forge.FromGitHubInstallationID`'s canonical form. Both are read ref-first by `orchestrator.runCredentialScope`, falling back to `installation_id` only when the ref is absent or empty.
+
+### CI-failure retry on GitLab
+
+A failed **Pipeline Hook** triggers the auto-retry when its `ref` matches a run's `fishhawk/run-<short>` branch AND its `sha` matches that run's recorded head SHA. Two operator-visible consequences:
+
+- **The first pipeline of a run never auto-retries.** It runs on the default branch, before the run branch exists. This is a deliberate deferral (issue #2043's own second option) rather than a gap — re-run it manually, or let the next stage's pipeline carry the retry. The audit records `ci_retry_skipped` with reason `first_stage_pipeline_on_non_run_branch` so a missing retry is diagnosable rather than silent.
+- **Every other non-retry is also named** in a `ci_retry_skipped` audit row: `no_candidate_run_owns_pipeline_ref`, `pipeline_sha_does_not_match_run_head_sha`, `run_lineage_cancelled`, `retry_policy_unresolvable_from_cached_spec`. Query them with `GET /v0/runs/{run_id}/audit?category=ci_retry_skipped`.

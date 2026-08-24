@@ -2354,6 +2354,14 @@ func runServe(args []string, logSink io.Writer) int {
 			// server's cfg.BudgetLocation so both admission seams
 			// bucket spend into the same calendar window.
 			BudgetLocation: budgetLocation,
+			// GitLabFiles reads .fishhawk/workflows.yaml for a GitLab-triggered
+			// run (E45.22 / #2043). It is the registered GitLab forge's
+			// forge.FileFetcher — the SAME resolution the per-repo conventions
+			// loader uses — because the GitHub client cannot accept a
+			// "gitlab:<project_id>" credential scope. nil when GitLab is
+			// unconfigured, which leaves GitLab run creation off rather than
+			// minting a run against an unvalidated spec.
+			GitLabFiles: registeredFileFetcher("gitlab"),
 			// ApprovalHandler is wired below after the Server
 			// is constructed — the Server implements the
 			// interface and holds all the deps the handler
