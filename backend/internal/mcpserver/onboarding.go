@@ -36,7 +36,9 @@ Gate semantics (these decide when a verb is legal):
 
 Refinement intake (separate from the run loop): when you have a natural-language brief to decompose into an epic + children, drive fishhawk_draft_epic — one tool with five arms (open, preview, edit, approve/reject, file); approve and file are ARMS on it, not fishhawk_approve_plan. Its session_guidance names the next arm at each step. See the runbook's "Refinement intake loop" section.
 
-Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, failed-run revive, decomposed-parent fan-out (run_children/consolidate_slices), drive_run loop shape, batch-as-campaign local drive (start_campaign/start_campaign_item_run/get_campaign_status), scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop).`
+Backlog grooming (also separate from the run loop): backlog_grooming is a NON-DIFF workflow — it proposes tracker mutations and parks at an approval gate. Approving that gate EXECUTES the approved mutations server-side; there is no separate apply step, so read the grooming report BEFORE you approve. Start it with trigger_source:on_demand (omit it and applies_to refuses the workflow and the run never starts) and drive its propose stage with the stage TYPE plan, not the stage id. See the runbook's "Backlog grooming loop" section.
+
+Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, failed-run revive, decomposed-parent fan-out (run_children/consolidate_slices), drive_run loop shape, batch-as-campaign local drive (start_campaign/start_campaign_item_run/get_campaign_status), scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop, backlog grooming loop).`
 
 // runbookMarkdown is the long-form operator runbook, embedded as a
 // product file so the binary serves it without a filesystem dependency.

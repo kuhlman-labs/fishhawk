@@ -361,3 +361,159 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		}
 	}
 }
+
+// groomingSectionHeading is the exact heading the E54.35 grooming section ships
+// under. The three grooming tests below all bound their assertions to that
+// section, so the heading is the one string they share.
+const groomingSectionHeading = "### Backlog grooming loop (non-diff)"
+
+// groomingSection slices the embedded runbook from the grooming heading to the
+// next same-level (`### `) heading, or EOF when it is the last section. A
+// missing heading is a t.Fatal with an actionable message rather than an empty
+// slice: an empty slice would let the presence and ordering assertions pass
+// vacuously, which is exactly the failure the counterfactual (delete the
+// section, observe RED) exists to rule out.
+func groomingSection(t *testing.T) string {
+	t.Helper()
+	start := strings.Index(runbookMarkdown, groomingSectionHeading)
+	if start < 0 {
+		t.Fatalf("runbook.md is missing the %q section heading — the E54.35 grooming section is absent or its heading was renamed", groomingSectionHeading)
+	}
+	rest := runbookMarkdown[start+len(groomingSectionHeading):]
+	if end := strings.Index(rest, "\n### "); end >= 0 {
+		return rest[:end]
+	}
+	return rest
+}
+
+// TestRunbook_DocumentsGroomingLoop is the E54.35 done-means: the EMBEDDED
+// runbook (not runbook.md on disk — asserting the embedded value is what proves
+// the text travels inside the binary to a client connecting from another
+// repository) must carry every load-bearing claim of the grooming loop. Each
+// claim is asserted independently so a half-written section names which one is
+// missing.
+func TestRunbook_DocumentsGroomingLoop(t *testing.T) {
+	// Whitespace-normalized so an anchor spanning a line wrap in the markdown
+	// still matches, and a re-wrap of the prose does not redden the table.
+	flat := strings.Join(strings.Fields(strings.ToLower(groomingSection(t))), " ")
+	for _, c := range []struct {
+		anchor string
+		claim  string
+	}{
+		{"backlog_grooming", "names the backlog_grooming workflow"},
+		{"fishhawk_approve_plan", "names the approving verb that triggers the write"},
+		{"executes the approved mutations server-side", "states that approving EXECUTES the mutations server-side"},
+		{"no separate apply step", "states there is no separate apply step to reconsider at"},
+		{"the gate is the apply trigger", "states the gate IS the apply trigger"},
+		{"trigger_source", "names the trigger_source requirement"},
+		{"on_demand", "names the on_demand trigger form"},
+		{"the stage type", "distinguishes the stage TYPE from the stage id"},
+		{"`groom`", "names the stage id the type is confused with"},
+		{"hygiene", "names hygiene as the applying class"},
+		{"objective_reversible", "names hygiene's backend-evaluable condition"},
+		{"ordering", "names the ordering class that stays a proposal"},
+		{"dedup", "names the dedup class that stays a proposal"},
+		{"scoping", "names the scoping class that stays a proposal"},
+		{"refused at **parse time**", "states mode: auto on those three is refused at PARSE time"},
+		{"max_autonomy", "states an escalation ceiling can clamp further"},
+		{"forge", "says to verify applied mutations on the FORGE"},
+		{"not from the run summary", "says the run summary is not the verification surface"},
+		{"grooming_run_id", "names the campaign-seeding parameter"},
+		{"grooming_order_not_approved", "names the un-ratified-order refusal"},
+		{"grooming_order_absent", "names the no-report refusal"},
+		{"grooming_order_superseded", "names the superseded-order refusal"},
+		{"grooming_run_not_found", "names the unknown-run refusal"},
+	} {
+		if !strings.Contains(flat, strings.ToLower(c.anchor)) {
+			t.Errorf("grooming section missing anchor %q — the section must state that it %s", c.anchor, c.claim)
+		}
+	}
+}
+
+// TestRunbook_GroomingHazardPrecedesInvocation asserts ORDER, not presence: a
+// section that documents the loop correctly but buries the approving-is-a-write
+// hazard under the invocation fails here, where a presence-only table passes.
+//
+// Anchored on SHORT load-bearing tokens — the workflow name and two tool verbs
+// — rather than on sentences, so a legitimate copy-edit of the surrounding
+// prose does not redden it while a genuinely reordered section still does
+// (binding condition C2).
+func TestRunbook_GroomingHazardPrecedesInvocation(t *testing.T) {
+	section := groomingSection(t)
+
+	hazard := strings.Index(section, "fishhawk_approve_plan")
+	if hazard < 0 {
+		t.Fatal("grooming section never names fishhawk_approve_plan; the write hazard is unstated")
+	}
+	workflow := strings.Index(section, "backlog_grooming")
+	if workflow < 0 {
+		t.Fatal("grooming section never names the backlog_grooming workflow")
+	}
+	for _, inv := range []struct {
+		anchor string
+		what   string
+	}{
+		{"fishhawk_start_run", "the run-minting verb"},
+		{"trigger_source", "the trigger_source invocation detail"},
+	} {
+		at := strings.Index(section, inv.anchor)
+		if at < 0 {
+			t.Errorf("grooming section never names %s (%q)", inv.what, inv.anchor)
+			continue
+		}
+		if hazard >= at {
+			t.Errorf("grooming section states the write hazard (fishhawk_approve_plan, index %d) AFTER %s (%q, index %d); the hazard must lead the section so a reader who skims only the opening still learns that approving writes", hazard, inv.what, inv.anchor, at)
+		}
+		if workflow >= at {
+			t.Errorf("grooming section names the backlog_grooming workflow (index %d) AFTER %s (%q, index %d); the section must say WHAT the loop is before how to invoke it", workflow, inv.what, inv.anchor, at)
+		}
+	}
+}
+
+// TestRunbook_GroomingSectionIsRepoAgnostic pins acceptance criterion 5: the
+// runbook ships to any repository, so a grooming section carrying THIS
+// repository's state is actively misleading elsewhere.
+//
+// Deliberately SECTION-SCOPED, not file-wide: the rest of runbook.md
+// legitimately carries kuhlman-labs issue links (the Batch-as-campaign section
+// alone links eight), so a file-wide assertion would be false. The check can
+// only prove the absence of the owner/URL string — the remaining repo-specific
+// classes (a bare issue number used as a step, a backlog count) are review-
+// verified, per the issue.
+func TestRunbook_GroomingSectionIsRepoAgnostic(t *testing.T) {
+	section := groomingSection(t)
+	for _, banned := range []string{
+		"kuhlman-labs",
+		"https://github.com/",
+	} {
+		if strings.Contains(section, banned) {
+			t.Errorf("grooming section contains repo-specific string %q; the runbook ships to every connecting repository, so the section must describe the MECHANISM and carry no owner, org or forge URL", banned)
+		}
+	}
+}
+
+// TestOnboardingInstructions_PointAtGroomingLoop is the E54.35 onboarding
+// pin: the initialize instructions must name the non-diff grooming loop, state
+// that approving its gate WRITES, name the on_demand trigger requirement, and
+// point at the runbook section — four independent assertions, so a half-edit
+// that names the workflow but drops the hazard fails where a presence gate
+// would pass.
+func TestOnboardingInstructions_PointAtGroomingLoop(t *testing.T) {
+	got := onboardingInstructions
+	lower := strings.ToLower(got)
+	for _, c := range []struct {
+		anchor string
+		claim  string
+	}{
+		{"backlog_grooming", "name the backlog_grooming workflow"},
+		{"non-diff", "state that it is a non-diff workflow"},
+		{"executes the approved mutations", "state that approving EXECUTES the mutations"},
+		{"no separate apply step", "state there is no separate apply step"},
+		{"trigger_source:on_demand", "name the on_demand trigger requirement"},
+		{"backlog grooming loop", "point at the runbook's Backlog grooming loop section"},
+	} {
+		if !strings.Contains(lower, strings.ToLower(c.anchor)) {
+			t.Errorf("onboardingInstructions missing %q — the grooming pointer must %s; got:\n%s", c.anchor, c.claim, got)
+		}
+	}
+}
