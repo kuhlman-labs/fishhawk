@@ -2,6 +2,18 @@
 
 Stage orchestrator: next-stage dispatch after approve. Called from the approval handler on approve; dispatches the next pending stage (or transitions the Run to terminal when all stages are done). Agent stages fire `workflow_dispatch`; human stages walk to `awaiting_approval` directly.
 
+## Credential-scope resolution in `triggerParams` (E45.22 / #2043)
+
+`triggerParams` maps a run + its next stage onto the forge-neutral `runnerbackend.TriggerParams`. Its `Scope` comes from `runCredentialScope`, which is a LADDER, not a switch:
+
+1. A non-nil, NON-EMPTY `run.InstallationRef` wraps verbatim via `forge.FromRef`. This is the only arm that can produce a GitLab scope (`gitlab:<project_id>`); it also covers a BACKFILLED GitHub row, whose ref is the bare base-10 decimal and therefore yields a scope byte-equal to arm 2's.
+2. A nil ref — or a ref recorded as the EMPTY STRING, a distinct persisted state that names no credential — falls back to `run.InstallationID` via `forge.FromGitHubInstallationID`. Every legacy pre-0076 GitHub row stays on exactly today's behaviour.
+3. Neither present → the zero scope, which `runnerbackend`'s `Scope.IsZero()` guard (`gitlabci.go`, `githubactions.go`) reads as "unwired" and warn-skips. Unchanged.
+
+**Why the ladder exists.** Before #2043 this read ONLY `InstallationID`, so a `gitlab_ci` run — which has no GitHub installation id — resolved the zero scope and every one of its stages warn-skipped without ever firing a pipeline (HIGH 1 of #2043). `TestTriggerParams_GitLabRefReachesCreatePipeline` drives the whole seam with NO scope substituted by the test: a run carrying `installation_ref` `gitlab:5` reaches `POST /api/v4/projects/5/pipeline`, and the same run stripped of both credentials issues no request at all. `TestTriggerParams_ResolvesCredentialScopeFromInstallationRef` covers one cell per branch, including the ref-wins-over-a-disagreeing-installation-id cell that makes the ORDERING an assertion rather than a coincidence.
+
+`Ref` is unchanged: the run's ADR-035 sole-writer branch from `runBranchRef`, which the `gitlab_ci` backend creates its pipeline against and the `github_actions` backend ignores.
+
 ## Auto-merge stages (#255 / ADR-017)
 
 Review stages with a check-only gate (`gate.Kind == 'check'`) take a third path — `dispatchAutoMergeStage` calls `githubclient.EnableAutoMerge` (REST GET `/pulls/{n}` for the node id, then GraphQL `enablePullRequestAutoMerge` mutation, default `SQUASH`) against the run's `pull_request_url` and walks the stage straight to `succeeded`.

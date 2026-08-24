@@ -20,6 +20,13 @@ type CreateRunParams struct {
 	TriggerSource  TriggerSource
 	TriggerRef     *string
 	InstallationID *int64
+	// InstallationRef is the ADR-057 / ADR-058 forge-neutral credential
+	// reference persisted on the run row (migration 0076). Nil means "no ref"
+	// — the create path had none to stamp and consumers fall back to
+	// InstallationID. A pointer to the empty string is a DIFFERENT state
+	// (recorded-as-empty) and callers must not substitute it for nil. See
+	// Run.InstallationRef for the full contract.
+	InstallationRef *string
 	// IdempotencyKey, when non-nil, makes the create idempotent
 	// against (Repo, *IdempotencyKey): a duplicate insert
 	// returns the existing row instead of failing on the unique

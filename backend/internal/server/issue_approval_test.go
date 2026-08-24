@@ -1718,3 +1718,200 @@ func TestHandleApprovalCommand_AdvanceStateChanged_ReplyCommentStaysSilent(t *te
 		}
 	}
 }
+
+// --- two-signal fail-closed run-forge derivation (E45.22 / #2043, HIGH 4) ---
+
+// TestForgeMatchesRun_TwoSignalFailClosed is the eight-cell table behind the
+// forgeMatchesRun rewrite. Before it, the helper ignored the run entirely and
+// returned normalizeForge(approvalForge) == "github", so a GitHub-sourced
+// approval matched EVERY run — including a gitlab_ci one the moment #1861's
+// dormant plumbing started minting them.
+//
+// Each cell drives the REAL HandleApprovalCommand and asserts COMMITTED STATE,
+// not an error value: the handler's refusal path returns nil (the stage simply
+// matches nothing), so an error-identity assertion would pass with the control
+// deleted. What the control actually changes is whether the stage ADVANCES and
+// whether an approval ROW is persisted, so that is what each cell reads back.
+//
+// Cells 3 and 4 are the fail-closed pair that justify TWO signals: in cell 3
+// the run's installation_ref is nil (a pre-0076 row, or a mint that forgot to
+// stamp it) so the ref signal necessarily says "github" and runner_kind must
+// carry the refusal ALONE; in cell 4 the runner_kind hint is still the
+// un-locked creation-time github_actions (ADR-045) so the ref must carry it
+// ALONE. Deleting either arm of runForge leaves the other cells green.
+//
+// Cells 7 and 8 are the AUTH-CHANGE IMPACT INVENTORY, asserted empirically
+// rather than argued: the two shapes every currently-persisted run has — a
+// legacy nil-ref GitHub row and a backfilled bare-decimal GitHub row — both
+// still MATCH a GitHub approval, so no existing run loses its approval path.
+func TestForgeMatchesRun_TwoSignalFailClosed(t *testing.T) {
+	ptr := func(s string) *string { return &s }
+
+	cases := []struct {
+		name          string
+		approvalForge string // "" / "github" / webhook.ForgeGitLab
+		credentialRef string // the APPROVAL's ref (GitLab notes carry one)
+		runRef        *string
+		runnerKind    string
+		wantMatch     bool
+	}{
+		{
+			name:          "1: github approval + github run (bare-decimal ref, github_actions)",
+			approvalForge: "", runRef: ptr("12345"), runnerKind: run.RunnerKindGitHubActions,
+			wantMatch: true,
+		},
+		{
+			name:          "2: github approval + gitlab run (both signals gitlab)",
+			approvalForge: "", runRef: ptr("gitlab:5"), runnerKind: run.RunnerKindGitLabCI,
+			wantMatch: false,
+		},
+		{
+			name:          "3: github approval + NIL-ref run whose runner_kind is gitlab_ci",
+			approvalForge: "", runRef: nil, runnerKind: run.RunnerKindGitLabCI,
+			wantMatch: false,
+		},
+		{
+			name:          "4: github approval + gitlab-ref run whose runner_kind is still github_actions",
+			approvalForge: "", runRef: ptr("gitlab:5"), runnerKind: run.RunnerKindGitHubActions,
+			wantMatch: false,
+		},
+		{
+			name:          "5: gitlab approval + gitlab run",
+			approvalForge: webhook.ForgeGitLab, credentialRef: "gitlab:5",
+			runRef: ptr("gitlab:5"), runnerKind: run.RunnerKindGitLabCI,
+			wantMatch: true,
+		},
+		{
+			name:          "6: gitlab approval + github run",
+			approvalForge: webhook.ForgeGitLab, credentialRef: "gitlab:5",
+			runRef: ptr("12345"), runnerKind: run.RunnerKindGitHubActions,
+			wantMatch: false,
+		},
+		{
+			name:          "7: github approval + LEGACY nil-ref github_actions run (impact inventory)",
+			approvalForge: "", runRef: nil, runnerKind: run.RunnerKindGitHubActions,
+			wantMatch: true,
+		},
+		{
+			name:          "8: github approval + BACKFILLED numeric-ref run (impact inventory)",
+			approvalForge: "", runRef: ptr("12345"), runnerKind: run.RunnerKindGitHubActions,
+			wantMatch: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			r := rr.seedRun()
+			r.TriggerSource = run.TriggerGitHubIssue
+			triggerRef := "issue:42"
+			r.TriggerRef = &triggerRef
+			r.InstallationID = ptrInt64(99)
+			r.InstallationRef = tc.runRef
+			r.RunnerKind = tc.runnerKind
+			r.Repo = "gitlab-org/gitlab-test"
+
+			stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+			stage.Type = run.StageTypePlan
+
+			ar := newFakeApprovalRepo()
+			au := newAuditCompleteAuditFake()
+			gh := newSlashGitHubRecorder()
+			o := &orchestrator.Orchestrator{Runs: rr}
+
+			s := New(Config{
+				Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+				Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+			})
+			s.issueNotifier = issuecomment.New(issuecomment.Deps{
+				GitHub: gh, Runs: rr, Audit: au,
+				ExternalURL: "https://app.fishhawk.example.com",
+			})
+
+			if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+				Repo: "gitlab-org/gitlab-test", IssueNumber: 42, InstallationID: 99,
+				SenderLogin:   "alice",
+				Decision:      webhook.MatchActionApprove,
+				Source:        webhook.ApprovalSourceSlash,
+				Forge:         tc.approvalForge,
+				CredentialRef: tc.credentialRef,
+			}); err != nil {
+				t.Fatalf("HandleApprovalCommand: %v", err)
+			}
+
+			// COMMITTED STATE, not the returned error: a refusal and a
+			// success both return nil.
+			if tc.wantMatch {
+				if len(ar.all) != 1 {
+					t.Errorf("approval rows = %d, want 1 (the approval must act on this run)", len(ar.all))
+				}
+				if stage.State == run.StageStateAwaitingApproval {
+					t.Errorf("stage state = %q, want it to have advanced off awaiting_approval", stage.State)
+				}
+				return
+			}
+			if len(ar.all) != 0 {
+				t.Errorf("approval rows = %d, want 0 — a cross-forge approval must not be persisted: %+v", len(ar.all), ar.all)
+			}
+			if stage.State != run.StageStateAwaitingApproval {
+				t.Errorf("stage state = %q, want awaiting_approval (unchanged) — the run advanced under a cross-forge approval", stage.State)
+			}
+		})
+	}
+}
+
+// TestRunForgeFromRef pins the ref-scheme reader in isolation, including the
+// branches the eight-cell table cannot reach through a run row: a malformed
+// ref whose scheme is EMPTY must be returned verbatim rather than normalized to
+// "github", or normalizeForge's empty-means-github rule would launder it into a
+// match for every GitHub approval.
+func TestRunForgeFromRef(t *testing.T) {
+	ptr := func(s string) *string { return &s }
+	cases := []struct {
+		name string
+		ref  *string
+		want string
+	}{
+		{"nil ref is github (pre-0076 / un-stamped)", nil, "github"},
+		{"empty ref is github", ptr(""), "github"},
+		{"bare decimal is github (the canonical github ref)", ptr("12345"), "github"},
+		{"gitlab scheme", ptr("gitlab:5"), "gitlab"},
+		{"scheme with an empty remainder still reads its scheme", ptr("gitlab:"), "gitlab"},
+		{"an unknown scheme passes through verbatim", ptr("bitbucket:9"), "bitbucket"},
+		{"a leading colon is NOT laundered into github", ptr(":5"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runForgeFromRef(tc.ref); got != tc.want {
+				t.Errorf("runForgeFromRef(%v) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunForge_GitLabWinsOnEitherSignal pins the OR, not the AND: runForge
+// treats a run as GitLab when EITHER signal says so, and only calls it GitHub
+// when NEITHER does. A nil run keeps the legacy "github" default rather than
+// panicking inside an HTTP handler.
+func TestRunForge_GitLabWinsOnEitherSignal(t *testing.T) {
+	ptr := func(s string) *string { return &s }
+	cases := []struct {
+		name string
+		r    *run.Run
+		want string
+	}{
+		{"nil run defaults to github", nil, "github"},
+		{"both signals github", &run.Run{InstallationRef: ptr("12345"), RunnerKind: run.RunnerKindGitHubActions}, "github"},
+		{"ref alone says gitlab", &run.Run{InstallationRef: ptr("gitlab:5"), RunnerKind: run.RunnerKindGitHubActions}, webhook.ForgeGitLab},
+		{"runner_kind alone says gitlab", &run.Run{InstallationRef: nil, RunnerKind: run.RunnerKindGitLabCI}, webhook.ForgeGitLab},
+		{"both say gitlab", &run.Run{InstallationRef: ptr("gitlab:5"), RunnerKind: run.RunnerKindGitLabCI}, webhook.ForgeGitLab},
+		{"a local run with no ref is github", &run.Run{RunnerKind: run.RunnerKindLocal}, "github"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runForge(tc.r); got != tc.want {
+				t.Errorf("runForge = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

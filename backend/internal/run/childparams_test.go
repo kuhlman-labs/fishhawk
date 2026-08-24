@@ -23,22 +23,24 @@ func childParamsParentFixture(t *testing.T) *Run {
 	t.Helper()
 	triggerRef := "issue:2589"
 	installID := int64(4242)
+	installRef := "gitlab:2589"
 	idemKey := "parent-idempotency-key"
 	grandparent := uuid.New()
 	upstream := uuid.New()
 	decomposedFrom := uuid.New()
 	sliceIdx := 3
 	return &Run{
-		ID:             uuid.New(),
-		Repo:           "kuhlman-labs/fishhawk",
-		WorkflowID:     "feature_change",
-		WorkflowSHA:    "feedf00dcafe",
-		TriggerSource:  TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installID,
-		IdempotencyKey: &idemKey,
-		ParentRunID:    &grandparent,
-		UpstreamRunID:  &upstream,
+		ID:              uuid.New(),
+		Repo:            "kuhlman-labs/fishhawk",
+		WorkflowID:      "feature_change",
+		WorkflowSHA:     "feedf00dcafe",
+		TriggerSource:   TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installID,
+		InstallationRef: &installRef,
+		IdempotencyKey:  &idemKey,
+		ParentRunID:     &grandparent,
+		UpstreamRunID:   &upstream,
 		RequiredChecksSnapshot: &RequiredChecksSnapshot{
 			Contexts: []string{"ci/build"},
 			Sources:  []string{"branch_protection"},
@@ -187,5 +189,41 @@ func TestChildParamsFrom_NilParent(t *testing.T) {
 	got := ChildParamsFrom(nil)
 	if !reflect.DeepEqual(got, CreateRunParams{}) {
 		t.Errorf("ChildParamsFrom(nil) = %#v, want the zero CreateRunParams", got)
+	}
+}
+
+// TestChildParamsFrom_InheritsInstallationRef is the named failure mode behind
+// the InstallationRef row in the inheritance table (E45.22 / #2043): a run
+// minted from a gitlab_ci parent must keep the parent's GitLab credential ref.
+// A child that dropped it would fall back to an InstallationID it does not
+// have and resolve the zero credential scope, so every one of its stages would
+// warn-skip.
+//
+// The reflection pin in TestChildParamsFrom_TableModesMatchBehavior already
+// checks the MODE agrees with the helper; this test names the consequence, and
+// covers the nil case the fixture (which is always non-nil) cannot.
+func TestChildParamsFrom_InheritsInstallationRef(t *testing.T) {
+	ref := "gitlab:5"
+	parent := &Run{
+		ID:              uuid.New(),
+		Repo:            "gitlab-org/gitlab-test",
+		WorkflowID:      "feature_change",
+		RunnerKind:      RunnerKindGitLabCI,
+		InstallationRef: &ref,
+	}
+	child := ChildParamsFrom(parent)
+	if child.InstallationRef == nil {
+		t.Fatal("child dropped the parent's InstallationRef; a gitlab_ci retry would lose its credentials")
+	}
+	if *child.InstallationRef != ref {
+		t.Errorf("child InstallationRef = %q, want %q", *child.InstallationRef, ref)
+	}
+
+	// A parent with no ref hands the child no ref — nil is inherited as nil,
+	// not manufactured into an empty string (the two are distinct persisted
+	// states).
+	noRef := ChildParamsFrom(&Run{ID: uuid.New(), Repo: "x/y"})
+	if noRef.InstallationRef != nil {
+		t.Errorf("child InstallationRef = %q, want nil when the parent has none", *noRef.InstallationRef)
 	}
 }

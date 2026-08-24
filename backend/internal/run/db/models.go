@@ -9,6 +9,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Account struct {
+	ID           uuid.UUID          `json:"id"`
+	Provider     string             `json:"provider"`
+	AccountKey   string             `json:"account_key"`
+	DisplayName  *string            `json:"display_name"`
+	Granularity  string             `json:"granularity"`
+	HomeRegion   *string            `json:"home_region"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	AutoJoinRole *string            `json:"auto_join_role"`
+}
+
+type AccountMember struct {
+	ID        uuid.UUID          `json:"id"`
+	AccountID uuid.UUID          `json:"account_id"`
+	Provider  string             `json:"provider"`
+	MemberRef string             `json:"member_ref"`
+	Role      *string            `json:"role"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	Origin    string             `json:"origin"`
+}
+
 type ApiToken struct {
 	ID         uuid.UUID          `json:"id"`
 	Subject    string             `json:"subject"`
@@ -17,6 +40,9 @@ type ApiToken struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	AuthMethod *string            `json:"auth_method"`
+	Provider   *string            `json:"provider"`
+	AccountID  *uuid.UUID         `json:"account_id"`
 }
 
 type Approval struct {
@@ -51,6 +77,7 @@ type AuditEntry struct {
 	Payload      []byte             `json:"payload"`
 	PrevHash     *string            `json:"prev_hash"`
 	EntryHash    string             `json:"entry_hash"`
+	AccountID    *uuid.UUID         `json:"account_id"`
 }
 
 type Campaign struct {
@@ -63,18 +90,34 @@ type Campaign struct {
 	PausePolicy    string             `json:"pause_policy"`
 	OperatorAgent  []byte             `json:"operator_agent"`
 	IdempotencyKey *string            `json:"idempotency_key"`
+	AccountID      *uuid.UUID         `json:"account_id"`
+	WorkingDir     string             `json:"working_dir"`
+	GroomingSource []byte             `json:"grooming_source"`
 }
 
 type CampaignItem struct {
-	ID          uuid.UUID          `json:"id"`
-	CampaignID  uuid.UUID          `json:"campaign_id"`
-	IssueRef    string             `json:"issue_ref"`
-	DependsOn   []byte             `json:"depends_on"`
-	RunID       *uuid.UUID         `json:"run_id"`
-	State       string             `json:"state"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	PauseReason []byte             `json:"pause_reason"`
+	ID            uuid.UUID          `json:"id"`
+	CampaignID    uuid.UUID          `json:"campaign_id"`
+	IssueRef      string             `json:"issue_ref"`
+	DependsOn     []byte             `json:"depends_on"`
+	RunID         *uuid.UUID         `json:"run_id"`
+	State         string             `json:"state"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	PauseReason   []byte             `json:"pause_reason"`
+	Autonomy      string             `json:"autonomy"`
+	QueuePosition int32              `json:"queue_position"`
+}
+
+type Installation struct {
+	ID              uuid.UUID          `json:"id"`
+	AccountID       uuid.UUID          `json:"account_id"`
+	Provider        string             `json:"provider"`
+	InstallationRef string             `json:"installation_ref"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	ForgeBaseUrl    *string            `json:"forge_base_url"`
+	OauthBaseUrl    *string            `json:"oauth_base_url"`
 }
 
 type McpToken struct {
@@ -86,6 +129,135 @@ type McpToken struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	Scopes     []string           `json:"scopes"`
+}
+
+type OauthAccessToken struct {
+	ID                  uuid.UUID          `json:"id"`
+	TokenHash           string             `json:"token_hash"`
+	Subject             string             `json:"subject"`
+	ClientID            string             `json:"client_id"`
+	Audience            string             `json:"audience"`
+	Scopes              []string           `json:"scopes"`
+	Provider            string             `json:"provider"`
+	AccountID           *uuid.UUID         `json:"account_id"`
+	AuthorizationCodeID uuid.UUID          `json:"authorization_code_id"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt          pgtype.Timestamptz `json:"last_used_at"`
+	RevokedAt           pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type OauthAuthorizationCode struct {
+	ID                  uuid.UUID          `json:"id"`
+	CodeHash            string             `json:"code_hash"`
+	ClientID            string             `json:"client_id"`
+	RedirectUri         string             `json:"redirect_uri"`
+	CodeChallenge       string             `json:"code_challenge"`
+	CodeChallengeMethod string             `json:"code_challenge_method"`
+	Scopes              []string           `json:"scopes"`
+	Resource            *string            `json:"resource"`
+	Subject             string             `json:"subject"`
+	Provider            string             `json:"provider"`
+	AccountID           *uuid.UUID         `json:"account_id"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt          pgtype.Timestamptz `json:"consumed_at"`
+}
+
+type OauthClient struct {
+	ID                      uuid.UUID          `json:"id"`
+	ClientID                string             `json:"client_id"`
+	RedirectUris            []string           `json:"redirect_uris"`
+	GrantTypes              []string           `json:"grant_types"`
+	ResponseTypes           []string           `json:"response_types"`
+	TokenEndpointAuthMethod string             `json:"token_endpoint_auth_method"`
+	ClientName              *string            `json:"client_name"`
+	ClientUri               *string            `json:"client_uri"`
+	LogoUri                 *string            `json:"logo_uri"`
+	Scope                   *string            `json:"scope"`
+	AccountID               *uuid.UUID         `json:"account_id"`
+	FirstSeenAt             pgtype.Timestamptz `json:"first_seen_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+}
+
+type OauthRefreshToken struct {
+	ID                  uuid.UUID          `json:"id"`
+	TokenHash           string             `json:"token_hash"`
+	Subject             string             `json:"subject"`
+	ClientID            string             `json:"client_id"`
+	Audience            string             `json:"audience"`
+	Scopes              []string           `json:"scopes"`
+	Provider            string             `json:"provider"`
+	AccountID           *uuid.UUID         `json:"account_id"`
+	AuthorizationCodeID uuid.UUID          `json:"authorization_code_id"`
+	AccessTokenID       uuid.UUID          `json:"access_token_id"`
+	ReplacedByID        *uuid.UUID         `json:"replaced_by_id"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt          pgtype.Timestamptz `json:"last_used_at"`
+	ConsumedAt          pgtype.Timestamptz `json:"consumed_at"`
+	RevokedAt           pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type RefinementDecision struct {
+	ID               uuid.UUID          `json:"id"`
+	SessionID        uuid.UUID          `json:"session_id"`
+	DraftID          uuid.UUID          `json:"draft_id"`
+	Decision         string             `json:"decision"`
+	Reason           string             `json:"reason"`
+	DraftContentHash string             `json:"draft_content_hash"`
+	DecidedBy        *string            `json:"decided_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	AccountID        *uuid.UUID         `json:"account_id"`
+}
+
+type RefinementDraft struct {
+	ID        uuid.UUID          `json:"id"`
+	SessionID uuid.UUID          `json:"session_id"`
+	Brief     string             `json:"brief"`
+	Draft     []byte             `json:"draft"`
+	Model     *string            `json:"model"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Origin    string             `json:"origin"`
+	AccountID *uuid.UUID         `json:"account_id"`
+}
+
+type RefinementFiledItem struct {
+	ID          uuid.UUID          `json:"id"`
+	DraftID     uuid.UUID          `json:"draft_id"`
+	Ordinal     int32              `json:"ordinal"`
+	IssueNumber int32              `json:"issue_number"`
+	IssueUrl    string             `json:"issue_url"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	AccountID   *uuid.UUID         `json:"account_id"`
+}
+
+type RefinementFilingSession struct {
+	DraftID     uuid.UUID          `json:"draft_id"`
+	SessionID   uuid.UUID          `json:"session_id"`
+	Repo        string             `json:"repo"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	AccountID   *uuid.UUID         `json:"account_id"`
+}
+
+type RepoAclEntry struct {
+	ID         uuid.UUID          `json:"id"`
+	Provider   string             `json:"provider"`
+	Subject    string             `json:"subject"`
+	Repo       string             `json:"repo"`
+	Permission string             `json:"permission"`
+	CheckedAt  pgtype.Timestamptz `json:"checked_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RepoAclPurgeWatermark struct {
+	Provider   string             `json:"provider"`
+	Subject    string             `json:"subject"`
+	Generation int64              `json:"generation"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
 
 type ReviewConcern struct {
@@ -103,6 +275,8 @@ type ReviewConcern struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	SuggestedPatch       string             `json:"suggested_patch"`
+	NewEvidence          string             `json:"new_evidence"`
+	SettledRef           string             `json:"settled_ref"`
 }
 
 type Run struct {
@@ -135,6 +309,7 @@ type Run struct {
 	AccountID               *uuid.UUID         `json:"account_id"`
 	WorkingDir              string             `json:"working_dir"`
 	PredictedRuntimeMinutes int32              `json:"predicted_runtime_minutes"`
+	InstallationRef         *string            `json:"installation_ref"`
 }
 
 type ScopeAmendment struct {
@@ -159,6 +334,7 @@ type Session struct {
 	SlidingExpiresAt  pgtype.Timestamptz `json:"sliding_expires_at"`
 	AbsoluteExpiresAt pgtype.Timestamptz `json:"absolute_expires_at"`
 	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
+	AccountID         *uuid.UUID         `json:"account_id"`
 }
 
 type SigningKey struct {
@@ -189,6 +365,8 @@ type Stage struct {
 	GateApprovers         []byte             `json:"gate_approvers"`
 	SelfRetryCount        int32              `json:"self_retry_count"`
 	ScopeCompletenessPark []byte             `json:"scope_completeness_park"`
+	Progress              []byte             `json:"progress"`
+	DispatchedAt          pgtype.Timestamptz `json:"dispatched_at"`
 }
 
 type StageCheck struct {
@@ -211,6 +389,7 @@ type User struct {
 	Email        *string            `json:"email"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Provider     string             `json:"provider"`
 }
 
 type WebhookDelivery struct {
