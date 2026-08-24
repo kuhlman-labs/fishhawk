@@ -3167,6 +3167,25 @@ func runBranchRef(r *run.Run) string {
 	return runBranchPrefix(r.ID)
 }
 
+// RunBranchRef is the exported, read-only seam onto the SAME derivation
+// triggerParams dispatches against (runBranchRef above) — the equivalence
+// seam for out-of-package consumers that must agree with it byte for byte.
+//
+// It exists because backend/internal/webhook's GitLab CI-retry correlation
+// re-derives the run branch locally (webhook.gitLabRunBranch): the correlation
+// matches a failing pipeline's ref against the branch the orchestrator
+// actually targeted, so a drift between the two would make EVERY correlation
+// miss silently. Exporting the orchestrator's own derivation lets that
+// package's test compare against the real thing instead of against a
+// hand-copied string table, which would stay green through exactly the drift
+// it is supposed to catch. TestRunBranchRef_IsTheRefTriggerParamsDispatches
+// pins this delegate to the dispatch path; the webhook side pins equivalence.
+//
+// Exported as a FUNCTION, not by exporting runBranchRef itself, so the
+// dispatch path keeps its single unexported call site (mirroring SliceBranch's
+// delegation to sliceBranch).
+func RunBranchRef(r *run.Run) string { return runBranchRef(r) }
+
 // dispatchStage transitions the next stage to dispatched and (for
 // agent stages) fires workflow_dispatch. Human stages transition
 // to awaiting_approval directly — there's no runner to wake up.

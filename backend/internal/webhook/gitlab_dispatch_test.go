@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -36,6 +38,41 @@ func (s *stubFileFetcher) FetchFile(_ context.Context, scope forge.CredentialSco
 	return &forge.FileContent{Path: path, Content: s.content, SHA: s.sha}, nil
 }
 
+// stubGitLabProjects is a GitLabProjectAuthorizer that vouches for an explicit
+// set of (credential_ref -> project_path) registrations and records every call.
+//
+// It deliberately has NO allow-everything mode: the guard binds a PAIR, so a
+// fake that answered true for any input would let a test pass while the pair
+// binding rotted.
+type stubGitLabProjects struct {
+	mu    sync.Mutex
+	allow map[string]string
+	err   error
+	calls []stubGitLabAuthzCall
+}
+
+type stubGitLabAuthzCall struct {
+	Ref  string
+	Path string
+}
+
+func (s *stubGitLabProjects) AuthorizedGitLabProject(_ context.Context, credentialRef, projectPath string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, stubGitLabAuthzCall{Ref: credentialRef, Path: projectPath})
+	if s.err != nil {
+		return false, s.err
+	}
+	registered, ok := s.allow[credentialRef]
+	return ok && registered == projectPath, nil
+}
+
+// registeredGitLabProject vouches for exactly the project
+// gitlabIssueTriggerEvent names, and for nothing else.
+func registeredGitLabProject() *stubGitLabProjects {
+	return &stubGitLabProjects{allow: map[string]string{"gitlab:4242": "acme/widgets"}}
+}
+
 // gitlabIssueTriggerEvent builds an admitted GitLab issue trigger: the
 // fishhawk label present on an `open` action, with the repo path and the
 // "gitlab:<project_id>" credential ref a real ParseGitLabEvent would stamp.
@@ -56,6 +93,11 @@ func newGitLabDispatcher(t *testing.T, specYAML string) (*Dispatcher, *stubFileF
 	d, gh, runs, au := newDispatcherWithStubs(t)
 	ff := &stubFileFetcher{content: []byte(specYAML), sha: "g1t1absha"}
 	d.GitLabFiles = ff
+	// The create path refuses any project not vouched for by a registry
+	// (E45.22 / #2043 fix-up), so every test that expects a run to be minted
+	// registers the event's project. Tests exercising the refusal replace or
+	// clear this.
+	d.GitLabProjects = registeredGitLabProject()
 	return d, ff, gh, runs, au
 }
 
@@ -130,6 +172,141 @@ func TestHandle_GitLabTrigger_CreatesGitLabCIRun(t *testing.T) {
 	}
 }
 
+// TestHandle_GitLabTrigger_UnregisteredProject_PerformsNoForgeCall is the
+// authorization control (E45.22 / #2043 fix-up, concern 403edbf3). The GitLab
+// receiver authenticates on a shared X-Gitlab-Token with no HMAC over the body,
+// so the project named in a payload is UNTRUSTED input that would otherwise
+// steer a deployment-credentialed file read and a pipeline creation.
+//
+// Every cell asserts on what the FAKES RECORDED, not on a returned value: the
+// handler returns nil for a refusal exactly as it does for a success, so a
+// return-value assertion could not tell them apart. Zero FetchFile calls, zero
+// CreateRun calls and zero CreateStage calls together mean no forge call
+// happened — the pipeline trigger is reachable only after a run and its stages
+// exist, so zero stages is proof no pipeline was created.
+//
+// The registered cell is the paired control: the SAME event admitted by the
+// registry mints the run, so the refusals cannot be satisfied by a path that
+// never creates anything.
+func TestHandle_GitLabTrigger_UnregisteredProject_PerformsNoForgeCall(t *testing.T) {
+	cases := []struct {
+		name        string
+		authorizer  GitLabProjectAuthorizer
+		wantCreated int
+		wantFetches int
+		wantReason  string
+	}{
+		{
+			// A project id nobody registered.
+			name:       "unregistered_project_id",
+			authorizer: &stubGitLabProjects{allow: map[string]string{"gitlab:9999": "acme/widgets"}},
+			wantReason: gitLabAuthzNotRegistered,
+		},
+		{
+			// The REGISTERED id paired with a DIFFERENT project path — the
+			// spec-read selector aimed at another project. Both halves of the
+			// pair must bind, so this is refused too.
+			name:       "registered_id_foreign_project_path",
+			authorizer: &stubGitLabProjects{allow: map[string]string{"gitlab:4242": "victim/other"}},
+			wantReason: gitLabAuthzNotRegistered,
+		},
+		{
+			// A registry fault must not open the gate.
+			name:       "registry_lookup_fails",
+			authorizer: &stubGitLabProjects{err: errors.New("connection reset")},
+			wantReason: gitLabAuthzLookupFailed,
+		},
+		{
+			// No registry wired at all: nothing can be shown authorized.
+			name:       "registry_unwired",
+			authorizer: nil,
+			wantReason: gitLabAuthzRegistryUnwired,
+		},
+		{
+			name:        "registered_project_admits",
+			authorizer:  registeredGitLabProject(),
+			wantCreated: 1,
+			wantFetches: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, ff, gh, runs, au := newGitLabDispatcher(t, validSpec)
+			d.GitLabProjects = tc.authorizer
+
+			if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+				t.Fatalf("Handle: %v (a refusal is a 202, not a 5xx)", err)
+			}
+
+			if ff.calls != tc.wantFetches {
+				t.Errorf("FetchFile calls = %d, want %d", ff.calls, tc.wantFetches)
+			}
+			if len(runs.created) != tc.wantCreated {
+				t.Errorf("runs created = %d, want %d", len(runs.created), tc.wantCreated)
+			}
+			if len(runs.createdStages) != tc.wantCreated {
+				t.Errorf("stages created = %d, want %d (no stages means no pipeline trigger)",
+					len(runs.createdStages), tc.wantCreated)
+			}
+			if gh.specCalls != 0 || gh.dispatchCalls != 0 {
+				t.Errorf("GitHub calls = %d spec / %d dispatch, want 0 / 0",
+					gh.specCalls, gh.dispatchCalls)
+			}
+			if tc.wantReason == "" {
+				return
+			}
+			// The refusal is RECORDED with its own reason, so an operator can
+			// tell an unregistered project from a registry fault.
+			if got := gitlabRefusalReasons(t, au); len(got) != 1 || got[0] != tc.wantReason {
+				t.Errorf("refusal reasons = %v, want [%s]", got, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestHandle_GitLabTrigger_AuthorizationSeesThePayloadIdentity pins WHAT the
+// gate is handed: the payload's credential ref and project path, unmodified.
+// A gate consulted with the wrong values could vouch for the wrong project
+// while every count-based assertion above stayed green.
+func TestHandle_GitLabTrigger_AuthorizationSeesThePayloadIdentity(t *testing.T) {
+	d, _, _, _, _ := newGitLabDispatcher(t, validSpec)
+	authz := registeredGitLabProject()
+	d.GitLabProjects = authz
+
+	ev := gitlabIssueTriggerEvent()
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(authz.calls) != 1 {
+		t.Fatalf("authorization calls = %d, want 1", len(authz.calls))
+	}
+	if got := authz.calls[0]; got.Ref != ev.CredentialRef || got.Path != ev.Repo {
+		t.Errorf("authorized (%q, %q), want (%q, %q)", got.Ref, got.Path, ev.CredentialRef, ev.Repo)
+	}
+}
+
+// gitlabRefusalReasons returns the `reason` of every global-chained
+// run_rejected_misconfigured entry written by the GitLab authorization gate.
+func gitlabRefusalReasons(t *testing.T, au *stubAudit) []string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []string
+	for _, a := range au.globalAppended {
+		if a.Category != "run_rejected_misconfigured" {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(a.Payload, &p); err != nil {
+			t.Fatalf("unmarshal run_rejected_misconfigured payload: %v", err)
+		}
+		if reason, ok := p["reason"].(string); ok {
+			out = append(out, reason)
+		}
+	}
+	return out
+}
+
 // TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating pins the
 // fail-closed branch for an unconfigured GitLab file reader: a deployment
 // misconfiguration must not mint a run against a spec that was never read,
@@ -137,6 +314,7 @@ func TestHandle_GitLabTrigger_CreatesGitLabCIRun(t *testing.T) {
 func TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating(t *testing.T) {
 	d, _, runs, au := newDispatcherWithStubs(t)
 	d.GitLabFiles = nil
+	d.GitLabProjects = registeredGitLabProject()
 
 	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
 		t.Fatalf("Handle: %v (want nil, not a 5xx)", err)
@@ -189,6 +367,9 @@ func TestHandle_GitLabTrigger_MalformedRepo_Skips(t *testing.T) {
 	d, ff, _, runs, _ := newGitLabDispatcher(t, validSpec)
 	ev := gitlabIssueTriggerEvent()
 	ev.Repo = "widgets" // no namespace
+	// Register the malformed path so the authorization gate admits it and the
+	// refusal under test is the repo PARSE guard, not the new authz guard.
+	d.GitLabProjects = &stubGitLabProjects{allow: map[string]string{"gitlab:4242": "widgets"}}
 
 	if err := d.Handle(context.Background(), ev); err != nil {
 		t.Fatalf("Handle: %v", err)

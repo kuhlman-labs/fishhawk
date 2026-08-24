@@ -1265,6 +1265,17 @@ type Dispatcher struct {
 	// minting a run whose spec was never validated.
 	GitLabFiles forge.FileFetcher
 
+	// GitLabProjects authorizes the payload-named GitLab project before the
+	// create path performs ANY forge call (E45.22 / #2043 fix-up). The GitLab
+	// receiver's shared X-Gitlab-Token proves only that the sender knows the
+	// deployment secret — never which project it may act on — so both
+	// payload-derived selectors (ev.CredentialRef and ev.Repo) must be bound
+	// to a registered installation first. NIL FAILS CLOSED: with no registry
+	// wired, no project can be shown to be authorized and GitLab run creation
+	// refuses, in contrast to the nil-means-off seams above which merely turn
+	// an optional side effect off. See GitLabProjectAuthorizer.
+	GitLabProjects GitLabProjectAuthorizer
+
 	// Accounts resolves the event's App installation to its owning tenant
 	// workspace account so the dispatcher's run-less audit entries
 	// (run_rejected_misconfigured / run_rejected_budget — no run row exists
@@ -1936,10 +1947,14 @@ var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-re
 //     required_checks_snapshot (#251). A non-required check failing
 //     isn't a merge blocker, so it isn't a retry trigger.
 //
-//  3. (E45.22 / #2043) Dedup is the runs_retry_child_once_idx CONSTRAINT
-//     at step 6's insert, not a read-then-write lookup: a redelivery or a
-//     concurrently-racing delivery derives the same retry_attempt from the
-//     same parent and loses the unique_violation benignly.
+//  3. Skip if a Fishhawk run already has this head_sha (defence in depth).
+//     The runner's fresh commit produces a new head_sha each retry, so an
+//     event for a SHA we already wrote a run against is a redelivery. The
+//     ATOMIC guard is the runs_retry_child_once_idx CONSTRAINT at step 6's
+//     insert — a concurrently-racing delivery derives the same retry_attempt
+//     from the same parent and loses the unique_violation benignly — but the
+//     index keys on (parent_run_id, retry_attempt) and so does not cover a
+//     redelivery that resolves a retry CHILD as its parent.
 //
 //  4. Read on_ci_failure.max_retries from the parent's cached
 //     workflow spec (#283 / #277), defaulting to DefaultMaxRetries
@@ -1997,12 +2012,30 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		return nil
 	}
 
-	// Step 3 (was: a read-then-write head_sha lookup) is now the
-	// runs_retry_child_once_idx CONSTRAINT at the CreateRun below — see
-	// the note there. A read-then-write guard cannot serialize two
-	// concurrent deliveries; the partial unique index can, and dedups the
-	// same-parent case the head_sha lookup covered (both deliveries derive
-	// retry_attempt from the SAME parent row, so both inserts collide).
+	// Step 3: the head_sha pre-read, retained as DEFENCE IN DEPTH beside the
+	// runs_retry_child_once_idx constraint at the CreateRun below. The
+	// constraint is the ATOMIC guard — it serializes two concurrent
+	// deliveries for the same parent, which this read-then-write cannot —
+	// but it keys on (parent_run_id, retry_attempt) and therefore does not
+	// cover a STALE REDELIVERY: once a retry child carries pull_request_url
+	// on the same PR, a redelivered failure for the ORIGINAL head_sha
+	// resolves the CHILD as parent and mints attempt N+1 against a SHA that
+	// was already retried. See runOnHeadSHAExists.
+	dup, err := d.runOnHeadSHAExists(ctx, ev.Repo, ref.PRNumber, ref.HeadSHA)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: dedup lookup failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if dup {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: a Fishhawk run already exists on this head_sha",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("head_sha", ref.HeadSHA))
+		return nil
+	}
 
 	// Step 4: resolve the retry cap from the cached spec.
 	workflow, maxRetries, ok := d.resolveRetryPolicy(ctx, parent)
@@ -2252,6 +2285,63 @@ func checkInSnapshot(r *run.Run, name string) bool {
 		}
 	}
 	return false
+}
+
+// runOnHeadSHAExists reports whether some Fishhawk run on this PR already
+// records the given head_sha — either as a direct PR artifact head or as an
+// ancestor in the chain.
+//
+// DEFENCE IN DEPTH, not the dedup primitive (E45.22 / #2043 fix-up). The
+// atomic guard is runs_retry_child_once_idx, which serializes two CONCURRENT
+// deliveries for the same parent — something this read-then-write pre-read
+// structurally cannot do. But the index keys on (parent_run_id,
+// retry_attempt), so it does NOT cover the STALE-REDELIVERY case this guard
+// does: once a retry child has itself set pull_request_url on the same PR, a
+// late or redelivered check_run failure for the ORIGINAL head_sha resolves the
+// CHILD as parent (findRunForCIRetry takes the newest non-terminal row on the
+// PR) and mints attempt N+1 for a SHA that was already retried — a different
+// parent, so the index never fires. The runner's fresh commit produces a NEW
+// head_sha each retry, so "some run on this PR already recorded this SHA"
+// remains an exact statement of "this failure was already retried".
+//
+// Kept nil-tolerant: an unwired Runs/Artifacts seam or an empty head_sha
+// reports false, leaving the constraint as the sole guard.
+func (d *Dispatcher) runOnHeadSHAExists(ctx context.Context, repo string, prNumber int, headSHA string) (bool, error) {
+	if d.Runs == nil || d.Artifacts == nil || headSHA == "" {
+		return false, nil
+	}
+	prURL := pullRequestURLFor(repo, prNumber)
+	runs, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{
+		PullRequestURL: &prURL,
+		Limit:          25,
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, r := range runs {
+		stages, err := d.Runs.ListStagesForRun(ctx, r.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, s := range stages {
+			if s.Type != run.StageTypeImplement {
+				continue
+			}
+			arts, err := d.Artifacts.ListForStage(ctx, s.ID)
+			if err != nil {
+				return false, err
+			}
+			for _, a := range arts {
+				if a.Kind != artifact.KindPullRequest {
+					continue
+				}
+				if sha := decodeArtifactHeadSHA(a.Content); sha != "" && sha == headSHA {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 // runHeadSHA returns the head SHA a run recorded on its implement-stage

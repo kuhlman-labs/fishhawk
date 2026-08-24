@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -467,18 +468,26 @@ func TestGitLabCIRetry_CapHitEmitsExhausted(t *testing.T) {
 
 // --- C1 / BC3: constraint-based dedup ------------------------------------
 
-// TestGitLabCIRetry_ConcurrentDeliveriesCreateOneChild drives two deliveries
-// racing one parent. Both derive retry_attempt from the PARENT row
-// (parent.RetryAttempt + 1) — BC3's caller contract — so both inserts compute
-// the SAME value and the loser trips runs_retry_child_once_idx. The stub
-// reproduces the loser's error shape via run.ErrRetryChildDuplicate, the
-// sentinel run.IsRetryChildDuplicate recognizes alongside a real 23505.
+// TestGitLabCIRetry_DuplicateSentinelIsBenign pins the HANDLER half of the
+// dedup contract and nothing more: when CreateRun reports
+// run.ErrRetryChildDuplicate — the sentinel run.IsRetryChildDuplicate
+// recognizes alongside a real 23505 on runs_retry_child_once_idx — the
+// delivery returns nil rather than a 5xx the forge would redeliver, and mints
+// no second child.
 //
-// The surviving child's retry_attempt is PINNED, not merely counted: a
-// child-derived value would let the two inserts disagree, the index would
-// never fire, and a count-only assertion would stay green while the defect
-// this test exists to close stayed open.
-func TestGitLabCIRetry_ConcurrentDeliveriesCreateOneChild(t *testing.T) {
+// IT IS NOT THE CONCURRENCY TEST, and its earlier name
+// (…_ConcurrentDeliveriesCreateOneChild) overstated it: two SEQUENTIAL Handle
+// calls against a fake that is HANDED the duplicate sentinel prove only that
+// the handler tolerates the sentinel. Deleting the index would leave this
+// green. The atomic dedup — two goroutines racing a real Postgres repository
+// where the index itself decides — is pinned by
+// TestGitLabCIRetry_ConcurrentDeliveriesCreateOneChild_Postgres in
+// postgres_test.go, which is the counterfactual vehicle for the index.
+//
+// The surviving child's retry_attempt is still PINNED here, because it is the
+// caller-side half of the same contract: both deliveries must derive the
+// attempt from the PARENT row, never from the latest existing child.
+func TestGitLabCIRetry_DuplicateSentinelIsBenign(t *testing.T) {
 	d, runs, _, arts := newGitLabRetryDispatcher(t)
 	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
 	// First create wins; the second loses the unique-index race.
@@ -575,21 +584,57 @@ func TestGitLabRunScope_RefLadder(t *testing.T) {
 	}
 }
 
-// TestGitLabRunBranch_MatchesOrchestratorDerivation pins the branch-name
-// derivation this package duplicates from orchestrator.runBranchRef. A drift
-// would make every correlation miss silently, so the exact strings for known
-// UUIDs are asserted rather than the formula being re-derived.
+// TestGitLabRunBranch_MatchesOrchestratorDerivation pins the CROSS-PACKAGE
+// equivalence its name claims: every case compares gitLabRunBranch against
+// orchestrator.RunBranchRef — the exported seam onto the SAME unexported
+// derivation orchestrator.triggerParams dispatches against (pinned there by
+// TestRunBranchRef_IsTheRefTriggerParamsDispatches).
+//
+// The earlier version of this test compared against hard-coded strings, so a
+// change to orchestrator.runBranchRef that diverged from this package's copy
+// left it green while correlation silently missed EVERY pipeline — the failure
+// mode is total and invisible, which is exactly why the assertion has to run
+// the other derivation rather than restate its output. Importing the
+// orchestrator here is acyclic: orchestrator depends on run/forge/runnerbackend
+// and never on webhook.
+//
+// The exact-string expectations are KEPT alongside the equivalence assertion.
+// Equivalence alone would stay green if BOTH derivations changed together, and
+// the branch name is also a wire contract with the runner's childSliceBranch.
 func TestGitLabRunBranch_MatchesOrchestratorDerivation(t *testing.T) {
 	id := uuid.MustParse("1dd0f40b-ea08-41cc-a79c-cc4a6a931648")
 	parentID := uuid.MustParse("bff9a242-9c4a-48a3-ad84-5feb66de9da2")
 	idx := 2
+	otherIdx := 0
 
-	if got := gitLabRunBranch(&run.Run{ID: id}); got != "fishhawk/run-1dd0f40b" {
-		t.Errorf("run branch = %q, want fishhawk/run-1dd0f40b", got)
+	cases := []struct {
+		name     string
+		run      *run.Run
+		wantName string
+	}{
+		{"top_level_run", &run.Run{ID: id}, "fishhawk/run-1dd0f40b"},
+		{"decomposed_child", &run.Run{ID: id, DecomposedFrom: &parentID, SliceIndex: &idx},
+			"fishhawk/run-bff9a242/slice-2"},
+		{"slice_index_zero", &run.Run{ID: id, DecomposedFrom: &parentID, SliceIndex: &otherIdx},
+			"fishhawk/run-bff9a242/slice-0"},
+		// Only ONE of the two decomposition fields set is not a slice: both
+		// derivations must fall back to the run's own namespace.
+		{"decomposed_from_without_slice_index", &run.Run{ID: id, DecomposedFrom: &parentID},
+			"fishhawk/run-1dd0f40b"},
+		{"slice_index_without_decomposed_from", &run.Run{ID: id, SliceIndex: &idx},
+			"fishhawk/run-1dd0f40b"},
 	}
-	got := gitLabRunBranch(&run.Run{ID: id, DecomposedFrom: &parentID, SliceIndex: &idx})
-	if got != "fishhawk/run-bff9a242/slice-2" {
-		t.Errorf("slice branch = %q, want fishhawk/run-bff9a242/slice-2", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gitLabRunBranch(tc.run)
+			if want := orchestrator.RunBranchRef(tc.run); got != want {
+				t.Errorf("gitLabRunBranch = %q, but orchestrator derives %q — correlation would miss every pipeline",
+					got, want)
+			}
+			if got != tc.wantName {
+				t.Errorf("branch = %q, want %q", got, tc.wantName)
+			}
+		})
 	}
 }
 

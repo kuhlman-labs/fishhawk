@@ -105,10 +105,24 @@ writes it into the project's default branch as `.gitlab-ci.yml`.
 
 Run creation from a GitLab trigger is live as of #2043. To turn it on for a deployment:
 
-1. **Register the GitLab forge.** Set the GitLab base URL and token so `forge.Get("gitlab")` resolves (see `resolveGitLabForge` in `backend/cmd/fishhawkd/serve.go`; the config gate is both-or-neither). The dispatcher's spec reader is `registeredFileFetcher("gitlab")` — with GitLab unconfigured, an admitted GitLab trigger logs `no GitLab file reader configured` and creates no run.
-2. **Configure the GitLab webhook secret** (`X-Gitlab-Token`) so deliveries authenticate, and enable at minimum the **Issue**, **Comment**, and **Pipeline** hooks. The **Job** hook may be enabled; Fishhawk skips it deliberately so one failing job drives at most one retry.
-3. **Commit `.fishhawk/workflows.yaml`** to the project's default branch. Fishhawk reads it through the GitLab Repository Files API at the deployment's default ref.
-4. **Label an issue `fishhawk`** (or comment `/fishhawk run`) to trigger.
+1. **Register the project as an installation.** GitLab run creation is authorization-gated and FAILS CLOSED: fishhawkd acts only on projects an operator has registered, because a GitLab delivery is authenticated by a shared `X-Gitlab-Token` with no signature over the body — the project a payload names proves nothing on its own. Insert an `installations` row for the project under an account whose `account_key` is the project path's namespace segment:
+
+   ```sql
+   -- account_key is the namespace segment of path_with_namespace ("acme" for acme/widgets)
+   INSERT INTO accounts (id, provider, account_key, display_name, granularity)
+        VALUES (gen_random_uuid(), 'gitlab', 'acme', 'Acme', 'org')
+   ON CONFLICT (provider, account_key) DO NOTHING;
+
+   INSERT INTO installations (id, account_id, provider, installation_ref)
+        SELECT gen_random_uuid(), id, 'gitlab', 'gitlab:4242' FROM accounts
+         WHERE provider = 'gitlab' AND account_key = 'acme';
+   ```
+
+   `gitlab:4242` is `gitlab:<numeric project id>` — the same string the run row's `installation_ref` carries. Without a matching row (or without a database at all) an admitted GitLab trigger is refused before the spec is read and before any pipeline is created, and a `run_rejected_misconfigured` audit row records the reason (`gitlab_project_not_registered`, `gitlab_project_registry_unwired`, or `gitlab_project_authorization_lookup_failed`). A registered project id paired with a project path OUTSIDE that account's namespace is refused too — both halves of the payload identity are bound.
+2. **Register the GitLab forge.** Set the GitLab base URL and token so `forge.Get("gitlab")` resolves (see `resolveGitLabForge` in `backend/cmd/fishhawkd/serve.go`; the config gate is both-or-neither). The dispatcher's spec reader is `registeredFileFetcher("gitlab")` — with GitLab unconfigured, an admitted GitLab trigger logs `no GitLab file reader configured` and creates no run.
+3. **Configure the GitLab webhook secret** (`X-Gitlab-Token`) so deliveries authenticate, and enable at minimum the **Issue**, **Comment**, and **Pipeline** hooks. The **Job** hook may be enabled; Fishhawk skips it deliberately so one failing job drives at most one retry.
+4. **Commit `.fishhawk/workflows.yaml`** to the project's default branch. Fishhawk reads it through the GitLab Repository Files API at the deployment's default ref.
+5. **Label an issue `fishhawk`** (or comment `/fishhawk run`) to trigger.
 
 ### `installation_ref` format
 

@@ -217,6 +217,7 @@ func TestHandle_BlockingBudget_GitLabTrigger_RefusesNewRun(t *testing.T) {
 		content: []byte(blockingBudgetDispatchSpec("50")),
 		sha:     "g1t1absha",
 	}
+	d.GitLabProjects = registeredGitLabProject()
 
 	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -238,6 +239,7 @@ func TestHandle_BlockingBudget_GitLabTrigger_UnderLimit_CreatesRun(t *testing.T)
 		content: []byte(blockingBudgetDispatchSpec("50")),
 		sha:     "g1t1absha",
 	}
+	d.GitLabProjects = registeredGitLabProject()
 
 	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
 		t.Fatalf("Handle: %v", err)

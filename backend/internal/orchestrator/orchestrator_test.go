@@ -4954,3 +4954,45 @@ func TestTriggerParams_GitLabRefReachesCreatePipeline(t *testing.T) {
 		t.Errorf("unwired run issued %s %s; want NO request (Scope.IsZero() warn-skip)", skipDoer.method, skipDoer.path)
 	}
 }
+
+// TestRunBranchRef_IsTheRefTriggerParamsDispatches pins the EXPORTED
+// RunBranchRef seam to the ref the dispatch path actually targets. It is the
+// orchestrator half of the cross-package equivalence chain closed by
+// webhook.TestGitLabRunBranch_MatchesOrchestratorDerivation: that test compares
+// webhook's local derivation against RunBranchRef, and this one proves
+// RunBranchRef is not a parallel copy but the very value triggerParams puts on
+// the wire. Without this link the exported seam could drift away from
+// triggerParams and the webhook test would keep agreeing with a function
+// nothing dispatches through.
+func TestRunBranchRef_IsTheRefTriggerParamsDispatches(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	parent := uuid.New()
+	sliceIdx := 3
+	cases := []struct {
+		name string
+		run  *run.Run
+	}{
+		{"top_level_run", &run.Run{ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change"}},
+		{"decomposed_child", &run.Run{
+			ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change",
+			DecomposedFrom: &parent, SliceIndex: &sliceIdx,
+		}},
+		// A run carrying only ONE of the two decomposition fields is not a
+		// slice: both derivations must fall back to the plain namespace.
+		{"decomposed_from_without_slice_index", &run.Run{
+			ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parent,
+		}},
+		{"slice_index_without_decomposed_from", &run.Run{
+			ID: uuid.New(), Repo: "x/y", SliceIndex: &sliceIdx,
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got, want := RunBranchRef(c.run), o.triggerParams(c.run, next).Ref; got != want {
+				t.Errorf("RunBranchRef = %q, but triggerParams dispatches against %q", got, want)
+			}
+		})
+	}
+}

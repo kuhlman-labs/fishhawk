@@ -21,6 +21,14 @@ type BaseFake struct{}
 var _ Repository = BaseFake{}
 
 // CreateRun returns nil, ErrNotFound.
+//
+// BaseFake holds NO in-memory store — it never materializes a Run — so there
+// is nothing here for a new CreateRunParams field to be copied into or dropped
+// from. In particular it cannot silently drop InstallationRef (ADR-057 /
+// ADR-058, migration 0076): a consumer that needs a created run to carry the
+// ref overrides this method with its own store, and the override is where the
+// field must be threaded. Stated explicitly because the shared fake is the
+// obvious place to look for such a gap.
 func (BaseFake) CreateRun(_ context.Context, _ CreateRunParams) (*Run, error) {
 	return nil, ErrNotFound
 }

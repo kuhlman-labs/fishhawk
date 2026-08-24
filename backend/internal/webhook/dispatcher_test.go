@@ -3743,6 +3743,99 @@ func TestHandle_CIFailureRetry_ConstraintDedup(t *testing.T) {
 	}
 }
 
+// TestHandle_CIFailureRetry_StaleRedeliveryOnRetriedHeadSHACreatesNoSecondChild
+// pins the head_sha pre-read the runs_retry_child_once_idx constraint does NOT
+// subsume (E45.22 / #2043 fix-up). The index keys on (parent_run_id,
+// retry_attempt), so it only dedups deliveries that resolve the SAME parent.
+// This drives the case where they do not:
+//
+//   - the parent has no recorded head_sha, so the first delivery for "abc123"
+//     legitimately mints retry child C1;
+//   - C1 then lands on the SAME PR and records "abc123" as its own
+//     implement-stage head — that commit has now been retried;
+//   - the original check_run failure for "abc123" is redelivered.
+//
+// findRunForCIRetry takes the newest non-terminal row on the PR, which is now
+// C1, so the constraint would see parent_run_id = C1 and retry_attempt 2 — no
+// collision — and without the pre-read a SECOND child is minted for a SHA that
+// was already retried. max_retries is raised to 2 on purpose so the cap check
+// cannot be what refuses the redelivery; the head_sha guard has to be.
+//
+// Counterfactual: delete step 3's runOnHeadSHAExists block in
+// handleCIFailureRetry and this observes a second child and goes red.
+func TestHandle_CIFailureRetry_StaleRedeliveryOnRetriedHeadSHACreatesNoSecondChild(t *testing.T) {
+	const specMaxRetries2 = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with a two-deep retry chain
+    on_ci_failure:
+      max_retries: 2
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.IssueNotifier = &stubIssueNotifier{}
+
+	// The parent records NO head_sha, so nothing yet covers "abc123".
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", specMaxRetries2, 0)
+
+	// First delivery: the legitimate retry.
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle (first delivery): %v", err)
+	}
+	children := retryChildren(runs, 1)
+	if len(children) != 1 {
+		t.Fatalf("after first delivery: retry children = %d, want 1", len(children))
+	}
+	child := children[0]
+
+	// C1 lands on the SAME PR and records the failing commit as its head —
+	// seeded by construction, exactly as the runner would leave it. From here
+	// the parent-finder resolves C1, not the parent.
+	runs.mu.Lock()
+	child.PullRequestURL = parent.PullRequestURL
+	runs.mu.Unlock()
+	recordHeadSHA(t, runs, arts, child.ID, "abc123")
+
+	// The ORIGINAL failure is redelivered for the now-retried SHA.
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle (redelivery): %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 1 {
+		t.Fatalf("retry children = %d, want 1 — a redelivery for an already-retried head_sha must mint no second child", len(got))
+	}
+}
+
+// recordHeadSHA seeds an implement stage on runID carrying a pull_request
+// artifact with the given head SHA — the shape the runner leaves behind and
+// the only thing the head_sha guard reads.
+func recordHeadSHA(t *testing.T, runs *stubRuns, arts *stubArtifacts, runID uuid.UUID, sha string) {
+	t.Helper()
+	st := &run.Stage{
+		ID:    uuid.New(),
+		RunID: runID,
+		Type:  run.StageTypeImplement,
+		State: run.StageStateSucceeded,
+	}
+	runs.mu.Lock()
+	runs.createdStages = append(runs.createdStages, st)
+	runs.mu.Unlock()
+	arts.add(st.ID, &artifact.Artifact{
+		ID:      uuid.New(),
+		StageID: st.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: []byte(fmt.Sprintf(`{"head_sha":%q}`, sha)),
+	})
+}
+
 // TestHandle_CIFailureRetry_UnrelatedCreateErrorStillFails pins the OTHER
 // half of the constraint branch: only the retry-child duplicate is benign.
 // Any other CreateRun error must still surface as a 5xx so the forge
@@ -4417,6 +4510,9 @@ func TestHandle_GitLabRun_CreatesRunInsteadOfParking(t *testing.T) {
 	ev := gitlabEvent("issue", "alice", body)
 	ev.DeliveryID = "gitlab:d2"
 	ev.Repo = "group/project"
+	// The create path is registry-gated (E45.22 / #2043 fix-up): register the
+	// project this event names so the unparking is what the test observes.
+	d.GitLabProjects = &stubGitLabProjects{allow: map[string]string{ev.CredentialRef: ev.Repo}}
 
 	if err := d.Handle(context.Background(), ev); err != nil {
 		t.Fatalf("Handle: %v", err)

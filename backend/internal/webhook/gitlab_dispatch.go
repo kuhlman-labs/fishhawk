@@ -2,11 +2,13 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -38,6 +40,132 @@ import (
 // not import the GitHub client for a constant.
 const gitLabWorkflowSpecPath = ".fishhawk/workflows.yaml"
 
+// GitLabProjectAuthorizer answers whether the GitLab project a webhook payload
+// names is one this deployment is REGISTERED to act on. It is the
+// authorization binding between untrusted payload identity and an operator
+// decision, and it gates GitLab run creation.
+//
+// WHY IT EXISTS. The GitLab receiver authenticates a delivery by comparing
+// X-Gitlab-Token against ONE shared deployment secret, and GitLab signs no HMAC
+// over the body (see VerifyGitLabToken). A valid token therefore proves the
+// sender knows the deployment secret; it proves NOTHING about the project named
+// in the payload. Both project selectors on the create path are payload-
+// derived: ev.CredentialRef ("gitlab:<project_id>") selects the credential AND
+// the project the pipeline is created in, while ev.Repo
+// (path_with_namespace) selects the project the executable workflow spec is
+// READ from. Left unbound, a token holder could aim either at any project the
+// deployment credential can reach — untrusted input steering sensitive
+// credentials, network egress and code execution. That is a confused deputy,
+// and it is why the check runs BEFORE the spec fetch and before the pipeline
+// trigger rather than between them.
+//
+// The GitHub path needs no analogue: its identity (ev.InstallationID) arrives
+// inside an HMAC-signed payload, and Dispatcher.Accounts resolves it to an
+// owning tenant.
+type GitLabProjectAuthorizer interface {
+	// AuthorizedGitLabProject reports whether credentialRef names a
+	// registered GitLab installation AND projectPath belongs to that
+	// installation's account. BOTH halves are required because the two
+	// selectors address different projects: registering only the id would
+	// still let a payload name any readable path for the spec read.
+	//
+	// A false answer is a REFUSAL, not an error. An error means the
+	// registry could not be consulted; the caller fails closed on both.
+	AuthorizedGitLabProject(ctx context.Context, credentialRef, projectPath string) (bool, error)
+}
+
+// gitLabAuthzRefusal names WHY a GitLab trigger was refused before any forge
+// call. They are audit-payload `reason` values on the existing run-less
+// rejection category, not new categories — the run row the refusal prevents
+// does not exist, so there is nothing to chain a per-run category to.
+const (
+	// gitLabAuthzRegistryUnwired is the FAIL-CLOSED default: no project
+	// registry is configured, so no project can be shown to be authorized.
+	// GitLab run creation is off until the operator wires one.
+	gitLabAuthzRegistryUnwired = "gitlab_project_registry_unwired"
+	// gitLabAuthzRefUnknown means the payload named no project id at all.
+	gitLabAuthzRefUnknown = "gitlab_project_ref_absent"
+	// gitLabAuthzLookupFailed means the registry could not be read. A
+	// transient fault must not open the gate, so it refuses.
+	gitLabAuthzLookupFailed = "gitlab_project_authorization_lookup_failed"
+	// gitLabAuthzNotRegistered is the refusal proper: the project is not one
+	// this deployment was authorized to act on.
+	gitLabAuthzNotRegistered = "gitlab_project_not_registered"
+)
+
+// authorizeGitLabProject is the create path's authorization gate. It returns
+// true only when the registry positively vouches for the payload's project;
+// every other outcome — unwired registry, absent ref, lookup fault, unknown
+// project — refuses, writes the run-less rejection audit naming which, and
+// leaves ZERO forge calls behind.
+func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Match, now time.Time) bool {
+	reason := ""
+	switch {
+	case d.GitLabProjects == nil:
+		reason = gitLabAuthzRegistryUnwired
+	case ev.CredentialRef == "":
+		reason = gitLabAuthzRefUnknown
+	default:
+		ok, err := d.GitLabProjects.AuthorizedGitLabProject(ctx, ev.CredentialRef, ev.Repo)
+		switch {
+		case err != nil:
+			reason = gitLabAuthzLookupFailed
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"gitlab dispatch: project authorization lookup failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", ev.Repo),
+				slog.String("error", err.Error()))
+		case !ok:
+			reason = gitLabAuthzNotRegistered
+		}
+	}
+	if reason == "" {
+		return true
+	}
+	d.writeGitLabUnauthorizedProjectAudit(ctx, ev, m, reason, now)
+	d.logger().LogAttrs(ctx, slog.LevelWarn,
+		"gitlab dispatch rejected: project not authorized",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("repo", ev.Repo),
+		slog.String("credential_ref", ev.CredentialRef),
+		slog.String("workflow_id", m.WorkflowID),
+		slog.String("reason", reason))
+	return false
+}
+
+// writeGitLabUnauthorizedProjectAudit records the refusal on the SAME run-less
+// category the plan-reviewer guard uses (run_rejected_misconfigured), keyed
+// apart by its `reason`. No run row exists at this point — the whole purpose of
+// the guard is that none is minted — so the entry is global-chained.
+func (d *Dispatcher) writeGitLabUnauthorizedProjectAudit(ctx context.Context, ev Event, m Match,
+	reason string, now time.Time) {
+	if d.Audit == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"reason":         reason,
+		"repo":           ev.Repo,
+		"credential_ref": ev.CredentialRef,
+		"workflow_id":    m.WorkflowID,
+		"delivery_id":    ev.DeliveryID,
+		"event":          ev.Type,
+		"forge":          string(ForgeGitLab),
+	})
+	if _, err := d.Audit.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp:    now,
+		Category:     "run_rejected_misconfigured",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("gitlab-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"append gitlab run_rejected_misconfigured audit entry failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+	}
+}
+
 // handleGitLabCreateRun creates a run from an admitted GitLab trigger.
 //
 // The run is stamped runner_kind=gitlab_ci as a CREATION-TIME HINT with
@@ -51,6 +179,13 @@ const gitLabWorkflowSpecPath = ".fishhawk/workflows.yaml"
 // Returns non-nil only for a transient fault the receiver should surface as a
 // 5xx; every refusal returns nil with an audit row and/or a structured log.
 func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Match, now time.Time) error {
+	// Step 0: AUTHORIZATION. First statement in the function on purpose —
+	// every later step either reads with deployment credentials or executes
+	// code in the named project, so an unauthorized payload must fall out
+	// here having caused zero forge calls. See GitLabProjectAuthorizer.
+	if !d.authorizeGitLabProject(ctx, ev, m, now) {
+		return nil
+	}
 	repo, err := parseRepo(ev.Repo)
 	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab dispatch: repo malformed",

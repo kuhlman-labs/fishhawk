@@ -645,6 +645,7 @@ func TestAppliesToWebhook_GitLabTrigger_GatesTheGitLabCreationPath(t *testing.T)
 			specYAML := appliesToSpecYAML(tc.appliesTo)
 			d, _, runs, au := newDispatcherWithStubs(t)
 			d.GitLabFiles = &stubFileFetcher{content: []byte(specYAML), sha: "g1t1absha"}
+			d.GitLabProjects = registeredGitLabProject()
 
 			if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
 				t.Fatalf("Handle: %v", err)
