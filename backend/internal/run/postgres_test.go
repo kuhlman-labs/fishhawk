@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -2520,5 +2521,177 @@ func TestPostgres_ParkScopeCompleteness_PRTextRoundTrip(t *testing.T) {
 	}
 	if legacy.HeldCommitSHA != "abc" || len(legacy.MissingPaths) != 1 {
 		t.Errorf("the pre-#2570 payload's own fields must be unaffected: %+v", legacy)
+	}
+}
+
+// TestCreateRun_PersistsInstallationRef pins the ADR-057 / ADR-058
+// installation_ref column (E45.22 / #2043, migration 0076) across all THREE
+// Run read paths — CreateRun's own return, GetRun, and ListRuns — against a
+// real Postgres, for all THREE persisted states.
+//
+// The three states are asserted separately because they are NOT
+// interchangeable downstream: nil falls back to installation_id, a
+// pointer-to-empty-string ALSO falls back but is a different provenance, and a
+// value is authoritative. A mapper that normalized "" to nil (or nil to "")
+// would collapse two of them and pass a single-state test.
+//
+// Three read paths because each is a distinct sqlc column-list/scan expansion
+// site: a positional mismatch between the RETURNING list and the Scan targets
+// would silently mis-bind two adjacent nullable TEXT columns and surface here
+// as a wrong string rather than as a compile error.
+func TestCreateRun_PersistsInstallationRef(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	empty := ""
+	gitlabRef := "gitlab:5"
+	githubRef := "12345"
+
+	cases := []struct {
+		name string
+		ref  *string
+	}{
+		{"gitlab ref round-trips verbatim", &gitlabRef},
+		{"backfilled bare-decimal github ref round-trips verbatim", &githubRef},
+		{"nil ref round-trips as nil", nil},
+		{"recorded-empty ref round-trips as pointer-to-empty, NOT nil", &empty},
+	}
+
+	created := make(map[uuid.UUID]*string, len(cases))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := repo.CreateRun(ctx, run.CreateRunParams{
+				Repo:            "kuhlman-labs/fishhawk-installation-ref",
+				WorkflowID:      "feature_change",
+				WorkflowSHA:     "deadbeef",
+				TriggerSource:   run.TriggerCLI,
+				InstallationRef: tc.ref,
+			})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			assertRefEqual(t, "CreateRun", r.InstallationRef, tc.ref)
+
+			got, err := repo.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			assertRefEqual(t, "GetRun", got.InstallationRef, tc.ref)
+			created[r.ID] = tc.ref
+		})
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "kuhlman-labs/fishhawk-installation-ref", Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	seen := 0
+	for _, r := range list {
+		want, ok := created[r.ID]
+		if !ok {
+			continue
+		}
+		seen++
+		assertRefEqual(t, "ListRuns", r.InstallationRef, want)
+	}
+	if seen != len(created) {
+		t.Errorf("ListRuns returned %d of the %d created runs", seen, len(created))
+	}
+}
+
+// assertRefEqual compares two *string installation refs, distinguishing nil
+// from a pointer to the empty string — the distinction the three-state contract
+// rests on.
+func assertRefEqual(t *testing.T, path string, got, want *string) {
+	t.Helper()
+	switch {
+	case want == nil && got == nil:
+	case want == nil:
+		t.Errorf("%s InstallationRef = %q, want nil", path, *got)
+	case got == nil:
+		t.Errorf("%s InstallationRef = nil, want %q", path, *want)
+	case *got != *want:
+		t.Errorf("%s InstallationRef = %q, want %q", path, *got, *want)
+	}
+}
+
+// TestCreateRun_RetryChildOnceIndexIsBenignDuplicate is the persistence-layer
+// half of the constraint-based retry dedup (#2043, C1/BC3): a SECOND child run
+// at the same (parent_run_id, retry_attempt) with retry_attempt > 0 must come
+// back as an error run.IsRetryChildDuplicate recognizes, so a retry path can
+// take its benign "someone else won" branch instead of surfacing a failure.
+//
+// It also pins the NEGATIVE side, which is what stops the helper being a
+// blanket 23505 swallow: a duplicate on the (repo, idempotency_key) partial
+// unique index — a DIFFERENT constraint the same INSERT can trip — must NOT be
+// recognized. A helper that matched any unique_violation would treat an
+// unrelated integrity failure as a won race.
+func TestCreateRun_RetryChildOnceIndexIsBenignDuplicate(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	parent := makeRun(t, repo)
+
+	childParams := func(attempt int) run.CreateRunParams {
+		p := run.ChildParamsFrom(parent)
+		// BC3: the attempt is derived from the PARENT row, which is what makes
+		// two concurrent deliveries compute the SAME value and collide.
+		p.RetryAttempt = attempt
+		return p
+	}
+
+	if _, err := repo.CreateRun(ctx, childParams(parent.RetryAttempt+1)); err != nil {
+		t.Fatalf("first retry child: %v", err)
+	}
+	_, err := repo.CreateRun(ctx, childParams(parent.RetryAttempt+1))
+	if err == nil {
+		t.Fatal("second retry child at the same attempt SUCCEEDED; want a unique_violation on runs_retry_child_once_idx")
+	}
+	if !run.IsRetryChildDuplicate(err) {
+		t.Errorf("IsRetryChildDuplicate(%v) = false, want true", err)
+	}
+
+	// A collision on a DIFFERENT constraint is not laundered into the benign
+	// branch. (repo, idempotency_key) is unique, and CreateRun surfaces the
+	// raw driver error for it.
+	key := "shared-idempotency-key"
+	base := run.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk-other-constraint",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  run.TriggerCLI,
+		IdempotencyKey: &key,
+	}
+	if _, err := repo.CreateRun(ctx, base); err != nil {
+		t.Fatalf("first idempotency-keyed run: %v", err)
+	}
+	_, otherErr := repo.CreateRun(ctx, base)
+	if otherErr == nil {
+		t.Fatal("duplicate idempotency key SUCCEEDED; want a unique_violation")
+	}
+	if run.IsRetryChildDuplicate(otherErr) {
+		t.Errorf("IsRetryChildDuplicate(%v) = true for an idempotency-key collision; the helper must be scoped to runs_retry_child_once_idx", otherErr)
+	}
+}
+
+// TestIsRetryChildDuplicate_Sentinel pins the sentinel-for-fakes half of the
+// idiom (mirroring audit.ErrMergeVerdictDuplicate): a fake Repository with no
+// Postgres can return run.ErrRetryChildDuplicate from CreateRun and a retry
+// path's benign branch still engages, wrapped or bare. An unrelated error does
+// not.
+func TestIsRetryChildDuplicate_Sentinel(t *testing.T) {
+	if !run.IsRetryChildDuplicate(run.ErrRetryChildDuplicate) {
+		t.Error("bare ErrRetryChildDuplicate must be recognized")
+	}
+	if !run.IsRetryChildDuplicate(fmt.Errorf("create run: %w", run.ErrRetryChildDuplicate)) {
+		t.Error("wrapped ErrRetryChildDuplicate must be recognized")
+	}
+	if run.IsRetryChildDuplicate(errors.New("some other failure")) {
+		t.Error("an unrelated error must NOT be recognized as the benign retry race")
+	}
+	if run.IsRetryChildDuplicate(nil) {
+		t.Error("nil must NOT be recognized as the benign retry race")
 	}
 }

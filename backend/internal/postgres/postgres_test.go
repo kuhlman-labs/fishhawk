@@ -1155,8 +1155,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0075 (#2826, E54.22; widens runs_trigger_source_check to admit
-	// 'on_demand') is now the latest migration. Roll it back FIRST, then 0074
+	// 0076 (#2043, E45.22; adds runs.installation_ref and the
+	// runs_retry_child_once_idx partial unique index) is now the latest
+	// migration. Roll it back FIRST, then 0075 (#2826, E54.22; widens
+	// runs_trigger_source_check to admit 'on_demand'), then 0074
 	// (#2238, E54.6; campaign_items.queue_position + campaigns.grooming_source),
 	// then 0073 (#2235, E54.3; widens artifacts_kind_check to admit
 	// 'grooming_report'), then
@@ -1175,7 +1177,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// audit_entries_merge_verdict_recorded_once_idx partial unique index,
 	// index-only), then 0061 (users.provider), so this test's historical
 	// assertions, which pin 0060 as the one-step-rollback target, stay valid.
-	// 0075's own up/down reversal is pinned by
+	// 0076's own up/down reversal is pinned by
+	// TestMigrateDown_RunsInstallationRefReversal, 0075's by
 	// TestMigrateDown_RunsTriggerSourceOnDemandReversal, 0073's by
 	// TestMigrateDown_ArtifactGroomingReportReversal, 0072's by
 	// TestMigrateDown_StagesDispatchedAtReversal, 0071's by
@@ -1191,7 +1194,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2075,13 +2081,16 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 	// (oauth_clients.provider drop), 0063 (the OAuth AS storage tables) and 0062
 	// (the index-only merge-verdict uniqueness) first so the next one-step down
 	// targets 0061 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2200,13 +2209,16 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir), 0064
 	// (oauth_clients.provider drop) and 0063 (the OAuth AS storage tables) first
 	// so the next one-step down targets 0062 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2314,13 +2326,16 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 
 	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
 	// first so the next one-step down targets 0067 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2418,13 +2433,16 @@ func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
 
 	// One MigrateDown drops exactly that index (index-only rollback); 0068 is
 	// the head, so no preparatory step-downs are needed.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2498,7 +2516,10 @@ func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeyless
 	// absent, and phase 2 re-applies nothing over the seeded rows: the test
 	// would still PASS while asserting nothing.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2677,13 +2698,16 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir) and 0064
 	// (oauth_clients.provider drop) first so the next one-step down targets
 	// 0063 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2847,13 +2871,16 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes) and 0065 (runs.working_dir) first so the
 	// next one-step down targets 0064 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -2947,13 +2974,16 @@ func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
 	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
 	// and 0067 (the index-only parent-awaiting-child uniqueness) first so the
 	// next one-step down targets 0066 — the reversal under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3030,13 +3060,16 @@ func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
 	// (runs.predicted_runtime_minutes) first so the next one-step down targets
 	// 0065 — the reversal under test. Exactly one MigrateDown then drops the
 	// column.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3128,7 +3161,10 @@ func TestMigrateDown_StagesProgressReversal(t *testing.T) {
 	// 0072 (#2744) and 0071 (#2527) sit above 0070; roll them back first so the
 	// next one-step down targets 0070 — the reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3165,6 +3201,252 @@ func TestMigrateDown_StagesProgressReversal(t *testing.T) {
 const runsTriggerSourceCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint
 	  WHERE conname = 'runs_trigger_source_check'`
 
+// TestMigrateDown_RunsInstallationRefReversal pins 0076 (#2043, E45.22) in
+// BOTH directions and on BOTH of the objects it creates: runs.installation_ref
+// and the runs_retry_child_once_idx partial unique index EXIST after MigrateUp
+// and are GONE after exactly one MigrateDown, with the runs table surviving
+// (0076 is an ALTER + a CREATE INDEX, never a DROP TABLE). Mirrors the 0065 /
+// 0066 column-reversal shape, extended to cover the index.
+func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	installationRefColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'installation_ref'`).Scan(&n); err != nil {
+			t.Fatalf("query runs.installation_ref: %v", err)
+		}
+		return n
+	}
+	retryChildIndex := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_indexes
+			  WHERE tablename = 'runs' AND indexname = 'runs_retry_child_once_idx'`).Scan(&n); err != nil {
+			t.Fatalf("query runs_retry_child_once_idx: %v", err)
+		}
+		return n
+	}
+
+	if n := installationRefColumn(); n != 1 {
+		t.Errorf("runs.installation_ref count after MigrateUp = %d, want 1 (0076 added it)", n)
+	}
+	if n := retryChildIndex(); n != 1 {
+		t.Errorf("runs_retry_child_once_idx count after MigrateUp = %d, want 1 (0076 created it)", n)
+	}
+	// The column is NULLABLE by design — the three-state contract (NULL /
+	// recorded-empty / a value) collapses to two if the column is NOT NULL,
+	// and every pre-0076 row with no derivable ref would have blocked the
+	// ALTER outright.
+	var nullable string
+	if err := pool.QueryRow(ctx,
+		`SELECT is_nullable FROM information_schema.columns
+		  WHERE table_name = 'runs' AND column_name = 'installation_ref'`).Scan(&nullable); err != nil {
+		t.Fatalf("query runs.installation_ref nullability: %v", err)
+	}
+	if nullable != "YES" {
+		t.Errorf("runs.installation_ref is_nullable = %q, want YES (the NULL state is load-bearing)", nullable)
+	}
+	// The index must be PARTIAL and UNIQUE. A non-partial index would refuse a
+	// second ordinary #216 follow-up child (which carries parent_run_id with
+	// retry_attempt 0); a non-unique one would dedup nothing at all.
+	var indexDef string
+	if err := pool.QueryRow(ctx,
+		`SELECT indexdef FROM pg_indexes
+		  WHERE tablename = 'runs' AND indexname = 'runs_retry_child_once_idx'`).Scan(&indexDef); err != nil {
+		t.Fatalf("query runs_retry_child_once_idx def: %v", err)
+	}
+	if !strings.Contains(indexDef, "UNIQUE") {
+		t.Errorf("runs_retry_child_once_idx is not UNIQUE: %s", indexDef)
+	}
+	if !strings.Contains(indexDef, "WHERE") {
+		t.Errorf("runs_retry_child_once_idx is not PARTIAL: %s", indexDef)
+	}
+
+	// Exactly one MigrateDown removes both objects.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0076): %v", err)
+	}
+	if n := installationRefColumn(); n != 0 {
+		t.Errorf("runs.installation_ref count after MigrateDown = %d, want 0 (0076 reverted)", n)
+	}
+	if n := retryChildIndex(); n != 0 {
+		t.Errorf("runs_retry_child_once_idx count after MigrateDown = %d, want 0 (0076 reverted)", n)
+	}
+	var runsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`).Scan(&runsTable); err != nil {
+		t.Fatalf("query runs table: %v", err)
+	}
+	if runsTable != 1 {
+		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0076 is an ALTER + CREATE INDEX)", runsTable)
+	}
+}
+
+// TestMigration0076_BackfillsInstallationRef is the #2043 backfill round-trip
+// guard, in the partial-migrate + seed + migrate + assert shape of
+// TestMigration0055_BackfillsRunsAccountID. Every column-level assertion in the
+// reversal test above passes even if the UPDATE is deleted — it seeds no rows,
+// so the backfill silently updates nothing. This test seeds three pre-0076 run
+// shapes at 0075 and asserts each lands in the state 0076 promises:
+//
+//   - installation_id 12345 -> installation_ref '12345', the BARE base-10
+//     decimal forge.FromGitHubInstallationID produces. A 'github:'-prefixed
+//     backfill (or a dropped ::text cast) fails here.
+//   - installation_id 0 -> installation_ref STAYS NULL. Zero is the
+//     unresolved-installation sentinel; backfilling '0' would turn a
+//     no-credentials run into one claiming installation 0.
+//   - installation_id NULL -> installation_ref STAYS NULL.
+func TestMigration0076_BackfillsInstallationRef(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	// One step down lands on 0075 — the pre-0076 schema, where runs exists
+	// with installation_id but without installation_ref.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0076 to reach 0075): %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	seed := func(installationID *int64) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind, installation_id)
+			 VALUES ($1, 'kuhlman-labs/fishhawk', 'feature_change', 'sha', 'github_issue', 'pending', 'github_actions', $2)`,
+			id, installationID); err != nil {
+			t.Fatalf("seed run (installation_id=%v): %v", installationID, err)
+		}
+		return id
+	}
+	githubID := int64(12345)
+	zeroID := int64(0)
+	withInstallation := seed(&githubID)
+	withZeroInstallation := seed(&zeroID)
+	withNoInstallation := seed(nil)
+
+	// Re-apply 0076: the ADD COLUMN + the backfill UPDATE + the index.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0076): %v", err)
+	}
+
+	refOf := func(id uuid.UUID) *string {
+		t.Helper()
+		var ref *string
+		if err := pool.QueryRow(ctx, `SELECT installation_ref FROM runs WHERE id = $1`, id).Scan(&ref); err != nil {
+			t.Fatalf("read installation_ref for %s: %v", id, err)
+		}
+		return ref
+	}
+
+	if got := refOf(withInstallation); got == nil {
+		t.Errorf("installation_id=12345 run: installation_ref = NULL, want '12345' — the backfill UPDATE did not fire")
+	} else if *got != "12345" {
+		t.Errorf("installation_id=12345 run: installation_ref = %q, want %q (the BARE decimal, not a 'github:'-prefixed ref)", *got, "12345")
+	}
+	if got := refOf(withZeroInstallation); got != nil {
+		t.Errorf("installation_id=0 run: installation_ref = %q, want NULL — 0 is the unresolved-installation sentinel and must not be backfilled", *got)
+	}
+	if got := refOf(withNoInstallation); got != nil {
+		t.Errorf("installation_id=NULL run: installation_ref = %q, want NULL", *got)
+	}
+}
+
+// TestMigration0076_RetryChildOnceIndexDedups is the BEHAVIOURAL pin on
+// runs_retry_child_once_idx (#2043, C1/BC3). The reversal test asserts the
+// index EXISTS; this one asserts what it DOES, against real rows:
+//
+//   - a second child at the SAME (parent_run_id, retry_attempt) with
+//     retry_attempt > 0 is refused with SQLSTATE 23505 naming the index — the
+//     benign "someone else won" branch run.IsRetryChildDuplicate keys on;
+//   - a child at a DIFFERENT retry_attempt is ACCEPTED, because one parent
+//     legitimately carries a CHAIN of retries (attempt 1, then 2). A
+//     parent_run_id-only key would wrongly refuse this;
+//   - TWO children at retry_attempt = 0 are BOTH accepted, because the
+//     partial predicate excludes ordinary #216 follow-up children, which are
+//     legitimately many-per-parent.
+//
+// The middle two cases are why the index is keyed and partial rather than a
+// blanket uniqueness on parent_run_id: an index that only refused duplicates
+// would pass a test that checked nothing else.
+func TestMigration0076_RetryChildOnceIndexDedups(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	insert := func(parent *uuid.UUID, attempt int) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind, parent_run_id, retry_attempt)
+			 VALUES ($1, 'kuhlman-labs/fishhawk', 'feature_change', 'sha', 'github_issue', 'pending', 'github_actions', $2, $3)`,
+			uuid.New(), parent, attempt)
+		return err
+	}
+
+	parent := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'kuhlman-labs/fishhawk', 'feature_change', 'sha', 'github_issue', 'pending', 'github_actions')`,
+		parent); err != nil {
+		t.Fatalf("seed parent run: %v", err)
+	}
+
+	// First retry child at attempt 1 lands.
+	if err := insert(&parent, 1); err != nil {
+		t.Fatalf("first retry child (attempt 1): %v", err)
+	}
+	// A concurrent delivery computing the SAME parent-derived attempt is
+	// refused by the index, not by a read-then-write guard.
+	err = insert(&parent, 1)
+	if err == nil {
+		t.Fatal("second retry child at attempt 1 was ACCEPTED; want a unique_violation — the index dedups nothing")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("second retry child returned %v, want a *pgconn.PgError", err)
+	}
+	if pgErr.Code != "23505" || pgErr.ConstraintName != "runs_retry_child_once_idx" {
+		t.Errorf("second retry child: SQLSTATE %s constraint %q, want 23505 runs_retry_child_once_idx",
+			pgErr.Code, pgErr.ConstraintName)
+	}
+	// The NEXT link in the retry chain is legitimate and must be accepted.
+	if err := insert(&parent, 2); err != nil {
+		t.Errorf("retry child at attempt 2: %v — the key must be (parent_run_id, retry_attempt), not parent_run_id alone", err)
+	}
+	// Ordinary follow-up children (retry_attempt 0) are outside the partial
+	// predicate and stay many-per-parent.
+	if err := insert(&parent, 0); err != nil {
+		t.Fatalf("first follow-up child (attempt 0): %v", err)
+	}
+	if err := insert(&parent, 0); err != nil {
+		t.Errorf("second follow-up child (attempt 0): %v — the index must be PARTIAL on retry_attempt > 0", err)
+	}
+}
+
 // TestMigrateDown_RunsTriggerSourceOnDemandReversal pins 0075 (#2826, E54.22)
 // in BOTH directions, and is the ONLY place the domain constant
 // run.TriggerOnDemand and the storage CHECK constraint are proven to agree
@@ -3198,6 +3480,14 @@ func TestMigrateDown_RunsTriggerSourceOnDemandReversal(t *testing.T) {
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	// 0076 (#2043, E45.22) now sits above 0075, so step it back FIRST — the
+	// whole test's premise is that 0075 is the APPLIED tip, and the
+	// documented-refusal probe below calls MigrateDown expecting 0075's own
+	// down to refuse. Without this step that probe would roll back 0076
+	// (which succeeds) and observe no refusal at all.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0076 to reach 0075, the migration under test): %v", err)
 	}
 	pool, err := postgres.Connect(context.Background(), url)
 	if err != nil {
@@ -3357,7 +3647,7 @@ func TestMigrateDown_RunsTriggerSourceOnDemandReversal(t *testing.T) {
 
 	// ---- state 2: 0075 rolled back ----
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0075, the migration under test): %v", err)
 	}
 
 	def := constraintDef()
@@ -3464,7 +3754,10 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 	// (campaign_items.queue_position + campaigns.grooming_source, E54.6 /
 	// #2238).
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3551,7 +3844,10 @@ func TestMigrateDown_StagesDispatchedAtReversal(t *testing.T) {
 
 	// Exactly one MigrateDown reverses 0072.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3598,7 +3894,10 @@ func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
 	// Step back to the pre-0072 schema: stages exists WITHOUT dispatched_at and
 	// WITHOUT the stamp trigger, so the seeded dispatched row predates the column.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3758,7 +4057,10 @@ func TestMigrateDown_ConcernNewEvidenceReversal(t *testing.T) {
 	// rollbacks are needed before the next one-step down targets 0069 — the
 	// reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3826,7 +4128,10 @@ func TestMigrateDown_CampaignsWorkingDirReversal(t *testing.T) {
 	}
 
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -3876,7 +4181,10 @@ func TestMigrateUp_ConcernNewEvidenceDefaultsExistingRows(t *testing.T) {
 	// and are unrelated to review_concerns — then 0069, so review_concerns is in
 	// its pre-0069 shape.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -4031,13 +4339,16 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -4193,13 +4504,16 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -4374,7 +4688,10 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// assertions here — now sit above them all, so the ladder starts three steps
 	// higher.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -4478,13 +4795,16 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// Every migration from 0069 (#2353) up to the current tip — 0075 (#2826,
-	// E54.22; the runs_trigger_source_check widening) — sits above this one, so
+	// Every migration from 0069 (#2353) up to the current tip — 0076 (#2043,
+	// E45.22; runs.installation_ref + runs_retry_child_once_idx) — sits above this one, so
 	// the ladder below steps down through each of them before reaching its
 	// target. The named steps in the t.Fatalf strings are the authority on the
 	// count, not this sentence.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)
@@ -4695,7 +5015,10 @@ func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T
 
 	// Exactly one MigrateDown reverses 0074 — it is the tip.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0075, the latest migration): %v", err)
+		t.Fatalf("MigrateDown (roll back 0076, the latest migration): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0075): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0074): %v", err)

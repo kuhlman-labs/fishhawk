@@ -20,7 +20,7 @@ UPDATE runs
            ELSE resolved_model
        END
  WHERE id = $3
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type AddRunCostParams struct {
@@ -66,17 +66,19 @@ func (q *Queries) AddRunCost(ctx context.Context, arg AddRunCostParams) (Run, er
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, installation_ref, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type CreateRunParams struct {
@@ -88,6 +90,7 @@ type CreateRunParams struct {
 	TriggerRef             *string    `json:"trigger_ref"`
 	State                  string     `json:"state"`
 	InstallationID         *int64     `json:"installation_id"`
+	InstallationRef        *string    `json:"installation_ref"`
 	IdempotencyKey         *string    `json:"idempotency_key"`
 	ParentRunID            *uuid.UUID `json:"parent_run_id"`
 	RequiredChecksSnapshot []byte     `json:"required_checks_snapshot"`
@@ -106,6 +109,10 @@ type CreateRunParams struct {
 // Run / stage queries consumed by the postgres adapter for the
 // run.Repository interface (E3.3 / #43). sqlc generates typed Go
 // into ./db per the config in /backend/sqlc.yaml.
+// installation_ref is the ADR-057/ADR-058 forge-neutral credential reference
+// (migration 0076). Nullable by design: a caller with no ref passes NULL and
+// the consumer falls back to installation_id, which is a DIFFERENT state from
+// a recorded-but-empty string.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.ID,
@@ -116,6 +123,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.TriggerRef,
 		arg.State,
 		arg.InstallationID,
+		arg.InstallationRef,
 		arg.IdempotencyKey,
 		arg.ParentRunID,
 		arg.RequiredChecksSnapshot,
@@ -158,8 +166,10 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -171,7 +181,7 @@ INSERT INTO stages (
     gate_type, gate_approvers
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at
 `
 
 type CreateStageParams struct {
@@ -223,12 +233,14 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -264,6 +276,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -283,7 +296,7 @@ func (q *Queries) GetRunAccountID(ctx context.Context, id uuid.UUID) (*uuid.UUID
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -326,85 +339,16 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
 
-const getStageProgress = `-- name: GetStageProgress :one
-SELECT progress FROM stages WHERE id = $1
-`
-
-// Reads back just the heartbeat payload for one stage (#2541). Progress-only
-// projection: no SELECT * expansion, no Stage model dependency.
-func (q *Queries) GetStageProgress(ctx context.Context, id uuid.UUID) ([]byte, error) {
-	row := q.db.QueryRow(ctx, getStageProgress, id)
-	var progress []byte
-	err := row.Scan(&progress)
-	return progress, err
-}
-
-const listStageProgressForRun = `-- name: ListStageProgressForRun :many
-SELECT id, progress FROM stages WHERE run_id = $1
-`
-
-type ListStageProgressForRunRow struct {
-	ID       uuid.UUID `json:"id"`
-	Progress []byte    `json:"progress"`
-}
-
-// Reads every stage's heartbeat payload for a run in one round-trip (#2541),
-// so the run-stages list handler pays one query rather than N. id + progress
-// only — no SELECT * expansion.
-func (q *Queries) ListStageProgressForRun(ctx context.Context, runID uuid.UUID) ([]ListStageProgressForRunRow, error) {
-	rows, err := q.db.Query(ctx, listStageProgressForRun, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ListStageProgressForRunRow
-	for rows.Next() {
-		var i ListStageProgressForRunRow
-		if err := rows.Scan(&i.ID, &i.Progress); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const recordStageProgress = `-- name: RecordStageProgress :execrows
-UPDATE stages
-   SET progress = $2
- WHERE id = $1
-   AND state NOT IN ('succeeded', 'failed', 'cancelled')
-`
-
-type RecordStageProgressParams struct {
-	ID       uuid.UUID `json:"id"`
-	Progress []byte    `json:"progress"`
-}
-
-// Last-writer-wins projection of the runner's stage_progress heartbeat onto
-// the stage row (#2541). The terminal-state predicate IS the refusal: a
-// heartbeat that arrives after the stage settled matches ZERO rows (execrows
-// returns 0), so the handler answers 409 without a prior read — there is no
-// check-then-write window (#2536). Touches ONLY the progress column, so no
-// existing stages SELECT list expands and the sqlc Stage model is unchanged.
-func (q *Queries) RecordStageProgress(ctx context.Context, arg RecordStageProgressParams) (int64, error) {
-	result, err := q.db.Exec(ctx, recordStageProgress, arg.ID, arg.Progress)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const getStage = `-- name: GetStage :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages WHERE id = $1
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages WHERE id = $1
 `
 
 func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -430,12 +374,27 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
 }
 
+const getStageProgress = `-- name: GetStageProgress :one
+SELECT progress FROM stages WHERE id = $1
+`
+
+// Reads back just the heartbeat payload for one stage (#2541). Progress-only
+// projection: no SELECT * expansion, no Stage model dependency.
+func (q *Queries) GetStageProgress(ctx context.Context, id uuid.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getStageProgress, id)
+	var progress []byte
+	err := row.Scan(&progress)
+	return progress, err
+}
+
 const listDeployStagesAwaitingDeployment = `-- name: ListDeployStagesAwaitingDeployment :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages
  WHERE state = 'awaiting_deployment'
    AND stage_type = 'deploy'
  ORDER BY updated_at ASC
@@ -475,6 +434,8 @@ func (q *Queries) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]Sta
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -487,7 +448,7 @@ func (q *Queries) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]Sta
 }
 
 const listDeployStagesRollbackPending = `-- name: ListDeployStagesRollbackPending :many
-SELECT s.id, s.run_id, s.sequence, s.stage_type, s.executor_kind, s.executor_ref, s.state, s.started_at, s.ended_at, s.failure_category, s.failure_reason, s.created_at, s.updated_at, s.gate_sla, s.requires_approval, s.gate_type, s.gate_approvers, s.self_retry_count, s.scope_completeness_park FROM stages s
+SELECT s.id, s.run_id, s.sequence, s.stage_type, s.executor_kind, s.executor_ref, s.state, s.started_at, s.ended_at, s.failure_category, s.failure_reason, s.created_at, s.updated_at, s.gate_sla, s.requires_approval, s.gate_type, s.gate_approvers, s.self_retry_count, s.scope_completeness_park, s.progress, s.dispatched_at FROM stages s
  WHERE s.stage_type = 'deploy'
    AND EXISTS (
      SELECT 1 FROM audit_entries ai
@@ -538,6 +499,56 @@ func (q *Queries) ListDeployStagesRollbackPending(ctx context.Context) ([]Stage,
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDispatchedStageLiveness = `-- name: ListDispatchedStageLiveness :many
+SELECT id, run_id, dispatched_at, updated_at, progress FROM stages
+ WHERE state = 'dispatched'
+ ORDER BY COALESCE(dispatched_at, updated_at) ASC
+`
+
+type ListDispatchedStageLivenessRow struct {
+	ID           uuid.UUID          `json:"id"`
+	RunID        uuid.UUID          `json:"run_id"`
+	DispatchedAt pgtype.Timestamptz `json:"dispatched_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Progress     []byte             `json:"progress"`
+}
+
+// The dispatch watchdog's liveness source (#2744). Per dispatched stage it
+// returns the dedicated dispatch clock (dispatched_at, migration 0072), the
+// generic updated_at, and the raw progress JSONB so the caller can decode the
+// last heartbeat. Deliberately NARROW — an explicit column list, not SELECT * —
+// so it expands no existing stages SELECT and changes no sqlc Stage model (the
+// 0070 precedent). Ordered by the COALESCED dispatch clock so the oldest
+// dispatch is processed first, preserving ListStagesDispatched's oldest-first
+// contract under the new signal even for a row still on the updated_at fallback.
+func (q *Queries) ListDispatchedStageLiveness(ctx context.Context) ([]ListDispatchedStageLivenessRow, error) {
+	rows, err := q.db.Query(ctx, listDispatchedStageLiveness)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDispatchedStageLivenessRow
+	for rows.Next() {
+		var i ListDispatchedStageLivenessRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.DispatchedAt,
+			&i.UpdatedAt,
+			&i.Progress,
 		); err != nil {
 			return nil, err
 		}
@@ -550,7 +561,7 @@ func (q *Queries) ListDeployStagesRollbackPending(ctx context.Context) ([]Stage,
 }
 
 const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages
  WHERE state = 'awaiting_approval'
    AND stage_type = 'review'
  ORDER BY updated_at ASC
@@ -592,6 +603,8 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -604,7 +617,7 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
@@ -691,6 +704,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.AccountID,
 			&i.WorkingDir,
 			&i.PredictedRuntimeMinutes,
+			&i.InstallationRef,
 		); err != nil {
 			return nil, err
 		}
@@ -702,8 +716,40 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 	return items, nil
 }
 
+const listStageProgressForRun = `-- name: ListStageProgressForRun :many
+SELECT id, progress FROM stages WHERE run_id = $1
+`
+
+type ListStageProgressForRunRow struct {
+	ID       uuid.UUID `json:"id"`
+	Progress []byte    `json:"progress"`
+}
+
+// Reads every stage's heartbeat payload for a run in one round-trip (#2541),
+// so the run-stages list handler pays one query rather than N. id + progress
+// only — no SELECT * expansion.
+func (q *Queries) ListStageProgressForRun(ctx context.Context, runID uuid.UUID) ([]ListStageProgressForRunRow, error) {
+	rows, err := q.db.Query(ctx, listStageProgressForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStageProgressForRunRow
+	for rows.Next() {
+		var i ListStageProgressForRunRow
+		if err := rows.Scan(&i.ID, &i.Progress); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStagesAwaitingApproval = `-- name: ListStagesAwaitingApproval :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages
  WHERE state IN ('awaiting_approval', 'awaiting_deploy_approval')
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC
@@ -754,6 +800,8 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -766,7 +814,7 @@ func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, erro
 }
 
 const listStagesAwaitingChildren = `-- name: ListStagesAwaitingChildren :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages
  WHERE state = 'awaiting_children'
  ORDER BY updated_at ASC
 `
@@ -803,6 +851,8 @@ func (q *Queries) ListStagesAwaitingChildren(ctx context.Context) ([]Stage, erro
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -815,7 +865,7 @@ func (q *Queries) ListStagesAwaitingChildren(ctx context.Context) ([]Stage, erro
 }
 
 const listStagesDispatched = `-- name: ListStagesDispatched :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages
  WHERE state = 'dispatched'
  ORDER BY updated_at ASC
 `
@@ -854,54 +904,8 @@ func (q *Queries) ListStagesDispatched(ctx context.Context) ([]Stage, error) {
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listDispatchedStageLiveness = `-- name: ListDispatchedStageLiveness :many
-SELECT id, run_id, dispatched_at, updated_at, progress FROM stages
- WHERE state = 'dispatched'
- ORDER BY COALESCE(dispatched_at, updated_at) ASC
-`
-
-type ListDispatchedStageLivenessRow struct {
-	ID           uuid.UUID          `json:"id"`
-	RunID        uuid.UUID          `json:"run_id"`
-	DispatchedAt pgtype.Timestamptz `json:"dispatched_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
-	Progress     []byte             `json:"progress"`
-}
-
-// The dispatch watchdog's liveness source (#2744). Per dispatched stage it
-// returns the dedicated dispatch clock (dispatched_at, migration 0072), the
-// generic updated_at, and the raw progress JSONB so the caller can decode the
-// last heartbeat. Deliberately NARROW — an explicit column list, not SELECT * —
-// so it expands no existing stages SELECT and changes no sqlc Stage model (the
-// 0070 precedent). Ordered by the COALESCED dispatch clock so the oldest
-// dispatch is processed first, preserving ListStagesDispatched's oldest-first
-// contract under the new signal even for a row still on the updated_at fallback.
-func (q *Queries) ListDispatchedStageLiveness(ctx context.Context) ([]ListDispatchedStageLivenessRow, error) {
-	rows, err := q.db.Query(ctx, listDispatchedStageLiveness)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ListDispatchedStageLivenessRow
-	for rows.Next() {
-		var i ListDispatchedStageLivenessRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.RunID,
-			&i.DispatchedAt,
-			&i.UpdatedAt,
 			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -914,7 +918,7 @@ func (q *Queries) ListDispatchedStageLiveness(ctx context.Context) ([]ListDispat
 }
 
 const listStagesForRun = `-- name: ListStagesForRun :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages WHERE run_id = $1 ORDER BY sequence ASC
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages WHERE run_id = $1 ORDER BY sequence ASC
 `
 
 func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stage, error) {
@@ -946,6 +950,8 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 			&i.GateApprovers,
 			&i.SelfRetryCount,
 			&i.ScopeCompletenessPark,
+			&i.Progress,
+			&i.DispatchedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -958,7 +964,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -991,14 +997,16 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
 
 const lockStageForUpdate = `-- name: LockStageForUpdate :one
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages WHERE id = $1 FOR UPDATE
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at FROM stages WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, error) {
@@ -1024,6 +1032,8 @@ func (q *Queries) LockStageForUpdate(ctx context.Context, id uuid.UUID) (Stage, 
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
 }
@@ -1033,7 +1043,7 @@ UPDATE stages
    SET state                   = $2,
        scope_completeness_park = $3
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at
 `
 
 type ParkScopeCompletenessParams struct {
@@ -1071,8 +1081,36 @@ func (q *Queries) ParkScopeCompleteness(ctx context.Context, arg ParkScopeComple
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
+}
+
+const recordStageProgress = `-- name: RecordStageProgress :execrows
+UPDATE stages
+   SET progress = $2
+ WHERE id = $1
+   AND state NOT IN ('succeeded', 'failed', 'cancelled')
+`
+
+type RecordStageProgressParams struct {
+	ID       uuid.UUID `json:"id"`
+	Progress []byte    `json:"progress"`
+}
+
+// Last-writer-wins projection of the runner's stage_progress heartbeat onto
+// the stage row (#2541). The terminal-state predicate IS the refusal: a
+// heartbeat that arrives after the stage settled matches ZERO rows (execrows
+// returns 0), so the handler answers 409 without a prior read — there is no
+// check-then-write window (#2536). Touches ONLY the progress column, so no
+// existing stages SELECT list expands and the sqlc Stage model is unchanged.
+func (q *Queries) RecordStageProgress(ctx context.Context, arg RecordStageProgressParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordStageProgress, arg.ID, arg.Progress)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const retryStageState = `-- name: RetryStageState :one
@@ -1083,7 +1121,7 @@ UPDATE stages
        ended_at         = NULL,
        self_retry_count = self_retry_count + 1
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at
 `
 
 type RetryStageStateParams struct {
@@ -1117,6 +1155,8 @@ func (q *Queries) RetryStageState(ctx context.Context, arg RetryStageStateParams
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
 }
@@ -1125,7 +1165,7 @@ const setRunPredictedRuntimeMinutes = `-- name: SetRunPredictedRuntimeMinutes :o
 UPDATE runs
    SET predicted_runtime_minutes = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type SetRunPredictedRuntimeMinutesParams struct {
@@ -1169,8 +1209,10 @@ func (q *Queries) SetRunPredictedRuntimeMinutes(ctx context.Context, arg SetRunP
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -1179,7 +1221,7 @@ const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
 UPDATE runs
    SET pull_request_url = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type SetRunPullRequestURLParams struct {
@@ -1221,8 +1263,10 @@ func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullReques
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -1265,7 +1309,7 @@ const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type UpdateRunStateParams struct {
@@ -1303,8 +1347,10 @@ func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) 
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -1314,7 +1360,7 @@ UPDATE runs
    SET runner_kind = $2,
        runner_kind_resolved = true
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes, installation_ref
 `
 
 type UpdateRunnerKindParams struct {
@@ -1358,8 +1404,10 @@ func (q *Queries) UpdateRunnerKind(ctx context.Context, arg UpdateRunnerKindPara
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 		&i.WorkingDir,
 		&i.PredictedRuntimeMinutes,
+		&i.InstallationRef,
 	)
 	return i, err
 }
@@ -1372,7 +1420,7 @@ UPDATE stages
        failure_category = $5,
        failure_reason   = $6
  WHERE id = $1
-RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park
+RETURNING id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park, progress, dispatched_at
 `
 
 type UpdateStageStateParams struct {
@@ -1414,6 +1462,8 @@ func (q *Queries) UpdateStageState(ctx context.Context, arg UpdateStageStatePara
 		&i.GateApprovers,
 		&i.SelfRetryCount,
 		&i.ScopeCompletenessPark,
+		&i.Progress,
+		&i.DispatchedAt,
 	)
 	return i, err
 }

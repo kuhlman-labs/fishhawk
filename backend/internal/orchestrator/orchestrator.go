@@ -3097,13 +3097,20 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 // triggerParams maps a run + its next stage onto the forge-neutral
 // runnerbackend.TriggerParams the resolved backend fires. It carries the same
 // values fireDispatch built its DispatchInputs from: Scope is the zero
-// (unwired) scope when InstallationID is nil, matching fireDispatch's
-// skip-when-unwired guard (Scope.IsZero() is the direct analogue of the
-// pre-flip InstallationID == 0 sentinel, #2013). Ref is the run's ADR-035
-// sole-writer branch (runBranchRef) — the branch the gitlab_ci backend creates
-// its pipeline against; the github_actions backend ignores it.
+// (unwired) scope when the run names no credential at all, matching
+// fireDispatch's skip-when-unwired guard (Scope.IsZero() is the direct
+// analogue of the pre-flip InstallationID == 0 sentinel, #2013). Ref is the
+// run's ADR-035 sole-writer branch (runBranchRef) — the branch the gitlab_ci
+// backend creates its pipeline against; the github_actions backend ignores it.
+//
+// Scope resolves through runCredentialScope, a LADDER, not a switch (E45.22 /
+// #2043, HIGH 1): the run's forge-neutral installation_ref wins when it is
+// present and non-empty, and only its absence falls back to the legacy GitHub
+// installation id. Without the ref arm a gitlab_ci run — which has no GitHub
+// installation id to fall back to — resolved the zero scope and every one of
+// its stages warn-skipped.
 func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.TriggerParams {
-	p := runnerbackend.TriggerParams{
+	return runnerbackend.TriggerParams{
 		RunID:            r.ID,
 		StageID:          next.ID,
 		WorkflowID:       r.WorkflowID,
@@ -3112,11 +3119,40 @@ func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.Tr
 		Ref:              runBranchRef(r),
 		DecomposedFrom:   r.DecomposedFrom,
 		SliceIndex:       r.SliceIndex,
+		Scope:            runCredentialScope(r),
+	}
+}
+
+// runCredentialScope resolves the credential a run's stages authenticate with,
+// preferring the ADR-057 / ADR-058 forge-neutral installation_ref over the
+// legacy GitHub installation id (E45.22 / #2043, migration 0076).
+//
+// The ladder, in order:
+//
+//  1. A non-nil, NON-EMPTY InstallationRef wraps verbatim via forge.FromRef.
+//     This is the only arm that can produce a GitLab scope
+//     ("gitlab:<project_id>"); it also covers a BACKFILLED GitHub row, whose
+//     ref is the bare base-10 decimal and therefore yields a scope byte-equal
+//     to what arm 2 would have produced.
+//  2. A nil ref — or a ref recorded as the EMPTY STRING, which is a distinct
+//     persisted state but names no credential — falls back to the run's
+//     InstallationID. This keeps every legacy pre-0076 GitHub row on exactly
+//     today's behaviour.
+//  3. Neither present → the zero scope, which fireDispatch's Scope.IsZero()
+//     guard reads as "unwired" and warn-skips. Unchanged.
+//
+// Arm 2's empty-string case matters because an empty ref would otherwise reach
+// forge.FromRef and produce a scope that IsZero() reports as zero anyway — but
+// only by coincidence of representation. Falling back explicitly means a row
+// carrying both an empty ref and a real installation id still authenticates.
+func runCredentialScope(r *run.Run) forge.CredentialScope {
+	if r.InstallationRef != nil && *r.InstallationRef != "" {
+		return forge.FromRef(*r.InstallationRef)
 	}
 	if r.InstallationID != nil {
-		p.Scope = forge.FromGitHubInstallationID(*r.InstallationID)
+		return forge.FromGitHubInstallationID(*r.InstallationID)
 	}
-	return p
+	return forge.CredentialScope{}
 }
 
 // runBranchRef derives the ADR-035 sole-writer branch a run's stages execute on

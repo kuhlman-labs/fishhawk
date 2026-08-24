@@ -16,6 +16,42 @@ import (
 	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
 )
 
+// RetryChildOnceIndex is the name of the partial unique index (migration 0076,
+// E45.22 / #2043) enforcing at most one CI-failure retry child per
+// (parent run, retry attempt): CREATE UNIQUE INDEX ... ON runs (parent_run_id,
+// retry_attempt) WHERE parent_run_id IS NOT NULL AND retry_attempt > 0. The
+// retry paths scope their benign concurrent-race catch to a collision on THIS
+// index specifically (see IsRetryChildDuplicate), so an unrelated 23505 —
+// notably the (repo, idempotency_key) uniqueness the same INSERT can trip —
+// stays a hard error.
+//
+// CALLER CONTRACT the index cannot enforce: both racing deliveries MUST derive
+// retry_attempt as parent.RetryAttempt + 1 from the PARENT row. A value derived
+// from the latest existing CHILD makes the two inserts disagree, the index
+// never fires, and two children land while a concurrency test still sees one
+// row per attempt value.
+const RetryChildOnceIndex = "runs_retry_child_once_idx"
+
+// ErrRetryChildDuplicate is a sentinel a fake Repository can return from
+// CreateRun to simulate LOSING the concurrent CI-failure-retry race (the
+// deterministic race-loser of the RetryChildOnceIndex collision).
+// IsRetryChildDuplicate recognizes it alongside a real driver-surfaced
+// unique_violation on that index, so a retry path's benign "someone else won"
+// branch can be exercised without importing pgconn or standing up real
+// Postgres.
+var ErrRetryChildDuplicate = errors.New("run: duplicate ci-failure retry child")
+
+// IsRetryChildDuplicate reports whether err is the SPECIFIC benign
+// retry-race collision: a unique_violation on the RetryChildOnceIndex partial
+// unique index, or the ErrRetryChildDuplicate sentinel (for fakes). It
+// deliberately does NOT match a 23505 on any OTHER constraint the run INSERT
+// can trip — swallowing those would treat an unrelated integrity failure as a
+// won race and silently drop a retry that never happened.
+func IsRetryChildDuplicate(err error) bool {
+	return errors.Is(err, ErrRetryChildDuplicate) ||
+		audit.IsDuplicateOnConstraint(err, RetryChildOnceIndex)
+}
+
 // pgxQueries is the minimum surface used by both *pgxpool.Pool and
 // pgx.Tx, satisfied by both via their respective Begin/Acquire APIs.
 // Keeping the adapter agnostic here lets the same query code run
@@ -87,6 +123,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		TriggerRef:             p.TriggerRef,
 		State:                  string(StatePending),
 		InstallationID:         p.InstallationID,
+		InstallationRef:        p.InstallationRef,
 		IdempotencyKey:         p.IdempotencyKey,
 		ParentRunID:            p.ParentRunID,
 		RequiredChecksSnapshot: snapshotBytes,
@@ -887,6 +924,7 @@ func rowToRun(r rundb.Run) *Run {
 		TriggerSource:      TriggerSource(r.TriggerSource),
 		TriggerRef:         r.TriggerRef,
 		InstallationID:     r.InstallationID,
+		InstallationRef:    r.InstallationRef,
 		IdempotencyKey:     r.IdempotencyKey,
 		ParentRunID:        r.ParentRunID,
 		PullRequestURL:     r.PullRequestUrl,
@@ -924,9 +962,11 @@ func rowToRun(r rundb.Run) *Run {
 	out.DecomposedFrom = r.DecomposedFrom
 	out.UpstreamRunID = r.UpstreamRunID
 	// NULL account_id → "" (untenanted); a set value → its UUID string
-	// (ADR-057 / E44.5). GetRun / ListRuns select the column; the other
-	// Run-returning queries leave rundb.Run.AccountID nil, which maps to ""
-	// here — those paths don't consume the account so the zero value is safe.
+	// (ADR-057 / E44.5). Every Run-returning sqlc query now carries account_id
+	// in its RETURNING/SELECT list (the E45.22 / #2043 regeneration restored
+	// the expansions a hand-edited copy of this generated package had drifted
+	// away from), so the tenant is populated on every read path; a nil column
+	// still maps to "" here, which is what an untenanted row scans as.
 	if r.AccountID != nil {
 		out.AccountID = r.AccountID.String()
 	}
@@ -949,6 +989,12 @@ func rowToRun(r rundb.Run) *Run {
 	// ListRuns, GetRunByIdempotencyKey, LockRunForUpdate, and the Update* /
 	// AddRunCost / SetRun* set). 0 is the unstamped state, not an error.
 	out.PredictedRuntimeMinutes = int(r.PredictedRuntimeMinutes)
+	// InstallationRef rides the same single shared row mapper (E45.22 / #2043,
+	// migration 0076): it is assigned in the struct literal above, and the
+	// three-state contract (nil / pointer-to-"" / a value) is preserved
+	// verbatim — this mapper deliberately does NOT normalize a
+	// pointer-to-empty-string to nil, because the two states mean different
+	// things to the credential-resolution and forge-derivation consumers.
 	return out
 }
 

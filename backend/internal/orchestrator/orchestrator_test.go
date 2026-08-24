@@ -4283,10 +4283,11 @@ func (d *pipelineCaptureDoer) Do(req *http.Request) (*http.Response, error) {
 // top-level run (fishhawk/run-<short>) and a decomposed child (its
 // fishhawk/run-<short>/slice-<n> branch).
 //
-// GitLab credential-scope threading onto the run row is deferred to enablement
-// (#2043), so the test substitutes a gitlab-shaped scope after triggerParams;
-// the REF (the seam the dispatch design turns on) is what flows unmodified from
-// the run-branch derivation all the way to the wire.
+// It substitutes a gitlab-shaped scope after triggerParams deliberately: this
+// test isolates the REF seam, and pins it for a run row that carries NO
+// installation_ref. The scope now threads off the run row for real — see
+// TestTriggerParams_GitLabRefReachesCreatePipeline (E45.22 / #2043), which runs
+// the same path with no substitution.
 func TestTriggerParams_RefSeam_ThroughToCreatePipeline(t *testing.T) {
 	o := &Orchestrator{}
 	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
@@ -4317,7 +4318,8 @@ func TestTriggerParams_RefSeam_ThroughToCreatePipeline(t *testing.T) {
 			if !strings.HasPrefix(p.Ref, "fishhawk/run-") {
 				t.Errorf("ref %q must be a fishhawk run branch", p.Ref)
 			}
-			// gitlab scope threading deferred to #2043; the ref is the seam here.
+			// This test's runs carry no installation_ref, so the scope is
+			// substituted; the ref is the seam under test here.
 			p.Scope = forge.FromRef("gitlab:77")
 
 			doer := &pipelineCaptureDoer{}
@@ -4789,5 +4791,166 @@ func TestSurfaceParkedChildren_DuplicateDoesNotDropSiblingEntry(t *testing.T) {
 	}
 	if p.ChildRunID != childB.ID.String() {
 		t.Errorf("recorded entry names child %q, want the SECOND child %q — the duplicate branch must continue to the sibling, not return", p.ChildRunID, childB.ID)
+	}
+}
+
+// TestTriggerParams_ResolvesCredentialScopeFromInstallationRef pins the
+// credential-scope LADDER runCredentialScope implements (E45.22 / #2043,
+// HIGH 1). Before this change triggerParams read ONLY r.InstallationID, so a
+// gitlab_ci run — which has no GitHub installation id — resolved the zero
+// scope and every one of its stages warn-skipped in
+// runnerbackend.GitLabCI.TriggerStage.
+//
+// One cell per branch of the ladder, including both halves of the three-state
+// installation_ref distinction (BC5: the EMPTY-STRING cell is tested here,
+// where the fallback actually lives, not only at the approval layer):
+//
+//   - a gitlab ref resolves a GitLab scope (the arm that unbreaks gitlab_ci);
+//   - a BACKFILLED bare-decimal GitHub ref resolves a scope BYTE-EQUAL to the
+//     legacy wrapper's, so a migrated row is indistinguishable from today's;
+//   - a nil ref falls back to InstallationID (every legacy row);
+//   - an EMPTY-STRING ref falls back to InstallationID — recorded-as-empty
+//     names no credential;
+//   - an empty-string ref with NO installation id resolves the zero scope;
+//   - neither present resolves the zero scope, preserving the warn-skip;
+//   - a ref present ALONGSIDE a DIFFERENT installation id resolves the REF.
+//     This last cell is what makes the ordering an assertion rather than a
+//     coincidence: with the arms swapped every other cell still passes.
+func TestTriggerParams_ResolvesCredentialScopeFromInstallationRef(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	ptr := func(s string) *string { return &s }
+	id := func(v int64) *int64 { return &v }
+
+	cases := []struct {
+		name       string
+		ref        *string
+		instID     *int64
+		want       forge.CredentialScope
+		wantIsZero bool
+	}{
+		{
+			name: "gitlab ref resolves a gitlab scope",
+			ref:  ptr("gitlab:5"),
+			want: forge.FromRef("gitlab:5"),
+		},
+		{
+			name:   "backfilled bare-decimal github ref equals the legacy wrapper",
+			ref:    ptr("12345"),
+			instID: id(12345),
+			want:   forge.FromGitHubInstallationID(12345),
+		},
+		{
+			name:   "legacy nil ref falls back to installation_id",
+			ref:    nil,
+			instID: id(999),
+			want:   forge.FromGitHubInstallationID(999),
+		},
+		{
+			name:   "recorded-empty ref falls back to installation_id",
+			ref:    ptr(""),
+			instID: id(999),
+			want:   forge.FromGitHubInstallationID(999),
+		},
+		{
+			name:       "recorded-empty ref with no installation_id is the zero scope",
+			ref:        ptr(""),
+			instID:     nil,
+			want:       forge.CredentialScope{},
+			wantIsZero: true,
+		},
+		{
+			name:       "neither present is the zero scope (warn-skip preserved)",
+			ref:        nil,
+			instID:     nil,
+			want:       forge.CredentialScope{},
+			wantIsZero: true,
+		},
+		{
+			name:   "ref WINS over a disagreeing installation_id",
+			ref:    ptr("gitlab:5"),
+			instID: id(12345),
+			want:   forge.FromRef("gitlab:5"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &run.Run{
+				ID:              uuid.New(),
+				Repo:            "x/y",
+				WorkflowID:      "feature_change",
+				InstallationRef: tc.ref,
+				InstallationID:  tc.instID,
+			}
+			p := o.triggerParams(r, next)
+			if p.Scope != tc.want {
+				t.Errorf("triggerParams Scope = %+v (ref %q), want %+v", p.Scope, p.Scope.Ref(), tc.want)
+			}
+			if got := p.Scope.IsZero(); got != tc.wantIsZero {
+				t.Errorf("triggerParams Scope.IsZero() = %v, want %v", got, tc.wantIsZero)
+			}
+		})
+	}
+}
+
+// TestTriggerParams_GitLabRefReachesCreatePipeline is the HIGH 1 seam E2E: a
+// gitlab_ci run carrying installation_ref 'gitlab:5' drives a REAL
+// *gitlab.Forge.TriggerPipeline all the way to POST
+// /api/v4/projects/5/pipeline, with NO scope substituted by the test.
+//
+// TestTriggerParams_RefSeam_ThroughToCreatePipeline (above) had to inject
+// `p.Scope = forge.FromRef("gitlab:77")` by hand because the run row had
+// nowhere to carry a GitLab credential; that hand-injection was the
+// deferred-to-#2043 seam. This test removes it — the project id in the
+// observed URL comes from the RUN ROW — and asserts the run-branch ref still
+// flows through unmodified alongside it.
+//
+// The negative half is the control: the SAME run with no installation_ref and
+// no installation id resolves the zero scope, and GitLabCI.TriggerStage
+// warn-skips — issuing NO request at all.
+func TestTriggerParams_GitLabRefReachesCreatePipeline(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	ref := "gitlab:5"
+	wired := &run.Run{
+		ID: uuid.New(), Repo: "gitlab-org/gitlab-test", WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindGitLabCI, InstallationRef: &ref,
+	}
+
+	newBackend := func() (*pipelineCaptureDoer, *runnerbackend.GitLabCI) {
+		doer := &pipelineCaptureDoer{}
+		glForge := forgegitlab.New("https://gitlab.example",
+			forgegitlab.NewStaticCredentialProvider("glpat-test"),
+			forgegitlab.WithHTTPClient(doer))
+		return doer, &runnerbackend.GitLabCI{Trigger: glForge}
+	}
+
+	doer, backend := newBackend()
+	p := o.triggerParams(wired, next)
+	if err := backend.TriggerStage(context.Background(), p); err != nil {
+		t.Fatalf("TriggerStage: %v", err)
+	}
+	if doer.method != http.MethodPost || doer.path != "/api/v4/projects/5/pipeline" {
+		t.Fatalf("request = %s %s, want POST /api/v4/projects/5/pipeline — the project id must come from the run's installation_ref",
+			doer.method, doer.path)
+	}
+	if want := runBranchPrefix(wired.ID); doer.body["ref"] != want {
+		t.Errorf("observed CreatePipeline ref = %v, want %q", doer.body["ref"], want)
+	}
+
+	// Control: no ref, no installation id -> zero scope -> no request.
+	unwired := &run.Run{
+		ID: uuid.New(), Repo: "gitlab-org/gitlab-test", WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	skipDoer, skipBackend := newBackend()
+	if err := skipBackend.TriggerStage(context.Background(), o.triggerParams(unwired, next)); err != nil {
+		t.Fatalf("TriggerStage (unwired): %v", err)
+	}
+	if skipDoer.method != "" || skipDoer.path != "" {
+		t.Errorf("unwired run issued %s %s; want NO request (Scope.IsZero() warn-skip)", skipDoer.method, skipDoer.path)
 	}
 }
