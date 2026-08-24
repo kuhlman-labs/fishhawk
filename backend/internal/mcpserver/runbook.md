@@ -346,6 +346,117 @@ resumable:
 **Every stop is resumable by re-invoking with the SAME `run_id`.** `max_minutes`
 clamps to **[1,240]** (default **60**); a timeout is itself a resumable stop.
 
+### Backlog grooming loop (non-diff)
+
+**Approving a grooming gate WRITES to the tracker.** `backlog_grooming` is a
+non-diff workflow: its propose stage emits a `grooming_report` artifact — no
+source edit, no PR — and parks at an approval gate. `fishhawk_approve_plan` on
+that gate does not merely let work proceed; it **executes the approved
+mutations server-side**, at the moment you approve. That is the asymmetry with
+every other Fishhawk gate: there is **no separate apply step to reconsider at —
+the gate IS the apply trigger**, so a downstream stage in the declaration does
+not stand between your decision and the write. Read the report's entries
+**before** you approve, not after (#2822, #2851).
+
+**Invocation.** Start the run on demand, then drive its propose stage:
+
+```
+fishhawk_start_run(
+  repo:           "<owner>/<repo>",
+  workflow_id:    "backlog_grooming",
+  issue:          <anchor issue>,   # OPTIONAL — only where YOUR declaration takes a github_issue input
+  trigger_source: "on_demand",      # required — see below
+  runner_kind:    "local",          # OPTIONAL — local drive only; omit for a github_actions run
+  working_dir:    "<absolute path to your checkout>"   # OPTIONAL — pass only with runner_kind:"local"
+)
+
+fishhawk_run_stage(
+  run_id:   <id>,
+  stage:    "plan",            # the stage TYPE, not the stage id
+  workflow: "backlog_grooming"
+)
+```
+
+Two failure modes that read as product bugs and are not:
+
+- **`trigger_source:"on_demand"` is load-bearing.** Omit it and the run derives
+  a `diff` trigger, the workflow's `applies_to` refuses it, and the run never
+  starts. An explicit `on_demand` is never overridden by the `github_issue`
+  auto-flip, so it combines with an anchor issue.
+- **`stage` takes the stage TYPE, which for the propose stage is `plan`.** A
+  grooming declaration typically ids its propose stage something like `groom`;
+  passing that id fails with an `available: [plan implement review]` list. The
+  stage's **id and type differ here** — that is the stage vocabulary (a
+  `plan`-typed stage is PROPOSE), not a defect.
+
+`runner_kind` and `working_dir` are the local-drive fields and follow the rules
+in the two sections above (`working_dir` is bound once at `fishhawk_start_run`
+and inherited by `fishhawk_run_stage`); omit them for a `github_actions` run.
+Whether an anchor issue is needed is decided by YOUR declaration, not by the
+loop: where its propose stage declares a required `github_issue` input, the
+**anchor issue supplies the request** — open or reuse an issue whose BODY
+states what you want groomed, because the body IS the request. Where the stage
+declares no such input, omit `issue`; the request comes from whatever inputs
+that declaration does take.
+
+**What approval applies is decided by the workflow's action matrix, not by a
+fixed rule.** A grooming report's entries are typed by action **class**. On
+approval the run's resolved autonomy matrix — the workflow's `actions` block,
+or the approval gate's own declaration where it carries one — decides which
+classes act:
+
+- **`hygiene` is the one auto-eligible class**, and the only one that may be
+  declared `mode: auto`, under `when: objective_reversible`: objective,
+  reversible defect fixes (a missing label, an absent parent link, board
+  placement, a field write).
+- **`ordering`, `dedup` and `scoping` receive no decision and apply nothing** —
+  they stay proposals. `mode: auto` on any of the three is refused at **parse
+  time**, because no backend-evaluable condition exists for a class whose
+  effects are not objectively reversible. No declaration can turn them on.
+
+A class the matrix does not name resolves `gated`, and an escalation
+`max_autonomy` **ceiling clamps further** — it downgrades every `auto` class
+the ceiling tier's expansion does not name, `hygiene` included. So read the
+report **and** the run's resolved matrix rather than assuming a declaration's
+values; gate counts, stage budgets and timeouts differ per declaration. The
+shipped workflow-v2 backlog-grooming example in the Fishhawk spec docs
+(`docs/spec/examples/workflow-v2-backlog-grooming.yaml`) is the illustrative
+declaration and explains why each class sits where it does.
+
+**Verify applied mutations on the FORGE, not from the run summary.** This is
+the same discipline as "verify the committed code at the PR head, not the
+agent's prose" in *The operator role*, applied to a different surface: a
+summary can truthfully report that every mutation applied while the applied
+VALUES are wrong. An audit row reading `applied` is a claim that a write was
+dispatched — it is not the claim that the tracker now carries the change you
+read in the report. Open the touched items and look.
+
+**Seeding a campaign from an approved order.** An **approved** grooming order
+feeds a campaign directly: pass `fishhawk_start_campaign` a `grooming_run_id`
+**instead of** `epic_ref` / `items` (combining them is refused), with
+`grooming_order_limit` to cap the first batch — the response's
+`grooming_source` block reports how many ranked issues the cap omitted, so a
+truncated batch is never silent. The refusals you will actually hit:
+
+- `grooming_run_not_found` — wrong id, or a run in another workspace account
+  (reported identically to a missing one).
+- `grooming_order_not_approved` — the report was never ratified, or its gate
+  carries a rejection. Approve (or resolve the rejection on) the propose
+  stage's gate first.
+- `grooming_order_absent` — that run shipped no `grooming_report`, so it
+  carries no order.
+- `grooming_order_superseded` — a newer approved grooming run exists and is
+  NAMED in the refusal. Prefer grooming from that newer run;
+  `grooming_allow_superseded` acknowledges the named newer run and bypasses
+  nothing else (a supersession check that could not finish is refused whatever
+  it says).
+
+Cap the first batch and watch the first item land before trusting the queue.
+The alternative — walking the ranked list downward with individual
+`fishhawk_start_run` calls — respects the ordering, skips nothing, and is
+slower but more predictable. Campaign drive itself is the *Batch-as-campaign*
+section below; `grooming_run_id` is its third assembly source.
+
 ### Batch-as-campaign (local campaign drive)
 
 A batch instruction — "run these N issues through the loop" — maps to **one
@@ -378,7 +489,10 @@ refinement intake loop) or `fishhawk_file_issue` with `relations.parent_epic` /
 `depends_on`, then start the campaign against that epic. Alternatively, for a
 cross-cutting batch that shares no epic parent, skip the epic entirely and pass
 an explicit `items` list (the no-epic variant, #2051) — the campaign assembles
-over exactly those issues, resolving each one's `depends_on` directly.
+over exactly those issues, resolving each one's `depends_on` directly. A THIRD
+source exists: an approved `backlog_grooming` order, passed as
+`grooming_run_id` instead of either (see the *Backlog grooming loop* section
+above).
 
 **1. Start the campaign.** `fishhawk_start_campaign` (`repo` required, plus ONE of
 `epic_ref` / `items`; optional `pause_policy` of `pause_campaign` (default) /
