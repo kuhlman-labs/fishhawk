@@ -45,10 +45,25 @@ import (
 // mis-correlated one retries the WRONG run.
 //
 // A deferral is not a silent nothing. Every no-correlation outcome writes a
-// `ci_retry_skipped` audit entry naming WHICH reason applied, chained to the
-// most recent candidate run for the project, so a failure that was correctly
-// ignored is distinguishable in the audit from one that should have retried
-// and did not (#2860).
+// `ci_retry_skipped` audit entry naming WHICH reason applied, so a failure that
+// was correctly ignored is distinguishable in the audit from one that should
+// have retried and did not (#2860). The entry is chained to a run ONLY when
+// that run actually owns the pipeline's ref; otherwise it is global-chained.
+// An entry hung off "the newest gitlab_ci run for the project" would land on an
+// arbitrary run with no relationship to the failing pipeline — every failed
+// default-branch build in the project would misattribute itself onto whichever
+// run happened to be newest.
+//
+// AUTHORIZATION. This path runs the SAME GitLabProjectAuthorizer gate the
+// create path runs, before candidate lookup, child creation or any pipeline
+// trigger. A Pipeline Hook is authenticated only by the deployment-shared
+// X-Gitlab-Token with no HMAC over the body, so ev.Repo / ev.CredentialRef are
+// untrusted: without the gate, a token holder who can name a managed project
+// path plus an observable run branch and head SHA could drive credentialed
+// pipeline dispatches — agent code execution and spend — on someone else's
+// run. Correlating on (ref, sha) bounds the blast radius but is NOT an
+// authorization binding: both values are readable from a public branch
+// listing.
 
 // gitLabRunBranchNamespace is the prefix of every ADR-035 sole-writer run
 // branch. A pipeline ref that does not start with it cannot belong to any run
@@ -70,6 +85,15 @@ const (
 	// gitLabRetrySkipSHAMismatch means a run owns the ref but recorded a
 	// DIFFERENT head SHA — a stale pipeline for a superseded commit.
 	gitLabRetrySkipSHAMismatch = "pipeline_sha_does_not_match_run_head_sha"
+	// gitLabRetrySkipHeadSHAUnreadable means a run owns the ref but its
+	// recorded head SHA could not be READ — a repository fault, not a
+	// judgement about the pipeline. It is deliberately distinct from
+	// gitLabRetrySkipSHAMismatch: reporting a lookup failure as a mismatch
+	// tells an operator the pipeline was stale when in fact Fishhawk never
+	// learned what the run's head was, and the retry that should have
+	// happened would be indistinguishable from one correctly declined
+	// (BC1 / #2860). A mismatch is terminal; this one is worth re-driving.
+	gitLabRetrySkipHeadSHAUnreadable = "run_head_sha_lookup_failed"
 	// gitLabRetrySkipCancelledLineage means the correlated run's lineage was
 	// manually stopped; the GitHub path refuses the same case.
 	gitLabRetrySkipCancelledLineage = "run_lineage_cancelled"
@@ -111,6 +135,18 @@ func shortRunID(id uuid.UUID) string {
 // fails on a Fishhawk-managed run branch. See the package-level contract above
 // for the correlation and deferral rules.
 func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match) error {
+	now := d.now()
+
+	// Step 0: AUTHORIZATION. First statement in the function, exactly as on
+	// the create path: everything below reads Fishhawk state keyed on the
+	// payload's project and can end in a credentialed pipeline trigger, so an
+	// unauthorized delivery must fall out here having created no child, no
+	// stage and no forge call. See the package contract above for why (ref,
+	// sha) correlation is a blast-radius bound and not a substitute.
+	if !d.authorizeGitLabProject(ctx, ev, m, gitLabAuthzPathCIRetry, now) {
+		return nil
+	}
+
 	if m.PipelineRef == nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"gitlab_ci_retry: missing PipelineRef",
@@ -118,7 +154,6 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 		return nil
 	}
 	pr := m.PipelineRef
-	now := d.now()
 
 	candidates, err := d.gitLabRetryCandidates(ctx, ev, pr)
 	if err != nil {
@@ -141,16 +176,20 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 
 	// THE DEFERRAL. Checked before the per-candidate walk so the reason names
 	// the first-stage case specifically rather than degrading into the
-	// generic "no run owns this ref".
+	// generic "no run owns this ref". The entry is GLOBAL-chained: a
+	// default-ref pipeline belongs to no run by definition, so there is no
+	// run it could honestly be attributed to.
 	if !strings.HasPrefix(pr.Ref, gitLabRunBranchNamespace) {
-		d.writeGitLabRetrySkippedAudit(ctx, ev, candidates[0], pr,
+		d.writeGitLabRetrySkippedAudit(ctx, ev, nil, pr,
 			gitLabRetrySkipFirstStageRef, now)
 		return nil
 	}
 
-	parent, reason := d.correlateGitLabPipeline(ctx, candidates, pr)
+	// anchor is the run the pipeline's ref belongs to, or nil when none does.
+	// It is the ONLY run a skip entry may be chained to.
+	parent, anchor, reason := d.correlateGitLabPipeline(ctx, candidates, pr)
 	if parent == nil {
-		d.writeGitLabRetrySkippedAudit(ctx, ev, candidates[0], pr, reason, now)
+		d.writeGitLabRetrySkippedAudit(ctx, ev, anchor, pr, reason, now)
 		return nil
 	}
 	if parent.State == run.StateCancelled {
@@ -274,13 +313,22 @@ func (d *Dispatcher) gitLabRetryCandidates(ctx context.Context, ev Event, pr *Pi
 	return narrowed, nil
 }
 
-// correlateGitLabPipeline selects the ONE run a failing pipeline belongs to,
-// or (nil, reason) naming why none does. Both halves of the predicate are
-// required: the ref identifies the run, the SHA proves the pipeline is for the
-// commit that run actually produced.
+// correlateGitLabPipeline selects the ONE run a failing pipeline belongs to.
+// It returns (match, anchor, "") on a hit and (nil, anchor, reason) naming why
+// none matched. Both halves of the predicate are required: the ref identifies
+// the run, the SHA proves the pipeline is for the commit that run actually
+// produced.
+//
+// anchor is the ref-owning run — the only run a skip entry may honestly be
+// chained to — and is nil when no candidate owns the ref at all.
 func (d *Dispatcher) correlateGitLabPipeline(ctx context.Context, candidates []*run.Run,
-	pr *PipelineRef) (*run.Run, string) {
+	pr *PipelineRef) (*run.Run, *run.Run, string) {
 	var refOwner *run.Run
+	// headUnreadable records that a ref-owner's head SHA could not be READ.
+	// Without it the caller would report a repository fault as a SHA
+	// MISMATCH — a terminal-sounding verdict about a comparison that never
+	// actually happened.
+	headUnreadable := false
 	for _, r := range candidates {
 		if gitLabRunBranch(r) != pr.Ref {
 			continue
@@ -290,6 +338,7 @@ func (d *Dispatcher) correlateGitLabPipeline(ctx context.Context, candidates []*
 		}
 		headSHA, err := d.runHeadSHA(ctx, r.ID)
 		if err != nil {
+			headUnreadable = true
 			d.logger().LogAttrs(ctx, slog.LevelWarn,
 				"gitlab_ci_retry: head sha lookup failed",
 				slog.String("run_id", r.ID.String()),
@@ -297,13 +346,17 @@ func (d *Dispatcher) correlateGitLabPipeline(ctx context.Context, candidates []*
 			continue
 		}
 		if headSHA != "" && headSHA == pr.SHA {
-			return r, ""
+			return r, r, ""
 		}
 	}
-	if refOwner != nil {
-		return nil, gitLabRetrySkipSHAMismatch
+	switch {
+	case refOwner == nil:
+		return nil, nil, gitLabRetrySkipNoRunForRef
+	case headUnreadable:
+		return nil, refOwner, gitLabRetrySkipHeadSHAUnreadable
+	default:
+		return nil, refOwner, gitLabRetrySkipSHAMismatch
 	}
-	return nil, gitLabRetrySkipNoRunForRef
 }
 
 // gitLabRunScope resolves the credential scope a retry child dispatches under,
@@ -370,36 +423,63 @@ func (d *Dispatcher) writeGitLabCIRetryDispatchedAudit(ctx context.Context, ev E
 // reason (BC1). Without it, a first-stage deferral and a mis-correlation would
 // both look like nothing happening, and nobody debugging a missing retry could
 // tell which one they were looking at (#2860).
+//
+// ATTRIBUTION. anchor is the run that OWNS the pipeline's ref, or nil when no
+// candidate does. A nil anchor writes a GLOBAL-chained entry rather than
+// hanging the record off an unrelated run: the earlier shape chained to "the
+// newest gitlab_ci run for the project", so every failed default-branch
+// pipeline in a project — any push to main whose CI fails — deposited a
+// ci_retry_skipped row into the audit stream of whichever run happened to be
+// newest, an event that run had no part in. The entry stays on ONE category
+// either way, so the stream remains awaitable; only its chain differs.
 func (d *Dispatcher) writeGitLabRetrySkippedAudit(ctx context.Context, ev Event, anchor *run.Run,
 	pr *PipelineRef, reason string, now time.Time) {
 	systemKind := audit.ActorKind("system")
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"event":             ev.Type,
 		"delivery_id":       ev.DeliveryID,
 		"repo":              ev.Repo,
-		"run_id":            anchor.ID.String(),
 		"reason":            reason,
 		"pipeline_id":       pr.PipelineID,
 		"pipeline_ref":      pr.Ref,
 		"head_sha":          pr.SHA,
 		"merge_request_iid": pr.MergeRequestIID,
-		"run_branch":        gitLabRunBranch(anchor),
-	})
-	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:        anchor.ID,
-		Timestamp:    now,
-		Category:     "ci_retry_skipped",
-		ActorKind:    &systemKind,
-		ActorSubject: stringPtr("gitlab-webhook"),
-		Payload:      payload,
-	}); err != nil {
+	}
+	runID := "" // "" renders as an absent run in the log line below.
+	if anchor != nil {
+		runID = anchor.ID.String()
+		fields["run_id"] = runID
+		fields["run_branch"] = gitLabRunBranch(anchor)
+	}
+	payload, _ := json.Marshal(fields)
+
+	var err error
+	if anchor != nil {
+		_, err = d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:        anchor.ID,
+			Timestamp:    now,
+			Category:     "ci_retry_skipped",
+			ActorKind:    &systemKind,
+			ActorSubject: stringPtr("gitlab-webhook"),
+			Payload:      payload,
+		})
+	} else {
+		_, err = d.Audit.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+			Timestamp:    now,
+			Category:     "ci_retry_skipped",
+			ActorKind:    &systemKind,
+			ActorSubject: stringPtr("gitlab-webhook"),
+			Payload:      payload,
+		})
+	}
+	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelError, "gitlab_ci_retry: skip audit append failed",
 			slog.String("delivery_id", ev.DeliveryID),
 			slog.String("error", err.Error()))
 	}
 	d.logger().LogAttrs(ctx, slog.LevelInfo, "gitlab_ci_retry: not retrying",
 		slog.String("delivery_id", ev.DeliveryID),
-		slog.String("run_id", anchor.ID.String()),
+		slog.String("run_id", runID),
 		slog.String("reason", reason),
 		slog.String("pipeline_ref", pr.Ref),
 		slog.Int("pipeline_id", pr.PipelineID),

@@ -879,8 +879,25 @@ func matchGitLabIssue(ev Event) Match {
 	return Match{
 		Action:     MatchActionRun,
 		WorkflowID: DefaultWorkflowID,
-		TriggerRef: fmt.Sprintf("issue:%d", payload.ObjectAttributes.IID),
-		IssueRef:   &IssueRef{Number: payload.ObjectAttributes.IID},
+		// TriggerSource is REQUIRED, not decorative: handleGitLabCreateRun
+		// passes it straight to CreateRun, and runs_trigger_source_check
+		// rejects the empty string, so omitting it makes every GitLab issue
+		// trigger fail at the INSERT and 5xx into a redelivery loop. The GitHub
+		// matcher has always set it; the GitLab matcher not doing so was
+		// invisible until a Postgres-backed test ran the two together
+		// (TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch), because
+		// every webhook unit test uses a fake repository that enforces no
+		// constraint.
+		//
+		// github_issue is the right VALUE despite the name: it is the enum's
+		// issue-anchored member (Run.IsIssueAnchored keys on it), and a
+		// GitLab-issue-triggered run is issue-anchored in exactly the same way.
+		// A distinct 'gitlab_issue' member would need a constraint-widening
+		// migration and an IsIssueAnchored widening to avoid silently
+		// un-anchoring these runs — deliberately not bundled here.
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    fmt.Sprintf("issue:%d", payload.ObjectAttributes.IID),
+		IssueRef:      &IssueRef{Number: payload.ObjectAttributes.IID},
 	}
 }
 
@@ -925,6 +942,11 @@ func matchGitLabNote(ev Event) Match {
 	}
 	if cmd.Action == MatchActionRun {
 		m.WorkflowID = DefaultWorkflowID
+		// Same storage-layer requirement as matchGitLabIssue above: only the
+		// run-creating command reaches CreateRun, and an empty trigger_source
+		// is rejected by runs_trigger_source_check. Approve / reject act on an
+		// existing run and create nothing, so they need no source.
+		m.TriggerSource = run.TriggerGitHubIssue
 	}
 	return m
 }
@@ -1275,6 +1297,19 @@ type Dispatcher struct {
 	// refuses, in contrast to the nil-means-off seams above which merely turn
 	// an optional side effect off. See GitLabProjectAuthorizer.
 	GitLabProjects GitLabProjectAuthorizer
+
+	// GitLabTrigger creates the GitLab pipeline both GitLab paths dispatch
+	// through. NIL — the production default — resolves it from the forge
+	// registry via runnerbackend.GitLabPipelineTrigger(), preserving the
+	// existing behaviour exactly, including its nil-safe warn-and-skip when
+	// GitLab is unconfigured.
+	//
+	// It exists as an explicit dependency rather than a bare global lookup so
+	// the dispatch-FAILED branches are reachable: a pipeline trigger that
+	// returns an error is the one outcome neither GitLab path could otherwise
+	// be driven into, and those branches decide whether a stage is left
+	// untransitioned and what the audit records (concerns e57e8cd3 / b57c1fd3).
+	GitLabTrigger runnerbackend.PipelineTrigger
 
 	// Accounts resolves the event's App installation to its owning tenant
 	// workspace account so the dispatcher's run-less audit entries
@@ -2539,16 +2574,24 @@ func (d *Dispatcher) backends() runnerbackend.Registry {
 			Logger:              d.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: d.Logger},
-		// gitlab_ci (#1861): DORMANT — registered so the seam is complete, but no
-		// gitlab_ci run is created until enablement (#2043). The CI-retry path only
-		// dispatches through the github_actions backend; this entry keeps the
-		// dispatcher's Registry consistent with the orchestrator's. Nil-safe when
-		// GitLab is unconfigured (forge.Get("gitlab") returns no PipelineTrigger).
+		// gitlab_ci: LIVE as of #2043 — both the GitLab create path and the
+		// GitLab CI-retry path dispatch through this entry. Nil-safe when
+		// GitLab is unconfigured (forge.Get("gitlab") returns no
+		// PipelineTrigger, and GitLabCI.TriggerStage warn-skips a nil one).
 		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
-			Trigger: runnerbackend.GitLabPipelineTrigger(),
+			Trigger: d.gitLabTrigger(),
 			Logger:  d.Logger,
 		},
 	}
+}
+
+// gitLabTrigger resolves the GitLab pipeline trigger: the explicitly injected
+// one when set, otherwise the registered GitLab forge. See Dispatcher.GitLabTrigger.
+func (d *Dispatcher) gitLabTrigger() runnerbackend.PipelineTrigger {
+	if d.GitLabTrigger != nil {
+		return d.GitLabTrigger
+	}
+	return runnerbackend.GitLabPipelineTrigger()
 }
 
 func (d *Dispatcher) now() time.Time {

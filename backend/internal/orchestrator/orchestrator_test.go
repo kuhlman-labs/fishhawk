@@ -24,10 +24,12 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // forceStageState directly sets a seeded stage's state under the stub's lock,
@@ -4952,6 +4954,145 @@ func TestTriggerParams_GitLabRefReachesCreatePipeline(t *testing.T) {
 	}
 	if skipDoer.method != "" || skipDoer.path != "" {
 		t.Errorf("unwired run issued %s %s; want NO request (Scope.IsZero() warn-skip)", skipDoer.method, skipDoer.path)
+	}
+}
+
+// --- E2E-1: admitted GitLab trigger -> persisted row -> orchestrator dispatch
+
+// e2eGitLabSpec is a TWO-stage workflow. The second stage is what matters: the
+// bug this chain exists to catch (E45.22 HIGH 1) was that a gitlab_ci run's
+// LATER stages resolved the zero credential scope and warn-skipped, which a
+// first-stage-only fixture cannot see.
+const e2eGitLabSpec = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Two-stage GitLab workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+`
+
+// e2eGitLabSpecFetcher serves e2eGitLabSpec as the project's workflow file.
+type e2eGitLabSpecFetcher struct{}
+
+func (e2eGitLabSpecFetcher) FetchFile(_ context.Context, _ forge.CredentialScope,
+	_ forge.RepoRef, path, _ string) (*forge.FileContent, error) {
+	return &forge.FileContent{Path: path, Content: []byte(e2eGitLabSpec), SHA: "g1t1absha"}, nil
+}
+
+// e2eGitLabRegistry vouches for exactly one (credential ref, project path) pair.
+type e2eGitLabRegistry struct{ ref, path string }
+
+func (r e2eGitLabRegistry) AuthorizedGitLabProject(_ context.Context, credentialRef, projectPath string) (bool, error) {
+	return credentialRef == r.ref && projectPath == r.path, nil
+}
+
+// TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch is the
+// CROSS-BOUNDARY chain (concern 51efb125). Every layer of the GitLab go-live
+// path is covered separately elsewhere, but each of those tests hand-shapes its
+// own run row — and a hand-shaped row is precisely what cannot catch HIGH 1,
+// whose failure was that the row the webhook PERSISTED did not carry what the
+// orchestrator LATER read. A per-layer suite agrees with itself while the seam
+// between the layers is broken.
+//
+// So this test hands no row to anybody. It runs, in one chain:
+//
+//  1. an admitted GitLab issue trigger through the real webhook dispatcher,
+//  2. against a REAL Postgres run repository (the row is INSERTed, not built),
+//  3. hydrated back out through that repository (so column round-tripping is
+//     in the chain, not assumed),
+//  4. into the orchestrator's real triggerParams for the SECOND stage,
+//  5. through the real runnerbackend.GitLabCI + real GitLab forge client,
+//  6. asserted on the HTTP request that actually goes on the wire.
+//
+// The assertion at the end is the one that matters: the pipeline is created
+// against /api/v4/projects/4242/pipeline. That project id exists nowhere in the
+// orchestrator's inputs except inside the installation_ref the webhook wrote
+// several layers earlier, so it can only be right if every hop preserved it.
+func TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runs := run.NewPostgresRepository(pool)
+
+	// (1)+(2) The webhook create path, writing to real Postgres.
+	d := &webhook.Dispatcher{
+		Runs:                   runs,
+		Audit:                  audit.NewPostgresRepository(pool),
+		GitLabFiles:            e2eGitLabSpecFetcher{},
+		GitLabProjects:         e2eGitLabRegistry{ref: "gitlab:4242", path: "acme/widgets"},
+		PlanReviewerConfigured: true,
+	}
+	ev := webhook.Event{
+		Type:          "issue",
+		DeliveryID:    "gitlab:e2e-1",
+		Repo:          "acme/widgets",
+		Sender:        "alice",
+		Forge:         webhook.ForgeGitLab,
+		CredentialRef: "gitlab:4242",
+		RawBody: []byte(`{"object_attributes":{"iid":7,"action":"open"},` +
+			`"labels":[{"title":"fishhawk"}]}`),
+	}
+	if err := d.Handle(ctx, ev); err != nil {
+		t.Fatalf("webhook Handle: %v", err)
+	}
+
+	// (3) Hydrate the row back OUT of the database. Nothing below touches the
+	// in-memory value the dispatcher held.
+	persisted, err := runs.ListRuns(ctx, run.ListRunsFilter{Repo: "acme/widgets", Limit: 10})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(persisted) != 1 {
+		t.Fatalf("persisted runs = %d, want 1 (the trigger must have minted exactly one)", len(persisted))
+	}
+	r := persisted[0]
+	if r.RunnerKind != run.RunnerKindGitLabCI {
+		t.Errorf("persisted runner_kind = %q, want %q", r.RunnerKind, run.RunnerKindGitLabCI)
+	}
+	if r.InstallationRef == nil || *r.InstallationRef != "gitlab:4242" {
+		t.Fatalf("persisted installation_ref = %v, want %q — the orchestrator has no other source for the project id",
+			r.InstallationRef, "gitlab:4242")
+	}
+
+	stages, err := runs.ListStagesForRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != 2 {
+		t.Fatalf("persisted stages = %d, want 2", len(stages))
+	}
+	// The SECOND stage — the one HIGH 1 left credential-less.
+	second := stages[1]
+
+	// (4)+(5) The orchestrator's real dispatch path into the real GitLab client.
+	o := &Orchestrator{}
+	doer := &pipelineCaptureDoer{}
+	backend := &runnerbackend.GitLabCI{
+		Trigger: forgegitlab.New("https://gitlab.example",
+			forgegitlab.NewStaticCredentialProvider("glpat-test"),
+			forgegitlab.WithHTTPClient(doer)),
+	}
+	if err := backend.TriggerStage(ctx, o.triggerParams(r, second)); err != nil {
+		t.Fatalf("TriggerStage: %v", err)
+	}
+
+	// (6) What actually went on the wire.
+	if doer.method != http.MethodPost || doer.path != "/api/v4/projects/4242/pipeline" {
+		t.Fatalf("request = %s %s, want POST /api/v4/projects/4242/pipeline — "+
+			"the project id must survive webhook -> Postgres -> hydrate -> triggerParams",
+			doer.method, doer.path)
+	}
+	if want := RunBranchRef(r); doer.body["ref"] != want {
+		t.Errorf("pipeline ref = %v, want the run's sole-writer branch %q", doer.body["ref"], want)
 	}
 }
 

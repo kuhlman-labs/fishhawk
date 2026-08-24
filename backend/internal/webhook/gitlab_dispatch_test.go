@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -256,9 +257,15 @@ func TestHandle_GitLabTrigger_UnregisteredProject_PerformsNoForgeCall(t *testing
 				return
 			}
 			// The refusal is RECORDED with its own reason, so an operator can
-			// tell an unregistered project from a registry fault.
-			if got := gitlabRefusalReasons(t, au); len(got) != 1 || got[0] != tc.wantReason {
-				t.Errorf("refusal reasons = %v, want [%s]", got, tc.wantReason)
+			// tell an unregistered project from a registry fault — and with the
+			// gate that refused, so a create refusal is not confusable with the
+			// CI-retry refusal that shares this category.
+			reasons, paths := gitlabRefusalReasonsAndPaths(t, au)
+			if len(reasons) != 1 || reasons[0] != tc.wantReason {
+				t.Errorf("refusal reasons = %v, want [%s]", reasons, tc.wantReason)
+			}
+			if len(paths) != 1 || paths[0] != gitLabAuthzPathCreate {
+				t.Errorf("refusal paths = %v, want [%s]", paths, gitLabAuthzPathCreate)
 			}
 		})
 	}
@@ -285,13 +292,107 @@ func TestHandle_GitLabTrigger_AuthorizationSeesThePayloadIdentity(t *testing.T) 
 	}
 }
 
+// stubPipelineTrigger is a runnerbackend.PipelineTrigger that records every
+// pipeline creation and can be made to fail. It is the seam that reaches the
+// dispatch-FAILED branches of both GitLab paths.
+type stubPipelineTrigger struct {
+	mu    sync.Mutex
+	err   error
+	calls []stubPipelineCall
+}
+
+type stubPipelineCall struct {
+	Ref   string
+	Scope string
+}
+
+func (s *stubPipelineTrigger) TriggerPipeline(_ context.Context, scope forge.CredentialScope,
+	ref string, _ []gitlabclient.PipelineVariable) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, stubPipelineCall{Ref: ref, Scope: scope.Ref()})
+	return s.err
+}
+
+func (s *stubPipelineTrigger) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.calls)
+}
+
+// TestHandle_GitLabTrigger_PipelineTriggerFails_PersistsAndAuditsFailure pins
+// the create path's dispatch-FAILED branch (concerns e57e8cd3 / b57c1fd3),
+// which no prior test reached because every fixture let the pipeline trigger
+// succeed.
+//
+// The contract under failure is deliberately NOT a rollback: the run and its
+// stages are already persisted and must stay, because the operator's recovery
+// verb acts on an existing run. What must NOT happen is the stage advancing to
+// `dispatched` — a stage marked dispatched when nothing was dispatched is a run
+// that waits forever on a pipeline that never existed. The audit records the
+// failure so the discrepancy is visible.
+//
+// The trigger is a REACHABLE in-test fake returning a chosen error, not an
+// unroutable endpoint: a connection error could map to the same outcome whether
+// or not the branch handled it.
+func TestHandle_GitLabTrigger_PipelineTriggerFails_PersistsAndAuditsFailure(t *testing.T) {
+	d, _, _, runs, au := newGitLabDispatcher(t, validSpec)
+	trigger := &stubPipelineTrigger{err: errors.New("gitlab: 500 internal error")}
+	d.GitLabTrigger = trigger
+
+	if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+		t.Fatalf("Handle: %v, want nil (a failed trigger is recorded, not redelivered)", err)
+	}
+
+	if trigger.callCount() != 1 {
+		t.Fatalf("pipeline trigger calls = %d, want 1", trigger.callCount())
+	}
+	// The run and its stage persist — recovery acts on them.
+	if len(runs.created) != 1 {
+		t.Errorf("runs created = %d, want 1 (a failed dispatch does not unwind the run)", len(runs.created))
+	}
+	if len(runs.createdStages) != 1 {
+		t.Errorf("stages created = %d, want 1", len(runs.createdStages))
+	}
+	// But the stage was NOT advanced.
+	if len(runs.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none (nothing was dispatched)", runs.transitions)
+	}
+	// And the audit says so.
+	if cats := auditCategories(au); len(cats) != 1 || cats[0] != "run_dispatched" {
+		t.Fatalf("audit = %v, want one run_dispatched row recording the outcome", cats)
+	}
+	au.mu.Lock()
+	payload := au.appended[0].Payload
+	au.mu.Unlock()
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatalf("unmarshal run_dispatched payload: %v", err)
+	}
+	if got, _ := p["outcome"].(string); got != "dispatch_failed" {
+		t.Errorf("audit outcome = %q, want dispatch_failed; a failed trigger must not read as a success", got)
+	}
+	if got, _ := p["error"].(string); !strings.Contains(got, "500 internal error") {
+		t.Errorf("audit error = %q, want it to carry the trigger failure", got)
+	}
+}
+
 // gitlabRefusalReasons returns the `reason` of every global-chained
 // run_rejected_misconfigured entry written by the GitLab authorization gate.
 func gitlabRefusalReasons(t *testing.T, au *stubAudit) []string {
 	t.Helper()
+	reasons, _ := gitlabRefusalReasonsAndPaths(t, au)
+	return reasons
+}
+
+// gitlabRefusalReasonsAndPaths returns the `reason` AND the `path` of every
+// global-chained run_rejected_misconfigured entry the GitLab authorization gate
+// wrote. Both GitLab entry points share one authorizer and one category, so
+// `path` is what distinguishes a refused run creation from a refused CI retry.
+func gitlabRefusalReasonsAndPaths(t *testing.T, au *stubAudit) (reasons, paths []string) {
+	t.Helper()
 	au.mu.Lock()
 	defer au.mu.Unlock()
-	var out []string
 	for _, a := range au.globalAppended {
 		if a.Category != "run_rejected_misconfigured" {
 			continue
@@ -301,10 +402,13 @@ func gitlabRefusalReasons(t *testing.T, au *stubAudit) []string {
 			t.Fatalf("unmarshal run_rejected_misconfigured payload: %v", err)
 		}
 		if reason, ok := p["reason"].(string); ok {
-			out = append(out, reason)
+			reasons = append(reasons, reason)
+		}
+		if path, ok := p["path"].(string); ok {
+			paths = append(paths, path)
 		}
 	}
-	return out
+	return reasons, paths
 }
 
 // TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating pins the

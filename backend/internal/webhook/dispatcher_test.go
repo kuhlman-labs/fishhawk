@@ -975,6 +975,11 @@ type stubRuns struct {
 	// listStagesErr, when set, makes ListStagesForRun fail — the per-candidate
 	// head-SHA lookup fault the GitLab correlation walk must skip past.
 	listStagesErr error
+	// listCalls counts ListRuns invocations, so a test can assert a guard runs
+	// BEFORE the candidate query rather than merely discarding its result.
+	// Incremented under mu (like every other field here) so it is safe under
+	// -race even when the racing-deliveries test drives concurrent calls.
+	listCalls int
 	// createErrQueue is popped one entry per CreateRun call before
 	// createErr is consulted, so a test can make the FIRST create succeed
 	// and a LATER one lose the runs_retry_child_once_idx race (a nil entry
@@ -1087,6 +1092,7 @@ func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run
 func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -4312,6 +4318,53 @@ func gitlabEvent(kind, sender, body string) Event {
 		Forge:         ForgeGitLab,
 		CredentialRef: "gitlab:1",
 		RawBody:       []byte(body),
+	}
+}
+
+// TestMatchGitLabEvent_RunActionCarriesAValidTriggerSource guards the storage
+// contract every GitLab run-creating match must satisfy: handleGitLabCreateRun
+// passes Match.TriggerSource straight into CreateRun, and
+// runs_trigger_source_check rejects any value outside
+// run.ValidTriggerSources() — including the empty string a Match that simply
+// never set the field carries.
+//
+// Both GitLab run-creating matchers are covered. The issue path is also proven
+// end to end against a real database by
+// orchestrator.TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch; the
+// COMMENT path has no such Postgres coverage, which is exactly why the check is
+// restated here as a cheap unit guard rather than left to the one E2E.
+//
+// The assertion is membership in the real enum, not equality with a literal: a
+// matcher that set some plausible-but-unlisted string would satisfy a
+// non-empty check while still failing the INSERT.
+func TestMatchGitLabEvent_RunActionCarriesAValidTriggerSource(t *testing.T) {
+	valid := make(map[run.TriggerSource]bool, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		valid[ts] = true
+	}
+
+	cases := []struct {
+		name string
+		ev   Event
+	}{
+		{"issue_labeled", gitlabEvent("issue", "alice",
+			`{"object_attributes":{"iid":7,"action":"open"},"labels":[{"title":"fishhawk"}]}`)},
+		{"issue_comment_command", gitlabEvent("note", "alice",
+			`{"object_attributes":{"noteable_type":"Issue","note":"/fishhawk run"},"issue":{"iid":7}}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := MatchGitLabEvent(tc.ev)
+			if m.Action != MatchActionRun {
+				t.Fatalf("Action = %q, want %q (fixture must reach the run-creating arm)",
+					m.Action, MatchActionRun)
+			}
+			if !valid[m.TriggerSource] {
+				t.Errorf("TriggerSource = %q, which is not in run.ValidTriggerSources() %v; "+
+					"CreateRun would be rejected by runs_trigger_source_check",
+					m.TriggerSource, run.ValidTriggerSources())
+			}
+		})
 	}
 }
 

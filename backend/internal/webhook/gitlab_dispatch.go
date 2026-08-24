@@ -93,12 +93,29 @@ const (
 	gitLabAuthzNotRegistered = "gitlab_project_not_registered"
 )
 
-// authorizeGitLabProject is the create path's authorization gate. It returns
-// true only when the registry positively vouches for the payload's project;
-// every other outcome — unwired registry, absent ref, lookup fault, unknown
-// project — refuses, writes the run-less rejection audit naming which, and
-// leaves ZERO forge calls behind.
-func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Match, now time.Time) bool {
+// gitLabAuthzPath names WHICH gate refused. Both GitLab entry points — run
+// creation and CI-failure retry — share one authorizer and one refusal
+// category, so without this discriminator the two refusals are byte-identical
+// in the audit and an operator cannot tell a rejected trigger from a rejected
+// retry. Same #2860 principle as the ci_retry_skipped reasons.
+const (
+	gitLabAuthzPathCreate  = "create_run"
+	gitLabAuthzPathCIRetry = "ci_failure_retry"
+)
+
+// authorizeGitLabProject is the authorization gate for EVERY GitLab entry
+// point that acts on a payload-named project — run creation and CI-failure
+// retry alike. It returns true only when the registry positively vouches for
+// the payload's project; every other outcome — unwired registry, absent ref,
+// lookup fault, unknown project — refuses, writes the run-less rejection audit
+// naming which (and via `path`, which gate), and leaves ZERO forge calls
+// behind.
+//
+// It is deliberately shared rather than duplicated per path: an authorizer
+// applied to only one of two entry points is the asymmetry that made the retry
+// path a forgeable pipeline-dispatch surface in the first place.
+func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Match,
+	path string, now time.Time) bool {
 	reason := ""
 	switch {
 	case d.GitLabProjects == nil:
@@ -122,13 +139,14 @@ func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Mat
 	if reason == "" {
 		return true
 	}
-	d.writeGitLabUnauthorizedProjectAudit(ctx, ev, m, reason, now)
+	d.writeGitLabUnauthorizedProjectAudit(ctx, ev, m, path, reason, now)
 	d.logger().LogAttrs(ctx, slog.LevelWarn,
 		"gitlab dispatch rejected: project not authorized",
 		slog.String("delivery_id", ev.DeliveryID),
 		slog.String("repo", ev.Repo),
 		slog.String("credential_ref", ev.CredentialRef),
 		slog.String("workflow_id", m.WorkflowID),
+		slog.String("path", path),
 		slog.String("reason", reason))
 	return false
 }
@@ -138,13 +156,14 @@ func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Mat
 // apart by its `reason`. No run row exists at this point — the whole purpose of
 // the guard is that none is minted — so the entry is global-chained.
 func (d *Dispatcher) writeGitLabUnauthorizedProjectAudit(ctx context.Context, ev Event, m Match,
-	reason string, now time.Time) {
+	path, reason string, now time.Time) {
 	if d.Audit == nil {
 		return
 	}
 	systemKind := audit.ActorKind("system")
 	payload, _ := json.Marshal(map[string]any{
 		"reason":         reason,
+		"path":           path,
 		"repo":           ev.Repo,
 		"credential_ref": ev.CredentialRef,
 		"workflow_id":    m.WorkflowID,
@@ -183,7 +202,7 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 	// every later step either reads with deployment credentials or executes
 	// code in the named project, so an unauthorized payload must fall out
 	// here having caused zero forge calls. See GitLabProjectAuthorizer.
-	if !d.authorizeGitLabProject(ctx, ev, m, now) {
+	if !d.authorizeGitLabProject(ctx, ev, m, gitLabAuthzPathCreate, now) {
 		return nil
 	}
 	repo, err := parseRepo(ev.Repo)

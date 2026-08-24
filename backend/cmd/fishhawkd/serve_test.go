@@ -3894,11 +3894,17 @@ func TestGitLabIdentityWarnings(t *testing.T) {
 // the pin is a body-grep on the source — the same technique the repo uses for
 // other un-constructible wiring sites.
 //
-// It is load-bearing rather than cosmetic: GitLabFiles nil leaves an admitted
-// GitLab trigger logging and skipping (see
-// TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating), so a dropped
-// wiring line turns GitLab go-live into a silent no-op that every unit test in
-// backend/internal/webhook still passes.
+// It is load-bearing rather than cosmetic. BOTH pinned lines fail silently
+// when dropped, in opposite directions, and neither shows up in any
+// backend/internal/webhook unit test:
+//
+//   - GitLabFiles nil leaves an admitted GitLab trigger logging and skipping
+//     (see TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating).
+//   - GitLabProjects nil FAILS CLOSED (concerns cbe8d579 / 435fad9b): every
+//     GitLab delivery — creation and CI retry alike — refuses with
+//     gitlab_project_registry_unwired. Safe, but it turns GitLab go-live off
+//     entirely while the whole unit suite stays green, because those tests
+//     supply their own authorizer.
 func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
 	src, err := os.ReadFile("serve.go")
 	if err != nil {
@@ -3914,9 +3920,16 @@ func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
 		t.Fatal("could not bound the webhook.Dispatcher literal; update this pin")
 	}
 	literal := body[i : i+end]
-	if !strings.Contains(literal, `GitLabFiles: registeredFileFetcher("gitlab")`) {
-		t.Errorf(`webhook.Dispatcher literal is missing GitLabFiles: registeredFileFetcher("gitlab"); `+
-			"GitLab run creation would be a silent no-op. Literal:\n%s", literal)
+	for _, want := range []struct{ line, consequence string }{
+		{`GitLabFiles: registeredFileFetcher("gitlab")`,
+			"GitLab run creation would be a silent no-op"},
+		{`GitLabProjects: gitlabProjects`,
+			"every GitLab delivery would fail closed as gitlab_project_registry_unwired"},
+	} {
+		if !strings.Contains(literal, want.line) {
+			t.Errorf("webhook.Dispatcher literal is missing %s; %s. Literal:\n%s",
+				want.line, want.consequence, literal)
+		}
 	}
 }
 

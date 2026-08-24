@@ -2676,6 +2676,95 @@ func TestCreateRun_RetryChildOnceIndexIsBenignDuplicate(t *testing.T) {
 	}
 }
 
+// TestCreateRun_ConcurrentRetryChildrenRaceToOne is the CONCURRENCY pin on
+// runs_retry_child_once_idx and the counterfactual vehicle for it (concerns
+// 54dec6e2 / 2dd03fa3).
+//
+// The test above is single-threaded: it inserts twice in sequence, so a
+// read-then-write dedup would also pass it. This one drives two goroutines at
+// one parent against a REAL Postgres, where nothing but the index decides the
+// outcome — drop the index and both inserts succeed. That is the whole point of
+// replacing the read-then-write with a constraint: the losing INSERT must fail
+// atomically rather than depend on a prior SELECT that another transaction can
+// interleave behind.
+//
+// It pins BC3's caller contract at the same time. Both racers derive the
+// attempt from the PARENT row (parent.RetryAttempt + 1), never from the latest
+// existing child, so they compute the SAME value and genuinely collide. A
+// child-derived value would make the two inserts disagree, the partial unique
+// index would never fire, and this test would pass while the defect it exists
+// to close stayed open — so the surviving child's attempt is asserted, not just
+// its count.
+func TestCreateRun_ConcurrentRetryChildrenRaceToOne(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	parent := makeRun(t, repo)
+	const racers = 2
+
+	// Every racer derives its attempt from the PARENT, per BC3.
+	attempt := parent.RetryAttempt + 1
+
+	var (
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		mu      sync.Mutex
+		winners []*run.Run
+		losers  []error
+	)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p := run.ChildParamsFrom(parent)
+			p.RetryAttempt = attempt
+			<-start // release both goroutines as close to simultaneously as possible
+			child, err := repo.CreateRun(ctx, p)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				losers = append(losers, err)
+				return
+			}
+			winners = append(winners, child)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(winners) != 1 {
+		t.Fatalf("successful inserts = %d, want exactly 1 (the index must serialise the race); losers = %v",
+			len(winners), losers)
+	}
+	if len(losers) != racers-1 {
+		t.Fatalf("failed inserts = %d, want %d", len(losers), racers-1)
+	}
+	for _, err := range losers {
+		if !run.IsRetryChildDuplicate(err) {
+			t.Errorf("loser error = %v, want one run.IsRetryChildDuplicate recognizes "+
+				"(otherwise the retry path surfaces a 5xx instead of taking its benign branch)", err)
+		}
+	}
+	if got := winners[0].RetryAttempt; got != attempt {
+		t.Errorf("surviving child retry_attempt = %d, want %d (parent-derived, per BC3)", got, attempt)
+	}
+
+	// And the database agrees: exactly one child row exists for this parent at
+	// this attempt. Counting rows rather than trusting the return values is
+	// what makes this a state assertion — a control that fired and was then
+	// rolled back would still have returned a plausible error above.
+	var rows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM runs WHERE parent_run_id = $1 AND retry_attempt = $2`,
+		parent.ID, attempt).Scan(&rows); err != nil {
+		t.Fatalf("count children: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("persisted retry children at attempt %d = %d, want 1", attempt, rows)
+	}
+}
+
 // TestIsRetryChildDuplicate_Sentinel pins the sentinel-for-fakes half of the
 // idiom (mirroring audit.ErrMergeVerdictDuplicate): a fake Repository with no
 // Postgres can return run.ErrRetryChildDuplicate from CreateRun and a retry
