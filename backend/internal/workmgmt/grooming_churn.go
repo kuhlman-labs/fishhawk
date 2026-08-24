@@ -353,9 +353,16 @@ func groomingBasisHash(class string, fields ...string) string {
 //	               jitter. RESIDUAL: a rejected duplicate does not resurface on
 //	               a confidence change alone — the pair either overlaps or it
 //	               does not, and the operator already ruled on the pair.
-//	hygiene        normalized suggested_fix — the VALUE that would be written,
-//	               so a different proposed label is a different proposal.
-//	               EXCLUDES detail (prose).
+//	hygiene        the normalized STRUCTURED fix — the sorted trimmed label
+//	               set, the normalized parent-epic ref, the lower-cased board
+//	               state and the trimmed field value — so a different proposed
+//	               label is a different proposal. EXCLUDES detail AND
+//	               suggested_fix, both prose (#2847). It moved off
+//	               suggested_fix with the value the apply path reads: with
+//	               `fix` present, a re-worded sentence over an unchanged label
+//	               set would be a "materially changed" proposal (defeating the
+//	               guard), and two different label sets behind one sentence
+//	               would be ONE proposal (suppressing a real correction).
 //	dependency     kind (the edge type). Direction is already in the id.
 //	               EXCLUDES basis (prose).
 //	vision_drift   the basis ENUM (non_goal | phase_theme). The charter_ref_id
@@ -381,7 +388,37 @@ func groomingDuplicateBasis(_ plan.DuplicateCandidate) string {
 }
 
 func groomingHygieneBasis(e plan.HygieneDefect) string {
-	return groomingBasisHash(plan.GroomingClassHygiene, strings.TrimSpace(e.SuggestedFix))
+	var labels []string
+	var epic, state, value string
+	if e.Fix != nil {
+		for _, l := range e.Fix.Labels {
+			if t := strings.TrimSpace(l); t != "" {
+				labels = append(labels, t)
+			}
+		}
+		sort.Strings(labels)
+		epic = groomingNormalizeRef(e.Fix.ParentEpic)
+		// Lower-cased to agree with groomingResolveBoardState's
+		// case-insensitive lookup: fingerprinting `Backlog` and `backlog`
+		// identically while resolving them differently is the idempotence
+		// asymmetry nobody can reproduce (approval condition C6).
+		state = strings.ToLower(strings.TrimSpace(e.Fix.BoardState))
+		value = strings.TrimSpace(e.Fix.FieldValue)
+	}
+	// TWO SEPARATORS, TWO DIFFERENT JOBS. The label set is joined on US
+	// (\x1f) so two different SETS do not collapse onto one fingerprint
+	// (["ab"] vs ["a","b"]); the MEMBER boundary is the \x00 groomingBasisHash
+	// joins FIELDS with, which is what stops a label forging the field value's
+	// contribution (["ab"] vs ["a"]+"b"). Both pairs are pinned in
+	// TestGroomingBasisExcludesProse — each collides under the corresponding
+	// empty join, so neither claim rests on prose.
+	//
+	// RESIDUAL: a label containing \x1f itself still collides with the
+	// equivalent two-label set here. It is bounded rather than fixed, because
+	// groomingValidLabel refuses any control rune, so such a label is
+	// undispatchable and the collision can only suppress a proposal that could
+	// never have been applied.
+	return groomingBasisHash(plan.GroomingClassHygiene, strings.Join(labels, "\x1f"), epic, state, value)
 }
 
 func groomingDependencyBasis(e plan.DependencyEdge) string {
@@ -616,7 +653,7 @@ func groomingBasisFieldName(class string) string {
 	case plan.GroomingClassOrdering:
 		return "rubric_citations"
 	case plan.GroomingClassHygiene:
-		return "suggested_fix"
+		return "fix"
 	case plan.GroomingClassDependency:
 		return "kind"
 	case plan.GroomingClassVisionDrift:

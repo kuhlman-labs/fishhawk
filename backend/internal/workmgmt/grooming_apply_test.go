@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 
@@ -35,14 +38,42 @@ func groomingStates() map[string]string {
 	}
 }
 
+// hygieneEntry builds a hygiene defect carrying `fix` in the STRUCTURED member
+// this defect's mutation kind reads (#2847). An empty `fix` leaves Fix NIL —
+// the absent-proposal case.
+//
+// The `suggested_fix` PROSE is deliberately fixed and lexically DISJOINT from
+// every structured value these tests use, so a dispatched-value assertion can
+// never accidentally pass on prose the code was not supposed to read.
 func hygieneEntry(n int, defect, fix string) plan.HygieneDefect {
 	r := groomingRef(n)
-	return plan.HygieneDefect{
+	d := plan.HygieneDefect{
 		ID:           plan.GroomingEntryID(plan.GroomingClassHygiene, defect, r),
 		ItemRef:      r,
 		Defect:       defect,
 		Detail:       "detail",
-		SuggestedFix: fix,
+		SuggestedFix: "prose only a human reads; never dispatched",
+	}
+	if fix != "" {
+		d.Fix = structuredFixFor(defect, fix)
+	}
+	return d
+}
+
+// structuredFixFor routes one value into the fix member the defect's mutation
+// kind reads. A defect with no mechanical mutation (absent_done_means) still
+// gets a FieldValue so the fixture is non-nil; its unmappable-defect skip is
+// decided before any fix is read.
+func structuredFixFor(defect, value string) *plan.HygieneFix {
+	switch defect {
+	case "missing_label_namespace":
+		return &plan.HygieneFix{Labels: []string{value}}
+	case "unlinked_parent_epic", "missing_parent_epic_link":
+		return &plan.HygieneFix{ParentEpic: value}
+	case "unboarded":
+		return &plan.HygieneFix{BoardState: value}
+	default:
+		return &plan.HygieneFix{FieldValue: value}
 	}
 }
 
@@ -362,14 +393,16 @@ func TestDeriveGroomingMutations_MapsEveryEntryClass(t *testing.T) {
 		class      string
 	}
 	table := map[string]want{
-		report.HygieneDefects[0].ID:           {GroomingKindLabelSet, "", "", "hygiene"},
-		report.HygieneDefects[1].ID:           {GroomingKindEpicLink, "", "#1437", "hygiene"},
-		report.HygieneDefects[2].ID:           {GroomingKindEpicLink, "", "#1437", "hygiene"},
-		report.HygieneDefects[3].ID:           {GroomingKindBoardPlace, "", "Backlog", "hygiene"},
+		report.HygieneDefects[0].ID: {GroomingKindLabelSet, "", "", "hygiene"},
+		report.HygieneDefects[1].ID: {GroomingKindEpicLink, "", "#1437", "hygiene"},
+		report.HygieneDefects[2].ID: {GroomingKindEpicLink, "", "#1437", "hygiene"},
+		// The board state is derived in the CANONICAL vocabulary; the provider
+		// option ("Backlog") is resolved later, at request-resolution time.
+		report.HygieneDefects[3].ID:           {GroomingKindBoardPlace, "", "backlog", "hygiene"},
 		report.HygieneDefects[4].ID:           {GroomingKindFieldSet, "", "3", "hygiene"},
 		report.HygieneDefects[5].ID:           {"", GroomingSkipUnmappableDefect, "", "hygiene"},
 		report.HygieneDefects[6].ID:           {"", GroomingSkipUnmappableDefect, "", "hygiene"},
-		report.HygieneDefects[7].ID:           {GroomingKindLabelSet, GroomingSkipNoSuggestedFix, "", "hygiene"},
+		report.HygieneDefects[7].ID:           {GroomingKindLabelSet, GroomingSkipNoStructuredFix, "", "hygiene"},
 		report.DependencyEdges[0].ID:          {GroomingKindDependsOnAdd, "", "", "hygiene"},
 		report.Ordering[0].ID:                 {GroomingKindRankSet, "", "1", "ordering"},
 		report.Duplicates[0].ID:               {GroomingKindCloseDuplicate, "", "closed", "dedup"},
@@ -1917,11 +1950,11 @@ func TestApplyGrooming_ItemRefResolutionRefusals(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ref := plan.ItemRef{Type: "github_issue", ID: tc.id, URL: "https://example.test"}
 			h := plan.HygieneDefect{
-				ID:           plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref),
-				ItemRef:      ref,
-				Defect:       "missing_label_namespace",
-				Detail:       "d",
-				SuggestedFix: "area:api",
+				ID:      plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref),
+				ItemRef: ref,
+				Defect:  "missing_label_namespace",
+				Detail:  "d",
+				Fix:     &plan.HygieneFix{Labels: []string{"area:api"}},
 			}
 			report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{h}}
 			mut := &fakeGroomingMutator{}
@@ -2045,4 +2078,610 @@ func TestGroomingActionClassFor(t *testing.T) {
 			t.Errorf("GroomingActionClassFor(%q) = %q, want %q", tc.reportClass, got, tc.want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #2847 — the structured hygiene fix, and the prose that must never reach a
+// mutation request.
+// ---------------------------------------------------------------------------
+
+// hygieneFixEntry builds a hygiene defect with an EXPLICIT fix, so a test can
+// seed a bad value BY CONSTRUCTION (a wrong member, a malformed label) rather
+// than by routing it through the helper's defect->member mapping.
+func hygieneFixEntry(n int, defect string, fix *plan.HygieneFix) plan.HygieneDefect {
+	d := hygieneEntry(n, defect, "")
+	d.Fix = fix
+	return d
+}
+
+// applyOneHygiene drives ONE hygiene entry through the real ApplyGrooming with
+// the entry approved and the class on auto, and returns its record together
+// with the mutator's full call log. Every #2847 refusal case asserts on the
+// call log — the observable behaviour — not on a return code.
+func applyOneHygiene(t *testing.T, h plan.HygieneDefect, states map[string]string) (GroomingMutationRecord, []GroomingMutationRequest) {
+	t.Helper()
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{h}}
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", Body: "Summary"},
+		"#2": {Number: 2, State: "open", Body: "Summary"},
+		"#3": {Number: 3, State: "open", Body: "Summary"},
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: []GroomingDecision{{EntryID: h.ID, Verdict: GroomingApproved}},
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    states,
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	return recordFor(t, res, h.ID), mut.calls
+}
+
+// TestDeriveGroomingMutations_LabelFixNamesEveryLabel is the positive half of
+// the #2847 fix: a THREE-label structured fix produces a request naming all
+// three names verbatim.
+//
+// The three-name case is the one the incident could not express: the prose
+// `Add area:server-api, autonomy:medium, phase:alpha.` was dispatched as ONE
+// label with that literal text. Recovering three names from that sentence is a
+// guess; the structured member states them.
+func TestDeriveGroomingMutations_LabelFixNamesEveryLabel(t *testing.T) {
+	want := []string{"area:server-api", "autonomy:medium", "phase:alpha"}
+	h := hygieneFixEntry(1, "missing_label_namespace", &plan.HygieneFix{Labels: want})
+
+	rec, calls := applyOneHygiene(t, h, groomingStates())
+	if rec.Outcome != GroomingOutcomeApplied {
+		t.Fatalf("outcome = %q (%+v), want applied", rec.Outcome, rec)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("dispatches = %d (%+v), want exactly one", len(calls), calls)
+	}
+	if got := calls[0].After.List; !equalStrings(got, want) {
+		t.Errorf("dispatched labels = %#v, want exactly %#v", got, want)
+	}
+	if calls[0].After.Scalar != "" {
+		t.Errorf("dispatched scalar = %q, want empty: a label set is a LIST", calls[0].After.Scalar)
+	}
+}
+
+// TestDeriveGroomingMutations_EpicFixAcceptsBothWireForms pins the parent-epic
+// validator against BOTH forms the schema admits — a bare `389` and a hashed
+// `#389` (approval condition C4) — and against the prose shapes that must not
+// dispatch. The validator is explicit rather than delegated to
+// groomingNormalizeRef, which returns an unparseable value UNCHANGED and would
+// therefore hand `Link as a sub-issue of E22 #389.` straight to the forge.
+func TestDeriveGroomingMutations_EpicFixAcceptsBothWireForms(t *testing.T) {
+	cases := []struct {
+		name       string
+		epic       string
+		wantAfter  string
+		wantSkip   string
+		wantCalled bool
+	}{
+		{name: "bare number", epic: "389", wantAfter: "#389", wantCalled: true},
+		{name: "hashed number", epic: "#389", wantAfter: "#389", wantCalled: true},
+		{name: "leading zeros normalize", epic: "0389", wantAfter: "#389", wantCalled: true},
+		{name: "surrounding space", epic: "  #389  ", wantAfter: "#389", wantCalled: true},
+		{name: "prose around the ref", epic: "Link as a sub-issue of E22 #389.", wantSkip: GroomingSkipInvalidFixValue},
+		{name: "epic slug", epic: "E22", wantSkip: GroomingSkipInvalidFixValue},
+		{name: "zero is not an issue number", epic: "0", wantSkip: GroomingSkipInvalidFixValue},
+		{name: "negative", epic: "-5", wantSkip: GroomingSkipInvalidFixValue},
+		{name: "two hashes", epic: "##389", wantSkip: GroomingSkipInvalidFixValue},
+		{name: "absent", epic: "", wantSkip: GroomingSkipNoStructuredFix},
+		{name: "all whitespace", epic: "   ", wantSkip: GroomingSkipNoStructuredFix},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := hygieneFixEntry(1, "unlinked_parent_epic", &plan.HygieneFix{ParentEpic: tc.epic})
+			rec, calls := applyOneHygiene(t, h, groomingStates())
+			if !tc.wantCalled {
+				if len(calls) != 0 {
+					t.Fatalf("dispatches = %+v, want ZERO", calls)
+				}
+				if rec.SkipReason != tc.wantSkip {
+					t.Errorf("skip reason = %q, want %q", rec.SkipReason, tc.wantSkip)
+				}
+				return
+			}
+			if len(calls) != 1 {
+				t.Fatalf("dispatches = %d (%+v), want exactly one", len(calls), calls)
+			}
+			if calls[0].After.Scalar != tc.wantAfter {
+				t.Errorf("dispatched parent epic = %q, want %q", calls[0].After.Scalar, tc.wantAfter)
+			}
+		})
+	}
+}
+
+// TestGroomingValidLabel_RejectsWhatItPromises reconciles the label rule with
+// its stated contract (approval condition C3): "leading or trailing
+// punctuation" means ANY punctuation or symbol rune, not the four
+// sentence-terminators, so `phase:alpha!` and `phase:alpha?` are refused
+// exactly as `Add phase:alpha.` is.
+//
+// It is a pure-function table; the BEHAVIOURAL half (a rejected label
+// dispatches nothing) is TestDeriveGroomingMutations_InvalidLabelIsRefused.
+func TestGroomingValidLabel_RejectsWhatItPromises(t *testing.T) {
+	cases := []struct {
+		name  string
+		label string
+		want  bool
+	}{
+		{name: "namespaced label", label: "phase:alpha", want: true},
+		{name: "hyphenated value", label: "area:server-api", want: true},
+		{name: "milestone", label: "milestone:alpha", want: true},
+		{name: "digits", label: "estimate:3", want: true},
+		{name: "at the length cap", label: strings.Repeat("a", groomingMaxLabelLen), want: true},
+
+		{name: "the incident's own prose", label: "Add phase:alpha."},
+		{name: "the incident's multi-label prose", label: "Add area:server-api, autonomy:medium, phase:alpha."},
+		{name: "trailing period", label: "phase:alpha."},
+		{name: "trailing exclamation", label: "phase:alpha!"},
+		{name: "trailing question mark", label: "phase:alpha?"},
+		{name: "trailing semicolon", label: "phase:alpha;"},
+		{name: "trailing comma", label: "phase:alpha,"},
+		{name: "leading hash", label: "#phase:alpha"},
+		{name: "leading colon", label: ":phase"},
+		{name: "leading plus symbol", label: "+phase:alpha"},
+		{name: "interior space", label: "good first issue"},
+		{name: "empty", label: ""},
+		// THE RAW BOUNDARY. The caller no longer trims before calling, so a
+		// space-padded name is judged as supplied and refused — it is not
+		// rewritten into a passing one. Under a caller-side trim these three
+		// rows are the same input as the valid `phase:alpha` row above.
+		{name: "leading space", label: " phase:alpha"},
+		{name: "trailing space", label: "phase:alpha "},
+		{name: "leading and trailing space", label: " phase:alpha "},
+		{name: "tab", label: "phase:\talpha"},
+		{name: "leading tab", label: "\tphase:alpha"},
+		{name: "newline", label: "phase:\nalpha"},
+		{name: "trailing newline", label: "phase:alpha\n"},
+		// A CONTROL rune that unicode.IsSpace does NOT match, and the very
+		// separator groomingHygieneBasis joins the label set on.
+		{name: "unit separator", label: "phase:alpha\x1fbeta"},
+		{name: "NUL", label: "phase:alpha\x00"},
+		{name: "one over the length cap", label: strings.Repeat("a", groomingMaxLabelLen+1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := groomingValidLabel(tc.label); got != tc.want {
+				t.Errorf("groomingValidLabel(%q) = %t, want %t", tc.label, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeriveGroomingMutations_InvalidLabelIsRefused is the behavioural half of
+// the label rule: each rejected shape records `invalid_fix_value` and
+// dispatches NOTHING. Bad values are seeded as literals, so the RED under a
+// deleted validator lands on the dispatch-count assertion.
+//
+// The multi-label row is the partial-write rule: ONE invalid name fails the
+// WHOLE entry, because a half-applied label set is a fix nobody proposed.
+func TestDeriveGroomingMutations_InvalidLabelIsRefused(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{name: "the incident's prose", labels: []string{"Add phase:alpha."}, want: GroomingSkipInvalidFixValue},
+		{name: "interior space", labels: []string{"good first issue"}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing period", labels: []string{"phase:alpha."}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing exclamation", labels: []string{"phase:alpha!"}, want: GroomingSkipInvalidFixValue},
+		{name: "over the length cap", labels: []string{strings.Repeat("a", groomingMaxLabelLen+1)}, want: GroomingSkipInvalidFixValue},
+		{name: "one bad name fails the whole set", labels: []string{"phase:alpha", "Add area:api."}, want: GroomingSkipInvalidFixValue},
+		{name: "a blank member", labels: []string{"phase:alpha", "   "}, want: GroomingSkipInvalidFixValue},
+		// The behavioural half of the raw boundary: a padded label is REFUSED
+		// with zero dispatches, not trimmed and written. Under a validate-
+		// after-trim ordering each of these dispatches `phase:alpha`.
+		{name: "leading space", labels: []string{" phase:alpha"}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing space", labels: []string{"phase:alpha "}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing newline", labels: []string{"phase:alpha\n"}, want: GroomingSkipInvalidFixValue},
+		{name: "one padded name fails the whole set", labels: []string{"phase:alpha", " area:api"}, want: GroomingSkipInvalidFixValue},
+		{name: "unit separator control char", labels: []string{"phase:alpha\x1fbeta"}, want: GroomingSkipInvalidFixValue},
+		{name: "empty list", labels: []string{}, want: GroomingSkipNoStructuredFix},
+		{name: "nil list", labels: nil, want: GroomingSkipNoStructuredFix},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := hygieneFixEntry(1, "missing_label_namespace", &plan.HygieneFix{Labels: tc.labels})
+			rec, calls := applyOneHygiene(t, h, groomingStates())
+			if len(calls) != 0 {
+				t.Fatalf("dispatches = %+v, want ZERO: a refused label must never reach the provider", calls)
+			}
+			if rec.SkipReason != tc.want {
+				t.Errorf("skip reason = %q, want %q", rec.SkipReason, tc.want)
+			}
+			if rec.Outcome != GroomingOutcomeSkipped {
+				t.Errorf("outcome = %q, want skipped", rec.Outcome)
+			}
+		})
+	}
+}
+
+// TestDeriveGroomingMutations_AbsentOrWrongMemberIsNoStructuredFix pins the
+// three shapes of "this proposal carries no value for this kind": a nil fix, a
+// fix populating only a member this kind does not read, and a blank scalar.
+// Each records `no_structured_fix` and dispatches NOTHING — and CRUCIALLY does
+// NOT fall back to the `suggested_fix` prose, which every fixture here carries.
+func TestDeriveGroomingMutations_AbsentOrWrongMemberIsNoStructuredFix(t *testing.T) {
+	cases := []struct {
+		name   string
+		defect string
+		fix    *plan.HygieneFix
+	}{
+		{name: "label/nil fix", defect: "missing_label_namespace", fix: nil},
+		{name: "label/only parent_epic populated", defect: "missing_label_namespace", fix: &plan.HygieneFix{ParentEpic: "#389"}},
+		{name: "epic/nil fix", defect: "unlinked_parent_epic", fix: nil},
+		{name: "epic/only labels populated", defect: "unlinked_parent_epic", fix: &plan.HygieneFix{Labels: []string{"phase:alpha"}}},
+		{name: "epic/all whitespace", defect: "unlinked_parent_epic", fix: &plan.HygieneFix{ParentEpic: "  \t "}},
+		{name: "board/nil fix", defect: "unboarded", fix: nil},
+		{name: "board/only field_value populated", defect: "unboarded", fix: &plan.HygieneFix{FieldValue: "3"}},
+		{name: "board/all whitespace", defect: "unboarded", fix: &plan.HygieneFix{BoardState: "   "}},
+		{name: "field/nil fix", defect: "missing_estimate", fix: nil},
+		{name: "field/only board_state populated", defect: "missing_estimate", fix: &plan.HygieneFix{BoardState: "backlog"}},
+		{name: "field/empty value", defect: "missing_estimate", fix: &plan.HygieneFix{FieldValue: ""}},
+		// Spaces and tabs only: a whitespace run CARRYING A NEWLINE is refused
+		// as invalid_fix_value by the raw single-line check that now runs
+		// ahead of the blank check, not reported as a missing value.
+		{name: "field/all whitespace", defect: "missing_estimate", fix: &plan.HygieneFix{FieldValue: " \t "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := hygieneFixEntry(1, tc.defect, tc.fix)
+			rec, calls := applyOneHygiene(t, h, groomingStates())
+			if len(calls) != 0 {
+				t.Fatalf("dispatches = %+v, want ZERO: with no structured value there is nothing to write", calls)
+			}
+			if rec.SkipReason != GroomingSkipNoStructuredFix {
+				t.Errorf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipNoStructuredFix)
+			}
+		})
+	}
+}
+
+// TestGroomingStructuredFix_UnreadKindFailsClosed pins the switch's DEFAULT
+// arm. It is unreachable from the derivation today — groomingHygieneKinds maps
+// exactly the four kinds the switch reads — so it is driven directly, which is
+// the only way to prove a kind added to that map without a corresponding arm
+// fails CLOSED (a named skip, nothing to write) rather than dispatching an
+// empty value.
+func TestGroomingStructuredFix_UnreadKindFailsClosed(t *testing.T) {
+	for _, kind := range []GroomingMutationKind{GroomingKindRankSet, GroomingKindCloseDuplicate, GroomingKindIcebox, ""} {
+		got, reason := groomingStructuredFix(kind, &plan.HygieneFix{
+			Labels: []string{"area:api"}, ParentEpic: "#1", BoardState: "backlog", FieldValue: "3",
+		})
+		if reason != GroomingSkipNoStructuredFix {
+			t.Errorf("kind %q: reason = %q, want %q", kind, reason, GroomingSkipNoStructuredFix)
+		}
+		if got.Scalar != "" || len(got.List) != 0 {
+			t.Errorf("kind %q: value = %+v, want the zero value: an unread kind has no member to read", kind, got)
+		}
+	}
+}
+
+// TestDeriveGroomingMutations_MultiLineFieldValueIsRefused pins the remaining
+// field_set branch: a value carrying a newline is not a board field value, and
+// is refused pre-dispatch rather than written.
+//
+// THE BOUNDARY ROWS ARE THE POINT. An interior newline is refused whichever
+// order the trim and the check run in; a LEADING or TRAILING one is refused
+// only because the single-line rule is enforced against the RAW value. With
+// the trim first, `3\n` and `\r3` become `3` and are dispatched — the exact
+// value the schema promises is refused.
+func TestDeriveGroomingMutations_MultiLineFieldValueIsRefused(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "interior newline", value: "3\nand also 5"},
+		{name: "trailing newline", value: "3\n"},
+		{name: "leading carriage return", value: "\r3"},
+		{name: "trailing carriage return", value: "3\r"},
+		{name: "trailing CRLF", value: "3\r\n"},
+		{name: "leading newline", value: "\n3"},
+		{name: "newline inside surrounding spaces", value: " 3\n "},
+		{name: "whitespace run carrying a newline", value: " \n "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := hygieneFixEntry(1, "missing_estimate", &plan.HygieneFix{FieldValue: tc.value})
+			rec, calls := applyOneHygiene(t, h, groomingStates())
+			if len(calls) != 0 {
+				t.Fatalf("dispatches = %+v, want ZERO: a value carrying a newline must never reach the provider", calls)
+			}
+			if rec.SkipReason != GroomingSkipInvalidFixValue {
+				t.Errorf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipInvalidFixValue)
+			}
+			if rec.Outcome != GroomingOutcomeSkipped {
+				t.Errorf("outcome = %q, want skipped", rec.Outcome)
+			}
+		})
+	}
+}
+
+// TestResolveGroomingRequest_BoardStateResolvesThroughTheStatesMap drives the
+// board-state rule at the layer that RESOLVES it (approval condition C5):
+// resolveGroomingRequest maps the derivation's CANONICAL state through the
+// request's states map to that board's own column option, and refuses a state
+// the conventions do not declare.
+//
+// A derivation-level test cannot observe either half — the derivation has no
+// states map — so both the positive resolution and the refusal are asserted
+// here and re-asserted end-to-end on the dispatched request below.
+func TestResolveGroomingRequest_BoardStateResolvesThroughTheStatesMap(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      string
+		states     map[string]string
+		wantOption string
+		wantSkip   string
+	}{
+		{name: "canonical backlog", state: "backlog", states: groomingStates(), wantOption: "Backlog"},
+		{name: "canonical up_next", state: "up_next", states: groomingStates(), wantOption: "Up Next"},
+		{
+			// Condition C6: the lookup is case-insensitive on BOTH sides, so
+			// it cannot disagree with the churn fingerprint (which lower-cases)
+			// about whether `Backlog` and `backlog` are one state.
+			name: "mixed case canonical", state: "BackLog", states: groomingStates(), wantOption: "Backlog",
+		},
+		{
+			// The other half of C6's symmetry: a conventions map whose KEY is
+			// mixed-case resolves too. Without the key-side normalization this
+			// row alone reddens — the input-side one below cannot cover it.
+			name: "mixed case conventions KEY", state: "backlog",
+			states: map[string]string{"BackLog": "Backlog"}, wantOption: "Backlog",
+		},
+		{name: "state the conventions do not declare", state: "icebox", states: groomingStates(), wantSkip: GroomingSkipInvalidFixValue},
+		{name: "provider option, not a canonical state", state: "In Progress", states: groomingStates(), wantSkip: GroomingSkipInvalidFixValue},
+		{name: "prose", state: "Add to Project #7 with Status=Backlog.", states: groomingStates(), wantSkip: GroomingSkipInvalidFixValue},
+		{name: "no states configured", state: "backlog", states: nil, wantSkip: GroomingSkipInvalidFixValue},
+		{name: "state declared with an empty option", state: "backlog", states: map[string]string{CanonicalStateBacklog: "  "}, wantSkip: GroomingSkipInvalidFixValue},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := groomingCandidate{
+				entryID: "hygiene:x:unboarded",
+				class:   "hygiene",
+				kind:    GroomingKindBoardPlace,
+				ref:     groomingRef(1),
+				after:   GroomingValue{Scalar: tc.state},
+			}
+			out, reason := resolveGroomingRequest(c, GroomingDecision{}, GroomingApplyRequest{
+				Target: groomingTarget(),
+				States: tc.states,
+			})
+			if reason != tc.wantSkip {
+				t.Fatalf("skip reason = %q, want %q", reason, tc.wantSkip)
+			}
+			if tc.wantSkip != "" {
+				return
+			}
+			if out.After.Scalar != tc.wantOption {
+				t.Errorf("resolved board option = %q, want %q (the PROVIDER's column name, not the canonical state)",
+					out.After.Scalar, tc.wantOption)
+			}
+		})
+	}
+}
+
+// TestApplyGrooming_UnresolvableBoardStateDispatchesNothing is the behavioural
+// half of the resolution refusal: the entry is approved, the class is on auto,
+// and the item is genuinely off-board — so with the refusal deleted the
+// mutation really does dispatch.
+func TestApplyGrooming_UnresolvableBoardStateDispatchesNothing(t *testing.T) {
+	h := hygieneFixEntry(1, "unboarded", &plan.HygieneFix{BoardState: "icebox"})
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{h}}
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", OnBoard: false},
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: []GroomingDecision{{EntryID: h.ID, Verdict: GroomingApproved}},
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if len(mut.calls) != 0 {
+		t.Fatalf("dispatches = %+v, want ZERO for a board state the conventions do not declare", mut.calls)
+	}
+	if rec := recordFor(t, res, h.ID); rec.SkipReason != GroomingSkipInvalidFixValue {
+		t.Errorf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipInvalidFixValue)
+	}
+}
+
+// TestApplyGrooming_BoardPlaceDispatchesTheProviderOption is the positive
+// control for the pair above: a declared canonical state dispatches, carrying
+// the BOARD's option string — the same vocabulary groomingObserved projects
+// item.BoardColumn onto, so a resolved placement still settles on re-apply.
+func TestApplyGrooming_BoardPlaceDispatchesTheProviderOption(t *testing.T) {
+	h := hygieneFixEntry(1, "unboarded", &plan.HygieneFix{BoardState: "backlog"})
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{h}}
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", OnBoard: false},
+	}}
+	if _, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: []GroomingDecision{{EntryID: h.ID, Verdict: GroomingApproved}},
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	}); err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if len(mut.calls) != 1 {
+		t.Fatalf("dispatches = %d (%+v), want exactly one", len(mut.calls), mut.calls)
+	}
+	if got := mut.calls[0].After.Scalar; got != "Backlog" {
+		t.Errorf("dispatched board value = %q, want the provider option %q", got, "Backlog")
+	}
+}
+
+// TestGroomingApply_NeverReadsSuggestedFix is the DEFECT-CLASS PIN the issue's
+// AC4 asks for, asserted directly rather than inferred: no `.SuggestedFix`
+// selector appears ANYWHERE in grooming_apply.go.
+//
+// A behavioural test can only prove that the paths it drives do not read the
+// prose. This proves the file cannot, so a future "just fall back when `fix` is
+// absent" one-liner fails HERE — it is the un-reappearable form of the fix.
+func TestGroomingApply_NeverReadsSuggestedFix(t *testing.T) {
+	const file = "grooming_apply.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel != nil && sel.Sel.Name == "SuggestedFix" {
+			t.Errorf("%s:%d reads .SuggestedFix — the apply path must read the STRUCTURED `fix` and never the prose (#2847)",
+				file, fset.Position(sel.Pos()).Line)
+		}
+		return true
+	})
+}
+
+// TestGroomingApply_ProseFixIsNeverDispatched is the LIVE-INCIDENT regression
+// fixture: the three literal `suggested_fix` sentences the groomer emitted on
+// 2026-08-22, with NO structured fix. Every entry must skip and nothing may
+// dispatch.
+//
+// It is deliberately NOT the vehicle for the disjointness assertion (approval
+// condition C1): `phase:alpha` is a SUBSTRING of `Add phase:alpha.`, so "no
+// request field contains the prose" cannot discriminate on these strings. That
+// assertion lives in the test below, on a fixture whose prose and structured
+// value share no substring.
+func TestGroomingApply_ProseFixIsNeverDispatched(t *testing.T) {
+	cases := []struct {
+		defect string
+		prose  string
+	}{
+		{defect: "missing_label_namespace", prose: "Add phase:alpha."},
+		{defect: "missing_label_namespace", prose: "Add area:server-api, autonomy:medium, phase:alpha."},
+		{defect: "unlinked_parent_epic", prose: "Link as a sub-issue of E22 #389."},
+		{defect: "unboarded", prose: "Add to Project #7 with Status=Backlog."},
+		{defect: "missing_estimate", prose: "Set the estimate to 3 points."},
+	}
+	report := &plan.GroomingReport{}
+	for i, tc := range cases {
+		h := hygieneEntry(i+1, tc.defect, "")
+		h.SuggestedFix = tc.prose
+		h.Fix = nil
+		report.HygieneDefects = append(report.HygieneDefects, h)
+	}
+
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if len(mut.calls) != 0 {
+		t.Fatalf("dispatches = %+v, want ZERO: prose is not a mutation payload", mut.calls)
+	}
+	if len(res.Skipped) != len(cases) {
+		t.Fatalf("skipped = %d, want one per entry (%d)", len(res.Skipped), len(cases))
+	}
+	for _, rec := range res.Skipped {
+		if rec.SkipReason != GroomingSkipNoStructuredFix {
+			t.Errorf("%s: skip reason = %q, want %q — an absent `fix` must be NAMED, not silently absorbed",
+				rec.EntryID, rec.SkipReason, GroomingSkipNoStructuredFix)
+		}
+	}
+}
+
+// TestGroomingApply_DispatchedValueIsStructuredAndNotProse is approval
+// condition C1's fixture: prose that is LEXICALLY DISJOINT from the structured
+// value, so both halves of the assertion are satisfiable AND discriminating.
+//
+//   - POSITIVE: the dispatched value EQUALS the structured fix exactly.
+//   - NEGATIVE: no field of the request contains any word of the prose.
+//
+// Equality alone would pass a code path that dispatched the structured value
+// while ALSO leaking the prose somewhere; disjointness alone would pass a path
+// that dispatched nothing. Together they pin the defect class shut. The
+// incident's own strings are kept as the separate regression fixture above,
+// where `phase:alpha ⊂ "Add phase:alpha."` makes disjointness unsatisfiable
+// for correct behaviour.
+func TestGroomingApply_DispatchedValueIsStructuredAndNotProse(t *testing.T) {
+	const prose = "Please attach the ownership marking for backend duties"
+	const label = "area:server-api"
+
+	// Words of four runes or more; the short connectives ("the", "for") are
+	// not discriminating tokens and would only make the assertion brittle.
+	var proseWords []string
+	for _, w := range strings.Fields(prose) {
+		if len(w) >= 4 {
+			proseWords = append(proseWords, w)
+		}
+	}
+	if len(proseWords) < 4 {
+		t.Fatalf("fixture bug: %d discriminating prose words, want several", len(proseWords))
+	}
+
+	h := hygieneFixEntry(1, "missing_label_namespace", &plan.HygieneFix{Labels: []string{label}})
+	h.SuggestedFix = prose
+	// THE DISJOINTNESS PRECONDITION, checked rather than assumed: if any prose
+	// word were a substring of the structured value, the negative assertion
+	// below could not pass for CORRECT behaviour — which is exactly the flaw
+	// condition C1 identified in the incident's own strings.
+	for _, w := range proseWords {
+		if strings.Contains(label, w) || strings.Contains(w, label) {
+			t.Fatalf("fixture bug: prose word %q overlaps the structured value %q; the fixture must be lexically disjoint", w, label)
+		}
+	}
+
+	rec, calls := applyOneHygiene(t, h, groomingStates())
+	if rec.Outcome != GroomingOutcomeApplied {
+		t.Fatalf("outcome = %q (%+v), want applied", rec.Outcome, rec)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("dispatches = %d (%+v), want exactly one", len(calls), calls)
+	}
+	req := calls[0]
+
+	// POSITIVE half: the request carries the structured value EXACTLY.
+	if !equalStrings(req.After.List, []string{label}) {
+		t.Errorf("dispatched labels = %#v, want exactly %#v", req.After.List, []string{label})
+	}
+
+	// NEGATIVE half: no part of the request came from the prose.
+	blob := fmt.Sprintf("%#v", req)
+	if strings.Contains(blob, prose) {
+		t.Errorf("the dispatched request carries the whole suggested_fix sentence: %s", blob)
+	}
+	for _, w := range proseWords {
+		if strings.Contains(blob, w) {
+			t.Errorf("the dispatched request carries the prose word %q — a value derived from suggested_fix reached the provider: %s", w, blob)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

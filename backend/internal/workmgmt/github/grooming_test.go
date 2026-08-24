@@ -1025,9 +1025,15 @@ func TestApplyGroomingMutation_ForgeErrorsSurface(t *testing.T) {
 // groomingForge is an httptest GitHub that records every request the apply
 // makes, so the assertions read the calls the forge ACTUALLY received.
 type groomingForge struct {
-	patches  []string // "<path> <body>", one per PATCH
-	posts    []string // "<path> <body>", one per non-GraphQL POST
-	graphql  []string // one operation name per GraphQL call
+	patches []string // "<path> <body>", one per PATCH
+	posts   []string // "<path> <body>", one per non-GraphQL POST
+	graphql []string // one operation name per GraphQL call
+	// bodies is EVERY request body the forge received, whatever the method or
+	// route, recorded ahead of the mux. It is what lets the cross-boundary
+	// test assert a NEGATIVE — that no request anywhere carried the
+	// `suggested_fix` prose — instead of only checking the routes it thought
+	// to look at.
+	bodies   []string
 	itemCols map[string]string
 }
 
@@ -1069,7 +1075,8 @@ func newGroomingForge(t *testing.T, currentColumn string) (*githubclient.Client,
 		case strings.Contains(body.Query, "ProjectFields"):
 			fx.graphql = append(fx.graphql, "ProjectFields")
 			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[`+
-				`{"id":"OPT_BACKLOG","name":"Backlog"},{"id":"OPT_ICEBOX","name":"Icebox"},{"id":"OPT_RANK_3","name":"3"}]}}}}}`)
+				`{"id":"OPT_BACKLOG","name":"Backlog"},{"id":"OPT_ICEBOX","name":"Icebox"},`+
+				`{"id":"OPT_RANK_1","name":"1"},{"id":"OPT_RANK_3","name":"3"}]}}}}}`)
 		case strings.Contains(body.Query, "projectItems"):
 			fx.graphql = append(fx.graphql, "ProjectItemStatus")
 			_, _ = io.WriteString(w, `{"data":{"node":{"projectItems":{"pageInfo":{"hasNextPage":false},"nodes":[`+
@@ -1086,7 +1093,13 @@ func newGroomingForge(t *testing.T, currentColumn string) (*githubclient.Client,
 		}
 	})
 
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		fx.bodies = append(fx.bodies, r.Method+" "+r.URL.Path+" "+string(raw))
+		r.Body = io.NopCloser(strings.NewReader(string(raw)))
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(srv.Close)
 	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
 	c.BaseURL = srv.URL
@@ -1117,10 +1130,16 @@ func groomingItemRef(number int) plan.ItemRef {
 }
 
 // TestApplyGrooming_EndToEndThroughGitHubProvider is the cross-boundary seam
-// per-layer units cannot cover (#618): the REAL workmgmt.ApplyGrooming core
-// drives the REAL *Provider over a REAL *githubclient.Client against an
-// httptest forge, and the assertions read the HTTP requests the fixture server
-// ACTUALLY received.
+// per-layer units cannot cover (#618, approval condition C2 of #2847): ONE
+// CONTINUOUS test from SERIALIZED report bytes through schema ingestion, domain
+// decoding, derivation, request resolution and the actual forge request body.
+//
+// It starts from hand-authored JSON — the bytes a groomer emits — rather than
+// from an in-memory struct, because the serialization seam is exactly where a
+// new schema field most plausibly gets lost: a missing json tag, an unsynced
+// embedded mirror, a decoder that drops the member. Any of those makes
+// `hygiene.fix` decode as nil, the entry skip, and the label POST vanish — so
+// the POST-body assertion below is the seam's own alarm.
 //
 // The fixture report carries four entries exercising the four outcomes that
 // matter: an APPROVED hygiene label fix (dispatches), an APPROVED gated
@@ -1138,27 +1157,55 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 	c, fx := newGroomingForge(t, "Backlog")
 	provider := New(c)
 
-	hygiene := plan.HygieneDefect{
-		ItemRef: groomingItemRef(2237), Defect: "missing_label_namespace",
-		Detail: "no area label", SuggestedFix: "area:backend",
+	// The `suggested_fix` PROSE is lexically disjoint from the structured
+	// label (approval condition C1), so "no request body carries the prose" is
+	// both satisfiable for correct behaviour and RED the moment the apply path
+	// reads the prose instead of `fix`.
+	const prose = "Please attach the ownership marking for platform duties"
+	const label = "area:backend"
+
+	hygieneRef := groomingItemRef(2237)
+	orderingRef := groomingItemRef(2238)
+	dupA, dupB := groomingItemRef(2239), groomingItemRef(2240)
+	decompRef := groomingItemRef(2241)
+
+	hygieneID := plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", hygieneRef)
+	orderingID := plan.GroomingEntryID(plan.GroomingClassOrdering, "", orderingRef)
+	dupID := plan.GroomingEntryID(plan.GroomingClassDuplicate, "", dupA, dupB)
+	decompID := plan.GroomingEntryID(plan.GroomingClassDecomposition, "", decompRef)
+
+	ref := func(r plan.ItemRef) string {
+		return fmt.Sprintf(`{"type":%q,"id":%q,"url":%q}`, r.Type, r.ID, r.URL)
 	}
-	hygiene.ID = plan.GroomingEntryID(plan.GroomingClassHygiene, hygiene.Defect, hygiene.ItemRef)
+	// AUTHORED BYTES, not a marshalled struct: `"fix"` is written here exactly
+	// as a groomer would emit it, so the json tag, the embedded schema mirror
+	// and the strict decoder are all on the path under test.
+	doc := []byte(fmt.Sprintf(`{
+  "kind": "grooming_report",
+  "report_version": "grooming_report_v1",
+  "ticket_reference": {"type":"github_issue","url":"https://github.com/kuhlman-labs/fishhawk/issues/2847","id":"kuhlman-labs/fishhawk#2847"},
+  "generated_by": {"agent":"claude-code","model":"claude-opus-5","timestamp":"2026-08-23T00:00:00Z"},
+  "summary": "One entry per outcome that matters.",
+  "ordering": [{"id":%q,"item_ref":%s,"rank":1,"score":9.0,"rubric_citations":[{"rubric_id":"U1"}]}],
+  "duplicates": [{"id":%q,"pair":[%s,%s],"basis":"same proposal","confidence":"high"}],
+  "hygiene_defects": [{"id":%q,"item_ref":%s,"defect":"missing_label_namespace","detail":"no area label","suggested_fix":%q,"fix":{"labels":[%q]}}],
+  "dependency_edges": [],
+  "vision_drift": [],
+  "decomposition_suggestions": [{"id":%q,"item_ref":%s,"rationale":"too big","proposed_children":[{"title":"a","scope_hint":"x"},{"title":"b","scope_hint":"y"}]}]
+}`,
+		orderingID, ref(orderingRef),
+		dupID, ref(dupA), ref(dupB),
+		hygieneID, ref(hygieneRef), prose, label,
+		decompID, ref(decompRef)))
 
-	ordering := plan.OrderingEntry{ItemRef: groomingItemRef(2238), Rank: 3, Score: 0.9}
-	ordering.ID = plan.GroomingEntryID(plan.GroomingClassOrdering, "", ordering.ItemRef)
-
-	dup := plan.DuplicateCandidate{
-		Pair:  []plan.ItemRef{groomingItemRef(2239), groomingItemRef(2240)},
-		Basis: "same proposal", Confidence: "high",
+	// INGESTION + DOMAIN DECODING — the production parser, not a test decoder.
+	report, err := plan.ParseGroomingReport(doc)
+	if err != nil {
+		t.Fatalf("ParseGroomingReport: %v", err)
 	}
-	dup.ID = plan.GroomingEntryID(plan.GroomingClassDuplicate, "", dup.Pair[0], dup.Pair[1])
-
-	decomp := plan.DecompositionSuggestion{ItemRef: groomingItemRef(2241), Rationale: "too big"}
-	decomp.ID = plan.GroomingEntryID(plan.GroomingClassDecomposition, "", decomp.ItemRef)
-
-	report := &plan.GroomingReport{
-		Ordering: []plan.OrderingEntry{ordering}, Duplicates: []plan.DuplicateCandidate{dup},
-		HygieneDefects: []plan.HygieneDefect{hygiene}, DecompositionSuggestions: []plan.DecompositionSuggestion{decomp},
+	if fix := report.HygieneDefects[0].Fix; fix == nil || len(fix.Labels) != 1 || fix.Labels[0] != label {
+		t.Fatalf("the structured fix did not survive serialization: %+v — a json tag or an unsynced schema mirror dropped it",
+			report.HygieneDefects[0])
 	}
 
 	sink := &recordingSink{}
@@ -1170,10 +1217,10 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 		},
 		Report: report,
 		Decisions: []workmgmt.GroomingDecision{
-			{EntryID: hygiene.ID, Verdict: workmgmt.GroomingApproved},
-			{EntryID: ordering.ID, Verdict: workmgmt.GroomingApproved},
-			{EntryID: dup.ID, Verdict: workmgmt.GroomingRejected, CloseTarget: dup.Pair[0].ID},
-			{EntryID: decomp.ID, Verdict: workmgmt.GroomingApproved},
+			{EntryID: hygieneID, Verdict: workmgmt.GroomingApproved},
+			{EntryID: orderingID, Verdict: workmgmt.GroomingApproved},
+			{EntryID: dupID, Verdict: workmgmt.GroomingRejected, CloseTarget: dupA.ID},
+			{EntryID: decompID, Verdict: workmgmt.GroomingApproved},
 		},
 		Modes: map[string]workmgmt.GroomingMode{
 			"hygiene":  workmgmt.GroomingModeAuto,
@@ -1183,7 +1230,7 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 			// icebox kind, whose entry ALSO holds an explicit gate approval.
 			"scoping": workmgmt.GroomingModeReport,
 		},
-		GateApproved: map[string]bool{decomp.ID: true},
+		GateApproved: map[string]bool{decompID: true},
 		States:       groomingStates,
 		IceboxColumn: "Icebox",
 	})
@@ -1191,21 +1238,46 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 		t.Fatalf("ApplyGrooming: %v", err)
 	}
 
-	// The label fix went out on the ADDITIVE endpoint carrying ONLY the new
-	// label, and ZERO PATCHes reached the forge — no wholesale label
-	// replacement and no close (#2237 review).
+	// THE FORGE REQUEST BODY — the far end of the seam. The label fix went out
+	// on the ADDITIVE endpoint carrying EXACTLY the structured label name, and
+	// ZERO PATCHes reached the forge (no wholesale label replacement, no
+	// close). AC1 requires the assertion be against the labels REQUESTED OF
+	// THE PROVIDER, not against the call merely succeeding.
 	if len(fx.posts) != 1 {
 		t.Fatalf("additive label POSTs = %v, want exactly one", fx.posts)
 	}
 	if !strings.Contains(fx.posts[0], "/repos/kuhlman-labs/fishhawk/issues/2237/labels") {
 		t.Errorf("POST path = %q, want the hygiene item's labels endpoint", fx.posts[0])
 	}
-	if !strings.Contains(fx.posts[0], `{"labels":["area:backend"]}`) {
-		t.Errorf("POST body = %q, want ONLY the added label — a union payload is the lost-update shape", fx.posts[0])
+	if !strings.Contains(fx.posts[0], `{"labels":["`+label+`"]}`) {
+		t.Errorf("POST body = %q, want ONLY the structured label — a union payload is the lost-update shape", fx.posts[0])
 	}
 	if len(fx.patches) != 0 {
 		t.Errorf("PATCH calls = %v, want none: the label write is additive and the duplicate close was REJECTED", fx.patches)
 	}
+
+	// THE NEGATIVE ARM (#2847): NO request body the forge received — on any
+	// route, by any method — carries the `suggested_fix` prose. This is what
+	// makes the seam prove the prose never reaches the forge, rather than only
+	// that the label route looked right.
+	var proseWords []string
+	for _, w := range strings.Fields(prose) {
+		if len(w) >= 4 {
+			proseWords = append(proseWords, w)
+		}
+	}
+	for _, body := range fx.bodies {
+		if strings.Contains(body, prose) {
+			t.Errorf("a forge request carries the whole suggested_fix sentence: %s", body)
+			continue
+		}
+		for _, w := range proseWords {
+			if strings.Contains(body, w) {
+				t.Errorf("a forge request carries the prose word %q — a value derived from suggested_fix reached the forge: %s", w, body)
+			}
+		}
+	}
+
 	// The report-mode entry is the only board move in the report, so ZERO
 	// board writes proves report mode beat the gate approval (condition I1).
 	if n := countOp(fx.graphql, "SetField"); n != 1 {
@@ -1226,13 +1298,13 @@ func TestApplyGrooming_EndToEndThroughGitHubProvider(t *testing.T) {
 	var sawReportMode, sawRejected bool
 	for _, rec := range sink.records {
 		switch rec.EntryID {
-		case decomp.ID:
+		case decompID:
 			sawReportMode = true
 			if rec.SkipReason != workmgmt.GroomingSkipReportMode {
 				t.Errorf("decomposition skip reason = %q, want %q (report mode beats the gate approval)",
 					rec.SkipReason, workmgmt.GroomingSkipReportMode)
 			}
-		case dup.ID:
+		case dupID:
 			sawRejected = true
 			if rec.SkipReason != workmgmt.GroomingSkipNotApproved {
 				t.Errorf("duplicate skip reason = %q, want %q", rec.SkipReason, workmgmt.GroomingSkipNotApproved)

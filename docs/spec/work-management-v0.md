@@ -282,12 +282,14 @@ An already-decided entry is re-proposed only when its **structural basis** moved
 |---|---|---|
 | `ordering` | sorted, lowercased `rubric_id` set | `rank`, `score` (compared numerically against the thresholds, not by equality), `rationale` |
 | `duplicate` | *nothing* — the pair identity is already the entry id | `basis` (prose), `confidence` (an agent-regenerated judgment; a `medium`→`high` flip is jitter of the same kind `score` is) |
-| `hygiene` | normalized `suggested_fix` — the value that would be written | `detail` |
+| `hygiene` | the normalized structured `fix` — sorted trimmed label set, normalized parent-epic ref, lower-cased board state, trimmed field value: the value that would actually be written (#2847) | `detail`, `suggested_fix` (both prose) |
 | `dependency` | `kind` — direction is already in the id | `basis` |
 | `vision_drift` | the `basis` enum | `detail`; `charter_ref_id` is already the id qualifier |
 | `decomposition` | the proposed-children **count** | child titles and scope hints |
 
 Two residuals, stated rather than implied: a rejected proposal whose **only** change is re-worded justification does not resurface, and two proposals to split the same item into the same number of children are treated as one proposal.
+
+A third, ONE-TIME residual: the `hygiene` basis moved from `suggested_fix` onto the structured `fix` in #2847, so every hygiene fingerprint changed value once and hygiene entries decided under the old basis resurface exactly **once** on the next grooming run. That is the honest consequence of the proposal's identity genuinely changing shape — the basis now covers the value the apply path dispatches, so a re-worded sentence over an unchanged label set is no longer a "materially changed" proposal, and two different label sets behind one sentence are no longer one proposal. The board state is lower-cased on both sides — in the fingerprint and in the conventions lookup that resolves it — so `Backlog` and `backlog` are one proposal for the guard and one state for the apply.
 
 ### The charter-change lift
 

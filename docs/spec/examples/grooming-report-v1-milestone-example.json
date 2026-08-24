@@ -46,7 +46,10 @@
       },
       "defect": "unboarded",
       "detail": "Not present on the phase board, so it is invisible to the kanban view — found while scoping the milestone.",
-      "suggested_fix": "Add the item to the phase board and set Status=Backlog."
+      "suggested_fix": "Add the item to the phase board and set Status=Backlog.",
+      "fix": {
+        "board_state": "backlog"
+      }
     }
   ],
   "dependency_edges": [],

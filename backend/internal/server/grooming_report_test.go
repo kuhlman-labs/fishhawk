@@ -1211,7 +1211,11 @@ func churnReport(ranks []int, scores []float64, hygieneDefect string) *plan.Groo
 		ref := churnItem("9")
 		gr.HygieneDefects = append(gr.HygieneDefects, plan.HygieneDefect{
 			ID:      plan.GroomingEntryID(plan.GroomingClassHygiene, hygieneDefect, ref),
-			ItemRef: ref, Defect: hygieneDefect, Detail: "detail", SuggestedFix: "3",
+			ItemRef: ref, Defect: hygieneDefect, Detail: "detail",
+			// The churn fingerprint's hygiene basis is the STRUCTURED fix
+			// (#2847), not the prose, so the boundary fixture drives it here.
+			SuggestedFix: "prose suggestion",
+			Fix:          &plan.HygieneFix{FieldValue: "3"},
 		})
 	}
 	return gr

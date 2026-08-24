@@ -76,6 +76,63 @@ All six entry arrays are **required** even when empty. `[]` states "none found",
 which is a different claim from omitting the key — and the two must not be
 conflated by a downstream diff (#2240).
 
+## The hygiene fix is STRUCTURED, and the prose is never dispatched
+
+A `hygiene_defects` entry carries two fields describing its correction, and they
+have different readers:
+
+- **`suggested_fix`** is **prose for a human**. It is rendered at the operator
+  gate and is **never** read as a mutation payload.
+- **`fix`** is the **structured mutation payload** the apply path reads. Exactly
+  the member the entry's `defect` requires is populated.
+
+| `defect` | mutation kind | `fix` member | example |
+|---|---|---|---|
+| `missing_label_namespace` | `label_set` | `fix.labels` | `["area:server-api", "phase:alpha"]` |
+| `unlinked_parent_epic` | `epic_link` | `fix.parent_epic` | `"389"` or `"#389"` |
+| `missing_parent_epic_link` | `epic_link` | `fix.parent_epic` | `"#389"` |
+| `unboarded` | `board_place` | `fix.board_state` | `"backlog"` (a **canonical** state) |
+| `missing_estimate` | `field_set` | `fix.field_value` | `"3"` |
+| `absent_done_means` | *none* | *none* | the fix is authored prose; no mutation kind expresses it |
+
+**Why the split exists (#2847).** The apply path used to assign
+`strings.TrimSpace(suggested_fix)` straight into the mutation's value. A report
+saying `"suggested_fix": "Add phase:alpha."` therefore asked GitHub to create a
+label named literally `Add phase:alpha.` — and GitHub did, on eight real issues.
+Recovering three label names from `Add area:server-api, autonomy:medium,
+phase:alpha.` is a guess, and a guess that writes to a real tracker is the
+failure mode this artifact's whole gate exists to prevent. So the value is
+**stated**, not parsed, and the prose is unreadable by the mutator.
+
+### Validation, and what happens when it fails
+
+Every value is validated **before** any provider call, so a bad proposal is an
+audited refusal rather than a forge error after a write was attempted:
+
+| Member | Rule |
+|---|---|
+| `labels` | Each name validated **exactly as written** (never trimmed first): non-empty, carrying **no whitespace** and **no control character**, **not beginning or ending** with a punctuation or symbol rune, at most **50 characters**. So ` phase:alpha` is refused, not silently trimmed. One invalid name fails the **whole entry** — a partial label write is a half-applied fix nobody proposed. |
+| `parent_epic` | A positive integer after stripping one optional leading `#`. Both wire forms (`389`, `#389`) are accepted and normalize to `#N`. |
+| `board_state` | A **canonical** state, matched case-insensitively against the work-management conventions `states` map and resolved to that board's own column option before dispatch. |
+| `field_value` | Single-line — checked **as written**, so a leading or trailing newline is refused rather than trimmed away — and non-empty after trimming surrounding spaces. |
+
+The label rule is deliberately **stricter than the forge**: GitHub accepts a
+label named `good first issue`. The defect class whose fix this is
+(`missing_label_namespace`) is by construction a `namespace:value` label, and
+the failure direction of an over-strict check is an audited skip, never a
+garbage write.
+
+An entry whose `fix` is **absent**, populates only a member this defect's kind
+does not read, or carries a **blank** value is recorded as the named skip
+`no_structured_fix`; one carrying an **invalid** value is recorded
+`invalid_fix_value`. Both apply **nothing**, and neither falls back to
+`suggested_fix` — however precisely that sentence names the value.
+
+**`fix` is optional and additive** within `grooming_report_v1`: an entry whose
+defect has no mechanical mutation legitimately carries none, so it is not
+`x-intended-required`. Its absence is distinguishable from an empty object on
+the wire and in the decoded struct.
+
 ## The citation rule is a schema constraint, not a prompt
 
 Charter §5.1: *"Every ranking entry names the rubric id justifying it. A score
