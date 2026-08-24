@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +51,31 @@ type tokenTestServer struct {
 
 	// mintRequests records what the CLI POSTed to the mint endpoint.
 	mintRequests []tokenLoginRequest
+
+	// ghDeviceCodeCalls counts POSTs to GitHub's device-code endpoint,
+	// so a test can assert the GitHub leg was NOT driven.
+	ghDeviceCodeCalls int
+
+	// --- GitLab device flow (E66.4 / #2392) -----------------------
+	//
+	// The same server also plays the GitLab instance, on GitLab's own
+	// paths. glDeviceCode is the /oauth/authorize_device response;
+	// glDeviceStatus/glDeviceBody override it with a raw body.
+	glDeviceCode   deviceCodeResponse
+	glDeviceStatus int
+	glDeviceBody   any
+
+	// glPollStates is the /oauth/token poll sequence. The handler picks
+	// the status from the state: GitLab (Doorkeeper) serves RFC 8628
+	// §3.5 poll states as OAuth errors on HTTP 400, not on 200 the way
+	// GitHub does, so a state carrying an error is answered 400.
+	glPollStates []accessTokenResponse
+	glPollIdx    int
+
+	// glDeviceForms / glPollForms record the form bodies the CLI POSTed
+	// to each GitLab endpoint, so the wire contract is assertable.
+	glDeviceForms []url.Values
+	glPollForms   []url.Values
 }
 
 func newTokenTestServer(t *testing.T) *tokenTestServer {
@@ -64,6 +90,14 @@ func newTokenTestServer(t *testing.T) *tokenTestServer {
 		},
 		pollStates: []accessTokenResponse{{AccessToken: "gho_useraccess"}},
 		discovery:  tokenLoginDiscovery{Provider: "github", ClientID: "Iv1.testclient"},
+		glDeviceCode: deviceCodeResponse{
+			DeviceCode:      "gl-devcode-123",
+			UserCode:        "GLAB-5678",
+			VerificationURI: "https://gitlab.example.com/oauth/device",
+			ExpiresIn:       900,
+			Interval:        5,
+		},
+		glPollStates: []accessTokenResponse{{AccessToken: "glpat_useraccess"}},
 		mint: tokenLoginResponse{
 			Token:      "fhk_minted",
 			Subject:    "github:octocat",
@@ -74,6 +108,9 @@ func newTokenTestServer(t *testing.T) *tokenTestServer {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
+		ts.mu.Lock()
+		ts.ghDeviceCodeCalls++
+		ts.mu.Unlock()
 		if ts.deviceCodeStatus != 0 {
 			writeJSON(w, ts.deviceCodeStatus, ts.deviceCodeBody)
 			return
@@ -88,6 +125,33 @@ func newTokenTestServer(t *testing.T) *tokenTestServer {
 			ts.pollIdx++
 		}
 		writeJSON(w, http.StatusOK, st)
+	})
+	// GitLab's device-flow endpoints. Both take form bodies; the poll
+	// endpoint answers a poll STATE on HTTP 400 (Doorkeeper) and the
+	// authorized token on 200.
+	mux.HandleFunc("/oauth/authorize_device", func(w http.ResponseWriter, r *http.Request) {
+		ts.mu.Lock()
+		ts.glDeviceForms = append(ts.glDeviceForms, readForm(r))
+		ts.mu.Unlock()
+		if ts.glDeviceStatus != 0 {
+			writeJSON(w, ts.glDeviceStatus, ts.glDeviceBody)
+			return
+		}
+		writeJSON(w, http.StatusOK, ts.glDeviceCode)
+	})
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		ts.glPollForms = append(ts.glPollForms, readForm(r))
+		st := ts.glPollStates[ts.glPollIdx]
+		if ts.glPollIdx < len(ts.glPollStates)-1 {
+			ts.glPollIdx++
+		}
+		status := http.StatusOK
+		if st.Error != "" {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, st)
 	})
 	mux.HandleFunc("/v0/tokens/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -115,6 +179,13 @@ func newTokenTestServer(t *testing.T) *tokenTestServer {
 	ts.srv = httptest.NewServer(mux)
 	t.Cleanup(ts.srv.Close)
 	return ts
+}
+
+// readForm parses an application/x-www-form-urlencoded request body.
+func readForm(r *http.Request) url.Values {
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	v, _ := url.ParseQuery(string(raw))
+	return v
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -446,18 +517,478 @@ func TestTokenLogin_DeviceCodeOtherOAuthError(t *testing.T) {
 	}
 }
 
-// A non-github provider is rejected before any network call.
+// An unrecognized provider is rejected before any network call, and the
+// message names the supported set (E66.4 / #2392).
 func TestTokenLogin_UnsupportedProvider(t *testing.T) {
 	ts := newTokenTestServer(t)
 	setupTokenTest(t, ts)
+	// Make discovery fail loudly: a provider rejected before the network
+	// call cannot have reached it.
+	ts.discoveryStatus = http.StatusServiceUnavailable
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "bitbucket"}, &stdout, &stderr)
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitUsage, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "bitbucket") {
+		t.Errorf("stderr should name the unsupported provider: %s", out)
+	}
+	// The rejection names what IS supported, so the operator can fix it
+	// without reading the source.
+	for _, want := range []string{"github", "gitlab"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr should name supported provider %q: %s", want, out)
+		}
+	}
+	if len(ts.mintRequests) != 0 {
+		t.Errorf("mint must not be reached for an unsupported provider, got %d", len(ts.mintRequests))
+	}
+}
+
+// --- GitLab device flow (E66.4 / #2392) ---------------------------
+
+// gitlabDiscovery points the discovery response at a dual-forge backend
+// whose gitlab entry names THIS test server as the instance base URL, so
+// the CLI's GitLab endpoints resolve to a reachable in-test server (the
+// counterfactual-attainability rule's trap (c)).
+func gitlabDiscovery(ts *tokenTestServer) tokenLoginDiscovery {
+	return tokenLoginDiscovery{
+		Provider: "github",
+		ClientID: "Iv1.testclient",
+		Providers: []tokenLoginProviderEntry{
+			{Provider: "github", ClientID: "Iv1.testclient"},
+			{Provider: "gitlab", ClientID: "glcid.device", BaseURL: ts.srv.URL},
+		},
+	}
+}
+
+// `--provider gitlab` selects the gitlab discovery entry, drives the RFC
+// 8628 device grant against the GitLab endpoints (form-encoded, no
+// client_secret), and mints with provider=gitlab.
+func TestTokenLogin_GitLabHappyPath(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = gitlabDiscovery(ts)
+	ts.mint = tokenLoginResponse{
+		Token:      "fhk_gl",
+		Subject:    "gitlab:alice",
+		Scopes:     []string{"read:runs"},
+		AuthMethod: "oauth",
+		Provider:   "gitlab",
+	}
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
-	if code != exitUsage {
-		t.Fatalf("exit = %d, want %d", code, exitUsage)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "gitlab") {
-		t.Errorf("stderr should name the unsupported provider: %s", stderr.String())
+
+	// The GitLab device-code prompt printed.
+	if !strings.Contains(stderr.String(), "GLAB-5678") {
+		t.Errorf("stderr missing gitlab user_code: %s", stderr.String())
+	}
+
+	// The GitLab endpoints were driven — NOT GitHub's.
+	if len(ts.glDeviceForms) != 1 {
+		t.Fatalf("want 1 /oauth/authorize_device request, got %d", len(ts.glDeviceForms))
+	}
+	dev := ts.glDeviceForms[0]
+	if got := dev.Get("client_id"); got != "glcid.device" {
+		t.Errorf("device-code client_id = %q, want the gitlab DEVICE client_id", got)
+	}
+	if got := dev.Get("scope"); got != "read_api" {
+		t.Errorf("device-code scope = %q, want read_api", got)
+	}
+	// The device application is NON-Confidential: no secret on the wire.
+	if got := dev.Get("client_secret"); got != "" {
+		t.Errorf("device-code request must not carry a client_secret, got %q", got)
+	}
+	if len(ts.glPollForms) != 1 {
+		t.Fatalf("want 1 /oauth/token request, got %d", len(ts.glPollForms))
+	}
+	poll := ts.glPollForms[0]
+	if got := poll.Get("grant_type"); got != "urn:ietf:params:oauth:grant-type:device_code" {
+		t.Errorf("poll grant_type = %q, want the RFC 8628 device grant", got)
+	}
+	if got := poll.Get("device_code"); got != "gl-devcode-123" {
+		t.Errorf("poll device_code = %q, want the issued device code", got)
+	}
+	if got := poll.Get("client_secret"); got != "" {
+		t.Errorf("poll request must not carry a client_secret, got %q", got)
+	}
+	// GitHub's endpoints were never touched.
+	if ts.ghDeviceCodeCalls != 0 {
+		t.Errorf("a gitlab login must not touch GitHub's device endpoint, got %d calls", ts.ghDeviceCodeCalls)
+	}
+	if len(ts.mintRequests) != 1 {
+		t.Fatalf("want 1 mint request, got %d", len(ts.mintRequests))
+	}
+	if ts.mintRequests[0].Provider != "gitlab" {
+		t.Errorf("mint provider = %q, want gitlab", ts.mintRequests[0].Provider)
+	}
+	if ts.mintRequests[0].AccessToken != "glpat_useraccess" {
+		t.Errorf("mint access_token = %q, want the GitLab device-flow token", ts.mintRequests[0].AccessToken)
+	}
+
+	cred, err := credstore.Load(ts.srv.URL)
+	if err != nil {
+		t.Fatalf("stored credential not found: %v", err)
+	}
+	if cred.Subject != "gitlab:alice" || cred.Provider != "gitlab" {
+		t.Errorf("stored credential wrong: %+v", cred)
+	}
+}
+
+// GitLab serves the RFC 8628 poll states as OAuth error responses on
+// HTTP 400 (Doorkeeper), not on 200 the way GitHub does. The CLI must
+// treat a decodable 400 as a poll STATE and keep polling, not as a
+// transport failure.
+func TestTokenLogin_GitLabPollsThroughPendingOn400(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = gitlabDiscovery(ts)
+	ts.glPollStates = []accessTokenResponse{
+		{Error: "authorization_pending"},
+		{Error: "slow_down"},
+		{AccessToken: "glpat_late"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
+	}
+	if len(ts.mintRequests) != 1 || ts.mintRequests[0].AccessToken != "glpat_late" {
+		t.Fatalf("expected mint with glpat_late, got %+v", ts.mintRequests)
+	}
+}
+
+// The terminal GitLab poll states abort the login and store nothing.
+func TestTokenLogin_GitLabTerminalPollStates(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     accessTokenResponse
+		wantInErr string
+	}{
+		{"access_denied", accessTokenResponse{Error: "access_denied"}, "denied"},
+		{"expired_token", accessTokenResponse{Error: "expired_token"}, "timed out"},
+		{"unknown", accessTokenResponse{Error: "invalid_grant"}, "invalid_grant"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTokenTestServer(t)
+			setupTokenTest(t, ts)
+			ts.discovery = gitlabDiscovery(ts)
+			ts.glPollStates = []accessTokenResponse{tc.state}
+
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+			if code != exitFailure {
+				t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantInErr) {
+				t.Errorf("stderr should carry %q: %s", tc.wantInErr, stderr.String())
+			}
+			if _, err := credstore.Load(ts.srv.URL); err == nil {
+				t.Error("credential must NOT be stored on a terminal poll state")
+			}
+			if len(ts.mintRequests) != 0 {
+				t.Errorf("mint must not be reached, got %d", len(ts.mintRequests))
+			}
+		})
+	}
+}
+
+// A GitLab device-code request that fails (non-2xx with an OAuth error
+// body) surfaces the error and never prompts.
+func TestTokenLogin_GitLabDeviceCodeRejected(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = gitlabDiscovery(ts)
+	ts.glDeviceStatus = http.StatusUnauthorized
+	ts.glDeviceBody = map[string]string{
+		"error":             "invalid_client",
+		"error_description": "Client authentication failed.",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "invalid_client") {
+		t.Errorf("stderr should surface the OAuth error: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "To authorize, open") {
+		t.Errorf("no device prompt should print when the device-code request failed: %s", stderr.String())
+	}
+}
+
+// A 200 device-code response carrying no device_code is refused rather
+// than prompting with an empty verification URI.
+func TestTokenLogin_GitLabDeviceCodeMissing(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = gitlabDiscovery(ts)
+	ts.glDeviceCode = deviceCodeResponse{Error: "unauthorized_client", ErrorDescription: "device flow not enabled"}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "device flow not enabled") {
+		t.Errorf("stderr should surface the error_description: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "To authorize, open") {
+		t.Errorf("no device prompt should print without a device_code: %s", stderr.String())
+	}
+}
+
+// A backend advertising gitlab WITHOUT a base_url is a misconfiguration
+// the CLI refuses loudly rather than driving a bare "/oauth/..." path.
+func TestTokenLogin_GitLabMissingBaseURL(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	disc := gitlabDiscovery(ts)
+	disc.Providers[1].BaseURL = ""
+	ts.discovery = disc
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "FISHHAWKD_GITLAB_BASE_URL") {
+		t.Errorf("stderr should name the missing backend config: %s", stderr.String())
+	}
+	if len(ts.glDeviceForms) != 0 {
+		t.Errorf("no device request should be attempted without a base URL, got %d", len(ts.glDeviceForms))
+	}
+}
+
+// An entry advertised with an empty client_id hits the no-client_id
+// guard rather than driving the flow with "".
+func TestTokenLogin_GitLabEmptyClientID(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	disc := gitlabDiscovery(ts)
+	disc.Providers[1].ClientID = ""
+	ts.discovery = disc
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "client_id") {
+		t.Errorf("stderr should explain the missing client_id: %s", stderr.String())
+	}
+	if len(ts.glDeviceForms) != 0 {
+		t.Errorf("no device request should be attempted without a client_id, got %d", len(ts.glDeviceForms))
+	}
+}
+
+// A dual-forge backend still serves `--provider github` from the github
+// ENTRY (not the legacy top-level mirror of it), driving GitHub's
+// endpoints unchanged.
+func TestTokenLogin_GitHubSelectedFromProvidersArray(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	disc := gitlabDiscovery(ts)
+	// Legacy top-level fields deliberately name gitlab, so a CLI that
+	// read them instead of the array would pick the wrong forge.
+	disc.Provider = "gitlab"
+	disc.ClientID = "glcid.device"
+	ts.discovery = disc
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
+	}
+	if len(ts.glDeviceForms) != 0 {
+		t.Errorf("a github login must not touch GitLab's endpoints, got %d", len(ts.glDeviceForms))
+	}
+	if ts.ghDeviceCodeCalls != 1 {
+		t.Errorf("github device-code endpoint calls = %d, want 1", ts.ghDeviceCodeCalls)
+	}
+	if len(ts.mintRequests) != 1 || ts.mintRequests[0].Provider != "github" {
+		t.Fatalf("mint should carry provider=github, got %+v", ts.mintRequests)
+	}
+}
+
+// Requesting a provider the backend does NOT advertise is refused with
+// the configured set named — never silently satisfied from another
+// forge's entry, which would drive the wrong instance.
+func TestTokenLogin_ProviderNotAdvertised(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = tokenLoginDiscovery{
+		Provider:  "github",
+		ClientID:  "Iv1.testclient",
+		Providers: []tokenLoginProviderEntry{{Provider: "github", ClientID: "Iv1.testclient"}},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "gitlab") || !strings.Contains(out, "configured: github") {
+		t.Errorf("stderr should name the requested and configured providers: %s", out)
+	}
+	if len(ts.glDeviceForms) != 0 || ts.ghDeviceCodeCalls != 0 {
+		t.Error("no device flow should be driven for an unadvertised provider")
+	}
+	if len(ts.mintRequests) != 0 {
+		t.Errorf("mint must not be reached, got %d", len(ts.mintRequests))
+	}
+}
+
+// A backend PREDATING the providers array (legacy top-level fields only)
+// still drives a github login — the forward-compat fallback.
+func TestTokenLogin_LegacyDiscoveryFallback(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	// No Providers array at all — exactly the pre-#2392 wire shape.
+	ts.discovery = tokenLoginDiscovery{Provider: "github", ClientID: "Iv1.legacy"}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
+	}
+	if len(ts.mintRequests) != 1 || ts.mintRequests[0].Provider != "github" {
+		t.Fatalf("mint should carry provider=github, got %+v", ts.mintRequests)
+	}
+}
+
+// A legacy backend cannot serve gitlab: the fallback is scoped to the
+// provider the top-level fields actually name, so a gitlab request is
+// refused rather than driven with a GitHub client_id.
+func TestTokenLogin_LegacyDiscoveryRefusesGitLab(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = tokenLoginDiscovery{Provider: "github", ClientID: "Iv1.legacy"}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL, "--provider", "gitlab"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "configured: github") {
+		t.Errorf("stderr should name the legacy configured provider: %s", stderr.String())
+	}
+	if len(ts.glDeviceForms) != 0 {
+		t.Errorf("no GitLab device request should be attempted, got %d", len(ts.glDeviceForms))
+	}
+	if len(ts.mintRequests) != 0 {
+		t.Errorf("mint must not be reached, got %d", len(ts.mintRequests))
+	}
+}
+
+// resolveProviderEntry's branches in isolation, including the
+// empty-legacy-provider default that only a hand-built response reaches.
+func TestResolveProviderEntry(t *testing.T) {
+	arrayed := tokenLoginDiscovery{
+		Provider: "github",
+		ClientID: "Iv1.top",
+		Providers: []tokenLoginProviderEntry{
+			{Provider: "github", ClientID: "Iv1.gh"},
+			{Provider: "gitlab", ClientID: "gl.dev", BaseURL: "https://gitlab.example.com"},
+		},
+	}
+	for _, tc := range []struct {
+		name     string
+		disc     tokenLoginDiscovery
+		provider string
+		want     tokenLoginProviderEntry
+		wantErr  string
+	}{
+		{"array github", arrayed, "github", tokenLoginProviderEntry{Provider: "github", ClientID: "Iv1.gh"}, ""},
+		{"array gitlab", arrayed, "gitlab", arrayed.Providers[1], ""},
+		{"array miss", arrayed, "bitbucket", tokenLoginProviderEntry{}, "configured: github, gitlab"},
+		{
+			"legacy github",
+			tokenLoginDiscovery{Provider: "github", ClientID: "Iv1.legacy"},
+			"github",
+			tokenLoginProviderEntry{Provider: "github", ClientID: "Iv1.legacy"},
+			"",
+		},
+		{
+			// A legacy body with no provider field at all: the only
+			// forge a pre-#2392 backend ever served was github.
+			"legacy empty provider defaults to github",
+			tokenLoginDiscovery{ClientID: "Iv1.legacy"},
+			"github",
+			tokenLoginProviderEntry{Provider: "github", ClientID: "Iv1.legacy"},
+			"",
+		},
+		{
+			"legacy refuses other provider",
+			tokenLoginDiscovery{Provider: "github", ClientID: "Iv1.legacy"},
+			"gitlab",
+			tokenLoginProviderEntry{},
+			"configured: github",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveProviderEntry(tc.disc, tc.provider)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got entry %+v", tc.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("entry = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// --client-id overrides the ADVERTISED device client_id for gitlab, but
+// discovery is still consulted for the instance base_url — a flag cannot
+// supply one, and driving the wrong instance is worse than one extra GET.
+func TestTokenLogin_GitLabClientIDOverrideStillUsesDiscoveredBaseURL(t *testing.T) {
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	ts.discovery = gitlabDiscovery(ts)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL,
+		"--provider", "gitlab", "--client-id", "gl.override"}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
+	}
+	if len(ts.glDeviceForms) != 1 {
+		t.Fatalf("want 1 device-code request against the discovered base URL, got %d", len(ts.glDeviceForms))
+	}
+	if got := ts.glDeviceForms[0].Get("client_id"); got != "gl.override" {
+		t.Errorf("device-code client_id = %q, want the overridden id", got)
+	}
+}
+
+// deviceFlowDriverFor refuses a provider it has no endpoints for. This
+// is defence in depth behind the flag validation: the two lists could
+// drift, and driving an unknown forge is not a failure the flow should
+// discover mid-poll.
+func TestDeviceFlowDriverFor_UnsupportedProvider(t *testing.T) {
+	_, err := deviceFlowDriverFor(tokenLoginProviderEntry{Provider: "bitbucket", ClientID: "x"})
+	if err == nil {
+		t.Fatal("want an error for an unsupported provider")
+	}
+	if !strings.Contains(err.Error(), "bitbucket") {
+		t.Errorf("error should name the provider: %v", err)
 	}
 }
 
