@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
@@ -3884,5 +3885,184 @@ func TestGitLabIdentityWarnings(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "gitlabIdentityWarnings(*gitlabBaseURL, *gitlabDeviceClientID, *gitlabToken)") {
 		t.Error("serve.go no longer calls gitlabIdentityWarnings with the three config values; the warnings would stop firing")
+	}
+}
+
+// TestWebhookDispatcher_WiresGitLabFileFetcher pins the GitLab run-creation
+// wiring (E45.22 / #2043). The dispatcher literal lives inside serve's
+// several-hundred-line config assembly, which no unit test can construct, so
+// the pin is a body-grep on the source — the same technique the repo uses for
+// other un-constructible wiring sites.
+//
+// It is load-bearing rather than cosmetic. BOTH pinned lines fail silently
+// when dropped, in opposite directions, and neither shows up in any
+// backend/internal/webhook unit test:
+//
+//   - GitLabFiles nil leaves an admitted GitLab trigger logging and skipping
+//     (see TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating).
+//   - GitLabProjects nil FAILS CLOSED (concerns cbe8d579 / 435fad9b): every
+//     GitLab delivery — creation and CI retry alike — refuses with
+//     gitlab_project_registry_unwired. Safe, but it turns GitLab go-live off
+//     entirely while the whole unit suite stays green, because those tests
+//     supply their own authorizer.
+func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	body := string(src)
+	i := strings.Index(body, "cfg.WebhookDispatcher = &webhook.Dispatcher{")
+	if i < 0 {
+		t.Fatal("webhook.Dispatcher literal not found in serve.go; update this pin")
+	}
+	end := strings.Index(body[i:], "\n\t\t}\n")
+	if end < 0 {
+		t.Fatal("could not bound the webhook.Dispatcher literal; update this pin")
+	}
+	literal := body[i : i+end]
+	for _, want := range []struct{ line, consequence string }{
+		{`GitLabFiles: registeredFileFetcher("gitlab")`,
+			"GitLab run creation would be a silent no-op"},
+		{`GitLabProjects: gitlabProjects`,
+			"every GitLab delivery would fail closed as gitlab_project_registry_unwired"},
+	} {
+		if !strings.Contains(literal, want.line) {
+			t.Errorf("webhook.Dispatcher literal is missing %s; %s. Literal:\n%s",
+				want.line, want.consequence, literal)
+		}
+	}
+}
+
+// fakeGitLabRegistryQueries is a gitLabProjectRegistryQueries that serves a
+// programmed installation + account, or a programmed error, and records the
+// lookup key — so the registry's binding can be exercised without a database.
+type fakeGitLabRegistryQueries struct {
+	inst    accountdb.Installation
+	instErr error
+	acct    accountdb.Account
+	acctErr error
+
+	gotProvider string
+	gotRef      string
+}
+
+func (f *fakeGitLabRegistryQueries) GetInstallationByRef(_ context.Context, arg accountdb.GetInstallationByRefParams) (accountdb.Installation, error) {
+	f.gotProvider = arg.Provider
+	f.gotRef = arg.InstallationRef
+	return f.inst, f.instErr
+}
+
+func (f *fakeGitLabRegistryQueries) GetAccount(_ context.Context, _ uuid.UUID) (accountdb.Account, error) {
+	return f.acct, f.acctErr
+}
+
+// TestGitLabProjectRegistry_AuthorizedGitLabProject pins the production
+// authorization binding the webhook dispatcher fails closed on (E45.22 /
+// #2043): a GitLab payload's project is authorized only when its credential
+// ref resolves to a REGISTERED gitlab installation AND the project path lives
+// in that installation's account namespace.
+//
+// The registered cell is the paired control — without it, "refuses" could be
+// satisfied by a function that returns false unconditionally.
+func TestGitLabProjectRegistry_AuthorizedGitLabProject(t *testing.T) {
+	acctID := uuid.New()
+	registered := accountdb.Installation{AccountID: acctID, Provider: "gitlab", InstallationRef: "gitlab:4242"}
+	acmeAccount := accountdb.Account{ID: acctID, Provider: "gitlab", AccountKey: "acme"}
+
+	cases := []struct {
+		name    string
+		q       gitLabProjectRegistryQueries
+		ref     string
+		path    string
+		want    bool
+		wantErr bool
+	}{
+		{
+			name: "registered_ref_in_account_namespace_authorizes",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/widgets", want: true,
+		},
+		{
+			// A nested group still resolves on its first segment, matching
+			// account.Resolver's owner-segment convention.
+			name: "registered_ref_nested_group_authorizes",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/team/widgets", want: true,
+		},
+		{
+			// The registered id paired with ANOTHER account's project path:
+			// the spec-read selector aimed elsewhere. Refused.
+			name: "registered_ref_foreign_namespace_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
+			ref:  "gitlab:4242", path: "victim/other", want: false,
+		},
+		{
+			name: "unregistered_ref_refuses",
+			q:    &fakeGitLabRegistryQueries{instErr: pgx.ErrNoRows},
+			ref:  "gitlab:9999", path: "acme/widgets", want: false,
+		},
+		{
+			name: "installation_without_account_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acctErr: pgx.ErrNoRows},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+		},
+		{
+			name: "installation_query_fault_errors",
+			q:    &fakeGitLabRegistryQueries{instErr: errors.New("connection reset")},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false, wantErr: true,
+		},
+		{
+			name: "account_query_fault_errors",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acctErr: errors.New("connection reset")},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false, wantErr: true,
+		},
+		{
+			name: "namespaceless_path_refuses_without_a_query",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
+			ref:  "gitlab:4242", path: "widgets", want: false,
+		},
+		{
+			name: "empty_ref_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
+			ref:  "", path: "acme/widgets", want: false,
+		},
+		{
+			name: "nil_queries_refuses",
+			q:    nil,
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := gitLabProjectRegistry{q: tc.q}
+			got, err := r.AuthorizedGitLabProject(context.Background(), tc.ref, tc.path)
+			if tc.wantErr && err == nil {
+				t.Fatal("err = nil, want the query fault surfaced (the dispatcher fails closed on it)")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("authorized = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGitLabProjectRegistry_LooksUpTheGitLabProvider pins the discriminator the
+// lookup is keyed by: an installations row is per (provider, ref), and querying
+// the wrong provider would authorize a GitHub installation whose ref happened
+// to collide with a GitLab project ref.
+func TestGitLabProjectRegistry_LooksUpTheGitLabProvider(t *testing.T) {
+	q := &fakeGitLabRegistryQueries{instErr: pgx.ErrNoRows}
+	if _, err := (gitLabProjectRegistry{q: q}).AuthorizedGitLabProject(
+		context.Background(), "gitlab:4242", "acme/widgets"); err != nil {
+		t.Fatalf("AuthorizedGitLabProject: %v", err)
+	}
+	if q.gotProvider != "gitlab" {
+		t.Errorf("provider = %q, want gitlab", q.gotProvider)
+	}
+	if q.gotRef != "gitlab:4242" {
+		t.Errorf("installation_ref = %q, want gitlab:4242", q.gotRef)
 	}
 }

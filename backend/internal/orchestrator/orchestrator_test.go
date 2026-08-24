@@ -24,10 +24,12 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // forceStageState directly sets a seeded stage's state under the stub's lock,
@@ -4283,10 +4285,11 @@ func (d *pipelineCaptureDoer) Do(req *http.Request) (*http.Response, error) {
 // top-level run (fishhawk/run-<short>) and a decomposed child (its
 // fishhawk/run-<short>/slice-<n> branch).
 //
-// GitLab credential-scope threading onto the run row is deferred to enablement
-// (#2043), so the test substitutes a gitlab-shaped scope after triggerParams;
-// the REF (the seam the dispatch design turns on) is what flows unmodified from
-// the run-branch derivation all the way to the wire.
+// It substitutes a gitlab-shaped scope after triggerParams deliberately: this
+// test isolates the REF seam, and pins it for a run row that carries NO
+// installation_ref. The scope now threads off the run row for real — see
+// TestTriggerParams_GitLabRefReachesCreatePipeline (E45.22 / #2043), which runs
+// the same path with no substitution.
 func TestTriggerParams_RefSeam_ThroughToCreatePipeline(t *testing.T) {
 	o := &Orchestrator{}
 	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
@@ -4317,7 +4320,8 @@ func TestTriggerParams_RefSeam_ThroughToCreatePipeline(t *testing.T) {
 			if !strings.HasPrefix(p.Ref, "fishhawk/run-") {
 				t.Errorf("ref %q must be a fishhawk run branch", p.Ref)
 			}
-			// gitlab scope threading deferred to #2043; the ref is the seam here.
+			// This test's runs carry no installation_ref, so the scope is
+			// substituted; the ref is the seam under test here.
 			p.Scope = forge.FromRef("gitlab:77")
 
 			doer := &pipelineCaptureDoer{}
@@ -4789,5 +4793,347 @@ func TestSurfaceParkedChildren_DuplicateDoesNotDropSiblingEntry(t *testing.T) {
 	}
 	if p.ChildRunID != childB.ID.String() {
 		t.Errorf("recorded entry names child %q, want the SECOND child %q — the duplicate branch must continue to the sibling, not return", p.ChildRunID, childB.ID)
+	}
+}
+
+// TestTriggerParams_ResolvesCredentialScopeFromInstallationRef pins the
+// credential-scope LADDER runCredentialScope implements (E45.22 / #2043,
+// HIGH 1). Before this change triggerParams read ONLY r.InstallationID, so a
+// gitlab_ci run — which has no GitHub installation id — resolved the zero
+// scope and every one of its stages warn-skipped in
+// runnerbackend.GitLabCI.TriggerStage.
+//
+// One cell per branch of the ladder, including both halves of the three-state
+// installation_ref distinction (BC5: the EMPTY-STRING cell is tested here,
+// where the fallback actually lives, not only at the approval layer):
+//
+//   - a gitlab ref resolves a GitLab scope (the arm that unbreaks gitlab_ci);
+//   - a BACKFILLED bare-decimal GitHub ref resolves a scope BYTE-EQUAL to the
+//     legacy wrapper's, so a migrated row is indistinguishable from today's;
+//   - a nil ref falls back to InstallationID (every legacy row);
+//   - an EMPTY-STRING ref falls back to InstallationID — recorded-as-empty
+//     names no credential;
+//   - an empty-string ref with NO installation id resolves the zero scope;
+//   - neither present resolves the zero scope, preserving the warn-skip;
+//   - a ref present ALONGSIDE a DIFFERENT installation id resolves the REF.
+//     This last cell is what makes the ordering an assertion rather than a
+//     coincidence: with the arms swapped every other cell still passes.
+func TestTriggerParams_ResolvesCredentialScopeFromInstallationRef(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	ptr := func(s string) *string { return &s }
+	id := func(v int64) *int64 { return &v }
+
+	cases := []struct {
+		name       string
+		ref        *string
+		instID     *int64
+		want       forge.CredentialScope
+		wantIsZero bool
+	}{
+		{
+			name: "gitlab ref resolves a gitlab scope",
+			ref:  ptr("gitlab:5"),
+			want: forge.FromRef("gitlab:5"),
+		},
+		{
+			name:   "backfilled bare-decimal github ref equals the legacy wrapper",
+			ref:    ptr("12345"),
+			instID: id(12345),
+			want:   forge.FromGitHubInstallationID(12345),
+		},
+		{
+			name:   "legacy nil ref falls back to installation_id",
+			ref:    nil,
+			instID: id(999),
+			want:   forge.FromGitHubInstallationID(999),
+		},
+		{
+			name:   "recorded-empty ref falls back to installation_id",
+			ref:    ptr(""),
+			instID: id(999),
+			want:   forge.FromGitHubInstallationID(999),
+		},
+		{
+			name:       "recorded-empty ref with no installation_id is the zero scope",
+			ref:        ptr(""),
+			instID:     nil,
+			want:       forge.CredentialScope{},
+			wantIsZero: true,
+		},
+		{
+			name:       "neither present is the zero scope (warn-skip preserved)",
+			ref:        nil,
+			instID:     nil,
+			want:       forge.CredentialScope{},
+			wantIsZero: true,
+		},
+		{
+			name:   "ref WINS over a disagreeing installation_id",
+			ref:    ptr("gitlab:5"),
+			instID: id(12345),
+			want:   forge.FromRef("gitlab:5"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &run.Run{
+				ID:              uuid.New(),
+				Repo:            "x/y",
+				WorkflowID:      "feature_change",
+				InstallationRef: tc.ref,
+				InstallationID:  tc.instID,
+			}
+			p := o.triggerParams(r, next)
+			if p.Scope != tc.want {
+				t.Errorf("triggerParams Scope = %+v (ref %q), want %+v", p.Scope, p.Scope.Ref(), tc.want)
+			}
+			if got := p.Scope.IsZero(); got != tc.wantIsZero {
+				t.Errorf("triggerParams Scope.IsZero() = %v, want %v", got, tc.wantIsZero)
+			}
+		})
+	}
+}
+
+// TestTriggerParams_GitLabRefReachesCreatePipeline is the HIGH 1 seam E2E: a
+// gitlab_ci run carrying installation_ref 'gitlab:5' drives a REAL
+// *gitlab.Forge.TriggerPipeline all the way to POST
+// /api/v4/projects/5/pipeline, with NO scope substituted by the test.
+//
+// TestTriggerParams_RefSeam_ThroughToCreatePipeline (above) had to inject
+// `p.Scope = forge.FromRef("gitlab:77")` by hand because the run row had
+// nowhere to carry a GitLab credential; that hand-injection was the
+// deferred-to-#2043 seam. This test removes it — the project id in the
+// observed URL comes from the RUN ROW — and asserts the run-branch ref still
+// flows through unmodified alongside it.
+//
+// The negative half is the control: the SAME run with no installation_ref and
+// no installation id resolves the zero scope, and GitLabCI.TriggerStage
+// warn-skips — issuing NO request at all.
+func TestTriggerParams_GitLabRefReachesCreatePipeline(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	ref := "gitlab:5"
+	wired := &run.Run{
+		ID: uuid.New(), Repo: "gitlab-org/gitlab-test", WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindGitLabCI, InstallationRef: &ref,
+	}
+
+	newBackend := func() (*pipelineCaptureDoer, *runnerbackend.GitLabCI) {
+		doer := &pipelineCaptureDoer{}
+		glForge := forgegitlab.New("https://gitlab.example",
+			forgegitlab.NewStaticCredentialProvider("glpat-test"),
+			forgegitlab.WithHTTPClient(doer))
+		return doer, &runnerbackend.GitLabCI{Trigger: glForge}
+	}
+
+	doer, backend := newBackend()
+	p := o.triggerParams(wired, next)
+	if err := backend.TriggerStage(context.Background(), p); err != nil {
+		t.Fatalf("TriggerStage: %v", err)
+	}
+	if doer.method != http.MethodPost || doer.path != "/api/v4/projects/5/pipeline" {
+		t.Fatalf("request = %s %s, want POST /api/v4/projects/5/pipeline — the project id must come from the run's installation_ref",
+			doer.method, doer.path)
+	}
+	if want := runBranchPrefix(wired.ID); doer.body["ref"] != want {
+		t.Errorf("observed CreatePipeline ref = %v, want %q", doer.body["ref"], want)
+	}
+
+	// Control: no ref, no installation id -> zero scope -> no request.
+	unwired := &run.Run{
+		ID: uuid.New(), Repo: "gitlab-org/gitlab-test", WorkflowID: "feature_change",
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	skipDoer, skipBackend := newBackend()
+	if err := skipBackend.TriggerStage(context.Background(), o.triggerParams(unwired, next)); err != nil {
+		t.Fatalf("TriggerStage (unwired): %v", err)
+	}
+	if skipDoer.method != "" || skipDoer.path != "" {
+		t.Errorf("unwired run issued %s %s; want NO request (Scope.IsZero() warn-skip)", skipDoer.method, skipDoer.path)
+	}
+}
+
+// --- E2E-1: admitted GitLab trigger -> persisted row -> orchestrator dispatch
+
+// e2eGitLabSpec is a TWO-stage workflow. The second stage is what matters: the
+// bug this chain exists to catch (E45.22 HIGH 1) was that a gitlab_ci run's
+// LATER stages resolved the zero credential scope and warn-skipped, which a
+// first-stage-only fixture cannot see.
+const e2eGitLabSpec = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Two-stage GitLab workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+`
+
+// e2eGitLabSpecFetcher serves e2eGitLabSpec as the project's workflow file.
+type e2eGitLabSpecFetcher struct{}
+
+func (e2eGitLabSpecFetcher) FetchFile(_ context.Context, _ forge.CredentialScope,
+	_ forge.RepoRef, path, _ string) (*forge.FileContent, error) {
+	return &forge.FileContent{Path: path, Content: []byte(e2eGitLabSpec), SHA: "g1t1absha"}, nil
+}
+
+// e2eGitLabRegistry vouches for exactly one (credential ref, project path) pair.
+type e2eGitLabRegistry struct{ ref, path string }
+
+func (r e2eGitLabRegistry) AuthorizedGitLabProject(_ context.Context, credentialRef, projectPath string) (bool, error) {
+	return credentialRef == r.ref && projectPath == r.path, nil
+}
+
+// TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch is the
+// CROSS-BOUNDARY chain (concern 51efb125). Every layer of the GitLab go-live
+// path is covered separately elsewhere, but each of those tests hand-shapes its
+// own run row — and a hand-shaped row is precisely what cannot catch HIGH 1,
+// whose failure was that the row the webhook PERSISTED did not carry what the
+// orchestrator LATER read. A per-layer suite agrees with itself while the seam
+// between the layers is broken.
+//
+// So this test hands no row to anybody. It runs, in one chain:
+//
+//  1. an admitted GitLab issue trigger through the real webhook dispatcher,
+//  2. against a REAL Postgres run repository (the row is INSERTed, not built),
+//  3. hydrated back out through that repository (so column round-tripping is
+//     in the chain, not assumed),
+//  4. into the orchestrator's real triggerParams for the SECOND stage,
+//  5. through the real runnerbackend.GitLabCI + real GitLab forge client,
+//  6. asserted on the HTTP request that actually goes on the wire.
+//
+// The assertion at the end is the one that matters: the pipeline is created
+// against /api/v4/projects/4242/pipeline. That project id exists nowhere in the
+// orchestrator's inputs except inside the installation_ref the webhook wrote
+// several layers earlier, so it can only be right if every hop preserved it.
+func TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runs := run.NewPostgresRepository(pool)
+
+	// (1)+(2) The webhook create path, writing to real Postgres.
+	d := &webhook.Dispatcher{
+		Runs:                   runs,
+		Audit:                  audit.NewPostgresRepository(pool),
+		GitLabFiles:            e2eGitLabSpecFetcher{},
+		GitLabProjects:         e2eGitLabRegistry{ref: "gitlab:4242", path: "acme/widgets"},
+		PlanReviewerConfigured: true,
+	}
+	ev := webhook.Event{
+		Type:          "issue",
+		DeliveryID:    "gitlab:e2e-1",
+		Repo:          "acme/widgets",
+		Sender:        "alice",
+		Forge:         webhook.ForgeGitLab,
+		CredentialRef: "gitlab:4242",
+		RawBody: []byte(`{"object_attributes":{"iid":7,"action":"open"},` +
+			`"labels":[{"title":"fishhawk"}]}`),
+	}
+	if err := d.Handle(ctx, ev); err != nil {
+		t.Fatalf("webhook Handle: %v", err)
+	}
+
+	// (3) Hydrate the row back OUT of the database. Nothing below touches the
+	// in-memory value the dispatcher held.
+	persisted, err := runs.ListRuns(ctx, run.ListRunsFilter{Repo: "acme/widgets", Limit: 10})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(persisted) != 1 {
+		t.Fatalf("persisted runs = %d, want 1 (the trigger must have minted exactly one)", len(persisted))
+	}
+	r := persisted[0]
+	if r.RunnerKind != run.RunnerKindGitLabCI {
+		t.Errorf("persisted runner_kind = %q, want %q", r.RunnerKind, run.RunnerKindGitLabCI)
+	}
+	if r.InstallationRef == nil || *r.InstallationRef != "gitlab:4242" {
+		t.Fatalf("persisted installation_ref = %v, want %q — the orchestrator has no other source for the project id",
+			r.InstallationRef, "gitlab:4242")
+	}
+
+	stages, err := runs.ListStagesForRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != 2 {
+		t.Fatalf("persisted stages = %d, want 2", len(stages))
+	}
+	// The SECOND stage — the one HIGH 1 left credential-less.
+	second := stages[1]
+
+	// (4)+(5) The orchestrator's real dispatch path into the real GitLab client.
+	o := &Orchestrator{}
+	doer := &pipelineCaptureDoer{}
+	backend := &runnerbackend.GitLabCI{
+		Trigger: forgegitlab.New("https://gitlab.example",
+			forgegitlab.NewStaticCredentialProvider("glpat-test"),
+			forgegitlab.WithHTTPClient(doer)),
+	}
+	if err := backend.TriggerStage(ctx, o.triggerParams(r, second)); err != nil {
+		t.Fatalf("TriggerStage: %v", err)
+	}
+
+	// (6) What actually went on the wire.
+	if doer.method != http.MethodPost || doer.path != "/api/v4/projects/4242/pipeline" {
+		t.Fatalf("request = %s %s, want POST /api/v4/projects/4242/pipeline — "+
+			"the project id must survive webhook -> Postgres -> hydrate -> triggerParams",
+			doer.method, doer.path)
+	}
+	if want := RunBranchRef(r); doer.body["ref"] != want {
+		t.Errorf("pipeline ref = %v, want the run's sole-writer branch %q", doer.body["ref"], want)
+	}
+}
+
+// TestRunBranchRef_IsTheRefTriggerParamsDispatches pins the EXPORTED
+// RunBranchRef seam to the ref the dispatch path actually targets. It is the
+// orchestrator half of the cross-package equivalence chain closed by
+// webhook.TestGitLabRunBranch_MatchesOrchestratorDerivation: that test compares
+// webhook's local derivation against RunBranchRef, and this one proves
+// RunBranchRef is not a parallel copy but the very value triggerParams puts on
+// the wire. Without this link the exported seam could drift away from
+// triggerParams and the webhook test would keep agreeing with a function
+// nothing dispatches through.
+func TestRunBranchRef_IsTheRefTriggerParamsDispatches(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	parent := uuid.New()
+	sliceIdx := 3
+	cases := []struct {
+		name string
+		run  *run.Run
+	}{
+		{"top_level_run", &run.Run{ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change"}},
+		{"decomposed_child", &run.Run{
+			ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change",
+			DecomposedFrom: &parent, SliceIndex: &sliceIdx,
+		}},
+		// A run carrying only ONE of the two decomposition fields is not a
+		// slice: both derivations must fall back to the plain namespace.
+		{"decomposed_from_without_slice_index", &run.Run{
+			ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parent,
+		}},
+		{"slice_index_without_decomposed_from", &run.Run{
+			ID: uuid.New(), Repo: "x/y", SliceIndex: &sliceIdx,
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got, want := RunBranchRef(c.run), o.triggerParams(c.run, next).Ref; got != want {
+				t.Errorf("RunBranchRef = %q, but triggerParams dispatches against %q", got, want)
+			}
+		})
 	}
 }

@@ -20,6 +20,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -2042,6 +2043,12 @@ func runServe(args []string, logSink io.Writer) int {
 	// installationBaseURLResolver; a nil pool leaves it nil so every consumer
 	// keeps its deployment default byte-identical.
 	var endpointResolver *account.EndpointResolver
+	// gitlabProjects authorizes a GitLab webhook payload's project against the
+	// registered installations before the dispatcher performs any forge call
+	// (E45.22 / #2043). It stays a literal nil interface without a pool, which
+	// the dispatcher FAILS CLOSED on: no database means no registry means no
+	// GitLab run creation.
+	var gitlabProjects webhook.GitLabProjectAuthorizer
 	if *dbURL != "" {
 		var err error
 		pool, err = pgxpool.New(context.Background(), *dbURL)
@@ -2073,6 +2080,7 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.AccountRoles = account.NewStore(accountdb.New(pool))
 		accountQueries = accountdb.New(pool)
 		endpointResolver = account.NewEndpointResolver(accountdb.New(pool))
+		gitlabProjects = gitLabProjectRegistry{q: accountdb.New(pool)}
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
@@ -2354,6 +2362,19 @@ func runServe(args []string, logSink io.Writer) int {
 			// server's cfg.BudgetLocation so both admission seams
 			// bucket spend into the same calendar window.
 			BudgetLocation: budgetLocation,
+			// GitLabFiles reads .fishhawk/workflows.yaml for a GitLab-triggered
+			// run (E45.22 / #2043). It is the registered GitLab forge's
+			// forge.FileFetcher — the SAME resolution the per-repo conventions
+			// loader uses — because the GitHub client cannot accept a
+			// "gitlab:<project_id>" credential scope. nil when GitLab is
+			// unconfigured, which leaves GitLab run creation off rather than
+			// minting a run against an unvalidated spec.
+			GitLabFiles: registeredFileFetcher("gitlab"),
+			// GitLabProjects binds the payload-named project to a registered
+			// installation BEFORE the spec read or the pipeline trigger
+			// (E45.22 / #2043). nil — no database — fails closed: GitLab run
+			// creation refuses rather than acting on an unvouched project.
+			GitLabProjects: gitlabProjects,
 			// ApprovalHandler is wired below after the Server
 			// is constructed — the Server implements the
 			// interface and holds all the deps the handler
@@ -3509,6 +3530,69 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 // githubapp.Client.AllowedInstallationHosts (E44.15 / #2093). An empty or
 // all-whitespace value yields nil, which leaves the allowlist unset — the
 // default scheme/parse-only posture.
+// gitLabProjectRegistryQueries is the query surface gitLabProjectRegistry
+// needs. *accountdb.Queries (accountdb.New(pool)) satisfies it.
+type gitLabProjectRegistryQueries interface {
+	GetInstallationByRef(ctx context.Context, arg accountdb.GetInstallationByRefParams) (accountdb.Installation, error)
+	GetAccount(ctx context.Context, id uuid.UUID) (accountdb.Account, error)
+}
+
+// gitLabProjectRegistry is the production webhook.GitLabProjectAuthorizer:
+// it answers the dispatcher's "is this project one we were authorized to act
+// on?" from the ADR-057 tenancy tables rather than from the payload.
+//
+// A GitLab delivery is authenticated by a shared X-Gitlab-Token with no HMAC
+// over the body, so the project it names is untrusted. Authorization is
+// therefore an OPERATOR decision recorded in the database: an installations row
+// (provider 'gitlab', installation_ref 'gitlab:<project_id>') pointing at the
+// account that owns it. Both halves of the payload identity are bound:
+//
+//  1. the credential ref must resolve to a registered gitlab installation, and
+//  2. the project path's namespace segment must equal that installation's
+//     account_key — the same owner-segment convention account.Resolver uses.
+//
+// Requiring (2) is what stops a registered project id from being paired with
+// some OTHER project's path: the two selectors address different projects (the
+// ref picks the credential and the pipeline target, the path picks the project
+// the workflow spec is read from), so binding only the ref would still leave
+// the spec read steerable.
+//
+// A missing row is a REFUSAL (false, nil); a query fault is an ERROR the
+// dispatcher also fails closed on. Neither ever admits.
+type gitLabProjectRegistry struct {
+	q gitLabProjectRegistryQueries
+}
+
+func (r gitLabProjectRegistry) AuthorizedGitLabProject(ctx context.Context, credentialRef, projectPath string) (bool, error) {
+	if r.q == nil || credentialRef == "" || projectPath == "" {
+		return false, nil
+	}
+	owner, _, ok := strings.Cut(projectPath, "/")
+	if !ok || owner == "" {
+		return false, nil
+	}
+	inst, err := r.q.GetInstallationByRef(ctx, accountdb.GetInstallationByRefParams{
+		Provider:        "gitlab",
+		InstallationRef: credentialRef,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	acct, err := r.q.GetAccount(ctx, inst.AccountID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return acct.AccountKey == owner, nil
+}
+
+var _ webhook.GitLabProjectAuthorizer = gitLabProjectRegistry{}
+
 func parseInstallationHostAllowlist(raw string) []string {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {

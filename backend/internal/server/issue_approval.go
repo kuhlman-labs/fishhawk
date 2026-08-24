@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -315,12 +316,13 @@ func (s *Server) findAwaitingApprovalStage(ctx context.Context, approvalForge, r
 			continue
 		}
 		if !forgeMatchesRun(approvalForge, r) {
-			// Cross-forge refusal (E45.19 / #2036): an approval sourced
-			// from a different forge than the run must not act on its
-			// gate. Runs carry no forge column yet (#1861), so every
-			// existing run is GitHub-sourced — a GitLab-sourced approval
-			// whose repo string + issue number collide with a GitHub run
-			// falls through here and matches nothing.
+			// Cross-forge refusal (E45.19 / #2036, made two-signal and
+			// fail-closed by E45.22 / #2043): an approval sourced from a
+			// different forge than the run must not act on its gate. The
+			// run's forge is now derived from its own installation_ref
+			// scheme AND its runner_kind, so this refuses in BOTH
+			// directions — a GitLab approval on a colliding GitHub run,
+			// and a GitHub approval on a gitlab_ci run.
 			continue
 		}
 		if r.State.IsTerminal() {
@@ -352,14 +354,73 @@ func normalizeForge(f string) string {
 }
 
 // forgeMatchesRun reports whether an approval sourced from
-// approvalForge may act on run r. Runs carry no forge column yet
-// (#1861 wires GitLab run creation), so every existing run is
-// GitHub-sourced: the helper matches only when the approval's
-// normalized forge is GitHub. This is the #1861 seam — once runs
-// gain a forge discriminator, the fixed "github" here becomes
-// r's own forge.
-func forgeMatchesRun(approvalForge string, _ *run.Run) bool {
-	return normalizeForge(approvalForge) == "github"
+// approvalForge may act on run r.
+//
+// It FAILS CLOSED (E45.22 / #2043, HIGH 4). The prior implementation ignored
+// the run entirely and returned normalizeForge(approvalForge) == "github", so
+// a GitHub-sourced approval matched EVERY run — including a gitlab_ci one, the
+// moment #1861's dormant plumbing started minting them. The refusal now
+// compares the approval's forge against the RUN's own forge, derived from TWO
+// INDEPENDENT SIGNALS, and a mismatch on EITHER refuses:
+//
+//   - runForgeFromRef(r.InstallationRef) — the scheme of the ADR-057 /
+//     ADR-058 credential ref (migration 0076).
+//   - r.RunnerKind == run.RunnerKindGitLabCI — the execution channel.
+//
+// Two signals rather than one because each covers the other's blind spot. A
+// row minted before 0076, or any future mint that forgets to stamp the ref,
+// carries a nil ref that necessarily normalizes to "github" — there the
+// runner_kind signal carries the refusal ALONE. Conversely runner_kind is an
+// UN-LOCKED creation-time hint until a signed runner self-report resolves it
+// (ADR-045), so a run whose hint still reads github_actions while its ref
+// already says gitlab has the refusal carried by the ref signal ALONE. The
+// control does not depend on either signal being right, only on either one
+// saying GitLab.
+//
+// The GitHub path is byte-unchanged: a GitHub approval on a run with a
+// numeric-or-absent ref and a non-gitlab_ci runner kind still matches.
+func forgeMatchesRun(approvalForge string, r *run.Run) bool {
+	return normalizeForge(approvalForge) == runForge(r)
+}
+
+// runForge derives a run's canonical forge id from the two independent signals
+// forgeMatchesRun cross-checks. GitLab wins on EITHER signal: the derivation is
+// fail-closed, so an ambiguous run (a gitlab ref with a github_actions hint, or
+// a gitlab_ci hint with no ref at all) is treated as GitLab and refuses a
+// GitHub approval rather than admitting one.
+//
+// A nil run yields "github", preserving the legacy default for the
+// never-observed nil case rather than panicking inside an HTTP handler.
+func runForge(r *run.Run) string {
+	if r == nil {
+		return "github"
+	}
+	if r.RunnerKind == run.RunnerKindGitLabCI {
+		return webhook.ForgeGitLab
+	}
+	return runForgeFromRef(r.InstallationRef)
+}
+
+// runForgeFromRef reads the forge out of an ADR-057 / ADR-058 installation_ref
+// (migration 0076). The canonical GitHub ref is a BARE base-10 decimal
+// (forge.FromGitHubInstallationID), so a ref with no "<scheme>:" prefix — and
+// equally a nil or empty ref, the pre-0076 and un-stamped shapes — normalizes
+// to "github". A ref of the form "<scheme>:<rest>" yields that scheme, which is
+// what makes "gitlab:5" a GitLab run.
+//
+// An EMPTY scheme (a ref that starts with ":") is deliberately NOT treated as
+// GitHub-by-default: it is a malformed ref, and returning the empty string
+// would let normalizeForge's empty-means-github rule launder it into a match.
+// It is returned verbatim so it matches no approval forge and refuses.
+func runForgeFromRef(ref *string) string {
+	if ref == nil || *ref == "" {
+		return "github"
+	}
+	scheme, _, ok := strings.Cut(*ref, ":")
+	if !ok {
+		return "github"
+	}
+	return scheme
 }
 
 // namespacedApproverSubject renders the approver identity used for

@@ -62,6 +62,13 @@ var childParamsAllowed = map[string]string{
 	// event payload. There is no parent run to inherit from.
 	"backend/internal/webhook/dispatcher.go::(*Dispatcher).Handle": "webhook event-driven fresh mint — no parent run exists",
 
+	// The GitLab half of that same event-driven fresh mint (E45.22 /
+	// #2043). It lives in its own file because the GitLab create path
+	// reads its spec through the forge-neutral FileFetcher and takes no
+	// branch-protection snapshot, but the reason is identical: the webhook
+	// event, not a parent run, is the source of every field.
+	"backend/internal/webhook/gitlab_dispatch.go::(*Dispatcher).handleGitLabCreateRun": "webhook event-driven fresh mint — no parent run exists",
+
 	// The request-driven mint behind POST /v0/runs and the campaign
 	// driver. Same reason: the request, not a parent run, is the source.
 	"backend/internal/server/runs.go::(*Server).CreateRunForTrigger": "request-driven fresh mint — no parent run exists",

@@ -964,11 +964,28 @@ func (s *stubGitHub) ListRulesetRequiredChecksForDefault(_ context.Context, _ fo
 // TransitionStage. Other methods stay "not used" so accidental
 // reads in the dispatcher path are loud.
 type stubRuns struct {
-	mu             sync.Mutex
-	created        []*run.Run
-	createdStages  []*run.Stage
-	transitions    []stubStageTransition
-	createErr      error
+	mu            sync.Mutex
+	created       []*run.Run
+	createdStages []*run.Stage
+	transitions   []stubStageTransition
+	createErr     error
+	// listErr, when set, makes ListRuns fail — the candidate-lookup degrade
+	// path the GitLab CI-retry handler must survive without a 5xx.
+	listErr error
+	// listStagesErr, when set, makes ListStagesForRun fail — the per-candidate
+	// head-SHA lookup fault the GitLab correlation walk must skip past.
+	listStagesErr error
+	// listCalls counts ListRuns invocations, so a test can assert a guard runs
+	// BEFORE the candidate query rather than merely discarding its result.
+	// Incremented under mu (like every other field here) so it is safe under
+	// -race even when the racing-deliveries test drives concurrent calls.
+	listCalls int
+	// createErrQueue is popped one entry per CreateRun call before
+	// createErr is consulted, so a test can make the FIRST create succeed
+	// and a LATER one lose the runs_retry_child_once_idx race (a nil entry
+	// means "succeed"). Postgres is the real arbiter; this reproduces the
+	// loser's error shape via run.ErrRetryChildDuplicate.
+	createErrQueue []error
 	createStageErr error
 	transitionErr  error
 }
@@ -981,18 +998,32 @@ type stubStageTransition struct {
 func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.createErrQueue) > 0 {
+		err := s.createErrQueue[0]
+		s.createErrQueue = s.createErrQueue[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
 	r := &run.Run{
-		ID:                     uuid.New(),
-		Repo:                   p.Repo,
-		WorkflowID:             p.WorkflowID,
-		WorkflowSHA:            p.WorkflowSHA,
-		TriggerSource:          p.TriggerSource,
-		TriggerRef:             p.TriggerRef,
-		InstallationID:         p.InstallationID,
+		ID:             uuid.New(),
+		Repo:           p.Repo,
+		WorkflowID:     p.WorkflowID,
+		WorkflowSHA:    p.WorkflowSHA,
+		TriggerSource:  p.TriggerSource,
+		TriggerRef:     p.TriggerRef,
+		InstallationID: p.InstallationID,
+		// InstallationRef is the ADR-057 / ADR-058 forge-neutral credential
+		// ref (migration 0076). Carried so the GitLab dispatch assertions
+		// witness the stamped "gitlab:<project_id>" rather than passing
+		// vacuously against a fake that dropped it.
+		InstallationRef:        p.InstallationRef,
 		ParentRunID:            p.ParentRunID,
+		DecomposedFrom:         p.DecomposedFrom,
+		SliceIndex:             p.SliceIndex,
 		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
 		WorkflowSpec:           p.WorkflowSpec,
 		RetryAttempt:           p.RetryAttempt,
@@ -1061,6 +1092,10 @@ func (s *stubRuns) GetRunByIdempotencyKey(context.Context, string, string) (*run
 func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	out := make([]*run.Run, 0, len(s.created))
 	// Mirror the SQL: created_at DESC tiebreak by id DESC. The
 	// dispatcher's parent-finder reads the first non-terminal row,
@@ -1080,6 +1115,11 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 			if r.PullRequestURL == nil || *r.PullRequestURL != *f.PullRequestURL {
 				continue
 			}
+		}
+		// RunnerKind narrows the GitLab CI-retry candidate set to
+		// gitlab_ci runs (E45.22 / #2043); the GitHub paths pass nil.
+		if f.RunnerKind != nil && r.RunnerKind != *f.RunnerKind {
+			continue
 		}
 		out = append(out, r)
 	}
@@ -1107,6 +1147,9 @@ func (s *stubRuns) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error)
 func (s *stubRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.listStagesErr != nil {
+		return nil, s.listStagesErr
+	}
 	var out []*run.Stage
 	for _, st := range s.createdStages {
 		if st.RunID == runID {
@@ -3675,44 +3718,146 @@ func TestHandle_CIFailureRetry_CheckNotRequired_Skips(t *testing.T) {
 	}
 }
 
-func TestHandle_CIFailureRetry_DuplicateHeadSHA_Skips(t *testing.T) {
+// TestHandle_CIFailureRetry_ConstraintDedup replaces the pre-#2043
+// read-then-write head_sha guard with the runs_retry_child_once_idx
+// CONSTRAINT (E45.22 / #2043, C1). It is not a weakening: the old guard could
+// not serialize two CONCURRENT deliveries at all, while the partial unique
+// index dedups them in the database. The behaviour under test is the same —
+// a second delivery for the same parent produces no second child, no
+// dispatch, and no audit row — but the loser now arrives as the driver's
+// unique_violation rather than as a pre-read.
+//
+// The stub returns run.ErrRetryChildDuplicate, the sentinel
+// run.IsRetryChildDuplicate recognizes alongside a real 23505 on that index.
+func TestHandle_CIFailureRetry_ConstraintDedup(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
-	arts := &stubArtifacts{}
-	d.Artifacts = arts
-	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
-
-	// Attach an implement stage to the parent with a pull_request
-	// artifact whose head_sha matches the event ("abc123") — i.e., a
-	// run already exists for this commit, so the retry should
-	// dedup.
-	implStage := &run.Stage{
-		ID:    uuid.New(),
-		RunID: parent.ID,
-		Type:  run.StageTypeImplement,
-		State: run.StageStateSucceeded,
-	}
-	runs.mu.Lock()
-	runs.createdStages = append(runs.createdStages, implStage)
-	runs.mu.Unlock()
-	prContent := []byte(`{"head_sha":"abc123"}`)
-	arts.add(implStage.ID, &artifact.Artifact{
-		ID:      uuid.New(),
-		StageID: implStage.ID,
-		Kind:    artifact.KindPullRequest,
-		Content: prContent,
-	})
+	d.Artifacts = &stubArtifacts{}
+	seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	runs.createErrQueue = []error{run.ErrRetryChildDuplicate}
 
 	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if len(runs.created) != 1 {
-		t.Errorf("runs.created = %d, want 1 (dedup; no child)", len(runs.created))
+		t.Errorf("runs.created = %d, want 1 (constraint dedup; no child)", len(runs.created))
 	}
 	if gh.dispatchCalls != 0 {
 		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
 	}
 	if len(au.appended) != 0 {
-		t.Errorf("audit rows = %d, want 0 (dedup skipped silently)", len(au.appended))
+		t.Errorf("audit rows = %d, want 0 (race loser is benign, not an outcome)", len(au.appended))
+	}
+}
+
+// TestHandle_CIFailureRetry_StaleRedeliveryOnRetriedHeadSHACreatesNoSecondChild
+// pins the head_sha pre-read the runs_retry_child_once_idx constraint does NOT
+// subsume (E45.22 / #2043 fix-up). The index keys on (parent_run_id,
+// retry_attempt), so it only dedups deliveries that resolve the SAME parent.
+// This drives the case where they do not:
+//
+//   - the parent has no recorded head_sha, so the first delivery for "abc123"
+//     legitimately mints retry child C1;
+//   - C1 then lands on the SAME PR and records "abc123" as its own
+//     implement-stage head — that commit has now been retried;
+//   - the original check_run failure for "abc123" is redelivered.
+//
+// findRunForCIRetry takes the newest non-terminal row on the PR, which is now
+// C1, so the constraint would see parent_run_id = C1 and retry_attempt 2 — no
+// collision — and without the pre-read a SECOND child is minted for a SHA that
+// was already retried. max_retries is raised to 2 on purpose so the cap check
+// cannot be what refuses the redelivery; the head_sha guard has to be.
+//
+// Counterfactual: delete step 3's runOnHeadSHAExists block in
+// handleCIFailureRetry and this observes a second child and goes red.
+func TestHandle_CIFailureRetry_StaleRedeliveryOnRetriedHeadSHACreatesNoSecondChild(t *testing.T) {
+	const specMaxRetries2 = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with a two-deep retry chain
+    on_ci_failure:
+      max_retries: 2
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.IssueNotifier = &stubIssueNotifier{}
+
+	// The parent records NO head_sha, so nothing yet covers "abc123".
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", specMaxRetries2, 0)
+
+	// First delivery: the legitimate retry.
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle (first delivery): %v", err)
+	}
+	children := retryChildren(runs, 1)
+	if len(children) != 1 {
+		t.Fatalf("after first delivery: retry children = %d, want 1", len(children))
+	}
+	child := children[0]
+
+	// C1 lands on the SAME PR and records the failing commit as its head —
+	// seeded by construction, exactly as the runner would leave it. From here
+	// the parent-finder resolves C1, not the parent.
+	runs.mu.Lock()
+	child.PullRequestURL = parent.PullRequestURL
+	runs.mu.Unlock()
+	recordHeadSHA(t, runs, arts, child.ID, "abc123")
+
+	// The ORIGINAL failure is redelivered for the now-retried SHA.
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle (redelivery): %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 1 {
+		t.Fatalf("retry children = %d, want 1 — a redelivery for an already-retried head_sha must mint no second child", len(got))
+	}
+}
+
+// recordHeadSHA seeds an implement stage on runID carrying a pull_request
+// artifact with the given head SHA — the shape the runner leaves behind and
+// the only thing the head_sha guard reads.
+func recordHeadSHA(t *testing.T, runs *stubRuns, arts *stubArtifacts, runID uuid.UUID, sha string) {
+	t.Helper()
+	st := &run.Stage{
+		ID:    uuid.New(),
+		RunID: runID,
+		Type:  run.StageTypeImplement,
+		State: run.StageStateSucceeded,
+	}
+	runs.mu.Lock()
+	runs.createdStages = append(runs.createdStages, st)
+	runs.mu.Unlock()
+	arts.add(st.ID, &artifact.Artifact{
+		ID:      uuid.New(),
+		StageID: st.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: []byte(fmt.Sprintf(`{"head_sha":%q}`, sha)),
+	})
+}
+
+// TestHandle_CIFailureRetry_UnrelatedCreateErrorStillFails pins the OTHER
+// half of the constraint branch: only the retry-child duplicate is benign.
+// Any other CreateRun error must still surface as a 5xx so the forge
+// redelivers, rather than being swallowed as a won race.
+func TestHandle_CIFailureRetry_UnrelatedCreateErrorStillFails(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	runs.createErrQueue = []error{errors.New("connection reset")}
+
+	err := d.Handle(context.Background(), checkRunFailedEvent(t))
+	if err == nil {
+		t.Fatal("Handle returned nil; want the non-duplicate create error surfaced")
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("error = %v, want it to carry the underlying create failure", err)
 	}
 }
 
@@ -4176,6 +4321,53 @@ func gitlabEvent(kind, sender, body string) Event {
 	}
 }
 
+// TestMatchGitLabEvent_RunActionCarriesAValidTriggerSource guards the storage
+// contract every GitLab run-creating match must satisfy: handleGitLabCreateRun
+// passes Match.TriggerSource straight into CreateRun, and
+// runs_trigger_source_check rejects any value outside
+// run.ValidTriggerSources() — including the empty string a Match that simply
+// never set the field carries.
+//
+// Both GitLab run-creating matchers are covered. The issue path is also proven
+// end to end against a real database by
+// orchestrator.TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch; the
+// COMMENT path has no such Postgres coverage, which is exactly why the check is
+// restated here as a cheap unit guard rather than left to the one E2E.
+//
+// The assertion is membership in the real enum, not equality with a literal: a
+// matcher that set some plausible-but-unlisted string would satisfy a
+// non-empty check while still failing the INSERT.
+func TestMatchGitLabEvent_RunActionCarriesAValidTriggerSource(t *testing.T) {
+	valid := make(map[run.TriggerSource]bool, len(run.ValidTriggerSources()))
+	for _, ts := range run.ValidTriggerSources() {
+		valid[ts] = true
+	}
+
+	cases := []struct {
+		name string
+		ev   Event
+	}{
+		{"issue_labeled", gitlabEvent("issue", "alice",
+			`{"object_attributes":{"iid":7,"action":"open"},"labels":[{"title":"fishhawk"}]}`)},
+		{"issue_comment_command", gitlabEvent("note", "alice",
+			`{"object_attributes":{"noteable_type":"Issue","note":"/fishhawk run"},"issue":{"iid":7}}`)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := MatchGitLabEvent(tc.ev)
+			if m.Action != MatchActionRun {
+				t.Fatalf("Action = %q, want %q (fixture must reach the run-creating arm)",
+					m.Action, MatchActionRun)
+			}
+			if !valid[m.TriggerSource] {
+				t.Errorf("TriggerSource = %q, which is not in run.ValidTriggerSources() %v; "+
+					"CreateRun would be rejected by runs_trigger_source_check",
+					m.TriggerSource, run.ValidTriggerSources())
+			}
+		})
+	}
+}
+
 func TestMatchGitLabEvent_EmptyCredentialRefSkips(t *testing.T) {
 	ev := gitlabEvent("issue", "root", `{"object_attributes":{"iid":1,"action":"open"}}`)
 	ev.CredentialRef = ""
@@ -4297,14 +4489,31 @@ func TestMatchGitLabEvent_MergeRequestSkipsForServerConsumer(t *testing.T) {
 	}
 }
 
-func TestMatchGitLabEvent_PipelineAndBuildRecognizedSkips(t *testing.T) {
-	for _, kind := range []string{"pipeline", "build"} {
-		t.Run(kind, func(t *testing.T) {
-			m := MatchGitLabEvent(gitlabEvent(kind, "root", `{"object_attributes":{"status":"success"}}`))
-			if !m.Skip || !strings.Contains(m.Reason, "#1861") {
-				t.Errorf("got %+v, want recognized skip naming #1861", m)
-			}
-		})
+// TestMatchGitLabEvent_PipelineClassifiedBuildSkipped supersedes the #1861
+// "both kinds recognized-and-parked" pin: E45.22 / #2043 UNPARKS the pipeline
+// kind as the CI-failure retry trigger while keeping the Job Hook skipped, so
+// one failing job drives at most one retry (HIGH 3). Both arms are asserted
+// on the SAME failing payload shape so the difference is the classification
+// decision, not the payload.
+func TestMatchGitLabEvent_PipelineClassifiedBuildSkipped(t *testing.T) {
+	const pipelineBody = `{"object_attributes":{"id":9001,"ref":"fishhawk/run-abcdef12","sha":"deadbeef","status":"failed"}}`
+	const buildBody = `{"ref":"fishhawk/run-abcdef12","sha":"deadbeef","build_status":"failed","pipeline_id":9001}`
+
+	m := MatchGitLabEvent(gitlabEvent("pipeline", "root", pipelineBody))
+	if m.Skip || m.Action != MatchActionCIFailureRetry {
+		t.Fatalf("pipeline: got %+v, want MatchActionCIFailureRetry", m)
+	}
+	if m.PipelineRef == nil || m.PipelineRef.Ref != "fishhawk/run-abcdef12" ||
+		m.PipelineRef.SHA != "deadbeef" || m.PipelineRef.PipelineID != 9001 {
+		t.Errorf("pipeline ref = %+v, want the ref/sha/id correlation inputs", m.PipelineRef)
+	}
+
+	b := MatchGitLabEvent(gitlabEvent("build", "root", buildBody))
+	if !b.Skip {
+		t.Fatalf("build: got %+v, want a skip (the pipeline hook is the single trigger)", b)
+	}
+	if !strings.Contains(b.Reason, "single retry trigger") {
+		t.Errorf("build skip reason = %q, want it to name the single-trigger rule", b.Reason)
 	}
 }
 
@@ -4340,30 +4549,35 @@ func TestHandle_GitLabApprove_RoutesWithZeroInstallation(t *testing.T) {
 	}
 }
 
-func TestHandle_GitLabRun_ParksWithoutCreatingRun(t *testing.T) {
+// TestHandle_GitLabRun_CreatesRunInsteadOfParking supersedes the E45.6 /
+// #1860 park pin. Run creation from a GitLab trigger is UNPARKED (E45.22 /
+// #2043): the same admitted issue trigger that used to log "parked" and
+// return now reaches the GitLab create path and mints a gitlab_ci run. The
+// old park log must be gone — a surviving park block would create no run and
+// fail here.
+func TestHandle_GitLabRun_CreatesRunInsteadOfParking(t *testing.T) {
 	d, _, runs, _ := newDispatcherWithStubs(t)
+	d.GitLabFiles = &stubFileFetcher{content: []byte(validSpec), sha: "g1t1absha"}
 	logs := captureDispatcherLogs(d)
 	body := `{"object_attributes":{"iid":5,"action":"open"},"labels":[{"title":"fishhawk"}]}`
 	ev := gitlabEvent("issue", "alice", body)
 	ev.DeliveryID = "gitlab:d2"
-	// A VALID Repo so the park boundary is regression-detectable: if the
-	// E45.8/#1861 park block were deleted, the fall-through would parse
-	// this repo successfully and reach the spec-fetch / CreateRun stubs,
-	// tripping the runs.created assertion below — instead of silently
-	// no-op'ing at parseRepo("") and passing identically (the vacuity
-	// the done-means pin must guard against).
 	ev.Repo = "group/project"
+	// The create path is registry-gated (E45.22 / #2043 fix-up): register the
+	// project this event names so the unparking is what the test observes.
+	d.GitLabProjects = &stubGitLabProjects{allow: map[string]string{ev.CredentialRef: ev.Repo}}
+
 	if err := d.Handle(context.Background(), ev); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if len(runs.created) != 0 {
-		t.Errorf("CreateRun called %d times; a parked GitLab run must create no run", len(runs.created))
+	if len(runs.created) != 1 {
+		t.Fatalf("CreateRun called %d times; want 1 (GitLab run creation is live)", len(runs.created))
 	}
-	// The park must emit its #1861-named log line (the stated done-means
-	// pin). Asserting it makes a deleted park block detectable even
-	// independent of the CreateRun stub.
-	if got := logs.String(); !strings.Contains(got, "gitlab run trigger parked") || !strings.Contains(got, "#1861") {
-		t.Errorf("expected park log naming #1861; got logs:\n%s", got)
+	if runs.created[0].RunnerKind != run.RunnerKindGitLabCI {
+		t.Errorf("runner_kind = %q, want %q", runs.created[0].RunnerKind, run.RunnerKindGitLabCI)
+	}
+	if got := logs.String(); strings.Contains(got, "gitlab run trigger parked") {
+		t.Errorf("park log still emitted; the #1861 boundary should be gone:\n%s", got)
 	}
 }
 

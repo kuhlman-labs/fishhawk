@@ -358,6 +358,28 @@ type Run struct {
 	TriggerSource  TriggerSource
 	TriggerRef     *string // e.g. "issue:1247" or nil for ad-hoc runs
 	InstallationID *int64  // GitHub App installation that owns the repo; nil for non-GitHub triggers
+	// InstallationRef is the ADR-057 / ADR-058 forge-neutral credential
+	// reference (migration 0076) — the persisted form of
+	// forge.CredentialScope. Unlike InstallationID, which is a bigint and can
+	// therefore only ever name a GitHub App installation, this TEXT ref names
+	// the credential to authenticate as on ANY forge: the bare base-10
+	// decimal of the installation id for GitHub (the canonical form
+	// forge.FromGitHubInstallationID produces), "gitlab:<project_id>" for
+	// GitLab.
+	//
+	// THREE STATES, deliberately distinguishable — do NOT collapse them:
+	//   nil          no ref recorded. A pre-0076 row whose installation_id was
+	//                absent or the 0 sentinel, or a mint that stamped none.
+	//                Consumers fall back to InstallationID.
+	//   pointer to "" recorded-as-empty. Also falls back, but it is a
+	//                DIFFERENT provenance than nil and a caller must never
+	//                store "" to mean "absent".
+	//   a value      authoritative; forge.FromRef wraps it verbatim.
+	//
+	// Inherited verbatim by every run minted from another run (see
+	// childParamsInheritance): a retry of a gitlab_ci run must keep talking to
+	// GitLab.
+	InstallationRef *string
 	// IdempotencyKey scopes a CLI / UI trigger to be safely
 	// retriable: a duplicate POST /v0/runs with the same
 	// (repo, idempotency_key) returns the existing run instead

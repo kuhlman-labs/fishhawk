@@ -196,6 +196,13 @@ type Match struct {
 	// the audit-row payload.
 	CheckRunRef *CheckRunRef
 
+	// PipelineRef carries the bits of a GitLab Pipeline Hook payload the
+	// GitLab CI-retry handler needs (E45.22 / #2043). Set when Action is
+	// MatchActionCIFailureRetry AND the event came from GitLab; the GitHub
+	// path sets CheckRunRef instead. Handle routes on Event.Forge, so the
+	// two are never both populated.
+	PipelineRef *PipelineRef
+
 	// Repositories is the set of "owner/name" repos an installation /
 	// installation_repositories event added to the App (ADR-048 / E29.7).
 	// Set only for MatchActionScaffold — handleInstallation opens one
@@ -212,6 +219,23 @@ type CheckRunRef struct {
 	HeadSHA    string
 	CheckName  string
 	Conclusion string
+}
+
+// PipelineRef is the subset of a GitLab Pipeline Hook payload the
+// GitLab CI-retry path needs (E45.22 / #2043), mirroring CheckRunRef.
+//
+// Ref and SHA are the CORRELATION inputs: the retry handler resolves a
+// failing pipeline to its Fishhawk run by matching Ref against the run's
+// ADR-035 sole-writer run branch AND SHA against the run's recorded head
+// SHA. MergeRequestIID only NARROWS the candidate set — a retry lineage
+// produces MULTIPLE runs per merge request by construction, so the iid
+// alone cannot select one. PipelineID is provenance for the audit payload.
+type PipelineRef struct {
+	PipelineID      int
+	Ref             string
+	SHA             string
+	Status          string
+	MergeRequestIID int
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -780,8 +804,10 @@ var gitLabBotUsername = regexp.MustCompile(`^(project|group)_\d+_bot`)
 //   - object_kind "merge_request" skips — the MR lifecycle is consumed
 //     server-side (the receiver's merge/close consumer drives the
 //     review stage), not via the dispatcher.
-//   - object_kind "pipeline" / "build" skip with a reason naming the
-//     E45.8 / #1861 CI-dispatch consumer.
+//   - object_kind "pipeline" classifies a FAILED pipeline as
+//     MatchActionCIFailureRetry (E45.22 / #2043); object_kind "build"
+//     (the Job Hook GitLab emits for the SAME failure) is skipped so one
+//     failing job drives at most one retry — see matchGitLabCIFailure.
 //   - Everything else is acknowledged and skipped.
 func MatchGitLabEvent(ev Event) Match {
 	if ev.CredentialRef == "" {
@@ -800,8 +826,7 @@ func MatchGitLabEvent(ev Event) Match {
 	case "merge_request":
 		return Match{Skip: true, Reason: "MR lifecycle consumed server-side"}
 	case "pipeline", "build":
-		return Match{Skip: true,
-			Reason: fmt.Sprintf("%s event recognized; run creation from GitLab triggers is the E45.8/#1861 CI-dispatch consumer", ev.Type)}
+		return matchGitLabCIFailure(ev)
 	default:
 		return Match{Skip: true,
 			Reason: fmt.Sprintf("unrecognized gitlab object_kind %q", ev.Type)}
@@ -854,8 +879,25 @@ func matchGitLabIssue(ev Event) Match {
 	return Match{
 		Action:     MatchActionRun,
 		WorkflowID: DefaultWorkflowID,
-		TriggerRef: fmt.Sprintf("issue:%d", payload.ObjectAttributes.IID),
-		IssueRef:   &IssueRef{Number: payload.ObjectAttributes.IID},
+		// TriggerSource is REQUIRED, not decorative: handleGitLabCreateRun
+		// passes it straight to CreateRun, and runs_trigger_source_check
+		// rejects the empty string, so omitting it makes every GitLab issue
+		// trigger fail at the INSERT and 5xx into a redelivery loop. The GitHub
+		// matcher has always set it; the GitLab matcher not doing so was
+		// invisible until a Postgres-backed test ran the two together
+		// (TestGitLabTrigger_PersistedRunReachesGitLabPipelineDispatch), because
+		// every webhook unit test uses a fake repository that enforces no
+		// constraint.
+		//
+		// github_issue is the right VALUE despite the name: it is the enum's
+		// issue-anchored member (Run.IsIssueAnchored keys on it), and a
+		// GitLab-issue-triggered run is issue-anchored in exactly the same way.
+		// A distinct 'gitlab_issue' member would need a constraint-widening
+		// migration and an IsIssueAnchored widening to avoid silently
+		// un-anchoring these runs — deliberately not bundled here.
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    fmt.Sprintf("issue:%d", payload.ObjectAttributes.IID),
+		IssueRef:      &IssueRef{Number: payload.ObjectAttributes.IID},
 	}
 }
 
@@ -900,8 +942,96 @@ func matchGitLabNote(ev Event) Match {
 	}
 	if cmd.Action == MatchActionRun {
 		m.WorkflowID = DefaultWorkflowID
+		// Same storage-layer requirement as matchGitLabIssue above: only the
+		// run-creating command reaches CreateRun, and an empty trigger_source
+		// is rejected by runs_trigger_source_check. Approve / reject act on an
+		// existing run and create nothing, so they need no source.
+		m.TriggerSource = run.TriggerGitHubIssue
 	}
 	return m
+}
+
+// gitLabCIFailureKindBuild is the object_kind GitLab stamps on a Job Hook.
+// GitLab emits BOTH a Pipeline Hook (object_kind "pipeline") and a Job Hook
+// (object_kind "build") for the same failing job, and both payloads carry the
+// ref / sha / pipeline id this classifier reads — so without an explicit
+// arm, one failure would classify TWICE and drive two retry attempts
+// (E45.22 / #2043, HIGH 3).
+const gitLabCIFailureKindBuild = "build"
+
+// gitLabPipelineFailedStatus is the object_attributes.status /
+// build_status value that marks a failed GitLab pipeline or job.
+const gitLabPipelineFailedStatus = "failed"
+
+// matchGitLabCIFailure classifies a GitLab Pipeline Hook (object_kind
+// "pipeline") or Job Hook (object_kind "build") for the CI-failure retry
+// path (E45.22 / #2043). Pure: correlation and cap enforcement live in
+// handleGitLabCIRetry.
+//
+// THE BUILD SKIP IS A CONTROL, not a parse failure. GitLab emits a Pipeline
+// Hook AND a Job Hook for the same failing job, and the Job Hook payload
+// carries top-level `ref`, `sha`, `build_status` and `pipeline_id` — every
+// correlation input the pipeline payload carries under object_attributes. The
+// union decode below therefore classifies a build payload just as happily as a
+// pipeline one, and the pipeline hook is elected the SINGLE retry trigger by
+// the explicit arm here. Delete the arm and a combined delivery drives two
+// retry attempts; the build-only isolation test is the counterfactual vehicle.
+//
+// Everything else skips with a reason: a non-failed status, and a payload
+// missing the ref or sha the correlation contract requires.
+func matchGitLabCIFailure(ev Event) Match {
+	if ev.Type == gitLabCIFailureKindBuild {
+		return Match{Skip: true,
+			Reason: "gitlab build (job) event skipped: the pipeline hook for the same failure is the single retry trigger (E45.22/#2043)"}
+	}
+	var payload struct {
+		ObjectAttributes struct {
+			ID     int    `json:"id"`
+			Ref    string `json:"ref"`
+			SHA    string `json:"sha"`
+			Status string `json:"status"`
+		} `json:"object_attributes"`
+		// The Job Hook carries the same fields at the TOP level. Decoded so
+		// the build arm above is a real control rather than a decode accident.
+		Ref          string `json:"ref"`
+		SHA          string `json:"sha"`
+		BuildStatus  string `json:"build_status"`
+		PipelineID   int    `json:"pipeline_id"`
+		MergeRequest struct {
+			IID int `json:"iid"`
+		} `json:"merge_request"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "gitlab pipeline payload parse failed"}
+	}
+	pr := PipelineRef{
+		PipelineID:      payload.ObjectAttributes.ID,
+		Ref:             payload.ObjectAttributes.Ref,
+		SHA:             payload.ObjectAttributes.SHA,
+		Status:          payload.ObjectAttributes.Status,
+		MergeRequestIID: payload.MergeRequest.IID,
+	}
+	if pr.PipelineID == 0 {
+		pr.PipelineID = payload.PipelineID
+	}
+	if pr.Ref == "" {
+		pr.Ref = payload.Ref
+	}
+	if pr.SHA == "" {
+		pr.SHA = payload.SHA
+	}
+	if pr.Status == "" {
+		pr.Status = payload.BuildStatus
+	}
+	if pr.Status != gitLabPipelineFailedStatus {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab %s status %q is not a failure", ev.Type, pr.Status)}
+	}
+	if pr.Ref == "" || pr.SHA == "" {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab %s payload missing ref or sha; cannot correlate to a run", ev.Type)}
+	}
+	return Match{Action: MatchActionCIFailureRetry, PipelineRef: &pr}
 }
 
 // gitLabLabel is the subset of a GitLab label object the matcher reads.
@@ -1149,6 +1279,38 @@ type Dispatcher struct {
 	// treated as UTC by CheckBlockingBudget.
 	BudgetLocation *time.Location
 
+	// GitLabFiles reads the workflow spec for a GitLab-triggered run
+	// (E45.22 / #2043). It is the forge-neutral FileFetcher rather than
+	// GitHubAPI because the GitHub client's scope parse rejects a
+	// "gitlab:<project_id>" credential ref outright. Nil leaves GitLab run
+	// creation off: an admitted GitLab trigger logs and skips rather than
+	// minting a run whose spec was never validated.
+	GitLabFiles forge.FileFetcher
+
+	// GitLabProjects authorizes the payload-named GitLab project before the
+	// create path performs ANY forge call (E45.22 / #2043 fix-up). The GitLab
+	// receiver's shared X-Gitlab-Token proves only that the sender knows the
+	// deployment secret — never which project it may act on — so both
+	// payload-derived selectors (ev.CredentialRef and ev.Repo) must be bound
+	// to a registered installation first. NIL FAILS CLOSED: with no registry
+	// wired, no project can be shown to be authorized and GitLab run creation
+	// refuses, in contrast to the nil-means-off seams above which merely turn
+	// an optional side effect off. See GitLabProjectAuthorizer.
+	GitLabProjects GitLabProjectAuthorizer
+
+	// GitLabTrigger creates the GitLab pipeline both GitLab paths dispatch
+	// through. NIL — the production default — resolves it from the forge
+	// registry via runnerbackend.GitLabPipelineTrigger(), preserving the
+	// existing behaviour exactly, including its nil-safe warn-and-skip when
+	// GitLab is unconfigured.
+	//
+	// It exists as an explicit dependency rather than a bare global lookup so
+	// the dispatch-FAILED branches are reachable: a pipeline trigger that
+	// returns an error is the one outcome neither GitLab path could otherwise
+	// be driven into, and those branches decide whether a stage is left
+	// untransitioned and what the audit records (concerns e57e8cd3 / b57c1fd3).
+	GitLabTrigger runnerbackend.PipelineTrigger
+
 	// Accounts resolves the event's App installation to its owning tenant
 	// workspace account so the dispatcher's run-less audit entries
 	// (run_rejected_misconfigured / run_rejected_budget — no run row exists
@@ -1212,28 +1374,25 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	case MatchActionRunnerActionFailed:
 		return d.handleRunnerActionFailed(ctx, ev, m)
 	case MatchActionCIFailureRetry:
+		// Route by source forge: a GitLab Pipeline Hook correlates on
+		// (ref, sha) against the run branch (E45.22 / #2043), a GitHub
+		// check_run on (pull_request_url, check name).
+		if ev.Forge == ForgeGitLab {
+			return d.handleGitLabCIRetry(ctx, ev, m)
+		}
 		return d.handleCIFailureRetry(ctx, ev, m)
 	case MatchActionScaffold:
 		return d.handleInstallation(ctx, ev, m)
 	}
 
-	// DELIBERATE BOUNDARY (E45.6 / #1860): a GitLab MatchActionRun
-	// parks fail-closed here, BEFORE the spec-fetch step. Actual run
-	// CREATION from a GitLab trigger is the CI/dispatch phase's work
-	// per ADR-058 (E45.8 / #1861): the forge.Forge interface has no
-	// workflow-spec read, comment-backs are GitHub-only, and no
-	// gitlab_ci runner_kind exists yet. Falling through would hand a
-	// "gitlab:<project_id>" scope to d.GitHub (the GitHub client),
-	// whose installation-id parse would fail into a 5xx retry loop, so
-	// we log the reason and return nil (202) instead.
+	// GitLab run creation (E45.22 / #2043) UNPARKS the E45.6 / #1860
+	// boundary that used to return here. A GitLab-sourced MatchActionRun
+	// takes its own create path: the spec is read through the forge-neutral
+	// FileFetcher (the GitHub client's installation-id parse cannot accept a
+	// "gitlab:<project_id>" scope), and the run is stamped
+	// runner_kind=gitlab_ci with a "gitlab:" installation_ref.
 	if ev.Forge == ForgeGitLab {
-		d.logger().LogAttrs(ctx, slog.LevelInfo,
-			"gitlab run trigger parked: run creation is the E45.8/#1861 CI-dispatch consumer",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("repo", ev.Repo),
-			slog.String("trigger_ref", m.TriggerRef),
-		)
-		return nil
+		return d.handleGitLabCreateRun(ctx, ev, m, now)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -1823,10 +1982,14 @@ var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-re
 //     required_checks_snapshot (#251). A non-required check failing
 //     isn't a merge blocker, so it isn't a retry trigger.
 //
-//  3. Skip if a Fishhawk run already has this head_sha. The runner's
-//     fresh commit produces a new head_sha each retry; an event for
-//     a SHA we already wrote a run against is a redelivery / racing
-//     event.
+//  3. Skip if a Fishhawk run already has this head_sha (defence in depth).
+//     The runner's fresh commit produces a new head_sha each retry, so an
+//     event for a SHA we already wrote a run against is a redelivery. The
+//     ATOMIC guard is the runs_retry_child_once_idx CONSTRAINT at step 6's
+//     insert — a concurrently-racing delivery derives the same retry_attempt
+//     from the same parent and loses the unique_violation benignly — but the
+//     index keys on (parent_run_id, retry_attempt) and so does not cover a
+//     redelivery that resolves a retry CHILD as its parent.
 //
 //  4. Read on_ci_failure.max_retries from the parent's cached
 //     workflow spec (#283 / #277), defaulting to DefaultMaxRetries
@@ -1884,7 +2047,15 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		return nil
 	}
 
-	// Step 3: dedup against existing runs on this head_sha.
+	// Step 3: the head_sha pre-read, retained as DEFENCE IN DEPTH beside the
+	// runs_retry_child_once_idx constraint at the CreateRun below. The
+	// constraint is the ATOMIC guard — it serializes two concurrent
+	// deliveries for the same parent, which this read-then-write cannot —
+	// but it keys on (parent_run_id, retry_attempt) and therefore does not
+	// cover a STALE REDELIVERY: once a retry child carries pull_request_url
+	// on the same PR, a redelivered failure for the ORIGINAL head_sha
+	// resolves the CHILD as parent and mints attempt N+1 against a SHA that
+	// was already retried. See runOnHeadSHAExists.
 	dup, err := d.runOnHeadSHAExists(ctx, ev.Repo, ref.PRNumber, ref.HeadSHA)
 	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
@@ -1956,7 +2127,23 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 	if installationID != 0 {
 		params.InstallationID = &installationID
 	}
+	// ATOMIC DEDUP (E45.22 / #2043, C1): runs_retry_child_once_idx is a
+	// partial unique index on (parent_run_id, retry_attempt). Two racing
+	// deliveries for the same parent both derive retry_attempt from the
+	// PARENT row (line above) — never from the latest existing CHILD, which
+	// would make the two inserts disagree and the index never fire — so the
+	// loser trips a unique_violation on that index. That is the benign
+	// "someone else won" outcome, NOT a failure: return nil without a 5xx so
+	// the forge does not redeliver. Every other error stays a hard error.
 	child, err := d.Runs.CreateRun(ctx, params)
+	if run.IsRetryChildDuplicate(err) {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"ci_failure_retry: concurrent delivery already created this retry child",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.Int("retry_attempt", params.RetryAttempt))
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("dispatcher: create retry run: %w", err)
 	}
@@ -2135,11 +2322,25 @@ func checkInSnapshot(r *run.Run, name string) bool {
 	return false
 }
 
-// runOnHeadSHAExists reports whether some Fishhawk run on this PR
-// already records the given head_sha — either as a direct PR
-// artifact head or as an ancestor in the chain. Used by the dedup
-// guard so a redelivery on the same head_sha doesn't spawn a second
-// retry.
+// runOnHeadSHAExists reports whether some Fishhawk run on this PR already
+// records the given head_sha — either as a direct PR artifact head or as an
+// ancestor in the chain.
+//
+// DEFENCE IN DEPTH, not the dedup primitive (E45.22 / #2043 fix-up). The
+// atomic guard is runs_retry_child_once_idx, which serializes two CONCURRENT
+// deliveries for the same parent — something this read-then-write pre-read
+// structurally cannot do. But the index keys on (parent_run_id,
+// retry_attempt), so it does NOT cover the STALE-REDELIVERY case this guard
+// does: once a retry child has itself set pull_request_url on the same PR, a
+// late or redelivered check_run failure for the ORIGINAL head_sha resolves the
+// CHILD as parent (findRunForCIRetry takes the newest non-terminal row on the
+// PR) and mints attempt N+1 for a SHA that was already retried — a different
+// parent, so the index never fires. The runner's fresh commit produces a NEW
+// head_sha each retry, so "some run on this PR already recorded this SHA"
+// remains an exact statement of "this failure was already retried".
+//
+// Kept nil-tolerant: an unwired Runs/Artifacts seam or an empty head_sha
+// reports false, leaving the constraint as the sole guard.
 func (d *Dispatcher) runOnHeadSHAExists(ctx context.Context, repo string, prNumber int, headSHA string) (bool, error) {
 	if d.Runs == nil || d.Artifacts == nil || headSHA == "" {
 		return false, nil
@@ -2176,6 +2377,43 @@ func (d *Dispatcher) runOnHeadSHAExists(ctx context.Context, repo string, prNumb
 		}
 	}
 	return false, nil
+}
+
+// runHeadSHA returns the head SHA a run recorded on its implement-stage
+// pull_request artifact, or "" when the run has none yet (no implement
+// stage, no artifact, or Artifacts unwired). It is the run-side half of the
+// GitLab correlation contract (E45.22 / #2043): a failing pipeline's SHA
+// must equal this value for the pipeline to belong to the run.
+//
+// An error is returned only for a genuine repository fault; a run with no
+// recorded SHA is ("", nil) so the caller can treat it as "not this run"
+// rather than as a lookup failure.
+func (d *Dispatcher) runHeadSHA(ctx context.Context, runID uuid.UUID) (string, error) {
+	if d.Runs == nil || d.Artifacts == nil {
+		return "", nil
+	}
+	stages, err := d.Runs.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	for _, s := range stages {
+		if s.Type != run.StageTypeImplement {
+			continue
+		}
+		arts, err := d.Artifacts.ListForStage(ctx, s.ID)
+		if err != nil {
+			return "", err
+		}
+		for _, a := range arts {
+			if a.Kind != artifact.KindPullRequest {
+				continue
+			}
+			if sha := decodeArtifactHeadSHA(a.Content); sha != "" {
+				return sha, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // decodeArtifactHeadSHA pulls head_sha out of a pull_request
@@ -2336,16 +2574,24 @@ func (d *Dispatcher) backends() runnerbackend.Registry {
 			Logger:              d.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: d.Logger},
-		// gitlab_ci (#1861): DORMANT — registered so the seam is complete, but no
-		// gitlab_ci run is created until enablement (#2043). The CI-retry path only
-		// dispatches through the github_actions backend; this entry keeps the
-		// dispatcher's Registry consistent with the orchestrator's. Nil-safe when
-		// GitLab is unconfigured (forge.Get("gitlab") returns no PipelineTrigger).
+		// gitlab_ci: LIVE as of #2043 — both the GitLab create path and the
+		// GitLab CI-retry path dispatch through this entry. Nil-safe when
+		// GitLab is unconfigured (forge.Get("gitlab") returns no
+		// PipelineTrigger, and GitLabCI.TriggerStage warn-skips a nil one).
 		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
-			Trigger: runnerbackend.GitLabPipelineTrigger(),
+			Trigger: d.gitLabTrigger(),
 			Logger:  d.Logger,
 		},
 	}
+}
+
+// gitLabTrigger resolves the GitLab pipeline trigger: the explicitly injected
+// one when set, otherwise the registered GitLab forge. See Dispatcher.GitLabTrigger.
+func (d *Dispatcher) gitLabTrigger() runnerbackend.PipelineTrigger {
+	if d.GitLabTrigger != nil {
+		return d.GitLabTrigger
+	}
+	return runnerbackend.GitLabPipelineTrigger()
 }
 
 func (d *Dispatcher) now() time.Time {
