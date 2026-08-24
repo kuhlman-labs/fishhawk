@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -449,6 +450,45 @@ func TestRunbook_DocumentsGroomingLoop(t *testing.T) {
 	if !regexp.MustCompile(`\bgroom\b`).MatchString(flat) {
 		t.Error("grooming section never names the stage id `groom` as a standalone word — it must name the id the stage TYPE is confused with")
 	}
+
+	// The anchors above prove a TERM is present. A term can be present while
+	// the claim made of it is gone or reversed: `plan` survives in the
+	// `available: [plan implement review]` list even if nothing binds it to the
+	// stage TYPE, and `hygiene`/`ordering`/`dedup`/`scoping` survive a rewrite
+	// that swaps which of them applies. So each load-bearing term is ALSO
+	// bound to its outcome.
+	for _, b := range []struct {
+		re    *regexp.Regexp
+		claim string
+	}{
+		{regexp.MustCompile(`stage:\s*"plan"`), "the invocation block must pass the stage TYPE `plan` (`stage: \"plan\"`), not a stage id"},
+		{near(`stage type`, `\bplan\b`), "the section must bind the stage TYPE to the literal `plan`"},
+		{near(`\bhygiene\b`, `auto-eligible`), "the section must say `hygiene` is the auto-eligible class, not merely name it"},
+		{near(`\bhygiene\b`, `objective_reversible`), "the section must bind `hygiene` to its `objective_reversible` condition"},
+		{near(`\bordering\b`, `proposal`), "the section must say the `ordering` class stays a proposal"},
+		{near(`\bdedup\b`, `proposal`), "the section must say the `dedup` class stays a proposal"},
+		{near(`\bscoping\b`, `proposal`), "the section must say the `scoping` class stays a proposal"},
+		{near(`mode: auto`, `refused at parse time`), "the section must say `mode: auto` on those classes is refused at PARSE time"},
+	} {
+		if !b.re.MatchString(flat) {
+			t.Errorf("grooming section fails binding /%s/ — %s", b.re, b.claim)
+		}
+	}
+}
+
+// bindingWindow is how far apart two bound anchors may sit. Wide enough to
+// span a clause, narrow enough that the match is a claim rather than a
+// coincidence of two terms landing in the same section.
+const bindingWindow = 160
+
+// near builds a regexp matching two anchors within ONE sentence (`[^.]` never
+// crosses a sentence boundary), in either order and at most bindingWindow
+// characters apart. Both anchors are short and load-bearing, so a re-wrap or a
+// copy-edit of the surrounding prose keeps the binding green while a section
+// that stopped making the claim — or reversed it — reddens (binding condition
+// C2).
+func near(a, b string) *regexp.Regexp {
+	return regexp.MustCompile(fmt.Sprintf(`%s[^.]{0,%d}%s|%s[^.]{0,%d}%s`, a, bindingWindow, b, b, bindingWindow, a))
 }
 
 // TestRunbook_GroomingHazardPrecedesInvocation asserts ORDER, not presence: a

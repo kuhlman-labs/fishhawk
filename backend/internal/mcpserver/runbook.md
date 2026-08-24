@@ -364,10 +364,10 @@ not stand between your decision and the write. Read the report's entries
 fishhawk_start_run(
   repo:           "<owner>/<repo>",
   workflow_id:    "backlog_grooming",
-  issue:          <anchor issue>,   # where YOUR declaration takes a github_issue input
+  issue:          <anchor issue>,   # OPTIONAL — only where YOUR declaration takes a github_issue input
   trigger_source: "on_demand",      # required — see below
-  runner_kind:    "local",          # local drive only; omit this and working_dir
-  working_dir:    "<absolute path to your checkout>"   # for a github_actions run
+  runner_kind:    "local",          # OPTIONAL — local drive only; omit for a github_actions run
+  working_dir:    "<absolute path to your checkout>"   # OPTIONAL — pass only with runner_kind:"local"
 )
 
 fishhawk_run_stage(
@@ -383,11 +383,11 @@ Two failure modes that read as product bugs and are not:
   a `diff` trigger, the workflow's `applies_to` refuses it, and the run never
   starts. An explicit `on_demand` is never overridden by the `github_issue`
   auto-flip, so it combines with an anchor issue.
-- **`stage` takes the stage TYPE.** A grooming declaration typically ids its
-  propose stage something like `groom`; passing that id fails with an
-  `available: [plan implement review]` list. The stage's **id and type differ
-  here** — that is the stage vocabulary (a `plan`-typed stage is PROPOSE), not
-  a defect.
+- **`stage` takes the stage TYPE, which for the propose stage is `plan`.** A
+  grooming declaration typically ids its propose stage something like `groom`;
+  passing that id fails with an `available: [plan implement review]` list. The
+  stage's **id and type differ here** — that is the stage vocabulary (a
+  `plan`-typed stage is PROPOSE), not a defect.
 
 `runner_kind` and `working_dir` are the local-drive fields and follow the rules
 in the two sections above (`working_dir` is bound once at `fishhawk_start_run`
