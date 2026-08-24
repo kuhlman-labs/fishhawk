@@ -356,7 +356,7 @@ mutations server-side**, at the moment you approve. That is the asymmetry with
 every other Fishhawk gate: there is **no separate apply step to reconsider at —
 the gate IS the apply trigger**, so a downstream stage in the declaration does
 not stand between your decision and the write. Read the report's entries
-**before** you approve, not after (E54.19 / #2822, #2851).
+**before** you approve, not after (#2822, #2851).
 
 **Invocation.** Start the run on demand, then drive its propose stage:
 
@@ -364,10 +364,10 @@ not stand between your decision and the write. Read the report's entries
 fishhawk_start_run(
   repo:           "<owner>/<repo>",
   workflow_id:    "backlog_grooming",
-  issue:          <anchor issue>,
-  trigger_source: "on_demand",
-  runner_kind:    "local",
-  working_dir:    "<absolute path to your checkout>"
+  issue:          <anchor issue>,   # where YOUR declaration takes a github_issue input
+  trigger_source: "on_demand",      # required — see below
+  runner_kind:    "local",          # local drive only; omit this and working_dir
+  working_dir:    "<absolute path to your checkout>"   # for a github_actions run
 )
 
 fishhawk_run_stage(
@@ -392,9 +392,12 @@ Two failure modes that read as product bugs and are not:
 `runner_kind` and `working_dir` are the local-drive fields and follow the rules
 in the two sections above (`working_dir` is bound once at `fishhawk_start_run`
 and inherited by `fishhawk_run_stage`); omit them for a `github_actions` run.
-Where the propose stage declares a required `github_issue` input — the shipped
-declaration does — the **anchor issue supplies the request**: open or reuse an
-issue whose BODY states what you want groomed. The body IS the request.
+Whether an anchor issue is needed is decided by YOUR declaration, not by the
+loop: where its propose stage declares a required `github_issue` input, the
+**anchor issue supplies the request** — open or reuse an issue whose BODY
+states what you want groomed, because the body IS the request. Where the stage
+declares no such input, omit `issue`; the request comes from whatever inputs
+that declaration does take.
 
 **What approval applies is decided by the workflow's action matrix, not by a
 fixed rule.** A grooming report's entries are typed by action **class**. On

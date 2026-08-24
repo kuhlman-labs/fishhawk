@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -386,6 +387,20 @@ func groomingSection(t *testing.T) string {
 	return rest
 }
 
+// markdownInline strips the inline-emphasis punctuation markdown uses for code
+// spans (`) and bold/italic (*), so an anchor keys on the WORDS a claim is made
+// of rather than on the markup wrapping them: dropping a pair of backticks or
+// moving a bold span changes no meaning, and a test that reddens on that gets
+// deleted by the next person to copy-edit the runbook.
+var markdownInline = strings.NewReplacer("`", "", "*", "")
+
+// flattenSection normalizes a runbook section for anchoring: markup stripped,
+// lowercased, and whitespace-folded so an anchor spanning a line wrap still
+// matches and a re-wrap of the prose does not redden the assertions.
+func flattenSection(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(markdownInline.Replace(s))), " ")
+}
+
 // TestRunbook_DocumentsGroomingLoop is the E54.35 done-means: the EMBEDDED
 // runbook (not runbook.md on disk — asserting the embedded value is what proves
 // the text travels inside the binary to a client connecting from another
@@ -393,9 +408,7 @@ func groomingSection(t *testing.T) string {
 // claim is asserted independently so a half-written section names which one is
 // missing.
 func TestRunbook_DocumentsGroomingLoop(t *testing.T) {
-	// Whitespace-normalized so an anchor spanning a line wrap in the markdown
-	// still matches, and a re-wrap of the prose does not redden the table.
-	flat := strings.Join(strings.Fields(strings.ToLower(groomingSection(t))), " ")
+	flat := flattenSection(groomingSection(t))
 	for _, c := range []struct {
 		anchor string
 		claim  string
@@ -408,13 +421,12 @@ func TestRunbook_DocumentsGroomingLoop(t *testing.T) {
 		{"trigger_source", "names the trigger_source requirement"},
 		{"on_demand", "names the on_demand trigger form"},
 		{"the stage type", "distinguishes the stage TYPE from the stage id"},
-		{"`groom`", "names the stage id the type is confused with"},
 		{"hygiene", "names hygiene as the applying class"},
 		{"objective_reversible", "names hygiene's backend-evaluable condition"},
 		{"ordering", "names the ordering class that stays a proposal"},
 		{"dedup", "names the dedup class that stays a proposal"},
 		{"scoping", "names the scoping class that stays a proposal"},
-		{"refused at **parse time**", "states mode: auto on those three is refused at PARSE time"},
+		{"refused at parse time", "states mode: auto on those three is refused at PARSE time"},
 		{"max_autonomy", "states an escalation ceiling can clamp further"},
 		{"forge", "says to verify applied mutations on the FORGE"},
 		{"not from the run summary", "says the run summary is not the verification surface"},
@@ -427,6 +439,15 @@ func TestRunbook_DocumentsGroomingLoop(t *testing.T) {
 		if !strings.Contains(flat, strings.ToLower(c.anchor)) {
 			t.Errorf("grooming section missing anchor %q — the section must state that it %s", c.anchor, c.claim)
 		}
+	}
+
+	// The stage id the stage TYPE is confused with, asserted as a whole WORD
+	// rather than as a table substring: with the code-span backticks stripped,
+	// a bare "groom" substring is carried by every "backlog_grooming" and
+	// "grooming" in the section, so a substring anchor would pass vacuously.
+	// \bgroom\b matches only the standalone id.
+	if !regexp.MustCompile(`\bgroom\b`).MatchString(flat) {
+		t.Error("grooming section never names the stage id `groom` as a standalone word — it must name the id the stage TYPE is confused with")
 	}
 }
 
