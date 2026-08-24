@@ -37,15 +37,23 @@ func gcOrdering(n string, rank int, score float64, rubric ...string) plan.Orderi
 	}
 }
 
+// gcHygiene builds a hygiene defect whose fingerprint basis is the STRUCTURED
+// fix (#2847), not the `suggested_fix` prose. The prose is a fixed string so a
+// test that changes only `fix` changes only the structural basis, and the
+// prose-reword test can change only the prose.
 func gcHygiene(n, defect, fix string) plan.HygieneDefect {
 	ref := gcItem(n)
-	return plan.HygieneDefect{
+	d := plan.HygieneDefect{
 		ID:           plan.GroomingEntryID(plan.GroomingClassHygiene, defect, ref),
 		ItemRef:      ref,
 		Defect:       defect,
 		Detail:       "prose detail",
-		SuggestedFix: fix,
+		SuggestedFix: "prose suggestion",
 	}
+	if fix != "" {
+		d.Fix = &plan.HygieneFix{FieldValue: fix}
+	}
+	return d
 }
 
 func gcDuplicate(a, b, confidence string) plan.DuplicateCandidate {
@@ -425,7 +433,7 @@ func TestRejectedProposalDoesNotReappear(t *testing.T) {
 
 	t.Run("changed STRUCTURAL basis resurfaces and names the field", func(t *testing.T) {
 		base := NewGroomingBaseline(prior, []GroomingDecision{{EntryID: rejected.ID, Verdict: GroomingRejected}}, nil)
-		changed := gcHygiene("1", "missing_estimate", "8") // suggested_fix 3 -> 8
+		changed := gcHygiene("1", "missing_estimate", "8") // fix.field_value 3 -> 8
 		report := gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{changed} })
 		res := FilterGroomingChurn(report, base, th)
 		if !containsID(proposedIDs(res), changed.ID) {
@@ -435,8 +443,61 @@ func TestRejectedProposalDoesNotReappear(t *testing.T) {
 		if !ok {
 			t.Fatal("no resurface record; AC5 requires the report to say what changed")
 		}
-		if rec.Reason != GroomingResurfaceBasisChanged || rec.ChangedField != "suggested_fix" {
-			t.Errorf("resurface = %+v, want reason %q changed_field %q", rec, GroomingResurfaceBasisChanged, "suggested_fix")
+		if rec.Reason != GroomingResurfaceBasisChanged || rec.ChangedField != "fix" {
+			t.Errorf("resurface = %+v, want reason %q changed_field %q", rec, GroomingResurfaceBasisChanged, "fix")
+		}
+	})
+
+	// #2847: the hygiene basis moved off `suggested_fix` onto the structured
+	// `fix` — the value the apply path actually dispatches. Both halves are
+	// asserted, because either alone is weak: a basis that ignored `fix` would
+	// suppress a genuinely different label set, and one that still hashed the
+	// prose would resurface an unchanged proposal on a re-worded sentence.
+	t.Run("a re-worded suggested_fix alone does not resurface", func(t *testing.T) {
+		base := NewGroomingBaseline(prior, []GroomingDecision{{EntryID: rejected.ID, Verdict: GroomingRejected}}, nil)
+		reworded := rejected
+		reworded.SuggestedFix = "Please set the estimate to three points."
+		report := gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{reworded} })
+		if containsID(proposedIDs(FilterGroomingChurn(report, base, th)), rejected.ID) {
+			t.Error("a re-worded suggested_fix resurfaced a rejected proposal; the fingerprint must cover `fix`, not the prose")
+		}
+	})
+
+	t.Run("a changed LABEL SET resurfaces and names the fix field", func(t *testing.T) {
+		before := gcHygiene("1", "missing_label_namespace", "")
+		before.Fix = &plan.HygieneFix{Labels: []string{"area:api"}}
+		base := NewGroomingBaseline(
+			gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{before} }),
+			[]GroomingDecision{{EntryID: before.ID, Verdict: GroomingRejected}}, nil)
+
+		after := before
+		after.Fix = &plan.HygieneFix{Labels: []string{"area:server-api"}}
+		report := gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{after} })
+		res := FilterGroomingChurn(report, base, th)
+		if !containsID(proposedIDs(res), after.ID) {
+			t.Fatal("a different proposed LABEL did not resurface; two different label sets must not be one proposal")
+		}
+		rec, ok := resurfaceRecord(t, res, after.ID)
+		if !ok || rec.ChangedField != "fix" {
+			t.Errorf("resurface = %+v (ok=%t), want changed_field %q", rec, ok, "fix")
+		}
+	})
+
+	t.Run("board_state case alone does NOT resurface", func(t *testing.T) {
+		// The fingerprint lower-cases the board state, exactly as
+		// groomingResolveBoardState lower-cases its lookup (condition C6):
+		// `Backlog` and `backlog` are ONE proposal on both sides.
+		before := gcHygiene("1", "unboarded", "")
+		before.Fix = &plan.HygieneFix{BoardState: "backlog"}
+		base := NewGroomingBaseline(
+			gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{before} }),
+			[]GroomingDecision{{EntryID: before.ID, Verdict: GroomingRejected}}, nil)
+
+		after := before
+		after.Fix = &plan.HygieneFix{BoardState: "Backlog"}
+		report := gcReport("h", func(gr *plan.GroomingReport) { gr.HygieneDefects = []plan.HygieneDefect{after} })
+		if containsID(proposedIDs(FilterGroomingChurn(report, base, th)), after.ID) {
+			t.Error("a board_state case change resurfaced the proposal; the basis and the lookup must agree on case")
 		}
 	})
 

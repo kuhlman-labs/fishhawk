@@ -118,7 +118,10 @@
       },
       "defect": "unboarded",
       "detail": "Not present on the tracking board, so it is invisible to the kanban view the phase is driven from.",
-      "suggested_fix": "Add the item to the phase board and set Status=Backlog."
+      "suggested_fix": "Add the item to the phase board and set Status=Backlog.",
+      "fix": {
+        "board_state": "backlog"
+      }
     }
   ],
   "dependency_edges": [

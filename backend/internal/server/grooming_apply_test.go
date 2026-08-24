@@ -143,7 +143,13 @@ func groomingApplyFullReport() (*plan.GroomingReport, groomingApplyEntryIDs) {
 		}},
 		HygieneDefects: []plan.HygieneDefect{{
 			ID: ids.hygiene, ItemRef: h, Defect: "missing_label_namespace",
-			Detail: "no area: label", SuggestedFix: "area:api",
+			Detail: "no area: label",
+			// The prose stays prose; the apply path reads `fix` and only
+			// `fix` (#2847), so the fixture must carry the structured member
+			// or this entry would skip and the dispatch assertions below
+			// would be vacuously green.
+			SuggestedFix: "Please attach the ownership marking for backend duties",
+			Fix:          &plan.HygieneFix{Labels: []string{"area:api"}},
 		}},
 		DependencyEdges: []plan.DependencyEdge{{
 			ID: ids.dependency, From: dFrom, To: dTo, Basis: "shared seam", Kind: "depends_on",

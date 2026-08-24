@@ -297,7 +297,38 @@
         },
         "suggested_fix": {
           "type": "string",
-          "description": "Optional. The concrete correction proposed."
+          "description": "Optional. PROSE for a human reader, describing the concrete correction proposed. It is NEVER read as a mutation payload: the apply path reads `fix` and nothing else, so an entry whose `fix` is absent applies nothing however precisely this sentence names the value (#2847)."
+        },
+        "fix": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional. The STRUCTURED mutation payload the apply path reads. Populate exactly the member this entry's `defect` requires: missing_label_namespace -> labels; unlinked_parent_epic / missing_parent_epic_link -> parent_epic; unboarded -> board_state; missing_estimate -> field_value; absent_done_means -> no mechanical mutation, so no fix. An absent, wrong-member or invalid value is recorded as a NAMED skip and applies nothing — it is never recovered from `suggested_fix`, which stays prose for a human.",
+          "properties": {
+            "labels": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "The label names to ADD, each exactly as it must appear on the forge (e.g. `phase:alpha`). No prose, no leading verb, no trailing punctuation: a name carrying whitespace, a leading or trailing punctuation/symbol rune, or more than 50 characters is refused pre-dispatch."
+            },
+            "parent_epic": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The parent epic's issue NUMBER, bare (`389`) or hashed (`#389`). Anything that is not a positive integer after stripping one optional leading `#` is refused pre-dispatch."
+            },
+            "board_state": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The CANONICAL state an unboarded item is placed at (e.g. `backlog`), matched case-insensitively against the work-management conventions `states` map and resolved to that board's own column option before dispatch. A state the conventions do not declare is refused pre-dispatch."
+            },
+            "field_value": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The board field value to write (e.g. an estimate). Single-line; a value carrying a newline is refused pre-dispatch."
+            }
+          }
         }
       }
     },

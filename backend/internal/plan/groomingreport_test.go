@@ -610,3 +610,86 @@ func TestEmbeddedGroomingReportSchemaHash_MatchesCanonical(t *testing.T) {
 		t.Error("embedded grooming-report schema drifted from docs/spec/ — run scripts/sync-schemas")
 	}
 }
+
+// TestValidateGroomingReport_HygieneFix covers the structured `fix` member
+// added by #2847 at the ARTIFACT boundary: the shapes the schema admits
+// round-trip into the typed struct, and the shapes it must reject are rejected.
+//
+// Every fixture is a hand-written JSON literal, so a RED lands on the
+// behavioral assertion rather than on a fixture-setup call to the validator
+// under test.
+func TestValidateGroomingReport_HygieneFix(t *testing.T) {
+	entry := func(fix string) []byte {
+		f := ""
+		if fix != "" {
+			f = `,"fix":` + fix
+		}
+		return groomingDocWithHygiene(`[{"id":"hygiene:github/kuhlman-labs/fishhawk#2235:missing_label_namespace",` +
+			`"item_ref":` + gr2235Ref + `,"defect":"missing_label_namespace","detail":"no area: label",` +
+			`"suggested_fix":"Add area:server-api."` + f + `}]`)
+	}
+
+	t.Run("every member round-trips", func(t *testing.T) {
+		body := entry(`{"labels":["area:server-api","phase:alpha"],"parent_epic":"389","board_state":"backlog","field_value":"3"}`)
+		gr, err := plan.ParseGroomingReport(body)
+		if err != nil {
+			t.Fatalf("ParseGroomingReport: %v", err)
+		}
+		fix := gr.HygieneDefects[0].Fix
+		if fix == nil {
+			t.Fatal("Fix decoded as nil; the json tag or the schema mirror dropped the field")
+		}
+		if len(fix.Labels) != 2 || fix.Labels[0] != "area:server-api" || fix.Labels[1] != "phase:alpha" {
+			t.Errorf("Labels = %#v, want both names in order", fix.Labels)
+		}
+		if fix.ParentEpic != "389" || fix.BoardState != "backlog" || fix.FieldValue != "3" {
+			t.Errorf("Fix = %+v, want the three scalars decoded verbatim", *fix)
+		}
+		// The prose is decoded too, and stays SEPARATE from the fix.
+		if gr.HygieneDefects[0].SuggestedFix != "Add area:server-api." {
+			t.Errorf("SuggestedFix = %q, want the prose preserved unchanged", gr.HygieneDefects[0].SuggestedFix)
+		}
+	})
+
+	t.Run("absent fix decodes nil — additive within grooming_report_v1", func(t *testing.T) {
+		gr, err := plan.ParseGroomingReport(entry(""))
+		if err != nil {
+			t.Fatalf("ParseGroomingReport: %v", err)
+		}
+		if gr.HygieneDefects[0].Fix != nil {
+			t.Errorf("Fix = %+v, want nil: `fix` is OPTIONAL and its absence must stay distinguishable from an empty one",
+				gr.HygieneDefects[0].Fix)
+		}
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		cases := []struct {
+			name string
+			fix  string
+		}{
+			{name: "unknown member", fix: `{"labls":["area:api"]}`},
+			{name: "member alongside a valid one", fix: `{"labels":["area:api"],"notes":"why"}`},
+			{name: "empty label array", fix: `{"labels":[]}`},
+			{name: "empty label name", fix: `{"labels":[""]}`},
+			{name: "labels not an array", fix: `{"labels":"area:api"}`},
+			{name: "parent_epic not a string", fix: `{"parent_epic":389}`},
+			{name: "empty board_state", fix: `{"board_state":""}`},
+			{name: "fix not an object", fix: `"area:api"`},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := plan.ValidateGroomingReport(entry(tc.fix)); err == nil {
+					t.Fatalf("accepted a hygiene fix of %s; the object is additionalProperties:false with typed members", tc.fix)
+				}
+			})
+		}
+	})
+}
+
+// groomingDocWithHygiene is groomingDoc with only the hygiene array varying,
+// so a rejection is attributable to the entry under test.
+func groomingDocWithHygiene(hygiene string) []byte {
+	return groomingDoc(
+		`[{"id":"ordering:github/kuhlman-labs/fishhawk#2235","item_ref":`+gr2235Ref+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
+		`[]`, hygiene, `[]`, `[]`, `[]`)
+}

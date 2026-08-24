@@ -119,12 +119,44 @@ type DuplicateCandidate struct {
 // HygieneDefect is one objective, reversible structural defect (charter S4).
 // Defect doubles as the entry id's qualifier, so one item may carry one
 // entry per distinct defect without an id collision.
+//
+// SuggestedFix is PROSE FOR A HUMAN and no mutation payload is ever derived
+// from it (#2847). The apply layer reads Fix and nothing else: recovering
+// three label names out of "Add area:server-api, autonomy:medium, phase:alpha."
+// is a guess, and the guess that shipped asked GitHub to create a label
+// literally named "Add phase:alpha." on eight real issues. An entry whose Fix
+// is absent applies NOTHING, however precisely SuggestedFix names the value.
 type HygieneDefect struct {
-	ID           string  `json:"id"`
-	ItemRef      ItemRef `json:"item_ref"`
-	Defect       string  `json:"defect"`
-	Detail       string  `json:"detail"`
-	SuggestedFix string  `json:"suggested_fix,omitempty"`
+	ID           string      `json:"id"`
+	ItemRef      ItemRef     `json:"item_ref"`
+	Defect       string      `json:"defect"`
+	Detail       string      `json:"detail"`
+	SuggestedFix string      `json:"suggested_fix,omitempty"`
+	Fix          *HygieneFix `json:"fix,omitempty"`
+}
+
+// HygieneFix is the STRUCTURED mutation payload for one hygiene defect: the
+// machine-readable counterpart of HygieneDefect.SuggestedFix's prose.
+//
+// Exactly the member the entry's Defect requires is populated —
+// missing_label_namespace -> Labels, unlinked_parent_epic /
+// missing_parent_epic_link -> ParentEpic, unboarded -> BoardState,
+// missing_estimate -> FieldValue; absent_done_means expresses no mechanical
+// mutation and carries no fix. It is a POINTER on HygieneDefect so absent and
+// empty stay distinguishable at the Go layer exactly as they are on the wire.
+type HygieneFix struct {
+	// Labels are the label names to ADD, each exactly as it must appear on
+	// the forge (e.g. "phase:alpha").
+	Labels []string `json:"labels,omitempty"`
+	// ParentEpic is the parent epic's issue number, bare ("389") or hashed
+	// ("#389").
+	ParentEpic string `json:"parent_epic,omitempty"`
+	// BoardState is the CANONICAL state an unboarded item is placed at (e.g.
+	// "backlog"), resolved to the board's own column option through the
+	// work-management conventions `states` map before dispatch.
+	BoardState string `json:"board_state,omitempty"`
+	// FieldValue is the board field value to write (e.g. an estimate).
+	FieldValue string `json:"field_value,omitempty"`
 }
 
 // DependencyEdge is a suggested dependency edge: From depends on To.

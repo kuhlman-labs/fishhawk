@@ -69,6 +69,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
@@ -166,9 +167,21 @@ const (
 	// mutation — an unknown defect value, or a known one whose fix is authored
 	// prose (absent_done_means). Recorded rather than guessed.
 	GroomingSkipUnmappableDefect = "unmappable_defect"
-	// GroomingSkipNoSuggestedFix marks a hygiene defect whose suggested_fix is
-	// absent, so the value to write is unknown. Never guessed.
-	GroomingSkipNoSuggestedFix = "no_suggested_fix"
+	// GroomingSkipNoStructuredFix marks a hygiene defect carrying no STRUCTURED
+	// fix value for its mutation kind — an absent `fix`, or a `fix` populating
+	// only a member this defect's kind does not read — so the value to write is
+	// unknown. Never guessed, and NEVER recovered from the `suggested_fix`
+	// prose (#2847): the prose is written for a human, and parsing it is how
+	// "Add phase:alpha." became a label on eight real issues.
+	GroomingSkipNoStructuredFix = "no_structured_fix"
+	// GroomingSkipInvalidFixValue marks a structured fix whose value cannot be
+	// dispatched as written: a label carrying whitespace, leading/trailing
+	// punctuation or more than 50 characters; a parent epic that is not a
+	// positive integer; a board state the conventions do not declare; a
+	// multi-line field value. Refused BEFORE the provider is called, so the
+	// refusal is an audited skip rather than a forge error after a write was
+	// attempted.
+	GroomingSkipInvalidFixValue = "invalid_fix_value"
 	// GroomingSkipNotApproved marks an entry the operator REJECTED.
 	GroomingSkipNotApproved = "not_approved"
 	// GroomingSkipAmended marks an entry the operator AMENDED — not applied as
@@ -289,8 +302,8 @@ func (e *GroomingAuditError) Error() string {
 
 // groomingCandidate is one derived mutation proposal before any containment
 // rule has run. skipReason non-empty marks a DERIVATION-time skip (a finding,
-// an unmappable defect, a missing suggested fix): the candidate is recorded
-// and never dispatched.
+// an unmappable defect, a missing or invalid structured fix): the candidate is
+// recorded and never dispatched.
 type groomingCandidate struct {
 	entryID      string
 	class        string
@@ -369,6 +382,13 @@ var groomingIceboxExpectedFrom = []string{CanonicalStateBacklog, CanonicalStateU
 // provider, no request-dependent resolution (item refs, icebox columns and
 // duplicate close targets are resolved by the executor, so a skip on one of
 // those never masks a higher-precedence containment refusal).
+//
+// A HYGIENE DEFECT'S VALUE COMES FROM ITS STRUCTURED `fix`, NEVER FROM THE
+// `suggested_fix` PROSE (#2847). The prose is written for a human; reading it
+// as the mutation payload is what asked GitHub to add a label literally named
+// `Add phase:alpha.` on eight real issues. An absent, wrong-member or invalid
+// fix records a NAMED skip here and dispatches nothing — there is no prose
+// fallback and no prose parsing anywhere in this file.
 func deriveGroomingMutations(report *plan.GroomingReport) []groomingCandidate {
 	if report == nil {
 		return nil
@@ -383,22 +403,21 @@ func deriveGroomingMutations(report *plan.GroomingReport) []groomingCandidate {
 			ref:         e.ItemRef,
 		}
 		kind, ok := groomingHygieneKinds[e.Defect]
-		switch {
-		case !ok:
+		if !ok {
 			c.skipReason = GroomingSkipUnmappableDefect
-		case strings.TrimSpace(e.SuggestedFix) == "":
-			// The value to write is unknown. A hygiene fix with no proposed
-			// value is recorded, never guessed.
-			c.kind = kind
-			c.skipReason = GroomingSkipNoSuggestedFix
-		default:
-			c.kind = kind
-			fix := strings.TrimSpace(e.SuggestedFix)
-			if kind == GroomingKindLabelSet {
-				c.after = GroomingValue{List: []string{fix}}
-			} else {
-				c.after = GroomingValue{Scalar: fix}
-			}
+			out = append(out, c)
+			continue
+		}
+		c.kind = kind
+		// THE STRUCTURED FIX IS THE ONLY SOURCE. e.SuggestedFix is not read
+		// here or anywhere else in this file (#2847) — see
+		// TestGroomingApply_NeverReadsSuggestedFix, which fails the build the
+		// moment a `.SuggestedFix` selector reappears.
+		after, reason := groomingStructuredFix(kind, e.Fix)
+		if reason != "" {
+			c.skipReason = reason
+		} else {
+			c.after = after
 		}
 		out = append(out, c)
 	}
@@ -468,6 +487,177 @@ func deriveGroomingMutations(report *plan.GroomingReport) []groomingCandidate {
 		return out[i].entryID < out[j].entryID
 	})
 	return out
+}
+
+// groomingMaxLabelLen is the pre-dispatch cap on a proposed label NAME. It is
+// a conservative bound chosen so a prose sentence cannot pass while every
+// namespaced label this repository uses does — NOT a claim about the forge's
+// exact limit. If it is wrong in either direction the consequence is a named,
+// audited skip, never a bad write.
+const groomingMaxLabelLen = 50
+
+// groomingStructuredFix reads EXACTLY the fix member this mutation kind
+// requires and validates it BEFORE any request is built (#2847). It returns
+// either the value to write or a named skip reason — never a guess, and never
+// a fall back to the `suggested_fix` prose.
+//
+// TWO REASONS, kept distinct because they send a reader to different places:
+// GroomingSkipNoStructuredFix means the proposal carries no value for this
+// kind (nil fix, wrong member populated, blank scalar), and
+// GroomingSkipInvalidFixValue means it carries one that cannot be dispatched
+// as written. The first is an incomplete proposal; the second is a malformed
+// one.
+func groomingStructuredFix(kind GroomingMutationKind, fix *plan.HygieneFix) (GroomingValue, string) {
+	if fix == nil {
+		return GroomingValue{}, GroomingSkipNoStructuredFix
+	}
+	switch kind {
+	case GroomingKindLabelSet:
+		if len(fix.Labels) == 0 {
+			return GroomingValue{}, GroomingSkipNoStructuredFix
+		}
+		labels := make([]string, 0, len(fix.Labels))
+		for _, raw := range fix.Labels {
+			name := strings.TrimSpace(raw)
+			if !groomingValidLabel(name) {
+				// ONE invalid label fails the WHOLE entry: a partial label
+				// write is a half-applied fix nobody proposed.
+				return GroomingValue{}, GroomingSkipInvalidFixValue
+			}
+			labels = append(labels, name)
+		}
+		return GroomingValue{List: labels}, ""
+	case GroomingKindEpicLink:
+		if strings.TrimSpace(fix.ParentEpic) == "" {
+			return GroomingValue{}, GroomingSkipNoStructuredFix
+		}
+		ref, ok := groomingEpicRef(fix.ParentEpic)
+		if !ok {
+			return GroomingValue{}, GroomingSkipInvalidFixValue
+		}
+		return GroomingValue{Scalar: ref}, ""
+	case GroomingKindBoardPlace:
+		state := strings.TrimSpace(fix.BoardState)
+		if state == "" {
+			return GroomingValue{}, GroomingSkipNoStructuredFix
+		}
+		// Carried in the CANONICAL vocabulary; resolveGroomingRequest maps it
+		// through the request's states map to the board's own column option,
+		// because only the request knows what that board calls it.
+		// Lower-cased here so the value the churn fingerprint hashes and the
+		// value the lookup resolves agree on case (approval condition C6).
+		return GroomingValue{Scalar: strings.ToLower(state)}, ""
+	case GroomingKindFieldSet:
+		value := strings.TrimSpace(fix.FieldValue)
+		if value == "" {
+			return GroomingValue{}, GroomingSkipNoStructuredFix
+		}
+		if strings.ContainsAny(value, "\n\r") {
+			return GroomingValue{}, GroomingSkipInvalidFixValue
+		}
+		return GroomingValue{Scalar: value}, ""
+	default:
+		// A kind groomingHygieneKinds maps but this switch does not read has
+		// no member to read, so there is no value — fail closed rather than
+		// dispatch an empty one.
+		return GroomingValue{}, GroomingSkipNoStructuredFix
+	}
+}
+
+// groomingValidLabel reports whether a proposed label NAME may be dispatched.
+//
+// The rule and its stated contract agree deliberately (approval condition C3):
+// a name is refused when it is empty after trimming, carries ANY whitespace
+// rune, BEGINS OR ENDS with a punctuation or symbol rune — not just the four
+// sentence-terminators, so `Add phase:alpha!` and `phase:alpha?` are refused
+// exactly as `Add phase:alpha.` is — or exceeds groomingMaxLabelLen runes.
+//
+// It is STRICTER than the forge: GitHub accepts a label named `good first
+// issue`. That is deliberate. The defect class whose fix this is
+// (missing_label_namespace) is by construction a `namespace:value` label, and
+// the failure direction of an over-strict check is an audited
+// `invalid_fix_value` skip, never a garbage write on a real issue.
+func groomingValidLabel(name string) bool {
+	if name == "" {
+		return false
+	}
+	runes := []rune(name)
+	if len(runes) > groomingMaxLabelLen {
+		return false
+	}
+	for _, r := range runes {
+		if unicode.IsSpace(r) {
+			return false
+		}
+	}
+	for _, r := range []rune{runes[0], runes[len(runes)-1]} {
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// groomingEpicRef normalizes a proposed parent-epic reference to the `#N` shape
+// the body markers persist, accepting BOTH wire forms the schema admits — a
+// bare `389` and a hashed `#389` (approval condition C4).
+//
+// It is deliberately EXPLICIT rather than routed through groomingNormalizeRef,
+// which returns an unparseable value trimmed-but-unchanged so that
+// normalization never collapses two different values into one. That is the
+// right behaviour for the read side and the WRONG behaviour here: prose like
+// `Link as a sub-issue of E22 #389.` would pass straight through and be
+// dispatched. So this one strips at most one leading `#`, requires every
+// remaining rune to be an ASCII digit and the value to be a positive integer,
+// and reports failure otherwise. That moves the provider-side "not a numeric
+// issue reference" refusal — which today is raised AFTER dispatch — to the
+// layer that can record it as a skip.
+func groomingEpicRef(s string) (string, bool) {
+	digits := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "#"))
+	if digits == "" {
+		return "", false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n <= 0 {
+		return "", false
+	}
+	return "#" + strconv.Itoa(n), true
+}
+
+// groomingResolveBoardState maps a CANONICAL board state onto the provider's
+// own column option through the conventions states map, reporting failure for a
+// state the conventions do not declare (or declare with an empty option).
+//
+// The match is case- and space-insensitive on BOTH sides, so the fingerprint
+// basis (which lower-cases) and this lookup cannot disagree about whether
+// `Backlog` and `backlog` are the same state (approval condition C6). Keys are
+// walked in sorted order so a conventions map carrying two keys differing only
+// in case resolves deterministically rather than by map iteration order.
+func groomingResolveBoardState(states map[string]string, canonical string) (string, bool) {
+	want := strings.ToLower(strings.TrimSpace(canonical))
+	if want == "" {
+		return "", false
+	}
+	keys := make([]string, 0, len(states))
+	for k := range states {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if strings.ToLower(strings.TrimSpace(k)) != want {
+			continue
+		}
+		if option := strings.TrimSpace(states[k]); option != "" {
+			return option, true
+		}
+		return "", false
+	}
+	return "", false
 }
 
 // groomingReportEntryIDs collects every entry id the report carries — the
@@ -631,7 +821,8 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	}
 
 	// Rule 0: a derivation-time skip (a finding, an unmappable defect, a
-	// missing suggested fix) never reaches a decision or a provider.
+	// missing or invalid structured fix) never reaches a decision or a
+	// provider.
 	if c.skipReason != "" {
 		return groomingSkipped(rec, c.skipReason)
 	}
@@ -806,6 +997,19 @@ func resolveGroomingRequest(c groomingCandidate, d GroomingDecision, req Groomin
 			return out, r
 		}
 		out.After = GroomingValue{Scalar: toRef}
+	case GroomingKindBoardPlace:
+		// The derivation carried the CANONICAL state; only the request knows
+		// what this board calls it. Resolving here (rather than at derivation
+		// time) also keeps the dispatched value in the SAME vocabulary the
+		// idempotence diff observes — groomingObserved projects board kinds
+		// onto item.BoardColumn, a provider option string — so a resolved
+		// placement still settles on re-apply instead of re-dispatching
+		// forever.
+		option, ok := groomingResolveBoardState(req.States, c.after.Scalar)
+		if !ok {
+			return out, GroomingSkipInvalidFixValue
+		}
+		out.After = GroomingValue{Scalar: option}
 	case GroomingKindIcebox:
 		col := strings.TrimSpace(req.IceboxColumn)
 		if col == "" {
