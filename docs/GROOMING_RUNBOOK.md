@@ -1,0 +1,175 @@
+# Grooming runbook
+
+Operator handoff for the `backlog_grooming` loop: how to run it, how to read what it
+produces, and how to turn its ranking into work. Written for an agent picking this up
+with no prior context.
+
+State as of 2026-08-24. Loop verified end to end by walks #2828, #2839, #2848.
+
+## 1. What works today
+
+An on-demand run produces a charter-anchored `grooming_report`, parks at an approval
+gate, and **approving it applies the hygiene-class mutations** to the tracker with every
+mutation audited.
+
+That path was assembled from five changes, each unblocking the next:
+
+| Change | What it fixed |
+|---|---|
+| #2826 | `applies_to` routing could not select the workflow — no producer emitted a non-diff trigger form |
+| #2833 | the runner destroyed the report before upload (structured-output adoption overwrote it) |
+| #2837 | `handleGroomingReport` never advanced the stage, so the gate never opened |
+| #2822 | `ApplyGrooming` had no production caller |
+| #2847 | the apply wrote `suggested_fix` PROSE as the mutation payload |
+
+Every one was found by RUNNING the loop, not by a test. Each layer was individually
+correct and tested; the seams between them were where it broke.
+
+Last verified walk: **18 mutations applied, 0 failed**, confirmed on the forge.
+
+## 2. Invocation
+
+```
+fishhawk_start_run(
+  repo:           "kuhlman-labs/fishhawk",
+  workflow_id:    "backlog_grooming",
+  issue:          2832,
+  trigger_source: "on_demand",
+  runner_kind:    "local",
+  working_dir:    "<absolute path to your checkout>"
+)
+
+fishhawk_run_stage(
+  run_id:      <id>,
+  stage:       "plan",              # the stage TYPE, not the id "groom"
+  workflow:    "backlog_grooming",
+  working_dir: <same>
+)
+```
+
+Two failure modes that look like product bugs and are not:
+
+- **`trigger_source: "on_demand"` is load-bearing.** Omit it and the run derives a `diff`
+  trigger, `applies_to` refuses the workflow, and the run never starts.
+- **`stage` takes the TYPE.** Passing `"groom"` fails with
+  `available: [plan implement review]`. `groom` is the stage id.
+
+The anchor issue supplies the request — the `groom` stage declares
+`inputs: [{source: github_issue, required: true}]`. Reuse #2832 or open a new issue whose
+body states what you want groomed; the body IS the request.
+
+Stage budget is 45m (#2838). A real pass over this backlog measures ~24m.
+
+## 3. Reading the report
+
+The artifact lands at `/tmp/fishhawk-plan.json` and is ingested as `grooming_report_v1`.
+Typical shape: ~27 ordering entries, ~16 hygiene defects, plus duplicates, dependency
+edges, decomposition suggestions, vision drift.
+
+Before approving, check that hygiene entries carry the STRUCTURED member:
+
+```json
+"fix": {"labels": ["phase:alpha"]}
+```
+
+The value alone. Prose in that field means the #2847 defect has returned.
+
+## 4. Approving is a write
+
+`fishhawk_approve_plan` executes the hygiene mutations server-side. There is no separate
+apply step to reconsider at — the gate IS the apply trigger, which is why the `apply`
+stage was removed (#2851).
+
+- `hygiene` applies (labels, fields, boarding, epic links — objective and reversible).
+- `ordering`, `dedup`, `scoping` receive no decision and apply nothing. They are
+  non-delegable by construction and refused at `mode: auto` at parse time.
+
+**Verify on the forge, not from the summary.** On walk #2844 the summary truthfully
+reported eight applied while every applied VALUE was garbage. An audit row saying
+`applied` is not the same claim as the tracker carrying the change.
+
+## 5. Turning the ranking into work
+
+An approved order seeds a campaign directly:
+
+```
+fishhawk_start_campaign(
+  repo:                 "kuhlman-labs/fishhawk",
+  grooming_run_id:      "<approved run id>",
+  working_dir:          "<absolute path>",
+  grooming_order_limit: 5
+)
+```
+
+Pass `grooming_run_id` INSTEAD of `epic_ref` / `items` — combining them is refused.
+
+Cap the first batch and watch the first item land before trusting the queue. Campaigns
+and recovery are the weaker subsystems in this product and have needed manual driving.
+
+The alternative — walking the ranked list downward with individual `fishhawk_start_run`
+calls — respects the ordering and skips nothing. Slower, more reliable.
+
+## 6. Autonomy tiers
+
+**Policy for this repo: only agents author code.** `autonomy:low` therefore means an
+agent STRUCTURALLY CANNOT do it, not that the work is sensitive — sensitivity is what
+the gate is for.
+
+Structural blockers, and nothing else:
+
+- edits `.github/workflows/**` (agent workflows forbid it)
+- edits `.fishhawk/**` (forbidden path)
+- requires a real external target the sandbox cannot reach: a second real repo,
+  GitLab.com, a real cluster, real secrets, a real OAuth app registration, a real domain
+- the human is the experimental subject (operator drills)
+- it is not code at all (partner agreements, commercial terms)
+
+A campaign refuses `autonomy:low` items as `item_human_led`.
+
+Current: **34 open `autonomy:low`**, of which 14 are epics (parents, never campaign
+items), leaving 20 genuine human-led work items. 36 issues were re-tiered to
+`autonomy:medium` on 2026-08-24 under this policy.
+
+#2274 is the durable fix — it introduces an `execution:` namespace so "cannot" and
+"should not be delegated" stop sharing one label.
+
+## 7. Hazards
+
+**A fresh groom can silently re-tier issues (#2855).** The hygiene class writes
+`autonomy:*` labels, and autonomy is the delegation control. The groomer proposed
+`autonomy:medium` for #1512 on one run and `autonomy:low` on the next. Approving a report
+can therefore undo a deliberate tier decision. Land #2855 first, or inspect the
+`autonomy:*` writes specifically before approving.
+
+**The acceptance sandbox cannot reach a forge.** A criterion needing one must carry
+`requires_live_validation` so acceptance short-circuits it into an operator walk rather
+than failing the run. Plans have omitted this four runs running (#2845).
+
+**A fix-up pass cannot rewrite the PR body.** It is composed once at PR-open. Route
+attestations to the fix-up self-report sidecar instead.
+
+## 8. Open follow-ups
+
+| Issue | Subject |
+|---|---|
+| #2855 | hygiene writes `autonomy:*`; unstable run-over-run — highest priority |
+| #2843 | per-entry dispositions; unblocks applying the destructive classes |
+| #2834 | prompt builder has no grooming branch (groom stage gets standard_v1 instructions) |
+| #2827 | intake scoring is margin-bound at filing time |
+| #2850 | churn basis vs apply-path normalization disagree on `parent_epic` |
+| #2845 | plans omit `requires_live_validation` |
+| #2274 | migrate issues to `execution:agent` |
+
+## 9. Verification discipline
+
+Habits that cost time when skipped:
+
+- Run `scripts/test verify`, never bare `go test ./...`. The latter bypasses the shared
+  reused Postgres container and produces a wall of false failures (#1174/#972).
+- Read exit codes without a pipe. `| tail` masks the real status; and zsh does NOT
+  word-split unquoted parameters the way bash does, so `for n in $LIST` iterates once
+  over the whole string.
+- Check claims against the forge or the code, not against a summary. Two verify-status
+  disputes cost real time in this epic, in opposite directions — one where reviewers
+  rejected on a failure that did not reproduce, one where a self-report disagreed with a
+  green gate.
