@@ -9,13 +9,18 @@
 // The concrete GitHub implementation (github.go) is a hand-rolled
 // REST client mirroring internal/githubclient + internal/githuboidc:
 // net/http + encoding/json, a test-overridable base URL, and explicit
-// rate-limit handling. The server depends only on IdentityProvider;
-// every GitHub specific lives in this package and its _test.go files.
+// rate-limit handling. The GitLab implementation (gitlab.go) is its
+// co-equal sibling (E66.4 / #2392): the RFC 8628 device flow against a
+// configurable GitLab base URL, server-side access-token re-verification,
+// and a bounded paginated exact-match members walk. The server depends
+// only on IdentityProvider; every forge specific lives in this package
+// and its _test.go files.
 package identity
 
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // Permission is the forge-neutral repository permission vocabulary.
@@ -82,6 +87,61 @@ func ParsePermission(name string) (Permission, bool) {
 	}
 }
 
+// The provider names that qualify a subject. Every caller that needs to
+// discriminate a forge uses these constants rather than re-spelling the
+// discriminator as a string literal, so the vocabulary has exactly one
+// definition (E66.4 / #2392).
+const (
+	ProviderGitHub = "github"
+	ProviderGitLab = "gitlab"
+)
+
+// ProviderOf returns the provider that qualifies subject — the substring
+// before the first ':' of a "<provider>:<login>" subject. An unqualified
+// subject (no ':') returns "", so a caller can tell "no provider stated"
+// apart from a stated one rather than guessing a default. The function is
+// deliberately total and allocation-light: it never errors and never
+// panics, because it sits on the authorization path where a parse failure
+// must degrade to "unknown provider" (which every caller treats as a
+// deny) rather than to a 500.
+func ProviderOf(subject string) string {
+	i := strings.IndexByte(subject, ':')
+	if i < 0 {
+		return ""
+	}
+	return subject[:i]
+}
+
+// IsConfigured reports whether p is a provider that can actually
+// authenticate somebody. It is false for a nil interface, for a
+// typed-nil concrete provider, and for *NoOpIdentityProvider — the
+// deny-by-default stand-in, which is installed precisely BECAUSE no
+// forge is configured and so must never be enumerated as one (E66.4 /
+// #2392, binding constraint 8).
+//
+// This is the single primitive the server's provider enumeration is
+// built on, and it lives here so the server and the fishhawkd wiring
+// consult ONE definition of "configured" rather than each re-deriving
+// it. An unrecognized concrete implementation is reported configured:
+// the exclusion is a deny-list of known-inert providers, not an
+// allow-list of blessed ones, so a future real provider is not
+// silently dropped from discovery.
+func IsConfigured(p IdentityProvider) bool {
+	switch v := p.(type) {
+	case nil:
+		return false
+	case *NoOpIdentityProvider:
+		// Catches a typed-nil NoOp too: it is inert either way.
+		return false
+	case *GitHubIdentityProvider:
+		return v != nil
+	case *GitLabIdentityProvider:
+		return v != nil
+	default:
+		return true
+	}
+}
+
 // DeviceCodePrompt is invoked once during VerifyUser with the user
 // code and verification URI the human must visit to authorize the
 // device flow. It is a plain func so no GitHub-specific display type
@@ -111,11 +171,26 @@ var (
 )
 
 // IdentityProvider is the forge-neutral identity contract. All three
-// methods take a context and speak provider-qualified subject strings
-// ("github:<login>"); no github.com/* forge type appears in any
-// signature. The name is deliberate (ADR / #1706): the server's Config
-// field is identity.IdentityProvider so a future non-GitHub provider
-// slots in without renaming the seam.
+// methods take a context and speak provider-qualified subject strings;
+// no github.com/* forge type appears in any signature. The name is
+// deliberate (ADR / #1706): the server's Config field is
+// identity.IdentityProvider so a future non-GitHub provider slots in
+// without renaming the seam.
+//
+// SUBJECT SHAPE. Every subject is "<provider>:<login>" — "github:octocat",
+// "gitlab:alice" — with the provider drawn from the ProviderGitHub /
+// ProviderGitLab constants and readable back out with ProviderOf. A
+// provider MUST emit only its own qualification and MUST refuse to
+// resolve a subject qualified for a different provider: a github: login
+// and a gitlab: login of the same spelling are distinct accounts, so
+// resolving one against the other's forge would answer an authorization
+// question about the wrong human.
+//
+// THE NoOp IS NOT A CONFIGURED PROVIDER. NoOpIdentityProvider satisfies
+// this interface so an unconfigured backend has something inert to hold,
+// but it can authenticate nobody. Callers enumerating "which providers
+// are configured" must filter through IsConfigured rather than counting
+// non-nil interface values (E66.4 / #2392, binding constraint 8).
 //
 //nolint:revive // interface name is the mandated forge-neutral seam name; the identity.IdentityProvider "stutter" is intentional.
 type IdentityProvider interface {
