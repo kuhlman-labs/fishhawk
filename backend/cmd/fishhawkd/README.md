@@ -145,6 +145,38 @@ and all three are empty by default (feature off, both endpoints respond `503`).
 | `FISHHAWKD_GITLAB_OAUTH_CLIENT_ID` | `--gitlab-oauth-client-id` | GitLab (group-scoped) OAuth application client_id; empty disables `/v0/auth/gitlab/*` (503) |
 | `FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET` | `--gitlab-oauth-client-secret` | GitLab OAuth application client_secret (secret: never logged); required with the client_id |
 | `FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL` | `--gitlab-oauth-callback-url` | public URL of `/v0/auth/gitlab/callback`; required with the client_id |
+| `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` | `--gitlab-device-client-id` | client_id of a **separate, NON-Confidential** GitLab application for the RFC 8628 device flow (`fishhawk token login --provider gitlab`); requires `FISHHAWKD_GITLAB_BASE_URL`; **no fallback** to `FISHHAWKD_GITLAB_OAUTH_CLIENT_ID` |
+
+### Two GitLab applications, not one (E66.4 / #2392)
+
+An operator running BOTH GitLab legs registers **two** GitLab applications:
+
+| Leg | Application | Config |
+|---|---|---|
+| Browser sign-in (`/v0/auth/gitlab/*`) | **Confidential** — the code exchange sends a `client_secret` (`auth/gitlab_oauth.go` `ExchangeCode`) | `FISHHAWKD_GITLAB_OAUTH_CLIENT_ID` / `_SECRET` / `_CALLBACK_URL` |
+| Device flow (`fishhawk token login --provider gitlab`) | **NON-Confidential** — RFC 8628 §3.4 specifies the device access-token request as `client_id`-only for a public client, with no secret | `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` + `FISHHAWKD_GITLAB_BASE_URL` |
+
+The two ids are **independent** and there is deliberately **no fallback** from
+the device id to the browser id. No citable GitLab documentation was found
+stating that one application serves both; the no-fallback design rests on the
+absence of that citation rather than on a positive finding that one application
+fails. Falling back would advertise an id in `GET /v0/tokens/login` discovery
+that the CLI cannot drive.
+
+Each leg is configured independently — either, both, or neither. Half-configured
+is legal and silent-safe: a device leg without the browser trio still advertises
+`gitlab` in discovery while `/v0/oauth/authorize` renders only the GitHub
+sign-in; the converse offers both sign-in choices while discovery advertises
+only `github`.
+
+The device flow's `PermissionLevel` / `ResolveMembership` reads reuse the
+EXISTING deployment credential `FISHHAWKD_GITLAB_TOKEN` (no new variable). It
+is **never** sent on `VerifyAccessToken`'s `GET /api/v4/user`, which carries
+only the submitted user token. When the credential is absent those reads go
+ANONYMOUS: GitLab answers an unauthenticated members read on a private project
+`404`, which maps to `PermissionNone`, which the mint's permission gate denies.
+That fails CLOSED but is non-functional for the common private-repo case, so
+boot WARNs, as it does when a base URL is set without a device client id.
 
 The requested OAuth **scope is `read_api`**, which authorizes BOTH
 `GET /api/v4/user` (the profile) and `GET /api/v4/groups` (the group-membership

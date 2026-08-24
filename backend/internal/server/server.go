@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -228,6 +229,43 @@ type Config struct {
 	// FISHHAWKD_OAUTH_CLIENT_ID in serve.go (the same client_id the
 	// browser sign-in flow uses).
 	OAuthClientID string
+
+	// IdentityProviders is the forge-keyed provider set the multi-provider
+	// surfaces enumerate: GET /v0/tokens/login discovery, the token mint's
+	// provider selection, and any future forge-aware identity read (E66.4 /
+	// #2392). Keys are identity.ProviderGitHub / identity.ProviderGitLab.
+	//
+	// New SEEDS the github entry from the single IdentityProvider +
+	// OAuthClientID fields above, and does so STRICTLY BEFORE the
+	// nil-IdentityProvider → NoOp default, so a NoOp installed by that
+	// default can never enter this map. Callers never range over this map
+	// directly: configuredIdentityProviders() is the single filtered
+	// enumeration (binding constraint 8).
+	IdentityProviders map[string]identity.IdentityProvider
+
+	// IdentityDeviceClientIDs is the per-provider DEVICE-flow client_id
+	// discovery advertises. It is the NON-Confidential application's id: the
+	// CLI drives an RFC 8628 device flow with it, so advertising the
+	// confidential browser-leg id would hand the CLI an id it cannot use. The
+	// github entry is seeded from OAuthClientID (GitHub's single OAuth App
+	// client_id already serves both legs); the gitlab entry comes from
+	// FISHHAWKD_GITLAB_DEVICE_CLIENT_ID, which has NO fallback to
+	// FISHHAWKD_GITLAB_OAUTH_CLIENT_ID (E66.4 / #2392, binding constraint 7).
+	//
+	// An entry with an empty client id is NOT configured: a provider the CLI
+	// cannot drive a device flow against must not be advertised.
+	IdentityDeviceClientIDs map[string]string
+
+	// IdentityBaseURLs is the per-provider instance base URL discovery
+	// advertises so the CLI can reach {base}/oauth/authorize_device and
+	// {base}/oauth/token (binding condition BC2). The github entry is empty
+	// in practice — the CLI knows github.com's device endpoints — while a
+	// gitlab entry is REQUIRED for a device-only GitLab deployment to be
+	// drivable at all, and is wired from FISHHAWKD_GITLAB_BASE_URL. It is a
+	// separate map rather than an accessor on identity.IdentityProvider
+	// because the provider's base URL is private and the interface carries
+	// no endpoint surface.
+	IdentityBaseURLs map[string]string
 
 	// OperatorRepo is the "owner/name" repository the token-mint authz
 	// gate reads the verified subject's permission tier on (E39.3 / #1708):
@@ -910,6 +948,15 @@ func New(cfg Config) *Server {
 	// OAuth-unconfigured backend never grants access through the
 	// identity surface (#1706) — and every existing server test that
 	// omits the field stays green.
+	//
+	// ORDERING IS LOAD-BEARING (E66.4 / #2392, binding constraint 8): the
+	// forge-keyed seeding below runs STRICTLY BEFORE the NoOp default and
+	// only when cfg.IdentityProvider is non-nil, so the NoOp installed by
+	// that default can never be seeded into IdentityProviders. This is the
+	// first of two deliberately redundant layers; configuredIdentityProviders
+	// independently excludes a NoOp by type, so a future refactor that moves
+	// either one still leaves the other standing.
+	cfg.IdentityProviders, cfg.IdentityDeviceClientIDs = seedIdentityProviderMaps(cfg)
 	if cfg.IdentityProvider == nil {
 		cfg.IdentityProvider = identity.NewNoOp()
 	}
@@ -1717,4 +1764,94 @@ func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage 
 		}
 	}
 	return failed
+}
+
+// seedIdentityProviderMaps returns the forge-keyed provider and
+// device-client-id maps for cfg, seeding the github entry from the single
+// IdentityProvider / OAuthClientID fields when they are set (E66.4 / #2392).
+//
+// It is called from New STRICTLY BEFORE the nil-IdentityProvider → NoOp
+// default and reads cfg.IdentityProvider directly, so a NoOp installed by
+// that default is not visible here and cannot be seeded. That ordering is
+// the first of binding constraint 8's two layers; the second is
+// configuredIdentityProviders' type exclusion.
+//
+// Explicit map entries WIN over the seed, so a deployment that wires the
+// maps directly is never overwritten. Fresh maps are returned rather than
+// mutating the caller's, so New never writes through a map the caller still
+// holds.
+func seedIdentityProviderMaps(cfg Config) (map[string]identity.IdentityProvider, map[string]string) {
+	providers := make(map[string]identity.IdentityProvider, len(cfg.IdentityProviders)+1)
+	for name, p := range cfg.IdentityProviders {
+		providers[name] = p
+	}
+	clientIDs := make(map[string]string, len(cfg.IdentityDeviceClientIDs)+1)
+	for name, id := range cfg.IdentityDeviceClientIDs {
+		clientIDs[name] = id
+	}
+	if cfg.IdentityProvider != nil {
+		if _, ok := providers[identity.ProviderGitHub]; !ok {
+			providers[identity.ProviderGitHub] = cfg.IdentityProvider
+		}
+		if _, ok := clientIDs[identity.ProviderGitHub]; !ok && cfg.OAuthClientID != "" {
+			clientIDs[identity.ProviderGitHub] = cfg.OAuthClientID
+		}
+	}
+	return providers, clientIDs
+}
+
+// configuredIdentityProviders is the SINGLE enumeration every "which forges
+// can authenticate somebody" caller goes through — discovery, the token
+// mint's provider selection, and anything added later. No handler may range
+// over cfg.IdentityProviders directly (E66.4 / #2392, binding constraint 8).
+//
+// It excludes two shapes. (1) A provider identity.IsConfigured reports false
+// for: a nil interface, a typed-nil concrete provider, or the
+// deny-by-default *identity.NoOpIdentityProvider, which is installed
+// precisely BECAUSE no forge is configured and so must never be enumerated
+// as one. (2) An entry with no DEVICE client id: discovery exists to tell
+// the CLI which id to drive the device flow with, so a provider it cannot
+// drive is not advertised. Both exclusions are deliberate redundancy against
+// the seeding-order layer in New.
+func (s *Server) configuredIdentityProviders() map[string]identity.IdentityProvider {
+	out := make(map[string]identity.IdentityProvider, len(s.cfg.IdentityProviders))
+	for name, p := range s.cfg.IdentityProviders {
+		if !identity.IsConfigured(p) {
+			continue
+		}
+		if s.cfg.IdentityDeviceClientIDs[name] == "" {
+			continue
+		}
+		out[name] = p
+	}
+	return out
+}
+
+// configuredIdentityProviderNames returns the configured provider names in a
+// DETERMINISTIC order — github, then gitlab, then any other name sorted — so
+// the discovery response and its legacy first-entry mirror are stable across
+// requests rather than following Go's randomized map iteration.
+func (s *Server) configuredIdentityProviderNames() []string {
+	configured := s.configuredIdentityProviders()
+	names := make([]string, 0, len(configured))
+	for _, preferred := range []string{identity.ProviderGitHub, identity.ProviderGitLab} {
+		if _, ok := configured[preferred]; ok {
+			names = append(names, preferred)
+			delete(configured, preferred)
+		}
+	}
+	rest := make([]string, 0, len(configured))
+	for name := range configured {
+		rest = append(rest, name)
+	}
+	sort.Strings(rest)
+	return append(names, rest...)
+}
+
+// identityProviderFor resolves a provider name through the same filtered
+// enumeration, so an unconfigured or NoOp-backed name is reported missing
+// rather than handed back as a provider that denies everything.
+func (s *Server) identityProviderFor(provider string) (identity.IdentityProvider, bool) {
+	p, ok := s.configuredIdentityProviders()[provider]
+	return p, ok
 }

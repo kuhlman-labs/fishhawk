@@ -14,17 +14,31 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 )
 
-// oauthProvider is the identity provider an OAuth-minted token records.
-// v0 has exactly one (GitHub); the value is stamped on the minted row
-// (auth_method='oauth', provider) and echoed in the discovery response.
-const oauthProvider = "github"
-
-// tokenLoginDiscoveryResponse is the 200 body for GET /v0/tokens/login.
-// It advertises the OAuth client_id the CLI drives the device flow with
-// and the provider that flow authenticates against.
-type tokenLoginDiscoveryResponse struct {
+// tokenLoginProviderEntry is one advertised federated identity provider in
+// the GET /v0/tokens/login discovery response (E66.4 / #2392). ClientID is
+// the NON-Confidential DEVICE application's client_id — the id the CLI
+// actually drives an RFC 8628 device flow with, not the confidential
+// browser-leg id. BaseURL is the instance root the CLI appends
+// /oauth/authorize_device and /oauth/token to; it is omitted for github,
+// whose device endpoints the CLI knows, and REQUIRED for gitlab, which can
+// be SaaS or any self-managed host (binding condition BC2).
+type tokenLoginProviderEntry struct {
 	Provider string `json:"provider"`
 	ClientID string `json:"client_id"`
+	BaseURL  string `json:"base_url,omitempty"`
+}
+
+// tokenLoginDiscoveryResponse is the 200 body for GET /v0/tokens/login.
+//
+// Providers is the forge-agnostic surface: one entry per configured
+// federated provider, in a deterministic github-then-gitlab order. The
+// top-level Provider/ClientID are RETAINED and mirror the FIRST entry so a
+// CLI predating the array keeps working byte-compatibly against a
+// GitHub-only deployment.
+type tokenLoginDiscoveryResponse struct {
+	Provider  string                    `json:"provider"`
+	ClientID  string                    `json:"client_id"`
+	Providers []tokenLoginProviderEntry `json:"providers"`
 }
 
 // tokenLoginRequest is the POST /v0/tokens/login body: the GitHub user
@@ -33,11 +47,14 @@ type tokenLoginDiscoveryResponse struct {
 // default set (mirroring `fishhawkd token issue`); any explicitly listed
 // scope must fall within that set.
 //
-// Provider is accepted (the CLI sends it, and the request decoder rejects
-// unknown fields) but is not the source of truth: v0 has exactly one
-// provider and the backend authoritatively stamps oauthProvider on the
-// minted row. When present it must name the supported provider — a
-// mismatch is refused rather than silently minting a github token.
+// Provider selects which configured federated provider verifies the token
+// (E66.4 / #2392). It must name a CONFIGURED provider; an unknown or
+// unconfigured name is refused 400 rather than silently minting against
+// another forge. When omitted it defaults to the SOLE configured provider
+// if exactly one is configured — so a GitLab-only deployment is drivable by
+// an old CLI or a plain POST rather than locked out (binding condition BC4)
+// — and to github otherwise, preserving the pre-#2392 implicit behavior on
+// a multi-forge deployment.
 type tokenLoginRequest struct {
 	AccessToken string   `json:"access_token"`
 	Scopes      []string `json:"scopes"`
@@ -51,14 +68,25 @@ type tokenLoginRequest struct {
 // the deny-by-default NoOp IdentityProvider, so a backend without OAuth
 // can neither advertise a client_id nor mint an OAuth token.
 func (s *Server) handleTokenLoginDiscovery(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.OAuthClientID == "" {
+	names := s.configuredIdentityProviderNames()
+	if len(names) == 0 {
 		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
-			"OAuth token login requires an OAuth client_id to be configured (FISHHAWKD_OAUTH_CLIENT_ID)", nil)
+			"OAuth token login requires a configured identity provider and its device client_id (FISHHAWKD_OAUTH_CLIENT_ID, or FISHHAWKD_GITLAB_BASE_URL + FISHHAWKD_GITLAB_DEVICE_CLIENT_ID)", nil)
 		return
 	}
+	entries := make([]tokenLoginProviderEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, tokenLoginProviderEntry{
+			Provider: name,
+			ClientID: s.cfg.IdentityDeviceClientIDs[name],
+			BaseURL:  s.cfg.IdentityBaseURLs[name],
+		})
+	}
 	s.writeJSON(w, r, http.StatusOK, tokenLoginDiscoveryResponse{
-		Provider: oauthProvider,
-		ClientID: s.cfg.OAuthClientID,
+		// Legacy top-level fields mirror the first entry (see the type doc).
+		Provider:  entries[0].Provider,
+		ClientID:  entries[0].ClientID,
+		Providers: entries,
 	})
 }
 
@@ -67,7 +95,7 @@ func (s *Server) handleTokenLoginDiscovery(w http.ResponseWriter, r *http.Reques
 // server-side, enforces mint authz — the subject must hold at least the
 // configured minimum permission on the operator repo AND request only
 // scopes within the operator default set — then mints an OAuth token
-// (auth_method='oauth', provider='github') via the APITokenRepo's
+// (auth_method='oauth', provider=<the selected forge>) via the APITokenRepo's
 // OAuthIssuer capability. This is the "server-side re-verify" mint half
 // of the CLI-driven device flow (E39.3 / #1708).
 //
@@ -109,9 +137,32 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 			"access_token is required", map[string]any{"field": "access_token"})
 		return
 	}
-	if req.Provider != "" && req.Provider != oauthProvider {
+	// Provider selection (E66.4 / #2392). Zero configured providers is a
+	// config gate, not a client error: it is the same fail-closed 503 the
+	// NoOp provider produced before this endpoint became forge-agnostic.
+	configured := s.configuredIdentityProviderNames()
+	if len(configured) == 0 {
+		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
+			"OAuth token login requires an identity provider to be configured", nil)
+		return
+	}
+	provider := req.Provider
+	if provider == "" {
+		// BC4: an omitted provider defaults to the SOLE configured entry when
+		// exactly one is configured, so a GitLab-only deployment is drivable
+		// by an old CLI or a plain POST instead of being locked out by a
+		// hardcoded github default. With more than one configured, github
+		// remains the default — the pre-#2392 implicit behavior.
+		provider = identity.ProviderGitHub
+		if len(configured) == 1 {
+			provider = configured[0]
+		}
+	}
+	idp, ok := s.identityProviderFor(provider)
+	if !ok {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"unsupported provider", map[string]any{"field": "provider", "got": req.Provider, "want": oauthProvider})
+			"unsupported provider", map[string]any{
+				"field": "provider", "got": req.Provider, "configured": configured})
 		return
 	}
 
@@ -119,7 +170,7 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 	// verified provider-qualified subject. Never trust a client-supplied
 	// login. ErrNotConfigured (the NoOp provider) degrades to 503; any
 	// other failure means the presented token is bad → 401, not a mint.
-	subject, err := s.cfg.IdentityProvider.VerifyAccessToken(r.Context(), req.AccessToken)
+	subject, err := idp.VerifyAccessToken(r.Context(), req.AccessToken)
 	if err != nil {
 		if errors.Is(err, identity.ErrNotConfigured) {
 			s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
@@ -131,9 +182,19 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defence in depth: the row's provider must agree with the subject the
+	// selected provider actually returned. A provider implementation that
+	// returned a foreign-qualified subject (or an unqualified one) must
+	// never produce a mis-stamped row, so this refuses rather than mints.
+	if identity.ProviderOf(subject) != provider {
+		s.writeError(w, r, http.StatusUnauthorized, "token_verification_failed",
+			"the presented access token could not be verified", nil)
+		return
+	}
+
 	// Mint authz: the verified subject must hold at least the configured
 	// minimum permission on the operator repo.
-	perm, err := s.cfg.IdentityProvider.PermissionLevel(r.Context(), s.cfg.OperatorRepo, subject)
+	perm, err := idp.PermissionLevel(r.Context(), s.cfg.OperatorRepo, subject)
 	if err != nil {
 		// Log the wrapped cause server-side so the underlying failure mode
 		// (401 anonymous read, rate-limit, network) is visible in fishhawkd
@@ -170,7 +231,8 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := issuer.IssueOAuth(r.Context(), subject, scopes, oauthProvider)
+	// The RESOLVED provider — not a constant — is what the minted row records.
+	tok, err := issuer.IssueOAuth(r.Context(), subject, scopes, provider)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"issue token failed", map[string]any{"error": err.Error()})

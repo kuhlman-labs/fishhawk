@@ -912,3 +912,58 @@ func TestBearerAuth_PrefixRoutingPreservedWithOAuthEnabled(t *testing.T) {
 		t.Errorf("OAuth store dialled %d times for an fhk_ token, want 0", store.authAccessCalls)
 	}
 }
+
+// TestBearerAuth_CookieSession_SubjectCarriesUserProvider pins the E66.4 /
+// #2392 correctness fix (approach step 12, constraint 12(a)): the
+// cookie-session subject was hardcoded "github:" + login regardless of
+// user.Provider, so a GitLab browser sign-in (live since E44.22 / #2109)
+// minted a github:-prefixed subject the GitLab identity provider could never
+// resolve.
+//
+// The EMPTY-Provider case is the done-means test for the legacy fallback: a
+// row predating the provider column reads as "" and must keep its exact
+// current subject, which is what makes a GitHub-only deployment
+// byte-identical across this change. It fails on a no-op touch of the
+// subject construction where a presence-only assertion would pass.
+func TestBearerAuth_CookieSession_SubjectCarriesUserProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		provider    string
+		wantSubject string
+	}{
+		{"gitlab user", "gitlab", "gitlab:alice"},
+		{"github user", "github", "github:alice"},
+		{"legacy row with no provider", "", "github:alice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newServer(t, newFakeRepo())
+			sessions := stubSessionAuth{
+				user: &auth.User{ID: "u-1", Provider: tc.provider, GitHubLogin: "alice"},
+				sess: &auth.Session{ID: "s-1", UserID: "u-1"},
+			}
+			var captured Identity
+			h := s.bearerAuth(nil, nil, sessions)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				captured = IdentityFrom(r.Context())
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "fhs_deadbeef"})
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if captured.Subject != tc.wantSubject {
+				t.Fatalf("Identity.Subject = %q, want %q", captured.Subject, tc.wantSubject)
+			}
+			// The provider the keyed downstream consumers (repoacl's cache key,
+			// account.Store.MemberRole) receive is derived from this subject by
+			// providerFromSubject, so pin that derivation too — it is the
+			// assertion that goes red if any consumer regressed to a hard-coded
+			// "github:" strip.
+			wantProvider := tc.provider
+			if wantProvider == "" {
+				wantProvider = "github"
+			}
+			if got := providerFromSubject(captured.Subject); got != wantProvider {
+				t.Errorf("providerFromSubject(%q) = %q, want %q", captured.Subject, got, wantProvider)
+			}
+		})
+	}
+}
