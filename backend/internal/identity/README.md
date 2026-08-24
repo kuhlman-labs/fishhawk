@@ -50,6 +50,18 @@ The deployment credential (`FISHHAWKD_GITLAB_TOKEN`, sent as `PRIVATE-TOKEN`) is
 
 A **nil** accessor sends no auth header — the anonymous-read degrade. It fails CLOSED (GitLab answers an unauthenticated caller 404 on a private project's members endpoint → `PermissionNone` → the mint gate denies) but is non-functional for the common private-repo case, so the fishhawkd wiring WARNs at boot. An accessor that **errors** propagates rather than falling back to anonymous: a broken credential must be loud, not a silent permission downgrade.
 
+### Credential-bearing requests refuse cross-origin redirects
+
+Every request that carries a credential — the members reads (`PRIVATE-TOKEN`) and `VerifyAccessToken` (the submitted bearer) — goes out on a client copy whose `CheckRedirect` **refuses any hop that leaves the original request's origin** (`credentialClient` / `refuseCrossOriginRedirect`). Same-origin hops are still followed, bounded by `gitLabMaxRedirects = 10` (restating the cap that setting `CheckRedirect` displaces).
+
+Go's redirect handling strips only a known set of sensitive headers (`Authorization`, `Cookie`, `WWW-Authenticate`) on a cross-host hop; a **nonstandard** header is copied verbatim — and GitLab's credential header, `PRIVATE-TOKEN`, is exactly that. Without the refusal, a GitLab instance or any proxy in front of it that answers a members read with a `302` to a host it controls receives `FISHHAWKD_GITLAB_TOKEN` in full, and that host's reply is accepted as the authorization answer. On `VerifyAccessToken` the stdlib would have dropped the bearer, but the redirect target would still dictate the **subject** the mint issues a token for.
+
+Origin comparison is scheme + host, lowercased, with the default port normalized away; a scheme downgrade (`https` → `http`) is a **different** origin and is refused, because sending the deployment credential in clear is a leak too. Pinned by `TestGitLabMembers_CrossOriginRedirect_RefusedAndCredentialNotLeaked` (the redirect target is a real in-test server that grants Owner and records the header, so a followed redirect shows up as both a leaked credential and a wrong `admin` verdict), `TestGitLabVerifyAccessToken_CrossOriginRedirect_Refused`, `TestGitLabMembers_SameOriginRedirect_Followed`, and `TestGitLabOrigin`.
+
+### `slow_down` is MONOTONE
+
+RFC 8628 `slow_down` means "poll less often", so it may only ever **lengthen** the device-flow poll interval. The token endpoint is untrusted input on this path: a response carrying a positive `interval` **smaller than** the one in effect (or below `minPollInterval`) would otherwise shrink the delay, turning the back-off signal into a licence to poll faster. A forge-supplied interval is therefore adopted only when it is strictly larger than the current interval; anything else — smaller, equal, or absent — falls back to the fixed `slowDownIncrement`, so `slow_down` always costs the caller time. `TestGitLabVerifyUser_SlowDownBumpsInterval` covers all four: larger, absent, smaller, and equal.
+
 ### Device application ≠ browser application (binding condition 7)
 
 `deviceClientID` is the client_id of a **NON-Confidential** GitLab application. This provider never holds or sends a `client_secret`: RFC 8628 §3.4 specifies the device access-token request as client_id-only for a public client, while the browser sign-in leg (`backend/internal/auth/gitlab_oauth.go`) sends a `client_secret` and so requires a **Confidential** application. Hence a separately-named `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` with **no fallback** to the browser leg's client id. `TestGitLabDeviceFlow_SendsNoClientSecret` asserts neither device-flow POST carries a secret.

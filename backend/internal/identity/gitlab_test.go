@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -346,8 +347,18 @@ func TestGitLabVerifyUser_SlowDownBumpsInterval(t *testing.T) {
 		slowDownBody string
 		want         time.Duration
 	}{
-		{"forge-supplied interval wins", `{"error":"slow_down","interval":13}`, 13 * time.Second},
+		{"larger forge-supplied interval wins", `{"error":"slow_down","interval":13}`, 13 * time.Second},
 		{"absent interval adds the fixed increment", `{"error":"slow_down"}`, 6*time.Second + slowDownIncrement},
+		// The boundary that matters: the token endpoint is untrusted, and
+		// a slow_down carrying a SMALLER positive interval must not be
+		// able to shrink the delay below the one already in effect (2s <
+		// the 6s in force, and below minPollInterval besides). slow_down
+		// is monotone, so this falls back to the fixed increment.
+		{"smaller forge-supplied interval cannot shrink the delay", `{"error":"slow_down","interval":2}`, 6*time.Second + slowDownIncrement},
+		// Equal is not larger: an interval echoing the current one must
+		// still cost the caller the increment, else a forge could pin the
+		// delay flat while signalling slow_down forever.
+		{"equal forge-supplied interval still adds the increment", `{"error":"slow_down","interval":6}`, 6*time.Second + slowDownIncrement},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1118,6 +1129,143 @@ func TestGitLabMembers_DeploymentCredentialAttached(t *testing.T) {
 	}
 	if gotAuth != "" {
 		t.Errorf("Authorization = %q, want it absent on a members read", gotAuth)
+	}
+}
+
+// TestGitLabMembers_CrossOriginRedirect_RefusedAndCredentialNotLeaked pins
+// the redirect guard on the credential-bearing members read.
+//
+// Go's redirect handling strips Authorization/Cookie on a cross-host hop
+// but copies a NONSTANDARD header verbatim — and the deployment credential
+// rides in exactly such a header, PRIVATE-TOKEN. Without the guard, a
+// GitLab (or a proxy in front of it) answering the members read with a 302
+// to a host it controls receives FISHHAWKD_GITLAB_TOKEN in full, and its
+// reply — here an Owner grant — is accepted as the authorization answer.
+//
+// The redirect target is a REAL in-test server, not an unreachable
+// address: an unreachable target would fail the call through a connection
+// error whether or not the guard exists, which would make the test pass
+// for the wrong reason. This one is reachable and eager to answer.
+func TestGitLabMembers_CrossOriginRedirect_RefusedAndCredentialNotLeaked(t *testing.T) {
+	var attackerHits int
+	var attackerSawToken string
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attackerHits++
+		attackerSawToken = r.Header.Get("PRIVATE-TOKEN")
+		// Answer the authorization question wrongly-in-our-favour, so a
+		// followed redirect is visible as a granted permission and not
+		// merely as a transport error.
+		_, _ = w.Write([]byte(membersPage(gitLabMember{Username: "alice", AccessLevel: gitLabAccessOwner})))
+	}))
+	t.Cleanup(attacker.Close)
+
+	f := newFakeGitLab(t)
+	f.route("/api/v4/projects/owner%2Frepo/members/all", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/api/v4/projects/owner%2Frepo/members/all", http.StatusFound)
+	})
+	p := newTestGitLabProvider(f)
+	p.token = func(context.Context) (string, error) { return "deployment-token", nil }
+
+	got, err := p.PermissionLevel(context.Background(), "owner/repo", "gitlab:alice")
+	if err == nil {
+		t.Fatalf("PermissionLevel = %q, want an error refusing the cross-origin redirect", got)
+	}
+	if got != PermissionNone {
+		t.Errorf("PermissionLevel = %q, want none on a refused redirect", got)
+	}
+	if attackerHits != 0 {
+		t.Errorf("redirect target received %d requests, want 0", attackerHits)
+	}
+	if attackerSawToken != "" {
+		t.Errorf("redirect target saw PRIVATE-TOKEN = %q, want the credential never to leave the origin", attackerSawToken)
+	}
+}
+
+// TestGitLabVerifyAccessToken_CrossOriginRedirect_Refused covers the same
+// guard on the verification read. The stdlib would drop the bearer on the
+// hop, so the leak here is not the credential but the ANSWER: an
+// attacker-controlled target that replies with a valid-looking user object
+// would dictate the subject the mint issues a fishhawkd token for.
+func TestGitLabVerifyAccessToken_CrossOriginRedirect_Refused(t *testing.T) {
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":99,"username":"attacker"}`))
+	}))
+	t.Cleanup(attacker.Close)
+
+	f := newFakeGitLab(t)
+	f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/api/v4/user", http.StatusFound)
+	})
+	p := newTestGitLabProvider(f)
+
+	subject, err := p.VerifyAccessToken(context.Background(), "glpat-user")
+	if err == nil {
+		t.Fatalf("VerifyAccessToken = %q, want an error refusing the cross-origin redirect", subject)
+	}
+	if subject != "" {
+		t.Errorf("subject = %q, want empty — a redirected identity read must not resolve a subject", subject)
+	}
+}
+
+// TestGitLabMembers_SameOriginRedirect_Followed is the other half of the
+// guard: it refuses a change of ORIGIN, not redirects as such, so a
+// same-origin hop (the shape a GitLab deployment actually serves for a
+// canonicalised path) still completes and still carries the credential.
+func TestGitLabMembers_SameOriginRedirect_Followed(t *testing.T) {
+	f := newFakeGitLab(t)
+	var gotPrivate string
+	f.route("/api/v4/projects/owner%2Frepo/members/all", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/api/v4/projects/owner%2Frepo/members/all/", http.StatusFound)
+	})
+	f.route("/api/v4/projects/owner%2Frepo/members/all/", func(w http.ResponseWriter, r *http.Request) {
+		gotPrivate = r.Header.Get("PRIVATE-TOKEN")
+		_, _ = w.Write([]byte(membersPage(gitLabMember{Username: "alice", AccessLevel: gitLabAccessDeveloper})))
+	})
+	p := newTestGitLabProvider(f)
+	p.token = func(context.Context) (string, error) { return "deployment-token", nil }
+
+	got, err := p.PermissionLevel(context.Background(), "owner/repo", "gitlab:alice")
+	if err != nil {
+		t.Fatalf("PermissionLevel: %v", err)
+	}
+	if got != PermissionWrite {
+		t.Errorf("PermissionLevel = %q, want write across a same-origin redirect", got)
+	}
+	if gotPrivate != "deployment-token" {
+		t.Errorf("PRIVATE-TOKEN after same-origin redirect = %q, want deployment-token", gotPrivate)
+	}
+}
+
+// TestGitLabOrigin covers the origin comparison the redirect guard rests
+// on: the default port is not a different origin, case is not a different
+// origin, and a scheme downgrade IS.
+func TestGitLabOrigin(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"https://gitlab.example.com/api/v4/user", "https://gitlab.example.com"},
+		{"https://gitlab.example.com:443/api/v4/user", "https://gitlab.example.com"},
+		{"https://GitLab.Example.COM/api/v4/user", "https://gitlab.example.com"},
+		{"http://gitlab.example.com:80/api/v4/user", "http://gitlab.example.com"},
+		{"http://gitlab.example.com/api/v4/user", "http://gitlab.example.com"},
+		{"https://gitlab.example.com:8443/api/v4/user", "https://gitlab.example.com:8443"},
+	}
+	for _, tc := range tests {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		if got := gitLabOrigin(u); got != tc.want {
+			t.Errorf("gitLabOrigin(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+	// A scheme downgrade on the same host is a DIFFERENT origin, so the
+	// credential is not sent in clear.
+	secure, _ := url.Parse("https://gitlab.example.com/x")
+	plain, _ := url.Parse("http://gitlab.example.com/x")
+	if gitLabOrigin(secure) == gitLabOrigin(plain) {
+		t.Errorf("https and http on one host compared equal; a scheme downgrade must be a different origin")
 	}
 }
 

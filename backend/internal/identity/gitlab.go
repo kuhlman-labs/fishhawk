@@ -59,6 +59,12 @@ const (
 	// unbounded. 50 pages x 100 = 5000 members walked.
 	gitLabMaxMemberPages = 50
 
+	// gitLabMaxRedirects bounds a credential-bearing request's redirect
+	// chain. Setting CheckRedirect (see credentialClient) REPLACES the
+	// stdlib's own 10-hop default, so the cap is restated here rather
+	// than silently lost.
+	gitLabMaxRedirects = 10
+
 	// gitLabMaxMemberPageBytes caps how much of ONE page body is read. The
 	// page cap bounds the number of requests but not the size of any single
 	// response, so an oversized or endlessly-streaming body could otherwise
@@ -242,10 +248,18 @@ func (p *GitLabIdentityProvider) VerifyUser(ctx context.Context, prompt DeviceCo
 		case "authorization_pending":
 			continue
 		case "slow_down":
-			// Honor the mandated back-off: prefer the forge-supplied
-			// interval, else add the fixed increment.
-			if tok.Interval > 0 {
-				interval = time.Duration(tok.Interval) * time.Second
+			// Honor the mandated back-off, which is MONOTONE: slow_down
+			// means "poll less often", so it may only ever LENGTHEN the
+			// interval. The forge-supplied value is preferred but only
+			// when it is larger than the interval already in effect —
+			// the token endpoint is untrusted input on this path, and a
+			// response carrying a SMALLER positive interval (or one
+			// below minPollInterval) would otherwise shrink the delay,
+			// turning the back-off signal into a licence to poll faster.
+			// Any non-larger or absent value falls back to the fixed
+			// increment, so slow_down always costs the caller time.
+			if suggested := time.Duration(tok.Interval) * time.Second; tok.Interval > 0 && suggested > interval {
+				interval = suggested
 			} else {
 				interval += slowDownIncrement
 			}
@@ -367,7 +381,7 @@ func (p *GitLabIdentityProvider) VerifyAccessToken(ctx context.Context, accessTo
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := p.client().Do(req)
+	resp, err := p.credentialClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("identity: get gitlab user: %w", err)
 	}
@@ -638,7 +652,7 @@ func (p *GitLabIdentityProvider) get(ctx context.Context, endpoint string) (*htt
 			req.Header.Set("PRIVATE-TOKEN", tok)
 		}
 	}
-	resp, err := p.client().Do(req)
+	resp, err := p.credentialClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("identity: do gitlab request: %w", err)
 	}
@@ -683,4 +697,68 @@ func (p *GitLabIdentityProvider) client() *http.Client {
 		return http.DefaultClient
 	}
 	return p.httpClient
+}
+
+// credentialClient returns the HTTP client for a CREDENTIAL-BEARING
+// request: a copy of the configured client whose CheckRedirect REFUSES any
+// redirect that leaves the original request's origin.
+//
+// Why a separate client and not the shared one: Go's redirect handling
+// strips only a known set of sensitive headers (Authorization, Cookie,
+// WWW-Authenticate) when a hop crosses to a different host. A NONSTANDARD
+// header is copied verbatim — and GitLab's credential header, PRIVATE-TOKEN,
+// is exactly that. A GitLab instance, or any proxy in front of it, that
+// answered a members read with a 302 to a host it controls would therefore
+// receive FISHHAWKD_GITLAB_TOKEN, the deployment credential, in full.
+// Refusing the hop is the fail-closed answer: a members read is an
+// authorization question, so a redirected one must ERROR (surfaced as a
+// 500 by the mint handler) rather than be answered by an unverified
+// origin. The same refusal covers VerifyAccessToken, where a cross-origin
+// hop would let the redirect target dictate the caller's IDENTITY even
+// though the stdlib had dropped the bearer.
+//
+// Same-origin redirects are still followed: the credential never leaves
+// the origin it was issued for.
+//
+// The copy is a plain struct copy, so the Transport (and its connection
+// pool) and Timeout are shared with the configured client; only the
+// redirect policy differs.
+func (p *GitLabIdentityProvider) credentialClient() *http.Client {
+	c := *p.client()
+	c.CheckRedirect = refuseCrossOriginRedirect
+	return &c
+}
+
+// refuseCrossOriginRedirect is the CheckRedirect policy above: same-origin
+// hops proceed (bounded by gitLabMaxRedirects, restoring the cap that
+// setting CheckRedirect displaces), any other origin is an error.
+func refuseCrossOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= gitLabMaxRedirects {
+		return fmt.Errorf("identity: gitlab request exceeded %d redirects", gitLabMaxRedirects)
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origin := gitLabOrigin(via[0].URL)
+	if target := gitLabOrigin(req.URL); target != origin {
+		return fmt.Errorf("identity: gitlab request refused cross-origin redirect from %s to %s", origin, target)
+	}
+	return nil
+}
+
+// gitLabOrigin renders a URL's origin (scheme + host) for comparison,
+// lowercasing both and dropping the default port so an explicit :443 on an
+// https URL is not read as a different origin than the same host without
+// it. A scheme downgrade (https -> http) IS a different origin, and is
+// refused — sending the deployment credential in clear is a leak too.
+func gitLabOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Host)
+	switch {
+	case scheme == "https" && strings.HasSuffix(host, ":443"):
+		host = strings.TrimSuffix(host, ":443")
+	case scheme == "http" && strings.HasSuffix(host, ":80"):
+		host = strings.TrimSuffix(host, ":80")
+	}
+	return scheme + "://" + host
 }
