@@ -609,3 +609,52 @@ func issueLabeledEventWithLabels(t *testing.T, labels ...string) Event {
 	}
 	return ev
 }
+
+// --- GitLab creation path (E45.22 / #2043) ---
+
+// TestAppliesToWebhook_GitLabTrigger_GatesTheGitLabCreationPath pins that the
+// applies_to routing gate holds for a GitLab-triggered run exactly as it does
+// for a GitHub one — the gate is not forge-aware, and the GitLab create path
+// calls it in the same position (before any run row exists).
+//
+// The refusing cell also documents a real consequence of the GitLab matcher:
+// matchGitLabIssue captures no forge label set, so a `labels` declaration
+// evaluates against an EMPTY set and fails CLOSED. That is the correct
+// posture — a routing declaration that cannot be evaluated must not admit —
+// and the admitting cell proves the refusal is not simply "GitLab never runs".
+func TestAppliesToWebhook_GitLabTrigger_GatesTheGitLabCreationPath(t *testing.T) {
+	cases := []struct {
+		name        string
+		appliesTo   string
+		wantCreated int
+		wantRefused int
+	}{
+		{
+			"labels_declaration_fails_closed_on_gitlab",
+			"    applies_to:\n      labels:\n        - docs\n",
+			0, 1,
+		},
+		{
+			"no_declaration_admits",
+			"",
+			1, 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			specYAML := appliesToSpecYAML(tc.appliesTo)
+			d, _, runs, au := newDispatcherWithStubs(t)
+			d.GitLabFiles = &stubFileFetcher{content: []byte(specYAML), sha: "g1t1absha"}
+
+			if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != tc.wantCreated {
+				t.Errorf("runs created = %d, want %d", len(runs.created), tc.wantCreated)
+			}
+			if n := countGlobalCategory(au, "run_rejected_applies_to"); n != tc.wantRefused {
+				t.Errorf("run_rejected_applies_to entries = %d, want %d", n, tc.wantRefused)
+			}
+		})
+	}
+}

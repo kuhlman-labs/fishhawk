@@ -1,0 +1,864 @@
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+)
+
+// --- fixtures ------------------------------------------------------------
+
+// gitlabPipelineEvent builds a GitLab Pipeline Hook delivery. ref / sha are
+// the correlation inputs; iid is the merge-request narrowing hint (0 omits
+// the merge_request block, as a branch pipeline's payload does).
+func gitlabPipelineEvent(status, ref, sha string, pipelineID, iid int) Event {
+	body := map[string]any{
+		"object_kind": "pipeline",
+		"object_attributes": map[string]any{
+			"id":     pipelineID,
+			"ref":    ref,
+			"sha":    sha,
+			"status": status,
+		},
+	}
+	if iid > 0 {
+		body["merge_request"] = map[string]any{"iid": iid}
+	}
+	raw, _ := json.Marshal(body)
+	ev := gitlabEvent("pipeline", "alice", string(raw))
+	ev.Repo = "acme/widgets"
+	ev.DeliveryID = "gitlab:pipe-1"
+	ev.CredentialRef = "gitlab:4242"
+	ev.Action = status
+	return ev
+}
+
+// gitlabBuildEvent builds the Job Hook GitLab emits for the SAME failing job
+// as the pipeline event above. It carries ref / sha / pipeline_id at the TOP
+// level — every correlation input the pipeline payload carries — which is
+// what makes the build-event skip a real control rather than a decode
+// accident.
+func gitlabBuildEvent(status, ref, sha string, pipelineID int) Event {
+	raw, _ := json.Marshal(map[string]any{
+		"object_kind":  "build",
+		"ref":          ref,
+		"sha":          sha,
+		"build_status": status,
+		"pipeline_id":  pipelineID,
+	})
+	ev := gitlabEvent("build", "alice", string(raw))
+	ev.Repo = "acme/widgets"
+	ev.DeliveryID = "gitlab:build-1"
+	ev.CredentialRef = "gitlab:4242"
+	ev.Action = status
+	return ev
+}
+
+// seedGitLabRun inserts a gitlab_ci run and, when headSHA is non-empty, an
+// implement stage carrying the pull_request artifact that records it — the
+// run-side half of the (ref, sha) correlation predicate.
+func seedGitLabRun(t *testing.T, runs *stubRuns, arts *stubArtifacts, repo, headSHA string,
+	retryAttempt int, mrIID int) *run.Run {
+	t.Helper()
+	triggerRef := "issue:7"
+	ref := "gitlab:4242"
+	r := &run.Run{
+		ID:                 uuid.New(),
+		Repo:               repo,
+		WorkflowID:         "feature_change",
+		WorkflowSHA:        "g1t1absha",
+		TriggerSource:      run.TriggerGitHubIssue,
+		TriggerRef:         &triggerRef,
+		InstallationRef:    &ref,
+		WorkflowSpec:       []byte(ciRetrySpec),
+		RetryAttempt:       retryAttempt,
+		MaxRetriesSnapshot: 1,
+		RunnerKind:         run.RunnerKindGitLabCI,
+		State:              run.StateRunning,
+		CreatedAt:          time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:          time.Now().Add(-time.Minute).UTC(),
+	}
+	if mrIID > 0 {
+		url := fmt.Sprintf("https://gitlab.com/%s/-/merge_requests/%d", repo, mrIID)
+		r.PullRequestURL = &url
+	}
+	runs.mu.Lock()
+	runs.created = append(runs.created, r)
+	if headSHA != "" {
+		st := &run.Stage{ID: uuid.New(), RunID: r.ID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}
+		runs.createdStages = append(runs.createdStages, st)
+		runs.mu.Unlock()
+		arts.add(st.ID, &artifact.Artifact{
+			ID:      uuid.New(),
+			StageID: st.ID,
+			Kind:    artifact.KindPullRequest,
+			Content: []byte(fmt.Sprintf(`{"head_sha":%q}`, headSHA)),
+		})
+		return r
+	}
+	runs.mu.Unlock()
+	return r
+}
+
+func newGitLabRetryDispatcher(t *testing.T) (*Dispatcher, *stubRuns, *stubAudit, *stubArtifacts) {
+	t.Helper()
+	d, _, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.GitLabFiles = &stubFileFetcher{content: []byte(ciRetrySpec), sha: "g1t1absha"}
+	return d, runs, au, arts
+}
+
+// retryChildren returns the runs created BEYOND the seeded ones — i.e. the
+// retry children this delivery minted.
+func retryChildren(runs *stubRuns, seeded int) []*run.Run {
+	runs.mu.Lock()
+	defer runs.mu.Unlock()
+	if len(runs.created) <= seeded {
+		return nil
+	}
+	out := make([]*run.Run, len(runs.created)-seeded)
+	copy(out, runs.created[seeded:])
+	return out
+}
+
+func auditCategories(au *stubAudit) []string {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	out := make([]string, 0, len(au.appended))
+	for _, a := range au.appended {
+		out = append(out, a.Category)
+	}
+	return out
+}
+
+// skipReason extracts the `reason` field from the single ci_retry_skipped
+// audit payload, failing when there is not exactly one.
+func skipReason(t *testing.T, au *stubAudit) string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found []map[string]any
+	for _, a := range au.appended {
+		if a.Category != "ci_retry_skipped" {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(a.Payload, &p); err != nil {
+			t.Fatalf("unmarshal ci_retry_skipped payload: %v", err)
+		}
+		found = append(found, p)
+	}
+	if len(found) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1", len(found))
+	}
+	reason, _ := found[0]["reason"].(string)
+	return reason
+}
+
+// --- HIGH 3: Pipeline classified, Build skipped --------------------------
+
+// TestGitLabCIRetry_BuildOnlyEventCreatesNoRetry is the build-only ISOLATION
+// test and the counterfactual vehicle for the build-event skip (C6).
+//
+// It delivers a Job Hook with NO preceding pipeline event, against a run the
+// build payload's ref+sha correlate to perfectly. Everything a retry needs is
+// present EXCEPT the classification decision, so the only thing standing
+// between this delivery and a retry child is the explicit build arm in
+// matchGitLabCIFailure. Delete that arm and this test observes one child and
+// goes red.
+//
+// It replaces the combined-delivery test as the vehicle deliberately: with
+// runs_retry_child_once_idx in place, deleting the skip in a pipeline-THEN-
+// build delivery still yields exactly one child (the second insert loses the
+// unique_violation benignly), so that pairing CANNOT go red.
+func TestGitLabCIRetry_BuildOnlyEventCreatesNoRetry(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+
+	ev := gitlabBuildEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Errorf("retry children = %d, want 0 (the pipeline hook is the single trigger)", len(got))
+	}
+	if cats := auditCategories(au); len(cats) != 0 {
+		t.Errorf("audit categories = %v, want none", cats)
+	}
+}
+
+// TestGitLabCIRetry_CombinedDeliveryEitherOrderCreatesOneChild pins the
+// COMBINED-delivery invariant: whichever order the two hooks arrive in, one
+// failing job produces exactly one retry child. Its counterfactual vehicle is
+// the unique index, not the classification skip — see the build-only test.
+func TestGitLabCIRetry_CombinedDeliveryEitherOrderCreatesOneChild(t *testing.T) {
+	orders := []struct {
+		name  string
+		first func(ref string) Event
+		then  func(ref string) Event
+	}{
+		{
+			"pipeline_then_build",
+			func(ref string) Event { return gitlabPipelineEvent("failed", ref, "deadbeef", 9001, 0) },
+			func(ref string) Event { return gitlabBuildEvent("failed", ref, "deadbeef", 9001) },
+		},
+		{
+			"build_then_pipeline",
+			func(ref string) Event { return gitlabBuildEvent("failed", ref, "deadbeef", 9001) },
+			func(ref string) Event { return gitlabPipelineEvent("failed", ref, "deadbeef", 9001, 0) },
+		},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			d, runs, _, arts := newGitLabRetryDispatcher(t)
+			parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+			branch := gitLabRunBranch(parent)
+
+			for _, ev := range []Event{tc.first(branch), tc.then(branch)} {
+				if err := d.Handle(context.Background(), ev); err != nil {
+					t.Fatalf("Handle: %v", err)
+				}
+			}
+			if got := retryChildren(runs, 1); len(got) != 1 {
+				t.Fatalf("retry children = %d, want exactly 1", len(got))
+			}
+		})
+	}
+}
+
+// TestMatchGitLabCIFailure_NonFailureAndMalformedSkip pins the classifier's
+// remaining refusals: a non-failed status, and a failed payload missing the
+// ref or sha the correlation contract requires.
+func TestMatchGitLabCIFailure_NonFailureAndMalformedSkip(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"success_status", `{"object_attributes":{"id":1,"ref":"fishhawk/run-abc","sha":"s","status":"success"}}`},
+		{"running_status", `{"object_attributes":{"id":1,"ref":"fishhawk/run-abc","sha":"s","status":"running"}}`},
+		{"missing_ref", `{"object_attributes":{"id":1,"sha":"s","status":"failed"}}`},
+		{"missing_sha", `{"object_attributes":{"id":1,"ref":"fishhawk/run-abc","status":"failed"}}`},
+		{"unparseable", `{`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := MatchGitLabEvent(gitlabEvent("pipeline", "alice", tc.body))
+			if !m.Skip {
+				t.Fatalf("Skip = false, want true (got action %q)", m.Action)
+			}
+			if m.Reason == "" {
+				t.Error("Reason is empty; a skip must name why")
+			}
+		})
+	}
+}
+
+// --- HIGH 2: deterministic (ref, sha) correlation ------------------------
+
+// TestGitLabCIRetry_CorrelatesToRunByRefAndSHA drives SEVERAL candidate runs
+// on ONE merge request — the shape a retry lineage produces by construction,
+// and the reason the merge-request iid alone cannot select a run — and
+// asserts the ref+sha predicate picks the right one.
+func TestGitLabCIRetry_CorrelatesToRunByRefAndSHA(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	// Three runs on merge request !31, each with its own branch and head.
+	_ = seedGitLabRun(t, runs, arts, "acme/widgets", "aaa111", 0, 31)
+	want := seedGitLabRun(t, runs, arts, "acme/widgets", "bbb222", 0, 31)
+	_ = seedGitLabRun(t, runs, arts, "acme/widgets", "ccc333", 0, 31)
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(want), "bbb222", 9001, 31)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	children := retryChildren(runs, 3)
+	if len(children) != 1 {
+		t.Fatalf("retry children = %d, want 1", len(children))
+	}
+	if children[0].ParentRunID == nil || *children[0].ParentRunID != want.ID {
+		t.Fatalf("child parent = %v, want the ref+sha-matched run %s",
+			children[0].ParentRunID, want.ID)
+	}
+	// Pipeline id is captured as correlation provenance so an operator can
+	// join the Fishhawk retry back to the GitLab pipeline that caused it.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var payload map[string]any
+	for _, a := range au.appended {
+		if a.Category == "ci_failure_retry_dispatched" {
+			_ = json.Unmarshal(a.Payload, &payload)
+		}
+	}
+	if payload == nil {
+		t.Fatal("no ci_failure_retry_dispatched audit row")
+	}
+	if got, _ := payload["pipeline_id"].(float64); int(got) != 9001 {
+		t.Errorf("audit pipeline_id = %v, want 9001", payload["pipeline_id"])
+	}
+	if got, _ := payload["pipeline_ref"].(string); got != gitLabRunBranch(want) {
+		t.Errorf("audit pipeline_ref = %q, want %q", got, gitLabRunBranch(want))
+	}
+}
+
+// TestGitLabCIRetry_FirstStagePipelineOnDefaultRefIsDeferred is BC1's
+// behavioural test. It drives an ACTUAL first-stage pipeline payload — ref is
+// the default branch, the SHA is present, and the run branch does not exist
+// yet because the runner has not created it — and asserts it correlates to
+// NOTHING and creates NO child.
+//
+// Critically it also asserts the outcome is DISTINGUISHABLE: a deliberate
+// deferral writes ci_retry_skipped naming first_stage_pipeline_on_non_run_branch,
+// which is a different record from every mis-correlation reason. A no-op that
+// looked identical to a bad correlation would leave the next person debugging
+// a missing retry unable to tell which happened (#2860).
+func TestGitLabCIRetry_FirstStagePipelineOnDefaultRefIsDeferred(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	// A run whose FIRST stage is in flight: no implement stage, no recorded
+	// head SHA, no run branch pushed yet.
+	seedGitLabRun(t, runs, arts, "acme/widgets", "", 0, 0)
+
+	ev := gitlabPipelineEvent("failed", "main", "c0ffee01", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0 (first-stage retry is deferred)", len(got))
+	}
+	if got := skipReason(t, au); got != gitLabRetrySkipFirstStageRef {
+		t.Errorf("ci_retry_skipped reason = %q, want %q", got, gitLabRetrySkipFirstStageRef)
+	}
+}
+
+// TestGitLabCIRetry_NonCorrelatingPipelinesSkipWithNamedReasons pins the
+// remaining non-correlation outcomes, each with its OWN reason so the audit
+// distinguishes them from the deliberate first-stage deferral above.
+func TestGitLabCIRetry_NonCorrelatingPipelinesSkipWithNamedReasons(t *testing.T) {
+	cases := []struct {
+		name string
+		// ref/sha are resolved against the seeded run by the closure.
+		pipeline func(parent *run.Run) Event
+		want     string
+	}{
+		{
+			"run_branch_of_no_candidate",
+			func(*run.Run) Event {
+				return gitlabPipelineEvent("failed", "fishhawk/run-99999999", "deadbeef", 9001, 0)
+			},
+			gitLabRetrySkipNoRunForRef,
+		},
+		{
+			"right_branch_wrong_sha",
+			func(p *run.Run) Event {
+				return gitlabPipelineEvent("failed", gitLabRunBranch(p), "not-the-head", 9001, 0)
+			},
+			gitLabRetrySkipSHAMismatch,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, runs, au, arts := newGitLabRetryDispatcher(t)
+			parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+
+			if err := d.Handle(context.Background(), tc.pipeline(parent)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if got := retryChildren(runs, 1); len(got) != 0 {
+				t.Fatalf("retry children = %d, want 0", len(got))
+			}
+			if got := skipReason(t, au); got != tc.want {
+				t.Errorf("ci_retry_skipped reason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGitLabCIRetry_CancelledLineageSkips pins the cancelled-lineage refusal:
+// a manually stopped run is not restarted, and the refusal is named.
+func TestGitLabCIRetry_CancelledLineageSkips(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.mu.Lock()
+	parent.State = run.StateCancelled
+	runs.mu.Unlock()
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0", len(got))
+	}
+	if got := skipReason(t, au); got != gitLabRetrySkipCancelledLineage {
+		t.Errorf("reason = %q, want %q", got, gitLabRetrySkipCancelledLineage)
+	}
+}
+
+// TestGitLabCIRetry_UnresolvableRetryPolicySkips pins the refusal when the
+// correlated run's cached spec cannot be read: the retry cap is unknown, so
+// retrying would risk a runaway loop.
+func TestGitLabCIRetry_UnresolvableRetryPolicySkips(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.mu.Lock()
+	parent.WorkflowSpec = nil
+	runs.mu.Unlock()
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0", len(got))
+	}
+	if got := skipReason(t, au); got != gitLabRetrySkipNoRetryPolicy {
+		t.Errorf("reason = %q, want %q", got, gitLabRetrySkipNoRetryPolicy)
+	}
+}
+
+// TestGitLabCIRetry_NoCandidateRunsSkipsSilently pins the one non-correlation
+// with NO audit row: a GitLab project Fishhawk manages no runs for. There is
+// no run to chain an entry against, and the delivery is not a Fishhawk
+// failure — the structured log is the whole record.
+func TestGitLabCIRetry_NoCandidateRunsSkipsSilently(t *testing.T) {
+	d, runs, au, _ := newGitLabRetryDispatcher(t)
+
+	ev := gitlabPipelineEvent("failed", "fishhawk/run-abcdef12", "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("runs.created = %d, want 0", len(runs.created))
+	}
+	if cats := auditCategories(au); len(cats) != 0 {
+		t.Errorf("audit categories = %v, want none (no run to chain against)", cats)
+	}
+}
+
+// TestGitLabCIRetry_CapHitEmitsExhausted pins the cap: a parent already at
+// max_retries emits ci_retry_exhausted and creates nothing.
+func TestGitLabCIRetry_CapHitEmitsExhausted(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	// ciRetrySpec sets max_retries: 1, so a parent at attempt 1 is capped.
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 1, 0)
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0", len(got))
+	}
+	if cats := auditCategories(au); len(cats) != 1 || cats[0] != "ci_retry_exhausted" {
+		t.Errorf("audit categories = %v, want [ci_retry_exhausted]", cats)
+	}
+}
+
+// --- C1 / BC3: constraint-based dedup ------------------------------------
+
+// TestGitLabCIRetry_ConcurrentDeliveriesCreateOneChild drives two deliveries
+// racing one parent. Both derive retry_attempt from the PARENT row
+// (parent.RetryAttempt + 1) — BC3's caller contract — so both inserts compute
+// the SAME value and the loser trips runs_retry_child_once_idx. The stub
+// reproduces the loser's error shape via run.ErrRetryChildDuplicate, the
+// sentinel run.IsRetryChildDuplicate recognizes alongside a real 23505.
+//
+// The surviving child's retry_attempt is PINNED, not merely counted: a
+// child-derived value would let the two inserts disagree, the index would
+// never fire, and a count-only assertion would stay green while the defect
+// this test exists to close stayed open.
+func TestGitLabCIRetry_ConcurrentDeliveriesCreateOneChild(t *testing.T) {
+	d, runs, _, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	// First create wins; the second loses the unique-index race.
+	runs.createErrQueue = []error{nil, run.ErrRetryChildDuplicate}
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	for i := 0; i < 2; i++ {
+		if err := d.Handle(context.Background(), ev); err != nil {
+			t.Fatalf("Handle (delivery %d): %v (a race loser must NOT surface an error)", i, err)
+		}
+	}
+
+	children := retryChildren(runs, 1)
+	if len(children) != 1 {
+		t.Fatalf("retry children = %d, want exactly 1", len(children))
+	}
+	if children[0].RetryAttempt != parent.RetryAttempt+1 {
+		t.Errorf("surviving child retry_attempt = %d, want %d (parent-derived, per BC3)",
+			children[0].RetryAttempt, parent.RetryAttempt+1)
+	}
+}
+
+// TestGitLabCIRetry_RetryAttemptIsParentDerived is the direct pin on BC3's
+// caller contract across a two-deep lineage: a child of a parent already at
+// attempt 1 must be attempt 2 — derived from the parent it retries, not from
+// any other row.
+func TestGitLabCIRetry_RetryAttemptIsParentDerived(t *testing.T) {
+	d, runs, _, arts := newGitLabRetryDispatcher(t)
+	// max_retries 1 would cap attempt 1, so raise the cap for this lineage.
+	spec2 := `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with retries
+    on_ci_failure:
+      max_retries: 5
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 1, 0)
+	runs.mu.Lock()
+	parent.WorkflowSpec = []byte(spec2)
+	runs.mu.Unlock()
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	children := retryChildren(runs, 1)
+	if len(children) != 1 {
+		t.Fatalf("retry children = %d, want 1", len(children))
+	}
+	if children[0].RetryAttempt != 2 {
+		t.Errorf("child retry_attempt = %d, want 2 (parent.RetryAttempt + 1)", children[0].RetryAttempt)
+	}
+}
+
+// --- credential-ref fallback (BC5, dispatch layer) -----------------------
+
+// TestGitLabRunScope_RefLadder pins the three-state installation_ref
+// distinction WHERE THE FALLBACK LIVES — the dispatch layer's scope
+// resolution — not only at the approval layer. Absent (nil) and
+// recorded-as-EMPTY are different states and both must fall back to the zero
+// scope rather than producing a scope from an empty ref; only a non-empty ref
+// resolves.
+func TestGitLabRunScope_RefLadder(t *testing.T) {
+	empty := ""
+	valid := "gitlab:4242"
+	cases := []struct {
+		name     string
+		ref      *string
+		wantRef  string
+		wantZero bool
+	}{
+		{"nil_ref_zero_scope", nil, "", true},
+		{"empty_string_ref_zero_scope", &empty, "", true},
+		{"valid_ref_resolves", &valid, "gitlab:4242", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gitLabRunScope(&run.Run{InstallationRef: tc.ref})
+			if got.IsZero() != tc.wantZero {
+				t.Errorf("IsZero() = %v, want %v", got.IsZero(), tc.wantZero)
+			}
+			if got.Ref() != tc.wantRef {
+				t.Errorf("Ref() = %q, want %q", got.Ref(), tc.wantRef)
+			}
+		})
+	}
+}
+
+// TestGitLabRunBranch_MatchesOrchestratorDerivation pins the branch-name
+// derivation this package duplicates from orchestrator.runBranchRef. A drift
+// would make every correlation miss silently, so the exact strings for known
+// UUIDs are asserted rather than the formula being re-derived.
+func TestGitLabRunBranch_MatchesOrchestratorDerivation(t *testing.T) {
+	id := uuid.MustParse("1dd0f40b-ea08-41cc-a79c-cc4a6a931648")
+	parentID := uuid.MustParse("bff9a242-9c4a-48a3-ad84-5feb66de9da2")
+	idx := 2
+
+	if got := gitLabRunBranch(&run.Run{ID: id}); got != "fishhawk/run-1dd0f40b" {
+		t.Errorf("run branch = %q, want fishhawk/run-1dd0f40b", got)
+	}
+	got := gitLabRunBranch(&run.Run{ID: id, DecomposedFrom: &parentID, SliceIndex: &idx})
+	if got != "fishhawk/run-bff9a242/slice-2" {
+		t.Errorf("slice branch = %q, want fishhawk/run-bff9a242/slice-2", got)
+	}
+}
+
+// --- degrade + error branches ---------------------------------------------
+
+// TestGitLabCIRetry_MissingPipelineRef_Skips pins the defensive guard at the
+// top of the handler. It is unreachable through Handle (the matcher fills
+// PipelineRef in lock-step with tagging the action), so it is driven
+// directly — a structural tripwire against a future matcher that tags the
+// action without the ref.
+func TestGitLabCIRetry_MissingPipelineRef_Skips(t *testing.T) {
+	d, runs, au, _ := newGitLabRetryDispatcher(t)
+
+	err := d.handleGitLabCIRetry(context.Background(),
+		gitlabPipelineEvent("failed", "fishhawk/run-abcdef12", "deadbeef", 9001, 0),
+		Match{Action: MatchActionCIFailureRetry}) // PipelineRef deliberately nil
+	if err != nil {
+		t.Fatalf("handleGitLabCIRetry: %v, want nil", err)
+	}
+	if len(runs.created) != 0 || len(au.appended) != 0 {
+		t.Errorf("created = %d runs / %d audit rows, want 0 / 0", len(runs.created), len(au.appended))
+	}
+}
+
+// TestGitLabCIRetry_CandidateLookupFails_SkipsWithoutRetrying pins the
+// degrade when the candidate query itself faults: no child, no audit row, and
+// crucially NO error — a 5xx would make the forge redeliver a pipeline event
+// we cannot correlate anyway.
+func TestGitLabCIRetry_CandidateLookupFails_SkipsWithoutRetrying(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	branch := gitLabRunBranch(parent)
+	runs.listErr = errors.New("connection reset")
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", branch, "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v, want nil (a query flap must not trigger redelivery)", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Errorf("retry children = %d, want 0", len(got))
+	}
+	if cats := auditCategories(au); len(cats) != 0 {
+		t.Errorf("audit categories = %v, want none", cats)
+	}
+}
+
+// TestGitLabCIRetry_CreateChildFails_SurfacesError is the paired negative of
+// the duplicate branch: only the runs_retry_child_once_idx collision is
+// benign. Any other create error must surface so the forge redelivers.
+func TestGitLabCIRetry_CreateChildFails_SurfacesError(t *testing.T) {
+	d, runs, _, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.createErrQueue = []error{errors.New("connection reset")}
+
+	err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0))
+	if err == nil {
+		t.Fatal("Handle returned nil; want the non-duplicate create error surfaced")
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("error = %v, want it to carry the underlying create failure", err)
+	}
+}
+
+// TestGitLabCIRetry_CreateStagesFails_SurfacesError pins the same posture one
+// step later: a stage-insert fault is infrastructure, not a policy refusal.
+func TestGitLabCIRetry_CreateStagesFails_SurfacesError(t *testing.T) {
+	d, runs, _, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.createStageErr = errors.New("stage insert failed")
+
+	err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0))
+	if err == nil {
+		t.Fatal("Handle returned nil; want the stage-create error surfaced")
+	}
+	if !strings.Contains(err.Error(), "stage insert failed") {
+		t.Errorf("error = %v, want it to carry the underlying stage failure", err)
+	}
+}
+
+// TestGitLabCIRetry_PlanOnlyWorkflow_MintsChildButDispatchesNothing pins the
+// no-non-plan-stages branch. A retry skips plan stages (the child reuses the
+// parent's approved plan), so a plan-ONLY workflow leaves nothing to retry:
+// the child row exists but no stage is created and nothing is dispatched.
+func TestGitLabCIRetry_PlanOnlyWorkflow_MintsChildButDispatchesNothing(t *testing.T) {
+	planOnly := `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Plan-only workflow
+    on_ci_failure:
+      max_retries: 2
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+`
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.mu.Lock()
+	parent.WorkflowSpec = []byte(planOnly)
+	runs.mu.Unlock()
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 1 {
+		t.Fatalf("retry children = %d, want 1 (the child row is created before the stage filter)", len(got))
+	}
+	// One stage pre-exists: the parent's seeded implement stage (which
+	// carries the head-SHA artifact). The retry must add NONE beyond it.
+	if len(runs.createdStages) != 1 {
+		t.Errorf("stages = %d, want 1 (only the parent's seeded stage; every retry stage was a plan stage)",
+			len(runs.createdStages))
+	}
+	if cats := auditCategories(au); len(cats) != 0 {
+		t.Errorf("audit categories = %v, want none (nothing was dispatched)", cats)
+	}
+}
+
+// TestGitLabCIRetry_TransitionFails_StillAuditsDispatch pins the best-effort
+// stage transition: a transition fault logs but must NOT unwind the retry —
+// the child and its stage already exist, and the audit row is the record.
+func TestGitLabCIRetry_TransitionFails_StillAuditsDispatch(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.transitionErr = errors.New("row locked")
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v, want nil (transition is best-effort)", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 1 {
+		t.Fatalf("retry children = %d, want 1", len(got))
+	}
+	if cats := auditCategories(au); len(cats) != 1 || cats[0] != "ci_failure_retry_dispatched" {
+		t.Errorf("audit categories = %v, want [ci_failure_retry_dispatched]", cats)
+	}
+}
+
+// TestGitLabCIRetry_AuditAppendFails_DoesNotUnwind pins both audit writers'
+// best-effort posture: an append fault logs at ERROR and leaves the decision
+// (retry taken, or retry skipped) exactly as it was.
+func TestGitLabCIRetry_AuditAppendFails_DoesNotUnwind(t *testing.T) {
+	t.Run("dispatched_path", func(t *testing.T) {
+		d, runs, au, arts := newGitLabRetryDispatcher(t)
+		parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+		au.appendErr = errors.New("audit down")
+
+		if err := d.Handle(context.Background(),
+			gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+			t.Fatalf("Handle: %v, want nil", err)
+		}
+		if got := retryChildren(runs, 1); len(got) != 1 {
+			t.Errorf("retry children = %d, want 1 (the retry still happened)", len(got))
+		}
+	})
+	t.Run("skipped_path", func(t *testing.T) {
+		d, runs, au, arts := newGitLabRetryDispatcher(t)
+		seedGitLabRun(t, runs, arts, "acme/widgets", "", 0, 0)
+		au.appendErr = errors.New("audit down")
+
+		if err := d.Handle(context.Background(),
+			gitlabPipelineEvent("failed", "main", "c0ffee01", 9001, 0)); err != nil {
+			t.Fatalf("Handle: %v, want nil", err)
+		}
+		if got := retryChildren(runs, 1); len(got) != 0 {
+			t.Errorf("retry children = %d, want 0 (the skip still held)", len(got))
+		}
+	})
+}
+
+// TestGitLabCIRetry_CapHit_AuditAppendFails_DoesNotUnwind pins the
+// exhausted-audit writer's best-effort posture on the same principle: the
+// refusal already happened, so a failed append must not turn it into a retry.
+func TestGitLabCIRetry_CapHit_AuditAppendFails_DoesNotUnwind(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 1, 0)
+	au.appendErr = errors.New("audit down")
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v, want nil", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Errorf("retry children = %d, want 0 (cap still holds)", len(got))
+	}
+}
+
+// TestGitLabCIRetry_MergeRequestNarrowingFallsBackWhenNothingMatches pins the
+// narrowing's deliberate best-effort shape: when the iid matches no
+// candidate's recorded merge-request URL, the FULL candidate set is used
+// rather than an empty one, so correlation never depends on artifact timing.
+func TestGitLabCIRetry_MergeRequestNarrowingFallsBackWhenNothingMatches(t *testing.T) {
+	d, runs, _, arts := newGitLabRetryDispatcher(t)
+	// The run records merge request !31, but the pipeline claims !99.
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 31)
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 99)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 1 {
+		t.Fatalf("retry children = %d, want 1 (ref+sha still correlate; narrowing only narrows)", len(got))
+	}
+}
+
+// TestShortRunID pins the 8-character branch-name prefix. The helper's
+// len(s) < 8 arm is structurally UNREACHABLE — uuid.UUID.String() is always
+// 36 characters — and is kept only to stay byte-identical to the
+// orchestrator's shortRunID, whose formula this correlation depends on.
+func TestShortRunID(t *testing.T) {
+	if got := shortRunID(uuid.Nil); got != "00000000" {
+		t.Errorf("shortRunID(uuid.Nil) = %q, want the first 8 chars", got)
+	}
+}
+
+// TestGitLabRetryCandidates_UnwiredGuards pins the nil-repository / empty-repo
+// guard: with nothing to query, the candidate set is empty and NO error is
+// produced, so the caller takes the quiet "not a Fishhawk project" path rather
+// than the "lookup failed" one.
+func TestGitLabRetryCandidates_UnwiredGuards(t *testing.T) {
+	pr := &PipelineRef{Ref: "fishhawk/run-abcdef12", SHA: "deadbeef"}
+	cases := []struct {
+		name string
+		d    *Dispatcher
+		ev   Event
+	}{
+		{"nil_run_repository", &Dispatcher{}, Event{Repo: "acme/widgets"}},
+		{"empty_repo", &Dispatcher{Runs: &stubRuns{}}, Event{Repo: ""}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.d.gitLabRetryCandidates(context.Background(), tc.ev, pr)
+			if err != nil {
+				t.Fatalf("err = %v, want nil (an unwired lookup is not a fault)", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("candidates = %d, want 0", len(got))
+			}
+		})
+	}
+}
+
+// TestGitLabCIRetry_HeadSHALookupFails_SkipsThatCandidate pins the
+// per-candidate degrade inside the correlation walk: a candidate whose stage
+// lookup faults is SKIPPED, not treated as a match and not turned into a 5xx.
+// With only the faulting candidate present, the outcome collapses into the
+// named ref-owner skip reason.
+func TestGitLabCIRetry_HeadSHALookupFails_SkipsThatCandidate(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	branch := gitLabRunBranch(parent)
+	runs.listStagesErr = errors.New("stage query failed")
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", branch, "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v, want nil", err)
+	}
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0 (a faulting candidate must not be treated as a match)", len(got))
+	}
+	if got := skipReason(t, au); got != gitLabRetrySkipSHAMismatch {
+		t.Errorf("reason = %q, want %q (the run owns the ref; its head could not be read)",
+			got, gitLabRetrySkipSHAMismatch)
+	}
+}

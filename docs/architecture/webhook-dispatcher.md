@@ -45,3 +45,42 @@ Implementation: `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `D
 ## SPA review-stage read-only summary
 
 (ADR-018 / #314) `frontend/src/review/review-document.tsx` drops the in-Fishhawk `ApprovalPanel` for review stages. Header gains a "View on GitHub" affordance pointing at `artifact.pr_url`. A new Activity section reads `listRunAudit({stageId, limit})` and renders the three PR-side categories from #312 — `pr_merged` → "@x merged the PR", `pr_approved_on_github` → "@x approved", `pr_review_submitted` → "@x requested changes / commented / dismissed" — oldest first so reviewers scan a left-to-right timeline. Approvers panel renamed "Approvers (informational)" with copy noting branch protection's required-reviewers is the actual gate. Plan-stage approval flow in `plan-document.tsx` unchanged.
+
+## GitLab run creation and CI-failure retry (E45.22 / #2043)
+
+### Run creation is live
+
+`Dispatcher.Handle` no longer parks a GitLab `MatchActionRun` at the E45.6 / #1860 boundary. An admitted GitLab trigger routes to `gitlab_dispatch.go::handleGitLabCreateRun`, which is a SEPARATE path from the GitHub create rather than a shared one, for three reasons the shared code cannot absorb:
+
+- the spec is read through the forge-neutral `forge.FileFetcher` (`Dispatcher.GitLabFiles`, wired in `serve.go` from `registeredFileFetcher("gitlab")`), because the GitHub client's scope parse rejects a `gitlab:<project_id>` credential ref outright;
+- there is no branch-protection snapshot to take — GitLab's protected-branches API contributes no required-status contexts, so the ADR-017 refusal would reject every GitLab run;
+- comment-back / board-sync notifiers are GitHub-only.
+
+Everything that IS shared is called, not reimplemented: the coarse plan-reviewer capability gate, the `applies_to` routing gate, the blocking periodic-budget gate (in that order), `CreateStagesFromSpec`, and the `run_dispatched` audit.
+
+The created run carries `runner_kind=gitlab_ci` as an ADR-045 creation-time HINT with `runner_kind_resolved` left false (the runner's signed self-report stays authoritative), `installation_ref = "gitlab:<project_id>"` (migration 0076 — this is what lets `orchestrator.runCredentialScope` resolve a non-zero scope for later stages instead of warn-skipping every one), and a nil `installation_id`. Its first stage's pipeline necessarily runs on the DEFAULT ref: the ADR-035 sole-writer run branch does not exist until the runner creates it.
+
+### Pipeline classified, Job (build) skipped
+
+GitLab emits BOTH a Pipeline Hook (`object_kind: "pipeline"`) and a Job Hook (`object_kind: "build"`) for the same failing job. `matchGitLabCIFailure` classifies a FAILED pipeline as `MatchActionCIFailureRetry` and SKIPS the build kind with an explicit reason, so one failing job drives at most one retry attempt at the classification layer.
+
+The build skip is a CONTROL, not a parse failure. The Job Hook payload carries top-level `ref`, `sha`, `build_status` and `pipeline_id` — every correlation input the pipeline payload carries under `object_attributes` — and the classifier's union decode reads both shapes, so a build payload would classify just as happily. Delete the build arm and a combined delivery drives two retry attempts; `TestGitLabCIRetry_BuildOnlyEventCreatesNoRetry` is the counterfactual vehicle.
+
+### Correlation contract: ref AND sha
+
+A GitLab pipeline carries no `pull_request_url` handle, so `gitlab_ciretry.go` correlates DETERMINISTICALLY on two signals that must BOTH hold:
+
+- the pipeline's `ref` equals the candidate run's ADR-035 run branch (`fishhawk/run-<short>`, or a decomposed child's `fishhawk/run-<shortParent>/slice-<n>` — the derivation duplicated from `orchestrator.runBranchRef` and pinned by `TestGitLabRunBranch_MatchesOrchestratorDerivation`), AND
+- the pipeline's `sha` equals the head SHA that run recorded on its implement-stage `pull_request` artifact.
+
+The merge-request `iid` only NARROWS the candidate set. It cannot select a run: a retry lineage produces MULTIPLE runs per merge request by construction. The pipeline id is captured into the audit payload as correlation provenance.
+
+**First-stage retry is DEFERRED, by design.** Issue #2043 offers two resolutions — "correlate by pipeline/project+SHA, or defer first-stage retry until the run branch exists" — and this contract takes the SECOND. A first pipeline runs on the default ref, so its ref can never equal a run branch and it correlates to nothing. Correlating a default-ref pipeline by project+SHA alone would match any run whose recorded head happened to be that commit, across branches and lineages, with no second signal to disambiguate. A deferred retry costs one manual re-run; a mis-correlated one retries the WRONG run.
+
+A deferral is not a silent nothing. Every non-correlation writes a `ci_retry_skipped` chained audit row naming WHICH reason applied — `first_stage_pipeline_on_non_run_branch`, `no_candidate_run_owns_pipeline_ref`, `pipeline_sha_does_not_match_run_head_sha`, `run_lineage_cancelled`, `retry_policy_unresolvable_from_cached_spec` — chained to the most recent candidate run, so a failure that was correctly ignored is distinguishable from one that should have retried and did not (#2860). The one case with no audit row is "no gitlab_ci runs for this project at all": there is no run to chain against, and the delivery is not a Fishhawk failure.
+
+### Dedup is a CONSTRAINT on both retry paths
+
+Both the GitLab path and the pre-existing GitHub `check_run` path dropped their read-then-write dedup guard in favour of the `runs_retry_child_once_idx` partial unique index (migration 0076). A `23505` on that index — recognized by `run.IsRetryChildDuplicate`, which matches the constraint name specifically and additionally accepts the `run.ErrRetryChildDuplicate` sentinel for fakes — is the benign "someone else won" branch: no error surfaces, so the forge does not redeliver. Every other create error stays a hard failure.
+
+The index only dedups when both racing inserts compute the SAME `retry_attempt`, so BOTH paths derive it as `parent.RetryAttempt + 1` from the PARENT row, never from the latest existing child. A child-derived value would make the two inserts disagree, the index would never fire, and a count-only concurrency test would stay green while the defect stayed open.

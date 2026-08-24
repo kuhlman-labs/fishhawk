@@ -340,6 +340,67 @@ func TestPublish_GitLabCI_PublishesGitLabCommitStatus(t *testing.T) {
 	}
 }
 
+// TestPublish_DispatcherMintedGitLabRun_RoutesToGitLabForge is the
+// commit-status report-back evidence for E45.22 / #2043 (C3 half one). The
+// #1861 routing above was pinned against a hand-shaped gitlab_ci row; this
+// pins it against the row shape the NEW webhook GitLab dispatch path actually
+// mints — runner_kind gitlab_ci, a "gitlab:<project_id>" installation_ref, a
+// NIL GitHub installation id, and runner_kind_resolved still false (the
+// ADR-045 hint is not a lock). That shape is itself pinned by
+// TestHandle_GitLabTrigger_CreatesGitLabCIRun in backend/internal/webhook.
+//
+// The claim is falsifiable: if this row could be made to route to the GitHub
+// client, the done-means clause "commit status reports back to GitLab" would
+// be wrong. It routes to the GitLab forge and makes zero GitHub calls.
+func TestPublish_DispatcherMintedGitLabRun_RoutesToGitLabForge(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	gitlabRef := "gitlab:4242"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:   runID,
+			Repo: "acme/widgets",
+			// Exactly what handleGitLabCreateRun stamps.
+			RunnerKind:         run.RunnerKindGitLabCI,
+			RunnerKindResolved: false,
+			InstallationRef:    &gitlabRef,
+			InstallationID:     nil,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "c0ffee01")},
+	}}
+	gh := &fakeGitHub{}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:4242")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected published=true")
+	}
+	if len(gh.calls) != 0 {
+		t.Fatalf("a dispatcher-minted gitlab_ci run must never reach the GitHub client, got %d calls", len(gh.calls))
+	}
+	if len(gl.calls) != 1 {
+		t.Fatalf("expected 1 GitLab commit-status call, got %d", len(gl.calls))
+	}
+	if got := gl.calls[0].params.HeadSHA; got != "c0ffee01" {
+		t.Errorf("head_sha = %q, want c0ffee01", got)
+	}
+	if got := gl.calls[0].scope; got != forge.FromRef("gitlab:4242") {
+		t.Errorf("scope = %v, want the run's gitlab:4242 credential scope", got)
+	}
+}
+
 // TestPublish_CrossForge_NoDedupSuppression proves the dedup cache is keyed
 // per-forge (#1861): a github_actions run publishing a Check Run for a given
 // owner/name@sha and state must NOT dedup-suppress a gitlab_ci run publishing a

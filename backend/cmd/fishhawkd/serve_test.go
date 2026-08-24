@@ -3886,3 +3886,35 @@ func TestGitLabIdentityWarnings(t *testing.T) {
 		t.Error("serve.go no longer calls gitlabIdentityWarnings with the three config values; the warnings would stop firing")
 	}
 }
+
+// TestWebhookDispatcher_WiresGitLabFileFetcher pins the GitLab run-creation
+// wiring (E45.22 / #2043). The dispatcher literal lives inside serve's
+// several-hundred-line config assembly, which no unit test can construct, so
+// the pin is a body-grep on the source — the same technique the repo uses for
+// other un-constructible wiring sites.
+//
+// It is load-bearing rather than cosmetic: GitLabFiles nil leaves an admitted
+// GitLab trigger logging and skipping (see
+// TestHandle_GitLabTrigger_NoFileReader_SkipsWithoutCreating), so a dropped
+// wiring line turns GitLab go-live into a silent no-op that every unit test in
+// backend/internal/webhook still passes.
+func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	body := string(src)
+	i := strings.Index(body, "cfg.WebhookDispatcher = &webhook.Dispatcher{")
+	if i < 0 {
+		t.Fatal("webhook.Dispatcher literal not found in serve.go; update this pin")
+	}
+	end := strings.Index(body[i:], "\n\t\t}\n")
+	if end < 0 {
+		t.Fatal("could not bound the webhook.Dispatcher literal; update this pin")
+	}
+	literal := body[i : i+end]
+	if !strings.Contains(literal, `GitLabFiles: registeredFileFetcher("gitlab")`) {
+		t.Errorf(`webhook.Dispatcher literal is missing GitLabFiles: registeredFileFetcher("gitlab"); `+
+			"GitLab run creation would be a silent no-op. Literal:\n%s", literal)
+	}
+}
