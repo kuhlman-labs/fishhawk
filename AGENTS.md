@@ -12,6 +12,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 - `docs/ARCHITECTURE.md` — current technical realization (stack, lifecycle, storage, invariants). Read before designing anything cross-component.
 - `docs/BRAND_FOUNDATIONS.md` — voice, naming, positioning.
 - `docs/METHODOLOGY.md` — autonomy tiers (low/medium/high).
+- `docs/GROOMING_RUNBOOK.md` — operating the `backlog_grooming` loop: invocation, what approving actually does (it writes), the autonomy-tier policy for this repo (`autonomy:low` means an agent STRUCTURALLY cannot, not that the work is sensitive), and turning the ranking into a campaign.
 - `docs/spec/` — canonical JSON Schemas + reference docs for the workflow spec (`.fishhawk/workflows.yaml`) and the plan artifact (`standard_v1`). Validate with `check-jsonschema --schemafile <schema> <yaml-or-json>`. Caveat: a workflow-v2 document using `defaults`/`extends` must be validated with `fishhawk validate` (or the backend), not a bare `check-jsonschema` run — the bare run resolves no same-document reuse, so it rejects a reuse-bearing spec (e.g. a stage inheriting its `executor`) the product accepts (#2340).
 - `docs/api/` — REST API surface: `v0.openapi.yaml` is source of truth, `v0.md` is the human companion. Lint with `npx -y @redocly/cli@2.31.5 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml` (pinned version — see the pinning rule under "Build, test, lint").
 - `.fishhawk/workflows.yaml` — placeholder; executed by the product itself starting Day 21 (~2026-05-20).
