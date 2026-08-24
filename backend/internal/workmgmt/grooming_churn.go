@@ -405,9 +405,19 @@ func groomingHygieneBasis(e plan.HygieneDefect) string {
 		state = strings.ToLower(strings.TrimSpace(e.Fix.BoardState))
 		value = strings.TrimSpace(e.Fix.FieldValue)
 	}
-	// The label set is joined on US (\x1f), not the \x00 groomingBasisHash
-	// separates FIELDS with, so a label carrying the field separator cannot
-	// forge a different member's contribution.
+	// TWO SEPARATORS, TWO DIFFERENT JOBS. The label set is joined on US
+	// (\x1f) so two different SETS do not collapse onto one fingerprint
+	// (["ab"] vs ["a","b"]); the MEMBER boundary is the \x00 groomingBasisHash
+	// joins FIELDS with, which is what stops a label forging the field value's
+	// contribution (["ab"] vs ["a"]+"b"). Both pairs are pinned in
+	// TestGroomingBasisExcludesProse — each collides under the corresponding
+	// empty join, so neither claim rests on prose.
+	//
+	// RESIDUAL: a label containing \x1f itself still collides with the
+	// equivalent two-label set here. It is bounded rather than fixed, because
+	// groomingValidLabel refuses any control rune, so such a label is
+	// undispatchable and the collision can only suppress a proposal that could
+	// never have been applied.
 	return groomingBasisHash(plan.GroomingClassHygiene, strings.Join(labels, "\x1f"), epic, state, value)
 }
 

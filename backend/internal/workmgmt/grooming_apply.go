@@ -518,13 +518,17 @@ func groomingStructuredFix(kind GroomingMutationKind, fix *plan.HygieneFix) (Gro
 		}
 		labels := make([]string, 0, len(fix.Labels))
 		for _, raw := range fix.Labels {
-			name := strings.TrimSpace(raw)
-			if !groomingValidLabel(name) {
+			// VALIDATED RAW, BEFORE ANY NORMALIZATION. Trimming first would
+			// judge a value the report never supplied: ` phase:alpha` carries
+			// whitespace, the contract refuses any label that does, and a trim
+			// ahead of the check silently rewrote it into a passing one and
+			// dispatched it.
+			if !groomingValidLabel(raw) {
 				// ONE invalid label fails the WHOLE entry: a partial label
 				// write is a half-applied fix nobody proposed.
 				return GroomingValue{}, GroomingSkipInvalidFixValue
 			}
-			labels = append(labels, name)
+			labels = append(labels, raw)
 		}
 		return GroomingValue{List: labels}, ""
 	case GroomingKindEpicLink:
@@ -548,12 +552,17 @@ func groomingStructuredFix(kind GroomingMutationKind, fix *plan.HygieneFix) (Gro
 		// value the lookup resolves agree on case (approval condition C6).
 		return GroomingValue{Scalar: strings.ToLower(state)}, ""
 	case GroomingKindFieldSet:
+		// SINGLE-LINE IS ENFORCED AGAINST THE RAW VALUE, ahead of the trim and
+		// ahead of the blank check, for the same reason the label rule is: a
+		// trim that runs first strips a LEADING or TRAILING line break, so
+		// `3\n` and `\r3` became `3` and were dispatched though the schema
+		// promises any value carrying a newline is refused pre-dispatch.
+		if strings.ContainsAny(fix.FieldValue, "\n\r") {
+			return GroomingValue{}, GroomingSkipInvalidFixValue
+		}
 		value := strings.TrimSpace(fix.FieldValue)
 		if value == "" {
 			return GroomingValue{}, GroomingSkipNoStructuredFix
-		}
-		if strings.ContainsAny(value, "\n\r") {
-			return GroomingValue{}, GroomingSkipInvalidFixValue
 		}
 		return GroomingValue{Scalar: value}, ""
 	default:
@@ -566,11 +575,19 @@ func groomingStructuredFix(kind GroomingMutationKind, fix *plan.HygieneFix) (Gro
 
 // groomingValidLabel reports whether a proposed label NAME may be dispatched.
 //
+// IT JUDGES THE RAW NAME. The caller does NOT trim before calling: a validator
+// that runs after normalization judges a value the report never supplied, and
+// a space-padded label would then be rewritten into a passing one and
+// dispatched.
+//
 // The rule and its stated contract agree deliberately (approval condition C3):
-// a name is refused when it is empty after trimming, carries ANY whitespace
-// rune, BEGINS OR ENDS with a punctuation or symbol rune — not just the four
-// sentence-terminators, so `Add phase:alpha!` and `phase:alpha?` are refused
-// exactly as `Add phase:alpha.` is — or exceeds groomingMaxLabelLen runes.
+// a name is refused when it is empty, carries ANY whitespace rune, carries ANY
+// control rune (which unicode.IsSpace does NOT cover — `\x1f`, the separator
+// groomingHygieneBasis joins the label set on, is a control character and not
+// a space), BEGINS OR ENDS with a punctuation or symbol rune — not just the
+// four sentence-terminators, so `Add phase:alpha!` and `phase:alpha?` are
+// refused exactly as `Add phase:alpha.` is — or exceeds groomingMaxLabelLen
+// runes.
 //
 // It is STRICTER than the forge: GitHub accepts a label named `good first
 // issue`. That is deliberate. The defect class whose fix this is
@@ -586,7 +603,7 @@ func groomingValidLabel(name string) bool {
 		return false
 	}
 	for _, r := range runes {
-		if unicode.IsSpace(r) {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
 			return false
 		}
 	}

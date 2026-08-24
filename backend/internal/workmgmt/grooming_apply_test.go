@@ -2227,9 +2227,22 @@ func TestGroomingValidLabel_RejectsWhatItPromises(t *testing.T) {
 		{name: "leading colon", label: ":phase"},
 		{name: "leading plus symbol", label: "+phase:alpha"},
 		{name: "interior space", label: "good first issue"},
-		{name: "leading space is trimmed away then refused", label: ""},
+		{name: "empty", label: ""},
+		// THE RAW BOUNDARY. The caller no longer trims before calling, so a
+		// space-padded name is judged as supplied and refused — it is not
+		// rewritten into a passing one. Under a caller-side trim these three
+		// rows are the same input as the valid `phase:alpha` row above.
+		{name: "leading space", label: " phase:alpha"},
+		{name: "trailing space", label: "phase:alpha "},
+		{name: "leading and trailing space", label: " phase:alpha "},
 		{name: "tab", label: "phase:\talpha"},
+		{name: "leading tab", label: "\tphase:alpha"},
 		{name: "newline", label: "phase:\nalpha"},
+		{name: "trailing newline", label: "phase:alpha\n"},
+		// A CONTROL rune that unicode.IsSpace does NOT match, and the very
+		// separator groomingHygieneBasis joins the label set on.
+		{name: "unit separator", label: "phase:alpha\x1fbeta"},
+		{name: "NUL", label: "phase:alpha\x00"},
 		{name: "one over the length cap", label: strings.Repeat("a", groomingMaxLabelLen+1)},
 	}
 	for _, tc := range cases {
@@ -2261,6 +2274,14 @@ func TestDeriveGroomingMutations_InvalidLabelIsRefused(t *testing.T) {
 		{name: "over the length cap", labels: []string{strings.Repeat("a", groomingMaxLabelLen+1)}, want: GroomingSkipInvalidFixValue},
 		{name: "one bad name fails the whole set", labels: []string{"phase:alpha", "Add area:api."}, want: GroomingSkipInvalidFixValue},
 		{name: "a blank member", labels: []string{"phase:alpha", "   "}, want: GroomingSkipInvalidFixValue},
+		// The behavioural half of the raw boundary: a padded label is REFUSED
+		// with zero dispatches, not trimmed and written. Under a validate-
+		// after-trim ordering each of these dispatches `phase:alpha`.
+		{name: "leading space", labels: []string{" phase:alpha"}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing space", labels: []string{"phase:alpha "}, want: GroomingSkipInvalidFixValue},
+		{name: "trailing newline", labels: []string{"phase:alpha\n"}, want: GroomingSkipInvalidFixValue},
+		{name: "one padded name fails the whole set", labels: []string{"phase:alpha", " area:api"}, want: GroomingSkipInvalidFixValue},
+		{name: "unit separator control char", labels: []string{"phase:alpha\x1fbeta"}, want: GroomingSkipInvalidFixValue},
 		{name: "empty list", labels: []string{}, want: GroomingSkipNoStructuredFix},
 		{name: "nil list", labels: nil, want: GroomingSkipNoStructuredFix},
 	}
@@ -2303,7 +2324,10 @@ func TestDeriveGroomingMutations_AbsentOrWrongMemberIsNoStructuredFix(t *testing
 		{name: "field/nil fix", defect: "missing_estimate", fix: nil},
 		{name: "field/only board_state populated", defect: "missing_estimate", fix: &plan.HygieneFix{BoardState: "backlog"}},
 		{name: "field/empty value", defect: "missing_estimate", fix: &plan.HygieneFix{FieldValue: ""}},
-		{name: "field/all whitespace", defect: "missing_estimate", fix: &plan.HygieneFix{FieldValue: " \n "}},
+		// Spaces and tabs only: a whitespace run CARRYING A NEWLINE is refused
+		// as invalid_fix_value by the raw single-line check that now runs
+		// ahead of the blank check, not reported as a missing value.
+		{name: "field/all whitespace", defect: "missing_estimate", fix: &plan.HygieneFix{FieldValue: " \t "}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2342,14 +2366,40 @@ func TestGroomingStructuredFix_UnreadKindFailsClosed(t *testing.T) {
 // TestDeriveGroomingMutations_MultiLineFieldValueIsRefused pins the remaining
 // field_set branch: a value carrying a newline is not a board field value, and
 // is refused pre-dispatch rather than written.
+//
+// THE BOUNDARY ROWS ARE THE POINT. An interior newline is refused whichever
+// order the trim and the check run in; a LEADING or TRAILING one is refused
+// only because the single-line rule is enforced against the RAW value. With
+// the trim first, `3\n` and `\r3` become `3` and are dispatched — the exact
+// value the schema promises is refused.
 func TestDeriveGroomingMutations_MultiLineFieldValueIsRefused(t *testing.T) {
-	h := hygieneFixEntry(1, "missing_estimate", &plan.HygieneFix{FieldValue: "3\nand also 5"})
-	rec, calls := applyOneHygiene(t, h, groomingStates())
-	if len(calls) != 0 {
-		t.Fatalf("dispatches = %+v, want ZERO", calls)
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "interior newline", value: "3\nand also 5"},
+		{name: "trailing newline", value: "3\n"},
+		{name: "leading carriage return", value: "\r3"},
+		{name: "trailing carriage return", value: "3\r"},
+		{name: "trailing CRLF", value: "3\r\n"},
+		{name: "leading newline", value: "\n3"},
+		{name: "newline inside surrounding spaces", value: " 3\n "},
+		{name: "whitespace run carrying a newline", value: " \n "},
 	}
-	if rec.SkipReason != GroomingSkipInvalidFixValue {
-		t.Errorf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipInvalidFixValue)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := hygieneFixEntry(1, "missing_estimate", &plan.HygieneFix{FieldValue: tc.value})
+			rec, calls := applyOneHygiene(t, h, groomingStates())
+			if len(calls) != 0 {
+				t.Fatalf("dispatches = %+v, want ZERO: a value carrying a newline must never reach the provider", calls)
+			}
+			if rec.SkipReason != GroomingSkipInvalidFixValue {
+				t.Errorf("skip reason = %q, want %q", rec.SkipReason, GroomingSkipInvalidFixValue)
+			}
+			if rec.Outcome != GroomingOutcomeSkipped {
+				t.Errorf("outcome = %q, want skipped", rec.Outcome)
+			}
+		})
 	}
 }
 

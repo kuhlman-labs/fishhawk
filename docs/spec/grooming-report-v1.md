@@ -111,10 +111,10 @@ audited refusal rather than a forge error after a write was attempted:
 
 | Member | Rule |
 |---|---|
-| `labels` | Each name non-empty after trimming, carrying **no whitespace**, **not beginning or ending** with a punctuation or symbol rune, at most **50 characters**. One invalid name fails the **whole entry** — a partial label write is a half-applied fix nobody proposed. |
+| `labels` | Each name validated **exactly as written** (never trimmed first): non-empty, carrying **no whitespace** and **no control character**, **not beginning or ending** with a punctuation or symbol rune, at most **50 characters**. So ` phase:alpha` is refused, not silently trimmed. One invalid name fails the **whole entry** — a partial label write is a half-applied fix nobody proposed. |
 | `parent_epic` | A positive integer after stripping one optional leading `#`. Both wire forms (`389`, `#389`) are accepted and normalize to `#N`. |
 | `board_state` | A **canonical** state, matched case-insensitively against the work-management conventions `states` map and resolved to that board's own column option before dispatch. |
-| `field_value` | Non-empty after trimming, single-line. |
+| `field_value` | Single-line — checked **as written**, so a leading or trailing newline is refused rather than trimmed away — and non-empty after trimming surrounding spaces. |
 
 The label rule is deliberately **stricter than the forge**: GitHub accepts a
 label named `good first issue`. The defect class whose fix this is

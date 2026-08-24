@@ -311,7 +311,7 @@
                 "type": "string",
                 "minLength": 1
               },
-              "description": "The label names to ADD, each exactly as it must appear on the forge (e.g. `phase:alpha`). No prose, no leading verb, no trailing punctuation: a name carrying whitespace, a leading or trailing punctuation/symbol rune, or more than 50 characters is refused pre-dispatch."
+              "description": "The label names to ADD, each exactly as it must appear on the forge (e.g. `phase:alpha`). No prose, no leading verb, no trailing punctuation, and NO surrounding whitespace \u2014 the name is validated exactly as written, never trimmed first: a name carrying whitespace or a control character, beginning or ending with a punctuation/symbol rune, or longer than 50 characters is refused pre-dispatch."
             },
             "parent_epic": {
               "type": "string",
@@ -326,7 +326,7 @@
             "field_value": {
               "type": "string",
               "minLength": 1,
-              "description": "The board field value to write (e.g. an estimate). Single-line; a value carrying a newline is refused pre-dispatch."
+              "description": "The board field value to write (e.g. an estimate). Single-line; a value carrying a newline is refused pre-dispatch \u2014 checked against the value as written, so a LEADING or TRAILING newline is refused too, not trimmed away."
             }
           }
         }

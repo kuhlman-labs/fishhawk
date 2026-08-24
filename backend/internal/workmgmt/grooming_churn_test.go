@@ -996,6 +996,45 @@ func TestGroomingBasisExcludesProse(t *testing.T) {
 		t.Error("hygiene: prose detail changed the fingerprint")
 	}
 
+	// THE TWO SEPARATOR BOUNDARIES, pinned rather than asserted in prose. Each
+	// pair is chosen so it COLLIDES under the corresponding naive
+	// concatenation, which is what makes it a counterfactual vehicle: a
+	// one-element label set joins to itself whatever the separator, so a pair
+	// built on one is separator-blind and pins nothing.
+	//
+	// (1) The label SET boundary: joining on US (\x1f) keeps ["ab"] and
+	// ["a", "b"] apart, where an empty join would fingerprint them
+	// identically and merge two different proposals into one.
+	withHygieneFix := func(f *plan.HygieneFix) plan.HygieneDefect {
+		d := gcHygiene("1", "missing_label_namespace", "")
+		d.Fix = f
+		return d
+	}
+	oneLabel := withHygieneFix(&plan.HygieneFix{Labels: []string{"ab"}})
+	twoLabels := withHygieneFix(&plan.HygieneFix{Labels: []string{"a", "b"}})
+	if groomingHygieneBasis(oneLabel) == groomingHygieneBasis(twoLabels) {
+		t.Error("hygiene: two DIFFERENT label sets share a fingerprint; the label-set join separator is not separating")
+	}
+
+	// (2) The MEMBER boundary: fields are joined on NUL by groomingBasisHash,
+	// so a label cannot forge the field_value's contribution. Without that
+	// separator both of these hash "ab".
+	labelOnly := withHygieneFix(&plan.HygieneFix{Labels: []string{"ab"}})
+	labelPlusValue := withHygieneFix(&plan.HygieneFix{Labels: []string{"a"}, FieldValue: "b"})
+	if groomingHygieneBasis(labelOnly) == groomingHygieneBasis(labelPlusValue) {
+		t.Error("hygiene: a label forged the field_value's contribution to the fingerprint; the member separator is not separating")
+	}
+
+	// RESIDUAL, stated honestly: a label containing \x1f ITSELF would still
+	// collide with the equivalent two-label set in this fingerprint. That
+	// label is refused pre-dispatch by groomingValidLabel's control-rune rule
+	// (unicode.IsSpace does not match \x1f, unicode.IsControl does), so it can
+	// never be applied — the collision is confined to churn suppression of a
+	// proposal that is undispatchable anyway.
+	if groomingValidLabel("a\x1fb") {
+		t.Error("a label carrying the label-set join separator must be undispatchable, which is what bounds the residual collision above")
+	}
+
 	// Cross-class collision guard: identical payloads under different classes
 	// must not share a fingerprint.
 	if groomingDuplicateBasis(gcDuplicate("1", "2", "high")) == groomingBasisHash(plan.GroomingClassHygiene) {
