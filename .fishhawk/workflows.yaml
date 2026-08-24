@@ -512,6 +512,11 @@ workflows:
       # (#2235); that citation requirement is ADR-065's named mitigation for
       # charter-specificity risk, and it is what keeps the gate below from
       # degrading into rubber-stamping.
+      #
+      # The approval gate on this stage is ALSO the apply trigger (#2822):
+      # approving it executes the report's hygiene-class mutations server-side
+      # and audits each one. Approving is therefore a write, not a filing
+      # decision — read the report before approving it.
       - id: groom
         type: plan
         executor:
@@ -539,16 +544,35 @@ workflows:
               members: [kuhlman-labs]
               not: [author, agent]
 
-      # APPLY — tracker mutations, not source edits. No diff constraints and no
-      # pull_request artifact; v2 binds those to what a stage produces.
-      - id: apply
-        type: implement
-        executor:
-          agent: claude-code
-          timeout: 30m
-        needs: [groom]
+      # THERE IS DELIBERATELY NO `apply` STAGE. Do not add one back.
+      #
+      # An `apply` stage existed here until #2822 wired the apply path, and it
+      # became vestigial the moment that landed. The mutations are executed
+      # SERVER-SIDE when the operator approves the `groom` gate above
+      # (backend/internal/server/grooming_apply.go), so by the time any apply
+      # stage could be dispatched the work is already done and audited — the
+      # stage would spawn an agent with nothing to do.
+      #
+      # Putting the apply behind the gate rather than in an agent stage is the
+      # design, not an accident: an agent stage between the operator's gate
+      # decision and the tracker write would place an agent inside the very
+      # step this workflow exists to keep human. The apply layer's containment
+      # rules ARE the authorization, and the gate decision is what triggers
+      # them.
+      #
+      # Only the `hygiene` class applies today. `ordering`, `dedup` and
+      # `scoping` receive no decision and stay proposals — see the action
+      # matrix above and #2843, which carries the per-entry disposition surface
+      # the destructive classes need before they can be applied at all.
 
-      # GATE — a human confirms the applied result.
+      # CONFIRM — a human checks that the mutations actually landed.
+      #
+      # This is not a second rubber stamp. The apply reports its own outcome
+      # per entry, but an audit row saying `applied` is not the same claim as
+      # the tracker actually carrying the change: on walk #2844 the summary
+      # truthfully reported eight applied while every applied VALUE was prose
+      # garbage (#2847). This gate is where an operator records that they
+      # checked the forge, not the summary.
       - id: confirm
         type: review
         executor:
