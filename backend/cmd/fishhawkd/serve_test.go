@@ -3754,3 +3754,135 @@ func TestDocumentBaseRefResolver(t *testing.T) {
 		}
 	})
 }
+
+// -------- GitLab federated identity wiring (E66.4 / #2392) --------
+
+// TestResolveGitLabIdentityProvider_BothOrNeither pins the config gate:
+// the device flow needs BOTH the instance base URL and the NON-Confidential
+// device client id, and there is deliberately NO fallback from the device
+// client id to the Confidential browser-leg client id (binding constraint 7).
+func TestResolveGitLabIdentityProvider_BothOrNeither(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		baseURL, devID string
+		wantProvider   bool
+	}{
+		{"both", "https://gitlab.example.test", "gl-device", true},
+		{"base url alone", "https://gitlab.example.test", "", false},
+		{"device client id alone", "", "gl-device", false},
+		{"neither", "", "", false},
+		{"whitespace-only device id", "https://gitlab.example.test", "   ", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveGitLabIdentityProvider(tc.baseURL, tc.devID, nil)
+			if (got != nil) != tc.wantProvider {
+				t.Fatalf("resolveGitLabIdentityProvider(%q, %q) = %#v, want non-nil: %v",
+					tc.baseURL, tc.devID, got, tc.wantProvider)
+			}
+			if got == nil {
+				return
+			}
+			if _, ok := got.(*identity.GitLabIdentityProvider); !ok {
+				t.Errorf("provider = %T, want *identity.GitLabIdentityProvider", got)
+			}
+		})
+	}
+}
+
+// TestResolveGitLabIdentityProvider_NoFallbackFromBrowserClientID is the
+// explicit no-fallback assertion (binding constraint 7). A deployment with
+// the full Confidential BROWSER trio but no FISHHAWKD_GITLAB_DEVICE_CLIENT_ID
+// must leave the GitLab identity provider NIL: a Confidential application
+// cannot serve the client_id-only RFC 8628 device grant, so silently reusing
+// the browser id would advertise an id the CLI cannot drive. This fails if a
+// fallback is ever reintroduced, which a comment-only touch of the flag block
+// could not satisfy.
+func TestResolveGitLabIdentityProvider_NoFallbackFromBrowserClientID(t *testing.T) {
+	// The browser-leg client id is a real, plausible value; the point is that
+	// it is NOT reachable from this call at all.
+	const browserClientID = "gl-confidential-browser-app"
+	if got := resolveGitLabIdentityProvider("https://gitlab.example.test", "", nil); got != nil {
+		t.Fatalf("provider = %#v, want nil: the Confidential browser client id %q must not be used as a device-flow fallback",
+			got, browserClientID)
+	}
+	body, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "resolveGitLabIdentityProvider(*gitlabBaseURL, *gitlabOAuthClientID") {
+		t.Error("serve.go wires the Confidential browser client id into the device-flow gate; the two ids must stay independent")
+	}
+}
+
+// TestResolveGitLabIdentityProvider_TokenAccessorReaches pins that the
+// deployment-credential accessor serve.go builds actually reaches the
+// constructed provider's unexported token field — otherwise the members reads
+// stay anonymous even when FISHHAWKD_GITLAB_TOKEN is configured.
+func TestResolveGitLabIdentityProvider_TokenAccessorReaches(t *testing.T) {
+	accessor := func(context.Context) (string, error) { return "glpat-deployment", nil }
+	for _, tc := range []struct {
+		name    string
+		token   func(context.Context) (string, error)
+		wantNil bool
+	}{
+		{"accessor wired", accessor, false},
+		{"no accessor", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := resolveGitLabIdentityProvider("https://gitlab.example.test", "gl-device", tc.token)
+			gl, ok := p.(*identity.GitLabIdentityProvider)
+			if !ok {
+				t.Fatalf("provider = %T, want *identity.GitLabIdentityProvider", p)
+			}
+			f := reflect.ValueOf(gl).Elem().FieldByName("token")
+			if !f.IsValid() {
+				t.Fatal("GitLabIdentityProvider has no token field; passthrough test is stale")
+			}
+			if f.IsNil() != tc.wantNil {
+				t.Errorf("provider.token IsNil = %v, want %v", f.IsNil(), tc.wantNil)
+			}
+		})
+	}
+}
+
+// TestGitLabIdentityWarnings covers BOTH half-configured directions, each on
+// its own: a configured device leg with no deployment credential (reads go
+// anonymous → the mint denies on a private operator repo) and a base URL with
+// no device client id (the device flow stays unconfigured, and the
+// Confidential browser id is not a fallback).
+func TestGitLabIdentityWarnings(t *testing.T) {
+	const anonymous = "REST reads stay anonymous"
+	const unconfigured = "gitlab device flow unconfigured"
+	for _, tc := range []struct {
+		name                    string
+		baseURL, devID, depTok  string
+		wantAnon, wantUnconfigd bool
+	}{
+		{"fully configured", "https://gl.test", "gl-device", "glpat", false, false},
+		{"device leg without deployment token", "https://gl.test", "gl-device", "", true, false},
+		{"base url without device client id", "https://gl.test", "", "glpat", false, true},
+		{"base url alone", "https://gl.test", "", "", false, true},
+		{"gitlab entirely unconfigured", "", "", "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Join(gitlabIdentityWarnings(tc.baseURL, tc.devID, tc.depTok), "\n")
+			if strings.Contains(got, anonymous) != tc.wantAnon {
+				t.Errorf("anonymous-reads warning present = %v, want %v; warnings:\n%s",
+					strings.Contains(got, anonymous), tc.wantAnon, got)
+			}
+			if strings.Contains(got, unconfigured) != tc.wantUnconfigd {
+				t.Errorf("device-unconfigured warning present = %v, want %v; warnings:\n%s",
+					strings.Contains(got, unconfigured), tc.wantUnconfigd, got)
+			}
+		})
+	}
+	// Call-site guard: the pure helper is only meaningful if serve.go still
+	// logs what it returns.
+	body, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "gitlabIdentityWarnings(*gitlabBaseURL, *gitlabDeviceClientID, *gitlabToken)") {
+		t.Error("serve.go no longer calls gitlabIdentityWarnings with the three config values; the warnings would stop firing")
+	}
+}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -424,5 +425,92 @@ func TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd(t *testing.T) {
 	}
 	if at.Audience != testResource {
 		t.Errorf("access token audience = %q, want %q", at.Audience, testResource)
+	}
+}
+
+// TestOAuthFlow_GitLabEndToEnd_SubjectAndProvider drives the full AS walk on
+// a GitLab-configured deployment: signed-out authorize → the GitLab sign-in
+// redirect → a cookie session whose user row carries Provider="gitlab" →
+// consent → code → token exchange, asserting the ISSUED row carries
+// subject "gitlab:alice" and provider "gitlab" end to end (E66.4 / #2392).
+//
+// The session identity is resolved by the REAL bearerAuth middleware rather
+// than injected into the context, because the middleware's subject
+// construction is exactly the seam this test exists to cross: a per-layer
+// unit test passes while the middleware's prefix and the AS's provider stamp
+// disagree, and that disagreement is the latent bug approach step 12 fixes.
+func TestOAuthFlow_GitLabEndToEnd_SubjectAndProvider(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	glUser := &auth.User{ID: uid.String(), Provider: "gitlab", GitHubLogin: "alice"}
+	repo.mu.Lock()
+	repo.users[uid.String()] = glUser
+	repo.mu.Unlock()
+
+	srv := New(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		AuthRepo:         repo,
+		GitLabOAuth:      testGitLabOAuth(), // the SOLE configured browser leg
+	})
+
+	// Signed out → the single-forge redirect goes to the GitLab sign-in, not
+	// to the previously hardcoded /v0/auth/github/login.
+	anon := getAuthorize(srv, authorizeQuery(nil), nil)
+	if anon.Code != http.StatusFound {
+		t.Fatalf("anonymous authorize status = %d, want 302; body=%s", anon.Code, anon.Body.String())
+	}
+	if loc := anon.Header().Get("Location"); !strings.HasPrefix(loc, "/v0/auth/gitlab/login?next=") {
+		t.Fatalf("anonymous authorize Location = %q, want the GitLab sign-in redirect", loc)
+	}
+
+	// Resolve the session identity through the REAL middleware.
+	sessions := stubSessionAuth{
+		user: glUser,
+		sess: &auth.Session{ID: uuid.NewString(), UserID: uid.String()},
+	}
+	var id Identity
+	capture := srv.bearerAuth(nil, nil, sessions)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		id = IdentityFrom(r.Context())
+	}))
+	sessReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	sessReq.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "fhs_deadbeef"})
+	capture.ServeHTTP(httptest.NewRecorder(), sessReq)
+	if id.Subject != "gitlab:alice" {
+		t.Fatalf("middleware-resolved subject = %q, want gitlab:alice", id.Subject)
+	}
+
+	if page := getAuthorize(srv, authorizeQuery(nil), &id); page.Code != http.StatusOK {
+		t.Fatalf("consent page status = %d, want 200; body=%s", page.Code, page.Body.String())
+	}
+	code := redirectQuery(t, postConsent(srv, consentForm(nil), &id)).Get("code")
+	if code == "" {
+		t.Fatal("consent did not mint a code")
+	}
+
+	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	at, err := store.AuthenticateAccessToken(ctx, resp.AccessToken)
+	if err != nil {
+		t.Fatalf("authenticate minted access token: %v", err)
+	}
+	if at.Subject != "gitlab:alice" || at.Provider != "gitlab" {
+		t.Errorf("access token subject/provider = %q/%q, want gitlab:alice/gitlab", at.Subject, at.Provider)
 	}
 }

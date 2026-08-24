@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 )
@@ -1050,6 +1052,156 @@ func TestAuthorizeConsent_GrantMatchesDisplayedScopeWhenRegistrationChanges(t *t
 		got := mintedCodeScopes(t, store)
 		if !equalStrings(got, shown) {
 			t.Fatalf("granted scopes = %v, want the DISPLAYED set %v — the broadened registration must not widen a grant the user already saw", got, shown)
+		}
+	})
+}
+
+// -------- forge-aware federated sign-in (E66.4 / #2392) --------
+
+// testGitLabOAuth builds a GitLab browser-sign-in client. Only its
+// NON-NILNESS is load-bearing for the sign-in-step tests: signInForges reads
+// the configured field, it never dials.
+func testGitLabOAuth() *auth.GitLabOAuth {
+	return auth.NewGitLabOAuth("https://gitlab.example.test", "gl-browser-id", "gl-secret",
+		"https://app.example/v0/auth/gitlab/callback", auth.GitLabOAuthURLs{})
+}
+
+// newForgeAwareAuthorizeServer builds an AS-enabled server with the named
+// browser sign-in legs configured.
+func newForgeAwareAuthorizeServer(t *testing.T, github, gitlab bool) *Server {
+	t.Helper()
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
+	cfg := Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	}
+	if github {
+		_, gh := stubGitHubOAuthServer(t)
+		cfg.GitHubOAuth = gh
+	}
+	if gitlab {
+		cfg.GitLabOAuth = testGitLabOAuth()
+	}
+	return New(cfg)
+}
+
+// Exactly ONE configured forge redirects straight to it. Asserted
+// BYTE-IDENTICAL to the pre-#2392 unconditional GitHub redirect, which is
+// what makes a GitHub-only deployment unchanged by this feature.
+func TestAuthorize_SingleForge_RedirectByteIdentical(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		github, gitlab bool
+		wantPrefix     string
+	}{
+		{"github only", true, false, "/v0/auth/github/login?next="},
+		{"gitlab only", false, true, "/v0/auth/gitlab/login?next="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newForgeAwareAuthorizeServer(t, tc.github, tc.gitlab)
+			query := authorizeQuery(nil)
+			rr := getAuthorize(srv, query, nil)
+			if rr.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302:\n%s", rr.Code, rr.Body.String())
+			}
+			want := tc.wantPrefix + url.QueryEscape("/v0/oauth/authorize?"+query)
+			if got := rr.Header().Get("Location"); got != want {
+				t.Errorf("Location = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// ZERO configured forges keeps the pre-#2392 503 oauth_unconfigured.
+func TestAuthorize_NoForge_503(t *testing.T) {
+	srv := newForgeAwareAuthorizeServer(t, false, false)
+	rr := getAuthorize(srv, authorizeQuery(nil), nil)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "oauth_unconfigured") {
+		t.Errorf("body = %q, want oauth_unconfigured", rr.Body.String())
+	}
+}
+
+// TWO configured forges render the provider-choice page: one LINK per forge,
+// each carrying the same next= return target. There is no form and no hidden
+// field — the page is a pure navigation choice.
+func TestAuthorize_DualForge_RendersChoicePage(t *testing.T) {
+	srv := newForgeAwareAuthorizeServer(t, true, true)
+	query := authorizeQuery(nil)
+	rr := getAuthorize(srv, query, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rr.Body.String()
+	next := url.QueryEscape("/v0/oauth/authorize?" + query)
+	for _, forge := range []string{"github", "gitlab"} {
+		want := "/v0/auth/" + forge + "/login?next=" + next
+		if !strings.Contains(body, want) {
+			t.Errorf("choice page missing %s link %q:\n%s", forge, want, body)
+		}
+	}
+}
+
+// TestOAuthAuthorize_ChoicePage_EscapesNext is BC7, split into the two
+// controls that are ACTUALLY load-bearing on this page, because the shape the
+// condition names is not attainable through the handler: `next` is built from
+// r.URL.Path + "?" + r.URL.RawQuery, and RawQuery is percent-encoded on the
+// wire, so a raw `"` or `<` never reaches the handler at all. Counterfactuals
+// confirmed that empirically — swapping the template to text/template AND
+// deleting forgeLoginURL's url.QueryEscape both left an end-to-end version of
+// this test GREEN. So each layer is pinned where it can actually fail.
+//
+// (1) forgeLoginURL percent-encodes the return target, so the next value
+// cannot inject additional query parameters into the sign-in URL.
+// (2) forgeChoiceTmpl escapes a hostile URL in the href context. Driven
+// directly with a raw value, this is the assertion that goes red on a switch
+// to text/template or to string concatenation — which is what BC7 exists to
+// prevent.
+func TestOAuthAuthorize_ChoicePage_EscapesNext(t *testing.T) {
+	// A hostile return target that PASSES isSafeRelativeRedirect, so escaping
+	// — not rejection — is what has to protect the page.
+	const hostileNext = `/v0/oauth/authorize?state="><script>alert(1)</script>`
+	if !isSafeRelativeRedirect(hostileNext) {
+		t.Fatalf("fixture is not a safe relative redirect; the test would pass for the wrong reason")
+	}
+
+	t.Run("forgeLoginURL percent-encodes the return target", func(t *testing.T) {
+		got := forgeLoginURL(identity.ProviderGitHub, hostileNext)
+		if strings.Contains(got, "<") || strings.Contains(got, `"`) || strings.Contains(got, "&") {
+			t.Fatalf("forgeLoginURL leaked raw markup/parameter separators: %q", got)
+		}
+		// Not-dropped control: the value survives, escaped.
+		if !strings.Contains(got, "%3Cscript%3E") {
+			t.Errorf("forgeLoginURL dropped the return target instead of escaping it: %q", got)
+		}
+	})
+
+	t.Run("template escapes a raw href value", func(t *testing.T) {
+		// Bypass forgeLoginURL deliberately: this sub-test isolates the
+		// TEMPLATE, so it must be handed a value that is still raw.
+		var buf bytes.Buffer
+		if err := forgeChoiceTmpl.Execute(&buf, forgeChoiceView{Forges: []forgeChoice{
+			{Provider: "github", LoginURL: `/v0/auth/github/login?next="><script>alert(1)</script>`},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		body := buf.String()
+		if strings.Contains(body, "<script>") {
+			t.Errorf("choice page rendered a raw <script> tag:\n%s", body)
+		}
+		if strings.Contains(body, `?next="><`) {
+			t.Errorf("choice page rendered a raw attribute break:\n%s", body)
+		}
+		// Not-dropped control.
+		if !strings.Contains(body, "script") {
+			t.Errorf("choice page dropped the href value instead of escaping it:\n%s", body)
 		}
 	})
 }

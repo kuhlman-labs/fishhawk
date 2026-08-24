@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
@@ -277,9 +278,9 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := Identity{Subject: "anonymous"}
 
-			// Cookie session first. Tied to a real GitHub user,
-			// so handlers that index on Subject get a stable
-			// "github:<login>" value.
+			// Cookie session first. Tied to a real forge user, so
+			// handlers that index on Subject get a stable
+			// "<provider>:<login>" value.
 			if sessions != nil {
 				if c, err := r.Cookie(auth.SessionCookieName); err == nil && c.Value != "" {
 					user, sess, err := sessions.Authenticate(r.Context(), c.Value)
@@ -289,7 +290,7 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 					}
 					if err == nil {
 						id = Identity{
-							Subject:   "github:" + user.GitHubLogin,
+							Subject:   sessionSubject(user),
 							UserID:    user.ID,
 							SessionID: sess.ID,
 							AccountID: sess.AccountID,
@@ -677,4 +678,24 @@ func tokenFromHeader(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return h[len(prefix):], true
+}
+
+// sessionSubject builds the provider-qualified subject for a cookie
+// session (E66.4 / #2392). Before this it was hardcoded "github:" +
+// login regardless of user.Provider, so a GitLab browser sign-in (live
+// since E44.22 / #2109) minted a github:-prefixed subject that the GitLab
+// identity provider could never resolve — the exact hazard
+// oauthauthorize.go's APPROVE branch already worked around by reading
+// auth.User.Provider rather than parsing the subject.
+//
+// An EMPTY Provider falls back to github. Rows predating the provider
+// column read as "", and those sessions must keep their exact current
+// subject: that fallback is what makes a GitHub-only deployment
+// byte-identical across this change.
+func sessionSubject(user *auth.User) string {
+	provider := user.Provider
+	if provider == "" {
+		provider = identity.ProviderGitHub
+	}
+	return provider + ":" + user.GitHubLogin
 }

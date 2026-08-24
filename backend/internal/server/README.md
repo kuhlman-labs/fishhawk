@@ -2881,3 +2881,109 @@ row is the one that detects exactly that drift (deleting the handler's top-level
   chain at the approve gate REFUSES the amendment; an absent `AuditRepo` or an
   undecodable `approval_submitted` payload leaves the criterion LIVE. None of them
   can silence a criterion.
+
+## Federated identity providers (E66.4 / #2392)
+
+`fishhawkd` stays the **sole** OAuth authorization server and clients keep
+seeing one issuer; what becomes forge-agnostic is which federated provider
+authenticates the human behind a token.
+
+### The enumeration, and why NoOp is never in it
+
+`Config.IdentityProviders` (forge-keyed) + `Config.IdentityDeviceClientIDs`
+(the NON-Confidential DEVICE application's client_id per forge) +
+`Config.IdentityBaseURLs` (the instance root the CLI appends
+`/oauth/authorize_device` and `/oauth/token` to) carry the multi-provider
+config. `New` SEEDS the `github` entry from the legacy single
+`IdentityProvider` + `OAuthClientID` fields.
+
+`configuredIdentityProviders()` is the **single** filtered enumeration every
+caller goes through — discovery, the mint's provider selection, and anything
+added later. **No handler may range over `cfg.IdentityProviders` directly.**
+It excludes two shapes:
+
+1. Anything `identity.IsConfigured` reports false for — a nil interface, a
+   typed-nil concrete provider, or `*identity.NoOpIdentityProvider`. The NoOp
+   is installed *because* no forge is configured, so enumerating it would
+   advertise a provider that cannot authenticate anyone.
+2. An entry with an empty DEVICE client id. Discovery exists to tell the CLI
+   which id to drive the device flow with; a provider it cannot drive is not
+   advertised.
+
+Two **deliberately redundant** layers keep a NoOp out of the map, and each is
+observed by its own test:
+
+| Layer | What it does | What it is pinned by |
+|---|---|---|
+| **Ordering** | `New` seeds the maps STRICTLY BEFORE the `IdentityProvider == nil → NewNoOp()` default and only when the field is non-nil, so the NoOp is not visible to the seeder | `TestNew_RawIdentityProvidersMap_NeverContainsNoOp` reads the RAW map |
+| **Type exclusion** | `configuredIdentityProviders` drops a `*NoOpIdentityProvider` whatever put it there | `TestNew_EmptyIdentityProvidersMap_ExcludesNoOp`'s explicitly-wired NoOp case |
+
+The two layers are **not** interchangeable, and the filtered enumeration alone
+cannot tell them apart: with the type check intact, moving the seeding after
+the default keeps `TestNew_NilIdentityProvidersMap_ExcludesNoOp` GREEN (run and
+observed — that was the plan's originally-claimed counterfactual, and it is
+unattainable). The raw-map test is the observation that isolates ordering.
+
+`configuredIdentityProviderNames()` orders github, then gitlab, then any other
+name sorted — a deterministic order the discovery response and its legacy
+first-entry mirror depend on.
+
+### `GET /v0/tokens/login` discovery
+
+Returns `{provider, client_id, providers: [{provider, client_id, base_url?}]}`.
+Each entry's `client_id` is the **DEVICE** client id, not the Confidential
+browser-leg id. `base_url` is omitted for github (the CLI knows github.com's
+device endpoints) and is REQUIRED for gitlab, which may be SaaS or any
+self-managed host. The legacy top-level `provider`/`client_id` mirror the
+FIRST entry, so a CLI predating the array keeps working byte-compatibly.
+Zero configured providers → `503 tokens_unconfigured`.
+
+### `POST /v0/tokens/login` mint
+
+The posted `provider` selects which configured provider re-verifies the token,
+and the **resolved** provider — not a constant — is what `IssueOAuth` stamps on
+the row. An omitted `provider` defaults to the **SOLE** configured entry when
+exactly one is configured (so a GitLab-only deployment is drivable by an old
+CLI rather than locked out), and to `github` otherwise. An unconfigured
+provider is refused `400` naming the configured set. A verified subject whose
+`identity.ProviderOf` disagrees with the selected provider is refused `401`
+rather than minted — defence in depth against a mis-stamped row.
+
+### Forge-aware federated sign-in
+
+`signInForges()` lists the configured BROWSER sign-in legs (`GitHubOAuth` /
+`GitLabOAuth` non-nil). It is **independent** of the device-flow enumeration
+above: the browser leg is gated on the Confidential application's OAuth trio,
+the device leg on a NON-Confidential application's client id alone, and reading
+one from the other would render a sign-in link to a 503 route.
+
+- zero → the pre-existing `503 oauth_unconfigured`
+- exactly one → a 302 to `/v0/auth/<forge>/login?next=…`, byte-identical to
+  the previous unconditional GitHub redirect on a GitHub-only deployment
+- two → a minimal `html/template` provider-choice page: one **link** per forge,
+  each carrying the same `next=` return target. There is no form and no hidden
+  field; the page is a pure navigation choice.
+
+### Session subject carries the user's provider
+
+`sessionSubject` builds the cookie-session subject as `<provider>:<login>`.
+Before #2392 it was hardcoded `"github:" + login` regardless of
+`user.Provider`, so a GitLab browser sign-in (live since E44.22 / #2109) minted
+a `github:`-prefixed subject the GitLab provider could never resolve. An EMPTY
+`Provider` falls back to `github`: rows predating the column read as `""`, and
+that fallback is what keeps a GitHub-only deployment byte-identical.
+
+Consumers were enumerated rather than assumed, and none hard-fails: the
+`repoacl` mirror's cache key takes a MISS that re-resolves live;
+`account.Store.MemberRole` is REPAIRED (a GitLab user currently keys their
+grant under `provider="github"`); `actorKindForSubject` keys only on the
+operator-agent prefix; the approval snapshot identity is likewise repaired; the
+`mcp:run:` prefix branches are unaffected; and no migration constrains a
+subject column's format. Two consequences are named rather than glossed:
+`repoacl.Mirror` holds a SINGLE resolver and uses provider only as a cache key,
+so GitLab-owned rows now reach a GitHub resolver, error, and are absorbed into
+`(false, nil)` plus a WARN — fail-closed, a visibility gap not a security one,
+and provider-ROUTING the mirror is follow-on work; and `ApproverSubject` is a
+dedup JOIN key, so on a deployment that already had GitLab sign-in live a
+user's pre-change `github:` vote and post-change `gitlab:` vote occupy two
+approver slots.
