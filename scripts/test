@@ -787,7 +787,7 @@ _verify_patch_coverage() {
 # so the exec would otherwise fail 127 and red-line verify instead of skipping.
 # test-site-voice (#2261) pins scripts/check-site-voice, the banned-vocabulary
 # gate over site/src/content/docs/; it is bash and adds well under a second
-# (six temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
+# (ten temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h

@@ -213,6 +213,69 @@ else
   pass "c8: verify skips the gate with a reason when check-site-voice is absent"
 fi
 
+# ---------------------------------------------------------------------------
+# c9 — a FAILED enumeration must fail the checker, not report a clean tree.
+# The failure is injected with a PATH-stubbed `find` (the seam
+# scripts/test-container-lease uses for `docker`) rather than an unreadable
+# directory, because a harness running as root would walk an unreadable
+# directory successfully and turn this case into a silent false PASS. The
+# fixture root holds a real, CLEAN page, so a checker that ignored the
+# enumeration status would exit 0 here — which is exactly the fail-open.
+# ---------------------------------------------------------------------------
+c9="$tmproot/c9"
+mkdir -p "$c9" "$tmproot/c9-stub"
+cat > "$c9/clean.md" <<'EOF'
+---
+title: Clean
+---
+Ordinary prose with no banned vocabulary.
+EOF
+cat > "$tmproot/c9-stub/find" <<'EOF'
+#!/usr/bin/env bash
+echo "find: stubbed traversal failure" >&2
+exit 1
+EOF
+chmod +x "$tmproot/c9-stub/find"
+c9out="$(PATH="$tmproot/c9-stub:$PATH" "$CHECK" "$c9" 2>&1)"
+c9status=$?
+if [ "$c9status" -eq 0 ]; then
+  fail "c9: enumeration failure exited 0 — the gate was silently bypassed; output: $c9out"
+elif ! printf '%s\n' "$c9out" | grep -q 'FAILED'; then
+  fail "c9: enumeration failure printed no reason; output: $c9out"
+elif printf '%s\n' "$c9out" | grep -q 'page(s) clean'; then
+  fail "c9: enumeration failure still reported pages clean; output: $c9out"
+else
+  pass "c9: a failed page enumeration exits non-zero ($c9status) with a printed reason"
+fi
+
+# ---------------------------------------------------------------------------
+# c10 — a page path containing `=` is linted, not swallowed by awk's operand
+# parsing. The content root is the RELATIVE directory `a=b`, invoked from its
+# parent: awk reads an operand as an assignment only when the WHOLE part before
+# the first `=` is a valid identifier, so it is a leading `a=` SEGMENT that
+# does the damage — a deeper `c10/a=b/page.md` is already safe because `c10/a`
+# is not an identifier, and would make this case a false PASS. stdin is
+# /dev/null because under the deletion of the `./` prefixing every operand
+# becomes an assignment, leaving awk no file operand: it would then read stdin
+# and block, instead of exiting 0 and showing the fail-open plainly.
+# ---------------------------------------------------------------------------
+mkdir -p "$tmproot/a=b"
+cat > "$tmproot/a=b/page.md" <<'EOF'
+---
+title: Equals
+---
+A frictionless deployment story.
+EOF
+c10out="$(cd "$tmproot" && "$CHECK" "a=b" 2>&1 </dev/null)"
+c10status=$?
+if [ "$c10status" -ne 1 ]; then
+  fail "c10: page under an 'a=b/' path exited $c10status (expected 1) — awk read it as an assignment; output: $c10out"
+elif ! printf '%s\n' "$c10out" | grep -q 'a=b/page\.md'; then
+  fail "c10: report does not name the page under 'a=b/'; output: $c10out"
+else
+  pass "c10: a page path containing '=' is linted, not read as an awk assignment"
+fi
+
 echo
 echo "scripts/test-site-voice: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

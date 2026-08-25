@@ -117,7 +117,10 @@ vocabulary. `scripts/check-site-voice` enforces the mechanically-safe half of
 that list over every page under `src/content/docs/`, case-insensitively and
 prefix-based, anchored on a leading word boundary — so `seamlessly` and
 `empowering` are caught while `unseamless` and `disempower` are not. It reports
-every violation, with file, line number and matched term, before exiting 1.
+every violation, with file, line number and matched term, before exiting 1. A
+failed page enumeration exits **2** rather than reporting a clean tree — the
+absent-root and no-pages branches are decisions about a tree with nothing to
+lint, a failed walk is not knowing what is there.
 
 `"Trust"` is **deliberately excluded** from the mechanical list. §5 bans trust as
 a *marketing claim*, not the word, and this repository legitimately writes
@@ -125,8 +128,9 @@ a *marketing claim*, not the word, and this repository legitimately writes
 those and train readers to ignore the checker, so it stays a human-review item.
 
 `scripts/test verify` runs both the gate (over the committed pages) and
-`scripts/test-site-voice` (eight fixture cases pinning the gate, including the
-two fail-open branches and the verify wiring's own skip). Long-form contract:
+`scripts/test-site-voice` (ten fixture cases pinning the gate, including the
+two fail-open branches, the enumeration-failure fail-CLOSED branch and the
+verify wiring's own skip). Long-form contract:
 [`scripts/README.md`](../scripts/README.md).
 
 ## Deploy — operator-installed workflow
@@ -156,12 +160,15 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
-# Least privilege for a Pages deploy: read the tree, write Pages, and mint the
-# OIDC token actions/deploy-pages exchanges.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# NO permissions by default; each job is granted exactly what it needs. The
+# split is load-bearing, not tidiness. The `build` job executes third-party
+# code with network egress — pnpm install lifecycle scripts and `astro build`
+# pulling in the whole dependency tree — so it gets `contents: read` and
+# NOTHING else. A compromised transitive dependency in that job therefore has
+# no Pages authority to abuse and no OIDC token to mint. `pages: write` and
+# `id-token: write` live only on `deploy`, which runs one first-party action
+# against the already-built artifact and executes no dependency code.
+permissions: {}
 
 # One deploy at a time. Do NOT cancel an in-progress run: a cancelled deploy can
 # leave Pages serving a half-published build.
@@ -173,6 +180,9 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    # Deliberately contents-only: this job runs dependency code.
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: site
@@ -195,8 +205,11 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - uses: actions/configure-pages@v6
-
+      # There is deliberately NO actions/configure-pages step. Its only job is
+      # to hand the framework a base path at build time, and astro.config.mjs
+      # hardcodes `site` and `base` instead (see "Base path" above). Omitting
+      # it keeps every Pages-scoped permission out of the job that runs
+      # dependency code; the Pages source is set once by hand, above.
       - name: Build
         run: pnpm build
 
@@ -210,6 +223,10 @@ jobs:
     name: Deploy
     needs: build
     runs-on: ubuntu-latest
+    # The only job holding these, and it runs no dependency code.
+    permissions:
+      pages: write # actions/deploy-pages publishes the artifact
+      id-token: write # ... and exchanges an OIDC token to authenticate that
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -217,6 +234,20 @@ jobs:
       - id: deployment
         uses: actions/deploy-pages@v5
 ```
+
+**The permission split is the part not to "simplify" back.** GitHub's own Pages
+starter workflows declare `contents: read` + `pages: write` + `id-token: write`
+once at the top of the file, which grants all three to *every* job — including
+the one that runs `pnpm install` lifecycle scripts and `astro build`, i.e.
+arbitrary third-party code with network egress. That hands a compromised
+transitive dependency a token it can exfiltrate and an OIDC identity it can
+mint. The block above instead defaults to `permissions: {}` and grants per job:
+`build` gets `contents: read` and nothing else, `deploy` gets the two sensitive
+scopes and runs no dependency code. `actions/upload-pages-artifact` needs no
+`permissions` grant — artifact upload authenticates with the Actions runtime
+token, not `GITHUB_TOKEN` — which is what makes the split work without breaking
+the handoff. `site/package.json`'s `pnpm.onlyBuiltDependencies` narrows the
+install-time half further, to `esbuild` and `sharp`.
 
 Action refs stay on **floating major tags** — that is the deliberate carve-out
 in `AGENTS.md`'s executable-tooling pin rule, because

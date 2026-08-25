@@ -24,7 +24,8 @@
 #
 # A missing content root prints a reason and exits 0 — a DOCUMENTED fail-open.
 # This is a voice linter that `scripts/test verify` runs unconditionally, not a
-# security control, and it must not red-line a tree that has no site yet.
+# security control, and it must not red-line a tree that has no site yet. A
+# FAILED enumeration is the opposite case and exits 2 — see the find call below.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,15 +39,50 @@ fi
 # docs/BRAND_FOUNDATIONS.md §5 "Things we never say", minus "trust" (above).
 BANNED_TERMS="revolutionary game-changing next-generation industry-leading world-class ai-powered frictionless seamless effortless empower"
 
+# Enumeration runs into a FILE, not a process substitution, so its exit status
+# is checked. Inside `< <(find … | sort)` the pipeline's status is invisible to
+# the surrounding `while`, so an unreadable subdirectory or an interrupted walk
+# yields a SHORT list — or none — and the script reports a clean tree, silently
+# bypassing the gate. That is the one fail-open this script must not have: the
+# absent-root and no-pages branches above are decisions about a tree with
+# nothing to lint, whereas a failed walk means we do not KNOW what is there.
+# It exits 2 (distinct from 1 = violations found) and harness case c9 pins it.
+listing="$(mktemp "${TMPDIR:-/tmp}/check-site-voice.XXXXXX")" || {
+  echo "check-site-voice: could not create a temp file for the page listing" >&2
+  exit 2
+}
+trap 'rm -f "$listing"' EXIT
+
+if ! find "$CONTENT_ROOT" -type f \( -name '*.md' -o -name '*.mdx' \) | LC_ALL=C sort > "$listing"; then
+  echo "check-site-voice: enumerating pages under $CONTENT_ROOT FAILED — refusing to report a clean tree" >&2
+  exit 2
+fi
+
 files=()
 while IFS= read -r f; do
   [ -n "$f" ] && files+=("$f")
-done < <(find "$CONTENT_ROOT" -type f \( -name '*.md' -o -name '*.mdx' \) | LC_ALL=C sort)
+done < "$listing"
 
 if [ "${#files[@]}" -eq 0 ]; then
   echo "check-site-voice: no .md/.mdx pages under $CONTENT_ROOT — nothing to lint"
   exit 0
 fi
+
+# awk reads an operand of the form `name=value` as a VARIABLE ASSIGNMENT, not a
+# file — so a relative page path whose first segment looks like an identifier
+# followed by `=` (CONTENT_ROOT is caller-supplied) would be silently skipped,
+# a fail-open in the linter's own argument handling. A `--` separator does not
+# help, because this is operand parsing rather than option parsing. Prefixing
+# `./` makes the operand start with a character no identifier can, which settles
+# it for every relative path; an absolute path already starts with `/` and is
+# left alone. Harness case c10 pins it.
+awk_files=()
+for f in "${files[@]}"; do
+  case "$f" in
+    /*) awk_files+=("$f") ;;
+    *) awk_files+=("./$f") ;;
+  esac
+done
 
 awk -v terms="$BANNED_TERMS" '
 BEGIN { nterms = split(terms, T, " "); violations = 0 }
@@ -75,7 +111,7 @@ END {
     exit 1
   }
 }
-' "${files[@]}"
+' "${awk_files[@]}"
 status=$?
 
 if [ "$status" -eq 0 ]; then

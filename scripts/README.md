@@ -554,7 +554,7 @@ substring ban would false-positive on those and train readers to ignore
 the checker, so `trust` stays a human-review item. Case c4 pins that it
 does not fire.
 
-### Fail-open contract
+### Fail-open contract — and its one exception
 
 A missing content root prints a one-line reason and exits **0**, as does
 a content root holding no pages. This is a voice linter that verify runs
@@ -562,9 +562,28 @@ unconditionally, not a security control: it must never red-line a
 checkout that has no `site/` yet. Case c6 pins the absent-root branch,
 asserting both the exit code and the printed reason.
 
+A FAILED enumeration is the exception and exits **2** (distinct from
+1 = violations found). Those two fail-open branches are decisions about a
+tree with nothing to lint; a failed walk means the checker does not KNOW
+what is there, and reporting it clean would silently bypass the gate. So
+the `find … | sort` runs into a file whose exit status is checked, not
+into a process substitution whose status the surrounding `while` cannot
+see. Case c9 pins it, injecting the failure with a PATH-stubbed `find`
+rather than an unreadable directory — a harness running as root would
+read that directory fine and turn the case into a silent false pass.
+
+Page paths are handed to `awk` prefixed with `./` when relative. awk
+reads an operand of the form `name=value` as a variable assignment rather
+than a file, and `CONTENT_ROOT` is caller-supplied, so a root like `a=b`
+would leave every page under it silently unlinted. `--` does not help —
+this is operand parsing, not option parsing. Case c10 pins it, with the
+content root named `a=b` and invoked from its parent: a deeper
+`c10/a=b/page.md` is already safe (`c10/a` is not an identifier) and
+would make the case a false pass.
+
 ### Testing
 
-`scripts/test-site-voice` runs eight cases, one per named behavior:
+`scripts/test-site-voice` runs ten cases, one per named behavior:
 
 | Case | Pins |
 |---|---|
@@ -576,12 +595,14 @@ asserting both the exit code and the printed reason.
 | c6 | absent content root → exit 0 with a printed reason |
 | c7 | content root with no `.md`/`.mdx` pages → exit 0 with a printed reason |
 | c8 | `scripts/test`'s `_verify_site_voice` skips with a reason (return 0) when the gate is absent |
+| c9 | a failed page enumeration (PATH-stubbed `find`) → exit 2 with a reason, never a clean report |
+| c10 | a page under a relative content root named `a=b` → exit 1, the page named (awk operand parsing) |
 
 c3 asserts the exit code plus exactly ONE named term, never both. That
 is deliberate: it keeps c3 green under a first-hit-and-stop weakening,
 so that counterfactual isolates c5.
 
-Six counterfactuals were run against the controls and OBSERVED, not
+Eight counterfactuals were run against the controls and OBSERVED, not
 reasoned about — each deletion restored byte-identically afterwards:
 
 | Deletion | Observed RED |
@@ -592,6 +613,8 @@ reasoned about — each deletion restored byte-identically afterwards:
 | `_verify_site_voice`'s not-executable guard | c8 only (exit 127, the red-line it prevents) |
 | the empty-file-list fail-open | c7 only (`files[@]: unbound variable` under bash 3.2) |
 | the absent-content-root fail-open | c6 only (bare `find` error, no reason printed) |
+| the enumeration-status check (back to `< <(find … \| sort)`) | c9 only (exit 0, "no .md/.mdx pages … nothing to lint" — the fail-open itself) |
+| the `./` operand prefixing | c10 only (exit 0, "1 page(s) clean under a=b" — the offending page never linted) |
 
 `scripts/test verify` runs BOTH: `test-site-voice` in the
 `_verify_gate_harnesses` loop (proving the control still works), and
