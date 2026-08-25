@@ -289,7 +289,15 @@ migrate:
   # and when it DOES fire it reports DeadlineExceeded — hiding the migration
   # error this Job exists to surface. Set it only if you need a hard ceiling on
   # a migration blocked on a lock; fishhawk.validateMigrateTiming then fails the
-  # render if the value you chose would win the race.
+  # render if the value you chose would win the race. That guard rejects a
+  # deadline LESS THAN OR EQUAL TO the derived time-to-Failed, not merely one
+  # below it: 210s is a lower bound, so a deadline set to exactly 210 already
+  # loses the race whenever the model is not exact.
+  #
+  # `null` and `0` both mean UNSET. 0 is not a meaningful ceiling (the Job
+  # controller's own validation on the field is exclusive-minimum 0), so the
+  # chart emits no activeDeadlineSeconds field for it and the timing guard has
+  # nothing to compare.
   activeDeadlineSeconds: null
   # Same sizing rationale as `resources` above: a one-shot Go process running
   # DDL against Postgres, no subprocesses. Both requests and limits are set.

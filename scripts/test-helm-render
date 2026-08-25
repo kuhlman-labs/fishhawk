@@ -95,6 +95,52 @@ assert_render_fails() {
   fi
 }
 
+# assert_equals <label> <actual> <expected>
+assert_equals() {
+  if [ "$2" = "$3" ]; then pass "$1"; else
+    fail "$1 (expected: $3 — got: $2)"
+  fi
+}
+
+# yaml_block <manifest> <key> — the FIRST block nested under `<key>:`, i.e. every
+# subsequent line indented STRICTLY deeper than the key itself, stopping at the
+# next sibling-or-shallower key.
+#
+# Why the harness parses structurally instead of grepping the whole document: a
+# bare `grep -F "name: fishhawk-secrets"` over a rendered Deployment is satisfied
+# by `volumes: - secret: secretName: ...` (the PEM projection references the same
+# Secret), by a comment naming it, or by an `envFrom:` on a DIFFERENT container —
+# so deleting the container's `envFrom.secretRef` leaves such an assertion GREEN
+# and the sufficiency proof r5 is meant to be becomes vacuous. Scoping to the
+# block makes the assertion fail exactly when the reference stops reaching the
+# container's environment.
+yaml_block() {
+  printf '%s' "$1" | awk -v key="$2" '
+    !f && $0 ~ "^[[:space:]]*" key ":[[:space:]]*$" {
+      match($0, /^[[:space:]]*/); ind = RLENGTH; f = 1; next
+    }
+    f {
+      if ($0 ~ /^[[:space:]]*$/) next
+      match($0, /^[[:space:]]*/)
+      if (RLENGTH <= ind) exit
+      print
+    }
+  '
+}
+
+# envfrom_ref <envFrom-block> <kind> — the `name:` value of the `- <kind>:` list
+# entry inside an envFrom block (kind is configMapRef or secretRef). Prints
+# nothing when the entry is absent, so an assert_equals against it goes red.
+envfrom_ref() {
+  printf '%s' "$1" | awk -v kind="$2" '
+    $0 ~ "^[[:space:]]*-[[:space:]]*" kind ":[[:space:]]*$" { f = 1; next }
+    f && /^[[:space:]]*name:[[:space:]]*/ {
+      sub(/^[[:space:]]*name:[[:space:]]*/, ""); gsub(/"/, ""); print; exit
+    }
+    f && /^[[:space:]]*-[[:space:]]*[A-Za-z]+:/ { f = 0 }
+  '
+}
+
 # ---------------------------------------------------------------------------
 # r1 — values-prod renders, carries no copy-paste caveat, and its DERIVED URLs
 #      and ingress wiring match the chosen hostname. "It rendered" is not the
@@ -213,6 +259,25 @@ render -f "$tmproot/r2e.yaml"
 assert_render_fails "r2e chartManaged, PEM required (privateKeyFile.enabled) but empty" \
   "githubAppPrivateKey"
 
+# r2f chartManaged with the WHOLE secrets.values map overridden to null. `index`
+# on an untyped nil raises "error calling index: index of untyped nil" — a raw
+# Go-template trace, not the guard's named message — so the guard substitutes an
+# empty dict and the operator gets the same actionable failure an absent single
+# field produces. Asserting the NAMED text (not merely a non-zero exit) is what
+# discriminates: without `| default dict` the render still fails, but with the
+# opaque trace instead.
+cat > "$tmproot/r2f.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  values: null
+YAML
+render -f "$tmproot/r2f.yaml"
+assert_render_fails "r2f chartManaged with a NULL secrets.values map names the missing field" \
+  "requires a non-empty secrets.values.databaseUrl"
+assert_absent "r2f null secrets.values does not surface a raw Go-template index error" "$err" \
+  "index of untyped nil"
+
 # ---------------------------------------------------------------------------
 # r3 — requests AND limits on the fishhawkd container and on the migrate Job.
 #      Limits included, so the criterion and its deciding test agree.
@@ -245,6 +310,26 @@ render --set migrate.activeDeadlineSeconds=60 --show-only templates/migrate-job.
 assert_render_fails "r4 too-tight activeDeadlineSeconds names the deadline" "migrate.activeDeadlineSeconds=60"
 assert_render_fails "r4 too-tight activeDeadlineSeconds names the derived time-to-Failed" "210s"
 
+# THE BOUNDARY. The derived figure is a LOWER bound, so a deadline EQUAL to it
+# already loses the race — validateMigrateTiming compares with `le`, not `lt`,
+# and this case pins that as a decided behaviour rather than an accident of which
+# operator was reached for. Without it the harness tests only 60 (far below) and
+# 600 (far above), and flipping le→lt stays green.
+render --set migrate.activeDeadlineSeconds=210 --show-only templates/migrate-job.yaml
+assert_render_fails "r4 activeDeadlineSeconds EQUAL to the derived time-to-Failed is rejected" "migrate.activeDeadlineSeconds=210"
+# One above the boundary renders — so the case above fails on the boundary rule,
+# not on 210 being unrenderable for some unrelated reason.
+render --set migrate.activeDeadlineSeconds=211 --show-only templates/migrate-job.yaml
+assert_render_ok "r4 activeDeadlineSeconds one second ABOVE the boundary renders"
+assert_contains "r4 boundary+1 deadline is emitted" "$out" "activeDeadlineSeconds: 211"
+
+# activeDeadlineSeconds=0 is UNSET, not a zero-second ceiling: the guard is inert
+# and the Job emits no such field (a 0 would be rejected by the Job controller's
+# own exclusive-minimum-0 validation). Documented in values.yaml + the helper.
+render --set migrate.activeDeadlineSeconds=0 --show-only templates/migrate-job.yaml
+assert_render_ok "r4 activeDeadlineSeconds=0 is treated as unset and renders"
+assert_field_absent "r4 activeDeadlineSeconds=0 emits no activeDeadlineSeconds field" "$out" "activeDeadlineSeconds"
+
 # A generous deadline renders and is emitted verbatim.
 render --set migrate.activeDeadlineSeconds=600 --show-only templates/migrate-job.yaml
 assert_render_ok "r4 generous activeDeadlineSeconds renders"
@@ -260,9 +345,17 @@ assert_contains "r4 generous activeDeadlineSeconds is emitted" "$out" "activeDea
 r5_envfrom() { # <label> <secret-name> <args...>
   local label="$1" secret="$2"; shift 2
   render "$@"
-  assert_contains "$label envFrom configMapRef" "$out" "name: fishhawk-config"
-  assert_contains "$label envFrom secretRef" "$out" "name: $secret"
-  if printf '%s' "$out" | grep -qF "envFrom:"; then pass "$label carries envFrom"; else fail "$label has no envFrom"; fi
+  local block
+  block=$(yaml_block "$out" "envFrom")
+  if [ -n "$block" ]; then pass "$label carries an envFrom block"; else fail "$label has no envFrom block"; fi
+  # Both names are read from INSIDE the envFrom block, under their own ref kind.
+  # Deleting either list entry empties the corresponding lookup and reddens the
+  # case; a Secret still referenced only by the PEM volume does not satisfy it,
+  # and a move from envFrom to explicit `env` entries reddens all three.
+  assert_equals "$label envFrom configMapRef names the ConfigMap" \
+    "$(envfrom_ref "$block" configMapRef)" "fishhawk-config"
+  assert_equals "$label envFrom secretRef names the Secret" \
+    "$(envfrom_ref "$block" secretRef)" "$secret"
 }
 r5_envfrom "r5 allInOne Deployment" fishhawk-secrets --show-only templates/deployment.yaml
 r5_envfrom "r5 split -api Deployment" fishhawk-secrets --set deployment.mode=split --show-only templates/deployment-api.yaml
@@ -341,10 +434,17 @@ assert_render_ok "r5 cell profile, complete externalSecrets mapping renders"
 # FISHHAWKD_DATABASE_URL, asserted PER PROFILE against the path that profile uses.
 # postgres.enabled → a container-level env entry (which overrides envFrom);
 # otherwise → a REQUIRED Secret key with no container-level entry.
+# Scoped to the container's own `env:` block, not the whole document: the key
+# name also appears in the ConfigMap-adjacent comments and (in chartManaged) in
+# the Secret, so a document-wide substring match would not distinguish "a
+# container-level env entry" from "mentioned somewhere".
 render -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
-assert_contains "r5 local (postgres.enabled) DB URL is a container-level env entry" "$out" "name: FISHHAWKD_DATABASE_URL"
+envblk=$(yaml_block "$out" "env")
+assert_contains "r5 local (postgres.enabled) DB URL is a container-level env entry" "$envblk" "name: FISHHAWKD_DATABASE_URL"
+assert_contains "r5 local container-level DB URL points at the in-cluster Service" "$envblk" "@fishhawk-postgres:5432/fishhawk?sslmode=disable"
 render -f "$CHART/values-prod.yaml" --show-only templates/deployment.yaml
-assert_absent "r5 prod DB URL is NOT a container-level env entry (it arrives via the Secret)" "$out" "name: FISHHAWKD_DATABASE_URL"
+envblk=$(yaml_block "$out" "env")
+assert_absent "r5 prod DB URL is NOT a container-level env entry (it arrives via the Secret)" "$envblk" "name: FISHHAWKD_DATABASE_URL"
 render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
 assert_contains "r5 local chartManaged Secret still carries the DB URL key" "$out" "FISHHAWKD_DATABASE_URL"
 # The requiredness predicate itself: with postgres.enabled the DB URL is NOT
@@ -483,7 +583,21 @@ assert_contains "r9 NOTES lists the cell model API key for a cell profile" "$env
 # be OMITTED rather than listed — this is the derived-not-fixed discriminator.
 assert_absent "r9 NOTES omits a NOT-required key (derived, not a fixed list)" "$envblock" "AWS_ACCESS_KEY_ID"
 assert_contains "r9 NOTES states the existing-mode render-time limit" "$out" "CANNOT see a pre-created Secret"
-assert_contains "r9 NOTES gives the kubectl key-confirmation one-liner" "$out" "get secret fishhawk-secrets -o jsonpath="
+# The key-confirmation command must inspect key NAMES without emitting VALUES.
+# `describe` prints "<key>: N bytes"; `-o jsonpath={.data}` / `-o yaml` / `-o
+# json` would dump every base64-encoded credential to the terminal and to any
+# log capturing it. The value-disclosure assertion is scoped to the RUNNABLE
+# kubectl lines, not the whole NOTES text, because the surrounding prose names
+# the unsafe flags in order to warn against them.
+assert_contains "r9 NOTES gives a key-name-only kubectl confirmation command" "$out" \
+  "describe secret fishhawk-secrets"
+kubectl_cmds=$(printf '%s' "$out" | grep -E '^[[:space:]]+kubectl ' || true)
+if [ -n "$kubectl_cmds" ]; then pass "r9 NOTES carries at least one runnable kubectl command"; else
+  fail "r9 NOTES carries no runnable kubectl command line to check"
+fi
+for unsafe in "jsonpath" "-o yaml" "-o json"; do
+  assert_absent "r9 NOTES kubectl commands never print Secret VALUES ($unsafe)" "$kubectl_cmds" "$unsafe"
+done
 assert_contains "r9 NOTES prints the cell region" "$out" "FISHHAWKD_HOME_REGION   = us"
 # The PEM's dotted key is listed as a FILE key, never among the env keys.
 assert_contains "r9 NOTES lists the PEM as a file key" "$out" "github-app-private-key.pem"

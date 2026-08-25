@@ -305,9 +305,17 @@ real wall-clock time-to-Failed can exceed it. Nothing in this chart
 asserts the figure is correct: `fishhawk.validateMigrateTiming` only
 ever compares a **set** `migrate.activeDeadlineSeconds` AGAINST the
 derived figure, failing the render when the deadline would win the race
-(and naming both numbers). The live drill below records the OBSERVED
-time-to-Failed and Helm's actual error text — that is what turns this
-model into evidence.
+(and naming both numbers). Because the figure is a lower bound, the
+comparison is `<=`, not `<`: a deadline set to EXACTLY 210 fires at the
+modelled moment the Job is marked Failed and so loses the race whenever
+the model is not exact — the boundary is rejected on purpose, and
+`scripts/test-helm-render` r4 pins `=210` as a REJECTED input alongside
+`60` (far below) and `600` (far above). `null` and `0` both mean unset:
+0 is not a meaningful ceiling (the Job controller's validation on the
+field is exclusive-minimum 0), so the chart emits no field for it and
+the guard has nothing to compare. The live drill below records the
+OBSERVED time-to-Failed and Helm's actual error text — that is what
+turns this model into evidence.
 
 `migrate.activeDeadlineSeconds` defaults to **unset**. A deadline
 generous enough for a slow but legitimate migration cannot also be
@@ -524,8 +532,10 @@ helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-singl
 helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-cell.yaml           # ADR-057 Mode 2
 # confirm the credential contract fails a missing required key:
 helm template fishhawk deploy/helm/fishhawk --set secrets.mode=existing --set existingSecret=
-# confirm the migrate timing guard rejects a deadline that would win the race:
+# confirm the migrate timing guard rejects a deadline that would win the race,
+# including the boundary case equal to the derived (lower-bound) figure:
 helm template fishhawk deploy/helm/fishhawk --set migrate.activeDeadlineSeconds=60
+helm template fishhawk deploy/helm/fishhawk --set migrate.activeDeadlineSeconds=210
 # split topology (two Deployments):
 helm template fishhawk deploy/helm/fishhawk --set deployment.mode=split --set workers.slaTimer=true
 # confirm the allInOne topology guard fails:

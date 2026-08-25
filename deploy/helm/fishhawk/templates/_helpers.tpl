@@ -400,7 +400,15 @@ A `lookup`-based presence check is deliberately NOT used — see the chart READM
 {{- $spec := fromYamlArray (include "fishhawk.secretKeySpec" .) -}}
 {{- $mode := .Values.secrets.mode -}}
 {{- if eq $mode "chartManaged" -}}
-{{- $values := .Values.secrets.values -}}
+{{- /* `| default dict` is load-bearing, not defensive noise: an operator who
+       overrides the whole map (`--set secrets.values=null`, or a values file
+       carrying `values:` with nothing under it) hands us an UNTYPED NIL, and
+       `index` on that raises `error calling index: index of untyped nil` —
+       an opaque Go-template trace instead of the named, actionable message
+       below. Substituting an empty dict makes every lookup miss, so the
+       operator gets the same "requires a non-empty secrets.values.X" failure
+       an absent single field produces. */ -}}
+{{- $values := .Values.secrets.values | default dict -}}
 {{- range $spec -}}
 {{- if .required -}}
 {{- $supplied := index $values .valuesField -}}
@@ -450,6 +458,12 @@ live drill in the chart README records the observed time-to-Failed.
 */}}
 {{- define "fishhawk.validateMigrateTiming" -}}
 {{- $deadline := .Values.migrate.activeDeadlineSeconds -}}
+{{- /* `if $deadline` is falsey for null AND for 0, and both are treated as
+       UNSET on purpose: activeDeadlineSeconds=0 is not a meaningful ceiling
+       (the Kubernetes Job controller rejects it — the field's validation is
+       exclusive-minimum 0), so there is nothing to race the failure path and
+       nothing to guard. The Job template applies the same `if`, so 0 emits no
+       activeDeadlineSeconds field at all rather than an invalid one. */ -}}
 {{- if $deadline -}}
 {{- $n := int .Values.migrate.backoffLimit -}}
 {{- $backoff := 0 -}}
@@ -459,8 +473,15 @@ live drill in the chart README records the observed time-to-Failed.
 {{- $delay = mul $delay 2 -}}
 {{- end -}}
 {{- $timeToFail := add (mul (add $n 1) (int .Values.migrate.assumedAttemptSeconds)) $backoff -}}
-{{- if lt (int $deadline) (int $timeToFail) -}}
-{{- fail (printf "migrate.activeDeadlineSeconds=%d would fire BEFORE the Job controller can mark the migration Failed (derived time-to-Failed %ds from backoffLimit=%d and assumedAttemptSeconds=%d), so Helm would report DeadlineExceeded and hide the migration error. Raise the deadline above %ds, lower migrate.backoffLimit/assumedAttemptSeconds, or leave activeDeadlineSeconds unset (the default)." (int $deadline) (int $timeToFail) $n (int .Values.migrate.assumedAttemptSeconds) (int $timeToFail)) -}}
+{{- /* `le`, not `lt`: the comparison is against a LOWER BOUND, so a deadline
+       EQUAL to the derived figure is already a loss, not a tie. At exactly
+       timeToFail the deadline fires at the modelled moment the Job would be
+       marked Failed, and the real wall time is >= the model — so the race is
+       lost whenever the model is not exact, which is the normal case. The
+       boundary is a decided behaviour (r4 pins =timeToFail as REJECTED), not
+       an accident of which comparison operator was reached for. */ -}}
+{{- if le (int $deadline) (int $timeToFail) -}}
+{{- fail (printf "migrate.activeDeadlineSeconds=%d would fire AT OR BEFORE the moment the Job controller can mark the migration Failed (derived time-to-Failed %ds from backoffLimit=%d and assumedAttemptSeconds=%d, a LOWER bound), so Helm would report DeadlineExceeded and hide the migration error. Raise the deadline above %ds, lower migrate.backoffLimit/assumedAttemptSeconds, or leave activeDeadlineSeconds unset (the default)." (int $deadline) (int $timeToFail) $n (int .Values.migrate.assumedAttemptSeconds) (int $timeToFail)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

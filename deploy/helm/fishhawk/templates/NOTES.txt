@@ -43,9 +43,13 @@ rather than listed as optional noise.
   start the pod on a missing key{{ end }}). A `lookup`-based render-time check is
   deliberately NOT used: under `helm template` with no cluster, lookup returns
   an EMPTY map, so such a guard would fail every dry-run render. Confirm the
-  keys yourself before installing:
+  keys yourself before installing — `describe` prints each key NAME and its byte
+  count and never the value, so this is safe to run in a shared terminal or a CI
+  log. Do NOT reach for `-o jsonpath='{.data}'` / `-o yaml` here: those print the
+  base64-encoded VALUE of every credential in the Secret, which is a disclosure,
+  not a key listing.
 
-    kubectl -n {{ .Release.Namespace }} get secret {{ include "fishhawk.secretName" . }} -o jsonpath='{.data}' | tr ',' '\n'
+    kubectl -n {{ .Release.Namespace }} describe secret {{ include "fishhawk.secretName" . }}
 {{- end }}
 {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
 
