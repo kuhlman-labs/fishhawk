@@ -44,11 +44,13 @@ failure instead of a silent reordering.
 
 Several Operating and Reference pages ship as **stubs** by design (#2261
 acceptance criterion 3). Each carries real frontmatter and an orientation
-paragraph naming the child issue that fills it — [E12.2
-(#2262)](https://github.com/kuhlman-labs/fishhawk/issues/2262), [E12.3
+paragraph naming the child issue that fills it — [E12.3
 (#2263)](https://github.com/kuhlman-labs/fishhawk/issues/2263), [E12.4
 (#2264)](https://github.com/kuhlman-labs/fishhawk/issues/2264) — so the site is
-honest about its state rather than blank.
+honest about its state rather than blank. `start/first-run.md` is no longer
+among them: [E12.2
+(#2262)](https://github.com/kuhlman-labs/fishhawk/issues/2262) replaced that
+stub with the full install-to-merge walkthrough.
 
 ## Versioning and spec majors, in one line
 
