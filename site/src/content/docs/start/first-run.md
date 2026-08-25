@@ -141,7 +141,25 @@ drift.
 What your decision actually turns on: that document describes three modes, and
 a backend on `localhost` puts you in **Mode B — App with OAuth, no webhooks**.
 Register the App, uncheck the webhook's **Active** box, enable **Device Flow**,
-and drop the credentials into `.env`. Mode B gives you UI sign-in and
+and put the credentials in the `.env` at the root of the clone (`cp .env.example
+.env` first if you skipped that above). These are the variables that carry them
+— the App and OAuth blocks of `.env.example`, uncommented:
+
+```sh
+FISHHAWKD_GITHUB_APP_ID=123456
+FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE=/abs/path/fishhawk-app.private-key.pem
+FISHHAWKD_GITHUB_WEBHOOK_SECRET=whatever-you-set
+FISHHAWKD_OAUTH_CLIENT_ID=Iv1.xxxx
+FISHHAWKD_OAUTH_CLIENT_SECRET=xxxx
+FISHHAWKD_OAUTH_CALLBACK_URL=http://localhost:8080/v0/auth/github/callback
+```
+
+The Makefile includes and exports `.env`, so restart `make dev-backend` to pick
+these up. `FISHHAWKD_GITHUB_WEBHOOK_SECRET` only gates `POST /webhooks/github`,
+which Mode B never receives; leaving it unset costs you a startup warning and a
+503 on that route, both expected here.
+
+Mode B gives you UI sign-in and
 CLI-driven run dispatch; it does *not* deliver GitHub events to your backend.
 That is the mode this guide's CLI-driven path is written for — you drive each
 gate by hand instead of waiting for a webhook to advance the run.
