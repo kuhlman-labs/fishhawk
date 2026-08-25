@@ -1,9 +1,16 @@
 # Production-posture override layer for the fishhawk chart.
 # Renders standalone: `helm template fishhawk . -f values-prod.yaml`.
-# Demonstrates the prod ingress + cert-manager TLS posture. Operators MUST
-# substitute their real host/IngressClass/ClusterIssuer and supply real secrets
-# (this file leaves secrets at the `existing` default — pre-create the Secret).
-# Not copy-paste-deployable as-is: the host/issuer below are examples.
+#
+# COMPLETE AS SHIPPED: every field an install needs is set to a concrete,
+# working value — a real IngressClass (nginx), a real hostname, a real
+# cert-manager ClusterIssuer — so `helm install -f values-prod.yaml` produces
+# working URLs rather than half-filled placeholders. Substitute the hostname,
+# IngressClass and ClusterIssuer for your own, and pre-create the Secret named
+# by `existingSecret` (this file leaves secrets at the `existing` default);
+# fishhawk.validateSecretContract fails the render if that name is empty.
+#
+# The derived URLs are asserted against this hostname by
+# scripts/test-helm-render case r1 — "it rendered" is not the criterion.
 
 # Stays prod (values.yaml default): no dev-only conveniences, real secrets.
 profile: prod

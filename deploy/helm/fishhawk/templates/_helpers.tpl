@@ -280,3 +280,208 @@ volumes:
           path: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Credential contract — the ONE source of truth for every key the chart expects in
+the Secret (E62.2 / #2301). Emits a YAML list of records, one per credential,
+keyed by SECRET KEY (the key in the Secret's `data`), NOT by rendered env key:
+the GitHub App PEM is not an env key at all (envFrom skips its dotted name), so
+an env-keyed map had no home for it and silently omitted it from validation.
+
+Each record is a dict serialized by `toYaml`, never hand-written YAML text, so a
+dynamic, dotted or dash-bearing secretKey (the PEM's) round-trips through
+`fromYamlArray` as a well-formed string instead of parsing oddly:
+
+  secretKey    — the key in the Secret's data/stringData
+  valuesField  — the field under .Values.secrets.values that supplies it in
+                 chartManaged mode
+  envDelivered — true when envFrom projects it as an environment variable;
+                 false for the PEM, which reaches the pod only as a file
+  required     — DERIVED from other values, not hardcoded: a blanket "always
+                 required" would break the local profile (in-cluster Postgres
+                 supplies FISHHAWKD_DATABASE_URL via a container-level env entry
+                 that overrides envFrom) and any deploy with no S3 bucket or no
+                 GitHub App.
+
+Consumers: secret.yaml (renders it), fishhawk.requiredSecretKeys (filters it),
+fishhawk.validateSecretContract (validates against it), NOTES.txt (prints it).
+*/}}
+{{- define "fishhawk.secretKeySpec" -}}
+{{- $v := .Values -}}
+{{- $records := list -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_DATABASE_URL"
+      "valuesField" "databaseUrl"
+      "envDelivered" true
+      "required" (not $v.postgres.enabled)) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_GITHUB_WEBHOOK_SECRET"
+      "valuesField" "githubWebhookSecret"
+      "envDelivered" true
+      "required" true) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_OAUTH_CLIENT_SECRET"
+      "valuesField" "oauthClientSecret"
+      "envDelivered" true
+      "required" true) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_ANTHROPIC_API_KEY"
+      "valuesField" "anthropicApiKey"
+      "envDelivered" true
+      "required" true) -}}
+{{- $records = append $records (dict
+      "secretKey" "AWS_ACCESS_KEY_ID"
+      "valuesField" "awsAccessKeyId"
+      "envDelivered" true
+      "required" (ne (toString $v.config.s3Bucket) "")) -}}
+{{- $records = append $records (dict
+      "secretKey" "AWS_SECRET_ACCESS_KEY"
+      "valuesField" "awsSecretAccessKey"
+      "envDelivered" true
+      "required" (ne (toString $v.config.s3Bucket) "")) -}}
+{{- $records = append $records (dict
+      "secretKey" (toString $v.secrets.githubApp.privateKeyFile.secretKey)
+      "valuesField" "githubAppPrivateKey"
+      "envDelivered" false
+      "required" $v.secrets.githubApp.privateKeyFile.enabled) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_HANDOFF_SECRET"
+      "valuesField" "handoffSecret"
+      "envDelivered" true
+      "required" (ne (toString $v.cell.homeRegion) "")) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_MODEL_API_KEY"
+      "valuesField" "modelApiKey"
+      "envDelivered" true
+      "required" (ne (toString $v.cell.modelBaseUrl) "")) -}}
+{{- toYaml $records -}}
+{{- end -}}
+
+{{/*
+The required subset of fishhawk.secretKeySpec, as a YAML list of secret keys.
+Derived from the spec — never a second authored list. Consumed by
+fishhawk.validateSecretContract and NOTES.txt.
+*/}}
+{{- define "fishhawk.requiredSecretKeys" -}}
+{{- $keys := list -}}
+{{- range fromYamlArray (include "fishhawk.secretKeySpec" .) -}}
+{{- if .required -}}{{- $keys = append $keys .secretKey -}}{{- end -}}
+{{- end -}}
+{{- toYaml $keys -}}
+{{- end -}}
+
+{{/*
+Credential-contract guard (E62.2 / #2301). `include`d once from service.yaml —
+the only template that renders in EVERY topology mode, and which already hosts
+fishhawk.validateMode for exactly that reason. deployment.yaml does not render in
+split mode and secret.yaml does not render outside chartManaged, so neither can
+host it.
+
+What it can check is MODE-DEPENDENT, and the criterion says so rather than
+quietly doing less:
+  chartManaged    — the values ARE visible, so each required record's
+                    secrets.values field must be present AND non-empty (an empty
+                    string fails, naming both the secret key and the values
+                    field).
+  externalSecrets — the chart sees only the DECLARED data[] mapping, so each
+                    required secretKey must appear in it. Whether the backing
+                    store actually holds that remote ref is not observable at
+                    render time (the chart does not install the ESO CRDs).
+  existing        — the chart can see NOTHING about a pre-created Secret's
+                    contents at render time, so the only render-time check is
+                    that existingSecret is non-empty. Key presence is enforced by
+                    Kubernetes at pod start (envFrom secretRef is non-optional,
+                    and the PEM items: projection refuses to start the pod on a
+                    missing key); VALUE-level emptiness is a live-drill item.
+A `lookup`-based presence check is deliberately NOT used — see the chart README's
+"Why `existing` mode has no render-time key check".
+*/}}
+{{- define "fishhawk.validateSecretContract" -}}
+{{- $spec := fromYamlArray (include "fishhawk.secretKeySpec" .) -}}
+{{- $mode := .Values.secrets.mode -}}
+{{- if eq $mode "chartManaged" -}}
+{{- /* `| default dict` is load-bearing, not defensive noise: an operator who
+       overrides the whole map (`--set secrets.values=null`, or a values file
+       carrying `values:` with nothing under it) hands us an UNTYPED NIL, and
+       `index` on that raises `error calling index: index of untyped nil` —
+       an opaque Go-template trace instead of the named, actionable message
+       below. Substituting an empty dict makes every lookup miss, so the
+       operator gets the same "requires a non-empty secrets.values.X" failure
+       an absent single field produces. */ -}}
+{{- $values := .Values.secrets.values | default dict -}}
+{{- range $spec -}}
+{{- if .required -}}
+{{- $supplied := index $values .valuesField -}}
+{{- if not $supplied -}}
+{{- fail (printf "secrets.mode=chartManaged requires a non-empty secrets.values.%s (it supplies the Secret key %q, which this configuration needs). It is absent or an empty string." .valuesField .secretKey) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $mode "externalSecrets" -}}
+{{- $declared := list -}}
+{{- range .Values.secrets.externalSecrets.data -}}
+{{- $declared = append $declared (toString .secretKey) -}}
+{{- end -}}
+{{- range $spec -}}
+{{- if .required -}}
+{{- if not (has .secretKey $declared) -}}
+{{- fail (printf "secrets.mode=externalSecrets does not map the required Secret key %q: add it to secrets.externalSecrets.data[] with its remoteRef. Declared keys: %v" .secretKey $declared) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $mode "existing" -}}
+{{- if not .Values.existingSecret -}}
+{{- fail "secrets.mode=existing requires existingSecret to name the pre-created Secret carrying the sensitive FISHHAWKD_* keys; it is empty." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Migrate-Job timing guard (E62.2 / #2301). `include`d once from migrate-job.yaml.
+Inert unless migrate.activeDeadlineSeconds is SET; when it is, it recomputes
+time-to-Failed from the SAME derivation values.yaml records and `fail`s when the
+deadline would win the race — because a fired activeDeadlineSeconds reports
+DeadlineExceeded and HIDES the migration error the failure path exists to
+surface. Derived, never asserted:
+
+  attempts   = backoffLimit + 1   (the Job controller marks Failed with reason
+               BackoffLimitExceeded when status.failed EXCEEDS backoffLimit)
+  backoff    = the 10s-doubling inter-attempt series (10,20,40,…, capped at
+               6 minutes) summed over backoffLimit terms
+  timeToFail = attempts * migrate.assumedAttemptSeconds + backoff
+
+timeToFail is a MODEL OUTPUT and a LOWER BOUND, not an observed number: the
+Kubernetes backoff series resets when no new failed pods appear, so the real
+wall time can exceed it. This guard therefore only ever compares a SET deadline
+AGAINST the derived figure; it never asserts the figure itself is correct. The
+live drill in the chart README records the observed time-to-Failed.
+*/}}
+{{- define "fishhawk.validateMigrateTiming" -}}
+{{- $deadline := .Values.migrate.activeDeadlineSeconds -}}
+{{- /* `if $deadline` is falsey for null AND for 0, and both are treated as
+       UNSET on purpose: activeDeadlineSeconds=0 is not a meaningful ceiling
+       (the Kubernetes Job controller rejects it — the field's validation is
+       exclusive-minimum 0), so there is nothing to race the failure path and
+       nothing to guard. The Job template applies the same `if`, so 0 emits no
+       activeDeadlineSeconds field at all rather than an invalid one. */ -}}
+{{- if $deadline -}}
+{{- $n := int .Values.migrate.backoffLimit -}}
+{{- $backoff := 0 -}}
+{{- $delay := 10 -}}
+{{- range until $n -}}
+{{- $backoff = add $backoff (min $delay 360) -}}
+{{- $delay = mul $delay 2 -}}
+{{- end -}}
+{{- $timeToFail := add (mul (add $n 1) (int .Values.migrate.assumedAttemptSeconds)) $backoff -}}
+{{- /* `le`, not `lt`: the comparison is against a LOWER BOUND, so a deadline
+       EQUAL to the derived figure is already a loss, not a tie. At exactly
+       timeToFail the deadline fires at the modelled moment the Job would be
+       marked Failed, and the real wall time is >= the model — so the race is
+       lost whenever the model is not exact, which is the normal case. The
+       boundary is a decided behaviour (r4 pins =timeToFail as REJECTED), not
+       an accident of which comparison operator was reached for. */ -}}
+{{- if le (int $deadline) (int $timeToFail) -}}
+{{- fail (printf "migrate.activeDeadlineSeconds=%d would fire AT OR BEFORE the moment the Job controller can mark the migration Failed (derived time-to-Failed %ds from backoffLimit=%d and assumedAttemptSeconds=%d, a LOWER bound), so Helm would report DeadlineExceeded and hide the migration error. Raise the deadline above %ds, lower migrate.backoffLimit/assumedAttemptSeconds, or leave activeDeadlineSeconds unset (the default)." (int $deadline) (int $timeToFail) $n (int .Values.migrate.assumedAttemptSeconds) (int $timeToFail)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

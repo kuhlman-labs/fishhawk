@@ -138,9 +138,50 @@ Kills the tracked port-forwards (fishhawkd pid in `.fishhawk/k8s-pf.pid`, Jaeger
 pid in `.fishhawk/k8s-jaeger-pf.pid`) and runs `helm uninstall fishhawk`. All
 steps are idempotent, so a double teardown is a no-op.
 
+## When the migration hook fails
+
+The chart's `pre-install`/`pre-upgrade` migrate Job is what stops serve starting
+against an unmigrated database, so its FAILURE path is the one worth knowing.
+
+- **`restartPolicy: Never`** (not `OnFailure`). Each attempt leaves a distinct
+  `Failed` pod whose logs persist, and the `hook-delete-policy`
+  (`before-hook-creation,hook-succeeded` — deliberately no `hook-failed`)
+  retains the Job to reach them:
+
+  ```sh
+  kubectl logs job/<release>-migrate            # the SQL error, verbatim
+  kubectl get pods -l app.kubernetes.io/component=migrate
+  ```
+
+- **The release does not go green.** Helm reports the hook failure and the
+  fishhawkd Deployment is not created (external-DB baseline) or does not begin
+  serving a migrated schema.
+- **No half-migrated schema.** A migration whose first statement succeeds and
+  whose second fails leaves NEITHER object behind — the pgx5 driver runs the
+  file in an implicit transaction. Confirm with
+  `SELECT to_regclass('<the table the failed migration would have created>')`,
+  which returns NULL. golang-migrate additionally marks the version dirty, so a
+  re-run REFUSES rather than proceeding; the refusal names the dirty version and
+  the `force` recovery step.
+- **Timing.** The Job gives up after `migrate.backoffLimit + 1` attempts. The
+  derived time-to-Failed (210s at the shipped defaults) is a MODEL OUTPUT and a
+  lower bound, sized to land inside Helm's 300s default `--timeout` so you see
+  the migration error rather than a Helm timeout. `migrate.activeDeadlineSeconds`
+  is unset by default on purpose — a fired deadline reports `DeadlineExceeded`
+  and hides the migration error. Full derivation:
+  [the chart README](../../deploy/helm/fishhawk/README.md).
+
+## Chart render gate
+
+`scripts/test-helm-render` drives the chart through `helm template` / `helm lint`
+and asserts on rendered output — the credential-contract failure modes, the
+migrate Job's timing and `restartPolicy`, the `envFrom` wiring, the derived
+ingress URLs, and a render + lint of every profile. It runs inside
+`scripts/test verify` and skips (exit 0, printed reason) when `helm` is absent.
+
 ## values-local vs values-prod
 
-The chart ships two worked override files (see the chart row in
+The chart ships four worked override files (see the chart row in
 [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §10 for the full template surface):
 
 | | `values-local.yaml` | `values-prod.yaml` |
@@ -150,6 +191,12 @@ The chart ships two worked override files (see the chart row in
 | Jaeger (tracing) | in-cluster (`jaeger.enabled`) | off (dev-only) |
 | Secrets | `chartManaged` dev Secret with placeholders | `existing` / `externalSecrets` |
 | Ingress / TLS | off (port-forward / NodePort) | Ingress + cert-manager TLS on |
+
+Two more ship alongside them, both complete as written (real IngressClass, real
+hostname, real ClusterIssuer — substitute your own and pre-create the Secret):
+`values-single-tenant.yaml` (ADR-057 Mode 1 — see
+[self-hosted.md](self-hosted.md)) and `values-cell.yaml` (ADR-057 Mode 2 /
+ADR-062 — see [hosted-regional.md](hosted-regional.md)).
 
 The `profile: local` signal is what lets `fishhawk.validateSecrets` permit the
 chart-managed Secret, the default in-cluster DB/MinIO credentials, and the

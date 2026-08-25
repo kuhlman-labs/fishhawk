@@ -1,0 +1,57 @@
+# Single-tenant (self-hosted) override layer for the fishhawk chart — ADR-057
+# Mode 1: ONE customer, their own perimeter, one implicit account bootstrapped
+# at startup so every member of that enterprise auto-joins at sign-in. Renders
+# standalone:
+#   helm template fishhawk . -f values-single-tenant.yaml
+#
+# COPY-PASTE POSTURE, NOT A DROP-IN: substitute the host, IngressClass,
+# ClusterIssuer and account key below, and pre-create the Secret named by
+# existingSecret. Operator guide: docs/deploy/self-hosted.md.
+
+profile: prod
+
+image:
+  tag: ""
+
+# Public ingress + cert-manager TLS. config.externalUrl / oauthCallbackUrl are
+# left empty so they DERIVE from ingress.host (https, since tls is on):
+#   FISHHAWKD_EXTERNAL_URL       = https://fishhawk.acme.example
+#   FISHHAWKD_OAUTH_CALLBACK_URL = https://fishhawk.acme.example/v0/auth/github/callback
+ingress:
+  enabled: true
+  className: nginx
+  host: fishhawk.acme.example
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+
+config:
+  externalUrl: ""
+  oauthCallbackUrl: ""
+
+# accountKey ALONE is the enablement signal. The chart renders each key it is
+# given VERBATIM and does not default an empty one — so a half-configured
+# profile (granularity/provider set, accountKey empty) reaches fishhawkd exactly
+# as authored and fishhawkd REFUSES to start, naming the missing key, rather
+# than degrading to hosted multi-tenant. That fail-closed posture surviving
+# templating is asserted by scripts/test-helm-render case r8.
+singleTenant:
+  accountKey: acme-corp
+  granularity: enterprise
+  autoJoinRole: member
+  displayName: Acme Corp
+  provider: github
+
+# GHES / EMU endpoint overrides that usually accompany Mode 1. Delete this block
+# for a github.com-backed single-tenant install.
+# config:
+#   githubApiUrl: https://ghes.acme.example/api/v3
+#   githubUploadUrl: https://ghes.acme.example/api/uploads
+#   oauthAuthorizeUrl: https://ghes.acme.example/login/oauth/authorize
+#   oauthTokenUrl: https://ghes.acme.example/login/oauth/access_token
+#   oauthUserUrl: https://ghes.acme.example/api/v3/user
+#   oauthOrgsUrl: https://ghes.acme.example/api/v3/user/orgs
+
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets

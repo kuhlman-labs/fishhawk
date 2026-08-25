@@ -20,15 +20,37 @@ Secret name: {{ include "fishhawk.secretName" . }}
 {{- if or (eq .Values.secrets.mode "existing") (eq .Values.secrets.mode "externalSecrets") }}
 
 The Secret "{{ include "fishhawk.secretName" . }}" must provide these keys
-({{ if eq .Values.secrets.mode "existing" }}pre-create it{{ else }}map them in the backing SecretStore{{ end }}):
+({{ if eq .Values.secrets.mode "existing" }}pre-create it{{ else }}map them in the backing SecretStore{{ end }}).
+This list is derived from fishhawk.secretKeySpec — the same contract
+fishhawk.validateSecretContract checks — so it cannot drift from the render. It
+is the REQUIRED set for THIS configuration: a key whose enabling condition is
+off (the cell credentials without cell.*, the AWS pair without config.s3Bucket,
+the DB URL with in-cluster postgres) is genuinely not needed and is omitted
+rather than listed as optional noise.
 
   Env keys (delivered via envFrom):
-    - FISHHAWKD_DATABASE_URL
-    - FISHHAWKD_GITHUB_WEBHOOK_SECRET
-    - FISHHAWKD_OAUTH_CLIENT_SECRET
-    - FISHHAWKD_ANTHROPIC_API_KEY
-    - AWS_ACCESS_KEY_ID
-    - AWS_SECRET_ACCESS_KEY
+{{- $required := fromYamlArray (include "fishhawk.requiredSecretKeys" .) }}
+{{- range fromYamlArray (include "fishhawk.secretKeySpec" .) }}
+{{- if and .envDelivered (has .secretKey $required) }}
+    - {{ .secretKey }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.secrets.mode "existing" }}
+
+  The chart CANNOT see a pre-created Secret's contents at render time, so it
+  does not check these keys — Kubernetes enforces them when the pod starts
+  (envFrom secretRef is non-optional{{ if .Values.secrets.githubApp.privateKeyFile.enabled }}, and the PEM items: projection refuses to
+  start the pod on a missing key{{ end }}). A `lookup`-based render-time check is
+  deliberately NOT used: under `helm template` with no cluster, lookup returns
+  an EMPTY map, so such a guard would fail every dry-run render. Confirm the
+  keys yourself before installing — `describe` prints each key NAME and its byte
+  count and never the value, so this is safe to run in a shared terminal or a CI
+  log. Do NOT reach for `-o jsonpath='{.data}'` / `-o yaml` here: those print the
+  base64-encoded VALUE of every credential in the Secret, which is a disclosure,
+  not a key listing.
+
+    kubectl -n {{ .Release.Namespace }} describe secret {{ include "fishhawk.secretName" . }}
+{{- end }}
 {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
 
   File key (mounted at {{ .Values.secrets.githubApp.privateKeyFile.mountPath }}, NOT an env var):
@@ -56,6 +78,20 @@ Ingress is enabled for host: {{ .Values.ingress.host }}
        cert-manager — NOT this chart — provisions that Secret from the
        {{ if .Values.ingress.tls.clusterIssuer }}ClusterIssuer "{{ .Values.ingress.tls.clusterIssuer }}"{{ else }}cluster-issuer annotation{{ end }}.
        The ClusterIssuer + cert-manager must already be installed in the cluster.
+{{- end }}
+{{- end }}
+
+{{- if or .Values.cell.homeRegion .Values.cell.modelBaseUrl }}
+
+Regional cell (ADR-062):
+{{- with .Values.cell.homeRegion }}
+  FISHHAWKD_HOME_REGION   = {{ . }}   (region-pin surface ENABLED; the Secret
+                            must carry FISHHAWKD_HANDOFF_SECRET, equal to the
+                            directory's FISHHAWK_DIRECTORY_HANDOFF_SECRET)
+{{- end }}
+{{- with .Values.cell.modelBaseUrl }}
+  FISHHAWKD_MODEL_BASE_URL = {{ . }}   (in-region inference; the Secret must
+                            carry FISHHAWKD_MODEL_API_KEY)
 {{- end }}
 {{- end }}
 

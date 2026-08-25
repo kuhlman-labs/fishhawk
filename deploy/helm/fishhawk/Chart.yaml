@@ -2,12 +2,15 @@ apiVersion: v2
 name: fishhawk
 description: >-
   Fishhawk control plane (fishhawkd) — the ADR-034 Kubernetes-deploy keystone
-  chart. Ships the fishhawkd Deployment + Service + non-secret ConfigMap; the
-  Secret object, in-cluster Postgres/MinIO, migrations Job, and Ingress + TLS
-  (cert-manager) ship here; the worker-singleton is owned by follow-up #851.
+  chart. Ships the fishhawkd Deployment(s) + Service + non-secret ConfigMap, the
+  Secret object across three provisioning modes behind one credential contract,
+  Ingress + cert-manager TLS, the DB-migration hook Job, and optional in-cluster
+  Postgres/MinIO/Jaeger for local development. Render-time guards reject a
+  configuration that would fail later at pod start; worked production postures
+  ship as values-prod / values-cell / values-single-tenant.
 type: application
 # Chart version: bump on chart-template changes.
-version: 0.1.0
+version: 0.2.0
 # appVersion tracks the fishhawkd image tag shipped by backend-release.yml.
 # Defaults to the `main` rolling tag (matches infra/terraform image_tag default);
 # override per-release via image.tag in values.yaml.

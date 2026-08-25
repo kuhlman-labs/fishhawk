@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4/database"
@@ -5039,6 +5040,159 @@ func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T
 		}
 		if got != 1 {
 			t.Errorf("%q table count after MigrateDown = %d, want 1 (0074 is an ALTER)", table, got)
+		}
+	}
+}
+
+// --- Committed-state migration-failure tests (E62.2 / #2301) ---------------
+//
+// These drive the REAL migration path (postgres.MigrateUpFS) against a
+// SYNTHETIC migration set, so the failure they characterise is deliberate and
+// reproducible rather than dependent on a broken committed migration. They use
+// startContainer above — the AGENTS.md-recorded exemption to the shared pgtest
+// container — because they need a RAW, un-migrated database: pgtest.NewURL
+// hands back a database the committed migrations have already been applied to,
+// against which a synthetic version-1 migration set is meaningless.
+
+// partialMigrationFS is the deciding fixture: migration 1 is valid and applies
+// cleanly; migration 2 PARTIALLY executes — its first statement is valid DDL
+// that would create a table, its second is invalid SQL. That distinction is the
+// point. "The migration was marked dirty and the next run refused" is a weaker
+// invariant than the one the deploy docs claim, because a migration can be
+// marked dirty having LEFT DDL BEHIND. What is asserted below is the SCHEMA
+// STATE after the failure returns.
+func partialMigrationFS() fstest.MapFS {
+	return fstest.MapFS{
+		"1_baseline.up.sql":   {Data: []byte("CREATE TABLE bc3_baseline (id integer PRIMARY KEY);")},
+		"1_baseline.down.sql": {Data: []byte("DROP TABLE IF EXISTS bc3_baseline;")},
+		// Statement 1 succeeds, statement 2 is a syntax error.
+		"2_partial.up.sql": {Data: []byte(
+			"CREATE TABLE bc3_partial (id integer PRIMARY KEY);\n" +
+				"CREATE TABLE bc3_never (id integer NOT A VALID COLUMN DEFINITION);\n")},
+		"2_partial.down.sql": {Data: []byte("DROP TABLE IF EXISTS bc3_partial; DROP TABLE IF EXISTS bc3_never;")},
+	}
+}
+
+func tableExists(t *testing.T, url, table string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := postgres.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = $1`, table,
+	).Scan(&n); err != nil {
+		t.Fatalf("query table %q: %v", table, err)
+	}
+	return n > 0
+}
+
+// TestMigrateUp_PartialMigrationLeavesNoSchemaBehind asserts the invariant the
+// deploy docs actually claim — no half-migrated schema — by reading COMMITTED
+// STATE after the call returns, not by matching an error string. A control that
+// fires and is then rolled back returns a byte-identical error, so error
+// identity could not discriminate here.
+func TestMigrateUp_PartialMigrationLeavesNoSchemaBehind(t *testing.T) {
+	url := startContainer(t)
+	mfs := partialMigrationFS()
+
+	err := postgres.MigrateUpFS(mfs, url)
+	if err == nil {
+		t.Fatal("expected MigrateUpFS to fail on the invalid second migration")
+	}
+
+	// Migration 1 committed: its object IS present. This is the discriminating
+	// half — without it, "bc3_partial absent" would also be satisfied by a
+	// migration path that applied nothing at all.
+	if !tableExists(t, url, "bc3_baseline") {
+		t.Error("migration 1's table bc3_baseline is absent; the failure was not scoped to migration 2")
+	}
+	// Migration 2 PARTIALLY executed. The object its FIRST statement created
+	// must not survive the failure of its second.
+	if tableExists(t, url, "bc3_partial") {
+		t.Error("migration 2's first statement left table bc3_partial behind after the migration failed: " +
+			"the schema IS half-migrated, contradicting the no-half-migrated-schema claim in docs/deploy/kubernetes.md")
+	}
+	if tableExists(t, url, "bc3_never") {
+		t.Error("migration 2's invalid second statement somehow created bc3_never")
+	}
+}
+
+// TestMigrateUp_FailingMigrationMarksDirtyAndRefusesSecondRun characterises
+// golang-migrate's dirty-flag behaviour and pins the consequence this change
+// depends on: a SECOND run refuses rather than proceeding over an unverified
+// schema. Stated honestly — the dirty flag is golang-migrate's, not this
+// package's, so this test is a CHARACTERISATION test and is NOT claimed as a
+// counterfactual vehicle for code in this repo.
+func TestMigrateUp_FailingMigrationMarksDirtyAndRefusesSecondRun(t *testing.T) {
+	url := startContainer(t)
+	mfs := partialMigrationFS()
+
+	if err := postgres.MigrateUpFS(mfs, url); err == nil {
+		t.Fatal("expected MigrateUpFS to fail on the invalid second migration")
+	}
+
+	// COMMITTED STATE, read after the call returned.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := postgres.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	var version int
+	var dirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty); err != nil {
+		pool.Close()
+		t.Fatalf("read schema_migrations: %v", err)
+	}
+	pool.Close()
+	if !dirty {
+		t.Errorf("schema_migrations.dirty = false after a failed migration; want true")
+	}
+	if version != 2 {
+		t.Errorf("schema_migrations.version = %d after the failed migration; want 2", version)
+	}
+
+	// The load-bearing assertion: a second run REFUSES. This is the code-layer
+	// form of "no green release over a broken schema".
+	second := postgres.MigrateUpFS(mfs, url)
+	if second == nil {
+		t.Fatal("second MigrateUpFS silently succeeded over a dirty, half-verified schema; want a refusal")
+	}
+	if !strings.Contains(second.Error(), "dirty") {
+		t.Errorf("second MigrateUpFS error does not report a dirty database: %v", second)
+	}
+}
+
+// TestMigrateUp_DirtyErrorNamesRecovery asserts the enrichment this package
+// OWNS: golang-migrate's bare "Dirty database version N. Fix and force
+// version." is replaced with a message naming the dirty version and the
+// recovery step. This is the counterfactual vehicle for enrichDirtyError —
+// deleting that enrichment leaves the bare text and this test goes red.
+func TestMigrateUp_DirtyErrorNamesRecovery(t *testing.T) {
+	url := startContainer(t)
+	mfs := partialMigrationFS()
+
+	if err := postgres.MigrateUpFS(mfs, url); err == nil {
+		t.Fatal("expected the first MigrateUpFS to fail")
+	}
+	err := postgres.MigrateUpFS(mfs, url)
+	if err == nil {
+		t.Fatal("expected the second MigrateUpFS to refuse against the dirty database")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"marked dirty at version 2",
+		"REFUSE",
+		"force 2",
+		"re-run migrate up",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("dirty error does not contain %q; got: %s", want, msg)
 		}
 	}
 }

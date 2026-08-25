@@ -68,6 +68,17 @@ data:
   {{- with .Values.config.oauthOrgsUrl }}
   FISHHAWKD_OAUTH_ORGS_URL: {{ . | quote }}
   {{- end }}
+  {{- /* Regional-cell NON-secret env (ADR-057 Mode 2 / ADR-062, E62.2 #2301).
+         The two SECRET halves (FISHHAWKD_HANDOFF_SECRET, FISHHAWKD_MODEL_API_KEY)
+         are records in fishhawk.secretKeySpec and arrive via the Secret, not
+         here. Unset keys stay unset: an empty homeRegion leaves the region-pin
+         surface disabled, an empty modelBaseUrl keeps the SDK default. */}}
+  {{- with .Values.cell.homeRegion }}
+  FISHHAWKD_HOME_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.cell.modelBaseUrl }}
+  FISHHAWKD_MODEL_BASE_URL: {{ . | quote }}
+  {{- end }}
   {{- /* Single-tenant profile (ADR-057 Mode 1, E44.9 / #1833). The account key
          alone enables it; the other keys render only when explicitly set, and
          fishhawkd REFUSES to start if one is set without the key. */}}
