@@ -38,4 +38,7 @@ bar.
 
 - [constraint](/fishhawk/concepts/constraint/) — the mechanical counterpart, which
   asks no one.
-- [Approvals](/fishhawk/operating/approvals/) — how to grant one in practice.
+- [Deciding at a gate](/fishhawk/operating/approvals/) — what each gate asks and
+  how to decide it in practice.
+- [Advisory reviews and disagreement](/fishhawk/operating/reviews/) — how the
+  advisory verdicts you read at a gate are produced and arbitrated.

@@ -58,7 +58,9 @@ export default defineConfig({
           items: [
             { slug: 'operating/driving-a-run' },
             { slug: 'operating/approvals' },
+            { slug: 'operating/reviews' },
             { slug: 'operating/when-a-run-fails' },
+            { slug: 'operating/autonomy' },
           ],
         },
         {

@@ -39,18 +39,20 @@ failure instead of a silent reordering.
 |---|---|
 | Start here | what Fishhawk is · what it is not · your first run |
 | Concepts | glossary · workflow · stage · gate · constraint · plan · audit log |
-| Operating | driving a run · approvals · when a run fails |
+| Operating | driving a run · deciding at a gate · advisory reviews · when a run fails · tuning autonomy |
 | Reference | landing + spec-major support table · workflow spec · plan schema · CLI · API · versioning |
 
-Several Operating and Reference pages ship as **stubs** by design (#2261
-acceptance criterion 3). Each carries real frontmatter and an orientation
-paragraph naming the child issue that fills it — [E12.3
-(#2263)](https://github.com/kuhlman-labs/fishhawk/issues/2263), [E12.4
+Several Reference pages ship as **stubs** by design (#2261 acceptance criterion
+3). Each carries real frontmatter and an orientation paragraph naming the child
+issue that fills it — [E12.4
 (#2264)](https://github.com/kuhlman-labs/fishhawk/issues/2264) — so the site is
-honest about its state rather than blank. `start/first-run.md` is no longer
-among them: [E12.2
-(#2262)](https://github.com/kuhlman-labs/fishhawk/issues/2262) replaced that
-stub with the full install-to-merge walkthrough.
+honest about its state rather than blank. The Operating section is no longer
+among them: [E12.3
+(#2263)](https://github.com/kuhlman-labs/fishhawk/issues/2263) replaced its three
+stubs with full pages and added advisory reviews and tuning autonomy, so all five
+Operating subjects are written. `start/first-run.md` was filled earlier by [E12.2
+(#2262)](https://github.com/kuhlman-labs/fishhawk/issues/2262) with the full
+install-to-merge walkthrough.
 
 ## Versioning and spec majors, in one line
 
