@@ -42,12 +42,19 @@ failure instead of a silent reordering.
 | Operating | driving a run · deciding at a gate · advisory reviews · when a run fails · tuning autonomy |
 | Reference | landing + spec-major support table · workflow spec · plan schema · CLI · API · versioning |
 
-Several Reference pages ship as **stubs** by design (#2261 acceptance criterion
-3). Each carries real frontmatter and an orientation paragraph naming the child
-issue that fills it — [E12.4
-(#2264)](https://github.com/kuhlman-labs/fishhawk/issues/2264) — so the site is
-honest about its state rather than blank. The Operating section is no longer
-among them: [E12.3
+The four Reference **surface** pages — workflow spec, plan schema, CLI, API — are
+no longer stubs: [E12.4
+(#2264)](https://github.com/kuhlman-labs/fishhawk/issues/2264) filled them with a
+field reference **generated** from the canonical sources. Each page keeps a
+hand-written orientation section and carries an `<!-- BEGIN/END GENERATED <id> -->`
+marker pair; the region between the markers is rendered by `cli/internal/docgen`
+from the workflow-spec/plan JSON Schemas, the OpenAPI document, and the
+`cli/internal/cmdinfo` command inventory, and is byte-exact. Regenerate with
+`scripts/gen-site-reference`; a Go drift test and `scripts/test-site-reference`
+fail if a generated region falls out of date, so a canonical-source change that
+skips the regenerate is caught in CI rather than shipping stale. No page is added
+to the sidebar (`astro.config.mjs`) — the four pages already existed as stubs, so
+the IA is unchanged. The Operating section is no longer among the stubs: [E12.3
 (#2263)](https://github.com/kuhlman-labs/fishhawk/issues/2263) replaced its three
 stubs with full pages and added advisory reviews and tuning autonomy, so all five
 Operating subjects are written. `start/first-run.md` was filled earlier by [E12.2

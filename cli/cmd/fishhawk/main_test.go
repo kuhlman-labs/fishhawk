@@ -2,11 +2,18 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/cmdinfo"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/version"
 )
@@ -1727,5 +1735,388 @@ func TestEnvOr(t *testing.T) {
 	t.Setenv("X_TEST_KEY", "explicit")
 	if got := envOr("X_TEST_KEY", "fallback"); got != "explicit" {
 		t.Errorf("got %q, want explicit", got)
+	}
+}
+
+// --- E12.4 / #2264: cmdinfo bound to the executable surface ---
+
+// flagLineRE matches a flag DEFINITION line in flag.PrintDefaults output.
+// PrintDefaults writes each flag as exactly "  -name…" (two spaces, dash)
+// and each usage continuation as "    \t…" (four spaces, tab). Anchoring
+// on the two-space-then-dash prefix therefore harvests flag names from the
+// flag package's own flag.VisitAll walk while being immune to a usage
+// string that begins with a newline (its content lands at column 0, which
+// the two-space anchor cannot match) — the fragility fs.VisitAll would
+// otherwise avoid, closed here by TestHarvestRobustToNewlineLeadingUsage.
+var flagLineRE = regexp.MustCompile(`(?m)^  -([A-Za-z0-9][A-Za-z0-9._-]*)`)
+
+// harvestFlags drives a command in-process with -h and returns the set of
+// flag names the flag package rendered — the LIVE registered flag set of
+// that command.
+func harvestFlags(t *testing.T, cmdKey string) map[string]bool {
+	t.Helper()
+	var buf strings.Builder
+	args := append(strings.Fields(cmdKey), "-h")
+	run(args, &buf, &buf)
+	out := map[string]bool{}
+	for _, m := range flagLineRE.FindAllStringSubmatch(buf.String(), -1) {
+		out[m[1]] = true
+	}
+	return out
+}
+
+func flagSet(names []string) map[string]bool {
+	m := map[string]bool{}
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+func commonPlus(extra ...string) []string {
+	return append([]string{"backend-url", "token", "timeout"}, extra...)
+}
+
+// TestCLIFlagsMatchExecutableSurface asserts SET EQUALITY, in BOTH
+// directions, between each cmdinfo command's declared flags and the flags
+// the binary actually registers for that command. A flag added to a
+// command without updating cmdinfo, or a cmdinfo flag that no longer
+// exists, reddens this.
+func TestCLIFlagsMatchExecutableSurface(t *testing.T) {
+	for _, c := range cmdinfo.Commands() {
+		c := c
+		t.Run(c.Key, func(t *testing.T) {
+			got := harvestFlags(t, c.Key)
+			want := flagSet(c.Flags)
+			for f := range want {
+				if !got[f] {
+					t.Errorf("%s: cmdinfo lists --%s but the binary does not register it", c.Key, f)
+				}
+			}
+			for f := range got {
+				if !want[f] {
+					t.Errorf("%s: the binary registers --%s but cmdinfo omits it", c.Key, f)
+				}
+			}
+		})
+	}
+}
+
+// TestZeroFlagCommandsInterceptHelp pins that the two commands whose
+// cmdinfo entry declares an EMPTY flag set — `token list` and `validate` —
+// nonetheless register a flag.FlagSet and Parse it BEFORE doing any work,
+// so the `-h` drive in harvestFlags (TestCLIFlagsMatchExecutableSurface) is
+// intercepted by the flag package (ErrHelp -> exitUsage, usage printed) and
+// never falls through to the command body. Without a FlagSet, `token list
+// -h` would execute the real credential-store listing during `go test` and
+// the empty harvest would be a vacuous fall-through, not a truthful reading
+// of an empty flag set.
+func TestZeroFlagCommandsInterceptHelp(t *testing.T) {
+	t.Run("token list", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		got := run([]string{"token", "list", "-h"}, &stdout, &stderr)
+		if got != exitUsage {
+			t.Fatalf("token list -h = %d, want exitUsage (the FlagSet must intercept -h before credstore.List)", got)
+		}
+		// The credential-store body writes its listing / placeholder to
+		// stdout; the -h interception must never reach it.
+		if strings.Contains(stdout.String(), "stored credentials") {
+			t.Errorf("token list -h reached the credential-store body:\nstdout=%q", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "token list") {
+			t.Errorf("token list -h printed no flag usage to stderr: %q", stderr.String())
+		}
+	})
+	t.Run("validate", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		got := run([]string{"validate", "-h"}, &stdout, &stderr)
+		if got != exitUsage {
+			t.Fatalf("validate -h = %d, want exitUsage", got)
+		}
+		// The custom Usage banner proves -h hit the FlagSet, not the
+		// path-argument fall-through (which would ReadFile the literal
+		// "-h" and report a file error instead).
+		if !strings.Contains(stderr.String(), "Usage: fishhawk validate") {
+			t.Errorf("validate -h did not print the FlagSet usage banner: %q", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "-h:") {
+			t.Errorf("validate -h fell through to the path-argument body: %q", stderr.String())
+		}
+	})
+}
+
+// usageOverrideFuncs parses every non-test .go file in the package and
+// returns, for each function that installs an `fs.Usage = func` override,
+// the NUMBER of override assignments it holds. It maps a site to its
+// ENCLOSING function rather than counting sites globally, so a moved
+// override (one pinned command's override relocated onto a different,
+// unpinned command — the count is unchanged) is visible as a set
+// difference, not swallowed by an equal total.
+func usageOverrideFuncs(t *testing.T) map[string]int {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	out := map[string]int{}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, lhs := range as.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "Usage" {
+						continue
+					}
+					if i >= len(as.Rhs) {
+						continue
+					}
+					if _, ok := as.Rhs[i].(*ast.FuncLit); !ok {
+						continue
+					}
+					out[fn.Name.Name]++
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
+
+// TestCustomUsageCommandsArePinned attributes each `fs.Usage = func`
+// override site to its ENCLOSING function via go/ast and asserts the SET of
+// override functions equals the set the pinned table expects — not merely
+// that the counts agree. Set equality closes the vacuity hole a bare count
+// leaves open: replacing one pinned command's override with an override on
+// a different, unpinned command keeps the count at 4 and the old test
+// green, letting that command's custom usage drop fs.PrintDefaults and
+// harvest empty against an empty cmdinfo entry. Per-command the harvest
+// must still equal the pinned flag set, so a dropped fs.PrintDefaults
+// reddens.
+func TestCustomUsageCommandsArePinned(t *testing.T) {
+	pinned := map[string][]string{
+		"validate":     {},
+		"migrate-spec": {"out", "in-place", "report-only"},
+		"token login":  commonPlus("provider", "client-id"),
+		"init":         commonPlus("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),
+	}
+	// Each pinned command names the function that installs its override.
+	// The ATTRIBUTED set of override functions must equal this value set.
+	pinnedFunc := map[string]string{
+		"validate":     "runValidate",
+		"migrate-spec": "runMigrateSpec",
+		"token login":  "tokenLogin",
+		"init":         "runInit",
+	}
+	wantFuncs := map[string]bool{}
+	for key := range pinned {
+		fn, ok := pinnedFunc[key]
+		if !ok {
+			t.Fatalf("pinned command %q has no expected override function in pinnedFunc", key)
+		}
+		wantFuncs[fn] = true
+	}
+
+	overrides := usageOverrideFuncs(t)
+	for fn, n := range overrides {
+		if !wantFuncs[fn] {
+			t.Errorf("function %s installs an fs.Usage override but is not pinned — add its command to the pinned table (a custom usage that omits fs.PrintDefaults produces a vacuous empty harvest)", fn)
+		}
+		if n > 1 {
+			t.Errorf("function %s installs %d fs.Usage overrides; expected exactly 1", fn, n)
+		}
+	}
+	for fn := range wantFuncs {
+		if _, ok := overrides[fn]; !ok {
+			t.Errorf("pinned override function %s installs no fs.Usage override in the package source — did the override move or get removed?", fn)
+		}
+	}
+
+	for key, flags := range pinned {
+		got := harvestFlags(t, key)
+		want := flagSet(flags)
+		for f := range want {
+			if !got[f] {
+				t.Errorf("%s: pinned flag --%s missing from harvest (custom usage dropped PrintDefaults?)", key, f)
+			}
+		}
+		for f := range got {
+			if !want[f] {
+				t.Errorf("%s: harvest has --%s not in the pinned table", key, f)
+			}
+		}
+	}
+}
+
+// TestInventoryCoversDispatch reads the SHARED production dispatch map and
+// cross-checks its keys against the cmdinfo inventory: every group name and
+// every standalone (spaceless) command key must be dispatched, and every
+// dispatch key must have cmdinfo coverage.
+func TestInventoryCoversDispatch(t *testing.T) {
+	expected := map[string]bool{}
+	for _, g := range cmdinfo.Groups() {
+		expected[g.Name] = true
+	}
+	for _, c := range cmdinfo.Commands() {
+		if !strings.Contains(c.Key, " ") {
+			expected[c.Key] = true
+		}
+	}
+	for k := range dispatch {
+		if !expected[k] {
+			t.Errorf("dispatch routes %q but cmdinfo has no group or command for it", k)
+		}
+	}
+	for k := range expected {
+		if _, ok := dispatch[k]; !ok {
+			t.Errorf("cmdinfo implies top-level command %q but the dispatch map omits it", k)
+		}
+	}
+}
+
+// TestGroupLeafCasesMatchInventory binds each group dispatcher's ACTUAL leaf
+// `case "sub":` set to the cmdinfo Groups() inventory, in BOTH directions, by
+// parsing the package source. TestInventoryCoversDispatch only checks the
+// TOP-LEVEL dispatch keys, and TestCLIFlagsMatchExecutableSurface harvests
+// flags but passes VACUOUSLY for a grouped cmdinfo command that has zero flags
+// and does not exist in any switch (empty harvest == empty declared set). This
+// closes both gaps: an executable subcommand omitted from cmdinfo (dispatcher
+// -> cmdinfo), and a cmdinfo subcommand with no real `case` (cmdinfo ->
+// dispatcher).
+func TestGroupLeafCasesMatchInventory(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	funcCases := map[string]map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if cases := subSwitchCases(fn); cases != nil {
+				funcCases[fn.Name.Name] = cases
+			}
+		}
+	}
+
+	for _, g := range cmdinfo.Groups() {
+		fnName := "run" + upperFirstASCII(g.Name)
+		got, ok := funcCases[fnName]
+		if !ok {
+			t.Errorf("group %q: no dispatcher %s with a `switch sub` was found in the package source", g.Name, fnName)
+			continue
+		}
+		want := map[string]bool{}
+		for _, sub := range g.Subcommands {
+			want[sub] = true
+		}
+		for sub := range want {
+			if !got[sub] {
+				t.Errorf("%s: cmdinfo group %q lists subcommand %q but the dispatcher has no `case %q`", fnName, g.Name, sub, sub)
+			}
+		}
+		for sub := range got {
+			if !want[sub] {
+				t.Errorf("%s: the dispatcher handles `case %q` but cmdinfo group %q omits it", fnName, sub, g.Name)
+			}
+		}
+	}
+}
+
+// subSwitchCases returns the string case values of the first `switch sub`
+// statement in fn — the subcommand dispatch — or nil if fn has none.
+func subSwitchCases(fn *ast.FuncDecl) map[string]bool {
+	var out map[string]bool
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if out != nil {
+			return false
+		}
+		sw, ok := n.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+		id, ok := sw.Tag.(*ast.Ident)
+		if !ok || id.Name != "sub" {
+			return true
+		}
+		cases := map[string]bool{}
+		for _, item := range sw.Body.List {
+			cc, ok := item.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			for _, expr := range cc.List { // a nil List is the default clause
+				lit, ok := expr.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if v, err := strconv.Unquote(lit.Value); err == nil {
+					cases[v] = true
+				}
+			}
+		}
+		out = cases
+		return false
+	})
+	return out
+}
+
+// upperFirstASCII capitalizes the first byte, deriving the group dispatcher
+// name (run -> runRun, runner -> runRunner) from the group name.
+func upperFirstASCII(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// TestHarvestRobustToNewlineLeadingUsage proves the flag-name harvest is
+// immune to a usage string beginning with a newline — the exact fragility
+// direct fs.VisitAll would avoid. The two-space-anchored regex captures
+// both flags and adds no phantom.
+func TestHarvestRobustToNewlineLeadingUsage(t *testing.T) {
+	fs := flag.NewFlagSet("x", flag.ContinueOnError)
+	var buf strings.Builder
+	fs.SetOutput(&buf)
+	fs.String("alpha", "", "\nusage that begins with a newline")
+	fs.Bool("beta", false, "ordinary usage")
+	fs.PrintDefaults()
+
+	got := map[string]bool{}
+	for _, m := range flagLineRE.FindAllStringSubmatch(buf.String(), -1) {
+		got[m[1]] = true
+	}
+	if !got["alpha"] || !got["beta"] {
+		t.Errorf("harvest missed a flag: %v", got)
+	}
+	if len(got) != 2 {
+		t.Errorf("harvest produced phantom flags: %v", got)
 	}
 }

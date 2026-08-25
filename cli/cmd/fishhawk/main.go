@@ -55,8 +55,34 @@ import (
 	"os"
 	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/cmdinfo"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/version"
 )
+
+// dispatch maps a top-level command name to its runner. It is the SHARED
+// production dispatch table: run() dispatches through it and
+// TestInventoryCoversDispatch cross-checks its keys against the cmdinfo
+// inventory, so a command reachable in the binary but absent from the
+// docs (or vice versa) fails in test rather than silently. The
+// non-dispatch cases (version, help, unknown, empty) stay in run().
+var dispatch = map[string]func([]string, io.Writer, io.Writer) int{
+	"run":          runRun,
+	"plan":         runPlan,
+	"token":        runToken,
+	"deploy":       runDeploy,
+	"release":      runRelease,
+	"campaign":     runCampaign,
+	"audit":        runAudit,
+	"init":         runInit,
+	"validate":     runValidate,
+	"migrate-spec": runMigrateSpec,
+	"runner":       runRunner,
+	"doctor":       runDoctor,
+	"file-issue":   runFileIssue,
+	"diagnose":     runDiagnose,
+	"report-issue": runReportIssue,
+	"export":       runExport,
+}
 
 const (
 	exitOK      = 0
@@ -72,42 +98,13 @@ func main() {
 // so tests can drive it without exiting the test process.
 func run(args []string, stdout, stderr io.Writer) int {
 	cmd, rest := splitCommand(args)
+	if fn, ok := dispatch[cmd]; ok {
+		return fn(rest, stdout, stderr)
+	}
 	switch cmd {
 	case "":
 		printUsage(stderr)
 		return exitUsage
-	case "run":
-		return runRun(rest, stdout, stderr)
-	case "plan":
-		return runPlan(rest, stdout, stderr)
-	case "token":
-		return runToken(rest, stdout, stderr)
-	case "deploy":
-		return runDeploy(rest, stdout, stderr)
-	case "release":
-		return runRelease(rest, stdout, stderr)
-	case "campaign":
-		return runCampaign(rest, stdout, stderr)
-	case "audit":
-		return runAudit(rest, stdout, stderr)
-	case "init":
-		return runInit(rest, stdout, stderr)
-	case "validate":
-		return runValidate(rest, stdout, stderr)
-	case "migrate-spec":
-		return runMigrateSpec(rest, stdout, stderr)
-	case "runner":
-		return runRunner(rest, stdout, stderr)
-	case "doctor":
-		return runDoctor(rest, stdout, stderr)
-	case "file-issue":
-		return runFileIssue(rest, stdout, stderr)
-	case "diagnose":
-		return runDiagnose(rest, stdout, stderr)
-	case "report-issue":
-		return runReportIssue(rest, stdout, stderr)
-	case "export":
-		return runExport(rest, stdout, stderr)
 	case "version", "--version":
 		if version.GitSHA != "unknown" {
 			_, _ = fmt.Fprintf(stdout, "%s (%s)\n", version.Version, version.GitSHA)
@@ -139,46 +136,26 @@ func splitCommand(args []string) (cmd string, rest []string) {
 	return args[0], args[1:]
 }
 
+// printUsage renders the top-level command listing from the shared
+// cli/internal/cmdinfo inventory — the same inventory the generated CLI
+// reference page renders from — so the binary's help and the docs cannot
+// list a different set of commands.
 func printUsage(w io.Writer) {
+	_, _ = fmt.Fprintln(w, "Usage: fishhawk <command> [args]")
+	_, _ = fmt.Fprintln(w, "")
+	_, _ = fmt.Fprintln(w, "Commands:")
+	width := 0
+	for _, c := range cmdinfo.Commands() {
+		if len(c.Key) > width {
+			width = len(c.Key)
+		}
+	}
+	for _, c := range cmdinfo.Commands() {
+		_, _ = fmt.Fprintf(w, "  %-*s  %s\n", width, c.Key, c.Synopsis)
+	}
+	_, _ = fmt.Fprintf(w, "  %-*s  %s\n", width, "version", "Print the CLI version and exit.")
+	_, _ = fmt.Fprintf(w, "  %-*s  %s\n", width, "help", "Show this help.")
 	for _, line := range []string{
-		"Usage: fishhawk <command> [args]",
-		"",
-		"Commands:",
-		"  run start    Trigger a workflow run.",
-		"  run status   Show a run's current state.",
-		"  run list     List runs with optional filters.",
-		"  run cancel   Cancel an in-flight run.",
-		"  run open     Open a run's detail page in the browser.",
-		"  run retry    Retry a failed stage (takes a stage id, not a run id).",
-		"  plan approve Approve the plan stage on a run.",
-		"  plan reject  Reject the plan stage on a run (category-D failure).",
-		"  token login  Log in via the OAuth device flow; mint + store a user-bound token.",
-		"  token list   List locally stored credentials (per backend URL).",
-		"  deploy status   Show the deploy stage state and the deployment artifact.",
-		"  deploy approve  Approve the deploy stage's pre-execution gate (needs write:deploy).",
-		"  deploy reject   Reject the deploy stage's pre-execution gate (category-D failure).",
-		"  deploy rollback Roll back a settled deploy (re-dispatches the rollback path).",
-		"  release preview Render release notes for a ref range without persisting.",
-		"  release prepare Persist rendered release notes as a release_notes artifact.",
-		"  release cut     Record the operator's ratified release version (no git tag push).",
-		"  release publish Write the notes to the GitHub Release body + asset.",
-		"  campaign start  Create a campaign from an epic ref.",
-		"  campaign status Show a campaign's rollup status and next action.",
-		"  campaign list   List campaigns with optional filters.",
-		"  campaign resume Resume a paused campaign (hand back to the auto-driver).",
-		"  audit list   List audit entries for a run.",
-		"  audit tail   Follow the audit log of a run in real time.",
-		"  init         Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight).",
-		"  validate     Validate a workflow spec file locally.",
-		"  migrate-spec Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report.",
-		"  doctor       Run local-loop install checks.",
-		"  file-issue   File a work item (issue/bug/chore/adr) via repo conventions.",
-		"  diagnose     Show a run's product-facts diagnostic bundle.",
-		"  report-issue File an upstream Fishhawk product bug/feature with a redacted, deduped bundle.",
-		"  export       Assemble a complete compliance export (JSON or --csv) for external verification.",
-		"  runner start Spawn the fishhawk-runner locally against an already-minted run (Phase C of E22 / #389).",
-		"  version      Print the CLI version and exit.",
-		"  help         Show this help.",
 		"",
 		"Global flags (apply to every subcommand):",
 		"  --backend-url URL   Fishhawk backend URL (default $FISHHAWK_BACKEND_URL or http://localhost:8080)",
