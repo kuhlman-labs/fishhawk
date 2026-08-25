@@ -363,12 +363,19 @@ func TestMigrateSpec_EndToEndAgainstCommittedGolden(t *testing.T) {
 // hole: printMigrateSpecUsage now calls fs.PrintDefaults(), so `migrate-spec -h`
 // names its three real flags. Removing the PrintDefaults() call reddens this
 // (and TestCustomUsageCommandsArePinned in main_test.go).
+//
+// A plain strings.Contains for "-out"/"-in-place"/"-report-only" would be
+// VACUOUS: the hand-written synopsis already prints "--out PATH", "--in-place"
+// and "--report-only", each of which contains those substrings, so the search
+// stays green with fs.PrintDefaults() removed. This instead harvests the
+// flag-DEFINITION lines via flagLineRE (which anchors on the two-space-dash
+// prefix flag.PrintDefaults emits and does NOT match the synopsis's
+// double-dash lines), so dropping PrintDefaults empties the harvest and reddens.
 func TestMigrateSpecUsageListsFlags(t *testing.T) {
-	var buf strings.Builder
-	run([]string{"migrate-spec", "-h"}, &buf, &buf)
-	for _, want := range []string{"-out", "-in-place", "-report-only"} {
-		if !strings.Contains(buf.String(), want) {
-			t.Errorf("migrate-spec -h output missing flag %q:\n%s", want, buf.String())
+	got := harvestFlags(t, "migrate-spec")
+	for _, want := range []string{"out", "in-place", "report-only"} {
+		if !got[want] {
+			t.Errorf("migrate-spec -h flag definitions missing %q (fs.PrintDefaults dropped?); harvested %v", want, got)
 		}
 	}
 }

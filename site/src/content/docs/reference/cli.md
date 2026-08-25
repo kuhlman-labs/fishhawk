@@ -36,39 +36,39 @@ Every command below is rendered from the `cli/internal/cmdinfo` inventory, which
 | Command | Arguments | Synopsis |
 |---|---|---|
 | `fishhawk run start` | — | Trigger a workflow run. |
-| `fishhawk run status` | <run-id> | Show a run's current state. |
+| `fishhawk run status` | `<run-id>` | Show a run's current state. |
 | `fishhawk run list` | — | List runs with optional filters. |
-| `fishhawk run cancel` | <run-id> | Cancel an in-flight run. |
-| `fishhawk run open` | <run-id> | Open a run's detail page in the browser. |
-| `fishhawk run retry` | <stage-id> | Retry a failed stage (takes a stage id, not a run id). |
-| `fishhawk run watch` | <run-id> | Block until a stage settles. |
-| `fishhawk plan approve` | <run-id> | Approve the plan stage on a run. |
-| `fishhawk plan reject` | <run-id> | Reject the plan stage on a run (category-D failure). |
-| `fishhawk plan revise` | <run-id> | Force a constrained replan pass. |
+| `fishhawk run cancel` | `<run-id>` | Cancel an in-flight run. |
+| `fishhawk run open` | `<run-id>` | Open a run's detail page in the browser. |
+| `fishhawk run retry` | `<stage-id>` | Retry a failed stage (takes a stage id, not a run id). |
+| `fishhawk run watch` | `<run-id>` | Block until a stage settles. |
+| `fishhawk plan approve` | `<run-id>` | Approve the plan stage on a run. |
+| `fishhawk plan reject` | `<run-id>` | Reject the plan stage on a run (category-D failure). |
+| `fishhawk plan revise` | `<run-id>` | Force a constrained replan pass. |
 | `fishhawk token login` | — | Log in via the OAuth device flow; mint + store a user-bound token. |
 | `fishhawk token list` | — | List locally stored credentials (per backend URL). |
-| `fishhawk deploy status` | <run-id> | Show the deploy stage state and the deployment artifact. |
-| `fishhawk deploy approve` | <run-id> | Approve the deploy stage's pre-execution gate (needs write:deploy). |
-| `fishhawk deploy reject` | <run-id> | Reject the deploy stage's pre-execution gate (category-D failure). |
-| `fishhawk deploy rollback` | <run-id> | Roll back a settled deploy (re-dispatches the rollback path). |
+| `fishhawk deploy status` | `<run-id>` | Show the deploy stage state and the deployment artifact. |
+| `fishhawk deploy approve` | `<run-id>` | Approve the deploy stage's pre-execution gate (needs write:deploy). |
+| `fishhawk deploy reject` | `<run-id>` | Reject the deploy stage's pre-execution gate (category-D failure). |
+| `fishhawk deploy rollback` | `<run-id>` | Roll back a settled deploy (re-dispatches the rollback path). |
 | `fishhawk release preview` | — | Render release notes for a ref range without persisting. |
 | `fishhawk release prepare` | — | Persist rendered release notes as a release_notes artifact. |
 | `fishhawk release cut` | — | Record the operator's ratified release version (no git tag push). |
 | `fishhawk release publish` | — | Write the notes to the GitHub Release body + asset. |
 | `fishhawk campaign start` | — | Create a campaign from an epic ref. |
-| `fishhawk campaign status` | <campaign-id> | Show a campaign's rollup status and next action. |
+| `fishhawk campaign status` | `<campaign-id>` | Show a campaign's rollup status and next action. |
 | `fishhawk campaign list` | — | List campaigns with optional filters. |
-| `fishhawk campaign resume` | <campaign-id> | Resume a paused campaign (hand back to the auto-driver). |
-| `fishhawk audit list` | <run-id> | List audit entries for a run. |
-| `fishhawk audit tail` | <run-id> | Follow the audit log of a run in real time. |
+| `fishhawk campaign resume` | `<campaign-id>` | Resume a paused campaign (hand back to the auto-driver). |
+| `fishhawk audit list` | `<run-id>` | List audit entries for a run. |
+| `fishhawk audit tail` | `<run-id>` | Follow the audit log of a run in real time. |
 | `fishhawk init` | — | Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight). |
-| `fishhawk validate` | [path] | Validate a workflow spec file locally. |
-| `fishhawk migrate-spec` | [path] | Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report. |
+| `fishhawk validate` | `[path]` | Validate a workflow spec file locally. |
+| `fishhawk migrate-spec` | `[path]` | Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report. |
 | `fishhawk runner start` | — | Spawn the fishhawk-runner locally against an already-minted run. |
 | `fishhawk doctor` | — | Run local-loop install checks. |
 | `fishhawk file-issue` | — | File a work item (issue/bug/chore/adr) via repo conventions. |
-| `fishhawk diagnose` | <run-id> | Show a run's product-facts diagnostic bundle. |
-| `fishhawk report-issue` | <run-id> | File an upstream Fishhawk product bug/feature with a redacted, deduped bundle. |
+| `fishhawk diagnose` | `<run-id>` | Show a run's product-facts diagnostic bundle. |
+| `fishhawk report-issue` | `<run-id>` | File an upstream Fishhawk product bug/feature with a redacted, deduped bundle. |
 | `fishhawk export` | — | Assemble a complete compliance export (JSON or --csv) for external verification. |
 
 ### Flags per command

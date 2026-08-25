@@ -4,12 +4,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1871,6 +1875,113 @@ func TestInventoryCoversDispatch(t *testing.T) {
 			t.Errorf("cmdinfo implies top-level command %q but the dispatch map omits it", k)
 		}
 	}
+}
+
+// TestGroupLeafCasesMatchInventory binds each group dispatcher's ACTUAL leaf
+// `case "sub":` set to the cmdinfo Groups() inventory, in BOTH directions, by
+// parsing the package source. TestInventoryCoversDispatch only checks the
+// TOP-LEVEL dispatch keys, and TestCLIFlagsMatchExecutableSurface harvests
+// flags but passes VACUOUSLY for a grouped cmdinfo command that has zero flags
+// and does not exist in any switch (empty harvest == empty declared set). This
+// closes both gaps: an executable subcommand omitted from cmdinfo (dispatcher
+// -> cmdinfo), and a cmdinfo subcommand with no real `case` (cmdinfo ->
+// dispatcher).
+func TestGroupLeafCasesMatchInventory(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	funcCases := map[string]map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if cases := subSwitchCases(fn); cases != nil {
+				funcCases[fn.Name.Name] = cases
+			}
+		}
+	}
+
+	for _, g := range cmdinfo.Groups() {
+		fnName := "run" + upperFirstASCII(g.Name)
+		got, ok := funcCases[fnName]
+		if !ok {
+			t.Errorf("group %q: no dispatcher %s with a `switch sub` was found in the package source", g.Name, fnName)
+			continue
+		}
+		want := map[string]bool{}
+		for _, sub := range g.Subcommands {
+			want[sub] = true
+		}
+		for sub := range want {
+			if !got[sub] {
+				t.Errorf("%s: cmdinfo group %q lists subcommand %q but the dispatcher has no `case %q`", fnName, g.Name, sub, sub)
+			}
+		}
+		for sub := range got {
+			if !want[sub] {
+				t.Errorf("%s: the dispatcher handles `case %q` but cmdinfo group %q omits it", fnName, sub, g.Name)
+			}
+		}
+	}
+}
+
+// subSwitchCases returns the string case values of the first `switch sub`
+// statement in fn — the subcommand dispatch — or nil if fn has none.
+func subSwitchCases(fn *ast.FuncDecl) map[string]bool {
+	var out map[string]bool
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if out != nil {
+			return false
+		}
+		sw, ok := n.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+		id, ok := sw.Tag.(*ast.Ident)
+		if !ok || id.Name != "sub" {
+			return true
+		}
+		cases := map[string]bool{}
+		for _, item := range sw.Body.List {
+			cc, ok := item.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			for _, expr := range cc.List { // a nil List is the default clause
+				lit, ok := expr.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if v, err := strconv.Unquote(lit.Value); err == nil {
+					cases[v] = true
+				}
+			}
+		}
+		out = cases
+		return false
+	})
+	return out
+}
+
+// upperFirstASCII capitalizes the first byte, deriving the group dispatcher
+// name (run -> runRun, runner -> runRunner) from the group name.
+func upperFirstASCII(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // TestHarvestRobustToNewlineLeadingUsage proves the flag-name harvest is

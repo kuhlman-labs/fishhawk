@@ -62,11 +62,16 @@ func RenderCLI() string {
 	b.WriteString("|---|---|---|\n")
 	for _, c := range cmdinfo.Commands() {
 		syn, _ := applyVocabulary(c.Synopsis)
-		args := c.Args
-		if args == "" {
-			args = "—"
+		// The argument summary carries angle-bracket placeholders
+		// (<run-id>, <stage-id>) which CommonMark/Starlight parse as raw
+		// inline HTML tags and drop from the rendered cell, so render it as
+		// a code span to keep the brackets literal. An empty summary stays
+		// the bare em-dash (a code-spanned "—" reads worse than the glyph).
+		args := "—"
+		if c.Args != "" {
+			args = codeSpan(c.Args)
 		}
-		b.WriteString("| " + codeSpan("fishhawk "+c.Key) + " | " + proseCell(args) + " | " +
+		b.WriteString("| " + codeSpan("fishhawk "+c.Key) + " | " + args + " | " +
 			proseCell(syn) + " |\n")
 	}
 	b.WriteString("\n### Flags per command\n\n")
