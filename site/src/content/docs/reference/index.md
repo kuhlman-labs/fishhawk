@@ -8,6 +8,13 @@ to the canonical source under
 [`docs/`](https://github.com/kuhlman-labs/fishhawk/tree/main/docs) in the
 repository rather than inlining it, which is what keeps the two from drifting.
 
+The field reference on each of the four surface pages below is **generated** from
+those canonical sources — the workflow-spec and plan JSON Schemas, the OpenAPI
+document, and the CLI command inventory — and a drift test fails CI if a
+generated region falls out of date. The orientation prose on each page is
+hand-written; only the region between its markers is generated. Regenerate with
+`scripts/gen-site-reference`.
+
 | Page | What |
 |---|---|
 | [Workflow spec](/fishhawk/reference/workflow-spec/) | `.fishhawk/workflows.yaml` — the document that declares your workflows. |

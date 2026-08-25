@@ -796,10 +796,17 @@ _verify_patch_coverage() {
 # INSIDE the harness (a printed reason plus exit 0), so this loop needs no
 # helm-specific branch, and a helm-less host takes the same residual the zsh
 # guard already accepts.
+# test-site-reference (E12.4 / #2264) is the drift gate for the four generated
+# Reference pages: it hashes each committed page, regenerates in place, hashes
+# again, and restores the committed bytes unconditionally, so a stale generated
+# region fails verify without leaving the tree mutated. It is bash and needs no
+# zsh guard; the go-absent SKIP lives INSIDE the harness (a printed reason plus
+# exit 0), exactly like test-helm-render's helm-absent skip, so this loop needs
+# no site-reference-specific branch.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-dev test-site-voice test-helm-render; do
+  for h in test-check-coverage test-patch-coverage test-dev test-site-voice test-helm-render test-site-reference; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue

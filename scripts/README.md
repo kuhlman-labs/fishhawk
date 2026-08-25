@@ -665,3 +665,28 @@ in the implement stage's `forbidden_paths`, so the workflow ships as a
 copy-pasteable, install-verbatim block in
 `deploy/helm/fishhawk/README.md`, following `site/README.md`'s Pages
 workflow pattern. Long-form chart contract: `deploy/helm/fishhawk/README.md`.
+
+## Site Reference generation and drift gate (E12.4 / [#2264](https://github.com/kuhlman-labs/fishhawk/issues/2264))
+
+`gen-site-reference` regenerates the four generated **Reference** pages of the
+documentation site (`site/src/content/docs/reference/{workflow-spec,plan-schema,cli,api}.md`)
+from the canonical sources — the workflow-spec and plan JSON Schemas under
+`docs/spec/`, the OpenAPI document `docs/api/v0.openapi.yaml`, and the
+`cli/internal/cmdinfo` command inventory. It is a thin wrapper over the
+`fishhawk-docgen` binary in the `cli` module, which splices each rendering
+between the page's `<!-- BEGIN/END GENERATED <id> -->` markers and leaves the
+orientation prose outside the markers untouched. `gen-site-reference --check`
+reports drift and writes nothing.
+
+`test-site-reference` is the drift gate, wired into `scripts/test verify`'s
+`_verify_gate_harnesses` loop. It hashes each committed page, regenerates the
+pages IN PLACE, hashes them again, then RESTORES the committed bytes
+unconditionally — so a generated region that has fallen out of date fails the
+gate WITHOUT leaving the working tree mutated. It compares CONTENT HASHES, not
+git status classes, so it behaves the same in a dirty tree, a fresh checkout, or
+CI. It SKIPS with a printed reason and exits 0 when `go` (or a sha256 tool) is
+absent from PATH — the harness owns that skip, the same residual the zsh and
+helm guards accept, so a go-less host is not red-lined with exit 127. The
+independent second path is the Go drift test `cli/internal/docgen/drift_test.go`,
+which gates CI through the module test loop and fails LOUDLY (never skips) when
+it cannot resolve the repo root or `site/` is absent.

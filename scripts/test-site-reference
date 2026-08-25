@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# test-site-reference is the drift gate for the four generated Reference
+# pages (E12.4 / #2264). It hashes each committed page, regenerates the
+# pages IN PLACE, hashes them again, then RESTORES the committed bytes
+# unconditionally — so a generated region that has fallen out of date fails
+# the gate WITHOUT leaving the working tree mutated. It compares CONTENT
+# HASHES, not git status classes, so it works the same in a dirty tree, a
+# fresh checkout, or CI.
+#
+# This is the second, independent enforcement path alongside the Go drift
+# test cli/internal/docgen/drift_test.go: the Go test gates CI through the
+# module test loop; this harness gates `scripts/test verify` in-loop.
+#
+# It SKIPS with a printed reason and exits 0 when go is absent from PATH
+# (the same residual the zsh/helm guards accept) — the harness owns that
+# skip so a go-less host is not red-lined with exit 127.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "test-site-reference: go absent from PATH — skipping (pages unguarded on this host)" >&2
+  exit 0
+fi
+
+# Pick a sha256 tool: sha256sum (Linux) or shasum -a 256 (macOS).
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  echo "test-site-reference: no sha256sum/shasum on PATH — skipping" >&2
+  exit 0
+fi
+
+PAGES=(
+  "site/src/content/docs/reference/workflow-spec.md"
+  "site/src/content/docs/reference/plan-schema.md"
+  "site/src/content/docs/reference/cli.md"
+  "site/src/content/docs/reference/api.md"
+)
+
+# Back up the committed pages and record their hashes.
+BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-site-reference.XXXXXX")"
+declare -a BEFORE
+i=0
+for p in "${PAGES[@]}"; do
+  if [ ! -f "$ROOT/$p" ]; then
+    echo "test-site-reference: expected page $p is missing" >&2
+    rm -rf "$BACKUP_DIR"
+    exit 1
+  fi
+  cp "$ROOT/$p" "$BACKUP_DIR/$i.bak"
+  BEFORE[$i]="$(sha256 "$ROOT/$p")"
+  i=$((i + 1))
+done
+
+# Always restore the committed bytes, whatever happens next.
+restore() {
+  local j=0
+  for q in "${PAGES[@]}"; do
+    cp "$BACKUP_DIR/$j.bak" "$ROOT/$q"
+    j=$((j + 1))
+  done
+  rm -rf "$BACKUP_DIR"
+}
+trap restore EXIT
+
+# Regenerate in place.
+( cd "$ROOT/cli" && go run ./cmd/fishhawk-docgen --root "$ROOT" >/dev/null )
+
+# Compare hashes after regeneration.
+rc=0
+i=0
+for p in "${PAGES[@]}"; do
+  after="$(sha256 "$ROOT/$p")"
+  if [ "$after" != "${BEFORE[$i]}" ]; then
+    echo "test-site-reference: DRIFT — $p is out of date; run scripts/gen-site-reference" >&2
+    rc=1
+  fi
+  i=$((i + 1))
+done
+
+if [ "$rc" -eq 0 ]; then
+  echo "test-site-reference: all ${#PAGES[@]} generated reference pages are up to date"
+fi
+exit "$rc"

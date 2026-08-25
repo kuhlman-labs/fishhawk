@@ -36,7 +36,7 @@ func runMigrateSpec(args []string, stdout, stderr io.Writer) int {
 	out := fs.String("out", "", "write the migrated spec to this path (refuses to overwrite an existing file)")
 	inPlace := fs.Bool("in-place", false, "rewrite the source file with the migrated spec")
 	reportOnly := fs.Bool("report-only", false, "print the report and write nothing (the default)")
-	fs.Usage = func() { printMigrateSpecUsage(stderr) }
+	fs.Usage = func() { printMigrateSpecUsage(fs, stderr) }
 	// Go's flag package stops parsing at the first non-flag argument, so a
 	// path-first invocation (`migrate-spec path --in-place`) would leave
 	// the flags unparsed and silently take the report-only cell. Parse,
@@ -200,7 +200,13 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-func printMigrateSpecUsage(w io.Writer) {
+// printMigrateSpecUsage renders the hand-written usage prose and THEN the
+// flag defaults via fs.PrintDefaults(), so migrate-spec's three real flags
+// (out, in-place, report-only) appear in `migrate-spec -h`. Without the
+// PrintDefaults() call the flags were invisible to any VisitAll-based
+// enumeration — the vacuous-empty-harvest hole TestCustomUsageCommandsArePinned
+// closes.
+func printMigrateSpecUsage(fs *flag.FlagSet, w io.Writer) {
 	for _, line := range []string{
 		"Usage: fishhawk migrate-spec [path] [--out PATH | --in-place | --report-only]",
 		"",
@@ -224,7 +230,11 @@ func printMigrateSpecUsage(w io.Writer) {
 		"  0  migrated, or already at workflow-v2",
 		"  1  refusal, output-validation failure, or a refused overwrite",
 		"  2  usage / I/O error",
+		"",
+		"Flags:",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}
+	fs.SetOutput(w)
+	fs.PrintDefaults()
 }

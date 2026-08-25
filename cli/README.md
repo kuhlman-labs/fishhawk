@@ -373,6 +373,36 @@ Or from this directory directly:
     # Follow a run's audit log in a side terminal
     fishhawk audit tail <run-id> --interval 1s
 
+## Documentation generator (E12.4 / #2264)
+
+The four **Reference** pages of the documentation site — the workflow spec, the
+plan schema, the CLI, and the REST API — are generated from the canonical
+sources rather than hand-written, so they cannot drift from what they document:
+
+- `internal/cmdinfo` is the importable inventory of the CLI surface: every leaf
+  command, its synopsis, argument summary, and the exact set of flag names it
+  registers. Both `cmd/fishhawk`'s `printUsage` and the docs generator render
+  from it. It is hand-maintained but bound to the binary — the package-main test
+  `TestCLIFlagsMatchExecutableSurface` drives each command in-process with `-h`,
+  harvests the live flag set the `flag` package renders (a `flag.VisitAll` walk),
+  and asserts SET EQUALITY against `cmdinfo` in BOTH directions. A flag added to
+  a command without updating `cmdinfo`, or a stale `cmdinfo` flag, reddens it.
+  `TestCustomUsageCommandsArePinned` closes the vacuity hole where a command that
+  overrides `fs.Usage` without calling `fs.PrintDefaults()` would harvest empty.
+- `internal/docgen` renders each page: `jsonschema.go` walks a JSON Schema
+  (parsed as YAML so field order is preserved) into field tables with exhaustive,
+  by-JSON-pointer accounting; `openapi.go` renders the API per `(method, path)`
+  operation; `cli_page.go` renders from `cmdinfo`; `spec_pages.go` adds the
+  major-to-major shape deltas and the §4-primitive demonstration; `docgen.go`
+  splices each rendering between the page's `<!-- BEGIN/END GENERATED -->`
+  markers, failing closed on a missing, duplicated or inverted marker pair.
+- `cmd/fishhawk-docgen` is the entry point (`--check` reports drift without
+  writing). Regenerate with `scripts/gen-site-reference`. The gates are the Go
+  drift test `internal/docgen/drift_test.go` (byte-compares each regenerated page
+  against the committed tree, and fails LOUDLY when it cannot resolve the repo
+  root or `site/` is absent) and `scripts/test-site-reference` (a content-hash
+  comparison wired into `scripts/test verify`).
+
 ## See also
 
 - `docs/api/v0.openapi.yaml` — the contract this CLI consumes.

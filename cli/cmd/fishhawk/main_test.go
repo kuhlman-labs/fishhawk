@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/cmdinfo"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/version"
 )
@@ -1727,5 +1731,168 @@ func TestEnvOr(t *testing.T) {
 	t.Setenv("X_TEST_KEY", "explicit")
 	if got := envOr("X_TEST_KEY", "fallback"); got != "explicit" {
 		t.Errorf("got %q, want explicit", got)
+	}
+}
+
+// --- E12.4 / #2264: cmdinfo bound to the executable surface ---
+
+// flagLineRE matches a flag DEFINITION line in flag.PrintDefaults output.
+// PrintDefaults writes each flag as exactly "  -name…" (two spaces, dash)
+// and each usage continuation as "    \t…" (four spaces, tab). Anchoring
+// on the two-space-then-dash prefix therefore harvests flag names from the
+// flag package's own flag.VisitAll walk while being immune to a usage
+// string that begins with a newline (its content lands at column 0, which
+// the two-space anchor cannot match) — the fragility fs.VisitAll would
+// otherwise avoid, closed here by TestHarvestRobustToNewlineLeadingUsage.
+var flagLineRE = regexp.MustCompile(`(?m)^  -([A-Za-z0-9][A-Za-z0-9._-]*)`)
+
+// harvestFlags drives a command in-process with -h and returns the set of
+// flag names the flag package rendered — the LIVE registered flag set of
+// that command.
+func harvestFlags(t *testing.T, cmdKey string) map[string]bool {
+	t.Helper()
+	var buf strings.Builder
+	args := append(strings.Fields(cmdKey), "-h")
+	run(args, &buf, &buf)
+	out := map[string]bool{}
+	for _, m := range flagLineRE.FindAllStringSubmatch(buf.String(), -1) {
+		out[m[1]] = true
+	}
+	return out
+}
+
+func flagSet(names []string) map[string]bool {
+	m := map[string]bool{}
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+func commonPlus(extra ...string) []string {
+	return append([]string{"backend-url", "token", "timeout"}, extra...)
+}
+
+// TestCLIFlagsMatchExecutableSurface asserts SET EQUALITY, in BOTH
+// directions, between each cmdinfo command's declared flags and the flags
+// the binary actually registers for that command. A flag added to a
+// command without updating cmdinfo, or a cmdinfo flag that no longer
+// exists, reddens this.
+func TestCLIFlagsMatchExecutableSurface(t *testing.T) {
+	for _, c := range cmdinfo.Commands() {
+		c := c
+		t.Run(c.Key, func(t *testing.T) {
+			got := harvestFlags(t, c.Key)
+			want := flagSet(c.Flags)
+			for f := range want {
+				if !got[f] {
+					t.Errorf("%s: cmdinfo lists --%s but the binary does not register it", c.Key, f)
+				}
+			}
+			for f := range got {
+				if !want[f] {
+					t.Errorf("%s: the binary registers --%s but cmdinfo omits it", c.Key, f)
+				}
+			}
+		})
+	}
+}
+
+// TestCustomUsageCommandsArePinned derives the set of `fs.Usage = func`
+// override sites from the package source and requires each in a pinned
+// expected-harvest table, so a NEW override cannot slip in without a
+// pinned expectation (the count check) and an existing override that drops
+// fs.PrintDefaults cannot silently produce a vacuously-empty harvest (the
+// per-command equality check).
+func TestCustomUsageCommandsArePinned(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	sites := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		sites += strings.Count(string(data), ".Usage = func")
+	}
+
+	pinned := map[string][]string{
+		"validate":     {},
+		"migrate-spec": {"out", "in-place", "report-only"},
+		"token login":  commonPlus("provider", "client-id"),
+		"init":         commonPlus("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),
+	}
+	if sites != len(pinned) {
+		t.Fatalf("found %d `fs.Usage = func` override sites but pinned %d — add the new override to the pinned table (a custom usage that omits fs.PrintDefaults produces a vacuous empty harvest)", sites, len(pinned))
+	}
+	for key, flags := range pinned {
+		got := harvestFlags(t, key)
+		want := flagSet(flags)
+		for f := range want {
+			if !got[f] {
+				t.Errorf("%s: pinned flag --%s missing from harvest (custom usage dropped PrintDefaults?)", key, f)
+			}
+		}
+		for f := range got {
+			if !want[f] {
+				t.Errorf("%s: harvest has --%s not in the pinned table", key, f)
+			}
+		}
+	}
+}
+
+// TestInventoryCoversDispatch reads the SHARED production dispatch map and
+// cross-checks its keys against the cmdinfo inventory: every group name and
+// every standalone (spaceless) command key must be dispatched, and every
+// dispatch key must have cmdinfo coverage.
+func TestInventoryCoversDispatch(t *testing.T) {
+	expected := map[string]bool{}
+	for _, g := range cmdinfo.Groups() {
+		expected[g.Name] = true
+	}
+	for _, c := range cmdinfo.Commands() {
+		if !strings.Contains(c.Key, " ") {
+			expected[c.Key] = true
+		}
+	}
+	for k := range dispatch {
+		if !expected[k] {
+			t.Errorf("dispatch routes %q but cmdinfo has no group or command for it", k)
+		}
+	}
+	for k := range expected {
+		if _, ok := dispatch[k]; !ok {
+			t.Errorf("cmdinfo implies top-level command %q but the dispatch map omits it", k)
+		}
+	}
+}
+
+// TestHarvestRobustToNewlineLeadingUsage proves the flag-name harvest is
+// immune to a usage string beginning with a newline — the exact fragility
+// direct fs.VisitAll would avoid. The two-space-anchored regex captures
+// both flags and adds no phantom.
+func TestHarvestRobustToNewlineLeadingUsage(t *testing.T) {
+	fs := flag.NewFlagSet("x", flag.ContinueOnError)
+	var buf strings.Builder
+	fs.SetOutput(&buf)
+	fs.String("alpha", "", "\nusage that begins with a newline")
+	fs.Bool("beta", false, "ordinary usage")
+	fs.PrintDefaults()
+
+	got := map[string]bool{}
+	for _, m := range flagLineRE.FindAllStringSubmatch(buf.String(), -1) {
+		got[m[1]] = true
+	}
+	if !got["alpha"] || !got["beta"] {
+		t.Errorf("harvest missed a flag: %v", got)
+	}
+	if len(got) != 2 {
+		t.Errorf("harvest produced phantom flags: %v", got)
 	}
 }

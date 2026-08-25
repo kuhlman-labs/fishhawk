@@ -358,3 +358,17 @@ func TestMigrateSpec_EndToEndAgainstCommittedGolden(t *testing.T) {
 		t.Fatalf("the bytes written to disk do not validate as workflow-v2: %v", err)
 	}
 }
+
+// TestMigrateSpecUsageListsFlags asserts the fix for the vacuous-empty-harvest
+// hole: printMigrateSpecUsage now calls fs.PrintDefaults(), so `migrate-spec -h`
+// names its three real flags. Removing the PrintDefaults() call reddens this
+// (and TestCustomUsageCommandsArePinned in main_test.go).
+func TestMigrateSpecUsageListsFlags(t *testing.T) {
+	var buf strings.Builder
+	run([]string{"migrate-spec", "-h"}, &buf, &buf)
+	for _, want := range []string{"-out", "-in-place", "-report-only"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("migrate-spec -h output missing flag %q:\n%s", want, buf.String())
+		}
+	}
+}

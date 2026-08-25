@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# gen-site-reference regenerates the four generated Reference pages of the
+# documentation site (workflow-spec, plan-schema, cli, api) from the
+# canonical sources, splicing each rendering between its page's HTML marker
+# comments. Orientation prose OUTSIDE the markers is left untouched.
+#
+# It is a thin wrapper over the fishhawk-docgen binary in the cli module.
+# The gate is scripts/test-site-reference (a content-hash comparison) plus
+# the Go drift test cli/internal/docgen/drift_test.go.
+#
+#   scripts/gen-site-reference           # rewrite the pages in place
+#   scripts/gen-site-reference --check   # report drift, write nothing (exit 1 on drift)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "gen-site-reference: go is not on PATH" >&2
+  exit 1
+fi
+
+cd "$ROOT/cli"
+exec go run ./cmd/fishhawk-docgen --root "$ROOT" "$@"
