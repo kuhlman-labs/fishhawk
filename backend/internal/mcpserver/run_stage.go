@@ -53,6 +53,15 @@ var runStageGitRemoteOriginURL = func(dir string) (string, error) {
 // shorten it.
 var runStageGracePeriod = 30 * time.Second
 
+// runStageAuditWindow is the limit run_stage's single best-effort audit fetch
+// requests (E31.15 / #1562). It is DELIBERATELY auditLimitMax — the same
+// ceiling clampAuditLimit admits for fishhawk_get_run_status — so the acceptance
+// signals run_stage derives from that window see exactly what the authoritative
+// fishhawk_get_run_status classification sees, and a future narrowing is a
+// visible edit here rather than a silent regression to the defensive
+// acceptance_settled_outcome_unknown arm.
+const runStageAuditWindow = auditLimitMax
+
 // DiffSummary reports the diff stats for the commit the runner made.
 // Present only when the runner emitted a git_diff event; nil otherwise
 // (e.g. plan stages, or runners that exited without committing). The
@@ -688,17 +697,29 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 
-	// Populate AuditPointer: best-effort, 5-second timeout. Mirrors
-	// the stageState fetch pattern above. Nil on any failure — no
-	// warning per the acceptance criteria.
+	// Populate AuditPointer AND the recent-audit window: ONE best-effort
+	// fetch, 5-second timeout, mirroring the stageState fetch pattern above.
+	// Nil pointer / empty window on any failure — no warning per the
+	// acceptance criteria.
+	//
+	// The window is read at runStageAuditWindow rather than the 1 the pointer
+	// alone needs (E31.15 / #1562) so the next_actions composition below can
+	// derive the acceptance signals from it. entries[0] still feeds the
+	// pointer: /v0/audit returns rows time-DESCENDING (see the
+	// ListRecentRunAudit doc comment), so the newest entry is index 0 at any
+	// limit. AuditPointer.URL keeps its ?limit=1 suffix — it is the
+	// operator-facing "read the newest entry" pointer, not a mirror of this
+	// internal window size.
 	var auditPointer *AuditPointer
+	var recentAudit []AuditEntry
 	func() {
 		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		entries, aerr := r.api.ListRecentRunAudit(fetchCtx, runUUID, 1)
+		entries, aerr := r.api.ListRecentRunAudit(fetchCtx, runUUID, runStageAuditWindow)
 		if aerr != nil || len(entries) == 0 {
 			return
 		}
+		recentAudit = entries
 		auditPointer = &AuditPointer{
 			LatestSequence: entries[0].Sequence,
 			EntryHash:      entries[0].EntryHash,
@@ -775,21 +796,40 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// next move directly. Omitted when the run fetch failed.
 	var nextActions *NextActions
 	if runView != nil {
-		// A run_stage call executes the plan or implement stage and can
-		// never observe a post-merge (the PR is not even open yet at
-		// implement-stage exit), so mergeObserved is the literal false (#1370).
-		// It holds no recent-audit slice (its own audit read is limit=1 for the
-		// pointer), so the acceptance verdict/disposition signals, the E38.3
-		// acceptance-skip flag AND the E66.37 arbitration flag are empty/false
-		// here — safe: run_stage never runs
-		// the acceptance stage, and the defensive acceptance_settled_outcome_unknown
-		// arm covers an already-settled acceptance stage (E31.9).
-		// A run_stage call executes plan/implement/acceptance, never the
-		// delegating "release" workflow's operator loop (E33.5 / #1590), and it
-		// holds no recent-audit slice to derive the release_cut/release_published
-		// signals from — so the release signals are the zero value here (the
-		// release arm is inert). getRunStatus is the surface that computes them.
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, false, false, "", "", releaseSignals{})
+		// Acceptance signals (E31.15 / #1562): derived from the recentAudit
+		// window fetched above with the SAME helpers fishhawk_get_run_status
+		// uses (never re-implemented — the mirrored-vocabulary trap, #875), so a
+		// blocking acceptance run_stage classifies the same arm the authoritative
+		// surface would instead of always falling to the defensive
+		// acceptance_settled_outcome_unknown arm.
+		//
+		// Named locals rather than inline calls are deliberate: acceptanceSkipped-
+		// OutOfScope and acceptanceArbitrated are ADJACENT positional bools at the
+		// call site, so a transposition is invisible to the compiler and only a
+		// human reader (or the transposition counterfactual in run_stage_test.go)
+		// can catch it.
+		//
+		// FAIL-OPEN, unchanged from before this derivation existed: all four
+		// helpers range over the slice and return their zero value on a nil or
+		// empty one, so an audit fetch error or a window that has aged the
+		// entries out leaves false/false/""/"" — which lands the DEFENSIVE
+		// acceptance_settled_outcome_unknown arm (fail toward read, never toward
+		// merge), i.e. today's behavior.
+		acceptanceVerdict := latestAcceptanceVerdict(recentAudit)
+		acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recentAudit)
+		acceptanceSkippedOutOfScope := acceptanceSkippedOutOfScopeIn(recentAudit)
+		acceptanceArbitrated := acceptanceArbitratedIn(recentAudit)
+		// mergeObserved stays the literal false BY CHOICE, not for want of a
+		// window: a run_stage call returns at stage exit, before its PR is merged
+		// (the PR is not even open yet at implement-stage exit), so there is no
+		// merge for this surface to observe (#1370).
+		//
+		// The release signals stay the zero value BY CHOICE too: a run_stage call
+		// executes plan/implement/acceptance, never the delegating "release"
+		// workflow's operator loop (E33.5 / #1590), so the release arm is inert
+		// here — and releaseSignalsFor costs extra cost-gated round-trips that
+		// getRunStatus owns.
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, releaseSignals{})
 	}
 
 	out := RunStageOutput{
