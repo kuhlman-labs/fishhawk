@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1687,8 +1688,13 @@ func TestRunStage_AuditPointer_NilOnBackend500(t *testing.T) {
 	if got := fb.auditCalledByID[runID]; got == 0 {
 		t.Errorf("expected /v0/audit to be called; auditCalledByID[runID] = %d", got)
 	}
-	if fb.lastAuditLimit != "1" {
-		t.Errorf("audit limit = %q, want 1", fb.lastAuditLimit)
+	// The widened window (E31.15 / #1562) must reach the backend UNCLAMPED:
+	// lastAuditLimit is the raw ?limit= query param the fake read off the
+	// request, so this is verification AT THE WIRE, not an assumption that the
+	// constant survives the client. A silent clamp, or a narrowing back to 1,
+	// fails here. The field is a STRING, hence strconv.Itoa.
+	if want := strconv.Itoa(runStageAuditWindow); fb.lastAuditLimit != want {
+		t.Errorf("audit limit = %q, want %q (runStageAuditWindow, unclamped at the wire)", fb.lastAuditLimit, want)
 	}
 }
 
@@ -3365,4 +3371,353 @@ func TestRunStage_PushAndOpenPRDescription_DescribesPerCaseBehavior(t *testing.T
 		t.Fatalf("infer RunStageInput schema: %v", err)
 	}
 	assertPushAndOpenPRDescription(t, "fishhawk_run_stage", schema)
+}
+
+// --- acceptance next_actions arms on the blocking verb (E31.15 / #1562) ---
+
+// seedAcceptanceArmRun seeds a NON-TERMINAL run whose plan/implement/review
+// stages have all settled and whose acceptance stage sits in the given state,
+// so the next_actions classifier walks
+// classifyNextActions -> implementStageNextActions -> acceptanceStageNextActions.
+// That is the exact shape a blocking acceptance fishhawk_run_stage returns on,
+// and the shape whose acceptance arm #1562 reports as misclassified.
+func seedAcceptanceArmRun(fb *fakeBackend, runID, acceptanceStageID uuid.UUID, acceptanceState string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running", WorkflowID: "feature_change",
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.New().String(), RunID: runID.String(), Sequence: 3, Type: "review", State: "succeeded"},
+		{ID: acceptanceStageID.String(), RunID: runID.String(), Sequence: 4, Type: "acceptance", State: acceptanceState},
+	}
+}
+
+// runAcceptanceStage drives the REAL runStage handler for the acceptance stage
+// of the seeded run — never nextActionsFor / classifyNextActions in isolation,
+// so the widened fetch, the four derivations AND the positional argument order
+// at the nextActionsFor call site are the things under test.
+func runAcceptanceStage(t *testing.T, r *runResolver, runID, stageID uuid.UUID) RunStageOutput {
+	t.Helper()
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "acceptance",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage(acceptance): %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("NextActions is nil; want the #1024 block on the run-terminal result")
+	}
+	return out
+}
+
+// nextActionOffered reports whether next_actions carries the named action.
+func nextActionOffered(na *NextActions, action string) bool {
+	for _, a := range na.Actions {
+		if a.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+// rsTriageEntry is the acceptance_triage_decided fixture, mirroring the
+// two-field payload shape of naOutcomeEntry / naArbitrationEntry in
+// next_actions_test.go rather than inventing a new payload vocabulary.
+func rsTriageEntry(seq int64, disposition string) AuditEntry {
+	return AuditEntry{
+		Category: auditCategoryAcceptanceTriageDecided,
+		Sequence: seq,
+		Payload:  map[string]any{"disposition": disposition},
+	}
+}
+
+// rsSkipEntry is the E38.3 / #1657 out-of-scope skip marker the orchestrator
+// writes when it auto-terminates a degenerate acceptance stage.
+func rsSkipEntry(seq int64) AuditEntry {
+	return AuditEntry{
+		Category: auditCategoryAcceptanceSkippedOutOfScope,
+		Sequence: seq,
+		Payload:  map[string]any{"reason": "verification.out_of_scope with no acceptance_criteria"},
+	}
+}
+
+// TestRunStage_NextActions_AcceptanceVerdictArms is arm 1 (E31.15 / #1562),
+// table-driven over the three MERGE-ELIGIBLE verdict strings that ride the same
+// latestAcceptanceVerdict signal. Before this change every one of them
+// classified acceptance_settled_outcome_unknown on the blocking verb, because
+// run_stage passed acceptanceVerdict="" unconditionally.
+//
+// The table is BINDING APPROVAL CONDITION "coverage": passed, not_validated and
+// undecidable must each be ASSERTED distinct, not merely exercised transitively.
+// undecidable in particular is the arm whose distinctness from passed decides
+// whether the operator is told the run WAS validated — the reason text differs,
+// and reading acceptance_passed off an undecidable run is exactly the
+// hint-quality wrongness #1562 reports.
+func TestRunStage_NextActions_AcceptanceVerdictArms(t *testing.T) {
+	for _, tc := range []struct {
+		verdict   string
+		wantState string
+	}{
+		{acceptanceVerdictPassed, "acceptance_passed"},
+		{acceptanceVerdictNotValidated, "acceptance_not_validated"},
+		{acceptanceVerdictUndecidable, "acceptance_undecidable"},
+	} {
+		t.Run(tc.verdict, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			captureArgv(t)
+
+			runID := uuid.New()
+			acceptanceID := uuid.New()
+			seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+			fb.mu.Lock()
+			fb.auditByRun[runID] = []AuditEntry{naOutcomeEntry(10, tc.verdict)}
+			fb.mu.Unlock()
+
+			out := runAcceptanceStage(t, r, runID, acceptanceID)
+			if out.NextActions.State != tc.wantState {
+				t.Errorf("next_actions.state = %q, want %q (verdict %q must not fall to the defensive arm)",
+					out.NextActions.State, tc.wantState, tc.verdict)
+			}
+			if !nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+				t.Errorf("the %s arm should offer the merge ritual; got %+v", tc.wantState, out.NextActions.Actions)
+			}
+		})
+	}
+}
+
+// TestRunStage_NextActions_AcceptanceTriagePaged is arm 2: a failed verdict
+// whose CORRELATED triage disposition paged the human. The triage entry sits
+// NEWER than (a lower index than) its verdict, which is the correlation rule
+// latestAcceptanceTriageDisposition applies.
+func TestRunStage_NextActions_AcceptanceTriagePaged(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	fb.mu.Lock()
+	fb.auditByRun[runID] = []AuditEntry{
+		rsTriageEntry(11, acceptanceDispositionPaged),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_triage_paged" {
+		t.Errorf("next_actions.state = %q, want acceptance_triage_paged", out.NextActions.State)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_arbitrate_acceptance") {
+		t.Errorf("the paged arm should offer fishhawk_arbitrate_acceptance; got %+v", out.NextActions.Actions)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("a paged triage must NOT offer the merge ritual; got %+v", out.NextActions.Actions)
+	}
+}
+
+// TestRunStage_NextActions_AcceptanceSkippedOutOfScope is arm 3: it pins
+// acceptanceSkippedOutOfScopeIn THROUGH the run_stage call site. Its fixture is
+// a SUCCEEDED, VERDICT-LESS acceptance stage carrying the skip marker — the skip
+// arm's precondition (state=="succeeded" && verdict=="") is disjoint from the
+// arbitration arm's (inside the failed-verdict case), which is what makes this
+// fixture sensitive to the OTHER bool in the transposition counterfactual.
+func TestRunStage_NextActions_AcceptanceSkippedOutOfScope(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	fb.mu.Lock()
+	fb.auditByRun[runID] = []AuditEntry{rsSkipEntry(10)}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_skipped_out_of_scope" {
+		t.Errorf("next_actions.state = %q, want acceptance_skipped_out_of_scope (NOT the defensive acceptance_settled_outcome_unknown arm)",
+			out.NextActions.State)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("the out-of-scope skip is merge-eligible (E38.3 / #1877); got %+v", out.NextActions.Actions)
+	}
+}
+
+// TestRunStage_NextActions_AcceptanceArbitrated is arm 4 — the signal the prior
+// plan left unexercised. It pins acceptanceArbitratedIn THROUGH the run_stage
+// call site: a failed verdict at a known SEQUENCE, a correlated paged
+// disposition, and an acceptance_triage_arbitrated discharge whose payload
+// outcome_sequence EQUALS that verdict's sequence (the payload-equality rule,
+// never an ordering rule — see acceptanceArbitratedIn).
+//
+// The negative assertions are load-bearing: acceptance_settled_outcome_unknown
+// is the defensive arm this issue is about, acceptance_triage_paged is the
+// UN-discharged failure (what a false acceptanceArbitrated would render), and
+// acceptance_passed would mean the verdict signal leaked into the wrong slot.
+func TestRunStage_NextActions_AcceptanceArbitrated(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	fb.mu.Lock()
+	fb.auditByRun[runID] = []AuditEntry{
+		naArbitrationEntry(12, 10),
+		rsTriageEntry(11, acceptanceDispositionPaged),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	switch out.NextActions.State {
+	case "acceptance_arbitrated":
+		// want
+	case "acceptance_settled_outcome_unknown":
+		t.Fatal("next_actions.state = acceptance_settled_outcome_unknown: run_stage is still passing empty acceptance signals (#1562)")
+	case "acceptance_triage_paged":
+		t.Fatal("next_actions.state = acceptance_triage_paged: the arbitration discharge did not reach the classifier (acceptanceArbitrated arrived false)")
+	default:
+		t.Fatalf("next_actions.state = %q, want acceptance_arbitrated", out.NextActions.State)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("the arbitrated arm should offer the merge ritual; got %+v", out.NextActions.Actions)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_arbitrate_acceptance") {
+		t.Errorf("a discharged run must not be offered the arbitration it already has; got %+v", out.NextActions.Actions)
+	}
+}
+
+// TestRunStage_NextActions_AuditFetchError_FailsOpen pins the fail-open degrade:
+// with the audit endpoint 500ing, the acceptance-stage run STILL returns a
+// next_actions block, classifies the DEFENSIVE acceptance_settled_outcome_unknown
+// arm (fail toward read, never toward merge), emits NO warning naming the audit,
+// and leaves AuditPointer nil — i.e. the widened fetch did not change the
+// pointer's failure contract. All four helpers range over the nil slice and
+// return their zero value, so fail-open is by construction, not by convention.
+func TestRunStage_NextActions_AuditFetchError_FailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	fb.mu.Lock()
+	fb.auditByRun[runID] = []AuditEntry{naOutcomeEntry(10, acceptanceVerdictPassed)}
+	fb.auditStatus = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_settled_outcome_unknown" {
+		t.Errorf("next_actions.state = %q, want acceptance_settled_outcome_unknown on an audit fetch error", out.NextActions.State)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("the defensive arm must NEVER offer the merge ritual; got %+v", out.NextActions.Actions)
+	}
+	if out.AuditPointer != nil {
+		t.Errorf("AuditPointer should stay nil on an audit fetch error; got %+v", out.AuditPointer)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(strings.ToLower(w), "audit") {
+			t.Errorf("an audit fetch failure must add no warning (#1024); got %q", w)
+		}
+	}
+}
+
+// TestRunStage_NextActions_EmptyAuditWindow pins the other degrade: a window
+// that carries no entries at all (every acceptance entry aged out) leaves the
+// four signals at their zero values and lands the same defensive arm.
+func TestRunStage_NextActions_EmptyAuditWindow(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	fb.mu.Lock()
+	fb.auditByRun[runID] = []AuditEntry{}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_settled_outcome_unknown" {
+		t.Errorf("next_actions.state = %q, want acceptance_settled_outcome_unknown on an empty audit window", out.NextActions.State)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("the defensive arm must NEVER offer the merge ritual; got %+v", out.NextActions.Actions)
+	}
+}
+
+// TestRunStage_NextActions_NonAcceptanceStage_VerdictInWindowIgnored pins the
+// residual of deriving the four signals UNCONDITIONALLY: every run_stage call
+// now carries them, and only classifier arm ORDERING keeps a NON-acceptance
+// stage from being reclassified off a verdict left in the window by a prior
+// acceptance attempt. A plan stage parked at its gate must still classify
+// plan_gate_parked and offer fishhawk_approve_plan.
+func TestRunStage_NextActions_NonAcceptanceStage_VerdictInWindowIgnored(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.auditByRun[runID] = []AuditEntry{naOutcomeEntry(10, acceptanceVerdictPassed)}
+	fb.mu.Unlock()
+	seedStage(fb, runID, stageID, "awaiting_approval")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "w",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("NextActions is nil; want the #1024 block")
+	}
+	if out.NextActions.State != "plan_gate_parked" {
+		t.Errorf("next_actions.state = %q, want plan_gate_parked — a stale acceptance verdict in the window must not reclassify a plan stage",
+			out.NextActions.State)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_approve_plan") {
+		t.Errorf("the parked plan gate should still offer fishhawk_approve_plan; got %+v", out.NextActions.Actions)
+	}
+}
+
+// TestRunStageAuditWindow_EqualsAuditLimitMax closes the one gap the wire-level
+// limit assertion in TestRunStage_AuditPointer_NilOnBackend500 cannot: that
+// assertion compares the observed ?limit= against strconv.Itoa(runStageAuditWindow),
+// so it proves the constant reaches the backend UNREWRITTEN and UNCLAMPED (a call
+// site passing a different value fails it) but is SELF-PAIRED with respect to the
+// constant's VALUE — narrowing runStageAuditWindow to 1 keeps it green. The fake
+// backend serves its whole seeded slice regardless of ?limit=, so no arm test
+// discriminates the window size either.
+//
+// This pins the value: run_stage's window must stay auditLimitMax, the same
+// ceiling clampAuditLimit admits for fishhawk_get_run_status, so the acceptance
+// signals the two surfaces derive can never disagree because one read a shorter
+// window than the other (E31.15 / #1562). A narrowing is then a visible RED here
+// rather than a silent regression to the defensive
+// acceptance_settled_outcome_unknown arm on aged-out entries.
+func TestRunStageAuditWindow_EqualsAuditLimitMax(t *testing.T) {
+	if runStageAuditWindow != auditLimitMax {
+		t.Errorf("runStageAuditWindow = %d, want auditLimitMax (%d): run_stage must read the same window fishhawk_get_run_status clamps to",
+			runStageAuditWindow, auditLimitMax)
+	}
 }
