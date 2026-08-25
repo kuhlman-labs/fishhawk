@@ -51,6 +51,19 @@ type FilingRequest struct {
 	// numbered item is filed with a non-empty seed whose max is 0
 	// (existing_numbers:[0] -> 1). Ignored for non-numbered types.
 	ExistingNumbers []int
+	// IdempotencyKey, when non-empty, is stamped into the rendered body as a
+	// hidden HTML-comment marker (see idempotency.go) so a FORGE-STATE
+	// query-before-file dedup can recognize an item this caller already filed
+	// — the durable handle GitHub's issue-create API does not otherwise offer
+	// (#2064, E50.7).
+	//
+	// It is ADDITIVE and inert by default: an empty key leaves the rendered
+	// body byte-identical to today's. The stamp is applied to whichever branch
+	// produced the body — a caller-supplied Body OR a skeleton assembled from
+	// Sections — so the key cannot be lost depending on which branch ran, and
+	// it is STAMP-ONCE, so a caller Body that already carries the key is not
+	// double-marked.
+	IdempotencyKey string
 }
 
 // placeholderRE matches a `{name}` title_format placeholder.
@@ -111,6 +124,10 @@ func Apply(req FilingRequest, conv Conventions) (WorkItem, int, error) {
 		}
 		body = assembleBody(itemType, req.Sections)
 	}
+	// Stamp the idempotency key AFTER the body branch resolves, so BOTH the
+	// caller-supplied-Body path and the skeleton-assembled path carry it
+	// (#2064). Empty key = no-op, so every existing caller renders unchanged.
+	body = StampIdempotencyKey(body, req.IdempotencyKey)
 
 	labels := mergeLabels(itemType.DefaultLabels, req.Labels)
 	labels, defaulted, missing := applyLabelCompleteness(itemType, labels)

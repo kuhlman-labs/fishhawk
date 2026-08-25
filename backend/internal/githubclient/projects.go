@@ -593,6 +593,13 @@ type SubIssue struct {
 	Labels      []string
 	State       string
 	StateReason string
+	// URL is the child issue's canonical absolute URL as GitHub returns it
+	// (the GraphQL `url` field). It is carried through verbatim rather than
+	// composed from owner/repo/number, because Client.BaseURL is configurable
+	// and a literal https://github.com/ prefix would be wrong on a GitHub
+	// Enterprise Server host — see workmgmt.EpicChild.URL, the consumer that
+	// records it as an adopted child's URL (#2064, E50.7).
+	URL string
 }
 
 // listSubIssuesFirst is the sub-issues connection page size. ListSubIssues
@@ -664,6 +671,7 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
           title
           body
           id
+          url
           state
           stateReason
           labels(first: $labelsFirst) {
@@ -691,6 +699,7 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 						Title       string `json:"title"`
 						Body        string `json:"body"`
 						ID          string `json:"id"`
+						URL         string `json:"url"`
 						State       string `json:"state"`
 						StateReason string `json:"stateReason"`
 						Labels      struct {
@@ -729,7 +738,7 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 					labels = append(labels, l.Name)
 				}
 			}
-			results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels, State: n.State, StateReason: n.StateReason})
+			results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, URL: n.URL, Labels: labels, State: n.State, StateReason: n.StateReason})
 		}
 		if !data.Node.SubIssues.PageInfo.HasNextPage {
 			break

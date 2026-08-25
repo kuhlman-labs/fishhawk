@@ -203,3 +203,31 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 		t.Errorf("provider did not receive epic-children request: %+v", fp.gotEpic)
 	}
 }
+
+// TestEpicChild_CarriesBodyAndURLForAdoption pins the capability SHAPE the
+// forge-state adoption path (#2064, E50.7) depends on: EpicChild carries the
+// child's raw Body (the surface the idempotency lookup reads) and the forge's
+// own URL (recorded verbatim on adoption). Both are additive — this asserts
+// they exist, round-trip through an EpicChildrenResult, and that a marker
+// stamped into a body is detectable off the mapped value.
+func TestEpicChild_CarriesBodyAndURLForAdoption(t *testing.T) {
+	key := MintIdempotencyKey("fishhawk-split-child", "run-abc", "0")
+	res := &EpicChildrenResult{Children: []EpicChild{{
+		Number: 100,
+		Title:  "phase child",
+		Body:   StampIdempotencyKey("## Summary\n\nphase child\n", key),
+		// A GHE host on purpose: the URL is the forge's own, never composed.
+		URL: "https://ghe.example.com/o/r/issues/100",
+	}}}
+
+	got := res.Children[0]
+	if !BodyHasIdempotencyKey(got.Body, key) {
+		t.Errorf("EpicChild.Body does not carry the stamped key: %q", got.Body)
+	}
+	if got.URL != "https://ghe.example.com/o/r/issues/100" {
+		t.Errorf("EpicChild.URL = %q, want the forge-supplied url verbatim", got.URL)
+	}
+	if strings.HasPrefix(got.URL, "https://github.com/") {
+		t.Errorf("EpicChild.URL must not be composed from a github.com prefix: %q", got.URL)
+	}
+}

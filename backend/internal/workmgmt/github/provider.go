@@ -625,6 +625,17 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			// not_planned / duplicate close is NOT complete — its work did not
 			// land — so it does not satisfy a downstream dependency (#2120).
 			Complete: s.State == "CLOSED" && s.StateReason == "COMPLETED",
+			// Body and URL carry the forge's own values through verbatim so
+			// the forge-state idempotency lookup (#2064, E50.7) can read the
+			// hidden marker off a child's body and, on adoption, record the
+			// SAME url the filed path would have recorded (issue.HTMLURL
+			// above) instead of composing one — Client.BaseURL is configurable,
+			// so a composed https://github.com/ url would be wrong on a GitHub
+			// Enterprise Server host. Note EpicChildren deliberately applies NO
+			// state filter, so a child CLOSED before a re-approval is still
+			// returned and still adoptable.
+			Body: s.Body,
+			URL:  s.URL,
 		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
