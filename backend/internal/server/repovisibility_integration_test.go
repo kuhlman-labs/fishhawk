@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/google/uuid"
@@ -293,6 +294,9 @@ func TestRepoVisibility_Integration_MemberSeesOnlyGrantedRepo(t *testing.T) {
 			{"run", "/v0/runs/" + f.hidRun.String()},
 			{"campaign", "/v0/campaigns/" + f.hidCamp.String()},
 			{"refinement session", "/v0/refinement/sessions/" + f.hidSess.String()},
+			// Onboarding readiness point read (#1512): the repo is a query
+			// param, not a path value, but it inherits the same 403 contract.
+			{"onboarding readiness", "/v0/onboarding/readiness?repo=" + url.QueryEscape(hiddenRepo)},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -315,6 +319,18 @@ func TestRepoVisibility_Integration_MemberSeesOnlyGrantedRepo(t *testing.T) {
 
 	t.Run("visible point reads still 200", func(t *testing.T) {
 		w := f.get(t, "/v0/runs/"+f.visRun.String(), alice)
+		if w.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200 on the granted repo:\n%s", w.Code, w.Body.String())
+		}
+	})
+
+	// Onboarding readiness on the GRANTED repo is admitted. The fixture wires
+	// no Config.GitHub, so the handler takes its nil-GitHub branch (App.Reason
+	// set, Spec cascaded to unavailable) and returns a hard 200 — the same
+	// branch TestOnboardingReadiness_GitHubUnconfigured pins. Re-confirmed by
+	// reading onboarding.go at the s.cfg.GitHub == nil branch.
+	t.Run("visible onboarding readiness is admitted (200)", func(t *testing.T) {
+		w := f.get(t, "/v0/onboarding/readiness?repo="+url.QueryEscape(visibleRepo), alice)
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want 200 on the granted repo:\n%s", w.Code, w.Body.String())
 		}
@@ -344,6 +360,11 @@ func TestRepoVisibility_Integration_AdminSeesEverything(t *testing.T) {
 	// middleware seam does NOT cover, so assert the admin bypass reaches it.
 	if w := f.get(t, "/v0/refinement/sessions/"+f.hidSess.String(), bob); w.Code != http.StatusOK {
 		t.Errorf("admin refinement read = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// Onboarding readiness (#1512) is the same handler-resolved gate: an admin
+	// cookie session is admitted on the hidden repo (200, nil-GitHub branch).
+	if w := f.get(t, "/v0/onboarding/readiness?repo="+url.QueryEscape(hiddenRepo), bob); w.Code != http.StatusOK {
+		t.Errorf("admin onboarding readiness = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	if f.forge.calls != 0 {
 		t.Errorf("admin bypass made %d forge calls, want 0", f.forge.calls)

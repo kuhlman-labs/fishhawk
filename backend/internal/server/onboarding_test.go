@@ -3,12 +3,15 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -502,6 +505,325 @@ func TestOnboardingReadiness_CookieSessionScopeBypass(t *testing.T) {
 	}
 	if len(resp.Scopes.Missing) != 0 {
 		t.Errorf("Scopes.Missing = %v, want empty", resp.Scopes.Missing)
+	}
+}
+
+// --- Repo read-visibility gate (#1512, ADR-057 Amendment A2 / #2071) ---
+
+// newOnboardingVisServer builds an onboarding Server with the repo-visibility
+// seams wired (mirror + account-role provider + repo-provider resolver) plus an
+// optional GitHub fake. It is the fixture for the #1512 point-read gate tests:
+// a nil ghSrv leaves cfg.GitHub nil, so the denied path (which short-circuits
+// before any forge call) needs no GitHub wiring, while an admitted path wires
+// ghSrv so the full 200 aggregate can be asserted.
+func newOnboardingVisServer(t *testing.T, ghSrv *httptest.Server, vis RepoVisibility, roles AccountRoles, providers ProviderResolver, reviewers ReviewerSet) *Server {
+	t.Helper()
+	cfg := Config{
+		Addr:           "127.0.0.1:0",
+		RepoVisibility: vis,
+		AccountRoles:   roles,
+		RepoProviders:  providers,
+		PlanReviewers:  reviewers,
+	}
+	if ghSrv != nil {
+		cfg.GitHub = &githubclient.Client{
+			BaseURL: ghSrv.URL,
+			Tokens:  &ghTokensStub{tok: "ghs_test"},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+			AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+		}
+	}
+	return New(cfg)
+}
+
+// runOnboarding invokes the handler directly with id injected and returns the
+// recorder so a test can assert on the raw body (the denied path is an error
+// envelope, not a decodable onboardingReadinessResponse).
+func runOnboarding(s *Server, repo string, id Identity) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq(repo, &id))
+	return w
+}
+
+// TestOnboardingReadiness_RepoNotVisible is the primary control (#1512) and the
+// counterfactual vehicle: a non-admin cookie session querying a repo the mirror
+// denies gets 403 repo_forbidden BEFORE any forge call, and no spec parse/
+// validation text reaches the caller. The deny is seeded BY CONSTRUCTION — the
+// fake mirror's default answer for an unlisted repo is false — so the RED lands
+// on the behavioral assertion, not on fixture setup.
+func TestOnboardingReadiness_RepoNotVisible(t *testing.T) {
+	// ghSrv is wired so a MISSING short-circuit would reach GitHub and bump the
+	// call counters; the gate must keep them at zero.
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	vis := newFakeRepoVisibility(map[string]bool{}) // "x/y" absent → not visible
+	s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "repo_forbidden" {
+		t.Errorf("error.code = %q, want repo_forbidden", code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "\"spec\"") || strings.Contains(body, "installation") {
+		t.Errorf("denied body leaks readiness state:\n%s", body)
+	}
+	if fake.installationCalls != 0 || fake.specCalls != 0 {
+		t.Errorf("forge calls = install:%d spec:%d, want 0/0 (short-circuit before any forge call)",
+			fake.installationCalls, fake.specCalls)
+	}
+}
+
+// TestOnboardingReadiness_RepoVisible is the admission control: the same
+// non-admin cookie identity on a repo the mirror ALLOWS gets the full
+// pre-change 200 surface. Without it a guard that denied everything would still
+// pass RepoNotVisible.
+func TestOnboardingReadiness_RepoVisible(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	reviewers := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": &fakePlanReviewer{},
+		"codex":     &fakePlanReviewer{},
+	}}
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true})
+	s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleMember}, nil, reviewers)
+
+	mid := memberIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &mid))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if !resp.App.Installed || resp.App.InstallationID != 12345 {
+		t.Errorf("App = %+v, want Installed=true InstallationID=12345", resp.App)
+	}
+	if resp.Spec.Source != "fetched" || !resp.Spec.Valid {
+		t.Errorf("Spec = %+v, want fetched+valid", resp.Spec)
+	}
+	if len(resp.Reviewers) != 2 {
+		t.Errorf("len(Reviewers) = %d, want 2", len(resp.Reviewers))
+	}
+}
+
+// TestOnboardingReadiness_BearerTokenUnfiltered: a bearer/MCP identity
+// (TokenID != "") is UNFILTERED even on a repo the mirror would deny — the
+// fishhawk doctor / fishhawk_doctor MCP posture. 200, mirror never asked.
+func TestOnboardingReadiness_BearerTokenUnfiltered(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	vis := newFakeRepoVisibility(map[string]bool{}) // would deny x/y
+	s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	// Bearer identity: Subject "github:op", TokenID "tok-1".
+	bid := tokenIdentity("read:runs")
+	code, _ := decodeReadiness(t, s, onboardingReq("x/y", &bid))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (bearer identity unfiltered)", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (bearer never filtered)", vis.callCount())
+	}
+}
+
+// TestOnboardingReadiness_AdminCookieBypass: a cookie session whose AccountRoles
+// resolves RoleAdmin bypasses filtering on a repo the mirror would deny → 200,
+// mirror never asked. This is what makes the NON-ADMIN qualification in every
+// doc surface true rather than merely asserted.
+func TestOnboardingReadiness_AdminCookieBypass(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	vis := newFakeRepoVisibility(map[string]bool{}) // would deny x/y
+	s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleAdmin}, nil, nil)
+
+	mid := memberIdentity()
+	code, _ := decodeReadiness(t, s, onboardingReq("x/y", &mid))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (admin cookie bypasses filtering)", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (admin bypass, mirror never asked)", vis.callCount())
+	}
+}
+
+// TestOnboardingReadiness_NoMirrorWired: with Config.RepoVisibility == nil the
+// endpoint keeps its exact pre-change surface (200), the untenanted-allow
+// posture (repoFilterFor's first early return).
+func TestOnboardingReadiness_NoMirrorWired(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	s := newOnboardingVisServer(t, ghSrv, nil, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	mid := memberIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &mid))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no mirror wired)", code)
+	}
+	if !resp.App.Installed {
+		t.Errorf("App.Installed = false, want true (pre-change surface preserved)")
+	}
+}
+
+// TestOnboardingReadiness_VisibilityStoreFault: a mirror STORE fault (Visible
+// returns a non-nil error) is 503 service_unavailable — never 403 and never
+// 200. The store-fault class must not collapse into the permission-denied class.
+func TestOnboardingReadiness_VisibilityStoreFault(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{})
+	vis.err = errors.New("mirror store unreachable")
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "service_unavailable" {
+		t.Errorf("error.code = %q, want service_unavailable", code)
+	}
+}
+
+// TestOnboardingReadiness_RoleResolutionFault: an AccountRoles.MemberRole error
+// surfaces as 503 (repoFilterFor propagates it rather than bypassing/denying).
+func TestOnboardingReadiness_RoleResolutionFault(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true})
+	roles := fakeAccountRoles{role: account.RoleMember, err: errors.New("role store down")}
+	s := newOnboardingVisServer(t, nil, vis, roles, nil, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "service_unavailable" {
+		t.Errorf("error.code = %q, want service_unavailable", code)
+	}
+}
+
+// TestOnboardingReadiness_ProviderResolutionFault: a RepoProviders.
+// ResolveProvider error surfaces as 503.
+func TestOnboardingReadiness_ProviderResolutionFault(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true})
+	providers := &fakeProviderResolver{err: errors.New("provider store down")}
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, providers, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "service_unavailable" {
+		t.Errorf("error.code = %q, want service_unavailable", code)
+	}
+}
+
+// TestOnboardingReadiness_CrossForgeDeny: a resolver answering a forge different
+// from the caller's (caller github:alice, row gitlab) denies 403 with ZERO
+// forge calls AND zero mirror Visible calls.
+func TestOnboardingReadiness_CrossForgeDeny(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	ghSrv := fake.server(t)
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true}) // would ALLOW if reached
+	providers := &fakeProviderResolver{provider: "gitlab", found: true}
+	s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleMember}, providers, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "repo_forbidden" {
+		t.Errorf("error.code = %q, want repo_forbidden", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (cross-forge short-circuits)", vis.callCount())
+	}
+	if fake.installationCalls != 0 || fake.specCalls != 0 {
+		t.Errorf("forge calls = install:%d spec:%d, want 0/0", fake.installationCalls, fake.specCalls)
+	}
+}
+
+// TestOnboardingReadiness_AmbiguousRowForgeDeny: a resolver answering found=false
+// (owner unregistered or dual-registered) fails CLOSED → 403.
+func TestOnboardingReadiness_AmbiguousRowForgeDeny(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true}) // would ALLOW if reached
+	providers := &fakeProviderResolver{found: false}
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, providers, nil)
+
+	w := runOnboarding(s, "x/y", memberIdentity())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "repo_forbidden" {
+		t.Errorf("error.code = %q, want repo_forbidden", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (ambiguous row short-circuits)", vis.callCount())
+	}
+}
+
+// TestOnboardingReadiness_PrefixlessSubjectDenyAll: a cookie subject with no
+// "<provider>:" prefix cannot be keyed into the mirror, so repoFilterFor returns
+// a deny-all filter → 403, mirror never asked.
+func TestOnboardingReadiness_PrefixlessSubjectDenyAll(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true}) // would ALLOW if reached
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	id := memberIdentity()
+	id.Subject = "alice" // no provider prefix
+	w := runOnboarding(s, "x/y", id)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "repo_forbidden" {
+		t.Errorf("error.code = %q, want repo_forbidden", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (deny-all never asks the mirror)", vis.callCount())
+	}
+}
+
+// TestOnboardingReadiness_AnonymousBeforeVisibility pins the ordering invariant:
+// an anonymous request against a store-faulting mirror still gets 401
+// authentication_required, not 503. Note the honest scope (CONDITION 2): the
+// visibility gate sits AFTER the handler's anonymous check, and repoFilterFor
+// ALSO short-circuits anonymous callers (returning a nil filter before the
+// mirror is ever consulted), so the mirror fault is unreachable for an anonymous
+// caller by two independent mechanisms. This test therefore documents the
+// handler-level ordering it can actually observe — anonymous is gated by auth,
+// never by the mirror — rather than serving as a strict hoist counterfactual.
+func TestOnboardingReadiness_AnonymousBeforeVisibility(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{})
+	vis.err = errors.New("mirror store unreachable")
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", nil)) // anonymous
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (auth precedes visibility):\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "authentication_required" {
+		t.Errorf("error.code = %q, want authentication_required", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (never consulted for anonymous)", vis.callCount())
+	}
+}
+
+// TestOnboardingReadiness_MalformedRepoBeforeVisibility pins the 400-before-403
+// ordering: an authenticated non-admin caller sending repo="owner/name/extra"
+// against a deny-all mirror still gets 400 validation_failed, and the mirror's
+// Visible is never called — the filter must never be handed a malformed key. If
+// the guard were hoisted above the format check this would go 403 (or ask the
+// mirror the malformed key), so the test discriminates.
+func TestOnboardingReadiness_MalformedRepoBeforeVisibility(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{}) // denies everything
+	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := runOnboarding(s, "owner/name/extra", memberIdentity())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (format check precedes visibility):\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "validation_failed" {
+		t.Errorf("error.code = %q, want validation_failed", code)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (malformed key never reaches the mirror)", vis.callCount())
 	}
 }
 
