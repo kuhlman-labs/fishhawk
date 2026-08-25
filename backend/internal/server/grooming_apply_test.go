@@ -1136,3 +1136,180 @@ func TestApproveGroomStage_AppliesHygieneAndAuditsEndToEnd(t *testing.T) {
 			got, ids.hygiene, ids.dependency)
 	}
 }
+
+// groomingApplyTierReport returns the one-of-every-class report with a SECOND
+// hygiene defect appended, proposing a delegation tier. Two hygiene entries,
+// identical in every way except the label set, is what makes the dispatch
+// assertion discriminating: a control that refused both, or neither, fails.
+func groomingApplyTierReport() (*plan.GroomingReport, groomingApplyEntryIDs, string) {
+	report, ids := groomingApplyFullReport()
+	tierRef := groomingApplyRef(19)
+	tierID := plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", tierRef)
+	report.HygieneDefects = append(report.HygieneDefects, plan.HygieneDefect{
+		ID: tierID, ItemRef: tierRef, Defect: "missing_label_namespace",
+		Detail:       "no area: label and the tier is unset",
+		SuggestedFix: "Please attach the ownership marking and the delegation posture",
+		Fix:          &plan.HygieneFix{Labels: []string{"area:backend", "autonomy:low"}},
+	})
+	return report, ids, tierID
+}
+
+// TestApproveGroomStage_DelegationTierLabelNotApplied is the CROSS-BOUNDARY
+// end-to-end for containment rule 8 (E54.34 / #2855): a real Postgres
+// run/stage/artifact/approval/audit stack, a real approve, the real apply layer,
+// and the resulting audit rows fed back through the UNCHANGED
+// priorGroomingDispositions.
+//
+// This is the seam the per-layer units cannot cover. Four things have to agree
+// for the refusal to be real: workmgmt's derivation must MARK the entry, the
+// server's apply hook must keep passing GateApproved nil, the bare audit payload
+// must carry the named skip reason, and the churn guard's decoder must read that
+// payload back as a skipped disposition. Each layer's unit pins its own side;
+// only this pins that they are the same shape.
+//
+// It asserts on COMMITTED state — the mutator's dispatch log and the persisted
+// audit rows — because the hook returns nothing.
+func TestApproveGroomStage_DelegationTierLabelNotApplied(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	apprRepo := approval.NewPostgresRepository(pool)
+
+	rn, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: groomingApplyRepo, WorkflowID: "backlog_grooming", WorkflowSHA: "abc",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(groomingApplySpec),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: rn.ID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("create groom stage: %v", err)
+	}
+	if _, err := runRepo.TransitionStage(ctx, stage.ID, run.StageStateAwaitingApproval, nil); err != nil {
+		t.Fatalf("park stage at awaiting_approval: %v", err)
+	}
+
+	report, ids, tierID := groomingApplyTierReport()
+	sv := "grooming_report_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: stage.ID, Kind: artifact.KindGroomingReport,
+		SchemaVersion: &sv, Content: groomingApplyReportJSON(t, report),
+	}); err != nil {
+		t.Fatalf("create grooming_report artifact: %v", err)
+	}
+
+	mut := &groomingApplyMutator{}
+	rdr := &groomingApplyReader{}
+	prevConv, prevMut, prevRdr := conventionsLoader, groomingMutatorFor, groomingReaderFor
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{Provider: "github", States: map[string]string{
+			workmgmt.CanonicalStateBacklog: "Backlog", workmgmt.CanonicalStateUpNext: "Up Next",
+		}}, nil
+	}
+	groomingMutatorFor = func(string) (workmgmt.GroomingMutator, error) { return mut, nil }
+	groomingReaderFor = func(string) (workmgmt.WorkItemReader, error) { return rdr, nil }
+	t.Cleanup(func() {
+		conventionsLoader, groomingMutatorFor, groomingReaderFor = prevConv, prevMut, prevRdr
+	})
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: runRepo, ArtifactRepo: artRepo,
+		AuditRepo: auditRepo, ApprovalRepo: apprRepo,
+	})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"hygiene looks right"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) The provider was NOT dialed for the tier entry — and WAS for the
+	// clerical hygiene entry beside it, so this is a refusal and not a
+	// whole-apply degrade.
+	dialed := mut.dialedEntryIDs()
+	for _, id := range dialed {
+		if id == tierID {
+			t.Fatalf("provider dialed the delegation-tier entry %q; a whole-report approval must not write an autonomy: label", tierID)
+		}
+	}
+	want := map[string]bool{ids.hygiene: true, ids.dependency: true}
+	if len(dialed) != len(want) {
+		t.Fatalf("dialed = %v, want exactly the clerical hygiene defect and the dependency edge", dialed)
+	}
+	for _, id := range dialed {
+		if !want[id] {
+			t.Errorf("provider dialed %q, which is neither the clerical hygiene entry nor the dependency edge", id)
+		}
+	}
+
+	// (b) The refusal is AUDITED with the named reason, and the proposal stays
+	// visible on the row — the operator can still see the tier that was proposed.
+	rows, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingMutationAppliedCategory)
+	if err != nil {
+		t.Fatalf("list mutation rows: %v", err)
+	}
+	var tierRec *workmgmt.GroomingMutationRecord
+	for _, row := range rows {
+		var rec workmgmt.GroomingMutationRecord
+		if uerr := json.Unmarshal(row.Payload, &rec); uerr != nil {
+			t.Fatalf("decode grooming_mutation_applied payload: %v (%s)", uerr, row.Payload)
+		}
+		if rec.EntryID == tierID {
+			cp := rec
+			tierRec = &cp
+		}
+	}
+	if tierRec == nil {
+		t.Fatalf("no grooming_mutation_applied row for the delegation-tier entry %q; a refusal that is not audited is invisible", tierID)
+	}
+	if tierRec.Outcome != workmgmt.GroomingOutcomeSkipped ||
+		tierRec.SkipReason != workmgmt.GroomingSkipDelegationTierNotAuthorized {
+		t.Errorf("tier row = %+v, want skipped/%s", *tierRec, workmgmt.GroomingSkipDelegationTierNotAuthorized)
+	}
+	if !containsString(tierRec.After.List, "autonomy:low") {
+		t.Errorf("tier row After = %+v, want the proposed tier surfaced so the suggestion stays visible", tierRec.After)
+	}
+
+	// (c) THE SEAM: the UNCHANGED churn-guard decoder reads that row back into
+	// the third state — ABSENT from the baseline (neither applied, nor an
+	// already_applied suppression, nor a rejected/amended verdict). Absence is
+	// what makes the entry RESURFACE next run for the human to decide, which is
+	// the disposition a containment refusal must produce. A decoder that
+	// classified it as applied or as already_applied would suppress it forever.
+	decisions, appliedResult, derr := s.priorGroomingDispositions(ctx, rn.ID)
+	if derr != nil {
+		t.Fatalf("priorGroomingDispositions: %v", derr)
+	}
+	for _, rec := range appliedResult.Applied {
+		if rec.EntryID == tierID {
+			t.Errorf("the refused tier entry round-tripped as APPLIED into the churn baseline; it would be suppressed instead of resurfacing")
+		}
+	}
+	for _, rec := range appliedResult.Skipped {
+		if rec.EntryID == tierID {
+			t.Errorf("the refused tier entry round-tripped as an already_applied SUPPRESSION; it must stay absent from the baseline so it resurfaces")
+		}
+	}
+	for _, d := range decisions {
+		if d.EntryID == tierID {
+			t.Errorf("the refused tier entry round-tripped as a %q verdict; the operator rejected nothing — containment refused it", d.Verdict)
+		}
+	}
+	// The CLERICAL hygiene entry beside it DID round-trip as applied, so the
+	// absence above is a per-entry outcome and not a decoder that read nothing.
+	var clericalApplied bool
+	for _, rec := range appliedResult.Applied {
+		if rec.EntryID == ids.hygiene {
+			clericalApplied = true
+		}
+	}
+	if !clericalApplied {
+		t.Errorf("the clerical hygiene entry %q did not round-trip as applied; the tier entry's absence proves nothing if the decoder read nothing", ids.hygiene)
+	}
+}

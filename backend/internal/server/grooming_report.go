@@ -283,6 +283,27 @@ func groomingEntryCounts(gr *plan.GroomingReport) map[string]int {
 		counts["milestone_exclusions"] = len(gr.MilestoneScope.Excluded)
 		counts["milestone_declined_calls"] = len(gr.MilestoneScope.DeclinedCalls)
 	}
+	// Delegation-tier proposals (E54.34 / #2855): how many hygiene entries
+	// propose a label in the `autonomy:` namespace. Those entries are NOT
+	// applied by a whole-report approval — the apply layer's rule 8 records each
+	// as an audited delegation_tier_not_authorized skip — so this is the count
+	// the operator reads at the gate to see the suggestion exists and that none
+	// of it will land. It keys on workmgmt.LabelsSetDelegationTier, the SAME
+	// predicate the refusal keys on, so the census cannot drift toward
+	// under-counting what is about to be blocked.
+	//
+	// Emitted ONLY when non-zero, following the milestone-counts precedent
+	// above, so an ordinary grooming report's audit payload stays byte-identical
+	// to before this change.
+	tierProposals := 0
+	for _, d := range gr.HygieneDefects {
+		if d.Fix != nil && workmgmt.LabelsSetDelegationTier(d.Fix.Labels) {
+			tierProposals++
+		}
+	}
+	if tierProposals > 0 {
+		counts["delegation_tier_proposals"] = tierProposals
+	}
 	return counts
 }
 

@@ -16,7 +16,7 @@ package workmgmt
 // ApplyRequest because apply.go already owns the pure FILING Apply +
 // FilingRequest; the two are different operations and must not share a name.
 //
-// CONTAINMENT is the point. Seven rules stand between an agent's proposal and
+// CONTAINMENT is the point. Eight rules stand between an agent's proposal and
 // a tracker write, and each is pinned by a named test that goes RED when the
 // rule is deleted:
 //
@@ -46,6 +46,23 @@ package workmgmt
 //	7. AUDIT           every candidate — applied, failed AND skipped — produces
 //	                   an audit record, and a sink error surfaces AFTER the loop
 //	                   so nothing is silently unaudited. AC3.
+//	8. DELEGATION TIER a hygiene label_set proposing a label in the `autonomy:`
+//	                   namespace — the label that decides whether an agent may
+//	                   drive the item AT ALL — dispatches ONLY under an explicit
+//	                   per-entry gate approval. Unlike rule 4 it does NOT accept
+//	                   mode auto: `hygiene: {mode: auto}` is precisely the
+//	                   authority this repository grants the class, and a tier
+//	                   write is precisely what that authority must not extend to
+//	                   (#2855). The refusal is an AUDITED skip carrying the
+//	                   proposed labels on `after`, so the groomer's suggestion
+//	                   stays visible and the entry resurfaces for a human.
+//
+// RULE 8'S LADDER POSITION IS LOAD-BEARING, and is a different claim from the
+// rule count. It sits BETWEEN rule 4 (destructive) and the pre-dispatch read:
+// AFTER rule 3, so a report-mode class still short-circuits first and reports
+// `mode_report_surface_only` rather than this reason (approval condition I1),
+// and BEFORE the resolution-skip return, so a containment refusal is never
+// masked by an item-ref resolution skip — exactly where rule 4 already sits.
 //
 // THE PRODUCTION CALLER IS THE SERVER'S GROOM-GATE APPROVAL HOOK (E54.19 /
 // #2822): backend/internal/server/grooming_apply.go's applyApprovedGrooming
@@ -61,6 +78,13 @@ package workmgmt
 // decision-capture surface exists to carry a real operator verdict for them; a
 // caller that wants to widen that must supply the decisions, not weaken a rule
 // here.
+//
+// THAT CALLER ALSO PASSES GateApproved NIL, which since #2855 additionally
+// means a hygiene entry proposing an `autonomy:` delegation-tier label is
+// UNCONDITIONALLY refused under it: rule 8 reads that map and the production
+// hook populates no entry in it. #2843's per-entry disposition surface is the
+// intended future grantor, and it authorizes by SUPPLYING GateApproved for the
+// entry the operator decided — never by weakening rule 8 here.
 
 import (
 	"context"
@@ -195,6 +219,14 @@ const (
 	// GroomingSkipDestructiveNotAuthorized marks a destructive kind that
 	// reached neither mode auto + approval nor an explicit gate approval.
 	GroomingSkipDestructiveNotAuthorized = "destructive_not_authorized"
+	// GroomingSkipDelegationTierNotAuthorized marks a hygiene label_set whose
+	// proposed labels include one in the `autonomy:` DELEGATION-TIER namespace
+	// (#2855). That label decides whether an agent may drive the item at all,
+	// so it is not part of what `hygiene: {mode: auto}` and a whole-report gate
+	// approval authorize — those authorize the clerical, reversible hygiene
+	// writes. It dispatches ONLY under an explicit per-entry gate approval
+	// (GateApproved), which the production caller never populates.
+	GroomingSkipDelegationTierNotAuthorized = "delegation_tier_not_authorized"
 	// GroomingSkipAlreadyApplied marks a candidate whose proposed state is
 	// already the observed state.
 	GroomingSkipAlreadyApplied = "already_applied"
@@ -304,16 +336,24 @@ func (e *GroomingAuditError) Error() string {
 // rule has run. skipReason non-empty marks a DERIVATION-time skip (a finding,
 // an unmappable defect, a missing or invalid structured fix): the candidate is
 // recorded and never dispatched.
+//
+// delegationTier marks a label_set proposing an `autonomy:` label (rule 8). It
+// is a FLAG rather than a derivation-time skipReason deliberately: rule 0 fires
+// ahead of both the decision check and report mode, so recording the refusal at
+// derivation would report `delegation_tier_not_authorized` for a report-mode
+// class and invert approval condition I1's precedence. The flag defers the
+// decision to the ladder, where the precedence already lives.
 type groomingCandidate struct {
-	entryID      string
-	class        string
-	reportClass  string
-	kind         GroomingMutationKind
-	ref          plan.ItemRef
-	pair         []plan.ItemRef
-	after        GroomingValue
-	expectedFrom []string
-	skipReason   string
+	entryID        string
+	class          string
+	reportClass    string
+	kind           GroomingMutationKind
+	ref            plan.ItemRef
+	pair           []plan.ItemRef
+	after          GroomingValue
+	expectedFrom   []string
+	skipReason     string
+	delegationTier bool
 }
 
 // groomingClassOrder fixes the iteration order so an apply's dispatch sequence
@@ -356,6 +396,33 @@ var groomingActionClass = map[string]string{
 // equality test against a named class is false for anything unrecognized.
 func GroomingActionClassFor(reportClass string) string {
 	return groomingActionClass[reportClass]
+}
+
+// LabelsSetDelegationTier reports whether a proposed label set includes a label
+// in the DELEGATION-TIER namespace — the `autonomy:` namespace AutonomyLabelPrefix
+// declares (#2855). It is the predicate containment rule 8 keys on.
+//
+// IT JUDGES NAMES, case-insensitively and after trimming, so `Autonomy:Low` and
+// ` autonomy:low` are both caught. A case-sensitive or untrimmed check is
+// evadable, and the direction an evasion fails in is a delegation tier written
+// on a real issue with no human in the loop.
+//
+// It is deliberately BROADER than ParseAutonomyLabel, which normalizes an
+// unrecognized tier (`autonomy:critical`) to "" = non-human-led. That breadth is
+// the safe direction here: a malformed tier PROPOSAL is refused and audited
+// rather than parsed away and applied.
+//
+// It is EXPORTED for the same reason GroomingActionClassFor is: the server's
+// ingest census counts the entries this rule will refuse, and it must key on the
+// SAME predicate the refusal keys on. A second copy could drift toward
+// under-counting exactly what the refusal is about to block.
+func LabelsSetDelegationTier(labels []string) bool {
+	for _, l := range labels {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(l)), AutonomyLabelPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // groomingHygieneKinds maps each hygiene defect in grooming-report-v1's closed
@@ -418,6 +485,10 @@ func deriveGroomingMutations(report *plan.GroomingReport) []groomingCandidate {
 			c.skipReason = reason
 		} else {
 			c.after = after
+			// Rule 8's MARK, not its decision (#2855). The decision belongs to
+			// the ladder, which already orders report mode ahead of every
+			// authorization check.
+			c.delegationTier = kind == GroomingKindLabelSet && LabelsSetDelegationTier(after.List)
 		}
 		out = append(out, c)
 	}
@@ -905,6 +976,19 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	// or an explicit per-entry gate approval.
 	if c.kind.Destructive() && mode != GroomingModeAuto && !req.GateApproved[c.entryID] {
 		return groomingSkipped(rec, GroomingSkipDestructiveNotAuthorized)
+	}
+
+	// Rule 8 (#2855): a proposed DELEGATION-TIER label needs an explicit
+	// per-entry gate approval. Note what is ABSENT from this condition
+	// deliberately: unlike rule 4 it does NOT accept mode auto. Auto is exactly
+	// the authority this repository grants `hygiene`, and the tier is exactly
+	// the write that authority must not extend to — the clerical hygiene
+	// mandate does not carry a decision about whether an agent may drive the
+	// item at all. Before is left unpopulated (no read is performed); After
+	// carries the proposed labels, so the audit row shows the operator the tier
+	// that was proposed and refused.
+	if c.delegationTier && !req.GateApproved[c.entryID] {
+		return groomingSkipped(rec, GroomingSkipDelegationTierNotAuthorized)
 	}
 
 	if reason != "" {
