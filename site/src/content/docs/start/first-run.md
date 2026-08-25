@@ -173,7 +173,7 @@ fishhawkd token issue --subject "$(whoami)"
 ```console
 fishhawkd token issue: applying default operator scope set
 fhk_<40-odd-opaque-characters>
-issued token id=069cb1c6-ee70-4afd-9a6b-ea5fdbcde49f subject=brett scopes=[read:runs read:audit write:runs write:approvals write:stages write:deploy write:campaigns read:audit-export]
+issued token id=<uuid> subject=<you> scopes=[read:runs read:audit write:runs write:approvals write:stages write:deploy write:campaigns read:audit-export]
 ```
 
 The middle line is the token — it is printed once and not recoverable. Export
@@ -448,14 +448,25 @@ the local runner working as designed.
 
 ### Missing or invalid token
 
-Symptom: a `401` or `403` from any CLI call that touches a run. Check what the
-CLI is actually sending, since `--token` defaults to `$FISHHAWK_TOKEN` and
-silently accepts empty:
+Symptom: a `401` or `403` from any CLI call that touches a run. `--token`
+defaults to `$FISHHAWK_TOKEN` and silently accepts empty, so the first question
+is whether the variable is populated at all. Check that without printing the
+token — it is a live bearer credential, and a terminal transcript, a captured
+log or a shared screen keeps whatever you echo into it:
 
 ```sh
-echo "${FISHHAWK_TOKEN:-(unset)}"
+if [ -n "${FISHHAWK_TOKEN:-}" ]; then
+  printf 'FISHHAWK_TOKEN: set, %s characters\n' "${#FISHHAWK_TOKEN}"
+else
+  printf 'FISHHAWK_TOKEN: unset or empty\n'
+fi
 fishhawk run list --backend-url "$FISHHAWK_BACKEND_URL"
 ```
+
+An `unset or empty` verdict explains a `401` on its own — `-n` is false for
+both, and the CLI accepts either without complaint. If it reports a length and
+the call still fails, the value is not the thing to inspect: reissue below
+instead.
 
 A `403 insufficient_scope` names the scope it wanted. Issue a fresh token with
 the default operator scope set:
