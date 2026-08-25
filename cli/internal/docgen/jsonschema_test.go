@@ -3,6 +3,7 @@ package docgen
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,11 +15,123 @@ var accountedSchemas = map[string]string{
 	"plan-standard-v1": planSchemaRel,
 }
 
+// pointersFromMarkdown reconstructs the set of JSON pointers a
+// RenderSchemaDoc body ACTUALLY EMITTED, by parsing the output itself:
+// each level-5 "name" definition heading yields /$defs/<name>, and each
+// properties-table data row yields a /properties/<key> (under the
+// top-level fields heading) or /$defs/<name>/properties/<key> (under a
+// definition heading) pointer. It is the authority TestSchemaAccountingIsExhaustive
+// trusts INSTEAD of SchemaRender.Rendered — so deleting a markdown row or a
+// definition heading, while the renderer still self-reports the pointer in
+// Rendered, drops the pointer here and reddens the accounting.
+func pointersFromMarkdown(md string) map[string]int {
+	out := map[string]int{}
+	section := "" // "toplevel" | "defs"
+	curDef := ""  // current $defs name while section=="defs"
+	for _, line := range strings.Split(md, "\n") {
+		switch {
+		case strings.HasPrefix(line, "#### ") && strings.HasSuffix(line, "— top-level fields"):
+			section, curDef = "toplevel", ""
+			continue
+		case strings.HasPrefix(line, "#### ") && strings.HasSuffix(line, "— definitions"):
+			section, curDef = "defs", ""
+			continue
+		case strings.HasPrefix(line, "##### "):
+			name := unbacktick(strings.TrimPrefix(line, "#####"))
+			if name != "" {
+				curDef = name
+				out["/$defs/"+name]++
+			}
+			continue
+		}
+		key, ok := firstTableCellKey(line)
+		if !ok {
+			continue
+		}
+		switch section {
+		case "toplevel":
+			out["/properties/"+key]++
+		case "defs":
+			if curDef != "" {
+				out["/$defs/"+curDef+"/properties/"+key]++
+			}
+		}
+	}
+	return out
+}
+
+// firstTableCellKey returns the code-span key in the first cell of a
+// properties-table DATA row, or ok=false for any non-row line (the header,
+// the |---| separator, prose). A data row has exactly five cells and a
+// first cell wrapped in a code span.
+func firstTableCellKey(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
+		return "", false
+	}
+	cells := splitTableRow(line)
+	if len(cells) != 5 {
+		return "", false
+	}
+	first := strings.TrimSpace(cells[0])
+	if first == "Field" || strings.HasPrefix(first, "---") {
+		return "", false
+	}
+	key := unbacktick(first)
+	if key == "" || key == first { // first cell was not a code span
+		return "", false
+	}
+	return key, true
+}
+
+// splitTableRow splits a markdown table row on unescaped `|`, honouring the
+// `\|` cell escape proseCell emits, and drops the empty cells the leading
+// and trailing border pipes produce.
+func splitTableRow(line string) []string {
+	var cells []string
+	var cur strings.Builder
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\\' && i+1 < len(line) && line[i+1] == '|' {
+			cur.WriteByte('|')
+			i++
+			continue
+		}
+		if line[i] == '|' {
+			cells = append(cells, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(line[i])
+	}
+	cells = append(cells, cur.String())
+	if len(cells) >= 2 {
+		cells = cells[1 : len(cells)-1]
+	}
+	return cells
+}
+
+// unbacktick strips a surrounding single-backtick code span (the shape
+// codeSpan emits for a backtick-free, space-free key) and trims space; it
+// returns the input trimmed when there is no code span to strip.
+func unbacktick(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "`")
+	return strings.TrimSpace(s)
+}
+
 // TestSchemaAccountingIsExhaustive requires that every accountable node
 // (top-level property, $defs entry, nested $defs property, by JSON
-// pointer) is rendered exactly once OR named in DeliberateExclusions,
-// that nothing NON-accountable is rendered, and that every exclusion
-// entry still resolves (a stale exclusion is a failure). Counts are
+// pointer) appears in the rendered Markdown exactly once OR is named in
+// DeliberateExclusions, that nothing NON-accountable appears, and that
+// every exclusion entry still resolves (a stale exclusion is a failure).
+//
+// The evidence is derived FROM THE RENDERED MARKDOWN (pointersFromMarkdown)
+// — the definition headings and property rows the reader will actually see
+// — NOT from SchemaRender.Rendered, which the renderer populates itself
+// alongside but independently of the Markdown writes. Deleting a Markdown
+// row or a definition heading while the renderer keeps claiming the pointer
+// in Rendered therefore reddens this, restoring the load-bearing
+// counterfactual (drop rendered schema coverage -> fail). Counts are
 // logged so coverage magnitude is visible.
 func TestSchemaAccountingIsExhaustive(t *testing.T) {
 	root := testRepoRoot(t)
@@ -35,32 +148,30 @@ func TestSchemaAccountingIsExhaustive(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: render: %v", name, err)
 		}
-		renderedSet := map[string]int{}
-		for _, p := range sr.Rendered {
-			renderedSet[p]++
-		}
+		renderedSet := pointersFromMarkdown(sr.Markdown)
 		accSet := map[string]bool{}
 		for _, p := range acc {
 			accSet[p] = true
 		}
 		excl := DeliberateExclusions[name]
 
-		// Every accountable node rendered exactly once or excluded.
+		// Every accountable node appears in the Markdown exactly once or
+		// is excluded.
 		for _, p := range acc {
 			switch {
 			case renderedSet[p] == 1:
 			case renderedSet[p] > 1:
-				t.Errorf("%s: node %s rendered %d times, want exactly once", name, p, renderedSet[p])
+				t.Errorf("%s: node %s appears in the rendered Markdown %d times, want exactly once", name, p, renderedSet[p])
 			case excl[p] != "":
 				// deliberately excluded — fine
 			default:
-				t.Errorf("%s: accountable node %s is neither rendered nor in DeliberateExclusions", name, p)
+				t.Errorf("%s: accountable node %s appears in neither the rendered Markdown nor DeliberateExclusions", name, p)
 			}
 		}
-		// Nothing non-accountable rendered.
-		for _, p := range sr.Rendered {
+		// Nothing non-accountable appears in the Markdown.
+		for p := range renderedSet {
 			if !accSet[p] {
-				t.Errorf("%s: rendered non-accountable pointer %s", name, p)
+				t.Errorf("%s: rendered Markdown carries non-accountable pointer %s", name, p)
 			}
 		}
 		// Every exclusion entry still resolves.
@@ -76,7 +187,7 @@ func TestSchemaAccountingIsExhaustive(t *testing.T) {
 				t.Errorf("%s: stale DeliberateExclusions entry %s does not resolve in the schema", name, ptr)
 			}
 		}
-		t.Logf("%s: %d accountable nodes, %d rendered, %d excluded", name, len(acc), len(sr.Rendered), len(excl))
+		t.Logf("%s: %d accountable nodes, %d rendered (from Markdown), %d excluded", name, len(acc), len(renderedSet), len(excl))
 	}
 }
 

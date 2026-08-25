@@ -1802,39 +1802,152 @@ func TestCLIFlagsMatchExecutableSurface(t *testing.T) {
 	}
 }
 
-// TestCustomUsageCommandsArePinned derives the set of `fs.Usage = func`
-// override sites from the package source and requires each in a pinned
-// expected-harvest table, so a NEW override cannot slip in without a
-// pinned expectation (the count check) and an existing override that drops
-// fs.PrintDefaults cannot silently produce a vacuously-empty harvest (the
-// per-command equality check).
-func TestCustomUsageCommandsArePinned(t *testing.T) {
+// TestZeroFlagCommandsInterceptHelp pins that the two commands whose
+// cmdinfo entry declares an EMPTY flag set — `token list` and `validate` —
+// nonetheless register a flag.FlagSet and Parse it BEFORE doing any work,
+// so the `-h` drive in harvestFlags (TestCLIFlagsMatchExecutableSurface) is
+// intercepted by the flag package (ErrHelp -> exitUsage, usage printed) and
+// never falls through to the command body. Without a FlagSet, `token list
+// -h` would execute the real credential-store listing during `go test` and
+// the empty harvest would be a vacuous fall-through, not a truthful reading
+// of an empty flag set.
+func TestZeroFlagCommandsInterceptHelp(t *testing.T) {
+	t.Run("token list", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		got := run([]string{"token", "list", "-h"}, &stdout, &stderr)
+		if got != exitUsage {
+			t.Fatalf("token list -h = %d, want exitUsage (the FlagSet must intercept -h before credstore.List)", got)
+		}
+		// The credential-store body writes its listing / placeholder to
+		// stdout; the -h interception must never reach it.
+		if strings.Contains(stdout.String(), "stored credentials") {
+			t.Errorf("token list -h reached the credential-store body:\nstdout=%q", stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "token list") {
+			t.Errorf("token list -h printed no flag usage to stderr: %q", stderr.String())
+		}
+	})
+	t.Run("validate", func(t *testing.T) {
+		var stdout, stderr strings.Builder
+		got := run([]string{"validate", "-h"}, &stdout, &stderr)
+		if got != exitUsage {
+			t.Fatalf("validate -h = %d, want exitUsage", got)
+		}
+		// The custom Usage banner proves -h hit the FlagSet, not the
+		// path-argument fall-through (which would ReadFile the literal
+		// "-h" and report a file error instead).
+		if !strings.Contains(stderr.String(), "Usage: fishhawk validate") {
+			t.Errorf("validate -h did not print the FlagSet usage banner: %q", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "-h:") {
+			t.Errorf("validate -h fell through to the path-argument body: %q", stderr.String())
+		}
+	})
+}
+
+// usageOverrideFuncs parses every non-test .go file in the package and
+// returns, for each function that installs an `fs.Usage = func` override,
+// the NUMBER of override assignments it holds. It maps a site to its
+// ENCLOSING function rather than counting sites globally, so a moved
+// override (one pinned command's override relocated onto a different,
+// unpinned command — the count is unchanged) is visible as a set
+// difference, not swallowed by an equal total.
+func usageOverrideFuncs(t *testing.T) map[string]int {
+	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read package dir: %v", err)
 	}
-	sites := 0
+	fset := token.NewFileSet()
+	out := map[string]int{}
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		data, err := os.ReadFile(name)
+		f, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
+			t.Fatalf("parse %s: %v", name, err)
 		}
-		sites += strings.Count(string(data), ".Usage = func")
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, lhs := range as.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "Usage" {
+						continue
+					}
+					if i >= len(as.Rhs) {
+						continue
+					}
+					if _, ok := as.Rhs[i].(*ast.FuncLit); !ok {
+						continue
+					}
+					out[fn.Name.Name]++
+				}
+				return true
+			})
+		}
 	}
+	return out
+}
 
+// TestCustomUsageCommandsArePinned attributes each `fs.Usage = func`
+// override site to its ENCLOSING function via go/ast and asserts the SET of
+// override functions equals the set the pinned table expects — not merely
+// that the counts agree. Set equality closes the vacuity hole a bare count
+// leaves open: replacing one pinned command's override with an override on
+// a different, unpinned command keeps the count at 4 and the old test
+// green, letting that command's custom usage drop fs.PrintDefaults and
+// harvest empty against an empty cmdinfo entry. Per-command the harvest
+// must still equal the pinned flag set, so a dropped fs.PrintDefaults
+// reddens.
+func TestCustomUsageCommandsArePinned(t *testing.T) {
 	pinned := map[string][]string{
 		"validate":     {},
 		"migrate-spec": {"out", "in-place", "report-only"},
 		"token login":  commonPlus("provider", "client-id"),
 		"init":         commonPlus("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),
 	}
-	if sites != len(pinned) {
-		t.Fatalf("found %d `fs.Usage = func` override sites but pinned %d — add the new override to the pinned table (a custom usage that omits fs.PrintDefaults produces a vacuous empty harvest)", sites, len(pinned))
+	// Each pinned command names the function that installs its override.
+	// The ATTRIBUTED set of override functions must equal this value set.
+	pinnedFunc := map[string]string{
+		"validate":     "runValidate",
+		"migrate-spec": "runMigrateSpec",
+		"token login":  "tokenLogin",
+		"init":         "runInit",
 	}
+	wantFuncs := map[string]bool{}
+	for key := range pinned {
+		fn, ok := pinnedFunc[key]
+		if !ok {
+			t.Fatalf("pinned command %q has no expected override function in pinnedFunc", key)
+		}
+		wantFuncs[fn] = true
+	}
+
+	overrides := usageOverrideFuncs(t)
+	for fn, n := range overrides {
+		if !wantFuncs[fn] {
+			t.Errorf("function %s installs an fs.Usage override but is not pinned — add its command to the pinned table (a custom usage that omits fs.PrintDefaults produces a vacuous empty harvest)", fn)
+		}
+		if n > 1 {
+			t.Errorf("function %s installs %d fs.Usage overrides; expected exactly 1", fn, n)
+		}
+	}
+	for fn := range wantFuncs {
+		if _, ok := overrides[fn]; !ok {
+			t.Errorf("pinned override function %s installs no fs.Usage override in the package source — did the override move or get removed?", fn)
+		}
+	}
+
 	for key, flags := range pinned {
 		got := harvestFlags(t, key)
 		want := flagSet(flags)

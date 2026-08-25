@@ -30,21 +30,47 @@ func (e *rootError) Error() string {
 	return "docgen: could not resolve repo root (no go.work above " + e.start + ")"
 }
 
+// resolveSiteRoot resolves the repo root (via resolveRepoRoot) AND requires
+// a site/ directory beneath it — the drift gate regenerates and byte-
+// compares pages under site/, so a resolvable root without site/ cannot
+// host the gate. Like resolveRepoRoot it returns an error (never a bogus
+// root) so the caller can FAIL LOUDLY rather than skip. Factoring the
+// site/-absent branch out of testRepoRoot is what makes it reachable by a
+// test — TestResolveSiteRootFailsClosedWithoutSite — on a tree that always
+// ships site/.
+func resolveSiteRoot(start string) (string, error) {
+	root, err := resolveRepoRoot(start)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(filepath.Join(root, "site")); err != nil {
+		return "", &siteRootError{root: root, err: err}
+	}
+	return root, nil
+}
+
+type siteRootError struct {
+	root string
+	err  error
+}
+
+func (e *siteRootError) Error() string {
+	return "docgen: site/ absent under repo root " + e.root + ": " + e.err.Error()
+}
+
 // testRepoRoot resolves the repository root for a test and FAILS LOUDLY
 // (t.Fatalf, never t.Skip) when it cannot — the drift gate is unenforced
-// if it silently skips, so an unresolved root is a hard failure.
+// if it silently skips, so an unresolved root (no go.work) or a root
+// without site/ is a hard failure.
 func testRepoRoot(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	root, err := resolveRepoRoot(wd)
+	root, err := resolveSiteRoot(wd)
 	if err != nil {
 		t.Fatalf("drift gate cannot run: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "site")); err != nil {
-		t.Fatalf("drift gate cannot run: site/ absent under repo root %q: %v", root, err)
 	}
 	return root
 }
@@ -62,6 +88,29 @@ func TestResolveRepoRootFailsClosed(t *testing.T) {
 		// this would misfire; guard by asserting the message shape only
 		// when an error is returned.
 		t.Fatalf("resolveRepoRoot(%q) = nil error, want fail-closed error", tmp)
+	}
+}
+
+// TestResolveSiteRootFailsClosedWithoutSite pins the SECOND loud-failure
+// mode testRepoRoot relies on: a resolvable repo root (go.work present)
+// that has NO site/ directory must return an error, not a bogus root a
+// caller might treat as success. This is the logic behind testRepoRoot's
+// site/-absent t.Fatalf, which no end-to-end test can otherwise reach on a
+// tree that always ships site/.
+func TestResolveSiteRootFailsClosedWithoutSite(t *testing.T) {
+	tmp := t.TempDir()
+	// A go.work makes resolveRepoRoot succeed AT tmp (it stops at the
+	// first ancestor carrying go.work) ...
+	if err := os.WriteFile(filepath.Join(tmp, "go.work"), []byte("go 1.24\n"), 0o600); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+	// ... but with no site/ beneath it, the site-root resolve must error.
+	root, err := resolveSiteRoot(tmp)
+	if err == nil {
+		t.Fatalf("resolveSiteRoot(%q) = %q, nil error; want a fail-closed error for a root without site/", tmp, root)
+	}
+	if !strings.Contains(err.Error(), "site/") {
+		t.Errorf("error %q does not name the missing site/ directory", err)
 	}
 }
 
