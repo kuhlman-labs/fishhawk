@@ -231,10 +231,13 @@ same single warning rather than crashing the doctor.
 ### Repo read-visibility gate (#1512)
 
 Since #1512 (ADR-057 Amendment A2 / #2071), the readiness endpoint applies the
-repo-scoped read-visibility gate the product already owns: a caller who holds
-no forge `read` on the queried repo is denied `403 repo_forbidden` **before**
-any installation resolve or spec fetch, so verbatim `spec.Error` text and
-installation state never reach a caller with no read on the repo. A `503
+repo-scoped read-visibility gate the product already owns: a **non-admin cookie
+session** that holds no forge `read` on the queried repo is denied `403
+repo_forbidden` **before** any installation resolve or spec fetch, so verbatim
+`spec.Error` text and installation state never reach that caller. That caller
+class is the ONLY one the gate can deny — the three unfiltered classes below
+(bearer/MCP tokens, workspace admins including admin cookie sessions, no-mirror
+deployments) keep the exact pre-gate surface and never see the `403`. A `503
 service_unavailable` is returned instead when the visibility mirror cannot be
 resolved (a store / provider-resolution / role-resolution fault) — deliberately
 distinct from the `403` permission-denied class, never a silent allow.
