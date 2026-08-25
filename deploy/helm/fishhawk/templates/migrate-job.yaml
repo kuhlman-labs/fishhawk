@@ -1,4 +1,5 @@
 {{- if .Values.migrate.enabled }}
+{{- include "fishhawk.validateMigrateTiming" . -}}
 # DB-migration hook Job: runs `fishhawkd migrate up` before serve handles traffic
 # against an unmigrated DB — the k8s analog of the ECS one-shot migrate Fargate
 # task (infra/terraform/migrations.tf). Reuses the published fishhawkd image;
@@ -33,14 +34,34 @@ metadata:
     # orphaned Jobs across upgrades.
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
+  # Attempts = backoffLimit + 1. The derived time-to-Failed is recorded (with the
+  # counting convention and the rejected alternative) in values.yaml's migrate
+  # block; fishhawk.validateMigrateTiming above re-derives it to reject an
+  # activeDeadlineSeconds that would fire first and report DeadlineExceeded
+  # instead of the migration error.
   backoffLimit: {{ .Values.migrate.backoffLimit }}
+  {{- with .Values.migrate.activeDeadlineSeconds }}
+  # Opt-in hard ceiling; UNSET by default (see values.yaml for why).
+  activeDeadlineSeconds: {{ . }}
+  {{- end }}
   template:
     metadata:
       labels:
         {{- include "fishhawk.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: migrate
     spec:
-      restartPolicy: OnFailure
+      # Never, not OnFailure (E62.2 / #2301), for two reasons that both bear on
+      # the failure path this Job exists to make diagnosable:
+      #   * Under OnFailure the pod running the Job is TERMINATED once the
+      #     backoff limit is reached, so the logs carrying the SQL error — the
+      #     thing "recoverable" depends on — become materially harder to
+      #     retrieve. With Never each attempt leaves a distinct Failed pod whose
+      #     logs persist for `kubectl logs`, and the hook-delete-policy above
+      #     (deliberately no hook-failed) retains the Job to reach them.
+      #   * Under OnFailure retries are governed by kubelet CrashLoopBackOff
+      #     (10s..300s), not the Job-controller schedule the values.yaml timing
+      #     derivation assumes — so that derivation would not hold.
+      restartPolicy: Never
       containers:
         - name: migrate
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

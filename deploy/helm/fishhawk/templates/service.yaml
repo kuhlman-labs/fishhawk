@@ -1,4 +1,10 @@
 {{- include "fishhawk.validateMode" . -}}
+{{- /* Credential-contract guard (E62.2 / #2301). service.yaml is the only
+       template that renders in EVERY topology mode AND every secrets mode,
+       which is why validateMode already lives here: deployment.yaml does not
+       render in split mode and secret.yaml does not render outside
+       chartManaged, so neither can host a guard that must always run. */}}
+{{- include "fishhawk.validateSecretContract" . -}}
 apiVersion: v1
 kind: Service
 metadata:

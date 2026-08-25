@@ -788,10 +788,18 @@ _verify_patch_coverage() {
 # test-site-voice (#2261) pins scripts/check-site-voice, the banned-vocabulary
 # gate over site/src/content/docs/; it is bash and adds well under a second
 # (ten temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
+# test-helm-render (E62.2 / #2301) is the render gate for deploy/helm/fishhawk:
+# it drives the real chart through `helm template`/`helm lint` and asserts on
+# shipped rendered output — the only machine check that the chart's YAML
+# defaults and rendered identifiers, which no compiler enforces, still say what
+# the docs claim. It is bash and needs no zsh guard; the helm-absent SKIP lives
+# INSIDE the harness (a printed reason plus exit 0), so this loop needs no
+# helm-specific branch, and a helm-less host takes the same residual the zsh
+# guard already accepts.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-dev test-site-voice; do
+  for h in test-check-coverage test-patch-coverage test-dev test-site-voice test-helm-render; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue

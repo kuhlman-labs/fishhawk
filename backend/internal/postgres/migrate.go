@@ -37,15 +37,55 @@ func Migrations() fs.FS {
 // Accepts the standard postgres:// URL scheme; rewritten internally
 // to the pgx5:// scheme that the driver registers.
 func MigrateUp(databaseURL string) error {
-	m, err := openMigrator(databaseURL)
+	return MigrateUpFS(Migrations(), databaseURL)
+}
+
+// MigrateUpFS is MigrateUp against an explicit migration filesystem —
+// the seam that lets a test drive the REAL migration path (including
+// the dirty-state enrichment below) against a synthetic migration set,
+// rather than re-implementing it. Production callers use MigrateUp,
+// which passes the embedded Migrations().
+//
+// It is exported rather than unexported because the package's
+// migration tests live in the EXTERNAL postgres_test package (they
+// need a raw, un-migrated throwaway database, the AGENTS.md-recorded
+// exemption to the shared pgtest container), which cannot reach an
+// unexported identifier.
+func MigrateUpFS(fsys fs.FS, databaseURL string) error {
+	m, err := openMigratorFS(fsys, databaseURL)
 	if err != nil {
 		return err
 	}
 	defer func() { _, _ = m.Close() }()
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("migrate up: %w", err)
+		return fmt.Errorf("migrate up: %w", enrichDirtyError(err))
 	}
 	return nil
+}
+
+// enrichDirtyError replaces golang-migrate's bare "Dirty database
+// version N. Fix and force version." with an actionable message naming
+// the dirty version AND the recovery, so an operator reading a failed
+// migrate Job's logs is not left to infer the procedure. Any other
+// error passes through unchanged.
+//
+// The dirty FLAG itself is golang-migrate's behaviour, not this
+// package's: before running a migration it records (version, dirty) and
+// clears the flag only on success, so a failed migration leaves the
+// marker that makes the NEXT run refuse rather than proceed over a
+// half-migrated schema. This function is the only part of that path
+// this package owns.
+func enrichDirtyError(err error) error {
+	var dirty migrate.ErrDirty
+	if !errors.As(err, &dirty) {
+		return err
+	}
+	return fmt.Errorf(
+		"database is marked dirty at version %d: a previous migration failed part-way and the schema was left unverified. "+
+			"Migrations will REFUSE to run until this is resolved — no release proceeds over a half-migrated schema. "+
+			"Recovery: inspect the failed migration, repair the schema by hand if needed, then clear the marker with "+
+			"`migrate -path <migrations> -database <url> force %d` (force the version you have actually applied) and re-run migrate up: %w",
+		dirty.Version, dirty.Version, err)
 }
 
 // MigrateDown rolls back the most recent migration step. Intended
@@ -64,7 +104,11 @@ func MigrateDown(databaseURL string) error {
 }
 
 func openMigrator(databaseURL string) (*migrate.Migrate, error) {
-	src, err := iofs.New(Migrations(), ".")
+	return openMigratorFS(Migrations(), databaseURL)
+}
+
+func openMigratorFS(fsys fs.FS, databaseURL string) (*migrate.Migrate, error) {
+	src, err := iofs.New(fsys, ".")
 	if err != nil {
 		return nil, fmt.Errorf("init source: %w", err)
 	}

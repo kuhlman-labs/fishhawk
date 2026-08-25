@@ -91,7 +91,24 @@ ingress:
     # TLS Secret name cert-manager populates. Empty defaults to <fullname>-tls.
     secretName: ""
 
-# Pod resource requests/limits. Tune per cluster capacity.
+# Pod resource requests/limits for the fishhawkd container.
+#
+# SIZING RATIONALE (E62.2 / #2301). fishhawkd is a plain Go HTTP service: it
+# serves the REST API, runs the (optional) background-worker goroutines, and
+# talks to Postgres and S3. Since the 2026-07-27 simplification that moved the
+# claudecode/codex reviewers to the RUNNER, the control-plane image carries no
+# agent CLIs and spawns NO reviewer subprocesses — so nothing here needs
+# subprocess headroom, which is why the memory limit is a few hundred MiB rather
+# than the multi-GiB an agent-hosting pod would want.
+#   requests — what the scheduler reserves. 100m/128Mi is the idle-to-light
+#              steady state of a Go service with a pgx pool and a handful of
+#              timers; it keeps the pod schedulable on a small node.
+#   limits   — the blast radius, not the expected use. 500m/512Mi gives ~5x CPU
+#              burst for request spikes and migration-adjacent work while still
+#              capping a leak. Both are SET on purpose: an unset memory limit
+#              makes the pod BestEffort/Burstable without a ceiling, so a leak
+#              takes the node down instead of the pod.
+# Raise both together per cluster capacity; keep requests <= limits.
 resources:
   requests:
     cpu: 100m
@@ -183,6 +200,29 @@ singleTenant:
   # github | gitlab. Empty → github.
   provider: ""
 
+# Regional-cell profile (ADR-057 Mode 2, ADR-062 / E44.7). This block carries
+# ONLY the two NON-secret halves of the cell env matrix
+# (docs/deploy/regional-cells.md); both default empty, and an empty key stays
+# unset in the ConfigMap.
+#
+# The two SECRET halves are deliberately NOT here: FISHHAWKD_HANDOFF_SECRET and
+# FISHHAWKD_MODEL_API_KEY are records in fishhawk.secretKeySpec and travel
+# through the SAME secrets machinery as every other credential in all three
+# modes (supply them via secrets.values.* in chartManaged, the pre-created
+# Secret in `existing`, or secrets.externalSecrets.data[] in externalSecrets).
+# Setting cell.homeRegion makes FISHHAWKD_HANDOFF_SECRET required, and setting
+# cell.modelBaseUrl makes FISHHAWKD_MODEL_API_KEY required — enforced by
+# fishhawk.validateSecretContract, mirroring fishhawkd's own startup refusals.
+cell:
+  # The region this cell serves → FISHHAWKD_HOME_REGION. Empty leaves the
+  # region-pin surface DISABLED (a handoff-carrying request is refused 503).
+  homeRegion: ""
+  # In-region inference endpoint → FISHHAWKD_MODEL_BASE_URL. Empty keeps the
+  # Anthropic SDK default. A region-scoped cell that sets homeRegion but is not
+  # fully inference-configured REFUSES to boot when a reviewer is configured
+  # (#2107) rather than egress out of region.
+  modelBaseUrl: ""
+
 # Background-worker enable toggles → FISHHAWKD_ENABLE_*. All default false so a
 # fresh deploy doesn't race the timers. These workers are singletons: exactly one
 # instance may run them. In allInOne mode that means keeping replicaCount=1 while
@@ -211,9 +251,48 @@ workers:
 # on the in-cluster Postgres (a normal resource) would deadlock. Retry on a
 # not-yet-ready DB is handled by Job backoffLimit (a fresh pod per attempt), not
 # a shell wait loop, since the distroless fishhawkd image has no shell.
+#
+# TIMING DERIVATION (E62.2 / #2301) — one counting convention, recorded once:
+#   * The Job controller marks the Job Failed with reason BackoffLimitExceeded
+#     when status.failed EXCEEDS backoffLimit, so total attempts =
+#     backoffLimit + 1.
+#   * Cumulative inter-attempt backoff is the 10s-doubling series
+#     (10, 20, 40, 80, 160, 320; each term capped at 6 minutes) summed over
+#     backoffLimit terms.
+#   * timeToFailed = (backoffLimit + 1) * assumedAttemptSeconds + backoff
+# At the shipped backoffLimit=2 and assumedAttemptSeconds=60 that is
+#   3 * 60 + (10 + 20) = 210s
+# against Helm's 300s default `--timeout`, a 90s margin. The rejected
+# alternative: backoffLimit=3 gives 4 * 60 + 70 = 310s, already PAST Helm's
+# default timeout — the release would report a Helm timeout instead of the
+# migration error, which is the whole point of the failure path.
+#
+# 210s IS A MODEL OUTPUT AND A LOWER BOUND, NOT AN OBSERVED NUMBER. The
+# Kubernetes backoff series resets when no new failed pods appear, so real
+# wall-clock time-to-Failed can exceed it. Nothing in this chart asserts the
+# figure is correct; fishhawk.validateMigrateTiming only ever compares a SET
+# activeDeadlineSeconds AGAINST it. The chart README's live operator drill
+# records the OBSERVED time-to-Failed and Helm's actual error text — that is
+# what turns this model into evidence.
 migrate:
   enabled: true
-  backoffLimit: 6
+  # Attempts = backoffLimit + 1 (see the derivation above). 2 keeps the derived
+  # time-to-Failed inside Helm's 300s default --timeout.
+  backoffLimit: 2
+  # Assumed per-attempt wall time (pod schedule + image pull + DB connect +
+  # failing SQL). An ASSUMPTION, shipped as a knob rather than baked into a
+  # constant precisely because it is one: raise it on a slow registry and the
+  # timing guard recomputes with you.
+  assumedAttemptSeconds: 60
+  # UNSET by default, on purpose. A deadline generous enough for a slow but
+  # legitimate migration cannot also be tight enough to beat the failure path,
+  # and when it DOES fire it reports DeadlineExceeded — hiding the migration
+  # error this Job exists to surface. Set it only if you need a hard ceiling on
+  # a migration blocked on a lock; fishhawk.validateMigrateTiming then fails the
+  # render if the value you chose would win the race.
+  activeDeadlineSeconds: null
+  # Same sizing rationale as `resources` above: a one-shot Go process running
+  # DDL against Postgres, no subprocesses. Both requests and limits are set.
   resources:
     requests:
       cpu: 100m
@@ -365,6 +444,11 @@ secrets:
     # PEM contents for the GitHub App private key (rendered under the dotted
     # secretKey above and mounted as a file, NOT injected as env).
     githubAppPrivateKey: ""
+    # Regional-cell credentials (ADR-062). Required only when the matching
+    # cell.* non-secret half is set: handoffSecret when cell.homeRegion is set,
+    # modelApiKey when cell.modelBaseUrl is set.
+    handoffSecret: ""         # FISHHAWKD_HANDOFF_SECRET
+    modelApiKey: ""           # FISHHAWKD_MODEL_API_KEY
 
   # `externalSecrets` mode: emit an ExternalSecret CR (no inline Secret).
   # secretStoreRef.name MUST be set (the guard fails an empty one). apiVersion is

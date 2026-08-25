@@ -621,3 +621,41 @@ reasoned about — each deletion restored byte-identically afterwards:
 `check-site-voice` itself via `_verify_site_voice` against the committed
 pages (proving they still pass it). Both are bash, so neither needs the
 zsh guard `test-dev` carries. Long-form site contract: `site/README.md`.
+
+## Helm chart render gate (`scripts/test-helm-render`, E62.2 / #2301)
+
+The fourth entry in `_verify_gate_harnesses`. `deploy/helm/fishhawk` is
+almost entirely YAML defaults and rendered identifiers whose correctness
+no compiler enforces, so this is the only machine check that the chart
+still renders what the docs claim. It drives the REAL chart through
+`helm template` / `helm lint` and asserts on SHIPPED RENDERED OUTPUT:
+
+| Case | What it pins |
+|---|---|
+| r1 | `values-prod` renders, the copy-paste caveat is gone, and the DERIVED `FISHHAWKD_EXTERNAL_URL` / `FISHHAWKD_OAUTH_CALLBACK_URL`, ingress class, TLS host and cert-manager issuer match the chosen hostname (plus a cross-check that the derived callback PATH is the one `backend/cmd/fishhawkd/` registers) |
+| r2a–r2e | one case per named failure mode of `fishhawk.validateSecretContract`: chartManaged field ABSENT, the same field an EMPTY STRING (deliberately distinct — present-but-empty must not pass), externalSecrets `data[]` not covering a required key, empty `existingSecret`, and the dotted PEM key participating in the contract at all |
+| r3 | requests AND limits on the fishhawkd container and the migrate Job |
+| r4 | migrate Job `restartPolicy: Never`, `backoffLimit: 2`, `activeDeadlineSeconds` omitted by default, and `fishhawk.validateMigrateTiming` rejecting a too-tight deadline naming BOTH numbers |
+| r5 | the `envFrom` wiring across allInOne / split-api / split-worker / migrate Job, the cell keys landing in the ConfigMap vs the credential contract, `FISHHAWKD_DATABASE_URL` per profile against the path that profile uses, and the PEM's dotted key being a Secret key + projected FILE but never an env key |
+| r6 | every profile renders (local, prod, single-tenant, cell), cell additionally under all three secret modes |
+| r7 | `helm lint` per profile |
+| r8 | the Mode-1 fail-closed case: a HALF-CONFIGURED `singleTenant` profile (fields set, `accountKey` empty) is emitted UNCHANGED and the account key is neither dropped-and-defaulted nor silently benign, so fishhawkd's documented startup refusal stays reachable |
+
+Every failure case asserts BOTH a non-zero exit AND the expected
+key/number in stderr, so a render failing for an unrelated reason cannot
+green it; `assert_field_absent` matches at YAML KEY position, because the
+rendered manifest carries comments that name the very fields being
+asserted absent.
+
+Bash (no zsh guard) and awk/grep only (no yq, no PyYAML). It **SKIPS with
+a printed reason and exits 0 when `helm` is absent from PATH** — the skip
+lives inside the harness, not in `_verify_gate_harnesses`, so the loop
+needs no helm-specific branch. The cost is honest: on a helm-less host the
+chart is unguarded, the same residual the zsh guard already accepts for
+`test-dev`, and preferable to red-lining verify with exit 127.
+
+The CI half of this gate is OPERATOR-INSTALLED: `.github/workflows/**` is
+in the implement stage's `forbidden_paths`, so the workflow ships as a
+copy-pasteable, install-verbatim block in
+`deploy/helm/fishhawk/README.md`, following `site/README.md`'s Pages
+workflow pattern. Long-form chart contract: `deploy/helm/fishhawk/README.md`.

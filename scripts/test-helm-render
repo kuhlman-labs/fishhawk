@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# Render gate for deploy/helm/fishhawk (E62.2 / #2301). Drives the REAL chart
+# through `helm template` / `helm lint` and asserts on SHIPPED RENDERED OUTPUT.
+#
+# Why this exists as a behavioural gate: almost everything in that chart is YAML
+# defaults and rendered identifiers whose correctness no compiler enforces, so a
+# comment-only or no-op touch would satisfy the scope-completeness gate while the
+# real edit was dropped. Every case below asserts what an operator's `helm
+# install` would actually produce.
+#
+# House style follows scripts/test-site-voice / scripts/test-container-lease:
+# PASS/FAIL counters, non-zero exit on any FAIL. Bash (not zsh), so
+# _verify_gate_harnesses needs no interpreter guard. Parsing is awk/grep only —
+# no yq, no PyYAML. Run by `scripts/test verify` via _verify_gate_harnesses, and
+# standalone.
+#
+# SKIP CONTRACT: `helm` is not guaranteed on every dev host or CI runner, so an
+# absent binary prints one line and exits 0 rather than red-lining verify with
+# exit 127. The cost is honest — on a helm-less host the chart is unguarded, the
+# same residual _verify_gate_harnesses already accepts for zsh/test-dev.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHART="$REPO_ROOT/deploy/helm/fishhawk"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+if ! command -v helm >/dev/null 2>&1; then
+  echo "scripts/test-helm-render: helm absent from PATH — skipping the chart render gate"
+  exit 0
+fi
+if [ ! -d "$CHART" ]; then
+  echo "scripts/test-helm-render: $CHART not found — skipping the chart render gate"
+  exit 0
+fi
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+out=""
+err=""
+status=0
+
+# render <args...> — run `helm template` against the chart, capturing stdout and
+# stderr SEPARATELY so a failure case can assert on the guard's message without
+# the rendered manifest polluting the match.
+render() {
+  out=$("$(command -v helm)" template fishhawk "$CHART" "$@" 2>"$tmproot/stderr")
+  status=$?
+  err=$(cat "$tmproot/stderr")
+}
+
+# assert_contains <label> <haystack> <needle>
+assert_contains() {
+  if printf '%s' "$2" | grep -qF -- "$3"; then pass "$1"; else
+    fail "$1 (expected to find: $3)"
+  fi
+}
+
+# assert_field_absent <label> <haystack> <field>
+# Matches the field at YAML KEY position (^<indent><field>:), not anywhere in the
+# text — the rendered manifest carries explanatory comments that name the field,
+# and a substring match would be satisfied by those comments alone.
+assert_field_absent() {
+  if printf '%s' "$2" | grep -qE "^[[:space:]]*$3:"; then
+    fail "$1 (unexpectedly rendered the field: $3)"
+  else pass "$1"; fi
+}
+
+# assert_absent <label> <haystack> <needle>
+assert_absent() {
+  if printf '%s' "$2" | grep -qF -- "$3"; then
+    fail "$1 (unexpectedly found: $3)"
+  else pass "$1"; fi
+}
+
+# assert_render_ok <label>
+assert_render_ok() {
+  if [ "$status" -eq 0 ]; then pass "$1"; else fail "$1 (render exited $status: $(printf '%s' "$err" | tail -2))"; fi
+}
+
+# assert_render_fails <label> <expected-text-in-stderr>
+# Asserts BOTH a non-zero exit AND the expected key/number in stderr, so a render
+# that fails for an UNRELATED reason cannot green the case.
+assert_render_fails() {
+  if [ "$status" -eq 0 ]; then
+    fail "$1 (render succeeded; expected a failure naming: $2)"
+  elif printf '%s' "$err" | grep -qF -- "$2"; then
+    pass "$1"
+  else
+    fail "$1 (failed, but stderr did not name: $2 — got: $(printf '%s' "$err" | tail -2))"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# r1 — values-prod renders, carries no copy-paste caveat, and its DERIVED URLs
+#      and ingress wiring match the chosen hostname. "It rendered" is not the
+#      criterion: a partner's install has to produce WORKING URLs.
+# ---------------------------------------------------------------------------
+PROD_HOST="app.fishhawk.example"
+render -f "$CHART/values-prod.yaml"
+assert_render_ok "r1 values-prod renders"
+if grep -qF "Not copy-paste-deployable as-is" "$CHART/values-prod.yaml"; then
+  fail "r1 values-prod still carries the copy-paste caveat"
+else
+  pass "r1 values-prod copy-paste caveat is gone"
+fi
+render -f "$CHART/values-prod.yaml" --show-only templates/configmap.yaml
+assert_contains "r1 derived FISHHAWKD_EXTERNAL_URL matches the chosen host" "$out" \
+  "FISHHAWKD_EXTERNAL_URL: \"https://$PROD_HOST\""
+assert_contains "r1 derived FISHHAWKD_OAUTH_CALLBACK_URL carries the registered callback path" "$out" \
+  "FISHHAWKD_OAUTH_CALLBACK_URL: \"https://$PROD_HOST/v0/auth/github/callback\""
+render -f "$CHART/values-prod.yaml" --show-only templates/ingress.yaml
+assert_contains "r1 ingress class" "$out" "ingressClassName: nginx"
+assert_contains "r1 ingress TLS host" "$out" "- \"$PROD_HOST\""
+assert_contains "r1 ingress rule host" "$out" "host: \"$PROD_HOST\""
+assert_contains "r1 cert-manager issuer annotation" "$out" \
+  "cert-manager.io/cluster-issuer: letsencrypt-prod"
+
+# The registered callback PATH is a cross-boundary claim: assert the chart's
+# derived path is the one fishhawkd actually registers, not just a plausible one.
+if grep -rqF "/v0/auth/github/callback" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r1 derived callback path matches the path fishhawkd registers"
+else
+  fail "r1 derived callback path /v0/auth/github/callback not found in backend/cmd/fishhawkd/"
+fi
+
+# ---------------------------------------------------------------------------
+# r2 — fishhawk.validateSecretContract, ONE CASE PER NAMED FAILURE MODE.
+#      Each bad state is seeded BY CONSTRUCTION in a values file, not by calling
+#      the guard in the setup, so the RED lands on the behavioural assertion.
+# ---------------------------------------------------------------------------
+# r2a chartManaged, a required field ABSENT from secrets.values.
+cat > "$tmproot/r2a.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+    githubAppPrivateKey: "pem"
+YAML
+render -f "$tmproot/r2a.yaml"
+assert_render_fails "r2a chartManaged, required secrets.values field ABSENT" \
+  "FISHHAWKD_OAUTH_CLIENT_SECRET"
+
+# r2b chartManaged, the SAME field present but an EMPTY STRING. Deliberately
+# distinct from r2a: present-but-empty must not pass.
+cat > "$tmproot/r2b.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: ""
+    anthropicApiKey: "a"
+    githubAppPrivateKey: "pem"
+YAML
+render -f "$tmproot/r2b.yaml"
+assert_render_fails "r2b chartManaged, required secrets.values field EMPTY STRING" \
+  "FISHHAWKD_OAUTH_CLIENT_SECRET"
+
+# r2c externalSecrets, a required secretKey not covered by data[].
+cat > "$tmproot/r2c.yaml" <<'YAML'
+profile: prod
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef:
+          key: fishhawk/db
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef:
+          key: fishhawk/webhook
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef:
+          key: fishhawk/anthropic
+YAML
+render -f "$tmproot/r2c.yaml"
+assert_render_fails "r2c externalSecrets, required secretKey not mapped by data[]" \
+  "FISHHAWKD_OAUTH_CLIENT_SECRET"
+
+# r2d existing, existingSecret empty.
+render --set secrets.mode=existing --set existingSecret=""
+assert_render_fails "r2d existing, existingSecret empty" \
+  "secrets.mode=existing requires existingSecret"
+
+# r2e the PEM record participates in the contract at all — the C7 defect was that
+# an env-keyed map had NO entry for the dotted PEM key, so it was never validated.
+cat > "$tmproot/r2e.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+    githubAppPrivateKey: ""
+YAML
+render -f "$tmproot/r2e.yaml"
+assert_render_fails "r2e chartManaged, PEM required (privateKeyFile.enabled) but empty" \
+  "githubAppPrivateKey"
+
+# ---------------------------------------------------------------------------
+# r3 — requests AND limits on the fishhawkd container and on the migrate Job.
+#      Limits included, so the criterion and its deciding test agree.
+# ---------------------------------------------------------------------------
+r3_resources() { # <label> <show-only template>
+  render --show-only "$2"
+  local block
+  block=$(printf '%s' "$out" | awk '/^ *resources:/{f=1} f{print} /^ *volumeMounts:|^ *livenessProbe:/{if(f)exit}')
+  assert_contains "$1 requests present" "$block" "requests:"
+  assert_contains "$1 limits present" "$block" "limits:"
+  assert_contains "$1 requests.cpu" "$block" "cpu: 100m"
+  assert_contains "$1 limits.memory" "$block" "memory: 512Mi"
+}
+r3_resources "r3 fishhawkd container" templates/deployment.yaml
+r3_resources "r3 migrate Job" templates/migrate-job.yaml
+
+# ---------------------------------------------------------------------------
+# r4 — migrate Job timing + restartPolicy, and the validateMigrateTiming guard.
+# ---------------------------------------------------------------------------
+render --show-only templates/migrate-job.yaml
+assert_render_ok "r4 migrate Job renders by default"
+assert_contains "r4 restartPolicy Never (failed-pod logs persist for kubectl logs)" "$out" "restartPolicy: Never"
+assert_absent   "r4 restartPolicy is not OnFailure" "$out" "restartPolicy: OnFailure"
+assert_contains "r4 backoffLimit 2 (derived time-to-Failed inside Helm's 300s default)" "$out" "backoffLimit: 2"
+assert_field_absent "r4 activeDeadlineSeconds omitted by default" "$out" "activeDeadlineSeconds"
+
+# A too-tight deadline must fail the render naming BOTH numbers: the deadline the
+# operator set and the derived time-to-Failed it would beat.
+render --set migrate.activeDeadlineSeconds=60 --show-only templates/migrate-job.yaml
+assert_render_fails "r4 too-tight activeDeadlineSeconds names the deadline" "migrate.activeDeadlineSeconds=60"
+assert_render_fails "r4 too-tight activeDeadlineSeconds names the derived time-to-Failed" "210s"
+
+# A generous deadline renders and is emitted verbatim.
+render --set migrate.activeDeadlineSeconds=600 --show-only templates/migrate-job.yaml
+assert_render_ok "r4 generous activeDeadlineSeconds renders"
+assert_contains "r4 generous activeDeadlineSeconds is emitted" "$out" "activeDeadlineSeconds: 600"
+
+# ---------------------------------------------------------------------------
+# r5 — THE WIRING CASE (C8). Object-level assertions on the ConfigMap/Secret are
+#      sufficient ONLY while the chart consumes them via envFrom. This case pins
+#      that idiom on rendered output for all three workload shapes plus the
+#      migrate Job. If the chart ever moves to explicit env entries, r5 goes red
+#      instead of the sufficiency claim silently becoming false.
+# ---------------------------------------------------------------------------
+r5_envfrom() { # <label> <secret-name> <args...>
+  local label="$1" secret="$2"; shift 2
+  render "$@"
+  assert_contains "$label envFrom configMapRef" "$out" "name: fishhawk-config"
+  assert_contains "$label envFrom secretRef" "$out" "name: $secret"
+  if printf '%s' "$out" | grep -qF "envFrom:"; then pass "$label carries envFrom"; else fail "$label has no envFrom"; fi
+}
+r5_envfrom "r5 allInOne Deployment" fishhawk-secrets --show-only templates/deployment.yaml
+r5_envfrom "r5 split -api Deployment" fishhawk-secrets --set deployment.mode=split --show-only templates/deployment-api.yaml
+r5_envfrom "r5 split -worker Deployment" fishhawk-secrets --set deployment.mode=split --show-only templates/deployment-worker.yaml
+r5_envfrom "r5 migrate Job" fishhawk-secrets --show-only templates/migrate-job.yaml
+# The secretRef name tracks fishhawk.secretName across modes, not a literal.
+r5_envfrom "r5 chartManaged secretRef name" fishhawk-secrets \
+  -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
+
+# Cell keys land where they are consumed from: the two NON-secret halves in the
+# ConfigMap, the two SECRET halves in the credential contract.
+render -f "$CHART/values-cell.yaml" --show-only templates/configmap.yaml
+assert_contains "r5 cell FISHHAWKD_HOME_REGION in the ConfigMap" "$out" 'FISHHAWKD_HOME_REGION: "us"'
+assert_contains "r5 cell FISHHAWKD_MODEL_BASE_URL in the ConfigMap" "$out" 'FISHHAWKD_MODEL_BASE_URL: "https://inference.us.fishhawk.example"'
+assert_absent "r5 cell handoff secret is NOT in the ConfigMap" "$out" "FISHHAWKD_HANDOFF_SECRET"
+assert_absent "r5 cell model API key is NOT in the ConfigMap" "$out" "FISHHAWKD_MODEL_API_KEY"
+
+# The cell secret halves are REQUIRED by the contract in each of the three modes.
+# existing: only existingSecret is checkable at render time, so assert the two
+# other modes reject a cell profile that omits them.
+cat > "$tmproot/r5cell-cm.yaml" <<'YAML'
+profile: local
+cell:
+  homeRegion: us
+  modelBaseUrl: https://inference.us.example
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r5cell-cm.yaml"
+assert_render_fails "r5 cell profile, chartManaged missing FISHHAWKD_HANDOFF_SECRET" "FISHHAWKD_HANDOFF_SECRET"
+cat > "$tmproot/r5cell-es.yaml" <<'YAML'
+profile: prod
+cell:
+  homeRegion: us
+  modelBaseUrl: https://inference.us.example
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_OAUTH_CLIENT_SECRET
+        remoteRef: {key: fishhawk/oauth}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+      - secretKey: FISHHAWKD_HANDOFF_SECRET
+        remoteRef: {key: fishhawk/handoff}
+YAML
+render -f "$tmproot/r5cell-es.yaml"
+assert_render_fails "r5 cell profile, externalSecrets missing FISHHAWKD_MODEL_API_KEY" "FISHHAWKD_MODEL_API_KEY"
+# And a COMPLETE cell mapping renders — so the two cases above fail on the
+# missing key, not on the cell profile being unrenderable at all.
+cat "$tmproot/r5cell-es.yaml" > "$tmproot/r5cell-es-ok.yaml"
+cat >> "$tmproot/r5cell-es-ok.yaml" <<'YAML'
+      - secretKey: FISHHAWKD_MODEL_API_KEY
+        remoteRef: {key: fishhawk/model}
+YAML
+render -f "$tmproot/r5cell-es-ok.yaml"
+assert_render_ok "r5 cell profile, complete externalSecrets mapping renders"
+
+# FISHHAWKD_DATABASE_URL, asserted PER PROFILE against the path that profile uses.
+# postgres.enabled → a container-level env entry (which overrides envFrom);
+# otherwise → a REQUIRED Secret key with no container-level entry.
+render -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
+assert_contains "r5 local (postgres.enabled) DB URL is a container-level env entry" "$out" "name: FISHHAWKD_DATABASE_URL"
+render -f "$CHART/values-prod.yaml" --show-only templates/deployment.yaml
+assert_absent "r5 prod DB URL is NOT a container-level env entry (it arrives via the Secret)" "$out" "name: FISHHAWKD_DATABASE_URL"
+render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+assert_contains "r5 local chartManaged Secret still carries the DB URL key" "$out" "FISHHAWKD_DATABASE_URL"
+# The requiredness predicate itself: with postgres.enabled the DB URL is NOT
+# required (r6's local profile renders); without it, it IS.
+cat > "$tmproot/r5db.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r5db.yaml"
+assert_render_fails "r5 DB URL required when postgres.enabled is false" "FISHHAWKD_DATABASE_URL"
+render -f "$tmproot/r5db.yaml" --set postgres.enabled=true
+assert_render_ok "r5 DB URL NOT required when postgres.enabled (in-cluster env overrides envFrom)"
+
+# The PEM's dotted secretKey is a Secret key and a projected FILE, never an env
+# key — envFrom skips it as an invalid identifier, so validating it as env would
+# be wrong.
+render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+assert_contains "r5 PEM dotted key is a Secret key" "$out" '"github-app-private-key.pem":'
+render -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
+assert_absent "r5 PEM dotted key is NOT emitted as an env key" "$out" "name: github-app-private-key.pem"
+assert_contains "r5 PEM dotted key backs the volume items: projection" "$out" 'key: "github-app-private-key.pem"'
+
+# ---------------------------------------------------------------------------
+# r6 — every profile renders; the cell profile additionally under all three
+#      secret modes.
+# ---------------------------------------------------------------------------
+for prof in values-local values-prod values-cell values-single-tenant; do
+  render -f "$CHART/$prof.yaml"
+  assert_render_ok "r6 $prof renders"
+done
+render -f "$CHART/values-cell.yaml"
+assert_render_ok "r6 cell profile, secrets.mode=existing"
+render -f "$tmproot/r5cell-es-ok.yaml"
+assert_render_ok "r6 cell profile, secrets.mode=externalSecrets"
+cat > "$tmproot/r6cell-cm.yaml" <<'YAML'
+profile: local
+cell:
+  homeRegion: us
+  modelBaseUrl: https://inference.us.example
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+    handoffSecret: "h"
+    modelApiKey: "m"
+YAML
+render -f "$tmproot/r6cell-cm.yaml"
+assert_render_ok "r6 cell profile, secrets.mode=chartManaged"
+render -f "$tmproot/r6cell-cm.yaml" --show-only templates/secret.yaml
+assert_contains "r6 cell chartManaged Secret carries the handoff secret" "$out" '"FISHHAWKD_HANDOFF_SECRET": "h"'
+assert_contains "r6 cell chartManaged Secret carries the model API key" "$out" '"FISHHAWKD_MODEL_API_KEY": "m"'
+
+# ---------------------------------------------------------------------------
+# r7 — helm lint per profile.
+# ---------------------------------------------------------------------------
+for prof in values-local values-prod values-cell values-single-tenant; do
+  if lint_out=$("$(command -v helm)" lint "$CHART" -f "$CHART/$prof.yaml" 2>&1); then
+    pass "r7 helm lint $prof"
+  else
+    fail "r7 helm lint $prof: $(printf '%s' "$lint_out" | tail -3)"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# r8 — THE MODE-1 FAIL-CLOSED CASE. fishhawkd REFUSES to start when any
+#      FISHHAWKD_SINGLE_TENANT_* key is set while the ACCOUNT KEY is empty — a
+#      deployment with no admitting account is one nobody can sign in to. That
+#      posture is only reachable if the chart hands the half-configured profile
+#      to the pod UNCHANGED. So: render with singleTenant fields set and
+#      accountKey EMPTY, and assert the keys are emitted verbatim, the account
+#      key is NOT defaulted to something benign, and the render does NOT silently
+#      drop the partial config into a clean hosted posture.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/r8-halfconfigured.yaml" <<'YAML'
+profile: prod
+singleTenant:
+  accountKey: ""
+  granularity: enterprise
+  autoJoinRole: member
+  displayName: Acme Corp
+  provider: github
+YAML
+render -f "$tmproot/r8-halfconfigured.yaml" --show-only templates/configmap.yaml
+assert_render_ok "r8 half-configured single-tenant profile still renders (the chart does not pre-empt fishhawkd's startup check)"
+assert_contains "r8 GRANULARITY is emitted UNCHANGED" "$out" 'FISHHAWKD_SINGLE_TENANT_GRANULARITY: "enterprise"'
+assert_contains "r8 AUTO_JOIN_ROLE is emitted UNCHANGED" "$out" 'FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE: "member"'
+assert_contains "r8 DISPLAY_NAME is emitted UNCHANGED" "$out" 'FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME: "Acme Corp"'
+assert_contains "r8 PROVIDER is emitted UNCHANGED" "$out" 'FISHHAWKD_SINGLE_TENANT_PROVIDER: "github"'
+# The account key must be ABSENT, not defaulted: a chart-side default would make
+# fishhawkd boot into an account the operator never chose, and the documented
+# startup error would become unreachable.
+assert_absent "r8 ACCOUNT_KEY is NOT defaulted to a benign value" "$out" "FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY"
+# And the FULLY configured profile does emit it — so r8's absence assertion is
+# about the empty key, not about the chart never emitting the key at all.
+render -f "$CHART/values-single-tenant.yaml" --show-only templates/configmap.yaml
+assert_contains "r8 fully configured profile emits the ACCOUNT_KEY" "$out" 'FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY: "acme-corp"'
+
+# ---------------------------------------------------------------------------
+# r9 — NOTES.txt. `helm template` EXECUTES NOTES.txt (a template error there
+#      fails the render, so r6 already covers it) but does not EMIT it, and
+#      --show-only cannot select it. So this case uses `helm install --dry-run`
+#      to assert the CONTENT: the operator-facing key list is derived from
+#      fishhawk.secretKeySpec, not a second hand-authored list that could drift.
+# ---------------------------------------------------------------------------
+notes() { # <args...>
+  out=$("$(command -v helm)" install --dry-run --generate-name "$CHART" "$@" 2>"$tmproot/stderr")
+  status=$?
+  err=$(cat "$tmproot/stderr")
+  out=$(printf '%s' "$out" | awk '/^NOTES:/{f=1} f{print}')
+}
+notes -f "$CHART/values-cell.yaml"
+assert_render_ok "r9 NOTES renders for the cell profile"
+# The env-key list is the REQUIRED set for THIS configuration, derived from the
+# spec — not a second hand-authored list. Scope the membership assertions to the
+# "Env keys" block, because the PEM's dotted key legitimately appears later
+# under the FILE key heading at the same indent.
+envblock=$(printf '%s' "$out" | awk '/Env keys \(delivered via envFrom\)/{f=1;next} f&&/^[^ ]/{exit} f&&/File key/{exit} f{print}')
+assert_contains "r9 NOTES lists a required env key" "$envblock" "- FISHHAWKD_OAUTH_CLIENT_SECRET"
+assert_contains "r9 NOTES lists the cell handoff secret for a cell profile" "$envblock" "- FISHHAWKD_HANDOFF_SECRET"
+assert_contains "r9 NOTES lists the cell model API key for a cell profile" "$envblock" "- FISHHAWKD_MODEL_API_KEY"
+# values-cell sets no config.s3Bucket, so the AWS pair is NOT required and must
+# be OMITTED rather than listed — this is the derived-not-fixed discriminator.
+assert_absent "r9 NOTES omits a NOT-required key (derived, not a fixed list)" "$envblock" "AWS_ACCESS_KEY_ID"
+assert_contains "r9 NOTES states the existing-mode render-time limit" "$out" "CANNOT see a pre-created Secret"
+assert_contains "r9 NOTES gives the kubectl key-confirmation one-liner" "$out" "get secret fishhawk-secrets -o jsonpath="
+assert_contains "r9 NOTES prints the cell region" "$out" "FISHHAWKD_HOME_REGION   = us"
+# The PEM's dotted key is listed as a FILE key, never among the env keys.
+assert_contains "r9 NOTES lists the PEM as a file key" "$out" "github-app-private-key.pem"
+assert_absent "r9 NOTES does not list the PEM among the env keys" "$envblock" "github-app-private-key.pem"
+# A non-cell profile must NOT advertise the cell credentials at all.
+notes -f "$CHART/values-single-tenant.yaml"
+assert_render_ok "r9 NOTES renders for the single-tenant profile"
+envblock=$(printf '%s' "$out" | awk '/Env keys \(delivered via envFrom\)/{f=1;next} f&&/^[^ ]/{exit} f&&/File key/{exit} f{print}')
+assert_absent "r9 NOTES omits the cell handoff secret off a cell profile" "$envblock" "FISHHAWKD_HANDOFF_SECRET"
+assert_absent "r9 NOTES omits the cell model key off a cell profile" "$envblock" "FISHHAWKD_MODEL_API_KEY"
+assert_contains "r9 NOTES still lists the baseline required keys off a cell profile" "$envblock" "- FISHHAWKD_DATABASE_URL"
+
+echo
+echo "scripts/test-helm-render: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1

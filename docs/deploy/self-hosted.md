@@ -111,6 +111,31 @@ helm upgrade --install fishhawk deploy/helm/fishhawk \
   --set config.oauthOrgsUrl=https://ghes.acme.example/api/v3/user/orgs
 ```
 
+`values-single-tenant.yaml` ships the same posture as a COMPLETE profile rather
+than a commented example, so the install reduces to substituting the hostname and
+account key:
+
+```sh
+helm upgrade --install fishhawk deploy/helm/fishhawk \
+  -f deploy/helm/fishhawk/values-single-tenant.yaml \
+  --set ingress.host=fishhawk.acme.example \
+  --set singleTenant.accountKey=acme-corp
+```
+
+### The fail-closed posture survives templating
+
+fishhawkd REFUSES to start when any `FISHHAWKD_SINGLE_TENANT_*` key is set while
+the ACCOUNT KEY is empty — a deployment with no admitting account is one nobody
+can sign in to. That refusal is only reachable if the chart hands the
+half-configured profile to the pod UNCHANGED, so the chart does exactly that: it
+renders each key it is given verbatim, and it does NOT default an empty account
+key to anything. A chart-side default would boot fishhawkd into an account the
+operator never chose and make the documented startup error unreachable.
+`scripts/test-helm-render` case r8 renders a half-configured profile
+(`granularity`/`autoJoinRole`/`displayName`/`provider` set, `accountKey` empty)
+and asserts the four keys are emitted unchanged while the account key is neither
+emitted nor defaulted.
+
 `values-prod.yaml` carries the same block commented out as a worked example.
 The chart's ConfigMap omits every empty key, so an unset profile renders no
 `FISHHAWKD_SINGLE_TENANT_*` entry at all. Chart reference:

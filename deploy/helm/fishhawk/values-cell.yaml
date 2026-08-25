@@ -1,0 +1,61 @@
+# Regional-cell override layer for the fishhawk chart (ADR-057 Mode 2 /
+# ADR-062 — the hosted multi-tenant service, N cells behind one global
+# directory). Renders standalone:
+#   helm template fishhawk . -f values-cell.yaml
+#
+# COPY-PASTE POSTURE, NOT A DROP-IN: substitute the host, IngressClass,
+# ClusterIssuer, region and inference endpoint below for your own, and
+# pre-create the Secret named by existingSecret. The topology, handoff protocol
+# and full env matrix are normative in docs/deploy/regional-cells.md; the
+# operator procedure is docs/deploy/hosted-regional.md.
+
+profile: prod
+
+image:
+  # Pin to an immutable sha-<short> or vX.Y.Z tag for a real cell.
+  tag: ""
+
+# Public ingress + cert-manager TLS. config.externalUrl / oauthCallbackUrl are
+# left empty so they DERIVE from ingress.host (https, since tls is on):
+#   FISHHAWKD_EXTERNAL_URL       = https://us.fishhawk.example
+#   FISHHAWKD_OAUTH_CALLBACK_URL = https://us.fishhawk.example/v0/auth/github/callback
+ingress:
+  enabled: true
+  className: nginx
+  host: us.fishhawk.example
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+
+config:
+  externalUrl: ""
+  oauthCallbackUrl: ""
+
+# The two NON-secret halves of the cell env matrix. Setting homeRegion makes
+# FISHHAWKD_HANDOFF_SECRET required, and setting modelBaseUrl makes
+# FISHHAWKD_MODEL_API_KEY required — both enforced by
+# fishhawk.validateSecretContract, mirroring fishhawkd's own startup refusals
+# (a region-scoped cell that is not fully inference-configured refuses to boot
+# rather than egress out of region, #2107).
+cell:
+  homeRegion: us
+  modelBaseUrl: https://inference.us.fishhawk.example
+
+# A real cell references a pre-created Secret. Besides the baseline credentials
+# it MUST carry FISHHAWKD_HANDOFF_SECRET (equal to the directory's
+# FISHHAWK_DIRECTORY_HANDOFF_SECRET) and FISHHAWKD_MODEL_API_KEY. In `existing`
+# mode the chart cannot see those contents at render time — confirm them with
+# the kubectl one-liner NOTES.txt prints before installing.
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+
+# Cells run the background workers. Keep allInOne at replicaCount 1, or switch
+# to deployment.mode=split to scale the API tier alongside a single worker pod.
+workers:
+  slaTimer: true
+  dispatchWatchdog: true
+  reactionPoller: true
+  mergeReconciler: true
+  childCompletionSweeper: true
+  invariantMonitor: true

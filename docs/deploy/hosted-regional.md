@@ -128,6 +128,41 @@ to an operator action:
 | 404 on a routed request | the cell has no row for that account | the account has never onboarded on this cell; the pin never creates one |
 | 500 naming a missing region config | the account is homed in a region absent from `FISHHAWK_DIRECTORY_REGIONS` | add the region to the map and restart the directory |
 
+## Deploying a cell with the Helm chart
+
+`deploy/helm/fishhawk/values-cell.yaml` is the Mode 2 profile: ingress +
+cert-manager TLS, `secrets.mode: existing`, the worker toggles on, and the two
+NON-secret halves of the cell env matrix set.
+
+| Values field | Env | Half |
+|---|---|---|
+| `cell.homeRegion` | `FISHHAWKD_HOME_REGION` | non-secret (ConfigMap) |
+| `cell.modelBaseUrl` | `FISHHAWKD_MODEL_BASE_URL` | non-secret (ConfigMap) |
+| `secrets.values.handoffSecret` / the pre-created Secret's key | `FISHHAWKD_HANDOFF_SECRET` | **secret** |
+| `secrets.values.modelApiKey` / the pre-created Secret's key | `FISHHAWKD_MODEL_API_KEY` | **secret** |
+
+The two secret halves are deliberately NOT in the `cell` block: they are records
+in the chart's one credential contract and travel through the same secrets
+machinery as every other credential in all three modes. Setting `cell.homeRegion`
+makes `FISHHAWKD_HANDOFF_SECRET` required and setting `cell.modelBaseUrl` makes
+`FISHHAWKD_MODEL_API_KEY` required — the render fails naming the missing key,
+mirroring fishhawkd's own startup refusals rather than deferring them to pod
+start. In `secrets.mode: existing` the chart cannot see a pre-created Secret's
+contents, so confirm the keys with the `kubectl` one-liner the chart's NOTES
+prints before installing.
+
+```sh
+helm upgrade --install fishhawk-us deploy/helm/fishhawk \
+  -f deploy/helm/fishhawk/values-cell.yaml \
+  --set ingress.host=us.fishhawk.example \
+  --set cell.homeRegion=us \
+  --set cell.modelBaseUrl=https://inference.us.fishhawk.example
+```
+
+Full env matrix and fail-closed table:
+[regional-cells.md](regional-cells.md). Chart reference:
+[deploy/helm/fishhawk/README.md](../../deploy/helm/fishhawk/README.md).
+
 ## Region-scoped inference
 
 Per-cell and process-level: set `FISHHAWKD_MODEL_BASE_URL` and
