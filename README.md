@@ -160,6 +160,7 @@ The full install path (pre-built release binaries, cosign verification, the comp
 | [`docs/api/v0.md`](docs/api/v0.md) | REST API surface (`docs/api/v0.openapi.yaml` is the source of truth). |
 | [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md) | Helm-chart quickstart for a Kubernetes deployment. |
 | [`AGENTS.md`](AGENTS.md) | Build/test/lint gates and the contributor workflow loop. |
+| [Documentation site](https://kuhlman-labs.github.io/fishhawk/) | Public docs — concepts, operating guide, and reference (source in [`site/`](site/)). |
 
 ### Components
 

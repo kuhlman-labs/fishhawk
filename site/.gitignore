@@ -1,0 +1,5 @@
+# Astro build output and caches. Duplicated from the repo-root .gitignore so
+# this package is self-describing when read on its own.
+dist/
+node_modules/
+.astro/

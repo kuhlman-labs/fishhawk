@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-site-voice. Drives the REAL script against
+# temp-dir fixture content roots, one case per named behavior of the control,
+# each asserting that branch's observable output rather than only the exit code.
+# House style follows scripts/test-container-lease / scripts/test-cleanup-merged:
+# PASS/FAIL counters, non-zero exit on any FAIL. Run by `scripts/test verify`
+# via _verify_gate_harnesses, and standalone.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-site-voice"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+# Run the real control against a fixture root; capture stdout+stderr and status.
+out=""
+status=0
+run_check() {
+  out="$("$CHECK" "$1" 2>&1)"
+  status=$?
+}
+
+# ---------------------------------------------------------------------------
+# c1 — clean content exits 0.
+# ---------------------------------------------------------------------------
+c1="$tmproot/c1"
+mkdir -p "$c1"
+cat > "$c1/clean.md" <<'EOF'
+---
+title: Clean
+---
+Fishhawk gates a change behind a human approval. This adds friction; that is
+the point. Plans are persisted to the audit log.
+EOF
+run_check "$c1"
+if [ "$status" -eq 0 ]; then
+  pass "c1: clean content exits 0"
+else
+  fail "c1: clean content exited $status (expected 0); output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# c2 — a banned term exits 1 AND the report names the file, the line number and
+# the matched term. Seeded BY CONSTRUCTION: the fixture is written with a
+# literal banned term, so a RED lands on this assertion and not on setup.
+# ---------------------------------------------------------------------------
+c2="$tmproot/c2"
+mkdir -p "$c2"
+cat > "$c2/page.md" <<'EOF'
+---
+title: Offender
+---
+Ordinary prose on line four.
+Fishhawk will empower your engineering organisation.
+EOF
+run_check "$c2"
+if [ "$status" -ne 1 ]; then
+  fail "c2: banned term exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'page\.md'; then
+  fail "c2: report does not name the file; output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'page\.md:5:'; then
+  fail "c2: report does not name line 5; output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'empower'; then
+  fail "c2: report does not name the matched term; output: $out"
+else
+  pass "c2: banned term exits 1 and names file, line number and term"
+fi
+
+# ---------------------------------------------------------------------------
+# c3 — matching is CASE-INSENSITIVE. Asserts the exit code plus exactly ONE
+# named term (the first offending line's). Deliberately NOT both: a
+# first-hit-and-stop weakening of the control must leave c3 green so that the
+# c5 counterfactual below isolates report-everything (operator condition BC2).
+# ---------------------------------------------------------------------------
+c3="$tmproot/c3"
+mkdir -p "$c3"
+cat > "$c3/mixed.md" <<'EOF'
+---
+title: Mixed case
+---
+Frictionless governance, they said.
+We EMPOWER teams, they added.
+EOF
+run_check "$c3"
+if [ "$status" -ne 1 ]; then
+  fail "c3: mixed-case banned terms exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'frictionless'; then
+  fail "c3: mixed-case 'Frictionless' not matched; output: $out"
+else
+  pass "c3: matching is case-insensitive"
+fi
+
+# ---------------------------------------------------------------------------
+# c4 — the NEGATIVE case, pinning two distinct properties:
+#   (a) the LEADING WORD-BOUNDARY anchor: "unseamless" and "disempower" embed a
+#       banned term after a non-boundary prefix and must NOT be reported. These
+#       are the tokens that make c4 a counterfactual vehicle for the anchor —
+#       a bare "seam" is SHORTER than "seamless" and can never be a false
+#       positive under a prefix match, so it pins nothing (operator condition
+#       BC1). "seam" is kept as a plain-English control alongside them.
+#   (b) the deliberate exclusion of "trust" from the mechanical list: a
+#       substring ban would false-positive on "trusted" / "trust boundary".
+# ---------------------------------------------------------------------------
+c4="$tmproot/c4"
+mkdir -p "$c4"
+cat > "$c4/negative.md" <<'EOF'
+---
+title: Not violations
+---
+The runner works against a trusted tree inside the trust boundary.
+A seam in the code is where two components meet.
+An unseamless join and a disempower helper are ugly names, not banned terms.
+EOF
+run_check "$c4"
+if [ "$status" -ne 0 ]; then
+  fail "c4: negative fixture exited $status (expected 0); output: $out"
+else
+  pass "c4: embedded terms (unseamless/disempower) and 'trust'/'seam' are not violations"
+fi
+
+# ---------------------------------------------------------------------------
+# c5 — EVERY violation is reported, not just the first. Two DISTINCTLY named
+# pages; the assertion names BOTH files, so it cannot be satisfied by the first
+# file alone, and it fails loudly rather than inverting silently if the walk
+# order changes. A line COUNT would not discriminate: a first-hit-and-stop
+# implementation that prints a trailing summary line hits the same count
+# (operator condition BC2 / plan condition C4).
+# ---------------------------------------------------------------------------
+c5="$tmproot/c5"
+mkdir -p "$c5"
+cat > "$c5/alpha.md" <<'EOF'
+---
+title: Alpha
+---
+A frictionless onboarding experience.
+EOF
+cat > "$c5/omega.md" <<'EOF'
+---
+title: Omega
+---
+Our world-class governance platform.
+EOF
+run_check "$c5"
+if [ "$status" -ne 1 ]; then
+  fail "c5: two offending pages exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'alpha\.md'; then
+  fail "c5: report does not name the FIRST offending page; output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'omega\.md'; then
+  fail "c5: report does not name the SECOND offending page — first-hit-and-stop; output: $out"
+else
+  pass "c5: every violation is reported, both offending pages named"
+fi
+
+# ---------------------------------------------------------------------------
+# c6 — a missing content root is the DOCUMENTED fail-open: exit 0 with a
+# printed reason, so a tree with no site/ never red-lines verify.
+# ---------------------------------------------------------------------------
+c6="$tmproot/c6-does-not-exist"
+run_check "$c6"
+if [ "$status" -ne 0 ]; then
+  fail "c6: absent content root exited $status (expected 0); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'does not exist'; then
+  fail "c6: absent content root printed no reason; output: $out"
+else
+  pass "c6: absent content root exits 0 with a printed reason"
+fi
+
+# ---------------------------------------------------------------------------
+# c7 — the OTHER fail-open branch: a content root that exists but holds no
+# .md/.mdx pages. Exit 0 with a printed reason, same rationale as c6 — a tree
+# mid-scaffold must not red-line verify.
+# ---------------------------------------------------------------------------
+c7="$tmproot/c7"
+mkdir -p "$c7/nested"
+: > "$c7/nested/not-a-page.txt"
+run_check "$c7"
+if [ "$status" -ne 0 ]; then
+  fail "c7: page-less content root exited $status (expected 0); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'no .md/.mdx pages'; then
+  fail "c7: page-less content root printed no reason; output: $out"
+else
+  pass "c7: content root with no pages exits 0 with a printed reason"
+fi
+
+# ---------------------------------------------------------------------------
+# c8 — the verify-wiring guard in scripts/test. `_verify_site_voice` skips with
+# a printed reason when scripts/check-site-voice is missing or non-executable,
+# so a checkout predating the gate cannot red-line verify. Sourced lib-only
+# (FISHHAWK_TEST_LIB_ONLY=1, no subcommand runs) with ROOT repointed at a
+# fixture, in a SUBSHELL so scripts/test's `set -e` and traps stay contained —
+# the same seam scripts/test-container-lease uses.
+# ---------------------------------------------------------------------------
+c8="$tmproot/c8"
+mkdir -p "$c8/scripts"
+c8out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$c8"
+  _verify_site_voice 2>&1
+  printf 'STATUS=%s\n' "$?"
+)"
+if ! printf '%s\n' "$c8out" | grep -q 'STATUS=0'; then
+  fail "c8: _verify_site_voice did not return 0 with the gate absent; output: $c8out"
+elif ! printf '%s\n' "$c8out" | grep -q 'missing or not executable'; then
+  fail "c8: _verify_site_voice printed no skip reason; output: $c8out"
+else
+  pass "c8: verify skips the gate with a reason when check-site-voice is absent"
+fi
+
+echo
+echo "scripts/test-site-voice: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

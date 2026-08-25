@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# check-site-voice: fail the build when a page under site/src/content/docs/
+# uses vocabulary docs/BRAND_FOUNDATIONS.md §5 bans ("Things we never say").
+#
+# Usage: scripts/check-site-voice [CONTENT_ROOT]
+#   CONTENT_ROOT defaults to <repo>/site/src/content/docs. scripts/test-site-voice
+#   injects a fixture root so the harness never depends on committed content.
+#
+# Matching is CASE-INSENSITIVE and PREFIX-based, anchored on a LEADING word
+# boundary. Prefix-based so "seamlessly" and "empowering" hit without listing
+# every inflection; leading-boundary-anchored so a banned term that merely
+# appears INSIDE a longer word ("unseamless", "disempower") does not. Both
+# halves are load-bearing and both are pinned by scripts/test-site-voice.
+#
+# EVERY violation is reported — file, line number, matched term — before the
+# non-zero exit. A first-hit-and-stop implementation would leave a page's second
+# offence invisible until the first was fixed; harness case c5 pins that.
+#
+# "Trust" is BANNED BY §5 as a marketing claim but is DELIBERATELY ABSENT from
+# the mechanical list below. The ban is on the claim, not the word, and this
+# repository legitimately writes "trust boundary" and "trusted tree" in
+# technical prose. A substring ban would false-positive on those and train
+# readers to ignore the checker, so "trust" stays a human-review item.
+#
+# A missing content root prints a reason and exits 0 — a DOCUMENTED fail-open.
+# This is a voice linter that `scripts/test verify` runs unconditionally, not a
+# security control, and it must not red-line a tree that has no site yet.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONTENT_ROOT="${1:-$ROOT/site/src/content/docs}"
+
+if [ ! -d "$CONTENT_ROOT" ]; then
+  echo "check-site-voice: content root $CONTENT_ROOT does not exist — nothing to lint"
+  exit 0
+fi
+
+# docs/BRAND_FOUNDATIONS.md §5 "Things we never say", minus "trust" (above).
+BANNED_TERMS="revolutionary game-changing next-generation industry-leading world-class ai-powered frictionless seamless effortless empower"
+
+files=()
+while IFS= read -r f; do
+  [ -n "$f" ] && files+=("$f")
+done < <(find "$CONTENT_ROOT" -type f \( -name '*.md' -o -name '*.mdx' \) | LC_ALL=C sort)
+
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "check-site-voice: no .md/.mdx pages under $CONTENT_ROOT — nothing to lint"
+  exit 0
+fi
+
+awk -v terms="$BANNED_TERMS" '
+BEGIN { nterms = split(terms, T, " "); violations = 0 }
+{
+  line = tolower($0)
+  for (i = 1; i <= nterms; i++) {
+    term = T[i]
+    rest = line
+    at = 0
+    while ((p = index(rest, term)) > 0) {
+      at = at + p
+      # Leading word-boundary anchor: the match must start a word. Without this
+      # "unseamless" and "disempower" would be reported. Harness case c4 is the
+      # counterfactual vehicle for exactly this condition.
+      if (at == 1 || substr(line, at - 1, 1) !~ /[[:alnum:]_]/) {
+        printf "%s:%d: banned term \"%s\" (docs/BRAND_FOUNDATIONS.md §5)\n", FILENAME, FNR, term
+        violations++
+      }
+      rest = substr(line, at + 1)
+    }
+  }
+}
+END {
+  if (violations > 0) {
+    printf "check-site-voice: %d banned-term occurrence(s) — see docs/BRAND_FOUNDATIONS.md §5\n", violations
+    exit 1
+  }
+}
+' "${files[@]}"
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  echo "check-site-voice: ${#files[@]} page(s) clean under $CONTENT_ROOT"
+fi
+exit "$status"

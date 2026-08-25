@@ -77,6 +77,19 @@ dev-frontend: ## Run the Web UI dev server on :5173 (proxies /v0 → :8080).
 validate: ## Validate .fishhawk/workflows.yaml with the CLI.
 	go run ./cli/cmd/fishhawk validate ./.fishhawk/workflows.yaml
 
+.PHONY: site-dev
+site-dev: ## Run the public docs site dev server on :4321 (/fishhawk base path).
+	cd site && pnpm install && pnpm dev
+
+.PHONY: site-build
+site-build: ## Build the public docs site to site/dist/ (what GitHub Pages serves).
+	cd site && pnpm install --frozen-lockfile && pnpm build
+
+.PHONY: site-lint
+site-lint: ## Check the docs site: astro content/frontmatter + the §5 voice gate.
+	cd site && pnpm install --frozen-lockfile && pnpm check
+	scripts/check-site-voice
+
 # ----- build ---------------------------------------------------------------
 
 .PHONY: build

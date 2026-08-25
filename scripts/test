@@ -785,10 +785,13 @@ _verify_patch_coverage() {
 # A missing or non-executable harness prints a reason and is skipped; test-dev is
 # ADDITIONALLY skipped when zsh is absent from PATH — it is `#!/usr/bin/env zsh`,
 # so the exec would otherwise fail 127 and red-line verify instead of skipping.
+# test-site-voice (#2261) pins scripts/check-site-voice, the banned-vocabulary
+# gate over site/src/content/docs/; it is bash and adds well under a second
+# (six temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-dev; do
+  for h in test-check-coverage test-patch-coverage test-dev test-site-voice; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -805,10 +808,30 @@ _verify_gate_harnesses() {
   done
 }
 
+# _verify_site_voice: run the banned-vocabulary gate over the COMMITTED site
+# content. _verify_gate_harnesses above proves the CONTROL still works against
+# fixtures; this proves the shipped pages still pass it, so a later docs child
+# that writes "seamless" into a page fails verify in-loop rather than landing
+# and being caught by a human, or not at all (#2261). The script itself
+# fail-OPENs with a printed reason on a tree with no site/src/content/docs —
+# it is a voice linter, not a security control — so it can never red-line a
+# checkout that predates the site. A real violation exits 1 and, under set -e,
+# fails verify: that is the enforcement AGENTS.md "Documentation surfaces"
+# claims. Long form: scripts/README.md.
+_verify_site_voice() {
+  if [ ! -x "$ROOT/scripts/check-site-voice" ]; then
+    echo "scripts/test: scripts/check-site-voice missing or not executable — skipping the site voice gate" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-site-voice\n'
+  "$ROOT/scripts/check-site-voice"
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
-# (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop.
+# (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop,
+# as are the gate harnesses and the site voice gate (#2261).
 # The AGGREGATE coverage gate is still intentionally omitted to bound in-loop
 # runtime — it stays on `coverage` and in CI. What runs here instead is the
 # PATCH-scoped gate (#1887), folded into the same test loop via -coverpkg so no
@@ -819,6 +842,7 @@ cmd_verify() {
   _verify_doc_line_budget
   _verify_schema_sync
   _verify_gate_harnesses
+  _verify_site_voice
   local base="" mods=""
   if [ -n "${FISHHAWK_SKIP_PATCH_COVERAGE:-}" ]; then
     echo "scripts/test: FISHHAWK_SKIP_PATCH_COVERAGE set — skipping the patch-coverage gate" >&2
