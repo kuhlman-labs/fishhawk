@@ -43,6 +43,10 @@ type splitFileProvider struct {
 	calls      int
 	success    int
 	failOnCall int
+	// creations records what File RETURNED for each successful call, so the
+	// forge-state adoption tests (#2064) can assert an adopted child's recorded
+	// url is byte-identical to the url the CREATION pass produced.
+	creations []workmgmt.CreatedItem
 }
 
 func (p *splitFileProvider) Name() string { return p.name }
@@ -57,12 +61,96 @@ func (p *splitFileProvider) File(_ context.Context, req workmgmt.ProviderRequest
 	p.reqs = append(p.reqs, req)
 	p.success++
 	num := 3000 + p.success
-	return &workmgmt.CreatedItem{
+	created := workmgmt.CreatedItem{
 		Provider: p.name,
 		Number:   num,
 		URL:      fmt.Sprintf("https://github.com/o/r/issues/%d", num),
 		Boarded:  true,
-	}, nil
+	}
+	p.creations = append(p.creations, created)
+	return &created, nil
+}
+
+// countRequestsFor reports how many File calls filed a title containing sub.
+// The adoption tests assert this is EXACTLY 1 for an ordinal across two passes.
+func (p *splitFileProvider) countRequestsFor(sub string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, r := range p.reqs {
+		if strings.Contains(r.Item.Title, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// createdFor returns what File RETURNED for the first call whose title contains
+// sub (the creation-pass record an adoption must reproduce exactly).
+func (p *splitFileProvider) createdFor(t *testing.T, sub string) workmgmt.CreatedItem {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, r := range p.reqs {
+		if strings.Contains(r.Item.Title, sub) {
+			return p.creations[i]
+		}
+	}
+	t.Fatalf("no creation recorded for a title containing %q", sub)
+	return workmgmt.CreatedItem{}
+}
+
+// bodyFor returns the BODY actually filed for the first call whose title
+// contains sub. The interleaving test seeds the adoptable child from this real
+// filed body rather than a hand-built one, so the adoption is proven against
+// what the implementation genuinely stamped.
+func (p *splitFileProvider) bodyFor(t *testing.T, sub string) string {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, r := range p.reqs {
+		if strings.Contains(r.Item.Title, sub) {
+			return r.Item.Body
+		}
+	}
+	t.Fatalf("no filed request with a title containing %q", sub)
+	return ""
+}
+
+// splitQueryProvider wraps splitFileProvider with the OPTIONAL
+// workmgmt.EpicChildrenQuerier capability (#2064). It is a separate type — not
+// a method on splitFileProvider — precisely so the capability-LESS variant
+// (the bare splitFileProvider, which gitlab/jira model) stays representable and
+// TestSplitFiling_CapabilityLessProviderKeepsTodaysPath has something to
+// register.
+type splitQueryProvider struct {
+	*splitFileProvider
+	mu         sync.Mutex
+	children   []workmgmt.EpicChild
+	err        error
+	queryCalls int
+}
+
+func (q *splitQueryProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.queryCalls++
+	if q.err != nil {
+		return nil, q.err
+	}
+	return &workmgmt.EpicChildrenResult{Children: q.children}, nil
+}
+
+func (q *splitQueryProvider) setChildren(children []workmgmt.EpicChild) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.children = children
+}
+
+func (q *splitQueryProvider) queries() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.queryCalls
 }
 
 func (p *splitFileProvider) requestFor(t *testing.T, title string) workmgmt.ProviderRequest {
@@ -85,6 +173,19 @@ type splitCommentGitHub struct {
 	mu       sync.Mutex
 	comments []splitCommentCall
 	status   int
+	// baseURL is the httptest server's own base, needed to render an absolute
+	// rel="next" Link header the real client will follow.
+	baseURL string
+	// listPages are the comment-thread PAGES the GET handler serves, one
+	// []string of bodies per page, linked by a rel="next" Link header. nil
+	// serves a single EMPTY page (today's behaviour for every pre-#2064 test).
+	listPages [][]string
+	// listStatus, when >= 400, makes the GET fail with that status — the m7
+	// fail-OPEN branch (a listing error must still post the comment).
+	listStatus int
+	// listCalls counts GET requests, so a test can assert the thread was read
+	// at all (and how many pages were fetched).
+	listCalls int
 }
 
 type splitCommentCall struct {
@@ -112,8 +213,52 @@ func newSplitCommentGitHub(t *testing.T, status int) (*splitCommentGitHub, *gith
 				_, _ = w.Write([]byte(`{"id":1}`))
 			}
 		})
+	// GET the parent thread — the read half of the #2064 comment dedup. It
+	// PAGINATES: page N carries listPages[N-1] and, when a further page exists,
+	// a rel="next" Link header, mirroring the shape githubclient's
+	// ListIssueComments follows. nil listPages serves one empty page.
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments",
+		func(w http.ResponseWriter, r *http.Request) {
+			num, _ := strconv.Atoi(r.PathValue("number"))
+			rec.mu.Lock()
+			rec.listCalls++
+			st, pages, base := rec.listStatus, rec.listPages, rec.baseURL
+			rec.mu.Unlock()
+			if st >= 400 {
+				w.WriteHeader(st)
+				return
+			}
+			page := 1
+			if p := r.URL.Query().Get("page"); p != "" {
+				if n, err := strconv.Atoi(p); err == nil && n > 0 {
+					page = n
+				}
+			}
+			var bodies []string
+			if page <= len(pages) {
+				bodies = pages[page-1]
+			}
+			if page < len(pages) {
+				w.Header().Set("Link", fmt.Sprintf(`<%s/repos/o/r/issues/%d/comments?per_page=100&page=%d>; rel="next"`,
+					base, num, page+1))
+			}
+			out := make([]map[string]any, 0, len(bodies))
+			for i, b := range bodies {
+				out = append(out, map[string]any{
+					"id":         page*1000 + i,
+					"user":       map[string]any{"login": "fishhawk-dev[bot]"},
+					"body":       b,
+					"created_at": "2026-08-25T00:00:00Z",
+				})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(out)
+		})
+
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	rec.baseURL = srv.URL
 	return rec, &githubclient.Client{
 		BaseURL: srv.URL,
 		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
@@ -133,6 +278,15 @@ type splitFilingConfig struct {
 	// default splitPlanBytes(withSplitProposal). Used by the #2412 refusal tests
 	// to construct a split_proposal with an over-cap lead phase by construction.
 	planOverride []byte
+	// withQuerier registers a provider implementing workmgmt.EpicChildrenQuerier
+	// (#2064) instead of the capability-less default. Left false, the harness
+	// reproduces today's exact path — which is what every pre-#2064 test asserts
+	// and what gitlab/jira still get.
+	withQuerier bool
+	// epicChildren / epicChildrenErr seed the querier's answer. An error drives
+	// the fail-CLOSED abort branch.
+	epicChildren    []workmgmt.EpicChild
+	epicChildrenErr error
 }
 
 // splitFilingHarness bundles the wired Server plus the seeded run coordinates.
@@ -141,6 +295,7 @@ type splitFilingHarness struct {
 	au        *auditFake
 	rr        *promptRunRepo
 	provider  *splitFileProvider
+	querier   *splitQueryProvider // nil unless cfg.withQuerier
 	runID     uuid.UUID
 	planStage *run.Stage
 }
@@ -258,7 +413,13 @@ func seedReachability(au *auditFake, runID uuid.UUID, contractDerived int) {
 func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarness {
 	t.Helper()
 	provider := &splitFileProvider{name: workmgmt.Default().Provider, failOnCall: cfg.providerFailOnCall}
-	workmgmt.Register(provider)
+	var querier *splitQueryProvider
+	if cfg.withQuerier {
+		querier = &splitQueryProvider{splitFileProvider: provider, children: cfg.epicChildren, err: cfg.epicChildrenErr}
+		workmgmt.Register(querier)
+	} else {
+		workmgmt.Register(provider)
+	}
 
 	au := newAuditFake()
 	rr := newPromptRunRepo()
@@ -304,7 +465,7 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	if cfg.github != nil {
 		s.cfg.GitHub = cfg.github
 	}
-	return &splitFilingHarness{s: s, au: au, rr: rr, provider: provider, runID: runID, planStage: planStage}
+	return &splitFilingHarness{s: s, au: au, rr: rr, provider: provider, querier: querier, runID: runID, planStage: planStage}
 }
 
 // completionEntry returns the decoded split_children_filed completion payload
@@ -1201,5 +1362,603 @@ func TestSplitFilingRefused_EndToEndThroughGetPlan(t *testing.T) {
 	}
 	if len(out.SplitFiling.Children) != 0 {
 		t.Errorf("a refusal must carry no filed children, got %+v", out.SplitFiling.Children)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2064 / E50.7 — forge-state (query-before-file) idempotency.
+//
+// The window this closes: provider.File SUCCEEDS and the durable per-ordinal
+// work_item_filed marker append then FAILS, so a re-approval has no record of
+// the ordinal and re-files a DUPLICATE child. Every case below drives the REAL
+// fileSplitProposalChildren hook.
+// ---------------------------------------------------------------------------
+
+// splitAdoptableChild builds an EpicChild bearing the key for phaseIndex of
+// runID. Bodies are stamped by the SHIPPED stamper and the URL is a GitHub
+// ENTERPRISE SERVER host, so an adoption path that composed a github.com url
+// instead of carrying the forge's own through is observable.
+func splitAdoptableChild(runID uuid.UUID, phaseIndex, number int) workmgmt.EpicChild {
+	key := splitfiling.SplitChildKey(runID.String(), phaseIndex)
+	return workmgmt.EpicChild{
+		Number: number,
+		Title:  fmt.Sprintf("phase %d child", phaseIndex),
+		Body:   workmgmt.StampIdempotencyKey("## Summary\n\nalready filed\n", key),
+		URL:    fmt.Sprintf("https://ghe.example.com/o/r/issues/%d", number),
+	}
+}
+
+// splitAllAdoptable builds an adoptable child for every phase of the default
+// 3-phase proposal, so a pass can adopt the whole set and file ZERO children.
+func splitAllAdoptable(runID uuid.UUID) []workmgmt.EpicChild {
+	return []workmgmt.EpicChild{
+		splitAdoptableChild(runID, 0, 501),
+		splitAdoptableChild(runID, 1, 502),
+		splitAdoptableChild(runID, 2, 503),
+	}
+}
+
+// splitChildMarkers decodes every split-filing work_item_filed resume marker
+// the audit fake captured, keyed by phase index.
+func splitChildMarkers(t *testing.T, h *splitFilingHarness) map[int]splitChildFiledMarker {
+	t.Helper()
+	out := map[int]splitChildFiledMarker{}
+	for _, e := range h.au.appended {
+		if e.Category != categoryWorkItemFiled {
+			continue
+		}
+		var m splitChildFiledMarker
+		if json.Unmarshal(e.Payload, &m) == nil && m.SplitPhaseIndex != nil {
+			out[*m.SplitPhaseIndex] = m
+		}
+	}
+	return out
+}
+
+// TestSplitFiling_MarkerAppendFails_ReapprovalAdoptsInsteadOfRefiling is the
+// DONE-MEANS behavioural test: it injects the exact interleaving that creates
+// the duplicate — File succeeds, the durable marker append fails — then
+// re-approves and asserts the ordinal is ADOPTED, not re-filed.
+//
+// The adoptable child is seeded from the body the implementation ACTUALLY
+// filed on pass 1 (provider.bodyFor), not a hand-built one, so the adoption is
+// proven against what the code genuinely stamped end to end: key minted in the
+// hook -> stamped by workmgmt.Apply -> carried across the provider seam ->
+// read back off the children query -> matched.
+//
+// Counterfactual c1: deleting the adoption branch in split_filing.go reddens
+// the creation-count assertion.
+func TestSplitFiling_MarkerAppendFails_ReapprovalAdoptsInsteadOfRefiling(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+
+	// PASS 1: every work_item_filed append fails, so the first child is created
+	// on the forge and its durable record is lost.
+	h.au.appendErrCategory = categoryWorkItemFiled
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("pass 1 filed %d children, want 1 (abort after the lost marker)", h.provider.calls)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Fatalf("pass 1 wrote %d completion markers, want 0", n)
+	}
+	if len(rec.comments) != 0 {
+		t.Fatalf("pass 1 posted %d parent comments, want 0", len(rec.comments))
+	}
+	pass1Created := h.provider.createdFor(t, "expand")
+	pass1Body := h.provider.bodyFor(t, "expand")
+
+	// The filed body carries the ordinal-0 key — the durable handle the next
+	// pass will find on the forge.
+	wantKey := splitfiling.SplitChildKey(h.runID.String(), 0)
+	if !workmgmt.BodyHasIdempotencyKey(pass1Body, wantKey) {
+		t.Fatalf("filed child body carries no idempotency marker for ordinal 0:\n%s", pass1Body)
+	}
+
+	// PASS 2: the marker append recovers, and the forge now returns the child
+	// pass 1 created — with the body pass 1 actually filed.
+	h.au.appendErrCategory = ""
+	h.querier.setChildren([]workmgmt.EpicChild{{
+		Number: pass1Created.Number,
+		Title:  "[E2100.1] expand: add NewFoo alongside Foo",
+		Body:   pass1Body,
+		URL:    pass1Created.URL,
+	}})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	// (i) EXACTLY ONE creation for that ordinal across BOTH passes.
+	if got := h.provider.countRequestsFor("expand"); got != 1 {
+		t.Errorf("ordinal 0 was filed %d times across two passes, want exactly 1", got)
+	}
+	if h.provider.calls != 3 {
+		t.Errorf("total File calls = %d, want 3 (1 on pass 1 + 2 un-adoptable ordinals on pass 2)", h.provider.calls)
+	}
+	// The query ran exactly once per pass — it is a single lookup, not per-ordinal.
+	if got := h.querier.queries(); got != 2 {
+		t.Errorf("EpicChildren called %d times across two passes, want 2 (once each)", got)
+	}
+
+	// (ii) the durable per-ordinal record exists after the second pass.
+	markers := splitChildMarkers(t, h)
+	m0, ok := markers[0]
+	if !ok {
+		t.Fatalf("no durable work_item_filed marker for ordinal 0 after adoption; markers = %+v", markers)
+	}
+	if len(markers) != 3 {
+		t.Errorf("durable markers = %d, want 3", len(markers))
+	}
+
+	// (iv) the URL recorded on the ADOPTION pass is byte-identical to the URL
+	// recorded on the CREATION pass. A composed or empty adopted url fails here.
+	if m0.CreatedURL != pass1Created.URL {
+		t.Errorf("adopted url = %q, want the creation-pass url %q", m0.CreatedURL, pass1Created.URL)
+	}
+	if m0.CreatedNumber != pass1Created.Number {
+		t.Errorf("adopted number = %d, want %d", m0.CreatedNumber, pass1Created.Number)
+	}
+
+	// The completion marker carries the same url for that child.
+	payload, n := h.completionEntry(t)
+	if n != 1 {
+		t.Fatalf("completion markers = %d, want 1", n)
+	}
+	var found bool
+	for _, c := range payload.Children {
+		if c.PhaseIndex == 0 {
+			found = true
+			if c.URL != pass1Created.URL || c.Number != pass1Created.Number {
+				t.Errorf("completion child[0] = %+v, want number %d url %q", c, pass1Created.Number, pass1Created.URL)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("completion marker has no entry for phase 0: %+v", payload.Children)
+	}
+
+	// (iii) exactly ONE parent acceptance-carrier comment across both passes.
+	if len(rec.comments) != 1 {
+		t.Errorf("posted %d parent comments across two passes, want exactly 1", len(rec.comments))
+	}
+}
+
+// TestSplitFiling_QueryErrorAbortsBeforeAnyCreation is failure mode m1: the
+// children query FAILS, so the pass aborts before ANY creation and leaves the
+// run resumable. Filing blind on an unreadable child set is what creates the
+// duplicate, so an unknown forge state must never be read as an empty one.
+//
+// Counterfactual c2: deleting the query-error abort reddens the creation count.
+func TestSplitFiling_QueryErrorAbortsBeforeAnyCreation(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+		epicChildrenErr: errors.New("epic children: injected 502"),
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("filed %d children after a query error, want 0", h.provider.calls)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("wrote %d completion markers after a query error, want 0", n)
+	}
+	if got := len(splitChildMarkers(t, h)); got != 0 {
+		t.Errorf("wrote %d durable child markers, want 0", got)
+	}
+	if len(rec.comments) != 0 {
+		t.Errorf("posted %d parent comments, want 0", len(rec.comments))
+	}
+}
+
+// TestSplitFiling_QueryDegradeBranches covers failure modes m2, m3 and m4 —
+// the querier-capable cases where the query SUCCEEDS but adopts nothing, so
+// filing proceeds exactly as before. Each non-matching key is minted from a
+// DIFFERENT run or ordinal (definitionally non-matching, seeded by
+// construction) rather than by calling the detector in the fixture.
+func TestSplitFiling_QueryDegradeBranches(t *testing.T) {
+	otherRun := uuid.New()
+	for _, tc := range []struct {
+		name     string
+		children func(runID uuid.UUID) []workmgmt.EpicChild
+	}{
+		{
+			// m2: query returns EMPTY.
+			name:     "empty_result",
+			children: func(uuid.UUID) []workmgmt.EpicChild { return nil },
+		},
+		{
+			// m3: a child that is NOT this run's, plus one keyed for an ordinal
+			// of a DIFFERENT run.
+			name: "non_matching_child",
+			children: func(uuid.UUID) []workmgmt.EpicChild {
+				return []workmgmt.EpicChild{
+					{Number: 900, Title: "unrelated", Body: "## Summary\n\nunrelated\n", URL: "https://ghe.example.com/o/r/issues/900"},
+					splitAdoptableChild(otherRun, 0, 901),
+				}
+			},
+		},
+		{
+			// m4: near-miss keys in BOTH directions. #902 bears a key that is a
+			// strict PREFIX of ordinal 0's key; #903 bears one that strictly
+			// EXTENDS it. Both directions are needed for this case to
+			// DISCRIMINATE: a substring matcher looking for the full key finds
+			// nothing in the shorter one, but DOES find it inside the longer
+			// one and wrongly adopts #903 (counterfactual c3).
+			name: "prefix_near_miss",
+			children: func(runID uuid.UUID) []workmgmt.EpicChild {
+				full := splitfiling.SplitChildKey(runID.String(), 0)
+				return []workmgmt.EpicChild{
+					{
+						Number: 902,
+						Title:  "prefix near-miss",
+						Body:   workmgmt.StampIdempotencyKey("## Summary\n", full[:len(full)-4]),
+						URL:    "https://ghe.example.com/o/r/issues/902",
+					},
+					{
+						Number: 903,
+						Title:  "extension near-miss",
+						Body:   workmgmt.StampIdempotencyKey("## Summary\n", full+"deadbeef"),
+						URL:    "https://ghe.example.com/o/r/issues/903",
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := int64(77)
+			rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+			h := newSplitFilingHarness(t, splitFilingConfig{
+				withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+				installID: &inst, github: gh, withQuerier: true,
+			})
+			h.querier.setChildren(tc.children(h.runID))
+			h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+			if h.provider.calls != 3 {
+				t.Fatalf("filed %d children, want 3 (nothing adoptable)", h.provider.calls)
+			}
+			if got := h.querier.queries(); got != 1 {
+				t.Errorf("EpicChildren called %d times, want exactly 1", got)
+			}
+			if _, n := h.completionEntry(t); n != 1 {
+				t.Errorf("completion markers = %d, want 1", n)
+			}
+			if len(rec.comments) != 1 {
+				t.Errorf("parent comments = %d, want 1", len(rec.comments))
+			}
+		})
+	}
+}
+
+// TestSplitFiling_ClosedChildBearingKeyIsAdopted is failure mode m5: a child
+// CLOSED before the re-approval was still FILED, so re-filing it would
+// duplicate it. EpicChildren applies no state filter, so it is still returned
+// and still adoptable. This test fails if a state filter is ever introduced.
+func TestSplitFiling_ClosedChildBearingKeyIsAdopted(t *testing.T) {
+	inst := int64(77)
+	_, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	closed := splitAllAdoptable(h.runID)
+	for i := range closed {
+		closed[i].Complete = true // closed-and-completed
+	}
+	h.querier.setChildren(closed)
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("filed %d children, want 0 (all three adoptable, though closed)", h.provider.calls)
+	}
+	markers := splitChildMarkers(t, h)
+	if len(markers) != 3 {
+		t.Fatalf("durable markers = %d, want 3", len(markers))
+	}
+	if markers[0].CreatedNumber != 501 || markers[0].CreatedURL != "https://ghe.example.com/o/r/issues/501" {
+		t.Errorf("adopted ordinal 0 = %+v, want #501 with the forge's own GHE url", markers[0])
+	}
+	if _, n := h.completionEntry(t); n != 1 {
+		t.Errorf("completion markers = %d, want 1", n)
+	}
+}
+
+// TestSplitFiling_CapabilityLessProviderKeepsTodaysPath is failure mode m6 and
+// the named RESIDUAL: gitlab and jira do not implement EpicChildrenQuerier
+// (backend/internal/workmgmt/gitlab/provider.go), so for them the window stays
+// open exactly as it is today — fail-OPEN by design. It fails if the query is
+// ever made a hard prerequisite for filing.
+func TestSplitFiling_CapabilityLessProviderKeepsTodaysPath(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, // withQuerier deliberately false
+	})
+	if h.querier != nil {
+		t.Fatal("fixture error: this case must register a capability-LESS provider")
+	}
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 3 {
+		t.Fatalf("filed %d children, want 3 (today's exact path)", h.provider.calls)
+	}
+	if got := len(splitChildMarkers(t, h)); got != 3 {
+		t.Errorf("durable markers = %d, want 3", got)
+	}
+	if _, n := h.completionEntry(t); n != 1 {
+		t.Errorf("completion markers = %d, want 1", n)
+	}
+	if len(rec.comments) != 1 {
+		t.Errorf("parent comments = %d, want 1", len(rec.comments))
+	}
+	// The children the filed bodies carry are still KEYED — stamping is not
+	// gated on the capability, so a capability-less provider that later gains
+	// the query finds the markers already in place.
+	body := h.provider.bodyFor(t, "expand")
+	if !workmgmt.BodyHasIdempotencyKey(body, splitfiling.SplitChildKey(h.runID.String(), 0)) {
+		t.Errorf("capability-less filing did not stamp the child body:\n%s", body)
+	}
+}
+
+// TestSplitFiling_AdoptionMarkerAppendFailureAborts is failure mode m8: the
+// durable marker append is a HARD prerequisite on the ADOPTION path too, not
+// just the filed one. A lost marker aborts the pass with no completion marker
+// rather than proceeding on a durable state the run cannot resume from.
+func TestSplitFiling_AdoptionMarkerAppendFailureAborts(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	h.querier.setChildren(splitAllAdoptable(h.runID))
+	h.au.appendErrCategory = categoryWorkItemFiled
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Errorf("filed %d children, want 0 (everything was adoptable)", h.provider.calls)
+	}
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("wrote %d completion markers after a lost adoption marker, want 0", n)
+	}
+	if len(rec.comments) != 0 {
+		t.Errorf("posted %d parent comments, want 0", len(rec.comments))
+	}
+}
+
+// TestSplitFiling_DuplicateKeyTieBreakIsDeterministic is failure mode m9: two
+// children bear the SAME key (the only way that happens is a prior concurrent
+// re-approval — the named TOCTOU residual). The tie-break is deterministic and
+// intentional: LOWEST NUMBER WINS. The second child is not reconciled.
+func TestSplitFiling_DuplicateKeyTieBreakIsDeterministic(t *testing.T) {
+	inst := int64(77)
+	_, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	children := splitAllAdoptable(h.runID)
+	// A DUPLICATE of ordinal 0, higher-numbered, listed FIRST so a
+	// first-match-wins implementation picks the wrong one.
+	dup := splitAdoptableChild(h.runID, 0, 777)
+	h.querier.setChildren(append([]workmgmt.EpicChild{dup}, children...))
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("filed %d children, want 0", h.provider.calls)
+	}
+	markers := splitChildMarkers(t, h)
+	if got := markers[0].CreatedNumber; got != 501 {
+		t.Errorf("adopted #%d for ordinal 0, want the LOWEST-numbered #501", got)
+	}
+	if len(markers) != 3 {
+		t.Errorf("durable markers = %d, want 3 (exactly one per ordinal)", len(markers))
+	}
+}
+
+// TestSplitFiling_ParentCommentCarriesIdempotencyMarker is the OUTBOUND half of
+// the comment dedup (operator binding condition). Nothing else in the battery
+// proves a comment POSTED BY THIS IMPLEMENTATION is stamped: the interleaving
+// case aborts before any comment, and the page-2 / CRLF fixtures SEED an
+// already-keyed comment, so they only prove the READER finds a marker someone
+// else put there. If the outbound stamp were dropped, the dedup would silently
+// never fire in production and every one of those cases would still pass.
+//
+// The assertion is on the body the FAKE SERVER RECEIVED, not on a body handed
+// to a stub.
+func TestSplitFiling_ParentCommentCarriesIdempotencyMarker(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if len(rec.comments) != 1 {
+		t.Fatalf("posted %d parent comments, want 1", len(rec.comments))
+	}
+	key := splitfiling.SplitCommentKey(h.runID.String(), splitfiling.CommentKindAcceptance)
+	if !workmgmt.BodyHasIdempotencyKey(rec.comments[0].body, key) {
+		t.Fatalf("the POSTED acceptance-carrier body carries no idempotency marker for %q:\n%s",
+			key, rec.comments[0].body)
+	}
+	// The prose survived the stamp.
+	if !strings.Contains(rec.comments[0].body, "#3003") {
+		t.Errorf("stamped comment lost the contract-child reference:\n%s", rec.comments[0].body)
+	}
+	// A refusal-keyed reader must NOT match it (the two kinds are distinct).
+	if workmgmt.BodyHasIdempotencyKey(rec.comments[0].body,
+		splitfiling.SplitCommentKey(h.runID.String(), splitfiling.CommentKindRefusal)) {
+		t.Errorf("acceptance comment matched the REFUSAL key")
+	}
+	// The thread WAS read before posting (the dedup is wired, not dead code).
+	if rec.listCalls == 0 {
+		t.Errorf("parent thread was never listed before posting")
+	}
+}
+
+// TestSplitFiling_RefusalCommentCarriesIdempotencyMarker is the same outbound
+// proof for the #2412 over-cap refusal comment, which arises from the identical
+// re-approval window.
+func TestSplitFiling_RefusalCommentCarriesIdempotencyMarker(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true,
+		installID: &inst, github: gh, withQuerier: true,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4), // lead phase 4 files > cap 3
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("filed %d children on a refusal, want 0", h.provider.calls)
+	}
+	if len(rec.comments) != 1 {
+		t.Fatalf("posted %d refusal comments, want 1", len(rec.comments))
+	}
+	key := splitfiling.SplitCommentKey(h.runID.String(), splitfiling.CommentKindRefusal)
+	if !workmgmt.BodyHasIdempotencyKey(rec.comments[0].body, key) {
+		t.Fatalf("the POSTED refusal body carries no idempotency marker for %q:\n%s", key, rec.comments[0].body)
+	}
+	if !strings.Contains(rec.comments[0].body, "did **not** file") {
+		t.Errorf("stamped refusal comment lost its prose:\n%s", rec.comments[0].body)
+	}
+}
+
+// TestSplitFiling_CommentDedupReadsWholeThread puts the keyed comment on PAGE 2
+// behind a rel="next" Link header, with page 1 carrying ONLY unrelated
+// comments. The zero-new-posts assertion can therefore only hold for a reader
+// that FOLLOWS the next-page link — the thing being searched for is not in the
+// first place searched.
+//
+// Counterfactual c5: deleting the pagination follow in
+// githubclient.ListIssueComments reddens this with a duplicate post.
+func TestSplitFiling_CommentDedupReadsWholeThread(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	key := splitfiling.SplitCommentKey(h.runID.String(), splitfiling.CommentKindAcceptance)
+	rec.listPages = [][]string{
+		{"first unrelated comment", "second unrelated comment"},
+		{"third unrelated comment", splitfiling.StampComment("Fishhawk filed the phased children.", key)},
+	}
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if len(rec.comments) != 0 {
+		t.Fatalf("posted %d parent comments, want 0 (the keyed comment is already on page 2):\n%v",
+			len(rec.comments), rec.comments)
+	}
+	if rec.listCalls < 2 {
+		t.Errorf("thread listed %d times, want >= 2 (page 1 then page 2)", rec.listCalls)
+	}
+	// The filing itself still ran — the dedup suppresses the COMMENT only.
+	if h.provider.calls != 3 {
+		t.Errorf("filed %d children, want 3", h.provider.calls)
+	}
+	if _, n := h.completionEntry(t); n != 1 {
+		t.Errorf("completion markers = %d, want 1", n)
+	}
+}
+
+// TestSplitFiling_CommentDedupToleratesCRLF serves the keyed comment with \r\n
+// line endings — the shape GitHub returns for a comment authored or edited
+// through the web interface. An exact-line matcher without normalization
+// re-posts a comment that is already there.
+//
+// Counterfactual c6: deleting the CRLF normalization in
+// workmgmt.BodyHasIdempotencyKey reddens this with a duplicate post.
+func TestSplitFiling_CommentDedupToleratesCRLF(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	key := splitfiling.SplitCommentKey(h.runID.String(), splitfiling.CommentKindAcceptance)
+	// The trailing "\n" is load-bearing: the marker is the LAST line, so without
+	// it the conversion would leave the marker line with no \r at all and this
+	// case would pass whether or not the normalization exists (counterfactual
+	// c6 would not discriminate).
+	lf := splitfiling.StampComment("Fishhawk filed the phased children.\n\nSecond paragraph.", key) + "\n"
+	crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+	if !strings.HasSuffix(crlf, "-->\r\n") {
+		t.Fatalf("fixture error: the seeded marker line does not end \\r\\n: %q", crlf)
+	}
+	rec.listPages = [][]string{{crlf}}
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if len(rec.comments) != 0 {
+		t.Fatalf("posted %d parent comments, want 0 (a CRLF-bodied keyed comment is already there):\n%v",
+			len(rec.comments), rec.comments)
+	}
+}
+
+// TestSplitFiling_CommentListErrorPostsAnyway is failure mode m7: the comment
+// path degrades fail-OPEN and DELIBERATELY OPPOSITE to the child path. A
+// missing operator-facing acceptance-carrier comment is worse than a duplicated
+// one; a duplicate child ISSUE is the bug being fixed. This pins the asymmetry
+// rather than leaving it incidental.
+func TestSplitFiling_CommentListErrorPostsAnyway(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	rec.listStatus = http.StatusInternalServerError
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if rec.listCalls == 0 {
+		t.Fatalf("the thread was never listed, so this does not exercise the listing-error branch")
+	}
+	if len(rec.comments) != 1 {
+		t.Fatalf("posted %d parent comments after a listing error, want 1 (fail-OPEN)", len(rec.comments))
+	}
+	// The child path, by contrast, still completed normally — the asymmetry is
+	// per-path, not a blanket posture.
+	if h.provider.calls != 3 {
+		t.Errorf("filed %d children, want 3", h.provider.calls)
+	}
+}
+
+// TestSplitFiling_SequentialReapprovalFilesAtMostOnce is the at-most-once
+// criterion, honestly scoped to SEQUENTIAL re-approval. The
+// children-query-then-file pair is NOT atomic, so two CONCURRENT re-approvals
+// can both observe nothing and both create — a named residual of at most one
+// duplicate, deliberately not serialized. This asserts only what the code holds.
+func TestSplitFiling_SequentialReapprovalFilesAtMostOnce(t *testing.T) {
+	inst := int64(77)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh, withQuerier: true,
+	})
+	// Pass 1: normal, complete filing.
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+	if h.provider.calls != 3 {
+		t.Fatalf("pass 1 filed %d children, want 3", h.provider.calls)
+	}
+	// Pass 2 re-approval: the completion marker short-circuits at the top.
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+	if h.provider.calls != 3 {
+		t.Errorf("total File calls after a sequential re-approval = %d, want 3", h.provider.calls)
+	}
+	if _, n := h.completionEntry(t); n != 1 {
+		t.Errorf("completion markers = %d, want 1", n)
+	}
+	if len(rec.comments) != 1 {
+		t.Errorf("parent comments = %d, want 1", len(rec.comments))
 	}
 }

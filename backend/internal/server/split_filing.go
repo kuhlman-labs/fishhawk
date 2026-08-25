@@ -300,6 +300,15 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	filed := s.loadFiledSplitChildren(ctx, runID)
 	parentEpicRef := "#" + strconv.Itoa(parentIssue)
 
+	// FORGE-STATE dedup (#2064, E50.7): query the parent's children ONCE, before
+	// filing anything, so an ordinal whose File succeeded but whose durable
+	// marker never persisted is ADOPTED instead of re-filed. A query error
+	// aborts before ANY creation — filing blind is what created this bug.
+	adoptable, ok := s.loadAdoptableSplitChildren(ctx, runRow, conv, target, parentEpicRef, specs, filed)
+	if !ok {
+		return // fail CLOSED: no completion marker, run stays resumable
+	}
+
 	// File each un-filed phase in wave (dependency) order, resolving each 0-based
 	// depends_on edge to the already-filed sibling #N.
 	for _, idx := range splitPhaseOrder(proposal) {
@@ -324,6 +333,28 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 		if !depsResolved {
 			break
 		}
+		// ADOPT: a child on the forge already bears this ordinal's key, so it
+		// was filed on a prior pass whose durable marker never landed. Fill the
+		// in-memory record from the forge's OWN number+url (never composed —
+		// see workmgmt.EpicChild.URL) and write the missing marker, WITHOUT
+		// calling provider.File.
+		childKey := splitfiling.SplitChildKey(runID.String(), idx)
+		if existing, found := splitfiling.FindAdoptableChild(adoptable, childKey); found {
+			created := &workmgmt.CreatedItem{
+				Provider: conv.Provider,
+				Number:   existing.Number,
+				URL:      existing.URL,
+			}
+			filed[idx] = filedChild{number: created.Number, url: created.URL}
+			if err := s.writeSplitChildFiledMarker(ctx, runRow, spec, created); err != nil {
+				// Same HARD-prerequisite discipline as the filed path below: a
+				// lost marker aborts with no completion marker rather than
+				// proceeding on a durable state we cannot resume from.
+				break
+			}
+			continue
+		}
+
 		child := refinement.ChildDraft{
 			Summary:            spec.Title,
 			Proposal:           spec.Proposal,
@@ -339,6 +370,10 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 		// explicit var keeps the best-effort hook self-contained. The ParentEpic
 		// relation still renders the "Parent epic: #N" body marker + depends_on.
 		req := refinement.FilingRequestForChild(child, idx+1, strconv.Itoa(parentIssue), parentEpicRef, deps)
+		// Stamp the ordinal's key so the NEXT pass can find this child on the
+		// forge even if the marker append below fails. workmgmt.Apply renders it
+		// into the body; the provider carries that body onto the create request.
+		req.IdempotencyKey = childKey
 		_, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name)
 		if werr != nil {
 			s.logSplitFilingWarn(ctx, runID, "file split child failed", werr.msg)
@@ -389,6 +424,102 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	// narrow best-effort residual on that one interleaving, not a guarantee.)
 	s.writeSplitChildrenFiledAudit(ctx, runRow, classification, children, contractChildNumber, capDraft)
 	s.postSplitParentComment(ctx, runRow, owner, name, parentIssue, contractChildNumber)
+}
+
+// loadAdoptableSplitChildren is the FORGE-STATE half of the query-before-file
+// dedup (#2064, E50.7). It queries the parent's children EXACTLY ONCE — before
+// any creation — so an ordinal whose provider.File succeeded but whose durable
+// work_item_filed marker never persisted can be ADOPTED rather than re-filed.
+//
+// It returns (children, true) to proceed and (nil, false) to ABORT the whole
+// pass. The branches, in order:
+//
+//   - every ordinal already has a durable record → nothing to look up; no query
+//     is issued (the query is not a prerequisite, it is a repair path).
+//   - the resolved provider does NOT implement workmgmt.EpicChildrenQuerier
+//     (gitlab and jira do not) → no query, empty adoptable set, and the caller
+//     keeps TODAY'S EXACT path. This is fail-OPEN by design: those providers
+//     keep the pre-#2064 window rather than losing the ability to file at all.
+//   - the query ERRORS → FAIL CLOSED. Returning false aborts before any
+//     creation, leaving the run resumable with no completion marker. Filing
+//     blind on an unreadable child set is precisely what created the duplicate
+//     this change exists to remove, so an unknown forge state must never be
+//     treated as an empty one.
+//
+// A provider-resolution failure is treated like an absent capability, not like
+// a query error: the filing loop below resolves the provider again through
+// applyAndFileWorkItem and reports the real error there, so aborting here would
+// only replace a specific downstream diagnosis with a vague one.
+func (s *Server) loadAdoptableSplitChildren(
+	ctx context.Context,
+	runRow *run.Run,
+	conv workmgmt.Conventions,
+	target workmgmt.Target,
+	parentEpicRef string,
+	specs []splitfiling.ChildSpec,
+	filed map[int]filedChild,
+) ([]workmgmt.EpicChild, bool) {
+	needQuery := false
+	for _, spec := range specs {
+		if _, done := filed[spec.PhaseIndex]; !done {
+			needQuery = true
+			break
+		}
+	}
+	if !needQuery {
+		return nil, true
+	}
+
+	prov, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "resolve provider for child adoption query failed", err.Error())
+		return nil, true // the filing loop reports the real provider error
+	}
+	querier, ok := prov.(workmgmt.EpicChildrenQuerier)
+	if !ok {
+		// Capability-less provider: today's exact path, no query attempted.
+		return nil, true
+	}
+
+	res, qerr := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: parentEpicRef})
+	if qerr != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "epic-children query failed; aborting split filing before any creation", qerr.Error())
+		return nil, false
+	}
+	if res == nil {
+		return nil, true
+	}
+	return res.Children, true
+}
+
+// splitParentThreadHasComment reports whether the parent thread already carries
+// a comment bearing key, and is the read half of the parent-comment dedup
+// (#2064). It pages the WHOLE thread through githubclient.ListIssueComments (a
+// keyed comment several pages down still counts).
+//
+// It degrades fail-OPEN, and DELIBERATELY OPPOSITE to the child path: a listing
+// error (or an absent client / installation) returns false, so the caller posts
+// anyway. A MISSING operator-facing acceptance-carrier or refusal comment is
+// worse than a duplicated one — the operator loses the pointer at the contract
+// child, or the statement that nothing was filed. A duplicate CHILD ISSUE, by
+// contrast, is the bug this change exists to remove, which is why that side
+// fails CLOSED. The asymmetry is chosen, not incidental.
+func (s *Server) splitParentThreadHasComment(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, key string) bool {
+	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
+		return false
+	}
+	comments, err := s.cfg.GitHub.ListIssueComments(ctx,
+		forge.FromGitHubInstallationID(*runRow.InstallationID),
+		forge.RepoRef{Owner: owner, Name: name}, parentIssue)
+	if err != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "list parent thread for comment dedup failed; posting anyway", err.Error())
+		return false
+	}
+	bodies := make([]string, 0, len(comments))
+	for _, c := range comments {
+		bodies = append(bodies, c.Body)
+	}
+	return splitfiling.ThreadHasComment(bodies, key)
 }
 
 // splitPhaseOrder returns the split proposal's phase indices in a
@@ -580,6 +711,14 @@ func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, ow
 	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
 		return
 	}
+	// Dedup (#2064): skip when the parent thread already carries a comment
+	// bearing this run's acceptance-carrier key. Fail-OPEN — see
+	// splitParentThreadHasComment for why this side is deliberately the
+	// opposite of the child path's fail-closed posture.
+	key := splitfiling.SplitCommentKey(runRow.ID.String(), splitfiling.CommentKindAcceptance)
+	if s.splitParentThreadHasComment(ctx, runRow, owner, name, parentIssue, key) {
+		return
+	}
 	body := fmt.Sprintf(
 		"Fishhawk filed the phased children of this issue's approved split proposal. "+
 			"The contract-phase child #%d is the acceptance carrier: it carries this issue's acceptance criteria.\n\n"+
@@ -587,6 +726,9 @@ func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, ow
 			"(a `Closes #%d` line in a child issue body would be functionless — GitHub auto-closes only from a PR/commit "+
 			"and only the enclosing issue); it will be automated by follow-up #%d (E50.6) once it ships.\n\n%s",
 		contractChildNumber, parentIssue, contractChildNumber, parentIssue, splitfiling.DeferralIssue, splitfiling.LandabilityCaveat)
+	// Stamp the OUTBOUND body: the dedup above can only ever find a marker this
+	// line put there, so dropping it would leave the dedup permanently inert.
+	body = splitfiling.StampComment(body, key)
 	repo := forge.RepoRef{Owner: owner, Name: name}
 	if _, err := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, parentIssue, body); err != nil {
 		s.logSplitFilingWarn(ctx, runRow.ID, "post parent acceptance-carrier comment failed", err.Error())
@@ -651,10 +793,19 @@ func (s *Server) postSplitRefusalComment(ctx context.Context, runRow *run.Run, o
 	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
 		return
 	}
+	// Dedup (#2064), fail-OPEN like the acceptance carrier. The refusal key is a
+	// DIFFERENT kind from the acceptance key, so the two never suppress each
+	// other on the same parent thread.
+	key := splitfiling.SplitCommentKey(runRow.ID.String(), splitfiling.CommentKindRefusal)
+	if s.splitParentThreadHasComment(ctx, runRow, owner, name, parentIssue, key) {
+		return
+	}
 	body := fmt.Sprintf(
 		"Fishhawk did **not** file the phased children of this issue's approved split proposal: %d phase(s) declare more files than the implement-stage max_files_changed cap of %d, so a filed child would itself fail the implement cap.\n\n- %s\n\nNo children were filed. Re-slice the offending phase(s) so each is at or under the cap, or — if the change is genuinely compile-atomic and cannot be phased — declare the plan `irreducible` with a rationale, then re-approve.\n\n%s",
 		len(phaseLines), capFiles, strings.Join(phaseLines, "\n- "), splitfiling.LandabilityCaveat,
 	)
+	// Stamp the OUTBOUND body (see postSplitParentComment).
+	body = splitfiling.StampComment(body, key)
 	repo := forge.RepoRef{Owner: owner, Name: name}
 	if _, err := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, parentIssue, body); err != nil {
 		s.logSplitFilingWarn(ctx, runRow.ID, "post parent split-filing refusal comment failed", err.Error())

@@ -868,3 +868,112 @@ func containsString(ss []string, s string) bool {
 	}
 	return false
 }
+
+// TestApply_StampsIdempotencyKeyOnBothBodyPaths is the c7 counterfactual
+// vehicle at the pure layer: it drives BOTH body branches — a caller-supplied
+// Body and a skeleton assembled from Sections — through the SAME
+// IdempotencyKey and asserts each rendered body carries the marker.
+//
+// Both branches matter because a stamp applied inside only one of them would
+// leave the other silently unkeyed, and which branch a caller takes is not
+// visible from the filing site. Deleting the stamping call in Apply reddens
+// this AND TestProviderFile_CreateRequestCarriesIdempotencyMarker.
+func TestApply_StampsIdempotencyKeyOnBothBodyPaths(t *testing.T) {
+	conv := testConventions(t)
+	key := MintIdempotencyKey("fishhawk-split-child", "run-abc", "0")
+
+	t.Run("caller_supplied_body", func(t *testing.T) {
+		item, _, err := Apply(FilingRequest{
+			Type:           "feature",
+			Summary:        "do the thing",
+			Body:           "## Summary\n\ndo the thing\n",
+			TitleVars:      map[string]string{"epic": "1", "n": "1"},
+			Relations:      Relations{ParentEpic: "#1"},
+			IdempotencyKey: key,
+		}, conv)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if !BodyHasIdempotencyKey(item.Body, key) {
+			t.Fatalf("caller-supplied body was not stamped:\n%s", item.Body)
+		}
+		if !strings.Contains(item.Body, "do the thing") {
+			t.Errorf("stamp destroyed the caller's body: %s", item.Body)
+		}
+	})
+
+	t.Run("skeleton_assembled_body", func(t *testing.T) {
+		item, _, err := Apply(FilingRequest{
+			Type:    "feature",
+			Summary: "do the thing",
+			Sections: map[string]string{
+				"Proposal":            "add NewFoo alongside Foo",
+				"Done-means":          "NewFoo exists",
+				"Acceptance criteria": "- NewFoo exists",
+			},
+			TitleVars:      map[string]string{"epic": "1", "n": "1"},
+			Relations:      Relations{ParentEpic: "#1"},
+			IdempotencyKey: key,
+		}, conv)
+		if err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if !BodyHasIdempotencyKey(item.Body, key) {
+			t.Fatalf("skeleton-assembled body was not stamped:\n%s", item.Body)
+		}
+		if !strings.Contains(item.Body, "add NewFoo alongside Foo") {
+			t.Errorf("stamp destroyed the assembled sections: %s", item.Body)
+		}
+	})
+}
+
+// TestApply_AbsentIdempotencyKeyLeavesBodyUnchanged pins the inert-by-default
+// posture: the SAME request with and without a key must render byte-identical
+// bodies apart from the marker, so every existing filing path is unaffected.
+func TestApply_AbsentIdempotencyKeyLeavesBodyUnchanged(t *testing.T) {
+	conv := testConventions(t)
+	req := FilingRequest{
+		Type:      "feature",
+		Summary:   "do the thing",
+		Body:      "## Summary\n\ndo the thing\n",
+		TitleVars: map[string]string{"epic": "1", "n": "1"},
+		Relations: Relations{ParentEpic: "#1"},
+	}
+	plainItem, _, err := Apply(req, conv)
+	if err != nil {
+		t.Fatalf("Apply (no key): %v", err)
+	}
+	if plainItem.Body != req.Body {
+		t.Fatalf("body changed with no key set:\ngot  %q\nwant %q", plainItem.Body, req.Body)
+	}
+	if strings.Contains(plainItem.Body, "fishhawk-idempotency-key") {
+		t.Errorf("an unkeyed filing carries a marker: %q", plainItem.Body)
+	}
+}
+
+// TestApply_StampsOnceWhenCallerBodyAlreadyKeyed covers the re-render path: a
+// caller Body that ALREADY carries the key (a body assembled from a previously
+// stamped source) must not be double-marked.
+func TestApply_StampsOnceWhenCallerBodyAlreadyKeyed(t *testing.T) {
+	conv := testConventions(t)
+	key := MintIdempotencyKey("fishhawk-split-child", "run-abc", "1")
+	pre := StampIdempotencyKey("## Summary\n\ndo the thing\n", key)
+
+	item, _, err := Apply(FilingRequest{
+		Type:           "feature",
+		Summary:        "do the thing",
+		Body:           pre,
+		TitleVars:      map[string]string{"epic": "1", "n": "1"},
+		Relations:      Relations{ParentEpic: "#1"},
+		IdempotencyKey: key,
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := strings.Count(item.Body, key); got != 1 {
+		t.Fatalf("body carries the key %d times, want exactly 1:\n%s", got, item.Body)
+	}
+	if item.Body != pre {
+		t.Errorf("already-keyed body was rewritten:\ngot  %q\nwant %q", item.Body, pre)
+	}
+}

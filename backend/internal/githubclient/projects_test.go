@@ -335,9 +335,13 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	// #41 is OPEN (stateReason null); #42 is CLOSED as COMPLETED — the
 	// closed+completed pair the workmgmt provider maps to EpicChild.Complete.
+	// The url values are a GitHub ENTERPRISE SERVER host on purpose: SubIssue.URL
+	// must carry the forge's own value through verbatim, never be composed from
+	// a literal https://github.com/ prefix (#2064 — Client.BaseURL is
+	// configurable, so a composed url would be wrong on a GHE host).
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41","state":"OPEN","stateReason":null,"labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","state":"CLOSED","stateReason":"COMPLETED","labels":{"nodes":[]}}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","url":"https://ghe.example.com/o/r/issues/41","state":"OPEN","stateReason":null,"labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","url":"https://ghe.example.com/o/r/issues/42","state":"CLOSED","stateReason":"COMPLETED","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
 	if err != nil {
@@ -368,6 +372,20 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	}
 	if subs[1].Body != "Depends on: #41" {
 		t.Errorf("subs[1].Body = %q", subs[1].Body)
+	}
+	// The `url` selection maps onto SubIssue.URL verbatim (#2064): it is the
+	// value workmgmt/github carries onto EpicChild.URL and the split-filing
+	// adoption path records for an adopted child.
+	if subs[0].URL != "https://ghe.example.com/o/r/issues/41" {
+		t.Errorf("subs[0].URL = %q, want the served url verbatim", subs[0].URL)
+	}
+	if subs[1].URL != "https://ghe.example.com/o/r/issues/42" {
+		t.Errorf("subs[1].URL = %q, want the served url verbatim", subs[1].URL)
+	}
+	// The query must SELECT url, or the field decodes empty for every child and
+	// an adopted child would be recorded with no url at all.
+	if q := pf.gotGraphQLQuery["ListSubIssues"]; !strings.Contains(q, "url") {
+		t.Errorf("ListSubIssues query does not request url: %q", q)
 	}
 	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["parentId"] != "EPIC_NODE" {
 		t.Errorf("vars = %+v, want parentId=EPIC_NODE", vars)

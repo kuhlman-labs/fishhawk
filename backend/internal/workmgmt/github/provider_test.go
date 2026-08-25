@@ -974,6 +974,11 @@ func TestParseIssueRef(t *testing.T) {
 type realClientFixture struct {
 	restAuth    string
 	graphqlAuth string
+	// restBody is the RAW JSON body of the issue-create request the fake server
+	// actually received. It exists so a test can assert on the OUTBOUND payload
+	// (#2064) rather than on a body handed to a stub — the serialization
+	// boundary is exactly where a marker would be lost.
+	restBody string
 }
 
 func newRealClient(t *testing.T, projectsToken string) (*githubclient.Client, *realClientFixture) {
@@ -983,6 +988,8 @@ func newRealClient(t *testing.T, projectsToken string) (*githubclient.Client, *r
 
 	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
 		fx.restAuth = r.Header.Get("Authorization")
+		raw, _ := io.ReadAll(r.Body)
+		fx.restBody = string(raw)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{"number":1234,"node_id":"ISSUE_NODE","html_url":"https://github.com/kuhlman-labs/fishhawk/issues/1234"}`)
@@ -1712,3 +1719,132 @@ var (
 	_ workmgmt.Transitioner     = (*Provider)(nil)
 	_ workmgmt.NumberDiscoverer = (*Provider)(nil)
 )
+
+// TestProvider_EpicChildren_PopulatesBodyAndURLVerbatim pins the two ADDITIVE
+// EpicChild fields the forge-state adoption path reads (#2064, E50.7): a served
+// sub-issue's body — including one already carrying an idempotency marker — and
+// its url reach EpicChild.Body / EpicChild.URL VERBATIM.
+//
+// The url fixture is deliberately a GitHub Enterprise Server host: a mapping
+// that composed https://github.com/{owner}/{repo}/issues/{n} instead of
+// carrying the forge's own value through would produce the WRONG url here, and
+// the adoption path would then record a url no operator could follow.
+func TestProvider_EpicChildren_PopulatesBodyAndURLVerbatim(t *testing.T) {
+	key := workmgmt.MintIdempotencyKey("fishhawk-split-child", "run-abc", "0")
+	keyedBody := workmgmt.StampIdempotencyKey("## Summary\n\nphase child\n", key)
+
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 100, NodeID: "N100", Title: "keyed child", Body: keyedBody,
+				URL: "https://ghe.example.com/kuhlman-labs/fishhawk/issues/100", State: "OPEN"},
+			{Number: 101, NodeID: "N101", Title: "plain child", Body: "no marker here",
+				URL: "https://ghe.example.com/kuhlman-labs/fishhawk/issues/101", State: "CLOSED", StateReason: "COMPLETED"},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#99",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if len(res.Children) != 2 {
+		t.Fatalf("children = %+v, want 2", res.Children)
+	}
+	if res.Children[0].Body != keyedBody {
+		t.Errorf("child[0].Body = %q, want the served body verbatim %q", res.Children[0].Body, keyedBody)
+	}
+	if res.Children[0].URL != "https://ghe.example.com/kuhlman-labs/fishhawk/issues/100" {
+		t.Errorf("child[0].URL = %q, want the forge's own url verbatim", res.Children[0].URL)
+	}
+	if res.Children[1].Body != "no marker here" {
+		t.Errorf("child[1].Body = %q", res.Children[1].Body)
+	}
+	if res.Children[1].URL != "https://ghe.example.com/kuhlman-labs/fishhawk/issues/101" {
+		t.Errorf("child[1].URL = %q", res.Children[1].URL)
+	}
+	// The marker survives the mapping well enough to be DETECTED off the mapped
+	// value — the actual thing the adoption lookup does.
+	if !workmgmt.BodyHasIdempotencyKey(res.Children[0].Body, key) {
+		t.Errorf("mapped child body no longer carries its idempotency key")
+	}
+	// A CLOSED+COMPLETED child is still returned (no state filter), so it stays
+	// adoptable — the property TestSplitFiling_ClosedChildBearingKeyIsAdopted
+	// depends on at the server layer.
+	if !res.Children[1].Complete {
+		t.Errorf("child[1].Complete = false, want true (CLOSED+COMPLETED)")
+	}
+}
+
+// TestProviderFile_CreateRequestCarriesIdempotencyMarker closes the ADAPTER
+// SERIALIZATION boundary (operator FIX 2). Every other case in this change
+// observes a body handed to a fake provider, or an EpicChildren OUTPUT — none
+// of them watches the OUTBOUND issue-create request, which is exactly where a
+// serialization bug would live.
+//
+// It drives the REAL Provider.File against the REAL githubclient against the
+// httptest mux, with a body rendered by the REAL workmgmt.Apply from a
+// FilingRequest carrying an IdempotencyKey, and asserts the marker is present
+// in the CREATE REQUEST BODY the fake server actually received — after
+// Provider.File's ensureDependsOnMarker body rewrite and the JSON request
+// assembly. Counterfactual c7: deleting the stamping call in workmgmt.Apply
+// reddens this alongside the Apply unit test.
+func TestProviderFile_CreateRequestCarriesIdempotencyMarker(t *testing.T) {
+	key := workmgmt.MintIdempotencyKey("fishhawk-split-child", "run-abc", "2")
+
+	item, _, err := workmgmt.Apply(workmgmt.FilingRequest{
+		Type:           "feature",
+		Summary:        "contract: delete the transitional Foo",
+		Body:           "## Summary\n\ndelete Foo now that all consumers use NewFoo\n",
+		TitleVars:      map[string]string{"epic": "2100", "n": "3"},
+		Relations:      workmgmt.Relations{ParentEpic: "#2100", DependsOn: []string{"#3002"}},
+		IdempotencyKey: key,
+	}, workmgmt.Default())
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	req := baseRequest()
+	req.Item = item
+	req.Item.Classification.Labels = []string{"type:feature"}
+	req.Item.BoardPlacement.Status = "Backlog"
+	// Apply resolved a depends_on relation onto the item, so the marker must
+	// survive ensureDependsOnMarker's body REWRITE rather than only an
+	// untouched pass-through.
+	if len(req.Item.Relations.DependsOn) == 0 {
+		t.Fatal("fixture error: no depends_on relation, so the body rewrite would not run")
+	}
+
+	c, fx := newRealClient(t, "pat_projects")
+	if _, err := New(c).File(context.Background(), req); err != nil {
+		t.Fatalf("File: %v", err)
+	}
+
+	if fx.restBody == "" {
+		t.Fatal("fake server recorded no issue-create request body")
+	}
+	var sent struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(fx.restBody), &sent); err != nil {
+		t.Fatalf("decode recorded create body %q: %v", fx.restBody, err)
+	}
+	// The assertion is on the OUTBOUND request, decoded from the wire.
+	if !workmgmt.BodyHasIdempotencyKey(sent.Body, key) {
+		t.Fatalf("issue-create request body does not carry the idempotency marker for %q:\n%s", key, sent.Body)
+	}
+	// The depends_on rewrite ran (so this is not a no-rewrite pass-through) and
+	// the original prose survived alongside the marker.
+	if !strings.Contains(sent.Body, "#3002") {
+		t.Errorf("create body lost the depends_on marker: %s", sent.Body)
+	}
+	if !strings.Contains(sent.Body, "delete Foo now that all consumers use NewFoo") {
+		t.Errorf("create body lost the original prose: %s", sent.Body)
+	}
+	// Exactly one marker on the wire: no double-stamp across Apply + File.
+	if got := strings.Count(sent.Body, key); got != 1 {
+		t.Errorf("create body carries the key %d times, want exactly 1:\n%s", got, sent.Body)
+	}
+}

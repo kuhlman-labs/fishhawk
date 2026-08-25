@@ -163,6 +163,20 @@ type EpicChild struct {
 	Title    string
 	Autonomy string
 	Complete bool
+	// Body is the child issue's raw body. It is the surface the forge-state
+	// idempotency lookup reads (#2064, E50.7): a filed child carries a hidden
+	// idempotency marker in its body, so query-before-file adoption asks
+	// BodyHasIdempotencyKey of this field. Additive and empty for a provider
+	// that does not return bodies.
+	Body string
+	// URL is the forge's OWN canonical absolute URL for the child, carried
+	// through verbatim — NEVER composed from owner/repo/number. The filed path
+	// records the URL the forge returned (github/provider.go uses
+	// issue.HTMLURL) and githubclient.Client.BaseURL is configurable, so
+	// composing a literal https://github.com/{owner}/{repo}/issues/{n} would
+	// produce a WRONG url on a GitHub Enterprise Server host. Additive and
+	// empty for a provider that does not return one.
+	URL string
 }
 
 // DropReason categorizes why a DependsEdge was dropped from the wave DAG, so
