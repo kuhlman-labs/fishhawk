@@ -52,6 +52,8 @@ logs/
 # Node / frontend build artifacts (will land with E7.1)
 node_modules/
 .pnpm-store/
+# Astro build cache (site/). dist/ and node_modules/ are already covered above.
+.astro/
 .cache/
 .eslintcache
 .parcel-cache/

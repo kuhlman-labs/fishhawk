@@ -513,3 +513,111 @@ Since #2455 `scripts/test verify` runs `scripts/test-dev` in its
 `_verify_gate_harnesses` loop, so a `scripts/dev` regression fails
 in-loop rather than only when a human remembers to run the harness (it
 is still runnable standalone; skipped in-loop when zsh is absent).
+
+## Docs-site voice gate (E12.1 / [#2261](https://github.com/kuhlman-labs/fishhawk/issues/2261))
+
+`docs/BRAND_FOUNDATIONS.md` §5 ("Things we never say") bans a specific
+vocabulary. On the public site — `site/src/content/docs/`, the one
+surface a stranger reads — that ban is machine-enforced rather than
+asserted in prose, so a later docs child that writes "seamless" into a
+page fails `scripts/test verify` in-loop instead of landing.
+
+Two scripts:
+
+- **`scripts/check-site-voice [CONTENT_ROOT]`** — the gate. Walks every
+  `*.md` / `*.mdx` under the content root (default
+  `site/src/content/docs`) and exits 1 on any banned term.
+- **`scripts/test-site-voice`** — the harness that pins the gate,
+  driving the real script against temp-dir fixtures.
+
+### Matching
+
+Case-insensitive and **prefix**-based, anchored on a **leading word
+boundary**. Prefix-based so `seamlessly` and `empowering` hit without
+enumerating every inflection; leading-boundary-anchored so a banned term
+appearing only *inside* a longer word (`unseamless`, `disempower`) does
+not. Both halves are load-bearing and both are pinned — the anchor by
+harness case c4, whose fixture carries exactly those embedded tokens.
+
+Every violation is reported — file, line number, matched term — before
+the non-zero exit. A first-hit-and-stop implementation would hide a
+page's second offence until the first was fixed; case c5 pins that with
+a two-file fixture and asserts the SECOND file is named. It asserts the
+name and not a line count deliberately: the summary line the script
+prints means a count is satisfiable by a first-hit-and-stop version.
+
+### What is deliberately NOT mechanized
+
+`trust`. §5 bans trust as a *marketing claim*, not the word, and this
+repository legitimately writes "trust boundary" and "trusted tree". A
+substring ban would false-positive on those and train readers to ignore
+the checker, so `trust` stays a human-review item. Case c4 pins that it
+does not fire.
+
+### Fail-open contract — and its one exception
+
+A missing content root prints a one-line reason and exits **0**, as does
+a content root holding no pages. This is a voice linter that verify runs
+unconditionally, not a security control: it must never red-line a
+checkout that has no `site/` yet. Case c6 pins the absent-root branch,
+asserting both the exit code and the printed reason.
+
+A FAILED enumeration is the exception and exits **2** (distinct from
+1 = violations found). Those two fail-open branches are decisions about a
+tree with nothing to lint; a failed walk means the checker does not KNOW
+what is there, and reporting it clean would silently bypass the gate. So
+the `find … | sort` runs into a file whose exit status is checked, not
+into a process substitution whose status the surrounding `while` cannot
+see. Case c9 pins it, injecting the failure with a PATH-stubbed `find`
+rather than an unreadable directory — a harness running as root would
+read that directory fine and turn the case into a silent false pass.
+
+Page paths are handed to `awk` prefixed with `./` when relative. awk
+reads an operand of the form `name=value` as a variable assignment rather
+than a file, and `CONTENT_ROOT` is caller-supplied, so a root like `a=b`
+would leave every page under it silently unlinted. `--` does not help —
+this is operand parsing, not option parsing. Case c10 pins it, with the
+content root named `a=b` and invoked from its parent: a deeper
+`c10/a=b/page.md` is already safe (`c10/a` is not an identifier) and
+would make the case a false pass.
+
+### Testing
+
+`scripts/test-site-voice` runs ten cases, one per named behavior:
+
+| Case | Pins |
+|---|---|
+| c1 | clean content → exit 0 |
+| c2 | a banned term → exit 1, report names file + line number + term |
+| c3 | mixed-case `Frictionless` → exit 1 (case-insensitivity) |
+| c4 | `unseamless` / `disempower` / `seam` / `trusted` → exit 0 (leading-boundary anchor + the `trust` carve-out) |
+| c5 | two distinctly-named offending pages → exit 1, BOTH named |
+| c6 | absent content root → exit 0 with a printed reason |
+| c7 | content root with no `.md`/`.mdx` pages → exit 0 with a printed reason |
+| c8 | `scripts/test`'s `_verify_site_voice` skips with a reason (return 0) when the gate is absent |
+| c9 | a failed page enumeration (PATH-stubbed `find`) → exit 2 with a reason, never a clean report |
+| c10 | a page under a relative content root named `a=b` → exit 1, the page named (awk operand parsing) |
+
+c3 asserts the exit code plus exactly ONE named term, never both. That
+is deliberate: it keeps c3 green under a first-hit-and-stop weakening,
+so that counterfactual isolates c5.
+
+Eight counterfactuals were run against the controls and OBSERVED, not
+reasoned about — each deletion restored byte-identically afterwards:
+
+| Deletion | Observed RED |
+|---|---|
+| the banned-term match loop | c2, c3, c5 |
+| weaken to first-hit-and-stop (exit code + summary line intact) | c5 only — the surviving summary still said "2 occurrence(s)", so a line COUNT would have passed |
+| the leading word-boundary anchor | c4 only, on `unseamless` → `seamless` and `disempower` → `empower` |
+| `_verify_site_voice`'s not-executable guard | c8 only (exit 127, the red-line it prevents) |
+| the empty-file-list fail-open | c7 only (`files[@]: unbound variable` under bash 3.2) |
+| the absent-content-root fail-open | c6 only (bare `find` error, no reason printed) |
+| the enumeration-status check (back to `< <(find … \| sort)`) | c9 only (exit 0, "no .md/.mdx pages … nothing to lint" — the fail-open itself) |
+| the `./` operand prefixing | c10 only (exit 0, "1 page(s) clean under a=b" — the offending page never linted) |
+
+`scripts/test verify` runs BOTH: `test-site-voice` in the
+`_verify_gate_harnesses` loop (proving the control still works), and
+`check-site-voice` itself via `_verify_site_voice` against the committed
+pages (proving they still pass it). Both are bash, so neither needs the
+zsh guard `test-dev` carries. Long-form site contract: `site/README.md`.

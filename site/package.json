@@ -1,0 +1,32 @@
+{
+  "name": "@fishhawk/site",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Fishhawk public documentation site — human-facing narrative docs, built with Astro + Starlight.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.33.3",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.41.8",
+    "astro": "7.2.6"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "typescript": "6.0.3"
+  }
+}

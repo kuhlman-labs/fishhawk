@@ -1,0 +1,46 @@
+---
+title: Fishhawk
+description: The governed, auditable workflow for agent-driven software development.
+template: splash
+hero:
+  tagline: Agents do the work. Your team approves the work. Fishhawk holds the record.
+  actions:
+    - text: What Fishhawk is
+      link: /fishhawk/start/what-fishhawk-is/
+      icon: right-arrow
+    - text: Source on GitHub
+      link: https://github.com/kuhlman-labs/fishhawk
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Fishhawk is a workflow engine for agent-driven software changes. It defines the
+stages a change moves through, enforces policy on what an agent may and may not
+do, gates the work behind human approvals, and keeps a signed, append-only
+record of every plan, approval, and outcome.
+
+**Status: alpha.** The v0 control plane, runner, CLI, MCP server, and Web UI
+have landed. Parts of this site are still stubs, and each one says which issue
+fills it. Feature PRs are not yet being accepted while the v0 abstractions
+settle.
+
+<CardGrid>
+  <Card title="Start here" icon="rocket">
+    What Fishhawk is, what it deliberately is not, and what a first run looks
+    like. [Read the introduction](/fishhawk/start/what-fishhawk-is/).
+  </Card>
+  <Card title="Concepts" icon="open-book">
+    The vocabulary — workflow, stage, gate, constraint, plan, audit log —
+    before anything else parses. [Read the glossary](/fishhawk/concepts/).
+  </Card>
+  <Card title="Operating" icon="setting">
+    Driving a run, granting approvals, and what to do when a run fails.
+    [Read the operator guide](/fishhawk/operating/driving-a-run/).
+  </Card>
+  <Card title="Reference" icon="document">
+    The workflow spec, the plan artifact, the CLI, and the REST API.
+    [Read the reference](/fishhawk/reference/).
+  </Card>
+</CardGrid>
