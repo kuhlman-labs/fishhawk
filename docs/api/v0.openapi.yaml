@@ -5603,10 +5603,16 @@ paths:
         per-reviewer availability on this deployment, and the caller token's
         scope adequacy against the run-driving scope subset. Read-only.
 
-        Gates on authentication only (401 for anonymous) — NOT a write scope,
-        because scope adequacy is itself a reported field: a write-scope gate
-        would lock out exactly the callers who need to discover their gap.
-        Mirrors `GET /v0/auth/me`.
+        Does NOT gate on a write scope, because scope adequacy is itself a
+        reported field: a write-scope gate would lock out exactly the callers
+        who need to discover their gap.
+
+        A non-admin cookie-session caller who does not hold `read` on the
+        queried repository at the forge is DENIED 403 `repo_forbidden`
+        (ADR-057 Amendment A2 / #2071) before any installation resolve or spec
+        fetch. Three identity classes are unfiltered: bearer/MCP token
+        identities, workspace admins (including admin cookie sessions), and
+        deployments with no repo-ACL mirror wired.
       tags: [onboarding]
       parameters:
         - name: repo
@@ -5624,6 +5630,8 @@ paths:
               schema: { $ref: '#/components/schemas/OnboardingReadiness' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v0/onboarding/start:
     get:

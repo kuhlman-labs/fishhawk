@@ -85,11 +85,31 @@ type scopeReadiness struct {
 
 // handleGetOnboardingReadiness implements GET /v0/onboarding/readiness?repo=owner/name
 // (E29.4). It aggregates the server-side-only readiness probes a first run
-// needs, reusing the exact classification the run-create path performs. It is
-// read-only and gates on AUTHENTICATION only (401 for anonymous) — not a write
-// scope — because scope adequacy is itself a reported field: a write-scope gate
-// would lock out precisely the callers who need to discover their gap. Mirrors
-// /v0/auth/me.
+// needs, reusing the exact classification the run-create path performs.
+//
+// Two-part gate:
+//
+//   - It does NOT gate on a write scope — scope adequacy is itself a reported
+//     field, and a write-scope gate would lock out precisely the callers who
+//     need to discover their gap.
+//   - It DOES gate on repo read-visibility: a NON-ADMIN cookie-session caller
+//     who lacks forge `read` on the queried repo gets 403 repo_forbidden BEFORE
+//     any installation resolve or spec fetch (ADR-057 Amendment A2 / #2071,
+//     issue #1512). The gate reuses enforceRepoVisibility, so the endpoint
+//     inherits the whole #2071 point-read contract: the three unfiltered
+//     postures (bearer/MCP token identities, workspace admins — INCLUDING admin
+//     cookie sessions, which bypass via the RoleAdmin branch of repoFilterFor
+//     and never see the 403 — and deployments with no repo-ACL mirror wired),
+//     403 on a deny, 503 on a mirror-store / provider-resolution / role-
+//     resolution fault, and the cross-forge / prefixless-subject fail-closed
+//     denies.
+//
+// The ordering invariant is load-bearing: 401 anonymous → 400 malformed repo →
+// visibility. Anonymous is rejected before any filter resolve (an
+// unauthenticated caller must not learn a repo exists), the repo string is
+// validated to a well-formed owner/name before the filter is handed it, and
+// only then does the visibility gate run — so a denied caller reaches ZERO
+// forge calls, ZERO spec fetches, and receives no spec.Error text at all.
 func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Request) {
 	ident := IdentityFrom(r.Context())
 	if ident.IsAnonymous() {
@@ -107,6 +127,13 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"repo must be in owner/name format",
 			map[string]any{"field": "repo", "got": repo})
+		return
+	}
+
+	// Repo read-visibility gate (#1512, ADR-057 Amendment A2 / #2071). Runs
+	// AFTER the 401/400 checks above and BEFORE any forge call below, so a
+	// denied caller learns nothing about the repo's installation or spec state.
+	if !s.enforceRepoVisibility(w, r, repo) {
 		return
 	}
 	repoRef := githubclient.RepoRef{Owner: owner, Name: name}

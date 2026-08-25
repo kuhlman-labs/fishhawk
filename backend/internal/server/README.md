@@ -1825,7 +1825,17 @@ It covers evidence assembly (`releaseevidence`) → notes render (`releasenotes`
 3. per-reviewer availability via the same `ReviewerSet.For(provider, model, reasoningEffort)` probe `unavailableSpecReviewers` performs (`runs.go`), surfacing the adapter's missing-env hint;
 4. caller-token scope adequacy against `requiredRunScopes` (the run-drive subset of `operatorDefaultScopes`, `backend/cmd/fishhawkd/token.go`).
 
-Read-only; cascades gracefully (not-installed → spec-unavailable → empty reviewers). Auth-only gate (401 anonymous, NOT a write scope — scope adequacy is a reported field), mirroring `/v0/auth/me`.
+Read-only; cascades gracefully (not-installed → spec-unavailable → empty reviewers).
+
+**Gate ordering is load-bearing: 401 anonymous → 400 malformed repo → `enforceRepoVisibility` (#1512, ADR-057 Amendment A2 / #2071).** It is NOT a write-scope gate — scope adequacy is a reported field — but it IS a repo read-visibility gate. Anonymous is rejected before any filter resolves (an unauthenticated caller must not learn a repo exists); the `repo` query value is validated to a well-formed `owner/name` before the filter is handed it; only then does the visibility gate run, so a denied caller reaches ZERO forge calls, ZERO spec fetches, and receives no `spec.Error` text. The gate reuses `enforceRepoVisibility` rather than hand-rolling a filter, so the endpoint inherits the whole #2071 point-read contract: 403 `repo_forbidden` on a deny, 503 `service_unavailable` on a mirror-store / provider-resolution / role-resolution fault (the store-fault class is kept DISTINCT from the permission-denied class), and the cross-forge / ambiguous-row / prefixless-subject fail-closed denies.
+
+Three identity classes are UNFILTERED, each preserving the exact pre-change surface:
+
+- **Bearer/MCP token identities** (`TokenID != ""`) — `repoFilterFor` returns nil; bounded by token ownership and scope, so the mirror (keyed on a human forge subject) has nothing to say about them. This is what keeps `fishhawk doctor` / the `fishhawk_doctor` MCP tool working.
+- **Workspace admins** — `RoleAdmin` bypasses the filter, INCLUDING admin cookie sessions. The 403 is a NON-ADMIN qualification: an admin cookie session never sees it.
+- **No-mirror deployments** — `Config.RepoVisibility == nil` is `repoFilterFor`'s first early return.
+
+Pinned by, in `onboarding_test.go`: `TestOnboardingReadiness_RepoNotVisible` (the 403 + zero-forge control and counterfactual vehicle), `_RepoVisible` (admission control), `_BearerTokenUnfiltered`, `_AdminCookieBypass`, `_NoMirrorWired`, `_VisibilityStoreFault`, `_RoleResolutionFault`, `_ProviderResolutionFault`, `_CrossForgeDeny`, `_AmbiguousRowForgeDeny`, `_PrefixlessSubjectDenyAll`, `_AnonymousBeforeVisibility`, `_MalformedRepoBeforeVisibility`; and the cross-layer arms in `repovisibility_integration_test.go` (`TestRepoVisibility_Integration_MemberSeesOnlyGrantedRepo` / `_AdminSeesEverything`) that drive the endpoint through the real router, session middleware and Postgres-backed mirror.
 
 ### CSRF enforcement (`csrf.go`, ADR-005)
 

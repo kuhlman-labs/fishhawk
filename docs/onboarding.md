@@ -225,7 +225,43 @@ grants the readiness endpoint authority over the local token rung (the cascade
 break above). A transport error, a non-200, or a malformed 200 body leaves the
 token rung free to fail on a genuine credential rejection: the relaxation is
 scoped to a positive server-side signal, never inferred from a status code
-alone.
+alone. A `403 repo_forbidden` (below) is one such non-200: it degrades to the
+same single warning rather than crashing the doctor.
+
+### Repo read-visibility gate (#1512)
+
+Since #1512 (ADR-057 Amendment A2 / #2071), the readiness endpoint applies the
+repo-scoped read-visibility gate the product already owns: a caller who holds
+no forge `read` on the queried repo is denied `403 repo_forbidden` **before**
+any installation resolve or spec fetch, so verbatim `spec.Error` text and
+installation state never reach a caller with no read on the repo. A `503
+service_unavailable` is returned instead when the visibility mirror cannot be
+resolved (a store / provider-resolution / role-resolution fault) — deliberately
+distinct from the `403` permission-denied class, never a silent allow.
+
+**Three identity classes are UNFILTERED and keep the exact pre-gate surface:**
+
+1. **Bearer / MCP token identities** — `repoFilterFor` returns nil for any
+   identity with `TokenID != ""`. *Rationale:* bearer identities are bounded by
+   token ownership and scope, and a repo-permission mirror keyed on a human
+   forge subject has nothing to say about them. This is what keeps `fishhawk
+   doctor` and the `fishhawk_doctor` MCP tool working — they authenticate with a
+   bearer token.
+2. **Workspace admins** — `RoleAdmin` bypasses the filter, INCLUDING admin
+   **cookie** sessions.
+3. **Deployments with no repo-ACL mirror wired** — `Config.RepoVisibility ==
+   nil` is `repoFilterFor`'s first early return, so the endpoint keeps its exact
+   pre-change surface.
+
+**Who CAN see the `403`:** a **non-admin** browser cookie session on a
+mirror-wired deployment. (Not "a browser cookie session on a mirror-wired
+deployment" — that would be overbroad and wrong, because an admin cookie session
+bypasses filtering.)
+
+The concern's **cookie-session half is CLOSED** by this gate. Its
+**bearer-token half is deliberately closed** with the recorded #2071 rationale
+above (bearer identities are bounded by token ownership and scope), not left as
+an unexamined gap.
 
 ## `fishhawk init`
 
