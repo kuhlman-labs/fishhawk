@@ -970,6 +970,36 @@ _scan_operator_worktrees() {
   done
 }
 
+# How long the stale-shim probe may run before it is killed and treated as a
+# degrade. Hashing a normal binary is milliseconds; anything near this bound is
+# a pathological child_path, not a slow machine.
+_SHIM_PROBE_TIMEOUT=5
+
+# Run a command with a wall-clock bound, stdout to <outfile> and stderr
+# discarded. Returns the command's own status when it finished in time, and
+# non-zero on expiry (the command is SIGTERMed) — so a caller that degrades on
+# any non-zero status treats a hang exactly like a failure.
+#
+# zsh has no portable `timeout` (macOS ships neither timeout nor gtimeout), so
+# this is the watchdog form: background the command, background a sleeper that
+# kills it, `wait` on the command, then kill the sleeper. Polling `kill -0`
+# instead would not work — a finished-but-unwaited child is a zombie and still
+# answers signal 0, so the poll would always run the full bound.
+# Args: <seconds> <outfile> <cmd> [args...]
+_run_with_timeout() {
+  local secs="$1"; shift
+  local outfile="$1"; shift
+  "$@" >"$outfile" 2>/dev/null &
+  local cmd_pid=$!
+  ( sleep "$secs"; kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
+  local watch_pid=$!
+  local rc=0
+  wait "$cmd_pid" 2>/dev/null || rc=$?
+  kill -TERM "$watch_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+  return "$rc"
+}
+
 # Non-fatal: warn when a registered fishhawk-mcp-shim has stopped hot-swapping
 # its child, leaving the live session on a binary that is no longer on disk
 # (#2831). Mirrors _warn_stale_worktrees' shape: strictly advisory, and every
@@ -981,6 +1011,14 @@ _scan_operator_worktrees() {
 # (either stream) when nothing is stale. Probe stderr is discarded here too, so
 # a future diagnostic that starts writing to stderr can never turn this advisory
 # into per-`up` noise.
+#
+# The probe is BOUNDED (_run_with_timeout, ${_SHIM_PROBE_TIMEOUT}s). cmd_up
+# calls this before anything else, so a probe that never returns would hang
+# `scripts/dev up`/`reload` outright rather than degrade — the one failure mode
+# an advisory must not have. The shim hashes each snapshot's child_path, an
+# untrusted path that can be a stalled network mount or a very large file; the
+# Go side refuses non-regular paths, and this bound covers the rest. Expiry is
+# treated exactly like every other degrade: silence, rc 0.
 #
 # State-dir coupling (see backend/cmd/fishhawk-mcp-shim/README.md): the probe
 # reads the DEFAULT state dir unless FISHHAWK_MCP_SHIM_STATE_DIR is set in THIS
@@ -999,10 +1037,16 @@ _warn_stale_shim() {
   if [[ -n "${FISHHAWK_MCP_SHIM_STATE_DIR:-}" ]]; then
     probe_args+=(--state-dir "${FISHHAWK_MCP_SHIM_STATE_DIR}")
   fi
-  local out=""
-  if ! out="$("$status_cmd" "${probe_args[@]}" 2>/dev/null)"; then
+  local out="" probe_tmp=""
+  if ! probe_tmp="$(mktemp "${TMPDIR:-/tmp}/fishhawk-shim-probe.XXXXXX" 2>/dev/null)"; then
     return 0
   fi
+  if ! _run_with_timeout "${_SHIM_PROBE_TIMEOUT}" "$probe_tmp" "$status_cmd" "${probe_args[@]}"; then
+    rm -f "$probe_tmp"
+    return 0
+  fi
+  out="$(cat "$probe_tmp" 2>/dev/null)" || out=""
+  rm -f "$probe_tmp"
   if [[ -z "$out" ]]; then
     return 0
   fi

@@ -252,7 +252,10 @@ func (s *supervisor) armSwap(h []byte) {
 // load-bearing: it makes spawnAndReplay take the FULL replay arm (synthetic id,
 // response swallowed) instead of the pre-handshake arm, which re-sends the
 // ORIGINAL initialize verbatim and would deliver a SECOND response under the
-// client's own JSON-RPC id — corrupting the session on every presumed swap.
+// client's own JSON-RPC id — corrupting the session on every presumed swap. It
+// also retires the never-matched initialize from in-flight accounting, without
+// which the gate would open onto a permanently non-empty in-flight set and the
+// swap would simply defer forever one arm later instead.
 func (s *supervisor) swapGate() (bool, string) {
 	if s.handshakeDone {
 		return true, ""
@@ -265,6 +268,22 @@ func (s *supervisor) swapGate() (bool, string) {
 	}
 	s.handshakePresumed = true
 	s.handshakeDone = true
+	// Retire the recorded initialize from in-flight accounting. handleUpstream
+	// registers it like any other request, and handleDownstream can only clear it
+	// by MATCHING its id — which by construction never happened on this path, so
+	// the entry leaks. An MCP server answers a request with a result only after
+	// the initialize lifecycle completes, so the response either already flowed
+	// under an id the shim could not match or is never coming; either way the
+	// entry is an accounting artifact, not real outstanding work. Left in place it
+	// hands maybeSwap a permanently non-empty in-flight set, which parks every
+	// swap in the deferred_in_flight passive wait — the same forever-deferral this
+	// presumption exists to end. Dropped from accounting ONLY: no orphan error is
+	// synthesized, because the full replay re-establishes the session and the
+	// client has already received whatever the child sent under its own id.
+	if s.initIDKey != "" {
+		delete(s.inFlight, s.initIDKey)
+		delete(s.inFlightSince, s.initIDKey)
+	}
 	s.logf("initialize response never matched, but the child has served %d result(s); presuming the handshake and allowing the swap (#2831)", s.servedResults)
 	return true, ""
 }

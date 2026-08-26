@@ -2189,7 +2189,8 @@ fi
 rm -rf "$prune_dry"
 rm -rf "$prune_repo"
 
-# 18b. _warn_stale_shim (#2831): four stub-driven branches plus the stderr case.
+# 18b. _warn_stale_shim (#2831): stub-driven branches for every degrade, plus
+# the stderr case and the bounded-probe case.
 # The probe is a MACHINE-CONSUMABLE mode, so anything other than non-empty stdout
 # must produce total silence — including output the probe wrote to STDERR, which
 # on a dev box that has ever run a shim is the COMMON case (dead-pid leftover
@@ -2252,6 +2253,47 @@ if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
   pass "_warn_stale_shim: probe stderr never reaches the operator (total silence)"
 else
   fail "_warn_stale_shim must swallow probe stderr (out: $shim_out rc: $shim_rc)"
+fi
+
+# (d2) probe that never returns -> the advisory must NOT hang. cmd_up calls this
+# before anything else, so an unbounded probe hangs `scripts/dev up`/`reload`
+# outright — the one failure mode an advisory must not have. The shim hashes each
+# snapshot's untrusted child_path, which can be a stalled mount or a huge file.
+# Case (b)/(c)/(d) cannot catch this: they all RETURN.
+cat > "${shim_stub_dir}/hangs" <<'STUB'
+#!/bin/sh
+echo "STALE: shim pid 4242"
+sleep 600
+STUB
+chmod +x "${shim_stub_dir}/hangs"
+# NB: as in case (g), an assignment prefix on an ASSIGNMENT is not a command
+# prefix in zsh — it would persist into case (d3) below and race its 1s stub — so
+# set and restore the bound explicitly.
+hang_saved="$_SHIM_PROBE_TIMEOUT"
+_SHIM_PROBE_TIMEOUT=1
+hang_start=$SECONDS
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/hangs" 2>&1)"; shim_rc=$?
+hang_elapsed=$(( SECONDS - hang_start ))
+_SHIM_PROBE_TIMEOUT="$hang_saved"
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]] && (( hang_elapsed < 15 )); then
+  pass "_warn_stale_shim: a hanging probe is bounded and degrades to silence (${hang_elapsed}s)"
+else
+  fail "_warn_stale_shim must bound the probe and stay silent (out: $shim_out rc: $shim_rc elapsed: ${hang_elapsed}s)"
+fi
+
+# (d3) the bound must not clip a probe that answers in time — otherwise (d2)
+# would pass with a timeout of zero and the advisory would never warn at all.
+cat > "${shim_stub_dir}/slow_ok" <<'STUB'
+#!/bin/sh
+sleep 1
+echo "STALE: shim pid 4242"
+STUB
+chmod +x "${shim_stub_dir}/slow_ok"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/slow_ok" 2>&1)"; shim_rc=$?
+if [[ "$shim_out" == *"4242"* ]] && (( shim_rc == 0 )); then
+  pass "_warn_stale_shim: a probe that answers within the bound still warns"
+else
+  fail "_warn_stale_shim clipped an in-time probe (out: $shim_out rc: $shim_rc)"
 fi
 
 # (e) missing binary -> silence, rc 0.

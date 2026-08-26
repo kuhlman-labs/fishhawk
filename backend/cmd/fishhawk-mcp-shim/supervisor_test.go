@@ -1106,6 +1106,93 @@ func TestSwapDeferredWhenNoInitializeRecorded(t *testing.T) {
 	waitFor(t, func() bool { return strings.Contains(h.logs(), "no client initialize was ever recorded") })
 }
 
+// TestPresumedHandshakeRetiresLeakedInitialize is the NO-CRASH mismatched
+// initialize: the child never dies, it simply answers the client's initialize
+// under a different id. handleUpstream registered the original id as in flight
+// and handleDownstream can only clear it by MATCHING, so that entry leaks for
+// the life of the session.
+//
+// TestSwapProceedsOnServedRequestEvidence cannot cover this — its preliminary
+// pre-handshake crash runs reapCrash, which resets both in-flight maps, so by
+// the time its gate presumes the handshake there is nothing left to leak. Here
+// the leak is live at swap time, and before the fix the gate opened only for
+// maybeSwap to see a permanently non-empty in-flight set, enter the
+// deferred_in_flight passive wait, and never swap again.
+//
+// The assertion is the COMPLETED full-replay swap, not the internal map: the
+// swap must finish, take the synthetic-id arm, and publish in_flight 0.
+func TestPresumedHandshakeRetiresLeakedInitialize(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true) // the swap target: auto-answers the synthetic replay
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	// The client initializes. No crash, ever.
+	h.send(initReq1)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 0 })
+
+	// The child answers under an id the shim cannot match: handshakeDone stays
+	// false, no initResp is stored, and in-flight id "1" is never cleared. The
+	// result-bearing response is the served evidence the gate keys on.
+	child0.pushFrame(`{"jsonrpc":"2.0","id":"1-coerced","result":{"serverInfo":{"name":"fake"}}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, "1-coerced") {
+		t.Fatalf("expected the mismatched init response to flow through, got %q", r)
+	}
+	// The leaked initialize is observable in the published snapshot before the
+	// swap is even armed — the state this test exists to survive.
+	h.pollTick()
+	if st := h.pub.waitFor(t, "the leaked initialize in flight", func(st swapState) bool {
+		return st.InFlight == 1 && st.OldestInFlightID == "1"
+	}); st.HandshakeDone {
+		t.Fatalf("the mismatched response must NOT complete the handshake: %+v", st)
+	}
+
+	h.triggerSwap("hash-B")
+
+	// The swap must COMPLETE. Before the fix this timed out: the gate presumed
+	// the handshake and maybeSwap then parked in the passive wait forever.
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected the swap to complete with list_changed, got %q", lc)
+	}
+	if !child0.isTerminated() {
+		t.Fatal("the old child should have been terminated by the swap")
+	}
+
+	// The full-replay arm, not the pre-handshake verbatim re-send (which would
+	// deliver a second response under the client's own id).
+	sent := child1.sentFrames()
+	var sawSynthetic, sawVerbatim bool
+	for _, f := range sent {
+		if strings.Contains(f, "fishhawk-shim/replay/") {
+			sawSynthetic = true
+		}
+		if strings.Contains(f, `"method":"initialize"`) && strings.Contains(f, `"id":1,`) {
+			sawVerbatim = true
+		}
+	}
+	if !sawSynthetic {
+		t.Fatalf("expected the FULL replay against the new child, got %v", sent)
+	}
+	if sawVerbatim {
+		t.Fatalf("the presumed-handshake swap must NOT re-send the ORIGINAL initialize: %v", sent)
+	}
+	h.expectNone()
+
+	st := h.pub.waitFor(t, "the completed swap", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeSwapped
+	})
+	if !st.HandshakePresumed {
+		t.Error("the swap must have gone through the presumption arm")
+	}
+	if st.InFlight != 0 {
+		t.Errorf("in_flight = %d after handshake presumption, want 0: the never-matched initialize must not stay outstanding", st.InFlight)
+	}
+	if st.OldestInFlightID != "" {
+		t.Errorf("oldest_in_flight_id = %q, want empty", st.OldestInFlightID)
+	}
+}
+
 // TestErrorOnlyResponsesAreNotHandshakeEvidence pins that evidence means a
 // SUCCESSFUL result, not any response frame: a child answering only JSON-RPC
 // errors has not demonstrated a completed initialize lifecycle.

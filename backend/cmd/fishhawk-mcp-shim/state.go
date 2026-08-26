@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -141,11 +142,21 @@ func removeState(dir string, pid int) {
 	_ = os.Remove(stateFilePath(dir, pid))
 }
 
-// processAlive reports whether pid is a live process this user can signal.
-// Signal 0 performs error checking without delivering a signal. It cannot
-// distinguish a REUSED pid — the same residual scripts/test's lease pruning
-// accepts — so at worst a reused pid surfaces one stale advisory line; nothing
-// destructive keys off this.
+// processAlive reports whether pid names a live process. Signal 0 performs
+// error checking without delivering a signal.
+//
+// EPERM is treated as ALIVE, not dead: the kernel refuses the signal because the
+// process exists and belongs to another user — it does not report the pid gone.
+// The direction matters because --status PRUNES the snapshots of pids it calls
+// dead, so a false DEAD verdict deletes a live foreign shim's diagnostic file
+// (a shared state dir, or simply a pid this user cannot signal). Reporting an
+// unsignalable-but-live pid costs at most one extra line; deleting its snapshot
+// is unrecoverable. This is the opposite direction from the pid-reuse residual
+// below, and both are recorded in README.md's accepted residuals.
+//
+// It cannot distinguish a REUSED pid — the same residual scripts/test's lease
+// pruning accepts — so at worst a reused pid surfaces one stale advisory line;
+// nothing destructive keys off this.
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -154,7 +165,11 @@ func processAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return p.Signal(syscall.Signal(0)) == nil
+	err = p.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, syscall.EPERM)
 }
 
 // stateSkip records one file the reader declined to use, and why. A skip is
@@ -296,6 +311,29 @@ func classifyState(st swapState, onDiskHash []byte, now time.Time, grace time.Du
 	return verdictPending
 }
 
+// hashChildPath hashes a snapshot's child_path for the on-disk comparison, but
+// only when that path is a REGULAR file. child_path is untrusted input — it is
+// read out of a file in a world-writable temp dir (see README.md's shared-state
+// -directory residual) and it can also simply go stale — while --status runs
+// SYNCHRONOUSLY inside scripts/dev's advisory, ahead of everything else cmd_up
+// does. Opening a FIFO blocks until a writer appears and reading a device node
+// can block indefinitely, either of which would hang `scripts/dev up` rather
+// than degrade to silence: the one failure mode the advisory does not otherwise
+// cover. os.Stat does not open the file, so it does not block on a FIFO. Any
+// non-regular path, and any stat or hash failure, yields nil — which
+// classifyState maps to the fail-safe pending verdict, never stale.
+func hashChildPath(path string) []byte {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	h, err := sha256File(path)
+	if err != nil {
+		return nil
+	}
+	return h
+}
+
 // renderStatus writes the human-readable status report to w and returns an exit
 // code — always exitOK, because a diagnostic that fails its caller's `set -e`
 // would be worse than useless.
@@ -312,10 +350,7 @@ func renderStatus(w, errw io.Writer, dir string, staleOnly bool, grace time.Dura
 	at := now()
 	shown := 0
 	for _, st := range states {
-		h, err := sha256File(st.ChildPath)
-		if err != nil {
-			h = nil
-		}
+		h := hashChildPath(st.ChildPath)
 		verdict := classifyState(st, h, at, grace)
 		if staleOnly && verdict != verdictStale {
 			continue

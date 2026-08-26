@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -461,6 +463,130 @@ func TestStatusNeverDeletesUnvalidatedFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(realLeftover); !os.IsNotExist(err) {
 		t.Fatalf("the validated dead-pid leftover was not pruned (stat err = %v) — the prune must stay reachable for this test to mean anything", err)
+	}
+}
+
+// TestRenderStatusDoesNotOpenANonRegularChildPath is the counterfactual vehicle
+// for the regular-file guard. --status runs SYNCHRONOUSLY inside scripts/dev's
+// advisory, ahead of everything cmd_up does, and child_path is untrusted input
+// read out of a world-writable temp dir. Hashing a FIFO opens it, and an open
+// with no writer BLOCKS forever, so the advisory would hang `scripts/dev up`
+// rather than degrade to silence.
+//
+// The FIFO here has NO writer by construction, so with the guard removed this
+// test does not fail — it HANGS, which the go test timeout converts into a RED.
+// The verdict assertion is the fail-safe direction: an unhashable child_path
+// classifies pending, never stale.
+func TestRenderStatusDoesNotOpenANonRegularChildPath(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "child.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unsupported here: %v", err)
+	}
+
+	stateDir := filepath.Join(dir, "state")
+	st := swapState{
+		Schema:          stateSchema,
+		ShimPid:         os.Getpid(),
+		ChildPath:       fifo,
+		ChildLaunchHash: hex.EncodeToString([]byte("baseline-that-cannot-match")),
+		// Old enough that a successful-but-different hash WOULD read stale, so a
+		// pending verdict can only come from the path being unhashable.
+		PendingSince: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	writeStateFile(t, stateDir, stateName(st.ShimPid), st)
+
+	done := make(chan string, 1)
+	go func() {
+		var out, errOut bytes.Buffer
+		renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now)
+		done <- out.String()
+	}()
+	select {
+	case got := <-done:
+		if !strings.Contains(got, "PENDING") {
+			t.Fatalf("an unhashable child_path must classify PENDING (fail-safe), got:\n%s", got)
+		}
+		if strings.Contains(got, "STALE") {
+			t.Fatalf("a non-regular child_path must never read STALE:\n%s", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("renderStatus blocked on a non-regular child_path — `scripts/dev up` would hang instead of degrading")
+	}
+}
+
+// TestHashChildPathRefusesNonRegularPaths pins the guard directly, including the
+// positive control: a real regular file still hashes, so the refusal cannot pass
+// by refusing everything.
+func TestHashChildPathRefusesNonRegularPaths(t *testing.T) {
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "bin")
+	if err := os.WriteFile(regular, []byte("payload"), 0o755); err != nil { //nolint:gosec // fixture binary
+		t.Fatalf("write: %v", err)
+	}
+	if got := hashChildPath(regular); hex.EncodeToString(got) != hashOf(t, regular) {
+		t.Fatalf("a regular file must still hash, got %x", got)
+	}
+	if got := hashChildPath(dir); got != nil {
+		t.Errorf("a directory must not hash, got %x", got)
+	}
+	if got := hashChildPath(filepath.Join(dir, "absent")); got != nil {
+		t.Errorf("an absent path must not hash, got %x", got)
+	}
+	fifo := filepath.Join(dir, "f.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err == nil {
+		if got := hashChildPath(fifo); got != nil {
+			t.Errorf("a FIFO must not hash, got %x", got)
+		}
+	}
+}
+
+// TestForeignLivePidIsNeverPruned is the counterfactual vehicle for the EPERM
+// arm of processAlive. --status DELETES the snapshots of pids it calls dead, so
+// a false DEAD verdict for a live process this user merely cannot signal
+// destroys a running shim's diagnostic file.
+//
+// pid 1 is the portable fixture: it is always live, and to a non-root user
+// signal 0 against it returns EPERM rather than success — so with the EPERM arm
+// deleted processAlive reports it dead and renderStatus prunes its snapshot.
+// Under root signal 0 succeeds and the arm is unreachable, so the test skips
+// rather than passing vacuously.
+func TestForeignLivePidIsNeverPruned(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: signal 0 to pid 1 succeeds, so the EPERM arm is unreachable")
+	}
+	if err := syscall.Kill(1, syscall.Signal(0)); !errors.Is(err, syscall.EPERM) {
+		t.Skipf("signal 0 to pid 1 returned %v, not EPERM: no foreign live pid available here", err)
+	}
+
+	dir := t.TempDir()
+	foreign := writeStateFile(t, dir, stateName(1), swapState{
+		Schema: stateSchema, ShimPid: 1, ChildPath: "/not/ours",
+	})
+	// A genuinely dead pid in the same dir keeps the prune reachable, so the
+	// assertion below cannot pass because pruning stopped working altogether.
+	gone := deadPid(t)
+	deadPidFile := writeStateFile(t, dir, stateName(gone), swapState{
+		Schema: stateSchema, ShimPid: gone, ChildPath: "/gone",
+	})
+
+	// t.Error, not t.Fatal: with the EPERM arm deleted BOTH this and the prune
+	// assertion below must be observable, so the counterfactual RED names the
+	// destructive consequence and not only the classifier.
+	if !processAlive(1) {
+		t.Error("pid 1 is live but unsignalable: EPERM must read ALIVE, not dead")
+	}
+
+	var out, errOut bytes.Buffer
+	renderStatus(&out, &errOut, dir, false, time.Minute, time.Now)
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("--status pruned a LIVE foreign shim's snapshot: %s (%v)", foreign, err)
+	}
+	if !strings.Contains(out.String(), "/not/ours") {
+		t.Errorf("a live foreign snapshot must be REPORTED, not silently dropped:\n%s", out.String())
+	}
+	if _, err := os.Stat(deadPidFile); !os.IsNotExist(err) {
+		t.Fatalf("the dead-pid control was not pruned (stat err = %v) — the prune must stay reachable", err)
 	}
 }
 
