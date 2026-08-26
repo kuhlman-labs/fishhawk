@@ -811,6 +811,47 @@ func TestMissingLiveValidationMarker_M1ResidualFalsePositive(t *testing.T) {
 	}
 }
 
+// (M1 residual — fix-up concern 2, low/untested-path) The clause scoping fixed
+// the WHOLE-STATEMENT kill switch; WITHIN one clause the sandbox-marker
+// negation remains absolute, and containsSandboxMarker is a SUBSTRING test, so
+// the inflected forms below ("sandboxed", "preview" inside a longer phrase)
+// count as markers. Each row names a GENUINE live target that the stand-in it
+// mentions does not make sandbox-validatable, yet draws no M1 finding — and M2
+// does not rescue either row: neither carries an "against …" phrase, so its
+// conjunct 2 fails. Separating these from "the github api client retries in the
+// fake transport test" needs parsing this word-list matcher does not do, so the
+// residual is pinned here rather than left implicit.
+//
+// LOAD-BEARING on the marker list: delete the negation in liveTargetCorpusMatch
+// (the `if containsSandboxMarker(clause) { continue }`), or drop "sandbox" /
+// "preview" from sandboxMarkers, and every row here goes RED. That is the
+// point — a future narrowing or widening of the marker list flips this test
+// visibly instead of moving the boundary silently.
+func TestMissingLiveValidationMarker_M1SameClauseMarkerResidual(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		// Live forge round-trip; "sandboxed" qualifies the runner, not the
+		// round-trip. Substring match: "sandboxed" carries "sandbox".
+		{"forge round-trip from a sandboxed runner", "a live GitHub round-trip closes the issue from the sandboxed runner"},
+		// Live forge API call; "preview token" is a bystander, not a stand-in
+		// for the API call itself.
+		{"real API call with a preview token", "a real GitHub API call is made with the preview token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+				t.Fatalf("documented same-clause M1 residual (see liveTargetCorpusMatch's RESIDUAL 2): want 0 findings for %q; got %d: %+v", tc.statement, len(got), got)
+			}
+		})
+	}
+}
+
 // DONE-MEANS BEHAVIORAL TEST (#1169). The two statements the SHIPPED detector
 // missed, verbatim from the four runs #2845 documents, as ordinary unmarked
 // blocking criteria. This is the observable output of the change: a comment-only

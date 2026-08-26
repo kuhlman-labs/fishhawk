@@ -711,14 +711,29 @@ func qualifierNearAction(tokens []string) bool {
 // mention. A marker only disarms the rule where it plausibly qualifies the
 // target: in the same clause as the phrase.
 //
-// RESIDUAL, stated honestly: the negation rescues a statement whose clause
-// names its own stand-in ("the github api client retries in the fake transport
-// test") but NOT one that carries a live-target phrase in sandbox-validatable
-// prose with no marker at all — "the deployed environment config template is
-// rendered" still fires. Narrowing further (say, also demanding a live-action
-// noun) would drop the genuine true positive "the deployed environment serves
-// the new endpoint", so the residual is accepted and pinned by a test rather
-// than papered over.
+// RESIDUAL 1 — FALSE POSITIVE, stated honestly: the negation rescues a
+// statement whose clause names its own stand-in ("the github api client retries
+// in the fake transport test") but NOT one that carries a live-target phrase in
+// sandbox-validatable prose with no marker at all — "the deployed environment
+// config template is rendered" still fires. Narrowing further (say, also
+// demanding a live-action noun) would drop the genuine true positive "the
+// deployed environment serves the new endpoint", so the residual is accepted
+// and pinned by a test rather than papered over.
+//
+// RESIDUAL 2 — FALSE NEGATIVE, stated honestly: WITHIN one clause the negation
+// is still an absolute kill switch, and containsSandboxMarker is a SUBSTRING
+// test, so an inflected form ("sandboxed", "previews", "fixtures") counts as a
+// marker too. A single-clause statement naming a genuine live target and a
+// stand-in in the same breath therefore draws no M1 finding — "a live GitHub
+// round-trip closes the issue from the sandboxed runner", "a real GitHub API
+// call is made with the preview token" — and M2 does not rescue either: neither
+// carries an "against …" phrase, so its conjunct 2 fails. Telling "in the fake
+// transport test" (the marker qualifies the whole check) from "from the
+// sandboxed runner" (it qualifies a bystander) needs parsing this deterministic
+// word-list matcher deliberately does not do. So the residual is accepted and
+// PINNED by TestMissingLiveValidationMarker_M1SameClauseMarkerResidual — a
+// later narrowing or widening of sandboxMarkers flips that test visibly instead
+// of moving this boundary in silence.
 func liveTargetCorpusMatch(lowered string) bool {
 	for _, clause := range acceptanceClauses(lowered) {
 		if containsSandboxMarker(clause) {
