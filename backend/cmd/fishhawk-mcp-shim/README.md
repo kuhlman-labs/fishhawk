@@ -43,7 +43,7 @@ bin/fishhawk-mcp-shim --status                      # every live shim, human-rea
 bin/fishhawk-mcp-shim --status --stale-only         # machine mode: stale entries only, silent when clean
 ```
 
-`--status` spawns no child and reads no stdin — it only reads the state dir, so running it against a live session is safe. It also prunes the leftover snapshots of shims that are no longer running (see below).
+`--status` spawns no child and reads no stdin — it only reads the state dir, so running it against a live session is safe. It also prunes the leftover snapshots of shims that are no longer running — and only those (see below).
 
 ### The state file
 
@@ -70,6 +70,10 @@ The snapshot carries no request payloads, no environment and no credentials — 
 ### Leftover state files are the steady state
 
 A shim removes its own snapshot when it shuts down cleanly. A SIGKILLed or harness-terminated shim never does, so its file persists with a dead pid. The reader skips any snapshot whose `shim_pid` is not a live process (a `signal 0` probe — which cannot distinguish a *reused* pid, at worst one stale advisory line and never anything destructive), and `--status` **removes** those leftovers as it reports them. `--stale-only` never reports skips at all: it is consumed by `scripts/dev`, where leftover-file chatter on a machine with nothing actually stale would be pure noise.
+
+Because that prune DELETES files in an operator-supplied directory, the reader only treats a file as a snapshot when it positively validates as one, on three axes: its name is `<positive-pid>.json` (the canonical form `writeState` produces), its `schema` is exactly `fishhawk-mcp-shim/state/v1`, and its `shim_pid` equals the pid in its own filename. Anything failing any of those — an unrelated `*.json`, another tool's document, a snapshot whose recorded pid contradicts its name — is reported on stderr under `--status` and left strictly alone. Only a fully validated snapshot for a dead pid is ever removed.
+
+**Shared state directory (residual).** The default `${TMPDIR:-/tmp}/fishhawk-mcp-shim` lives under a world-writable temp dir. The shim creates it `0700`, but a directory that already exists with a permissive mode (planted by another local user before any shim ran) is used as found. In that case another local user can drop a well-formed `<pid>.json` naming a live pid, which `--status` would then report and whose `child_path` it would hash — leaking the first 12 hex characters of the sha-256 of any file that user could already have the shim read. Nothing follows a planted symlink: `CreateTemp` is `O_EXCL` and `rename` replaces a link rather than writing through it. The exposure is local-only and read-of-hash-prefix, accepted for a dev-loop diagnostic; on a shared host, point `--state-dir` (or `FISHHAWK_MCP_SHIM_STATE_DIR`) at a directory you own — and see the state-dir coupling note below before doing so.
 
 
 ## Flags

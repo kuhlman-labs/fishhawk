@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -159,6 +160,10 @@ func processAlive(pid int) bool {
 // stateSkip records one file the reader declined to use, and why. A skip is
 // never fatal: a diagnostic that refuses to report because one file is
 // unreadable is worse than one that reports the rest.
+//
+// DeadPid is set ONLY for a POSITIVELY VALIDATED shim snapshot (see
+// loadStates) whose owning pid is gone. It is what --status keys its prune off,
+// so nothing the reader could not prove is a shim snapshot is ever deletable.
 type stateSkip struct {
 	Path    string
 	Reason  string
@@ -167,9 +172,35 @@ type stateSkip struct {
 
 func (s stateSkip) String() string { return s.Path + ": " + s.Reason }
 
+// snapshotPid parses the shim pid a snapshot FILENAME encodes. writeState names
+// every snapshot "<shim_pid>.json", so a name that is not the canonical decimal
+// rendering of a positive pid ("notes.json", "007.json", "-1.json") was not
+// written by a shim.
+func snapshotPid(name string) (int, bool) {
+	if !strings.HasSuffix(name, ".json") {
+		return 0, false
+	}
+	base := strings.TrimSuffix(name, ".json")
+	pid, err := strconv.Atoi(base)
+	if err != nil || pid <= 0 || strconv.Itoa(pid) != base {
+		return 0, false
+	}
+	return pid, true
+}
+
 // loadStates reads every *.json snapshot under dir and returns those belonging
 // to LIVE shim pids, plus a skip record per file it declined. An absent dir
 // yields no states, no skips and no error.
+//
+// A file is treated as a shim snapshot only when it POSITIVELY validates as
+// one: its name is "<pid>.json" for a positive pid, it parses as JSON, its
+// schema is exactly stateSchema, and its shim_pid equals the pid in its own
+// filename. That identity check is a SAFETY control, not a tidiness one:
+// --state-dir and FISHHAWK_MCP_SHIM_STATE_DIR accept any operator-supplied
+// directory, and --status DELETES the snapshots it finds for dead pids. Without
+// positive validation an unrelated but parseable *.json in that directory would
+// decode to a zero-valued swapState, fail the liveness probe on pid 0, and be
+// removed. Anything that fails validation is reported and left strictly alone.
 func loadStates(dir string) ([]swapState, []stateSkip) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -182,6 +213,11 @@ func loadStates(dir string) ([]swapState, []stateSkip) {
 			continue
 		}
 		p := filepath.Join(dir, e.Name())
+		namePid, ok := snapshotPid(e.Name())
+		if !ok {
+			skips = append(skips, stateSkip{Path: p, Reason: "not a shim snapshot: filename is not <shim-pid>.json"})
+			continue
+		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			skips = append(skips, stateSkip{Path: p, Reason: "unreadable: " + err.Error()})
@@ -190,6 +226,20 @@ func loadStates(dir string) ([]swapState, []stateSkip) {
 		var st swapState
 		if err := json.Unmarshal(b, &st); err != nil {
 			skips = append(skips, stateSkip{Path: p, Reason: "unparseable: " + err.Error()})
+			continue
+		}
+		if st.Schema != stateSchema {
+			skips = append(skips, stateSkip{
+				Path:   p,
+				Reason: fmt.Sprintf("not a shim snapshot: schema %q is not %q", st.Schema, stateSchema),
+			})
+			continue
+		}
+		if st.ShimPid != namePid {
+			skips = append(skips, stateSkip{
+				Path:   p,
+				Reason: fmt.Sprintf("not a shim snapshot: shim_pid %d does not match filename pid %d", st.ShimPid, namePid),
+			})
 			continue
 		}
 		if !processAlive(st.ShimPid) {

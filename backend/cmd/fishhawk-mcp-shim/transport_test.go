@@ -373,3 +373,92 @@ func TestRunPublishesStateFileAndCleansUpOnExit(t *testing.T) {
 		t.Fatalf("state file was not removed on clean shutdown (stat err = %v)", err)
 	}
 }
+
+// TestRunDegradesWhenStateDirUnusable pins the diagnostic's degrade path
+// through the REAL run() wiring: with --state-dir pointing at a regular file,
+// every writeState fails, and the contract is that the DIAGNOSTIC degrades, not
+// the proxy. Two things are asserted: frames keep flowing (the initialize
+// round-trip AND a later tool call both answer), and the warning appears
+// EXACTLY ONCE no matter how many poll ticks fire — the `warned` latch in
+// main.go, which would otherwise reprint the same line every poll interval for
+// the life of the session.
+//
+// Nothing here asserts that the settle window is long ENOUGH, so a slow runner
+// can only make the once-check weaker, never red.
+func TestRunDegradesWhenStateDirUnusable(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "D", "")
+
+	// A regular FILE where the state dir should be: MkdirAll cannot proceed, so
+	// every publish fails.
+	blocked := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	outC := make(chan []byte, 32)
+	go frameReader(outR, outC)
+	logs := &syncBuf{}
+
+	done := make(chan int, 1)
+	go func() {
+		rc := run([]string{
+			"fishhawk-mcp-shim",
+			"--child", childPath,
+			"--state-dir", blocked,
+			"--poll-interval", "5ms",
+		}, inR, outW, logs)
+		_ = outW.Close()
+		done <- rc
+	}()
+
+	expect := func(want string) {
+		t.Helper()
+		select {
+		case f := <-outC:
+			if !strings.Contains(string(f), want) {
+				t.Fatalf("frame = %q, want it to contain %q", f, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for a frame containing %q (stderr: %s)", want, logs.String())
+		}
+	}
+
+	if _, err := io.WriteString(inW, initReq1+"\n"); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	expect(`"id":1`)
+
+	countWarn := func() int {
+		return strings.Count(logs.String(), "swap-state snapshot unavailable")
+	}
+	waitFor(t, func() bool { return countWarn() >= 1 })
+
+	// Let many more poll ticks fire (5ms interval), then pin the latch.
+	time.Sleep(250 * time.Millisecond)
+	if got := countWarn(); got != 1 {
+		t.Fatalf("warning printed %d times, want exactly 1 (stderr: %s)", got, logs.String())
+	}
+
+	// The proxy is unaffected: a later request still round-trips.
+	if _, err := io.WriteString(inW, `{"jsonrpc":"2.0","method":"tools/call","id":2}`+"\n"); err != nil {
+		t.Fatalf("write tool call: %v", err)
+	}
+	expect(`"marker":"D"`)
+	if got := countWarn(); got != 1 {
+		t.Fatalf("warning printed %d times after continued traffic, want exactly 1", got)
+	}
+
+	_ = inW.Close()
+	select {
+	case rc := <-done:
+		if rc != exitOK {
+			t.Fatalf("run = %d, want %d (stderr: %s)", rc, exitOK, logs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after upstream EOF")
+	}
+}

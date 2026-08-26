@@ -31,6 +31,12 @@ func writeStateFile(t *testing.T, dir, name string, st swapState) string {
 	return p
 }
 
+// stateName is the filename writeState gives one shim's snapshot. Fixtures
+// build it the same way the producer does, because loadStates now REQUIRES the
+// name and the recorded shim_pid to agree before it will treat a file as a
+// snapshot at all.
+func stateName(pid int) string { return strconv.Itoa(pid) + ".json" }
+
 // hashOf is the hex launch hash of a fixture file.
 func hashOf(t *testing.T, path string) string {
 	t.Helper()
@@ -104,14 +110,25 @@ func TestClassifyStateVerdicts(t *testing.T) {
 func TestLoadStatesSkipsDeadAndMalformed(t *testing.T) {
 	dir := t.TempDir()
 	live := swapState{Schema: stateSchema, ShimPid: os.Getpid(), ChildPath: "/live/child"}
-	writeStateFile(t, dir, strconv.Itoa(live.ShimPid)+".json", live)
+	writeStateFile(t, dir, stateName(live.ShimPid), live)
 
 	dead := swapState{Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/dead/child"}
-	deadPath := writeStateFile(t, dir, strconv.Itoa(dead.ShimPid)+".json", dead)
+	deadPath := writeStateFile(t, dir, stateName(dead.ShimPid), dead)
 
-	badPath := filepath.Join(dir, "garbage.json")
+	// Parseable JSON under a snapshot-shaped NAME but with a foreign schema, and
+	// a well-formed snapshot whose recorded pid contradicts its filename: both
+	// fail positive validation, so neither may be reported as a shim snapshot
+	// (and, per TestStatusNeverDeletesUnvalidatedFiles, neither is deletable).
+	foreignSchemaPath := writeStateFile(t, dir, "424243.json", swapState{Schema: "some-other-tool/v9", ShimPid: 424243})
+	mismatchPath := writeStateFile(t, dir, "424244.json", swapState{Schema: stateSchema, ShimPid: os.Getpid()})
+
+	badPath := filepath.Join(dir, "424242.json")
 	if err := os.WriteFile(badPath, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("write garbage: %v", err)
+	}
+	namedPath := filepath.Join(dir, "garbage.json")
+	if err := os.WriteFile(namedPath, []byte(`{"hello":"world"}`), 0o600); err != nil {
+		t.Fatalf("write named json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignored"), 0o600); err != nil {
 		t.Fatalf("write non-json: %v", err)
@@ -121,29 +138,35 @@ func TestLoadStatesSkipsDeadAndMalformed(t *testing.T) {
 	if len(states) != 1 || states[0].ChildPath != "/live/child" {
 		t.Fatalf("states = %+v, want exactly the live snapshot", states)
 	}
-	var sawDead, sawBad bool
-	for _, s := range skips {
-		if s.Reason == "" {
-			t.Errorf("skip %s carries no reason", s.Path)
+	byPath := map[string]stateSkip{}
+	for _, sk := range skips {
+		if sk.Reason == "" {
+			t.Errorf("skip %s carries no reason", sk.Path)
 		}
-		if s.Path == deadPath {
-			sawDead = true
-			if !s.DeadPid {
-				t.Errorf("dead-pid skip not flagged DeadPid: %+v", s)
-			}
-			if !strings.Contains(s.Reason, "not running") {
-				t.Errorf("dead-pid reason = %q, want it to name the dead pid", s.Reason)
-			}
-		}
-		if s.Path == badPath {
-			sawBad = true
-			if !strings.Contains(s.Reason, "unparseable") {
-				t.Errorf("malformed reason = %q, want 'unparseable'", s.Reason)
-			}
-		}
+		byPath[sk.Path] = sk
 	}
-	if !sawDead || !sawBad {
-		t.Fatalf("skips = %+v, want a reason for both the dead-pid and the malformed file", skips)
+	for _, c := range []struct {
+		path        string
+		wantReason  string
+		wantDeadPid bool
+	}{
+		{path: deadPath, wantReason: "not running", wantDeadPid: true},
+		{path: badPath, wantReason: "unparseable"},
+		{path: foreignSchemaPath, wantReason: "schema"},
+		{path: mismatchPath, wantReason: "does not match filename pid"},
+		{path: namedPath, wantReason: "filename is not <shim-pid>.json"},
+	} {
+		sk, ok := byPath[c.path]
+		if !ok {
+			t.Errorf("no skip recorded for %s (skips = %+v)", c.path, skips)
+			continue
+		}
+		if !strings.Contains(sk.Reason, c.wantReason) {
+			t.Errorf("skip reason for %s = %q, want it to name %q", c.path, sk.Reason, c.wantReason)
+		}
+		if sk.DeadPid != c.wantDeadPid {
+			t.Errorf("skip for %s DeadPid = %v, want %v (only a validated snapshot is prunable)", c.path, sk.DeadPid, c.wantDeadPid)
+		}
 	}
 
 	// An ABSENT dir is empty, not an error: the diagnostic must be inert on a
@@ -151,6 +174,23 @@ func TestLoadStatesSkipsDeadAndMalformed(t *testing.T) {
 	gone, goneSkips := loadStates(filepath.Join(dir, "nope"))
 	if len(gone) != 0 || len(goneSkips) != 0 {
 		t.Fatalf("absent dir = (%v, %v), want empty", gone, goneSkips)
+	}
+}
+
+// TestSnapshotPidRejectsNonSnapshotNames pins the filename half of positive
+// validation: only the canonical "<positive-pid>.json" writeState produces is
+// accepted, so no unrelated file can be mistaken for a snapshot on name alone.
+func TestSnapshotPidRejectsNonSnapshotNames(t *testing.T) {
+	if pid, ok := snapshotPid("4242.json"); !ok || pid != 4242 {
+		t.Fatalf("snapshotPid(4242.json) = (%d, %v), want (4242, true)", pid, ok)
+	}
+	for _, name := range []string{
+		"notes.json", "007.json", "-1.json", "0.json", "4242.JSON",
+		"4242.json.bak", ".json", "42 42.json", "+42.json", "4242.json ",
+	} {
+		if pid, ok := snapshotPid(name); ok {
+			t.Errorf("snapshotPid(%q) = (%d, true), want rejected", name, pid)
+		}
 	}
 }
 
@@ -241,7 +281,7 @@ func TestRenderStatusNamesEveryDiagnosticField(t *testing.T) {
 	dir := t.TempDir()
 	st := staleFixture(t, dir, "child")
 	stateDir := filepath.Join(dir, "state")
-	writeStateFile(t, stateDir, "1.json", st)
+	writeStateFile(t, stateDir, stateName(st.ShimPid), st)
 
 	var out, errOut bytes.Buffer
 	if rc := renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now); rc != exitOK {
@@ -277,7 +317,7 @@ func TestRenderStatusPresumedHandshakeIsLabelled(t *testing.T) {
 	st.HandshakeDone = true
 	st.HandshakePresumed = true
 	stateDir := filepath.Join(dir, "state")
-	writeStateFile(t, stateDir, "1.json", st)
+	writeStateFile(t, stateDir, stateName(st.ShimPid), st)
 
 	var out, errOut bytes.Buffer
 	renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now)
@@ -293,21 +333,23 @@ func TestRenderStatusStaleOnlyFiltersAndIsEmptyWhenClean(t *testing.T) {
 	stateDir := filepath.Join(dir, "state")
 
 	stale := staleFixture(t, dir, "stalechild")
-	writeStateFile(t, stateDir, "stale.json", stale)
+	writeStateFile(t, stateDir, stateName(stale.ShimPid), stale)
 
-	// A CURRENT snapshot: same live pid, different child path, launch hash equal
-	// to the bytes on disk.
+	// A CURRENT snapshot: a DIFFERENT live pid (this test binary's parent — the
+	// go test harness — which is alive for the duration), because a snapshot's
+	// filename and its shim_pid must agree and one dir cannot hold two files for
+	// the same pid. Different child path, launch hash equal to the bytes on disk.
 	currentPath := filepath.Join(dir, "currentchild.bin")
 	if err := os.WriteFile(currentPath, []byte("fresh"), 0o755); err != nil { //nolint:gosec // fixture binary
 		t.Fatalf("write: %v", err)
 	}
 	current := swapState{
 		Schema:          stateSchema,
-		ShimPid:         os.Getpid(),
+		ShimPid:         os.Getppid(),
 		ChildPath:       currentPath,
 		ChildLaunchHash: hashOf(t, currentPath),
 	}
-	writeStateFile(t, stateDir, "current.json", current)
+	writeStateFile(t, stateDir, stateName(current.ShimPid), current)
 
 	var out, errOut bytes.Buffer
 	renderStatus(&out, &errOut, stateDir, true, time.Minute, time.Now)
@@ -324,9 +366,10 @@ func TestRenderStatusStaleOnlyFiltersAndIsEmptyWhenClean(t *testing.T) {
 	// leftover (the steady state on any dev box that has ever run a shim) must
 	// not turn a clean machine into a noisy one.
 	cleanDir := filepath.Join(dir, "clean")
-	writeStateFile(t, cleanDir, "current.json", current)
-	writeStateFile(t, cleanDir, "leftover.json", swapState{Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/gone"})
-	if err := os.WriteFile(filepath.Join(cleanDir, "garbage.json"), []byte("{nope"), 0o600); err != nil {
+	writeStateFile(t, cleanDir, stateName(current.ShimPid), current)
+	cleanLeftover := swapState{Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/gone"}
+	writeStateFile(t, cleanDir, stateName(cleanLeftover.ShimPid), cleanLeftover)
+	if err := os.WriteFile(filepath.Join(cleanDir, "424242.json"), []byte("{nope"), 0o600); err != nil {
 		t.Fatalf("write garbage: %v", err)
 	}
 	var cleanOut, cleanErr bytes.Buffer
@@ -347,14 +390,16 @@ func TestRenderStatusStaleOnlyFiltersAndIsEmptyWhenClean(t *testing.T) {
 // does not accumulate.
 func TestRenderStatusReportsAndPrunesLeftoverFiles(t *testing.T) {
 	dir := t.TempDir()
-	leftover := writeStateFile(t, dir, "leftover.json", swapState{Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/gone"})
+	st := swapState{Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/gone"}
+	name := stateName(st.ShimPid)
+	leftover := writeStateFile(t, dir, name, st)
 
 	var out, errOut bytes.Buffer
 	renderStatus(&out, &errOut, dir, false, time.Minute, time.Now)
-	if !strings.Contains(errOut.String(), "leftover.json") {
+	if !strings.Contains(errOut.String(), name) {
 		t.Fatalf("skip reason not reported on stderr: %q", errOut.String())
 	}
-	if strings.Contains(out.String(), "leftover.json") {
+	if strings.Contains(out.String(), name) {
 		t.Fatalf("skip reason leaked to stdout: %q", out.String())
 	}
 	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
@@ -362,6 +407,60 @@ func TestRenderStatusReportsAndPrunesLeftoverFiles(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "no live fishhawk-mcp-shim state files") {
 		t.Fatalf("--status should say so when nothing live is found: %q", out.String())
+	}
+}
+
+// TestStatusNeverDeletesUnvalidatedFiles is the counterfactual vehicle for the
+// positive-validation control. --state-dir (and FISHHAWK_MCP_SHIM_STATE_DIR)
+// accept ANY operator-supplied directory, and --status DELETES the snapshots it
+// finds for dead pids — so "is this file a shim snapshot?" is a destructive
+// decision and must be proved, not assumed.
+//
+// Each unrelated file below differs from a genuinely prunable snapshot in
+// EXACTLY ONE attribute (its name, its schema, or its filename/shim_pid
+// identity) and is otherwise maximally deletable — parseable JSON naming a DEAD
+// pid — so removing any one of the three validation steps deletes it and turns
+// this test RED. The real leftover in the same dir proves the prune is still
+// reachable, so the assertions cannot pass vacuously.
+func TestStatusNeverDeletesUnvalidatedFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// (1) Valid JSON, not a snapshot NAME. It carries NO shim_pid, so with the
+	// filename check gone it decodes to a zero-valued snapshot, whose pid 0 is
+	// never live — the exact path that would delete it.
+	unrelated := filepath.Join(dir, "notes.json")
+	if err := os.WriteFile(unrelated, []byte(`{"hello":"world"}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// (2) Snapshot NAME and a dead pid, but a foreign SCHEMA.
+	foreignPid := deadPid(t)
+	foreign := writeStateFile(t, dir, stateName(foreignPid), swapState{
+		Schema: "some-other-tool/v9", ShimPid: foreignPid, ChildPath: "/not/ours",
+	})
+	// (3) Snapshot name and schema, but the recorded shim_pid contradicts the
+	// filename — the identity half of validation.
+	mismatchName := deadPid(t)
+	mismatch := writeStateFile(t, dir, stateName(mismatchName), swapState{
+		Schema: stateSchema, ShimPid: deadPid(t), ChildPath: "/not/ours",
+	})
+	// (4) A genuine leftover: validates on every axis, dead pid ⇒ prunable.
+	realLeftoverPid := deadPid(t)
+	realLeftover := writeStateFile(t, dir, stateName(realLeftoverPid), swapState{
+		Schema: stateSchema, ShimPid: realLeftoverPid, ChildPath: "/gone",
+	})
+
+	var out, errOut bytes.Buffer
+	if rc := renderStatus(&out, &errOut, dir, false, time.Minute, time.Now); rc != exitOK {
+		t.Fatalf("renderStatus rc = %d, want %d", rc, exitOK)
+	}
+
+	for _, keep := range []string{unrelated, foreign, mismatch} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("--status deleted a file it could not prove was a shim snapshot: %s (%v)", keep, err)
+		}
+	}
+	if _, err := os.Stat(realLeftover); !os.IsNotExist(err) {
+		t.Fatalf("the validated dead-pid leftover was not pruned (stat err = %v) — the prune must stay reachable for this test to mean anything", err)
 	}
 }
 

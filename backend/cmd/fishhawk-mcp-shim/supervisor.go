@@ -131,6 +131,7 @@ func (s *supervisor) run(ctx context.Context) error {
 	s.publishState("")
 
 	for {
+		fromTick := false
 		select {
 		case frame, ok := <-s.clientIn:
 			if !ok {
@@ -143,6 +144,7 @@ func (s *supervisor) run(ctx context.Context) error {
 		case err := <-s.child.Exited():
 			s.handleCrash(ctx, err)
 		case <-s.tick:
+			fromTick = true
 			if s.watcher != nil {
 				if changed, h := s.watcher.step(); changed {
 					s.armSwap(h)
@@ -157,7 +159,7 @@ func (s *supervisor) run(ctx context.Context) error {
 		case h := <-s.swapReq:
 			s.armSwap(h)
 		}
-		s.maybeSwap(ctx)
+		s.maybeSwap(ctx, fromTick)
 	}
 }
 
@@ -274,7 +276,10 @@ func (s *supervisor) swapGate() (bool, string) {
 // replayed handshake completes. Every path that declines to swap RECORDS why —
 // in the published snapshot and in a rate-limited log line — so a shim that has
 // stopped swapping is never silent about it (#2831).
-func (s *supervisor) maybeSwap(ctx context.Context) {
+//
+// fromTick reports whether this re-entry came from a watcher tick rather than a
+// proxied frame; the passive-wait arm below is the one path that keys off it.
+func (s *supervisor) maybeSwap(ctx context.Context, fromTick bool) {
 	if s.pendingSwapHash == nil {
 		return
 	}
@@ -289,9 +294,17 @@ func (s *supervisor) maybeSwap(ctx context.Context) {
 	if s.quiesceExpired {
 		// Passive wait: swap on the next in-flight==0 transition, handled when a
 		// future downstream response empties inFlight and re-enters maybeSwap.
-		// Republish on every re-entry so the snapshot stays fresh while the wait
-		// lasts — this arm changes no state, so nothing else would refresh it.
-		s.noteDeferral(outcomeDeferredInFlight, s.deferralMessage(outcomeDeferredInFlight))
+		// Republish so the snapshot stays fresh while the wait lasts — this arm
+		// changes no state, so nothing else would refresh it — but ONLY on a
+		// watcher tick. maybeSwap re-enters after EVERY select branch, so
+		// republishing unconditionally would be one atomic temp-create+rename per
+		// proxied frame for as long as a long-lived request holds the swap off:
+		// I/O amplification bounded only by the client's frame rate. The tick
+		// fires on a fixed interval regardless of traffic, so gating on it costs
+		// no freshness.
+		if fromTick {
+			s.noteDeferral(outcomeDeferredInFlight, s.deferralMessage(outcomeDeferredInFlight))
+		}
 		return
 	}
 	// Active quiesce: hold upstream (do not read clientIn) and drain in-flight

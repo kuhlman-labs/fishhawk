@@ -1179,6 +1179,66 @@ func TestQuiesceDeferralPublishesOldestInFlight(t *testing.T) {
 	})
 }
 
+// TestPassiveWaitRepublishesOnTickOnlyNotPerFrame pins the tick gate on the
+// passive-wait republish. maybeSwap re-enters after EVERY select branch, so an
+// ungated republish is one atomic state-file write per PROXIED FRAME for as
+// long as a long-lived request holds the swap off — hours, by design, since
+// in-flight requests are never force-orphaned. The watcher tick is what keeps
+// the snapshot fresh (fixed interval, traffic-independent), so only the tick
+// publishes.
+//
+// The counterfactual: with the fromTick guard removed, the five notifications
+// below each add a publish and the exact-count assertion goes red.
+func TestPassiveWaitRepublishesOnTickOnlyNotPerFrame(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	timeoutCh := make(chan time.Time, 1)
+	h.sup.after = func(time.Duration) <-chan time.Time { return timeoutCh }
+	h.start()
+
+	h.send(initReq1)
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	h.expect()
+
+	// A request that never completes, then the quiesce timeout: the swap parks
+	// in the passive-wait arm.
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":7}`)
+	timeoutCh <- time.Time{}
+	h.triggerSwap("hash-B")
+	isDeferral := func(st swapState) bool { return st.LastSwapOutcome == outcomeDeferredInFlight }
+	h.pub.waitFor(t, "deferred_in_flight", isDeferral)
+
+	all := func(swapState) bool { return true }
+	before := h.pub.count(all)
+
+	// Five proxied client frames. Each is an UNBUFFERED handoff to the event
+	// loop, so by the time the last send returns every earlier iteration —
+	// including its maybeSwap re-entry — has already run. Notifications carry no
+	// id, so none of them changes in-flight state.
+	for i := 0; i < 5; i++ {
+		h.send(`{"jsonrpc":"2.0","method":"notifications/progress"}`)
+	}
+
+	// One tick: publishes exactly twice (the tick's own freshness publish, then
+	// the deferral publish that overwrites the outcome).
+	h.pollTick()
+	waitFor(t, func() bool { return h.pub.count(all) >= before+2 })
+	if got := h.pub.count(all); got != before+2 {
+		t.Fatalf("publishes after 5 proxied frames + 1 tick = %d, want %d (the frames must not republish)", got-before, 2)
+	}
+
+	// And the TICK publish is the one carrying the deferral fields (C3): the
+	// passive-wait arm changes no state, so nothing else would refresh them.
+	st := h.pub.waitFor(t, "deferred_in_flight after the tick", isDeferral)
+	if st.OldestInFlightID != "7" || st.OldestInFlightSince == "" || st.InFlight != 1 {
+		t.Fatalf("tick publish lost the deferral fields: %+v", st)
+	}
+	if child0.isTerminated() {
+		t.Fatal("a deferral must never kill the in-flight child")
+	}
+}
+
 // TestDeferralLogRateLimited pins that a persistent deferral logs on the
 // transition and then at most once per deferralLogInterval, while EVERY
 // re-entry republishes the snapshot. The re-entries are driven by watcher
