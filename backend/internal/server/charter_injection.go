@@ -70,6 +70,15 @@ import (
 // makes the guarantee unbypassable by a deployment that simply leaves the seam
 // unwired, which is precisely the configuration in which L1 cannot run.
 //
+// L2 is ALSO the sole producer of the prompt layer's grooming determination
+// (E54.28 / #2834): it RETURNS a *prompt.GroomingContext the handler threads
+// into prompt.Build, so the prompt builder's grooming fork and this fail-closed
+// check are one determination per served prompt. Before #2834 the prompt builder
+// derived grooming-ness independently and did not fork at all, so a groom stage
+// was served standard_v1 plan instructions while L2 treated it as grooming;
+// making L2 the single producer is what closes that two-layer disagreement, and
+// a future second derivation site would reopen it.
+//
 // L2 CHECKS THE CHARTER, NOT "SOME DOCUMENT" (approval condition H2). It
 // re-resolves the declared charter path and requires an injected document AT
 // THAT PATH, so a grooming prompt carrying an unrelated injected document and
@@ -540,24 +549,36 @@ func (s *Server) charterBaseRef(ctx context.Context, runRow *run.Run) (string, e
 // configuration in which L1 cannot run.
 // The receiver is deliberately UNUSED: L2 depends on no Server state at all,
 // which is exactly why it still refuses on a deployment that wired nothing.
-func (*Server) assertCharterInjected(ctx context.Context, runRow *run.Run, stage *run.Stage, injected []prompt.InjectedDocument) error {
+//
+// L2 IS ALSO THE SOLE PRODUCER OF THE PROMPT LAYER'S GROOMING DETERMINATION
+// (E54.28 / #2834, approval condition C3). On success for a grooming propose
+// stage it returns a non-nil *prompt.GroomingContext carrying the resolved
+// charter path; on every non-grooming stage it returns (nil, nil). The handler
+// hands that value straight to prompt.Build (trigger.Grooming), so the grooming
+// determination the prompt builder forks on and the fail-closed determination
+// enforced here are computed EXACTLY ONCE, by this function. That is the
+// structural reason the two layers cannot disagree — #2834 records the defect
+// that arose when they were derived independently, and any future SECOND
+// derivation site (a workflow-name check, a bare bytes.Contains) would
+// reintroduce it.
+func (*Server) assertCharterInjected(ctx context.Context, runRow *run.Run, stage *run.Stage, injected []prompt.InjectedDocument) (*prompt.GroomingContext, error) {
 	required, err := stageRequiresCharter(runRow, stage)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !required {
-		return nil
+		return nil, nil
 	}
 	path, err := charterDeclaredPath(ctx, runRow.Repo, runRow.WorkflowID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, doc := range injected {
 		if doc.Path == path {
-			return nil
+			return &prompt.GroomingContext{CharterPath: path}, nil
 		}
 	}
-	return charterRefusal(reasonCharterNotInjected, fmt.Sprintf(
+	return nil, charterRefusal(reasonCharterNotInjected, fmt.Sprintf(
 		"refusing to serve the backlog-grooming prompt for workflow %s in %s: none of the %d injected documents was "+
 			"resolved from the declared charter path %q (declared at %s). A grooming run ranks the backlog against "+
 			"the charter's rubric and there is no unanchored-grooming mode; wire the repo-document injection seam "+

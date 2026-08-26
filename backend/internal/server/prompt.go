@@ -1333,12 +1333,20 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// Every non-grooming stage returns nil from the first line of the check,
 	// so this adds nothing to any other prompt. NOT wired on the
 	// /prompt-render preview, which injects no documents at all (#2804).
-	if err := s.assertCharterInjected(r.Context(), runRow, stage, injected); err != nil {
+	// assertCharterInjected is BOTH the fail-closed check AND the sole producer
+	// of the prompt layer's grooming determination (E54.28 / #2834): it returns
+	// a non-nil *prompt.GroomingContext for a grooming propose stage and (nil,
+	// nil) for every other stage. Threading that value straight into prompt.Build
+	// is what makes the two layers agree — there is exactly one determination per
+	// served prompt.
+	groomingCtx, err := s.assertCharterInjected(r.Context(), runRow, stage, injected)
+	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
 			"required charter document was not injected", charterAwareInjectionErrorDetails(err))
 		return
 	}
 	trigger.InjectedDocuments = injected
+	trigger.Grooming = groomingCtx
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
@@ -1346,6 +1354,25 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusNotImplemented, "unsupported_stage_type",
 				"prompt construction not yet implemented for this stage type",
 				map[string]any{"stage_type": string(stage.Type)})
+			return
+		}
+		// DEFENCE IN DEPTH (E54.28 / #2834): prompt.buildGroomingPropose fails
+		// closed with ErrCharterNotInjected if a grooming propose stage reaches
+		// it with no charter among the injected documents. This is practically
+		// UNREACHABLE through this handler — assertCharterInjected above refuses
+		// on the same condition FIRST — but the prompt layer keeps its own copy
+		// of the policy so buildGroomingPropose cannot emit a report prompt
+		// without a charter EVEN IF a future caller forgets L2. This mapping is
+		// its server-side translation for that case: surface it as the same
+		// charter refusal shape L2 produces, not a generic internal_error. The
+		// error itself IS covered (prompt package test
+		// TestBuild_GroomingPropose_NoCharterInjected_Refuses); what is untested
+		// is this mapping, because the L2 refusal above makes it unreachable —
+		// unreachable here is not uncovered nor unimportant.
+		if errors.Is(err, prompt.ErrCharterNotInjected) {
+			s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+				"required charter document was not injected",
+				map[string]any{"reason": reasonCharterNotInjected, "error": err.Error()})
 			return
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -1889,6 +1916,14 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
 	trigger.ImplementStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)) * time.Second
 
+	// This PREVIEW handler deliberately sets NO grooming context (trigger.Grooming
+	// stays nil), because — unlike handleGetStagePrompt — it injects NO documents
+	// at all (a pre-existing #2242 divergence). Forking to buildGroomingPropose
+	// here would render the grooming report contract with no charter among the
+	// injected set — the exact report-without-a-charter shape #2834's fail-closed
+	// forbids — so the preview stays byte-identical to today and renders a groom
+	// stage as an ordinary plan. Widening the preview to resolve documents (and
+	// then set Grooming) is #2804's, not this slice's.
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		if errors.Is(err, prompt.ErrUnsupportedStage) {

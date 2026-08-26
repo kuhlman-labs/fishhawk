@@ -55,6 +55,21 @@ handler has already recorded on the stage.
 A THIRD sibling kind is one entry in `planSiblingKinds` plus the backend's own
 routing — a known, documented residual of the module wall, not a solved problem.
 
+### The propose stage's PROMPT states this contract (E54.28 / #2834)
+
+The prompt a `plan`-typed grooming propose stage is served comes from
+`prompt.buildGroomingPropose`, NOT `prompt.buildPlan`: it names the
+`grooming_report` kind and `grooming_report_v1` version (from the
+`plan.ArtifactKindGroomingReport` / `plan.GroomingReportVersion` constants), the
+six-required-arrays rule, the per-ordering-entry rubric-citation requirement, the
+derived-id and 1..N rank-permutation rules, and instructs the agent NOT to emit
+any standard_v1 plan field. This is COMPLEMENTARY to, not a substitute for, the
+schema: the prompt steers the agent toward a valid report, but the **schema —
+validated by `handleGroomingReport` at ingest — remains the enforcement**. A
+report that ignores the prompt still fails `grooming_report_invalid`. The prompt
+branch itself fails closed (`prompt.ErrCharterNotInjected`) if no charter is
+among the injected documents, so a report prompt is never served unanchored.
+
 ## Top-level fields
 
 | Field | Required | Notes |
