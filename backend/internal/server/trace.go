@@ -3464,6 +3464,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// no gate ran, extraction error) keeps the prompt byte-identical.
 		GateEvidence: gateEvidence,
 	}
+	// Decomposed-parent rollup (#2820): a fan-out CHILD's APPROVED mid-stage scope
+	// amendment lives under the CHILD run id, so a path an operator authorized on a
+	// slice reaches this parent's consolidated diff with no provenance on the
+	// parent and reads as scope drift (#2237, #2239). Resolve the children's
+	// approved amendments ONCE here; the value is consumed by BOTH the review
+	// section (buildImplementReview) and the provenance fold (scopeProvenanceForReview,
+	// which receives trig by value below). nil for every non-decomposed run.
+	trig.ChildAmendedScopeFiles = s.childApprovedAmendmentScopePaths(ctx, runID)
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
 		trig.IssueBody = runRow.IssueContext.Body
@@ -3532,6 +3540,15 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// the subset absent from the committed diff. Both channel lookups are
 	// best-effort and never block the review (approvedAmendmentScopePaths
 	// WARN-logs a nil repo / list error and contributes nothing).
+	//
+	// #2820 DELIBERATE OMISSION: trig.ChildAmendedScopeFiles (a decomposed
+	// parent's children's approved amendments) is NOT unioned here. That set is a
+	// PERMISSION granted on a child slice, not a work-order the operator placed on
+	// THIS parent; an approved-but-unused child amendment path folded into this
+	// signal would surface as an operator-scope-undelivered MISS on the parent,
+	// trading the #2820 false drift signal for a false miss signal. It is folded
+	// only into the review-facing provenance (scopeProvenanceForReview), never the
+	// operator-scope-undelivered union.
 	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
 	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
 	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, diff); len(undelivered) > 0 {
@@ -3983,6 +4000,8 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // The effective set is rebuilt in the SAME fold order handleGetStagePrompt
 // applies (server/prompt.go): plan scope.files, then trig.AmendedScopeFiles
 // (approval-add-scope-files), approvedAmendmentScopePaths (scope-amendment),
+// the decomposed parent's children's approved amendments (child-scope-amendment,
+// #2820 — carrying a per-path Detail naming the authorizing amendment),
 // and — on a fix-up pass only — resolveFixupAllowCreate (fixup-allow-create)
 // and the coupled *_test.go stem siblings over the accumulated set
 // (fixup-coupled-test-sibling), deduped by path with first-source-wins
@@ -4053,8 +4072,36 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 			folds = append(folds, prompt.GateScopeFold{Path: p, Source: source, Touched: touched(p)})
 		}
 	}
+	// addFoldDetailed is addFold's sibling for a fold channel that carries a
+	// per-path provenance Detail (#2820). It shares addFold's first-source-wins
+	// dedup (a path already in plan scope or an earlier channel is skipped) and
+	// touched marking; only the extra Detail suffix differs, so the existing
+	// addFold signature and call sites are untouched.
+	addFoldDetailed := func(paths []prompt.ChildAmendedScopePath, source string) {
+		for _, cp := range paths {
+			if _, ok := inScope[cp.Path]; ok {
+				continue
+			}
+			inScope[cp.Path] = struct{}{}
+			foldSource[cp.Path] = source
+			accum = append(accum, scopeFile{Path: cp.Path, Operation: "modify"})
+			detail := "authorized by approved amendment " + cp.AmendmentID
+			if cp.SliceIndex != nil {
+				detail += fmt.Sprintf(" on child slice %d", *cp.SliceIndex)
+			}
+			detail += ", child run " + cp.ChildRunID
+			folds = append(folds, prompt.GateScopeFold{
+				Path: cp.Path, Source: source, Touched: touched(cp.Path), Detail: detail,
+			})
+		}
+	}
 	addFold(trig.AmendedScopeFiles, "approval-add-scope-files")
 	addFold(s.approvedAmendmentScopePaths(ctx, runID), "scope-amendment")
+	// Decomposed-parent children's approved amendments (#2820): a slice's
+	// operator-approved amendment path folds in as in-scope so it does not read as
+	// an unexplained residual on the parent. Resolved once in runImplementReviews
+	// and threaded via trig; nil for every non-decomposed run.
+	addFoldDetailed(trig.ChildAmendedScopeFiles, "child-scope-amendment")
 	fixupPass := hasFixupRoutedConcern(trig.PriorConcerns)
 	if fixupPass {
 		addFold(s.resolveFixupAllowCreate(ctx, runID, stageID), "fixup-allow-create")
