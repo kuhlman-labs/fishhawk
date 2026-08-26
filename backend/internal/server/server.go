@@ -152,6 +152,22 @@ type Config struct {
 	// which is exactly what pinning exists to prevent.
 	DocumentBaseRef func(ctx context.Context, repo forge.RepoRef) (string, error)
 
+	// IntakeGroomDeadline is a TEST SEAM: the budget the intake-groom hook
+	// (backend/internal/server/intake_hook.go, #2239 / #2827) derives its own
+	// child context with.
+	//
+	// A ZERO VALUE MEANS "USE THE DEFAULT". The shipped default is
+	// intakegroom.DefaultDeadline and this change does not move it, so every
+	// existing construction site — none of which sets this field — keeps
+	// today's behaviour with no edit. The default is resolved at the READ
+	// site, so exactly one place knows it.
+	//
+	// It exists because the hook spends its budget on two CONCURRENT forge
+	// reads whose relative timings are what the tests discriminate on, and a
+	// wall-clock test cannot hold its ratios against a shipped constant it
+	// cannot scale with (AGENTS.md / #1984). Production wires it nowhere.
+	IntakeGroomDeadline time.Duration
+
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and
 	// GET /v0/artifacts/{id}; nil leaves both 503.

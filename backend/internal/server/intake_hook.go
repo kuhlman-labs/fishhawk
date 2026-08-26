@@ -28,32 +28,72 @@ package server
 // WARN-logged and reported on the 201, and nothing about the filing changes.
 // A degraded hook is NORMAL, not an incident.
 //
-// THE LATENCY BOUND, STATED HONESTLY (binding approval condition L1, option
-// (a)). runIntakeGroom derives its own context with intakegroom.DefaultDeadline
-// and hands that context to the reader. A context deadline does NOT preempt a
-// callee that never consults the context, so this mechanism bounds the read for
-// a CANCELLATION-COOPERATIVE reader — it is not, and is not claimed to be, a
-// hard bound against an arbitrary blocking reader.
+// TWO CONCURRENT READS UNDER ONE BUDGET (#2827). runIntakeGroom needs two
+// INDEPENDENT forge reads — the duplicate-candidate scan and the charter read —
+// and it runs them CONCURRENTLY on one derived context, joining both before it
+// reads either result.
 //
-// The production path IS cancellation-cooperative, which is what makes the
-// conditional bound the real one: the GitHub work-item reader reaches the forge
-// through githubclient, which builds every request with
-// http.NewRequestWithContext, and Go's HTTP client returns at a context
-// deadline. TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline pins
-// that BEHAVIOURALLY — it drives the real reader through the real client
-// against a hanging HTTP server and asserts the server's own in-flight request
-// is cancelled at the caller's deadline, so a future edit that stopped
-// threading the context anywhere in that chain reddens it. (An earlier version
-// grepped githubclient for the http.NewRequestWithContext constructor, which
-// stayed green as long as any file in the package mentioned it and so could not
-// see that regression at all.) The wedged-reader tests use a ctx-respecting
-// fake — which honestly tests this plumbing rather than pretending to test
-// preemption. Option (b) (running the read on a goroutine and selecting on the
-// deadline) was the alternative; it was not taken because
-// it buys a hard bound only by leaking a goroutine of unbounded lifetime
-// holding an abandoned result, whose later panic would be unrecoverable by this
-// frame's recover() — a worse failure mode than the one it removes, on a path
-// whose entire promise is that it cannot make filing worse.
+// It used to spend that one budget SEQUENTIALLY, scan first. On a real backlog
+// the scan alone costs most of the 3s, so the charter read inherited whatever
+// was left and the outcome flipped on ordinary latency variance. Worse, when it
+// lost, the reported gap said "no rubric lines could be parsed from the
+// charter" — blaming a demonstrably healthy parser for a document that had
+// never been fetched. Concurrency makes the hook's wall clock max(scan,
+// charter) instead of scan+charter, so neither read can starve the other, and
+// the budget becomes a PER-READ time cap rather than a shared pool. That is why
+// DefaultDeadline is NOT raised: with the reads concurrent the constant already
+// bounds each read on its own.
+//
+// It does NOT rescue a scan that alone exceeds the whole budget. That filing
+// still degrades; what changes is that the reason names the read that actually
+// failed.
+//
+// PER-GOROUTINE RECOVER. A deferred recover() in the frame that STARTED a
+// goroutine cannot catch that goroutine's panic — the runtime terminates the
+// program (Go spec, "Handling panics": https://go.dev/ref/spec#Handling_panics).
+// So each read goroutine carries its OWN deferred recover mapping a panic onto
+// DegradeReasonHookPanic. The outer recover below remains for the hook's own
+// frame. (An earlier version of this comment claimed the outer guard was total
+// "because the hook starts no goroutine of its own" — that is no longer true,
+// and the per-goroutine recovers are what keeps the claim it stood for.)
+//
+// JOIN, NOT ABANDON. The hook WAITS for both goroutines before returning, so
+// neither outlives this frame, no abandoned result is held, and no goroutine's
+// later panic escapes an already-returned recover. That is precisely the
+// failure mode option (b) of #2239 (start the read on a goroutine and SELECT on
+// the deadline, abandoning the loser) was rejected for, and joining is what
+// keeps that objection from applying to this shape.
+//
+// THE LATENCY BOUND, STATED HONESTLY — AND WHAT CONCURRENCY CHANGED. Because
+// the hook joins, a reader that never consults its context still blocks the
+// filing, exactly as it did under the sequential shape. A context deadline does
+// NOT preempt a callee that ignores the context, so this mechanism bounds a
+// CANCELLATION-COOPERATIVE reader and is not claimed to be a hard bound against
+// an arbitrary blocking one.
+//
+// That bound is PRESERVED for the candidate read and EXTENDED to the charter
+// read, and the extension is a NEW exposure path rather than a preserved one:
+// under the sequential shape a scan that exhausted the budget meant the charter
+// read was never dialed at all, so a non-cooperative charter reader could not
+// block a filing it was never asked to serve. Now it is always dialed, so it
+// can. That is an accepted consequence of running the reads concurrently — the
+// same conditional exposure the candidate read has always carried, now applying
+// to both.
+//
+// Both production paths ARE cancellation-cooperative, which is what makes the
+// conditional bound the real one: the GitHub work-item reader and the charter
+// document read both reach the forge through githubclient, which builds every
+// request with http.NewRequestWithContext, and Go's HTTP client returns at a
+// context deadline. TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline
+// pins that BEHAVIOURALLY for BOTH seams — it drives the real reader and the
+// real repodoc charter resolver through the real client against a hanging HTTP
+// server and asserts the server's own in-flight request is cancelled at the
+// caller's deadline, so a future edit that stopped threading the context
+// anywhere in either chain reddens it. (An earlier version grepped githubclient
+// for the http.NewRequestWithContext constructor, which stayed green as long as
+// any file in the package mentioned it and so could not see that regression at
+// all.) The wedged-reader tests use a ctx-respecting fake — which honestly
+// tests this plumbing rather than pretending to test preemption.
 
 import (
 	"context"
@@ -61,6 +101,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -86,10 +127,11 @@ const intakeCharterDeclarationSite = "charter.path in .fishhawk/work-management.
 // (so the rendered advisory section lands on the created issue itself).
 func (s *Server) runIntakeGroom(ctx context.Context, conv workmgmt.Conventions, target workmgmt.Target, filing intakegroom.Filing) (sig intakegroom.Signals) {
 	start := time.Now()
-	// The panic guard is the outermost control: a bug anywhere below —
-	// including in the pure derivation package — degrades the hook rather than
-	// taking down the filing that was about to succeed. It is total for this
-	// hook's own code because the hook starts no goroutine of its own.
+	// The panic guard for the hook's OWN frame: a bug in the sequential half
+	// below — including in the pure derivation package — degrades the hook
+	// rather than taking down the filing that was about to succeed. It does
+	// NOT cover the two read goroutines; each carries its own (see the file
+	// comment's per-goroutine-recover note).
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonHookPanic,
@@ -101,28 +143,97 @@ func (s *Server) runIntakeGroom(ctx context.Context, conv workmgmt.Conventions, 
 
 	// The hook's own budget. This is a CHILD context: cancelling it does not
 	// affect the caller's request context, which is what lets a hook timeout
-	// degrade while the filing proceeds on the parent.
-	hctx, cancel := context.WithTimeout(ctx, intakegroom.DefaultDeadline)
+	// degrade while the filing proceeds on the parent. Both reads share it, and
+	// because they run CONCURRENTLY it bounds each of them rather than being a
+	// pool the first read can drain. A context is safe for simultaneous use by
+	// multiple goroutines.
+	hctx, cancel := context.WithTimeout(ctx, s.intakeGroomDeadline())
 	defer cancel()
 
-	candidates, truncated, reason := s.intakeCandidates(hctx, conv, target)
-	if reason != "" {
-		return intakegroom.Degrade(reason)
-	}
+	var (
+		candidates      []intakegroom.Candidate
+		truncated       bool
+		candidateReason intakegroom.DegradeReason
 
-	charter, charterReason := s.intakeCharter(hctx, conv, target)
+		charter       intakegroom.Charter
+		charterReason intakegroom.DegradeReason
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer s.recoverIntakeRead(ctx, target, func(reason intakegroom.DegradeReason) {
+			candidates, truncated, candidateReason = nil, false, reason
+		})
+		candidates, truncated, candidateReason = s.intakeCandidates(hctx, conv, target)
+	}()
+	go func() {
+		defer wg.Done()
+		defer s.recoverIntakeRead(ctx, target, func(reason intakegroom.DegradeReason) {
+			charter, charterReason = intakegroom.Charter{}, reason
+		})
+		charter, charterReason = s.intakeCharter(hctx, conv, target)
+	}()
+	// JOIN, not abandon: every write above happens-before this returns, so the
+	// reads below need no further synchronisation, and no goroutine outlives
+	// this frame.
+	wg.Wait()
+
+	if candidateReason != "" {
+		// A failed scan degrades the whole hook and reports NO findings, so the
+		// filed body stays byte-identical. A charter resolved alongside a
+		// failed scan is therefore read but not used: scoring on a partial
+		// window is deliberately out of scope.
+		return intakegroom.Degrade(candidateReason)
+	}
 
 	sig = intakegroom.Evaluate(filing, candidates, charter)
 	sig.WindowTruncated = truncated
 	if charterReason != "" {
-		// Evaluate reports the generic charter_rubric_unparsed for any empty
-		// rubric. Override it with the more specific cause observed upstream —
-		// an undeclared charter and an unresolvable one are different operator
-		// problems and must not be reported as the same one.
+		// Evaluate can only see whether the Charter it was handed was resolved.
+		// Override it with the more specific cause observed upstream — an
+		// undeclared charter, an unwired seam and an exhausted budget are
+		// different operator problems and must not be reported as the same one.
 		sig.Degraded = true
 		sig.DegradeReason = charterReason
 	}
 	return sig
+}
+
+// intakeGroomDeadline resolves the hook's budget at the READ site: the Config
+// value when set, intakegroom.DefaultDeadline otherwise.
+//
+// The zero value meaning "use the default" is what keeps every existing Server
+// construction site — none of which sets the field — on today's behaviour, and
+// resolving it here rather than at construction keeps exactly one place knowing
+// the default. Config.IntakeGroomDeadline is a test seam; production sets it
+// nowhere.
+func (s *Server) intakeGroomDeadline() time.Duration {
+	if s.cfg.IntakeGroomDeadline > 0 {
+		return s.cfg.IntakeGroomDeadline
+	}
+	return intakegroom.DefaultDeadline
+}
+
+// recoverIntakeRead is the deferred panic guard ONE read goroutine installs.
+//
+// It exists per-goroutine because a recover() in the frame that started a
+// goroutine cannot catch that goroutine's panic — the runtime terminates the
+// program instead (Go spec, "Handling panics"). Omitting it would turn what is
+// today a recovered panic on a load-bearing write path into a process crash.
+//
+// It logs through the same funnel every other degradation uses and hands the
+// typed reason back to the caller's own result variables via assign, so the
+// join below sees a degraded read rather than a half-written one.
+func (s *Server) recoverIntakeRead(ctx context.Context, target workmgmt.Target, assign func(intakegroom.DegradeReason)) {
+	rec := recover()
+	if rec == nil {
+		return
+	}
+	s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonHookPanic,
+		fmt.Sprintf("panic recovered in intake groom: %v", rec))
+	assign(intakegroom.DegradeReasonHookPanic)
 }
 
 // intakeCandidates enumerates the bounded, newest-first window of existing
@@ -250,10 +361,15 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		return intakegroom.Charter{Path: path}, reason
 	}
 
+	// Resolved is set HERE and nowhere else: this is the one path on which a
+	// charter document was actually fetched and its content parsed. Every early
+	// return above leaves it false, which is what lets the pure package tell a
+	// never-read charter from a read-but-rubric-less one.
 	charter := intakegroom.Charter{
 		Path:        doc.Path,
 		ContentHash: doc.ContentHash,
 		RubricIDs:   intakegroom.ParseRubricIDs(doc.Content),
+		Resolved:    true,
 	}
 	if charter.RubricIDs.Len() == 0 {
 		// The charter resolved but carries no parsable rubric ids. Scoring
@@ -270,12 +386,15 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 //
 // Deadline expiry is BUDGET EXHAUSTION, not an unresolvable charter, and it
 // must classify the same way at EVERY seam the budget can expire in. The
-// candidate scan runs first and shares the same hook budget, so it can consume
-// most or all of it before the charter read starts — which means any of the
-// three charter seams (base-ref resolution, credential-scope resolution, the
-// document read) can be the one that observes the deadline, not just the
-// document read. Classifying two of them as charter_unresolved sends an
-// operator hunting a charter-path misconfiguration for what is a slow forge.
+// charter read spends the hook's budget across three seams in sequence
+// (base-ref resolution, credential-scope resolution, the document read), so any
+// of them can be the one that observes the deadline, not just the document
+// read. Classifying two of them as charter_unresolved sends an operator hunting
+// a charter-path misconfiguration for what is a slow forge. (This mattered even
+// more before #2827, when the candidate scan ran FIRST on the same budget and
+// routinely left the charter read almost none of it; the classification is
+// still required now that the reads are concurrent, because a slow forge
+// expires the budget at whichever seam the charter read happens to be in.)
 //
 // It reads BOTH the returned error and ctx.Err(): a seam may wrap the
 // cancellation into an opaque error of its own, in which case the context is

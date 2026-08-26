@@ -149,7 +149,14 @@ var structuralRules = []structuralRule{
 //   - A GAP IS A FINDING. When no citation survives, the result is
 //     Unscored with the reason, never a synthesized citation invented to
 //     satisfy the shape (charter §6.6).
-func ScoreFiling(f Filing, dups []DuplicateCandidate, r Rubric) Score {
+//
+// It takes the whole Charter rather than only its Rubric so the gap can name
+// the CAUSE of an empty rubric: a charter that was never read is a different
+// operator problem from one that was read and carries no rubric table, and
+// reporting both as "the parser found nothing" blames a healthy parser for a
+// document that was never fetched (#2827).
+func ScoreFiling(f Filing, dups []DuplicateCandidate, c Charter) Score {
+	r := c.RubricIDs
 	var s Score
 	var firedButUndeclared []string
 	for _, rule := range structuralRules {
@@ -172,13 +179,31 @@ func ScoreFiling(f Filing, dups []DuplicateCandidate, r Rubric) Score {
 		return s
 	}
 	s.Unscored = true
+	path := strings.TrimSpace(c.Path)
 	switch {
+	// The three empty-rubric arms name three distinct causes. Only the last
+	// one is about the PARSER; the first two are about a read that did not
+	// happen, and conflating them is the #2827 defect.
+	case r.Len() == 0 && !c.Resolved && path != "":
+		s.CharterGap = fmt.Sprintf("the charter at %s was not read, so no citation is available", path)
+	case r.Len() == 0 && !c.Resolved:
+		s.CharterGap = "no charter is declared for this repository, so no citation is available"
 	case r.Len() == 0:
-		s.CharterGap = "no rubric lines could be parsed from the charter, so no citation is available"
+		s.CharterGap = fmt.Sprintf("no rubric lines could be parsed from %s, so no citation is available", charterLabel(path))
 	case len(firedButUndeclared) > 0:
 		s.CharterGap = fmt.Sprintf("the structural rules that fired (%s) cite rubric ids the charter does not declare", strings.Join(firedButUndeclared, ", "))
 	default:
 		s.CharterGap = "no decidable structural rubric line fires for this filing; a semantic ranking is the periodic sweep's job"
 	}
 	return s
+}
+
+// charterLabel names a RESOLVED charter in a gap string. A resolved charter
+// always carries the path it was read from; the fallback exists so a
+// hand-constructed Charter cannot render a sentence with a hole in it.
+func charterLabel(path string) string {
+	if path == "" {
+		return "the charter"
+	}
+	return path
 }

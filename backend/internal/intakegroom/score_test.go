@@ -122,7 +122,7 @@ func TestScoreFiling_EachStructuralRuleFiresAndDoesNot(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ScoreFiling(tc.filing, tc.dups, rubric)
+			got := ScoreFiling(tc.filing, tc.dups, Charter{Path: charterPath, RubricIDs: rubric, Resolved: true})
 			gotIDs := citedIDs(got)
 			if strings.Join(gotIDs, ",") != strings.Join(tc.wantCite, ",") {
 				t.Fatalf("citations = %v, want %v", gotIDs, tc.wantCite)
@@ -166,7 +166,7 @@ func TestScore_DropsCitationForIdAbsentFromCharter(t *testing.T) {
 	// A filing that fires S4 (no parent epic) and U4 (no depends_on).
 	filing := Filing{MissingLabelNamespaces: []string{"phase"}}
 
-	got := ScoreFiling(filing, nil, withoutS4)
+	got := ScoreFiling(filing, nil, Charter{Path: charterPath, RubricIDs: withoutS4, Resolved: true})
 
 	for _, c := range got.Citations {
 		if c.RubricID == "S4" {
@@ -188,7 +188,7 @@ func TestScore_UnscoredRecordsCharterGap(t *testing.T) {
 	unrelated := ParseRubricIDs("| **V1** | Directly unblocks the current phase. |\n")
 	filing := Filing{MissingLabelNamespaces: []string{"phase"}}
 
-	got := ScoreFiling(filing, nil, unrelated)
+	got := ScoreFiling(filing, nil, Charter{Path: charterPath, RubricIDs: unrelated, Resolved: true})
 
 	if len(got.Citations) != 0 {
 		t.Fatalf("want no citation, got %v", citedIDs(got))
@@ -201,10 +201,67 @@ func TestScore_UnscoredRecordsCharterGap(t *testing.T) {
 	}
 }
 
-func TestScoreFiling_UnscoredWhenTheCharterHasNoRubricAtAll(t *testing.T) {
-	got := ScoreFiling(Filing{}, nil, Rubric{})
-	if !got.Unscored || !strings.Contains(got.CharterGap, "no rubric lines") {
-		t.Fatalf("want the unparsed-charter gap, got %+v", got)
+// TestScoreFiling_EmptyRubricGapNamesTheCauseNotTheParser covers the three arms of the
+// empty-rubric gap, is the pure-package half of the #2827 fix: an empty Rubric
+// has three distinct causes and each must produce its OWN cause-naming gap
+// string. Before this change all three produced one string blaming the parser,
+// which is what sent an operator to inspect a healthy parser for a document
+// that had never been fetched.
+//
+// The table asserts BOTH that each arm names its own cause AND that the three
+// strings are pairwise DISTINCT — the distinctness half is what a future edit
+// collapsing two arms back together would redden.
+func TestScoreFiling_EmptyRubricGapNamesTheCauseNotTheParser(t *testing.T) {
+	tests := []struct {
+		name    string
+		charter Charter
+		// wantSubstr is the phrase that names THIS arm's cause.
+		wantSubstr string
+		// notSubstr must NOT appear: an unread charter must never be reported
+		// as a parse failure, which is the exact confusion #2827 is about.
+		notSubstr string
+	}{
+		{
+			name:       "declared but never read names the read, not the parser",
+			charter:    Charter{Path: charterPath},
+			wantSubstr: charterPath + " was not read",
+			notSubstr:  "could not be parsed",
+		},
+		{
+			name:       "no charter declared at all names the declaration",
+			charter:    Charter{},
+			wantSubstr: "no charter is declared for this repository",
+			notSubstr:  "parsed",
+		},
+		{
+			name:       "read but carrying no rubric table names the parse",
+			charter:    Charter{Path: charterPath, Resolved: true},
+			wantSubstr: "no rubric lines could be parsed from " + charterPath,
+			notSubstr:  "was not read",
+		},
+	}
+
+	seen := map[string]string{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ScoreFiling(Filing{}, nil, tc.charter)
+			if !got.Unscored {
+				t.Fatalf("want Unscored with an empty rubric, got %+v", got)
+			}
+			if !strings.Contains(got.CharterGap, tc.wantSubstr) {
+				t.Fatalf("CharterGap = %q, want it to contain %q — the gap must name the cause", got.CharterGap, tc.wantSubstr)
+			}
+			if strings.Contains(got.CharterGap, tc.notSubstr) {
+				t.Fatalf("CharterGap = %q must NOT contain %q — that names a different cause than the one that occurred", got.CharterGap, tc.notSubstr)
+			}
+			if prev, dup := seen[got.CharterGap]; dup {
+				t.Fatalf("CharterGap %q is shared with %q; the three causes must be distinguishable from the gap alone", got.CharterGap, prev)
+			}
+			seen[got.CharterGap] = tc.name
+		})
+	}
+	if len(seen) != len(tests) {
+		t.Fatalf("got %d distinct gap strings across %d arms: %v", len(seen), len(tests), seen)
 	}
 }
 
@@ -212,7 +269,7 @@ func TestScoreFiling_UnscoredWhenNoRuleFires(t *testing.T) {
 	rubric := ParseRubricIDs(rubricFixture)
 	complete := Filing{ParentEpicRef: "#54", DependsOn: []string{"#2230"}}
 
-	got := ScoreFiling(complete, nil, rubric)
+	got := ScoreFiling(complete, nil, Charter{Path: charterPath, RubricIDs: rubric, Resolved: true})
 	if !got.Unscored {
 		t.Fatalf("want Unscored for a structurally complete filing, got %+v", got)
 	}

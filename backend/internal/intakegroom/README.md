@@ -83,26 +83,91 @@ than hidden.
 The reason set is closed (`DegradeReasons()`), so a degradation is always
 attributable to a named cause rather than to an unexplained empty result.
 
-## The latency bound, stated honestly
+## The budget is spent CONCURRENTLY by two independent reads
 
-`DefaultDeadline` (3s) bounds the hook's own derived context. A context
-deadline does **not** preempt a callee that never consults the context, so
-this bounds the read for a **cancellation-cooperative** reader — which the
-production path is: `githubclient` builds every request with
-`http.NewRequestWithContext`, and Go's HTTP client honours a context
-deadline, so the real provider read returns at the deadline. A reader that
-blocks without consulting `ctx` is not bounded by this mechanism, and a claim
-that it is would be a claim about a fiction. The hook slice's wedged-reader
-test therefore uses a ctx-respecting fake and tests the plumbing, which is
-what is actually there.
+`DefaultDeadline` (3s) bounds the hook's own derived context, and the hook
+spends it on two **independent** forge reads — the duplicate-candidate scan
+and the charter read — running **concurrently** on that one context, joined
+before either result is read.
+
+That makes the deadline a **per-read bound, not a shared pool**. It used to be
+a pool spent sequentially, scan first (#2827): on a real backlog the scan alone
+cost most of the 3s, so the charter read inherited whatever was left and the
+outcome flipped on ordinary latency variance — three degraded filings at
+3001-3002ms against one scored filing at 2529ms. The hook's wall clock is now
+`max(scan, charter)` rather than `scan + charter`, so neither read can starve
+the other.
+
+**`DefaultDeadline` was NOT raised, and that is the point.** With the reads
+concurrent the constant already caps each read on its own, so buying the
+charter read more time by nudging a constant would be paying latency on the
+filing path for something the shape change already delivers.
+
+**Concurrency does not rescue a scan that alone exceeds the whole budget.**
+That filing still degrades. What changes is that the reason names the read that
+actually failed instead of blaming the charter parser for a document that was
+never fetched.
+
+Each read goroutine carries its **own** deferred `recover()`. A `recover()` in
+the frame that started a goroutine cannot catch that goroutine's panic — the
+runtime terminates the program ([Go spec, "Handling
+panics"](https://go.dev/ref/spec#Handling_panics)) — so the per-goroutine guard
+is what keeps a panic on this load-bearing write path a swallowed degradation
+rather than a process crash. The hook **joins** rather than abandoning a
+goroutine at the deadline, so none outlives the frame and no abandoned result is
+held: that is exactly the failure mode the alternative design was rejected for.
+
+## The latency bound, stated honestly — and what concurrency changed
+
+A context deadline does **not** preempt a callee that never consults the
+context, so this bounds the read for a **cancellation-cooperative** reader — the
+production path is one: `githubclient` builds every request with
+`http.NewRequestWithContext`, and Go's HTTP client honours a context deadline,
+so the real provider read returns at the deadline. A reader that blocks without
+consulting `ctx` is not bounded by this mechanism, and a claim that it is would
+be a claim about a fiction. The hook slice's wedged-reader test therefore uses a
+ctx-respecting fake and tests the plumbing, which is what is actually there.
+
+Running the reads concurrently **preserves** that bound for the candidate read
+and **extends the same conditional exposure to the charter read** — an honest
+new exposure path, not a preserved one. Under the sequential shape a scan that
+exhausted the budget meant the charter read was never dialed at all, so a
+non-cooperative charter reader could not block a filing it was never asked to
+serve. It is now always dialed, so it can. That is an accepted consequence of
+the change.
 
 Because the bound is conditional on that production property, the property is
-pinned behaviourally rather than asserted in prose:
+pinned behaviourally rather than asserted in prose, and for **both** seams:
 `TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline` drives the real
-`workmgmt/github` reader through the real `githubclient` against a hanging HTTP
-server and asserts the server's own in-flight request is cancelled at the
-caller's deadline. An edit that stopped threading the context anywhere in that
-chain reddens it.
+`workmgmt/github` reader AND the real `repodoc` charter resolver through the real
+`githubclient` against a hanging HTTP server and asserts the server's own
+in-flight request is cancelled at the caller's deadline. An edit that stopped
+threading the context anywhere in either chain reddens it.
+
+## `Charter.Resolved`: a never-read charter is not an unparsable one
+
+`Charter.Resolved` is true **only** when a charter document was actually
+fetched and its content handed to `ParseRubricIDs`. Every early-return path in
+the hook — undeclared, seam unwired, base-ref failure, credential-scope
+failure, resolver failure — leaves it false.
+
+Without it an empty `RubricIDs` had two indistinguishable causes, and both
+surfaced as `charter_rubric_unparsed` with a gap blaming the parser for a
+document that was never read. The flag splits them:
+
+| `Charter` state | `Score.CharterGap` | `DegradeReason` from `Evaluate` |
+|---|---|---|
+| not resolved, a path declared | `the charter at <path> was not read, so no citation is available` | `charter_unresolved` |
+| not resolved, no path declared | `no charter is declared for this repository, so no citation is available` | `charter_unresolved` |
+| resolved, no rubric rows parsed | `no rubric lines could be parsed from <path>, so no citation is available` | `charter_rubric_unparsed` |
+
+The hook may still **override** the reason with the more specific cause it
+observed upstream (`charter_undeclared`, `seam_unwired`, `budget_exceeded`);
+those name causes only the caller can see. The closed `DegradeReason` set is
+unchanged — `charter_unresolved` was already a member.
+
+`ScoreFiling` therefore takes the whole `Charter` rather than only its
+`Rubric`: the gap has to name which of the three happened.
 
 ## The recency approximation, and what it misses
 
@@ -125,7 +190,7 @@ matching's false-positive rate is a tuning question, not a correctness one:
 | `typeLabelBonus` / `areaLabelBonus` | 0.05 / 0.10 | same-`type:` and same-`area:` label bonuses, capped at 1.0 |
 | `MaxDuplicates` | 3 | a list a human reads |
 | `DefaultMaxScanned` | 300 | ~three GraphQL pages |
-| `DefaultDeadline` | 3s | see above |
+| `DefaultDeadline` | 3s | the hook's budget, spent CONCURRENTLY by the two reads — so it is a per-read cap, not a pool; see above for why it was not raised |
 
 Moving any of them touches no wiring.
 
