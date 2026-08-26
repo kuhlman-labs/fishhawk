@@ -1370,6 +1370,9 @@ func TestBuild_Plan_CouplingDiscoveryChecklist(t *testing.T) {
 		"scripts/sync-schemas",
 		"backend/internal/postgres/migrations/*.sql",
 		"backend/internal/postgres/postgres_test.go",
+		// #2815: the coupling now names the NEW migration's own reversal
+		// test rather than a tip-pinning update of an existing one.
+		"its own MigrateDown reversal test",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

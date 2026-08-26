@@ -127,7 +127,8 @@ func TestEvaluateTestSweep(t *testing.T) {
 		},
 		{
 			// #1031: a scoped migration without the pinned migration-walk
-			// test (postgres_test.go pins the LATEST migration).
+			// test (postgres_test.go, where a new migration needs its own
+			// reversal test there).
 			name:     "migration sql without postgres_test flags migration_walk",
 			scope:    []plan.ScopeFile{{Path: "backend/internal/postgres/migrations/0032_x.up.sql", Operation: plan.FileOpCreate}},
 			listings: map[string][]string{},
