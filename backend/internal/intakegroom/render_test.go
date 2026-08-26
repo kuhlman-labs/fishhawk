@@ -230,7 +230,7 @@ func TestRenderBody_DegradedWithNoFindingsIsAByteIdenticalNoOp(t *testing.T) {
 	body := "## Summary\n\nThe original body, unchanged.\n"
 	for _, reason := range DegradeReasons() {
 		s := Degrade(reason)
-		s.Score = ScoreFiling(Filing{}, nil, Rubric{}) // Unscored, no citations.
+		s.Score = ScoreFiling(Filing{}, nil, Charter{}) // Unscored, no citations.
 		if got := RenderBody(body, s); got != body {
 			t.Fatalf("reason %q: body changed under a degraded hook:\n%s", reason, got)
 		}

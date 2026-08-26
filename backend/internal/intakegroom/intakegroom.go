@@ -221,6 +221,19 @@ type Charter struct {
 	// be cited, each with its line text for quoting. An empty rubric is a
 	// degradation, never a licence to cite an id that is not there.
 	RubricIDs Rubric
+	// Resolved reports that a charter document was actually FETCHED and its
+	// content handed to ParseRubricIDs. It is true ONLY on that one path.
+	//
+	// It exists because an empty RubricIDs has two completely different
+	// causes that the code could not previously tell apart: the charter was
+	// never read at all (undeclared, seam unwired, base-ref failure,
+	// credential-scope failure, resolver failure, or the read simply did not
+	// happen), versus the charter WAS read and carries no parsable rubric
+	// table. Both used to surface as charter_rubric_unparsed with a gap
+	// string blaming the parser — which sends an operator to inspect a parser
+	// that is healthy for a document that was never fetched (#2827). Every
+	// early-return path leaves this false; only the successful fetch sets it.
+	Resolved bool
 }
 
 // Citation is one rubric line a score cites, with the quote a reviewer
@@ -339,18 +352,28 @@ func Degrade(reason DegradeReason) Signals {
 //
 // The caller sets WindowTruncated and DurationMS afterwards, and may
 // override DegradeReason with a more specific cause it observed upstream
-// (an unresolvable charter is charter_unresolved, not the
-// charter_rubric_unparsed an empty Charter would produce here).
+// (charter_undeclared, seam_unwired and budget_exceeded all name a cause
+// only the caller can see; an unresolved Charter degrades here as the
+// generic charter_unresolved).
 func Evaluate(f Filing, candidates []Candidate, c Charter) Signals {
 	s := Signals{ScannedItems: len(candidates)}
 	s.Duplicates = Duplicates(f, candidates)
 	if strings.TrimSpace(f.ParentEpicRef) == "" {
 		s.EpicSuggestion = SuggestEpic(f, candidates)
 	}
-	s.Score = ScoreFiling(f, s.Duplicates, c.RubricIDs)
+	s.Score = ScoreFiling(f, s.Duplicates, c)
 	if c.RubricIDs.Len() == 0 {
 		s.Degraded = true
-		s.DegradeReason = DegradeReasonCharterRubricUnparsed
+		// An empty rubric has two causes and they are different operator
+		// problems. A charter that was never READ is charter_unresolved; a
+		// charter that was read and carries no parsable rubric table is
+		// charter_rubric_unparsed. Collapsing both onto the latter reported a
+		// parser failure for a document that was never fetched (#2827).
+		if c.Resolved {
+			s.DegradeReason = DegradeReasonCharterRubricUnparsed
+		} else {
+			s.DegradeReason = DegradeReasonCharterUnresolved
+		}
 	}
 	return s
 }

@@ -28,6 +28,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegithub "github.com/kuhlman-labs/fishhawk/backend/internal/forge/github"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/intakegroom"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
@@ -65,22 +66,65 @@ const igCharterDoc = `# Charter
 const igCharterNoRubric = "# Charter\n\nProse only. No rubric table here.\n"
 
 // igFetcher serves one charter document at any ref.
+//
+// It is mutex-guarded because the charter read now runs CONCURRENTLY with the
+// candidate scan (#2827), so a test that inspects fetches races the hook
+// otherwise. `go test -race` is what would fail if this were dropped.
 type igFetcher struct {
+	mu sync.Mutex
+
 	content string
 	missing bool
 	// err, when set, is returned verbatim — the seam-observed-a-deadline case
 	// wraps context.DeadlineExceeded through it.
 	err error
+	// delay, when > 0, holds a SUCCEEDING fetch for that long, cooperatively:
+	// it selects on ctx.Done() so it can never outlive the hook's budget. It
+	// is what lets a test give the charter read a known, nontrivial cost to
+	// race the scan against.
+	delay time.Duration
+	// panicOnFetch makes FetchFile panic — the charter GOROUTINE's panic case,
+	// which the hook's own frame cannot recover (Go spec, "Handling panics").
+	panicOnFetch bool
+
+	// calls counts FetchFile invocations. It is the timing-INSENSITIVE
+	// counterfactual for the concurrency: under the old sequential shape a
+	// scan that exhausted the budget meant this stayed at 0, because the
+	// charter read was never dialed at all.
+	calls int
 }
 
-func (f *igFetcher) FetchFile(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, p, _ string) (*forge.FileContent, error) {
-	if f.err != nil {
-		return nil, f.err
+func (f *igFetcher) FetchFile(ctx context.Context, _ forge.CredentialScope, _ forge.RepoRef, p, _ string) (*forge.FileContent, error) {
+	f.mu.Lock()
+	f.calls++
+	content, missing, err := f.content, f.missing, f.err
+	delay, panicOnFetch := f.delay, f.panicOnFetch
+	f.mu.Unlock()
+
+	if panicOnFetch {
+		panic("intake charter resolver exploded")
 	}
-	if f.missing {
+	if err != nil {
+		return nil, err
+	}
+	if missing {
 		return nil, forge.ErrNotFound
 	}
-	return &forge.FileContent{Path: p, Content: []byte(f.content), SHA: "blob"}, nil
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return &forge.FileContent{Path: p, Content: []byte(content), SHA: "blob"}, nil
+}
+
+// fetchCalls reports how many times the charter document was actually read.
+func (f *igFetcher) fetchCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 type igCommits struct{}
@@ -91,8 +135,14 @@ func (igCommits) GetBranchSHA(_ context.Context, _ forge.CredentialScope, _ forg
 
 // igCharterConfig returns the document seams wired against content.
 func igCharterConfig(content string, missing bool) Config {
+	return igCharterConfigWith(&igFetcher{content: content, missing: missing})
+}
+
+// igCharterConfigWith returns the document seams wired against f, so a test
+// that needs to observe or delay the charter read keeps a handle on it.
+func igCharterConfigWith(f *igFetcher) Config {
 	return Config{
-		DocumentResolver: &repodoc.Resolver{Fetcher: &igFetcher{content: content, missing: missing}, Commits: igCommits{}},
+		DocumentResolver: &repodoc.Resolver{Fetcher: f, Commits: igCommits{}},
 		DocumentBaseRef: func(context.Context, forge.RepoRef) (string, error) {
 			return igBranch, nil
 		},
@@ -206,8 +256,13 @@ type igReadProvider struct {
 	items     []workmgmt.WorkItemRecord
 	truncated bool
 	listErr   error
-	// panicOnList makes ListWorkItems panic synchronously — the reachable
-	// panic case (the hook starts no goroutine of its own).
+	// panicOnList makes ListWorkItems panic — the CANDIDATE GOROUTINE's panic
+	// case. Since #2827 the hook runs its two reads on goroutines of its own,
+	// so this panic is NOT recoverable by the hook's own frame (Go spec,
+	// "Handling panics"): what catches it is the candidate goroutine's own
+	// deferred recover. Delete that recover and
+	// TestIntakeHook_PanickingReaderStillFiles crashes the test binary rather
+	// than merely failing — which is the honest RED to record.
 	panicOnList bool
 	// wedge, when > 0, makes ListWorkItems block until the CONTEXT is done or
 	// wedge elapses, whichever comes first, then return ctx.Err(). It is
@@ -839,12 +894,16 @@ func (p *igNilPageProvider) ListWorkItems(context.Context, workmgmt.ListWorkItem
 	return nil, nil //nolint:nilnil // deliberately the contract violation under test
 }
 
-// TestIntakeHook_PanickingReaderStillFiles: a reader that panics
-// SYNCHRONOUSLY — the reachable panic case, since the hook starts no goroutine
-// of its own.
+// TestIntakeHook_PanickingReaderStillFiles: a reader that panics — the
+// CANDIDATE GOROUTINE's panic case.
 //
-// COUNTERFACTUAL (2): delete the deferred recover() in runIntakeGroom and this
-// test dies with the panic instead of asserting a 201.
+// COUNTERFACTUAL (2): delete the candidate goroutine's own deferred recover
+// (runIntakeGroom's `defer s.recoverIntakeRead(...)` on the candidate
+// goroutine) and this test CRASHES THE TEST BINARY rather than merely failing.
+// That is the honest RED: since #2827 the read runs on a goroutine, and the
+// hook's own frame cannot recover a goroutine's panic (Go spec, "Handling
+// panics") — so removing the per-goroutine guard turns a swallowed failure
+// into a process crash on a load-bearing write path.
 func TestIntakeHook_PanickingReaderStillFiles(t *testing.T) {
 	p := &igReadProvider{panicOnList: true}
 	igRegisterReadProvider(t, p)
@@ -991,6 +1050,308 @@ func TestIntakeHook_MeasuredAddedLatencyWithinBudget(t *testing.T) {
 		elapsed, resp.Intake.DurationMS, igLatencyFloor, bound)
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent reads under one budget (#2827)
+// ---------------------------------------------------------------------------
+
+// igConcurrentDeadline is the injected hook budget the two tests below race
+// their reads against, with the scan and charter delays derived from the SAME
+// timescale factor.
+//
+// Every deadline-competing duration derives from one factor so the
+// discrimination ratios hold at any scale (AGENTS.md / #1984). That is exactly
+// why Config.IntakeGroomDeadline exists: intakegroom.DefaultDeadline is a
+// SHIPPED constant these delays could not scale with, so leaving them raw
+// flakes on a loaded runner while scaling them against an unscaled 3s budget
+// INVERTS the discrimination outright. The ratios below (scan+charter > budget,
+// max(scan, charter) < budget) are the 2.2s/1.5s-against-3s shape of the
+// originating issue, at a cheaper base.
+func igConcurrentBudget() (deadline, scanDelay, charterDelay time.Duration) {
+	return timescale.D(1500 * time.Millisecond),
+		timescale.D(1100 * time.Millisecond),
+		timescale.D(750 * time.Millisecond)
+}
+
+// TestIntakeHook_SlowScanStillResolvesCharterAndScores is the headline claim:
+// a scan that consumes most of the budget no longer starves the charter read,
+// because the two run CONCURRENTLY. The hook's wall clock is max(scan, charter)
+// rather than scan+charter, so a filing whose reads sum past the budget still
+// scores.
+//
+// COUNTERFACTUAL: collapse the two goroutines back to the sequential
+// scan-then-charter shape and the reads sum past the budget — the charter read
+// observes the deadline, the filing degrades with budget_exceeded, and the
+// scored-with-a-real-citation assertion goes red.
+//
+// The test guards its OWN discrimination up front, so a later change to the
+// delays or the budget makes it fail loudly rather than pass vacuously.
+func TestIntakeHook_SlowScanStillResolvesCharterAndScores(t *testing.T) {
+	deadline, scanDelay, charterDelay := igConcurrentBudget()
+	if scanDelay+charterDelay <= deadline {
+		t.Fatalf("test is not discriminating: sequential cost %s fits the budget %s, so the sequential shape would pass too",
+			scanDelay+charterDelay, deadline)
+	}
+	if scanDelay >= deadline || charterDelay >= deadline {
+		t.Fatalf("test is not discriminating: a single read (scan %s, charter %s) already exceeds the budget %s, so concurrency cannot rescue it",
+			scanDelay, charterDelay, deadline)
+	}
+
+	p := igHealthyProvider(t)
+	p.delay = scanDelay
+	// A truncated window is the shape the real backlog produces: the scan is
+	// slow BECAUSE it hit its item cap.
+	p.truncated = true
+	igInstallCharterConventions(t)
+
+	fetcher := &igFetcher{content: igCharterDoc, delay: charterDelay}
+	cfg := igCharterConfigWith(fetcher)
+	cfg.IntakeGroomDeadline = deadline
+	sink := igCaptureDegrades(&cfg)
+	s := New(cfg)
+
+	start := time.Now()
+	rec := igFileFeatureRec(t, s)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Intake == nil {
+		t.Fatalf("no intake object on the 201 (body=%s)", rec.Body.String())
+	}
+	if resp.Intake.Degraded {
+		t.Fatalf("intake degraded with %q; the charter read must not be starved by a slow scan (gap=%q, logged=%+v)",
+			resp.Intake.DegradeReason, resp.Intake.Score.CharterGap, sink.snapshot())
+	}
+	if resp.Intake.Score.Unscored {
+		t.Fatalf("score is unscored with gap %q; the charter resolved, so a citation must be available",
+			resp.Intake.Score.CharterGap)
+	}
+	// The DONE-MEANS assertion: a real citation, anchored to a rubric id the
+	// fixture charter actually declares. Merely "the hook ran" would be
+	// satisfied by a no-op.
+	if len(resp.Intake.Score.Citations) == 0 {
+		t.Fatal("no citations on a scored filing; the charter was read but nothing anchored to it")
+	}
+	declared := intakegroom.ParseRubricIDs(igCharterDoc)
+	for _, c := range resp.Intake.Score.Citations {
+		if !declared.Has(c.RubricID) {
+			t.Errorf("citation %q is not declared in the fixture charter; the score is not anchored to the document that was read", c.RubricID)
+		}
+		if c.Quote == "" {
+			t.Errorf("citation %q carries no quote, so it was not taken from the resolved charter", c.RubricID)
+		}
+	}
+	if fetcher.fetchCalls() != 1 {
+		t.Errorf("charter fetched %d times, want exactly 1", fetcher.fetchCalls())
+	}
+	t.Logf("MEASURED concurrent reads: elapsed=%s duration_ms=%d budget=%s scan=%s charter=%s (sequential cost would be %s)",
+		elapsed, resp.Intake.DurationMS, deadline, scanDelay, charterDelay, scanDelay+charterDelay)
+}
+
+// TestIntakeHook_WedgedScanStillDialsTheCharterRead is the deliberately
+// TIMING-INSENSITIVE counterfactual for the concurrency, so the claim does not
+// rest on a margin.
+//
+// The scan wedges past the WHOLE budget. Under the old sequential shape the
+// charter read was never reached at all, so the fetch counter read 0. Under the
+// concurrent shape it is dialed and completes, and the counter reads 1 — an
+// assertion on a call count, not on a race outcome.
+//
+// The filing still degrades with budget_exceeded, which is the honest half:
+// concurrency does not rescue a scan that alone exceeds the budget. What it
+// buys is that the reason names the read that actually failed.
+func TestIntakeHook_WedgedScanStillDialsTheCharterRead(t *testing.T) {
+	deadline := timescale.D(1500 * time.Millisecond)
+	wedge := timescale.D(20 * time.Second)
+	if wedge <= deadline {
+		t.Fatalf("test is not discriminating: wedge %s <= deadline %s", wedge, deadline)
+	}
+
+	p := &igReadProvider{wedge: wedge}
+	igRegisterReadProvider(t, p)
+	igInstallCharterConventions(t)
+
+	fetcher := &igFetcher{content: igCharterDoc}
+	cfg := igCharterConfigWith(fetcher)
+	cfg.IntakeGroomDeadline = deadline
+	sink := igCaptureDegrades(&cfg)
+	s := New(cfg)
+
+	rec := igFileFeatureRec(t, s)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// THE control assertion: the charter read was dialed even though the scan
+	// ate the entire budget. It reads 0 under the sequential shape.
+	if got := fetcher.fetchCalls(); got != 1 {
+		t.Fatalf("charter fetched %d times, want exactly 1 — a scan that exhausts the budget must not prevent the charter read from being dialed at all", got)
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Intake == nil || !resp.Intake.Degraded {
+		t.Fatalf("intake = %+v, want a degradation", resp.Intake)
+	}
+	if resp.Intake.DegradeReason != intakegroom.DegradeReasonBudgetExceeded {
+		t.Errorf("degrade_reason = %q, want %q — the reason must name the read that actually failed",
+			resp.Intake.DegradeReason, intakegroom.DegradeReasonBudgetExceeded)
+	}
+	igAssertDegradeLogged(t, sink, intakegroom.DegradeReasonBudgetExceeded)
+}
+
+// TestIntakeHook_PanickingCharterResolverStillFiles pins the CHARTER
+// goroutine's own recover.
+//
+// COUNTERFACTUAL: delete the charter goroutine's `defer s.recoverIntakeRead(…)`
+// and this test CRASHES THE TEST BINARY. A recover() in the frame that started
+// a goroutine cannot catch that goroutine's panic (Go spec, "Handling panics"),
+// so the hook's outer guard does not cover this at all — which is precisely why
+// the concurrent shape needs one guard per goroutine.
+func TestIntakeHook_PanickingCharterResolverStillFiles(t *testing.T) {
+	p := igHealthyProvider(t)
+	igInstallCharterConventions(t)
+	cfg := igCharterConfigWith(&igFetcher{panicOnFetch: true})
+	sink := igCaptureDegrades(&cfg)
+	s := New(cfg)
+	igAssertDegraded(t, s, sink, func() bool { return p.called }, intakegroom.DegradeReasonHookPanic)
+}
+
+// TestIntakeHook_UnreachableAndUnparsableCharterDegradeDifferently is the
+// criterion-2 property: a charter that was never READ and one that was read but
+// carries no rubric are DIFFERENT operator problems and must be distinguishable
+// from the filing alone.
+//
+// Both halves shared one degrade reason and one gap string before #2827 — the
+// gap said "no rubric lines could be parsed from the charter" even for a
+// document that was never fetched, sending an operator to inspect a parser that
+// matches 19 rows against the committed charter.
+//
+// COUNTERFACTUAL: delete the `!c.Resolved` arms of ScoreFiling's gap switch and
+// the gap-string inequality goes red; delete Evaluate's
+// unresolved -> charter_unresolved mapping and the reason inequality goes red.
+// Each half is constructed independently and neither calls the control in its
+// own setup, so the RED lands on the behavioural assertion.
+func TestIntakeHook_UnreachableAndUnparsableCharterDegradeDifferently(t *testing.T) {
+	// Half 1: the declared charter does not exist at the pinned commit, so it
+	// was never read.
+	unreachable := func() *intakegroom.Signals {
+		igHealthyProvider(t)
+		igInstallCharterConventions(t)
+		cfg := igCharterConfig("", true)
+		igCaptureDegrades(&cfg)
+		return igIntakeOf(t, New(cfg))
+	}()
+
+	// Half 2: the charter resolves and simply carries no rubric table. Seeded
+	// BY CONSTRUCTION with a rubric-less fixture, not by calling the control.
+	unparsable := func() *intakegroom.Signals {
+		igHealthyProvider(t)
+		igInstallCharterConventions(t)
+		cfg := igCharterConfig(igCharterNoRubric, false)
+		igCaptureDegrades(&cfg)
+		return igIntakeOf(t, New(cfg))
+	}()
+
+	if unreachable.DegradeReason != intakegroom.DegradeReasonCharterUnresolved {
+		t.Errorf("unreachable charter degrade_reason = %q, want %q",
+			unreachable.DegradeReason, intakegroom.DegradeReasonCharterUnresolved)
+	}
+	if unparsable.DegradeReason != intakegroom.DegradeReasonCharterRubricUnparsed {
+		t.Errorf("unparsable charter degrade_reason = %q, want %q",
+			unparsable.DegradeReason, intakegroom.DegradeReasonCharterRubricUnparsed)
+	}
+	if unreachable.DegradeReason == unparsable.DegradeReason {
+		t.Errorf("both halves report %q; a never-read charter and a rubric-less one are different operator problems",
+			unreachable.DegradeReason)
+	}
+
+	unreachableGap := unreachable.Score.CharterGap
+	unparsableGap := unparsable.Score.CharterGap
+	if unreachableGap == "" || unparsableGap == "" {
+		t.Fatalf("a gap is a finding: unreachable=%q unparsable=%q", unreachableGap, unparsableGap)
+	}
+	if unreachableGap == unparsableGap {
+		t.Fatalf("both halves report the SAME charter gap %q; the filing cannot distinguish a charter that was never read from one that carries no rubric", unreachableGap)
+	}
+	// Each gap must name the read that actually failed, not the other one.
+	if !strings.Contains(unreachableGap, "was not read") {
+		t.Errorf("unreachable gap = %q, want it to name the READ that did not happen", unreachableGap)
+	}
+	if strings.Contains(unreachableGap, "could not be parsed") || strings.Contains(unreachableGap, "no rubric lines could be parsed") {
+		t.Errorf("unreachable gap = %q blames the PARSER for a document that was never fetched — the #2827 defect", unreachableGap)
+	}
+	if !strings.Contains(unparsableGap, "no rubric lines could be parsed") {
+		t.Errorf("unparsable gap = %q, want it to name the PARSE", unparsableGap)
+	}
+	if strings.Contains(unparsableGap, "was not read") {
+		t.Errorf("unparsable gap = %q says the charter was not read, but it was", unparsableGap)
+	}
+	t.Logf("DISTINCT gaps:\n  unreachable: %s\n  unparsable:  %s", unreachableGap, unparsableGap)
+}
+
+// igIntakeOf files the standard work item against s and returns the intake
+// signals from the 201, failing if the filing did not succeed.
+func igIntakeOf(t *testing.T, s *Server) *intakegroom.Signals {
+	t.Helper()
+	rec := igFileFeatureRec(t, s)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Intake == nil {
+		t.Fatalf("no intake object on the 201 (body=%s)", rec.Body.String())
+	}
+	return resp.Intake
+}
+
+// TestIntakeHook_ZeroDeadlineConfigUsesTheShippedDefault pins the
+// zero-value-means-default contract on Config.IntakeGroomDeadline.
+//
+// The field is a test seam, and every production construction site leaves it
+// zero. If a future edit made the zero value mean "no timeout", every one of
+// those sites would silently lose the hook's budget and nothing else in this
+// file would catch it: the tests that assert the budget all SET the field.
+//
+// So this one deliberately does not set it, wedges the reader past the shipped
+// default, and asserts the filing is still bounded by that default.
+func TestIntakeHook_ZeroDeadlineConfigUsesTheShippedDefault(t *testing.T) {
+	wedge := timescale.D(20 * time.Second)
+	elapsedBound := intakegroom.DefaultDeadline + timescale.D(2*time.Second)
+	if elapsedBound >= wedge {
+		t.Fatalf("test is not discriminating: elapsedBound %s >= wedge %s", elapsedBound, wedge)
+	}
+
+	p := &igReadProvider{wedge: wedge}
+	igRegisterReadProvider(t, p)
+	igInstallCharterConventions(t)
+	cfg := igCharterConfig(igCharterDoc, false)
+	if cfg.IntakeGroomDeadline != 0 {
+		t.Fatalf("fixture sets IntakeGroomDeadline = %s; this test must exercise the ZERO value", cfg.IntakeGroomDeadline)
+	}
+	sink := igCaptureDegrades(&cfg)
+	s := New(cfg)
+
+	start := time.Now()
+	rec := igFileFeatureRec(t, s)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if elapsed > elapsedBound {
+		t.Errorf("filing took %s, want <= %s — a zero IntakeGroomDeadline must mean intakegroom.DefaultDeadline, not 'no timeout'", elapsed, elapsedBound)
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Intake == nil || resp.Intake.DegradeReason != intakegroom.DegradeReasonBudgetExceeded {
+		t.Fatalf("intake = %+v, want a budget_exceeded degradation at the shipped default", resp.Intake)
+	}
+	if got, want := resp.Intake.DurationMS, intakegroom.DefaultDeadline.Milliseconds(); got < want {
+		t.Errorf("duration_ms = %d, want >= %d — the read must have run to the SHIPPED default", got, want)
+	}
+	igAssertDegradeLogged(t, sink, intakegroom.DegradeReasonBudgetExceeded)
+	t.Logf("MEASURED zero-config filing: elapsed=%s duration_ms=%d default=%s", elapsed, resp.Intake.DurationMS, intakegroom.DefaultDeadline)
+}
+
 // TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline is the assertion
 // binding approval condition L1 requires: the hook's latency bound is
 // CONDITIONAL on a cancellation-respecting reader, so the claim that the
@@ -1003,13 +1364,29 @@ func TestIntakeHook_MeasuredAddedLatencyWithinBudget(t *testing.T) {
 // the ListRepoIssues call chain stopped threading its context — which is
 // exactly the regression the bound depends on not happening.
 //
-// So this drives the REAL production chain, with no fake in it:
+// So this drives the REAL production chains, with no fake in them — and since
+// #2827 it covers BOTH seams, not only the list seam. Running the two reads
+// concurrently EXTENDS the conditional latency bound to the charter read (under
+// the sequential shape a budget-exhausting scan meant the charter read was
+// never dialed, so its cooperativeness could not affect a filing), which makes
+// that half a claim this test must pin rather than assume:
 //
-//	workmgmt/github.Provider.ListWorkItems  (the reader the hook resolves)
-//	  -> githubclient.Client.ListRepoIssues (the GraphQL enumeration)
-//	    -> net/http over a real TCP connection
+//	the candidate seam:
+//	  workmgmt/github.Provider.ListWorkItems  (the reader the hook resolves)
+//	    -> githubclient.Client.ListRepoIssues (the GraphQL enumeration)
+//	      -> net/http over a real TCP connection
 //
-// against an HTTP server that HANGS, and asserts all three observable
+//	the charter seam:
+//	  repodoc.Resolver.Resolve                (the resolver the hook dials)
+//	    -> forge/github.Forge.FetchFile
+//	      -> githubclient.Client.GetFile      (the contents read)
+//	        -> net/http over a real TCP connection
+//
+// The charter case pins its base ref to a 40-hex commit so repodoc skips the
+// branch resolution and the hanging request IS the document read — the hop the
+// hook's charter budget is actually spent in.
+//
+// Each runs against an HTTP server that HANGS, and asserts all three observable
 // consequences of a context-threaded request:
 //
 //  1. the call returns at the caller's deadline, not at the hang;
@@ -1032,71 +1409,118 @@ func TestIntakeHook_ProductionReadPathCancelsInFlightAtDeadline(t *testing.T) {
 		t.Fatalf("test is not discriminating: deadline %s, bound %s, hang %s", deadline, elapsedBound, hang)
 	}
 
-	// serverSawCancel is buffered so the handler never blocks on a test that
-	// has already failed and stopped reading.
-	serverSawCancel := make(chan bool, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		// Drain the request body FIRST. net/http only starts the background
-		// read that detects a client disconnect — and therefore only cancels
-		// r.Context() — once the request body has hit EOF. A handler that
-		// blocks without reading its body never observes the cancellation, and
-		// this test would report a false negative about the client.
-		_, _ = io.Copy(io.Discard, r.Body)
-		select {
-		case <-r.Context().Done():
-			serverSawCancel <- true
-		case <-time.After(hang):
-			// Reaching here means the caller's deadline never reached the
-			// wire: the request outlived the deadline by the whole hang.
-			serverSawCancel <- false
-		}
-	}))
-	defer srv.Close()
-
-	// The HTTP client's OWN timeout is set beyond the hang deliberately. If it
-	// were tighter it would bound the call by itself and this test would pass
-	// whether or not the context was threaded — the transport-timeout version
-	// of the "unreachable address" trap.
-	client := &githubclient.Client{
-		BaseURL: srv.URL,
-		Tokens:  &fakeTokenProvider{tok: "ghs_intake"},
-		HTTP:    &http.Client{Timeout: hang * 2},
-	}
-	reader := workmgmtgithub.New(client)
-
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
-	defer cancel()
-	start := time.Now()
-	page, err := reader.ListWorkItems(ctx, workmgmt.ListWorkItemsRequest{
-		Target: workmgmt.Target{
-			Repo:  workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
-			Scope: forge.FromGitHubInstallationID(7),
+	seams := []struct {
+		name string
+		// dial drives the real production chain for one seam against baseURL
+		// under ctx, returning the error the hook would classify.
+		dial func(ctx context.Context, client *githubclient.Client) error
+	}{
+		{
+			name: "candidate scan seam",
+			dial: func(ctx context.Context, client *githubclient.Client) error {
+				page, err := workmgmtgithub.New(client).ListWorkItems(ctx, workmgmt.ListWorkItemsRequest{
+					Target: workmgmt.Target{
+						Repo:  workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+						Scope: forge.FromGitHubInstallationID(7),
+					},
+					IncludeClosed: true,
+					Newest:        true,
+					MaxScanned:    intakegroom.DefaultMaxScanned,
+				})
+				if err == nil {
+					return fmt.Errorf("ListWorkItems returned page %+v and no error against a hanging server", page)
+				}
+				return err
+			},
 		},
-		IncludeClosed: true,
-		Newest:        true,
-		MaxScanned:    intakegroom.DefaultMaxScanned,
-	})
-	elapsed := time.Since(start)
+		{
+			// The seam concurrency newly exposed: before #2827 a
+			// budget-exhausting scan meant this read was never dialed at all.
+			name: "charter document seam",
+			dial: func(ctx context.Context, client *githubclient.Client) error {
+				resolver := &repodoc.Resolver{Fetcher: forgegithub.New(client)}
+				doc, err := resolver.Resolve(ctx, repodoc.Request{
+					Repo:  forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"},
+					Scope: forge.FromGitHubInstallationID(7),
+					// A 40-hex base ref is already pinned, so repodoc skips
+					// GetBranchSHA and the hanging request IS the document read.
+					BaseRef: igCommit,
+					Declaration: repodoc.Declaration{
+						Path:            igCharterPath,
+						DeclarationSite: intakeCharterDeclarationSite,
+					},
+				})
+				if err == nil {
+					return fmt.Errorf("Resolve returned document %+v and no error against a hanging server", doc)
+				}
+				return err
+			},
+		},
+	}
 
-	if err == nil {
-		t.Fatalf("ListWorkItems returned page %+v and no error against a hanging server", page)
+	for _, seam := range seams {
+		t.Run(seam.name, func(t *testing.T) {
+			// serverSawCancel is buffered so the handler never blocks on a test
+			// that has already failed and stopped reading.
+			serverSawCancel := make(chan bool, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				// Drain the request body FIRST. net/http only starts the
+				// background read that detects a client disconnect — and
+				// therefore only cancels r.Context() — once the request body
+				// has hit EOF. A handler that blocks without reading its body
+				// never observes the cancellation, and this test would report a
+				// false negative about the client.
+				_, _ = io.Copy(io.Discard, r.Body)
+				select {
+				case <-r.Context().Done():
+					serverSawCancel <- true
+				case <-time.After(hang):
+					// Reaching here means the caller's deadline never reached
+					// the wire: the request outlived the deadline by the whole
+					// hang.
+					serverSawCancel <- false
+				}
+			}))
+			defer srv.Close()
+
+			// The HTTP client's OWN timeout is set beyond the hang
+			// deliberately. If it were tighter it would bound the call by
+			// itself and this test would pass whether or not the context was
+			// threaded — the transport-timeout version of the "unreachable
+			// address" trap.
+			client := &githubclient.Client{
+				BaseURL: srv.URL,
+				Tokens:  &fakeTokenProvider{tok: "ghs_intake"},
+				HTTP:    &http.Client{Timeout: hang * 2},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), deadline)
+			defer cancel()
+			start := time.Now()
+			err := seam.dial(ctx, client)
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatal("the production read returned no error against a hanging server")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("error = %v, want one that unwraps to context.DeadlineExceeded so the hook can classify it as budget_exceeded", err)
+			}
+			if elapsed > elapsedBound {
+				t.Errorf("the read took %s, want <= %s — the supplied deadline did not bound the production read", elapsed, elapsedBound)
+			}
+			select {
+			case cancelled := <-serverSawCancel:
+				if !cancelled {
+					t.Error("the server's in-flight request was NOT cancelled at the caller's deadline; the read is not cancellation-cooperative and the hook's latency bound does not hold")
+				}
+			case <-time.After(elapsedBound):
+				t.Error("the server never reported on its in-flight request; cancellation did not reach the wire")
+			}
+			t.Logf("MEASURED production read cancellation (%s): deadline=%s elapsed=%s bound=%s hang=%s err=%v",
+				seam.name, deadline, elapsed, elapsedBound, hang, err)
+		})
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("error = %v, want one that unwraps to context.DeadlineExceeded so the hook can classify it as budget_exceeded", err)
-	}
-	if elapsed > elapsedBound {
-		t.Errorf("ListWorkItems took %s, want <= %s — the supplied deadline did not bound the production read", elapsed, elapsedBound)
-	}
-	select {
-	case cancelled := <-serverSawCancel:
-		if !cancelled {
-			t.Error("the server's in-flight request was NOT cancelled at the caller's deadline; the read is not cancellation-cooperative and the hook's latency bound does not hold")
-		}
-	case <-time.After(elapsedBound):
-		t.Error("the server never reported on its in-flight request; cancellation did not reach the wire")
-	}
-	t.Logf("MEASURED production read cancellation: deadline=%s elapsed=%s bound=%s hang=%s err=%v",
-		deadline, elapsed, elapsedBound, hang, err)
 }
 
 // TestIntakeHook_DegradedFilingBodyIsUnchanged pins the blast-radius claim: a

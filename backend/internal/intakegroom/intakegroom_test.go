@@ -15,11 +15,16 @@ const rubricFixture = `## 4. Prioritization rubric
 | **U4** | Blocks nothing, and nothing blocks it. |
 `
 
+// charterPath is the declared charter path every fixture uses. It is shared so
+// a gap string that names the path can be asserted against the same literal.
+const charterPath = ".fishhawk/charter.md"
+
 func testCharter() Charter {
 	return Charter{
-		Path:        ".fishhawk/charter.md",
+		Path:        charterPath,
 		ContentHash: "sha256:test",
 		RubricIDs:   ParseRubricIDs(rubricFixture),
+		Resolved:    true,
 	}
 }
 
@@ -58,14 +63,41 @@ func TestEvaluate_HealthyFilingDerivesAllThreeSignals(t *testing.T) {
 	}
 }
 
-func TestEvaluate_EmptyRubricDegradesCharterRubricUnparsed(t *testing.T) {
-	got := Evaluate(Filing{Title: "some new work item"}, nil, Charter{Path: ".fishhawk/charter.md"})
+// TestEvaluate_EmptyRubricDegradeReasonNamesTheReadNotTheParser is the pure
+// half of the #2827 reason split. An empty rubric used to collapse onto
+// charter_rubric_unparsed whatever its cause, so a charter that was never
+// fetched reported a PARSE failure. The reason now follows Charter.Resolved.
+//
+// The bad state is seeded BY CONSTRUCTION — two Charter literals differing only
+// in Resolved — rather than by calling the control, so the RED under a deleted
+// mapping lands on the behavioural assertion and not on fixture setup.
+func TestEvaluate_EmptyRubricDegradeReasonNamesTheReadNotTheParser(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		charter Charter
+		want    DegradeReason
+	}{
+		{
+			name:    "never read degrades as charter_unresolved",
+			charter: Charter{Path: charterPath},
+			want:    DegradeReasonCharterUnresolved,
+		},
+		{
+			name:    "read but carrying no rubric degrades as charter_rubric_unparsed",
+			charter: Charter{Path: charterPath, Resolved: true},
+			want:    DegradeReasonCharterRubricUnparsed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Evaluate(Filing{Title: "some new work item"}, nil, tc.charter)
 
-	if !got.Degraded {
-		t.Fatal("want Degraded with an unparsable charter")
-	}
-	if got.DegradeReason != DegradeReasonCharterRubricUnparsed {
-		t.Fatalf("DegradeReason = %q, want %q", got.DegradeReason, DegradeReasonCharterRubricUnparsed)
+			if !got.Degraded {
+				t.Fatal("want Degraded with an empty rubric")
+			}
+			if got.DegradeReason != tc.want {
+				t.Fatalf("DegradeReason = %q, want %q — the reason must name the read that actually failed", got.DegradeReason, tc.want)
+			}
+		})
 	}
 }
 
