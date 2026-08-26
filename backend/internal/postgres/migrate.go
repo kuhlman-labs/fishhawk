@@ -103,6 +103,40 @@ func MigrateDown(databaseURL string) error {
 	return nil
 }
 
+// MigrateVersion reports the migration version golang-migrate has
+// recorded against the given Postgres URL, and whether that version is
+// dirty (a previous migration failed part-way — see enrichDirtyError).
+// It is the read primitive that lets a rollback test NAME its target
+// migration instead of counting steps from the current tip (#2815): a
+// test reads the live version, computes how many steps down its target
+// is, and asserts it landed there — so a new migration landing above
+// the target shifts the tip without editing the test.
+//
+// A fresh database with no migration applied reports (0, false, nil):
+// golang-migrate returns migrate.ErrNilVersion in that case, which this
+// maps to version 0. That mapping is unambiguous ONLY because the
+// migration series starts at 0001, so version 0 can never be a real
+// applied migration; TestMigrations_EmbeddedFiles asserts that invariant.
+//
+// Exported for the same reason as MigrateUpFS: the package's migration
+// tests live in the external postgres_test package and cannot reach an
+// unexported identifier.
+func MigrateVersion(databaseURL string) (uint, bool, error) {
+	m, err := openMigrator(databaseURL)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _, _ = m.Close() }()
+	version, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("migrate version: %w", err)
+	}
+	return version, dirty, nil
+}
+
 func openMigrator(databaseURL string) (*migrate.Migrate, error) {
 	return openMigratorFS(Migrations(), databaseURL)
 }

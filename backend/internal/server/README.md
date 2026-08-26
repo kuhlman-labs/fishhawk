@@ -847,7 +847,7 @@ Three deterministic rules in the pure matcher:
 
 1. *Stem-sibling* — a scoped production file matching a convention's `match` (and not itself a recognized test file) whose expanded candidate test exists on the base ref and is absent from scope (rule id stays `stem_sibling`).
 2. *New-test-in-tested-package* — a scoped CREATE whose basename is a recognized test file, in a directory that already has other recognized test files, reporting them sorted and capped at 10 names with `omitted_count` carrying the remainder.
-3. The *path-trigger rule table* (`testSweepPathTriggerRules`, #1031) — curated rows of trigger glob → required paths evaluated against the scope set only (no Contents API consultation), currently one row: `migration_walk`, any scoped `backend/internal/postgres/migrations/*.sql` requires `backend/internal/postgres/postgres_test.go` (it pins the LATEST migration; planners missed it on 0029/0030/0031); `RequiredPaths` is a slice so a future row can require multiple paths per trigger.
+3. The *path-trigger rule table* (`testSweepPathTriggerRules`, #1031) — curated rows of trigger glob → required paths evaluated against the scope set only (no Contents API consultation), currently one row: `migration_walk`, any scoped `backend/internal/postgres/migrations/*.sql` requires `backend/internal/postgres/postgres_test.go` (a new migration needs its own reversal test there; planners missed it on 0029/0030/0031); `RequiredPaths` is a slice so a future row can require multiple paths per trigger.
 
 Overlapping declared+default conventions are deduped (candidate-set per production file + findings by `(rule, trigger_path)`), so an overlap yields exactly one finding.
 

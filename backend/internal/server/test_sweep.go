@@ -43,9 +43,9 @@ const (
 	// package usually extends an existing harness the plan must scope).
 	testSweepRuleNewTestInTestedPackage = "new_test_in_tested_package"
 	// testSweepRuleMigrationWalk flags a scoped migrations/*.sql whose
-	// pinned migration-walk test (postgres_test.go pins the LATEST
-	// migration) is absent from scope.files — the #1031 class, missed by
-	// planners three times (migrations 0029/0030/0031).
+	// pinned migration-walk test (postgres_test.go, where a new migration
+	// needs its own reversal test there) is absent from scope.files — the
+	// #1031 class, missed by planners three times (migrations 0029/0030/0031).
 	testSweepRuleMigrationWalk = "migration_walk"
 )
 
