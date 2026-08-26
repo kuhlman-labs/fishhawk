@@ -26,9 +26,11 @@ import (
 //     that needs the v2 autonomy resolver — see checkEscalations.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
-// structs — this package is schema-only), tolerating any shape mismatch by
-// skipping: the schema layer already rejected genuinely malformed structure,
-// so a non-map/non-string node here is simply not a value to check.
+// structs — this package carries no typed decode; the stage-reference
+// resolution added in E52.13 / #2323 lives in graphshape.go and works the same
+// raw tree), tolerating any shape mismatch by skipping: the schema layer
+// already rejected genuinely malformed structure, so a non-map/non-string node
+// here is simply not a value to check.
 func validateAgentVersions(raw any) error {
 	var errs []ValidationErrorEntry
 	root, ok := raw.(map[string]any)

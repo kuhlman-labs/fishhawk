@@ -16,10 +16,20 @@ import (
 // the repo root just works.
 const defaultSpecPath = ".fishhawk/workflows.yaml"
 
+// validateResidualLine names, on a successful validate, exactly what the CLI
+// checked locally and what it deliberately leaves to the backend (E52.13 /
+// #2323). It is a package-level constant so the test asserts the shipped string
+// rather than a re-typed copy. Printed as a second stdout line after `<path>:
+// OK`, whose bytes are kept unchanged so any consumer parsing the first line is
+// unaffected.
+const validateResidualLine = "checked locally: schema, reuse resolution, and stage-reference resolution (duplicate ids, needs, inputs.from_stage). The remaining stage-binding rules (type/executor/constraint, produces-artifact, plan schema, max_autonomy) are checked server-side at run creation."
+
 // runValidate implements `fishhawk validate [path]`. Reads the
 // file (default `.fishhawk/workflows.yaml`), validates it against
-// the workflow-v0 schema, and prints either "OK" or one error
-// line per leaf failure.
+// the version-routed workflow schema and the local semantic sweeps
+// (including stage-reference resolution, E52.13 / #2323), and prints
+// either an "OK" line plus the residual-scope note or one error line
+// per leaf failure.
 //
 // Exit code 0 on success, 1 on validation failure (per the issue
 // body — exit 2 is reserved for usage errors).
@@ -29,7 +39,9 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "Usage: fishhawk validate [path]")
 		_, _ = fmt.Fprintln(stderr, "")
-		_, _ = fmt.Fprintln(stderr, "Validates a Fishhawk workflow spec against the v0 JSON Schema.")
+		_, _ = fmt.Fprintln(stderr, "Validates a Fishhawk workflow spec against the version-routed JSON Schema (v0/v1/v2),")
+		_, _ = fmt.Fprintln(stderr, "then resolves stage references locally (duplicate ids, needs, inputs.from_stage).")
+		_, _ = fmt.Fprintln(stderr, "The remaining stage-binding rules are checked server-side at run creation.")
 		_, _ = fmt.Fprintln(stderr, "Defaults to .fishhawk/workflows.yaml when no path is supplied.")
 		_, _ = fmt.Fprintln(stderr, "")
 		_, _ = fmt.Fprintln(stderr, "Exit codes:")
@@ -76,5 +88,6 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	}
 
 	_, _ = fmt.Fprintf(stdout, "%s: OK\n", path)
+	_, _ = fmt.Fprintln(stdout, validateResidualLine)
 	return exitOK
 }

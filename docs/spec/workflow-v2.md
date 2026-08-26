@@ -680,7 +680,7 @@ So the resolved input set is identical however the author spelled it.
 
 Referent errors reuse the existing `from_stage` graph-shape rules with their unchanged messages: a referent that does not exist reports `from_stage "…" does not match any stage id`, and a self or later reference reports the must-be-earlier error. One tradeoff follows: the report names the post-expansion `inputs` index rather than the `needs` entry the author wrote. That is deliberate — one canonical error beats two competing ones.
 
-> **`fishhawk validate` does NOT check `needs` referents.** `cli/internal/spec` is a deliberately separate, **schema-only** module: it performs no typed decode and no graph-shape pass, so it also accepts a longhand `inputs[].from_stage` naming a nonexistent stage. Both `needs`-referent errors — a nonexistent stage, and a `review` / `deploy` / `acceptance` referent with no default input artifact — surface **only server-side, at run creation**. The CLI does validate the `needs` **shape** (an array of stage-id-patterned strings). Closing the general asymmetry needs its own decision about duplication versus coupling and is tracked on **#2323**.
+> **`fishhawk validate` now resolves `needs` referents locally (E52.13 / #2323).** The CLI ports the backend's needs-expansion and `from_stage` rules onto the same raw tree, so `fishhawk validate` reports the identical errors at the identical post-expansion paths: a `needs` (or longhand `inputs[].from_stage`) naming a nonexistent stage reports `from_stage "…" does not match any stage id`, a self or later reference reports the must-be-earlier error, and a `review` / `deploy` / `acceptance` referent with no default input artifact reports the no-default-artifact error at `/needs/<j>`. What still surfaces **only server-side, at run creation** is the stage-BINDING class (see the [Produces](#produces) note and [Validation rules beyond the schema](#validation-rules-beyond-the-schema)).
 
 ## Produces
 
@@ -839,7 +839,7 @@ Two orderings are contracts rather than accidents:
 - A **deploy** stage gets its own ADR-038 message (`post-hoc diff constraint is not valid on a deploy stage`), never this one.
 - A stage that does produce `pull_request` but is typed other than `implement` still gets the `diff_coverage is valid only on an implement stage` message.
 
-> **`fishhawk validate` does NOT report this binding.** `cli/internal/spec` is schema-only, so like the `needs`-referent errors this surfaces **only server-side, at run creation**. Same asymmetry, tracked on **#2323**.
+> **`fishhawk validate` does NOT report this binding.** This is a stage-BINDING rule (which produced artifact a constraint binds to), and the binding class stays backend-only — the CLI carries no typed decode and no autonomy resolver — so it surfaces **only server-side, at run creation**. `fishhawk validate` DOES now resolve stage references (duplicate ids, `needs`, `inputs[].from_stage`); only the binding class remains asymmetric (E52.13 / #2323).
 
 ### Pre-flight deploy constraints
 
@@ -1163,7 +1163,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - `extends` names a defined workflow and forms no cycle.
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 
-`fishhawk validate` (the CLI) is **schema-only** — no typed decode, no graph-shape pass. It reports schema errors, the removed-form messages, and the reuse-resolution rejections, but not the graph-shape rules above, which surface server-side at run creation (**#2323**).
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 

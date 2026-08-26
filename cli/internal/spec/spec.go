@@ -19,12 +19,19 @@
 // .github/workflows/ci.yml catches drift between this copy, the
 // backend's copy, and the canonical docs/spec/ copy.
 //
-// Scope: JSON Schema validation only. The richer semantic checks
-// (cross-stage references, role resolution against the spec's
-// roles map) live on the backend; the CLI returns the same
-// schema errors the backend would return as the first line of
-// defense, which covers ~95% of "did I write valid YAML?"
-// failures.
+// Scope: two tiers, matching the backend. ValidateBytes runs the JSON
+// Schema, resolves workflow-v2 same-document reuse, then mirrors the
+// backend's semantic sweeps the schema can't express — agent_version
+// ranges, reviewers.authority, applies_to and escalations — and, since
+// E52.13 / #2323, RESOLVES STAGE REFERENCES: duplicate stage ids, the
+// `needs:` shorthand, and inputs[].from_stage referent/ordering rules.
+// What stays backend-only is the BINDING class: the ADR-038
+// type<->executor<->constraint bindings, the plan `schema: standard_v1`
+// rule, the produces-artifact bindings (deployment / acceptance /
+// grooming_report and the E52.7 post-hoc-constraint<->pull_request rule),
+// and the `max_autonomy` no-op check that needs the autonomy resolver the
+// CLI deliberately does not carry. Those are checked server-side at run
+// creation; everything else `fishhawk validate` now reports locally.
 package spec
 
 import (
@@ -273,7 +280,7 @@ func decodeAndResolve(data []byte) (raw any, schema *jsonschema.Schema, major in
 // empty / malformed YAML, a *ValidationError for schema failures
 // (including an unsupported version major), and nil on success.
 func ValidateBytes(data []byte) error {
-	raw, schema, _, err := decodeAndResolve(data)
+	raw, schema, major, err := decodeAndResolve(data)
 	if err != nil {
 		return err
 	}
@@ -287,13 +294,34 @@ func ValidateBytes(data []byte) error {
 			{Path: "/", Message: err.Error()},
 		}}
 	}
-	// Semantic sweep the schema can't express: agent_version compatibility
-	// ranges (#1743) are plain strings to the schema, so a malformed range
-	// is caught here (the CLI's sole semantic check; richer graph-shape
-	// checks stay on the backend). At major >= 2 it now sweeps the RESOLVED
-	// document, so a defaults.executor.agent_version range is validated on
-	// every stage that inherits it.
-	return validateAgentVersions(raw)
+	// Semantic sweeps the schema can't express, run in a FIXED order that
+	// mirrors the backend (schema.Validate → workflow/stage sweeps → needs
+	// expansion → graph-shape). validateAgentVersions covers agent_version
+	// ranges (#1743), reviewers.authority, applies_to and escalations;
+	// validateGraphShape (E52.13 / #2323) resolves stage references —
+	// duplicate ids, inputs[].from_stage, and the `needs:` shorthand at
+	// major >= 2 — so `fishhawk validate` reports the SAME errors the backend
+	// would at run creation. The two entry sets are merged with the
+	// agent-version sweep's first, so pre-existing error ordering is unchanged.
+	var errs []ValidationErrorEntry
+	if avErr := validateAgentVersions(raw); avErr != nil {
+		var ve *ValidationError
+		if !errors.As(avErr, &ve) {
+			return avErr
+		}
+		errs = append(errs, ve.Errors...)
+	}
+	if gsErr := validateGraphShape(raw, major); gsErr != nil {
+		var ve *ValidationError
+		if !errors.As(gsErr, &ve) {
+			return gsErr
+		}
+		errs = append(errs, ve.Errors...)
+	}
+	if len(errs) > 0 {
+		return &ValidationError{Errors: errs}
+	}
+	return nil
 }
 
 // ResolveReuse decodes data as a workflow spec, runs the same
