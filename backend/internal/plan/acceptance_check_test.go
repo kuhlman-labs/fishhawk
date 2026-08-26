@@ -491,9 +491,19 @@ func TestUnevaluableCriteria_FlagsCapabilityStatements(t *testing.T) {
 }
 
 // (exemption) A criterion already marked skip_expected with a non-whitespace
-// expectation_basis is the SANCTIONED declaration of the same condition — it is
-// NOT re-flagged. This is the control the plan calls out: re-flagging a
-// correctly-marked criterion trains the operator to ignore the rule.
+// expectation_basis is the SANCTIONED declaration for undecidable_criterion —
+// it is NOT re-flagged by THAT rule. This is the control the #2512 plan calls
+// out: re-flagging a correctly-marked criterion trains the operator to ignore
+// the rule.
+//
+// #2845 PAIRED HOLE CASE. This is exactly the shape the live-validation hole
+// takes: because undecidable_criterion exempts here, a criterion naming a LIVE
+// forge round-trip drew NO finding at all and silently lost its auto-filed
+// operator-validation walk. undecidable_criterion's behaviour is UNCHANGED (it
+// still exempts, asserted below); missing_live_validation_marker, whose
+// exemption is requires_live_validation ALONE, is what now flags it. So the
+// criterion is no longer silent — the original comment's claim that it draws no
+// finding is no longer true and is corrected here.
 func TestUnevaluableCriteria_ExemptsSkipExpectedWithBasis(t *testing.T) {
 	v := Verification{
 		AcceptanceCriteria: []AcceptanceCriterion{
@@ -504,8 +514,12 @@ func TestUnevaluableCriteria_ExemptsSkipExpectedWithBasis(t *testing.T) {
 			},
 		},
 	}
-	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); f != nil {
+	findings := EvaluateAcceptanceCriteria(v)
+	if f := findingFor(findings, RuleUndecidableCriterion); f != nil {
 		t.Fatalf("a skip_expected criterion with a basis must not be flagged; got %+v", *f)
+	}
+	if f := findingFor(findings, RuleMissingLiveValidationMarker); f == nil {
+		t.Fatalf("#2845: the live-target hole — skip_expected-with-basis must still draw missing_live_validation_marker; got %+v", findings)
 	}
 }
 
@@ -608,5 +622,541 @@ func TestEvaluateAcceptanceCriteria_IncludesUnevaluableFindings(t *testing.T) {
 func TestUnevaluableCriteria_NonNilOnCleanPlan(t *testing.T) {
 	if got := UnevaluableCriteria(Verification{}); got == nil {
 		t.Fatal("UnevaluableCriteria must return a non-nil slice")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// missing_live_validation_marker (#2845, E54.31)
+//
+// FIXTURE-COLLISION SWEEP (run BEFORE any production edit, per the approved
+// plan's step 1). `grep -rniE '\b(live|real|actual|production|genuine)\b'` over
+// the four test files in scope found:
+//   - backend/internal/refinement/precheck_test.go — ZERO qualifier occurrences.
+//   - backend/internal/prompt/prompt_test.go — ZERO inside criterion statements
+//     (all hits are prompt-literal assertions or unrelated prose).
+//   - acceptance_check_test.go — five INCIDENTAL hits, none of which fire the
+//     final matcher: :304 "live target" (no action noun, and
+//     RequiresLiveValidation anyway); :467 "an operator making an MCP tool call"
+//     (no qualifier); :468 "a real operator session shows the merge banner"
+//     (operator/session are not action nouns); :471 "a real webhook delivery
+//     from the forge reopens the run" ("run" is 8 tokens from "real" and there
+//     is no against-phrase — promoted to an explicit near-miss row below);
+//     :549-560 the drivable controls. Plus the INTENTIONAL "a live GitHub
+//     round-trip" / "the deployed environment" hits, which fire via M1 by
+//     design and whose assertions are all rule-FILTERED, so they stay green.
+//   - acceptance_precheck_test.go — three intentional "a live GitHub round-trip
+//     closes the originating issue" hits (:473, :526, :576), same disposition.
+//
+// No fixture reword was required.
+// ---------------------------------------------------------------------------
+
+// (discrimination — issue AC4, operator defect 2) EIGHT sandbox-validatable
+// statements that each carry a real qualifier/target collocation and MUST NOT
+// fire. The first four are the operator's verbatim fixtures; the next three are
+// sharper ones carrying an explicit against-phrase; the last is the incidental
+// collision the sweep found at :471.
+//
+// Two of these are green for reasons worth stating, because a later corpus
+// addition would silently flip them:
+//
+//   - "a real run of the verify gate against the committed tree" is green ONLY
+//     because "tree" is absent from externalTargetNouns — greenness by ABSENCE.
+//     Conjunct 1 and the "against" of conjunct 2 both hold; adding "tree" to the
+//     noun corpus would turn this row red with no other change. (Recorded per
+//     operator condition C1.)
+//   - "a real apply against the localhost preview records the audit entry" is
+//     green because conjunct 2 fails outright (neither "localhost" nor
+//     "preview" is an external-target noun), NOT because of conjunct 3. The
+//     conjunct-3 counterfactual therefore uses the "fake tracker" row, which is
+//     the only row where conjunct 2 holds and conjunct 3 is what saves it.
+func TestMissingLiveValidationMarker_NearMissDrivableStatements(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		{"operator/actual issue body", "the actual issue body is parsed"},
+		{"operator/real repo path", "the real repo path is resolved from the sandbox checkout"},
+		{"operator/real run of the test suite", "a real run of the test suite regenerates the pages"},
+		{"operator/production label list", "the production label list in config is read"},
+		{"against a committed tree", "a real run of the verify gate against the committed tree"},
+		{"against a fake tracker", "the actual walk issue is filed against the fake tracker in the integration test"},
+		{"against a localhost preview", "a real apply against the localhost preview records the audit entry"},
+		{"incidental webhook fixture", "a real webhook delivery from the forge reopens the run"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+				t.Fatalf("drivable statement %q must not fire missing_live_validation_marker; got %+v", tc.statement, got)
+			}
+		})
+	}
+}
+
+// (M1 false-positive row — operator condition C2) M1 REUSES phrases written for
+// a rule with the looser either-marking exemption, so a sandbox-validatable
+// statement carrying an inherited liveTarget phrase now fires where it was
+// previously silent. This row and the residual row below were added and RUN to
+// decide, with the result in hand, whether M1 should honour the sandbox-marker
+// negation.
+//
+// OBSERVED RESULT and DECISION: it should, and it does. The negation rescues
+// the row that names its stand-in. It does NOT rescue the row that carries the
+// phrase in sandbox-validatable prose with no marker at all — see
+// TestMissingLiveValidationMarker_M1ResidualFalsePositive, which pins that
+// residual rather than deleting the fixture.
+//
+// Narrowing was applied per C2's resolution — narrowing what M1 CONSIDERS, NOT
+// editing unevaluableCapabilities' phrase strings, which stay byte-identical.
+// SCOPE, added by the fix-up pass: the marker must sit in the SAME CLAUSE as
+// the phrase. This row is a single clause carrying both, so it is still green;
+// the mixed-clause rows below are what prove the negation is no longer a
+// whole-statement kill switch.
+func TestMissingLiveValidationMarker_M1SandboxMarkerNegation(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "the github api client retries on 502 in the fake transport test", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("an M1 phrase in prose naming its own stand-in must not fire; got %+v", got)
+	}
+}
+
+// (M1 FALSE-NEGATIVE HOLE — fix-up concern 1, high/regression) A WHOLE-statement
+// sandbox-marker negation is itself a defect: any stray "fake" / "mock" /
+// "preview" / "sandbox" anywhere in a sentence disabled M1 outright, even when
+// the sentence named a genuine live target — recreating the very hole #2845
+// exists to close. The negation is therefore scoped to the CLAUSE the phrase
+// sits in.
+//
+// Each row below is a MIXED statement: one clause names a genuine live target
+// with no stand-in, a NEIGHBOURING clause names a stand-in. All must FIRE. A
+// stand-in in a different clause does not make the live target
+// sandbox-validatable.
+//
+// LOAD-BEARING, and this is the counterfactual vehicle for the scoping: widen
+// liveTargetCorpusMatch's negation back to the whole statement
+// (`if containsSandboxMarker(lowered) { return false }`) and every row here goes
+// RED while TestMissingLiveValidationMarker_M1SandboxMarkerNegation — whose
+// marker and phrase share ONE clause — stays green. That pair is what pins the
+// scope rather than the mere presence of a negation.
+func TestMissingLiveValidationMarker_M1MarkerInAnotherClauseStillFires(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		// Comma clause boundary; the live forge round-trip is genuine and the
+		// "fake transport" belongs to a contrast clause about the unit test.
+		{"forge vs fake transport", "a live GitHub round-trip closes the issue, unlike the fake transport used in the unit test"},
+		// Semicolon boundary; the deployed environment is genuinely exercised
+		// and the preview build is a separate, independently-checked thing.
+		{"deployed vs preview build", "the deployed environment serves the new endpoint; the preview build is verified separately"},
+		// Colon boundary, marker FIRST — order must not matter.
+		{"mock listed first", "the mock forge covers the parse path: a real GitHub API call still reconciles the run"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+			if len(got) != 1 {
+				t.Fatalf("a live target in a clause of its own must still fire, whatever a neighbouring clause mentions; %q got %d: %+v", tc.statement, len(got), got)
+			}
+			if got[0].CriterionID != "a1" {
+				t.Errorf("CriterionID = %q, want a1", got[0].CriterionID)
+			}
+		})
+	}
+}
+
+// (clause-split boundary) '.' is deliberately NOT a clause boundary: splitting
+// on it would cut the liveTarget corpus phrase "against github.com" in half and
+// M1 would lose a true positive to its own splitter. This pins that carve-out —
+// adding '.' to clauseBoundary turns this test RED.
+func TestMissingLiveValidationMarker_DotIsNotAClauseBoundary(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "the run is reconciled against github.com", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("the against-github.com corpus phrase must survive the clause split; got %d: %+v", len(got), got)
+	}
+}
+
+// (M1 residual — operator condition C2, recorded honestly) A liveTarget phrase
+// in sandbox-validatable prose carrying NO sandbox marker still fires. This is
+// a KNOWN residual false positive, not an oversight: the only narrowing that
+// would suppress it — additionally demanding a live-action noun — also drops
+// the genuine true positive "the deployed environment serves the new endpoint",
+// so per the plan's binding decision rule the fixture is kept and the residual
+// stated rather than the corpus narrowed past a true positive.
+//
+// This test pins the CURRENT observed behaviour so a future narrowing that
+// fixes it flips this test visibly instead of passing unnoticed.
+func TestMissingLiveValidationMarker_M1ResidualFalsePositive(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "the deployed environment config template is rendered", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("documented M1 residual: want exactly 1 finding (see the rule's doc comment); got %d: %+v", len(got), got)
+	}
+}
+
+// (M1 residual — fix-up concern 2, low/untested-path) The clause scoping fixed
+// the WHOLE-STATEMENT kill switch; WITHIN one clause the sandbox-marker
+// negation remains absolute, and containsSandboxMarker is a SUBSTRING test, so
+// the inflected forms below ("sandboxed", "preview" inside a longer phrase)
+// count as markers. Each row names a GENUINE live target that the stand-in it
+// mentions does not make sandbox-validatable, yet draws no M1 finding — and M2
+// does not rescue either row: neither carries an "against …" phrase, so its
+// conjunct 2 fails. Separating these from "the github api client retries in the
+// fake transport test" needs parsing this word-list matcher does not do, so the
+// residual is pinned here rather than left implicit.
+//
+// LOAD-BEARING on the marker list: delete the negation in liveTargetCorpusMatch
+// (the `if containsSandboxMarker(clause) { continue }`), or drop "sandbox" /
+// "preview" from sandboxMarkers, and every row here goes RED. That is the
+// point — a future narrowing or widening of the marker list flips this test
+// visibly instead of moving the boundary silently.
+func TestMissingLiveValidationMarker_M1SameClauseMarkerResidual(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		// Live forge round-trip; "sandboxed" qualifies the runner, not the
+		// round-trip. Substring match: "sandboxed" carries "sandbox".
+		{"forge round-trip from a sandboxed runner", "a live GitHub round-trip closes the issue from the sandboxed runner"},
+		// Live forge API call; "preview token" is a bystander, not a stand-in
+		// for the API call itself.
+		{"real API call with a preview token", "a real GitHub API call is made with the preview token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+				t.Fatalf("documented same-clause M1 residual (see liveTargetCorpusMatch's RESIDUAL 2): want 0 findings for %q; got %d: %+v", tc.statement, len(got), got)
+			}
+		})
+	}
+}
+
+// DONE-MEANS BEHAVIORAL TEST (#1169). The two statements the SHIPPED detector
+// missed, verbatim from the four runs #2845 documents, as ordinary unmarked
+// blocking criteria. This is the observable output of the change: a comment-only
+// or no-op touch of acceptance_check.go fails here.
+func TestMissingLiveValidationMarker_FourRunRegressionCorpus(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		id        string
+		statement string
+	}{
+		{"#2822 criterion 6", "live-walk", "A live walk is recorded: one real grooming run against this repo's backlog"},
+		{"#2833 criterion 6", "grooming-run", "A real backlog_grooming run against this repository reaches its approval gate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: tc.id, Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+			if len(got) != 1 {
+				t.Fatalf("want exactly 1 missing_live_validation_marker for %q; got %d: %+v", tc.statement, len(got), got)
+			}
+			if got[0].CriterionID != tc.id {
+				t.Errorf("CriterionID = %q, want %q", got[0].CriterionID, tc.id)
+			}
+		})
+	}
+}
+
+// (THE HOLE — the defect #2845 documents) "Validate against live GitHub" marked
+// skip_expected with a basis and NO requires_live_validation is EXEMPT from
+// undecidable_criterion, so before this rule it drew no finding at all and
+// silently lost its operator-validation walk. The marker-only exemption is what
+// closes that: the criterion IS flagged.
+func TestMissingLiveValidationMarker_SkipExpectedWithBasisIsNotAnExemption(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "live-github", Statement: "Validate against live GitHub",
+				Source: CriterionSourceExplicit, SourceRef: "#2845",
+				SkipExpected: true, ExpectationBasis: "pinned by the fake-forge integration test",
+			},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	f := findingFor(findings, RuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatalf("skip_expected-with-basis must NOT exempt a live-target criterion; got %+v", findings)
+	}
+	if f.CriterionID != "live-github" {
+		t.Errorf("CriterionID = %q, want live-github", f.CriterionID)
+	}
+	// And the older rule stays silent on it — which is exactly why the hole
+	// existed and why this rule is not redundant with it.
+	if u := findingFor(findings, RuleUndecidableCriterion); u != nil {
+		t.Errorf("undecidable_criterion's behaviour must be unchanged (still exempt); got %+v", *u)
+	}
+}
+
+// (remedy wording — operator condition C3) Criterion `finding-names-the-criterion`
+// requires the Detail to carry BOTH halves of the remedy. Without a literal
+// assertion the prose can drift while every other test stays green.
+func TestMissingLiveValidationMarker_DetailNamesBothHalvesOfTheRemedy(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a live GitHub round-trip closes the issue", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	f := findingFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatal("want a missing_live_validation_marker finding")
+	}
+	for _, want := range []string{
+		// Half 1: the marker must be PAIRED, and the pairing is what files the walk.
+		"set requires_live_validation: true",
+		"pair it with skip_expected: true plus an expectation_basis",
+		"auto-files the tracked operator-validation walk",
+		// Half 2: the weaker marking silently loses the walk.
+		"A skip_expected-only marking silently loses that walk.",
+	} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("Detail must carry %q\n---\n%s", want, f.Detail)
+		}
+	}
+}
+
+// (WORKING-PATH CONTROL — issue AC3) A correctly-marked criterion is
+// undisturbed: requires_live_validation paired with skip_expected + basis draws
+// NO finding from EITHER rule, and the live-validation selectors still pick it
+// up so the walk-filing path this issue says already works is provably intact.
+//
+// COUNTERFACTUAL: deleting the `c.RequiresLiveValidation` exemption in
+// MissingLiveValidationMarker reddens this test. Executed and observed.
+func TestMissingLiveValidationMarker_CorrectlyMarkedCriterionUndisturbed(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "live-walk", Statement: "A live walk is recorded: one real grooming run against this repo's backlog",
+				Source: CriterionSourceExplicit, SourceRef: "#2845",
+				RequiresLiveValidation: true,
+				SkipExpected:           true, ExpectationBasis: "pinned by the fake-tracker grooming integration test",
+			},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if f := findingFor(findings, RuleMissingLiveValidationMarker); f != nil {
+		t.Fatalf("a requires_live_validation criterion must not be flagged; got %+v", *f)
+	}
+	if f := findingFor(findings, RuleUndecidableCriterion); f != nil {
+		t.Fatalf("a requires_live_validation criterion must not be flagged undecidable either; got %+v", *f)
+	}
+	selected := LiveValidationCriteria(v)
+	if len(selected) != 1 || selected[0].ID != "live-walk" {
+		t.Fatalf("LiveValidationCriteria must still select the marked criterion; got %+v", selected)
+	}
+	if n := LiveValidationCriteriaCount(v); n != 1 {
+		t.Errorf("LiveValidationCriteriaCount = %d, want 1", n)
+	}
+}
+
+// (no cross-rule suppression) A wholly-unmarked live-target criterion draws
+// EXACTLY one finding from EACH rule — one finding per criterion per rule. The
+// doubling is deliberate and complementary, not a bug.
+func TestMissingLiveValidationMarker_BothRulesFireWithoutSuppression(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a live GitHub round-trip closes the issue", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if got := findingsFor(findings, RuleUndecidableCriterion); len(got) != 1 {
+		t.Errorf("want exactly 1 undecidable_criterion; got %d: %+v", len(got), got)
+	}
+	if got := findingsFor(findings, RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Errorf("want exactly 1 missing_live_validation_marker; got %d: %+v", len(got), got)
+	}
+}
+
+// (EXCLUDED CLASS — the principled non-coverage boundary) The external-TRIGGER
+// capabilities — a real webhook delivery, an MCP tool call, an operator session
+// — are NOT live targets. For them skip_expected with a basis is the
+// doctrinally complete marking and no operator-validation walk is owed, so
+// NEITHER rule fires. This test is where that decision is recorded; widening is
+// a one-line liveTarget flip in unevaluableCapabilities.
+func TestMissingLiveValidationMarker_ExternalTriggerClassExcluded(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		{"webhook", "a real webhook delivery from the forge reopens the run"},
+		{"mcp", "an operator making an MCP tool call sees the new state"},
+		{"operator session", "a real operator session shows the merge banner"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{
+						ID: "a1", Statement: tc.statement,
+						Source: CriterionSourceExplicit, SourceRef: "#2845",
+						SkipExpected: true, ExpectationBasis: "pinned by the fake-forge integration test",
+					},
+				},
+			}
+			findings := EvaluateAcceptanceCriteria(v)
+			if f := findingFor(findings, RuleMissingLiveValidationMarker); f != nil {
+				t.Errorf("the external-trigger class must not demand the marker; got %+v", *f)
+			}
+			if f := findingFor(findings, RuleUndecidableCriterion); f != nil {
+				t.Errorf("skip_expected-with-basis must still exempt undecidable_criterion; got %+v", *f)
+			}
+		})
+	}
+}
+
+// (M1/M2 independence) Each matcher fires ON ITS OWN, so neither is dead code
+// carried by the other.
+func TestMissingLiveValidationMarker_M1AndM2FireIndependently(t *testing.T) {
+	// M1 only: a liveTarget corpus phrase, with neither proximity conjunct.
+	m1Statement := "the deployed environment serves the new endpoint"
+	if livenessProximityMatch(acceptanceTokens(m1Statement)) {
+		t.Fatal("premise broken: this statement was chosen because M2 must NOT match it")
+	}
+	m1 := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{ID: "a1", Statement: m1Statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+	}}
+	if got := findingsFor(EvaluateAcceptanceCriteria(m1), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M1 must fire alone; got %+v", got)
+	}
+
+	// M2 only: no corpus phrase anywhere, purely the three-conjunct match.
+	m2Statement := "a real grooming run against this repo's backlog is recorded"
+	if liveTargetCorpusMatch(m2Statement) {
+		t.Fatal("premise broken: this statement was chosen because M1 must NOT match it")
+	}
+	m2 := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{ID: "a1", Statement: m2Statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+	}}
+	if got := findingsFor(EvaluateAcceptanceCriteria(m2), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M2 must fire alone; got %+v", got)
+	}
+}
+
+// (TOKENIZER BRANCHES — fix-up concern 2, low/untested-path) Two M2 rows that
+// each drive a tokenizer/corpus branch no other fixture reaches. Patch coverage
+// showed both lines "covered" only because the TrimSuffix calls are
+// unconditional statements; nothing asserted the BEHAVIOUR, so a tokenizer
+// change could have dropped either silently.
+//
+// Each row is written so the branch is LOAD-BEARING — the branch's own output
+// is the only thing that satisfies a conjunct:
+//
+//   - curly possessive: "the repo’s default branch" is the ONLY external-target
+//     noun inside the against-window, so conjunct 2 holds only if the U+2019
+//     TrimSuffix("’s") strips it to "repo". Deleting that TrimSuffix reddens the
+//     row. (The hyphenated corpus fixtures all use the ASCII apostrophe, and
+//     "A live walk is recorded: one real grooming run against this repo's
+//     backlog" would still fire off "backlog" even with the possessive intact —
+//     which is why this row uses a different tail.)
+//   - bare "trip": "a real round trip" is the un-hyphenated spelling, so
+//     conjunct 1 holds only via the standalone "trip" entry in liveActionNouns
+//     — "round-trip" never forms as one token here. Deleting "trip" from
+//     liveActionNouns reddens the row.
+func TestMissingLiveValidationMarker_TokenizerBranches(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		{"curly possessive", "a real grooming run against the repo’s default branch is recorded"},
+		{"un-hyphenated round trip", "a real round trip against github closes the issue"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			// M2 is the matcher under test: assert M1 does NOT carry the row,
+			// so a corpus phrase cannot mask a broken tokenizer branch.
+			if liveTargetCorpusMatch(strings.ToLower(tc.statement)) {
+				t.Fatalf("premise broken: %q must not match M1, or the row would not test the tokenizer", tc.statement)
+			}
+			got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+			if len(got) != 1 {
+				t.Fatalf("want exactly 1 missing_live_validation_marker for %q; got %d: %+v", tc.statement, len(got), got)
+			}
+			if got[0].CriterionID != "a1" {
+				t.Errorf("CriterionID = %q, want a1", got[0].CriterionID)
+			}
+		})
+	}
+}
+
+// (tokenizer — ASCII possessive) The ASCII half of the same branch pair, kept
+// beside the curly one so a change that drops EITHER TrimSuffix is caught. Same
+// statement shape, `repo's` with U+0027.
+func TestMissingLiveValidationMarker_AsciiPossessiveToken(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a real grooming run against the repo's default branch is recorded", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("the ASCII possessive must normalize to repo; got %d: %+v", len(got), got)
+	}
+}
+
+// (case-insensitivity) Matching is case-insensitive over the statement.
+func TestMissingLiveValidationMarker_CaseInsensitive(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "A REAL BACKLOG_GROOMING RUN AGAINST THIS REPOSITORY REACHES ITS APPROVAL GATE", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); f == nil {
+		t.Fatal("matching must be case-insensitive")
+	}
+}
+
+// (shared rule set) The matcher rides EvaluateAcceptanceCriteria, so both
+// consumers get it from ONE place. Calling it directly and via the evaluator
+// must agree exactly.
+func TestEvaluateAcceptanceCriteria_IncludesLiveValidationMarkerFindings(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "A real backlog_grooming run against this repository reaches its approval gate", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	direct := MissingLiveValidationMarker(v)
+	viaSet := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+	if len(direct) != 1 || len(viaSet) != 1 || direct[0] != viaSet[0] {
+		t.Fatalf("evaluator and matcher disagree: direct=%+v viaSet=%+v", direct, viaSet)
+	}
+}
+
+// (non-nil contract) The matcher returns [] not nil on a clean plan.
+func TestMissingLiveValidationMarker_NonNilOnCleanPlan(t *testing.T) {
+	if got := MissingLiveValidationMarker(Verification{}); got == nil {
+		t.Fatal("MissingLiveValidationMarker must return a non-nil slice")
+	}
+}
+
+// (rule name) The wire contract consumers key on.
+func TestMissingLiveValidationMarker_RuleName(t *testing.T) {
+	if RuleMissingLiveValidationMarker != "missing_live_validation_marker" {
+		t.Errorf("rule = %q, want missing_live_validation_marker", RuleMissingLiveValidationMarker)
 	}
 }
