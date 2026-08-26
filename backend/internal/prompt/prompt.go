@@ -45,6 +45,17 @@ const ImplementReviewSplitMarker = "\n### Diff under review\n\n"
 // wired for prompt construction. The handler maps this to HTTP 501.
 var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
 
+// ErrCharterNotInjected is buildGroomingPropose's own fail-closed refusal
+// (E54.28 / #2834): a backlog-grooming propose stage was routed to the grooming
+// builder, but no injected document matches the declared charter path
+// t.Grooming.CharterPath. This is the prompt layer's copy of
+// backend/internal/server/charter_injection.go's L2 policy — the grooming branch
+// must not be able to emit a report prompt with no charter, EVEN IF a future
+// caller forgets to run L2. The server maps this to the same 500
+// document_injection_failed / charter_not_injected shape L2 produces (see
+// backend/internal/server/prompt.go).
+var ErrCharterNotInjected = errors.New("prompt: grooming propose stage has no charter among the injected documents")
+
 // PlanArtifactPath is the absolute path the runner expects to find
 // the agent's plan artifact at after a plan-stage invocation. It's
 // embedded in the prompt template (so the agent knows where to
@@ -790,6 +801,33 @@ type Trigger struct {
 	// declares a document) renders NOTHING, keeping every existing prompt
 	// byte-identical.
 	InjectedDocuments []InjectedDocument
+
+	// Grooming, when non-nil, marks this plan-typed stage as a BACKLOG-GROOMING
+	// PROPOSE stage (E54.28 / #2834): ADR-067 §2 gives the grooming propose
+	// stage `type: plan`, so it reaches Build with stageType "plan", but it must
+	// be served the grooming_report artifact contract, NOT standard_v1 plan
+	// instructions. When set, Build forks the plan case to buildGroomingPropose;
+	// nil means an ordinary plan stage and buildPlan renders byte-identically to
+	// before this field existed.
+	//
+	// It is set by the SAME server call that enforces the charter fail-closed
+	// (backend/internal/server.assertCharterInjected returns it), so the prompt
+	// layer's grooming determination and the charter-injection layer's cannot
+	// disagree — the two-layer split #2834 records is closed by having exactly
+	// one producer of this determination per served prompt.
+	Grooming *GroomingContext
+}
+
+// GroomingContext is the prompt-side statement that a plan-typed stage is a
+// backlog-grooming propose stage (E54.28 / #2834). CharterPath is the
+// repo-declared charter path the server resolved; buildGroomingPropose fails
+// closed (ErrCharterNotInjected) unless an injected document matches it exactly.
+// A nil *GroomingContext on a Trigger means "ordinary plan stage".
+type GroomingContext struct {
+	// CharterPath is the declared charter path this grooming run ranks against,
+	// carried so buildGroomingPropose can verify charter IDENTITY (declared-path
+	// match) against t.InjectedDocuments rather than mere document presence.
+	CharterPath string
 }
 
 // InjectedDocument is one repo-authored document rendered into a prompt.
@@ -1291,11 +1329,23 @@ type PriorConcern struct {
 // The prompt is plain text, not JSON or markdown-front-matter — the
 // runner writes it to a temp file and passes that path to the
 // agent's `--prompt-file` flag.
+//
+// The `plan` case forks on the trigger's grooming channel: ADR-067 §2 gives the
+// backlog-grooming PROPOSE stage `type: plan`, so a groom stage arrives here as
+// "plan", but when t.Grooming is set it must be served the grooming_report
+// artifact contract (buildGroomingPropose) rather than standard_v1 plan
+// instructions. This fork is the fix for the two-layer disagreement #2834
+// records — a groom stage that charter injection treated as grooming while the
+// prompt builder served it a plan. A nil t.Grooming reaches buildPlan
+// byte-identically to before this fork existed.
 func Build(stageType string, t Trigger) (string, error) {
 	switch stageType {
 	case "implement":
 		return buildImplement(t), nil
 	case "plan":
+		if t.Grooming != nil {
+			return buildGroomingPropose(t)
+		}
 		return buildPlan(t), nil
 	case "plan_review":
 		return buildPlanReview(t), nil
@@ -3324,6 +3374,187 @@ func buildPlan(t Trigger) string {
 		}
 	}
 	return b.String()
+}
+
+// buildGroomingPropose renders the backlog-grooming PROPOSE prompt (E54.28 /
+// #2834). ADR-067 §2 declares this stage `type: plan`, so it arrives at Build as
+// "plan", but it emits a grooming_report artifact — the typed set of ranking /
+// duplicate / hygiene / dependency / vision-drift / decomposition PROPOSALS —
+// scored against the injected product charter, NOT a standard_v1 implementation
+// plan. Its own optional-channel blocks are DUPLICATED from buildPlan rather than
+// extracted into shared helpers: the two builders' wording genuinely differs
+// (grooming_report_v1 vs standard_v1, backlog-window vs scope framing), and
+// extraction would risk perturbing buildPlan's bytes, which the pre-change golden
+// forbids.
+//
+// FAIL CLOSED FIRST (approval condition H2 mirror, #2834 criterion 4): before
+// composing ANY text, it requires an injected document whose Path equals the
+// server-resolved t.Grooming.CharterPath. This is the prompt layer's own copy of
+// charter_injection.go's L2 policy — a report prompt must never be emitted with
+// no charter, INDEPENDENTLY of whether the caller ran L2. The check is charter
+// IDENTITY (declared-path match), not mere document presence: a prompt carrying
+// some other injected document and no charter is refused, the case an
+// any-document-present check would wave through.
+func buildGroomingPropose(t Trigger) (string, error) {
+	// (H2 mirror) Fail closed before any text is composed.
+	charterInjected := false
+	for _, d := range t.InjectedDocuments {
+		if d.Path == t.Grooming.CharterPath {
+			charterInjected = true
+			break
+		}
+	}
+	if !charterInjected {
+		return "", fmt.Errorf("%w: declared charter %q was not injected", ErrCharterNotInjected, t.Grooming.CharterPath)
+	}
+
+	var b strings.Builder
+	b.WriteString("You are producing a backlog grooming report for the repository ")
+	b.WriteString(quoteRepo(t.Repo))
+	b.WriteString(".\n\n")
+
+	// Injected repo-authored documents (E55.1 / #2242) lead the cache-stable
+	// prefix, exactly as buildPlan does: the charter with its repodoc framing is
+	// the first block, so a per-repo-stable document costs nothing incremental
+	// across a stage's re-render rounds and the charter-injection end-to-end
+	// assertions (pinned-commit content, `### <heading>`, Source line, content
+	// hash) hold on this branch too.
+	writeInjectedDocuments(&b, t)
+
+	// Prior rejection feedback — grooming-worded copy of buildPlan's channel,
+	// capped identically (CapTextWithRetrieval + MaxRejectionFeedbackBytes).
+	if t.PriorRejectionFeedback != nil && *t.PriorRejectionFeedback != "" {
+		feedback, truncated := CapTextWithRetrieval(*t.PriorRejectionFeedback,
+			MaxRejectionFeedbackBytes, priorRejectionRetrievalPointer(t.PriorRejectionFeedbackRunID))
+		b.WriteString("### Prior grooming-stage rejection feedback\n\n")
+		b.WriteString("The operator rejected the most recent grooming report for this backlog with the following rationale. You MUST address this feedback in your new report:\n\n")
+		if truncated {
+			b.WriteString("IMPORTANT: the rejection feedback below was TRUNCATED — the visible text is INCOMPLETE, so some of the operator's steering may not be shown. Record in the report summary that the rejection feedback was truncated and that you could not see all of it (naming what you could not see if you recover the dropped tail via the pointer in the elision marker below).\n\n")
+		}
+		b.WriteString(feedback)
+		b.WriteString("\n\n")
+	}
+
+	// Prior schema-validation failure — names grooming_report_v1, NOT
+	// standard_v1. Same 4000-byte cap as buildPlan's sibling channel.
+	if t.PriorSchemaValidationError != nil && *t.PriorSchemaValidationError != "" {
+		validationErr := *t.PriorSchemaValidationError
+		const maxFeedbackBytes = 4000
+		if len(validationErr) > maxFeedbackBytes {
+			validationErr = validationErr[:maxFeedbackBytes] + "...[truncated]"
+		}
+		b.WriteString("### Prior grooming-stage schema validation failure\n\n")
+		b.WriteString("Your previous report failed " + plan.GroomingReportVersion + " validation with the following error. Fix exactly this and re-emit a valid report:\n\n")
+		b.WriteString(validationErr)
+		b.WriteString("\n\n")
+	}
+
+	// Revision constraint + revision base report — the plan-gate `revise`
+	// re-open channel, worded for a grooming report. Capped like buildPlan's.
+	if t.RevisionConstraint != nil && *t.RevisionConstraint != "" {
+		b.WriteString("### Revision constraint (binding — revise this report to satisfy)\n\n")
+		b.WriteString("The operator reviewed your previous grooming report and approved its direction, but requires a " +
+			"change before it can proceed. Treat the constraint below as authoritative: REVISE the prior report — do NOT " +
+			"regroom blank-slate, and do NOT discard the findings the constraint does not touch. Re-emit a complete, valid " +
+			plan.GroomingReportVersion + " report that honours the constraint.\n\n")
+		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
+			base := *t.RevisionBasePlan
+			const maxBaseBytes = 4000
+			if len(base) > maxBaseBytes {
+				base = base[:maxBaseBytes] + "...[truncated]"
+			}
+			b.WriteString("Prior report (the revision base):\n\n")
+			b.WriteString(base)
+			b.WriteString("\n\n")
+		}
+		constraint := *t.RevisionConstraint
+		const maxConstraintBytes = 4000
+		if len(constraint) > maxConstraintBytes {
+			constraint = constraint[:maxConstraintBytes] + "...[truncated]"
+		}
+		b.WriteString("Operator constraint (MANDATORY — wins on conflict with the prior report):\n\n")
+		b.WriteString(constraint)
+		b.WriteString("\n\n")
+	}
+
+	// Clarification answers on the #558 binding-conditions channel, worded for
+	// grooming. Capped like buildPlan's clarification channel.
+	if t.ApprovalConditions != nil {
+		answers := *t.ApprovalConditions
+		const maxAnswerBytes = 4000
+		if len(answers) > maxAnswerBytes {
+			answers = answers[:maxAnswerBytes] + "...[truncated]"
+		}
+		b.WriteString("### Clarification answers (binding — resolve your parked questions)\n\n")
+		b.WriteString("You previously parked this grooming run with a clarification_request. The operator answered your " +
+			"questions through the binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
+			"non-derivable facts and produce a concrete " + plan.GroomingReportVersion + " report now.\n\n")
+		b.WriteString(answers)
+		b.WriteString("\n\n")
+	}
+
+	// The triggering issue and its sanitized/quarantined comments. The grooming
+	// agent is a PROPOSE-only, quarantined agent exactly as the planner is
+	// (ADR-029 / #650 item 1), so the untrusted-comment path is reused unchanged
+	// via writeIssueContext — a hand-rolled renderer here would silently bypass
+	// the quarantine.
+	writeIssueContext(&b, t)
+
+	// Propose-stage budget: plan-stage minutes only. A grooming run produces no
+	// diff, so there is NO implement-stage budget; an overrun is a scope problem
+	// — narrow the backlog window.
+	planMins := resolveMins(t.PlanStageTimeout)
+	fmt.Fprintf(&b,
+		"Stage budget (ADR-025): grooming propose stage %d minutes. Treat overrunning the budget as a scope "+
+			"problem, not a runtime problem — if the backlog slice is too large to rank within the budget, narrow "+
+			"the backlog window you groom rather than rushing an unanchored ranking.\n\n",
+		planMins,
+	)
+
+	// The artifact contract — the substance of #2834's done-means.
+	b.WriteString("### Your task: emit a grooming report, NOT an implementation plan\n\n")
+	b.WriteString("This stage emits a `" + string(plan.ArtifactKindGroomingReport) + "` artifact — the typed set of " +
+		"PROPOSALS produced by ranking this backlog slice against the injected charter. It does NOT produce an " +
+		"implementation plan and it changes no code. Write the report as a single JSON object to `")
+	b.WriteString(PlanArtifactPath)
+	b.WriteString("`; the runner routes the artifact on its top-level `kind` discriminator.\n\n")
+	b.WriteString("- `kind` MUST be `" + string(plan.ArtifactKindGroomingReport) + "` and `report_version` MUST be `" +
+		plan.GroomingReportVersion + "`.\n")
+	b.WriteString("- The six entry arrays — ordering, duplicates, hygiene_defects, dependency_edges, vision_drift, " +
+		"decomposition_suggestions — are ALL REQUIRED even when empty: `[]` states \"none found\", which is a " +
+		"different claim from omitting the key.\n")
+	b.WriteString("- EVERY ordering entry MUST carry at least one `rubric_citations` id taken from the injected " +
+		"charter's rubric tables (the uppercase ids V*, R*, U*, S*). A ranking that cannot be justified against the " +
+		"charter is REJECTED by the schema, never shipped undecorated.\n")
+	b.WriteString("- Entry ids are DERIVED (class:item-key[:qualifier]), never minted per run: the same finding on " +
+		"the same item MUST yield the same id run over run, so #2240's run-over-run diff is stable.\n")
+	b.WriteString("- The ordering ranks are EXACTLY the permutation 1..N over the ranked items — no gaps, no " +
+		"duplicates.\n")
+	b.WriteString("- Populate `charter_ref` {path, content_hash, ref} from the injected charter's Source line so the " +
+		"report pins the exact charter revision it was scored against.\n")
+	b.WriteString("See docs/spec/grooming-report-v1.md for the normative id-derivation and semantic rules — do NOT " +
+		"restate the whole schema, follow it.\n\n")
+	b.WriteString("Do NOT emit any standard_v1 plan field (scope, approach, verification, decomposition, " +
+		"model_recommendation, predicted_runtime_minutes): " + plan.GroomingReportVersion + " is " +
+		"additionalProperties:false, so an emitted plan field fails validation.\n\n")
+	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only, so you MUST WRITE the report " +
+		"to " + PlanArtifactPath + " — that file is what the runner uploads (a recognized sibling wins over " +
+		"structured-output adoption).\n\n")
+
+	// Action-class matrix + no-write rules. The four class names are rendered as
+	// literal prose; the non-delegable set is fixed at parse time in
+	// backend/internal/spec (nonDelegableGroomingClasses), not per-repo config,
+	// so no spec threading is needed. prompt_test.go asserts these literals equal
+	// the exported spec.ActionGroom* constants as a registry-drift guard.
+	b.WriteString("### What is applied, and what is only proposed\n\n")
+	b.WriteString("`hygiene` is the ONLY grooming class whose mutations are ever applied (server-side, when the " +
+		"operator approves this stage's gate — approving is a write, not a filing decision). `ordering`, `dedup` and " +
+		"`scoping` are non-delegable, PROPOSE-ONLY classes NEVER applied by this run: they are proposals a human acts " +
+		"on.\n")
+	b.WriteString("You yourself perform NO tracker writes and NO code changes — a grooming run produces no diff at any " +
+		"stage, so no source file is to be modified.\n\n")
+
+	return b.String(), nil
 }
 
 // writeReviewToolClause writes the tool-use MUST-NOT bullet for a review prompt,

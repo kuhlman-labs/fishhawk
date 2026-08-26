@@ -804,12 +804,15 @@ func TestGroomingPrompt_H2_UnrelatedDocumentInjected_Refused(t *testing.T) {
 
 	body := chRefusal(t, s, runID, stageID, priv)
 	chAssertReason(t, body, reasonCharterNotInjected)
-	l2 := s.assertCharterInjected(context.Background(),
+	gctx, l2 := s.assertCharterInjected(context.Background(),
 		s.cfg.RunRepo.(*promptRunRepo).getRuns[runID],
 		s.cfg.RunRepo.(*promptRunRepo).getStages[stageID],
 		[]prompt.InjectedDocument{{Path: chOtherPath}})
 	if l2 == nil || !strings.Contains(l2.Error(), chCharterPath) {
 		t.Errorf("L2 refusal does not name the declared charter path: %v", l2)
+	}
+	if gctx != nil {
+		t.Errorf("a refused grooming stage returned a non-nil grooming context: %+v", gctx)
 	}
 }
 
@@ -1223,15 +1226,24 @@ func TestAssertCharterInjected_AcceptsTheCharterDocument(t *testing.T) {
 	runRow := &run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming", WorkflowSpec: []byte(chGroomingSpec)}
 	stage := &run.Stage{ID: uuid.New(), Type: run.StageTypePlan}
 
-	if err := s.assertCharterInjected(context.Background(), runRow, stage,
-		[]prompt.InjectedDocument{{Path: chOtherPath}, {Path: chCharterPath}}); err != nil {
+	gctx, err := s.assertCharterInjected(context.Background(), runRow, stage,
+		[]prompt.InjectedDocument{{Path: chOtherPath}, {Path: chCharterPath}})
+	if err != nil {
 		t.Fatalf("assertCharterInjected refused a set containing the charter: %v", err)
 	}
-	err := s.assertCharterInjected(context.Background(), runRow, stage,
+	// The accepting path is ALSO the sole producer of the grooming determination
+	// (#2834): it returns the charter path the handler threads into prompt.Build.
+	if gctx == nil || gctx.CharterPath != chCharterPath {
+		t.Fatalf("assertCharterInjected returned grooming context %+v, want CharterPath %q", gctx, chCharterPath)
+	}
+	gctx, err = s.assertCharterInjected(context.Background(), runRow, stage,
 		[]prompt.InjectedDocument{{Path: chOtherPath}})
 	var ce *charterInjectionError
 	if !errors.As(err, &ce) || ce.Reason != reasonCharterNotInjected {
 		t.Fatalf("assertCharterInjected err = %v, want reason %s", err, reasonCharterNotInjected)
+	}
+	if gctx != nil {
+		t.Fatalf("assertCharterInjected returned a non-nil grooming context on refusal: %+v", gctx)
 	}
 }
 
@@ -1276,5 +1288,136 @@ func TestGroomingPrompt_M5d_UnparseableRepoRef_Refused(t *testing.T) {
 	}
 	if len(ff.refs) != 0 {
 		t.Errorf("the forge was fetched at %v despite an unparseable repo ref", ff.refs)
+	}
+}
+
+// groomContractMarkerForRefusals is the same role-line marker
+// TestGroomingPrompt_CrossLayerAgreement uses: a string that appears ONLY in
+// buildGroomingPropose's output. If a refusal ever leaked a report prompt, this
+// substring would appear in the response body.
+const groomContractMarkerForRefusals = "You are producing a backlog grooming report"
+
+// TestGroomingPrompt_RefusalsCarryNoReportContract extends the handler-level
+// fail-closed family for criterion 4: every refusal branch must not only refuse
+// with its exact reason but ALSO never leak a grooming report prompt. A refusal
+// returns an error body with no prompt, so the report contract must be absent
+// from the response entirely — the degradation the criterion forbids is a
+// refusal that nonetheless served the report prompt.
+func TestGroomingPrompt_RefusalsCarryNoReportContract(t *testing.T) {
+	type refusalCase struct {
+		name       string
+		setup      func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey)
+		wantReason string
+	}
+	cases := []refusalCase{
+		{"M1 charter absent", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventionsWithoutCharter(), nil)
+			s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+			return s, runID, stageID, priv
+		}, reasonCharterAbsent},
+		{"M2 empty charter path", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventions("   "), nil)
+			s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+			return s, runID, stageID, priv
+		}, reasonCharterPathEmpty},
+		{"M3 conventions unavailable", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, workmgmt.Conventions{}, errors.New("forge unavailable"))
+			s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+			return s, runID, stageID, priv
+		}, reasonConventionsUnavailable},
+		{"M4 declared path missing", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventions("docs/no-such-charter.md"), nil)
+			s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+			return s, runID, stageID, priv
+		}, ""}, // repodoc ErrMissingDocument surfaces without a charter reason key
+		{"M5a nil base-ref seam", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventions(chCharterPath), nil)
+			s, runID, stageID, priv, _ := newCharterServer(t, chServerOpts{
+				specYAML:    chGroomingSpec,
+				resolver:    &repodoc.Resolver{Fetcher: newCHFetcher(), Commits: &chCommits{sha: chPinnedCommit}},
+				baseRef:     nil,
+				useCharter:  true,
+				stageIsPlan: true,
+			})
+			return s, runID, stageID, priv
+		}, reasonCharterBaseRefUnresolved},
+		{"M6 seam unwired", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventions(chCharterPath), nil)
+			s, runID, stageID, priv, _ := newCharterServer(t, chServerOpts{
+				specYAML:    chGroomingSpec,
+				stageIsPlan: true,
+			})
+			return s, runID, stageID, priv
+		}, reasonCharterNotInjected},
+		{"M8a unparseable grooming spec", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+			installConventions(t, chConventions(chCharterPath), nil)
+			s, runID, stageID, priv, _ := chWiredServer(t, chCorruptGroomingSpec, newCHFetcher(), 0)
+			return s, runID, stageID, priv
+		}, reasonGroomingSpecUnreadable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runID, stageID, priv := tc.setup(t)
+			w := promptRequest(t, s, runID, stageID, priv, "")
+			if w.Code == http.StatusOK {
+				t.Fatalf("%s served a 200 instead of refusing:\n%s", tc.name, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), groomContractMarkerForRefusals) {
+				t.Errorf("%s leaked a grooming report prompt in its refusal body:\n%s", tc.name, w.Body.String())
+			}
+			if tc.wantReason != "" {
+				var body map[string]any
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+				}
+				chAssertReason(t, body, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestGroomingPrompt_CharterCheckPrecedesBuild is the ORDERING assertion (step
+// 12): the L2 charter check runs BEFORE prompt.Build, so a served grooming
+// prompt with no charter is impossible. In the seam-unwired case (grooming
+// required, nothing injected) the handler refuses with L2's reasonCharterNotInjected
+// and never reaches Build; the same guard, driven directly with an empty
+// injected set, errors with L2's identifying "none of the ... injected documents"
+// message — the check the handler invokes ahead of Build.
+func TestGroomingPrompt_CharterCheckPrecedesBuild(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := newCharterServer(t, chServerOpts{
+		specYAML:    chGroomingSpec,
+		stageIsPlan: true,
+	})
+
+	// The handler refuses rather than serving any prompt.
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code == http.StatusOK {
+		t.Fatalf("a grooming stage with no charter served a prompt instead of refusing:\n%s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), groomContractMarkerForRefusals) {
+		t.Errorf("the refusal body leaked a grooming report prompt:\n%s", w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+	}
+	chAssertReason(t, body, reasonCharterNotInjected)
+
+	// The guard the handler invokes before Build is L2 — its message identifies
+	// it. buildGroomingPropose's own fail-closed carries a DIFFERENT message
+	// ("declared charter ... was not injected"); L2's names the injected count.
+	gctx, err := s.assertCharterInjected(context.Background(),
+		s.cfg.RunRepo.(*promptRunRepo).getRuns[runID],
+		s.cfg.RunRepo.(*promptRunRepo).getStages[stageID],
+		nil)
+	if err == nil {
+		t.Fatalf("assertCharterInjected admitted a grooming stage with no injected charter")
+	}
+	if gctx != nil {
+		t.Errorf("assertCharterInjected returned a grooming context on refusal: %+v", gctx)
+	}
+	if !strings.Contains(err.Error(), "none of the") {
+		t.Errorf("the pre-Build guard is not L2 (message = %q)", err.Error())
 	}
 }

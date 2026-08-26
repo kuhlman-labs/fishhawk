@@ -391,3 +391,63 @@ it is deliberately changed, and say so.
 
 The slim fix-up prompt (`buildImplementFixup`) forks before the writer and does
 not render injected documents; see `backend/internal/repodoc/README.md`.
+
+## Backlog-grooming propose branch (E54.28 / #2834)
+
+A `groom` stage is declared `type: plan` (ADR-067 §2 gives the grooming PROPOSE
+stage the plan stage type), so it reaches `Build` as `stageType == "plan"` — but
+it must be served the `grooming_report` artifact contract, not standard_v1 plan
+instructions. `Build`'s `plan` case therefore forks on `Trigger.Grooming`: nil
+routes to `buildPlan` (byte-identical to before this field existed, pinned by
+`TestBuild_Plan_ByteIdenticalToPreChangeGolden` against a golden captured from
+the base commit), non-nil routes to `buildGroomingPropose`.
+
+**Why the fork is a `Trigger` channel, not a stage type.** The DB stage type
+stays `plan`; introducing a `groom` stage type would ripple through every
+stage-type switch in the codebase for a stage that is a plan stage in every
+respect except its output artifact. The channel keeps the fork local to prompt
+construction.
+
+**Exactly one producer of the grooming determination.** `Trigger.Grooming` is
+set ONLY from `backend/internal/server.assertCharterInjected`, which is also the
+charter fail-closed (L2) check. That function returns a `*GroomingContext` on a
+grooming propose stage and `(nil, nil)` on every other stage; the handler threads
+it straight into `Build`. So the prompt builder's grooming fork and the
+charter-injection layer's fail-closed are computed by the SAME call — the
+two-layer disagreement #2834 records (a groom stage served a plan while charter
+injection treated it as grooming) is closed structurally. A second derivation
+site (a workflow-name check, a bare `bytes.Contains`) would reintroduce it;
+`backend/internal/server/grooming_prompt_agreement_test.go` reddens on exactly
+the rows where the layers would drift apart.
+
+**Fail-closed on charter identity.** `buildGroomingPropose` refuses BEFORE
+composing any text (`ErrCharterNotInjected`) unless an injected document's `Path`
+equals `t.Grooming.CharterPath` — charter IDENTITY, not mere document presence,
+so a prompt carrying some other injected document and no charter is refused. This
+is the prompt layer's own copy of L2's policy: it cannot emit a report prompt
+with no charter EVEN IF a future caller forgets L2. The server maps
+`ErrCharterNotInjected` to the same `document_injection_failed` /
+`charter_not_injected` shape L2 produces. That mapping is DEFENCE IN DEPTH and is
+practically unreachable through the handler (L2 refuses on the same condition
+first); the error itself is covered by the prompt-package test
+`TestBuild_GroomingPropose_NoCharterInjected_Refuses`, while the mapping is
+unreachable-but-present so a later caller that skips L2 still fails closed.
+
+**What the branch omits from the plan prompt, and why.** It renders no scope,
+decomposition, model_recommendation, max_files_changed or calibration blocks:
+those are plan-artifact concepts, and `grooming_report_v1` is
+`additionalProperties:false`, so instructing the agent to emit them would produce
+a report that fails ingest validation. The optional operator channels (prior
+rejection feedback, prior schema failure, revision constraint + base, clarification
+answers) and the untrusted-issue-comment quarantine (ADR-029, via
+`writeIssueContext`) ARE reused — the grooming agent is a propose-only,
+quarantined agent exactly as the planner is. The blocks are DUPLICATED rather
+than extracted from `buildPlan` because the wording genuinely differs
+(grooming_report_v1 vs standard_v1, backlog-window vs scope framing) and
+extraction risks perturbing `buildPlan`'s golden-pinned bytes.
+
+**Preview divergence residual (#2804).** The unsigned preview handler
+(`handleGetStagePromptRender`) injects no documents at all, so it sets NO grooming
+context and renders a groom stage as an ordinary plan. Widening the preview to
+resolve documents (and then fork) is #2804's, not this slice's; the preview stays
+byte-identical to today.
