@@ -161,3 +161,33 @@ func TestEvaluateDraftCriteria_FindingsNonNil(t *testing.T) {
 		t.Fatal("a clean child's Findings must be [] not null")
 	}
 }
+
+// (#2845 E54.31, shared rule set) A drafted criterion carrying the #2833 true
+// positive surfaces missing_live_validation_marker at INTAKE. This proves the
+// single-evaluator claim empirically rather than by assertion: precheck.go needs
+// NO edit for this rule to reach intake — it passes plan.EvaluateAcceptanceCriteria's
+// findings through wholesale and only special-cases RuleNoBlockingCriterion — so
+// a rule added to the shared set applies to intake and the plan gate at once.
+func TestEvaluateDraftCriteria_MissingLiveValidationMarker_SurfacedAtIntake(t *testing.T) {
+	d := EpicDraft{
+		Epic: EpicSpec{Summary: "e", Scope: "s", OutOfScope: "perf deferred"},
+		Children: []ChildDraft{
+			{Summary: "c1", Proposal: "p1", AcceptanceCriteria: []string{"the parsed issue body renders in the preview"}},
+			{Summary: "c2", Proposal: "p2", AcceptanceCriteria: []string{"A real backlog_grooming run against this repository reaches its approval gate"}},
+		},
+	}
+	pc := EvaluateDraftCriteria(d)
+
+	if f := childFinding(pc, 2, plan.RuleMissingLiveValidationMarker); f == nil {
+		t.Fatalf("child 2 must surface missing_live_validation_marker at intake; got %+v", pc.Children)
+	}
+	// The drivable child stays clean, so the rule is a signal at intake too.
+	if f := childFinding(pc, 1, plan.RuleMissingLiveValidationMarker); f != nil {
+		t.Errorf("child 1 is drivable and must not be flagged; got %+v", *f)
+	}
+	// Advisory: only no_blocking_criterion sets NeedsAttention, so this finding
+	// renders without flagging the child.
+	if c := childCheck(pc, 2); c == nil || c.NeedsAttention {
+		t.Errorf("missing_live_validation_marker must render without setting NeedsAttention; got %+v", c)
+	}
+}

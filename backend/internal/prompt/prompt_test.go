@@ -711,6 +711,11 @@ func TestBuild_Plan_ExternallyTriggeredCriteriaGuidance(t *testing.T) {
 		"LIVE",
 		"operator-validation walk",
 		"MUST ALSO mark `skip_expected: true`",
+		// #2845: the detective half must be named in the preventive half, so
+		// the two cannot silently drift apart.
+		"missing_live_validation_marker",
+		"ALONE does NOT satisfy it",
+		"a skip-only marking silently loses that walk",
 		// #2347: the planner must be told the all-skip short-circuit records a
 		// NOT-VALIDATED verdict, not a pass — otherwise an all-skip plan reads as
 		// a cheap green and the guidance actively encourages the behavior the

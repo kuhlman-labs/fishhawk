@@ -38,6 +38,13 @@ const categoryPlanAcceptancePrecheck = "plan_acceptance_precheck"
 // a reader gets the headline number without re-walking Findings. It is
 // ADVISORY like every other field here: the pre-check writes an entry and
 // never refuses a plan.
+//
+// LiveValidationMarkerCount (#2845, E54.31) counts the criteria the shared rule
+// set flagged missing_live_validation_marker — again one per criterion, never
+// per phrase hit. It is a SEPARATE headline from UndecidableCount because the
+// two rules answer different questions and deliberately do not suppress each
+// other: a wholly-unmarked live-target criterion is counted in BOTH. Also
+// ADVISORY — the pre-check never refuses a plan on it.
 type AcceptancePrecheckPayload struct {
 	WorkflowID        string              `json:"workflow_id"`
 	AcceptanceStageID string              `json:"acceptance_stage_id"`
@@ -46,6 +53,8 @@ type AcceptancePrecheckPayload struct {
 	BlockingCount     int                 `json:"blocking_count"`
 	OutOfScopeCount   int                 `json:"out_of_scope_count"`
 	UndecidableCount  int                 `json:"undecidable_count"`
+
+	LiveValidationMarkerCount int `json:"live_validation_marker_count"`
 }
 
 // AcceptanceFinding is one deterministic defect the acceptance pre-check
@@ -62,10 +71,11 @@ type AcceptanceFinding = plan.AcceptanceFinding
 // exactly one place. The remaining rules (missing_rationale, empty_id) are
 // referenced only through plan.Rule* directly.
 const (
-	acceptanceRuleNoBlockingCriterion  = plan.RuleNoBlockingCriterion
-	acceptanceRuleMissingSourceRef     = plan.RuleMissingSourceRef
-	acceptanceRuleDuplicateID          = plan.RuleDuplicateID
-	acceptanceRuleUndecidableCriterion = plan.RuleUndecidableCriterion
+	acceptanceRuleNoBlockingCriterion         = plan.RuleNoBlockingCriterion
+	acceptanceRuleMissingSourceRef            = plan.RuleMissingSourceRef
+	acceptanceRuleDuplicateID                 = plan.RuleDuplicateID
+	acceptanceRuleUndecidableCriterion        = plan.RuleUndecidableCriterion
+	acceptanceRuleMissingLiveValidationMarker = plan.RuleMissingLiveValidationMarker
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -158,10 +168,18 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 	// plan.EvaluateAcceptanceCriteria call above (#2512, layer 3) — there is no
 	// second evaluation — so the count is read back off the findings the shared
 	// rule set already returned.
+	//
+	// #2845 (E54.31): missing_live_validation_marker rides the same call and is
+	// counted the same way. The two counts are independent — the rules do not
+	// suppress each other, so an unmarked live-target criterion increments both.
 	undecidableCount := 0
+	liveValidationMarkerCount := 0
 	for _, f := range findings {
-		if f.Rule == acceptanceRuleUndecidableCriterion {
+		switch f.Rule {
+		case acceptanceRuleUndecidableCriterion:
 			undecidableCount++
+		case acceptanceRuleMissingLiveValidationMarker:
+			liveValidationMarkerCount++
 		}
 	}
 
@@ -173,6 +191,8 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 		BlockingCount:     blockingCount,
 		OutOfScopeCount:   len(v.OutOfScope),
 		UndecidableCount:  undecidableCount,
+
+		LiveValidationMarkerCount: liveValidationMarkerCount,
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

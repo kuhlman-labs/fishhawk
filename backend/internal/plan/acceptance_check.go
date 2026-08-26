@@ -41,6 +41,29 @@ const (
 	// requires_live_validation) instead of shipping it to an executor that
 	// can only report it undecidable.
 	RuleUndecidableCriterion = "undecidable_criterion"
+	// RuleMissingLiveValidationMarker flags a criterion whose STATEMENT names a
+	// LIVE forge/deploy/external TARGET but which is NOT marked
+	// requires_live_validation (#2845, E54.31). It is ADVISORY: like
+	// undecidable_criterion it never refuses a plan.
+	//
+	// It is DELIBERATELY not a duplicate of undecidable_criterion. That rule's
+	// exemption is EITHER sanctioned declaration — skip_expected-with-basis OR
+	// requires_live_validation — which is correct for the external-TRIGGER
+	// class it covers. For a live TARGET the weaker marking is not enough:
+	// only requires_live_validation auto-files the tracked
+	// operator-validation walk on plan approval, so a live-target criterion
+	// marked skip_expected-with-basis alone is silent under
+	// undecidable_criterion and silently loses its walk. This rule's exemption
+	// is therefore requires_live_validation ALONE — that gap is the defect
+	// #2845 documents across four runs.
+	//
+	// There is NO cross-rule suppression: a wholly-unmarked live-target
+	// criterion draws one finding from EACH rule. That is complementary, not
+	// redundant — undecidable_criterion says "declare it (either marking)",
+	// this rule says "the weaker marking will not suffice here" — and it
+	// avoids a two-step in which an author applies the weaker remedy and only
+	// then learns it was insufficient.
+	RuleMissingLiveValidationMarker = "missing_live_validation_marker"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -63,6 +86,11 @@ const (
 //     operator session, a running external instance, a live forge round-trip, a
 //     real webhook delivery), and which is NOT already marked skip_expected
 //     with a basis or requires_live_validation. Advisory only.
+//   - missing_live_validation_marker — a criterion whose statement names a LIVE
+//     forge/deploy/external TARGET and which is NOT marked
+//     requires_live_validation. Its exemption is that marker ALONE:
+//     skip_expected-with-basis does not exempt, because only the marker files
+//     the tracked operator-validation walk (#2845). Advisory only.
 func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	findings := []AcceptanceFinding{}
 
@@ -114,6 +142,10 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	// refinement.EvaluateDraftCriteria) get it from one place, per this file's
 	// single-source contract.
 	findings = append(findings, UnevaluableCriteria(v)...)
+
+	// #2845 (E54.31): the live-validation-marker matcher rides the SAME call
+	// for the same reason — one evaluator, both surfaces, no second copy.
+	findings = append(findings, MissingLiveValidationMarker(v)...)
 
 	return findings
 }
@@ -339,15 +371,34 @@ const (
 // are deliberately MULTI-WORD: a bare "github" or "webhook" appears in ordinary
 // drivable prose, and an advisory rule that fires on ordinary prose trains the
 // operator to ignore it.
+//
+// liveTarget marks the entries whose capability is a LIVE forge/deploy/external
+// TARGET rather than merely an external TRIGGER EVENT (#2845, E54.31). It is
+// what MissingLiveValidationMarker's M1 matcher reads, so that rule REUSES this
+// one corpus instead of carrying a second phrase list that would drift from it.
+// The flag is metadata only: no phrase string moves or changes, so
+// UnevaluableCriteria's behaviour is byte-identical.
 type unevaluableCapability struct {
 	capability string
 	phrases    []string
+	liveTarget bool
 }
 
 // unevaluableCapabilities is the deterministic term corpus behind
 // UnevaluableCriteria. Order is fixed so the findings a given plan produces are
 // stable across runs (the pre-check payload is compared byte-for-byte in the
 // audit log).
+//
+// liveTarget (#2845) partitions the corpus for MissingLiveValidationMarker. The
+// MCP-client, operator-session and webhook-delivery entries are deliberately
+// FALSE: the plan artifact schema scopes requires_live_validation to a criterion
+// needing "a LIVE forge/deploy/external target the default-deny sandbox lacks
+// (not merely an external trigger event, which skip_expected covers)". For those
+// three, skip_expected with an expectation_basis is the doctrinally COMPLETE
+// marking and no operator-validation walk is owed — demanding the marker there
+// would fire on correctly-authored criteria and auto-file spurious walks, which
+// is the habituation failure #2845 documents. Widening the rule to one of them
+// is a one-line flip here; the excluded-class control test records the decision.
 var unevaluableCapabilities = []unevaluableCapability{
 	{
 		capability: "a live MCP client / MCP tool call",
@@ -370,6 +421,7 @@ var unevaluableCapabilities = []unevaluableCapability{
 			"staging environment", "external instance", "running cluster",
 			"deployed instance",
 		},
+		liveTarget: true,
 	},
 	{
 		capability: "a live forge round-trip",
@@ -377,6 +429,7 @@ var unevaluableCapabilities = []unevaluableCapability{
 			"live github", "real github", "github api", "live gitlab", "real gitlab",
 			"gitlab api", "live forge", "real forge", "against github.com",
 		},
+		liveTarget: true,
 	},
 	{
 		capability: "a real webhook delivery",
@@ -452,4 +505,228 @@ func containsAnyPhrase(lowered string, phrases []string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// missing_live_validation_marker (#2845, E54.31)
+// ---------------------------------------------------------------------------
+
+// livenessQualifiers are the adjectives that assert a statement is about the
+// REAL thing rather than a sandbox stand-in. A qualifier alone is not a signal —
+// "the real repo path is resolved" is perfectly drivable — so M2 below requires
+// two further conjuncts on top of it.
+var livenessQualifiers = []string{"live", "real", "actual", "production", "genuine"}
+
+// liveActionNouns are the ACTIONS a live target is exercised through. The
+// generic target nouns (issue, label, repository, tracker, backlog, board) are
+// deliberately ABSENT: they appear constantly in drivable prose about parsing or
+// rendering, and including them made the matcher fire on ordinary statements.
+// "trip" carries the un-hyphenated "round trip" spelling; "round-trip" survives
+// tokenization as one token.
+var liveActionNouns = []string{
+	"run", "runs", "walk", "walks", "apply", "applies",
+	"round-trip", "round-trips", "trip", "dispatch", "dispatches",
+}
+
+// externalTargetNouns are the objects a live action is performed AGAINST. They
+// are only ever consulted inside an "against …" phrase (conjunct 2), which is
+// what separates "a real grooming run AGAINST this repo's backlog" from "a real
+// run OF THE TEST SUITE".
+var externalTargetNouns = []string{
+	"repo", "repos", "repository", "repositories", "backlog", "tracker",
+	"issue", "issues", "board", "project", "org", "organization",
+	"forge", "github", "gitlab", "instance", "environment", "api",
+}
+
+// sandboxMarkers name a stand-in. Their presence is a NEGATION: a statement
+// driving a fake/stub/localhost target is sandbox-validatable however live its
+// prose reads.
+var sandboxMarkers = []string{
+	"fake", "stub", "mock", "localhost", "preview", "sandbox",
+	"testdata", "fixture", "in-test",
+}
+
+// livenessProximityWindow is the maximum token distance for both proximity
+// conjuncts. Four tokens spans an ordinary adjective/preposition run ("a real
+// grooming run", "against this repo's backlog") without letting two unrelated
+// clauses of one sentence pair up.
+const livenessProximityWindow = 4
+
+// acceptanceTokens splits a lowercased statement into comparable tokens: it
+// trims surrounding punctuation and a trailing possessive, so "repo's" and
+// "round-trip," normalize to "repo" and "round-trip". Interior hyphens are
+// PRESERVED, which is what keeps "round-trip" a single token.
+func acceptanceTokens(lowered string) []string {
+	raw := strings.Fields(lowered)
+	tokens := make([]string, 0, len(raw))
+	for _, t := range raw {
+		t = strings.Trim(t, ".,;:!?()[]{}\"'`")
+		t = strings.TrimSuffix(t, "'s")
+		t = strings.TrimSuffix(t, "’s")
+		if t != "" {
+			tokens = append(tokens, t)
+		}
+	}
+	return tokens
+}
+
+// tokenIn reports whether tok is in set. The sets are small fixed slices, so a
+// linear scan is both simplest and stable in ordering.
+func tokenIn(tok string, set []string) bool {
+	for _, s := range set {
+		if tok == s {
+			return true
+		}
+	}
+	return false
+}
+
+// containsSandboxMarker reports whether a lowercased statement names a stand-in
+// ANYWHERE. It is M1's negation: M1 has no proximity window to scope, so the
+// whole statement is the right span. M2 uses the narrower windowed form below.
+func containsSandboxMarker(lowered string) bool {
+	return containsAnyPhrase(lowered, sandboxMarkers)
+}
+
+// windowHasSandboxMarker reports whether any token in tokens[lo:hi] (clamped)
+// is a sandbox marker. This is M2's conjunct 3, scoped to the against-phrase so
+// a marker in an unrelated clause does not silently disarm the rule.
+func windowHasSandboxMarker(tokens []string, lo, hi int) bool {
+	// Clamped as EXPRESSIONS, not branches: lo arrives as a slice index so the
+	// lower clamp is unreachable from the only caller, and a dead `if` would be
+	// an untestable branch. min/max keep the bound safe without one.
+	lo = max(lo, 0)
+	hi = min(hi, len(tokens)-1)
+	for i := lo; i <= hi; i++ {
+		if tokenIn(tokens[i], sandboxMarkers) {
+			return true
+		}
+	}
+	return false
+}
+
+// livenessProximityMatch is M2: the three-conjunct proximity matcher. ALL THREE
+// must hold.
+//
+//	(1) a liveness qualifier within livenessProximityWindow tokens BEFORE a live
+//	    ACTION noun — "a real grooming run", "a live walk".
+//	(2) an external-target preposition phrase: "against" within the same window
+//	    BEFORE an external-target noun — "against this repo's backlog".
+//	(3) NO sandbox marker inside that against-phrase window.
+//
+// Conjunct 1 alone is provably insufficient, which is why 2 and 3 exist: "a real
+// run of the test suite regenerates the pages" satisfies conjunct 1 outright
+// ("real" and "run" are adjacent) and is entirely sandbox-validatable. Conjunct
+// 2 is what separates it from "a real grooming run against this repo's backlog";
+// conjunct 3 separates that from "against the fake tracker in the integration
+// test".
+func livenessProximityMatch(tokens []string) bool {
+	if !qualifierNearAction(tokens) {
+		return false
+	}
+	for k, tok := range tokens {
+		if tok != "against" {
+			continue
+		}
+		for m := k + 1; m <= k+livenessProximityWindow && m < len(tokens); m++ {
+			if !tokenIn(tokens[m], externalTargetNouns) {
+				continue
+			}
+			if windowHasSandboxMarker(tokens, k, m+2) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// qualifierNearAction is conjunct 1 of livenessProximityMatch, named so the
+// conjunct is one idea rather than an inline nested loop.
+func qualifierNearAction(tokens []string) bool {
+	for i, tok := range tokens {
+		if !tokenIn(tok, livenessQualifiers) {
+			continue
+		}
+		for j := i + 1; j <= i+livenessProximityWindow && j < len(tokens); j++ {
+			if tokenIn(tokens[j], liveActionNouns) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// liveTargetCorpusMatch is M1: the statement names a live TARGET via a phrase
+// already in the shared unevaluableCapabilities corpus, on an entry flagged
+// liveTarget. It REUSES that corpus rather than carrying a second phrase list,
+// so the two rules cannot drift apart on what counts as a live forge or a
+// deployed environment.
+//
+// M1 honours the sandbox-marker negation (#2845, operator condition C2): those
+// phrases were written for a rule with the LOOSER either-marking exemption, so
+// reusing them under the marker-only exemption makes previously-silent criteria
+// fire. The negation narrows what M1 CONSIDERS without touching a single phrase
+// string, keeping UnevaluableCriteria byte-identical.
+//
+// RESIDUAL, stated honestly: the negation rescues a statement that names its
+// stand-in ("the github api client retries in the fake transport test") but NOT
+// one that carries a live-target phrase in sandbox-validatable prose with no
+// marker at all — "the deployed environment config template is rendered" still
+// fires. Narrowing further (say, also demanding a live-action noun) would drop
+// the genuine true positive "the deployed environment serves the new endpoint",
+// so the residual is accepted and pinned by a test rather than papered over.
+func liveTargetCorpusMatch(lowered string) bool {
+	if containsSandboxMarker(lowered) {
+		return false
+	}
+	for _, uc := range unevaluableCapabilities {
+		if uc.liveTarget && containsAnyPhrase(lowered, uc.phrases) {
+			return true
+		}
+	}
+	return false
+}
+
+// MissingLiveValidationMarker flags every acceptance criterion whose STATEMENT
+// names a LIVE forge/deploy/external target but which is not marked
+// requires_live_validation (#2845, E54.31). It is the detective half of the
+// live-validation classification rule; the preventive half is the planner
+// prompt's Live-validation criteria guidance.
+//
+// A criterion is flagged when EITHER matcher fires:
+//
+//	M1 — the statement contains a phrase from a liveTarget entry of the shared
+//	     unevaluableCapabilities corpus (and names no sandbox stand-in).
+//	M2 — the three-conjunct liveness-proximity matcher fires, catching the
+//	     named-system prose ("a real backlog_grooming run against this
+//	     repository") that no fixed phrase list anticipates.
+//
+// EXEMPTION — requires_live_validation ALONE. skip_expected with a basis
+// deliberately does NOT exempt: it is the correct marking for an external
+// trigger EVENT, but for a live TARGET it silently loses the auto-filed
+// operator-validation walk. That gap is the defect this rule exists to close.
+//
+// ADVISORY ONLY, and at most ONE finding per criterion (the loop breaks on the
+// first match) so a downstream count is a count of criteria. Returns a non-nil
+// empty slice when nothing is flagged.
+func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	for _, c := range v.AcceptanceCriteria {
+		if c.RequiresLiveValidation {
+			continue
+		}
+		lowered := strings.ToLower(c.Statement)
+		if !liveTargetCorpusMatch(lowered) && !livenessProximityMatch(acceptanceTokens(lowered)) {
+			continue
+		}
+		findings = append(findings, AcceptanceFinding{
+			Rule:        RuleMissingLiveValidationMarker,
+			CriterionID: c.ID,
+			Detail: "criterion statement names a LIVE forge/deploy/external target the sandboxed acceptance executor cannot stand up; " +
+				"set requires_live_validation: true and pair it with skip_expected: true plus an expectation_basis — that pairing is what " +
+				"auto-files the tracked operator-validation walk on plan approval. A skip_expected-only marking silently loses that walk.",
+		})
+	}
+	return findings
 }

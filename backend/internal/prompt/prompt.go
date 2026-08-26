@@ -3212,7 +3212,11 @@ func buildPlan(t Trigger) string {
 		"criterion never dispatches to the acceptance agent. That short-circuit records a NOT-VALIDATED verdict, never a passed one " +
 		"(#2347), and the recorded count of `requires_live_validation` criteria is what tells the operator the skip carries a tracked " +
 		"live check rather than none. On plan approval the system auto-files-or-links an operator-validation walk for every " +
-		"`requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated.\n")
+		"`requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated. " +
+		"The plan gate runs a deterministic `missing_live_validation_marker` check over your criteria statements: marking a " +
+		"live-target criterion `skip_expected` with an `expectation_basis` ALONE does NOT satisfy it, because only " +
+		"`requires_live_validation` files the tracked operator-validation walk — a skip-only marking silently loses that walk. The " +
+		"finding is ADVISORY and never refuses the plan.\n")
 	b.WriteString("Undecidable-criteria rule: the acceptance executor is a SANDBOXED agent driving a localhost preview. It has no live " +
 		"MCP client, no real operator session, no running external instance or deployed environment, no live GitHub/GitLab " +
 		"round-trip, and no real webhook delivery. Author a criterion that needs one of those UP FRONT as an explicit skip: set " +

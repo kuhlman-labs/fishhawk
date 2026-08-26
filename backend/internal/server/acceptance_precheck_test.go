@@ -567,8 +567,18 @@ func TestShipPlan_UndecidableCriterion_IsAdvisoryNotARefusal(t *testing.T) {
 }
 
 // (#2512 layer 3, exemption) A criterion already marked skip_expected with an
-// expectation_basis is the sanctioned declaration of the same condition — no
-// finding and undecidable_count stays 0.
+// expectation_basis is the sanctioned declaration for undecidable_criterion —
+// no finding from THAT rule and undecidable_count stays 0.
+//
+// #2845 PAIRED HOLE CASE, at the server seam. This fixture is the operator's
+// exact case: a criterion naming a LIVE forge round-trip, marked
+// skip_expected-with-basis and NOT requires_live_validation. Because
+// undecidable_criterion exempts it, the plan gate reported NOTHING and the
+// criterion silently lost its auto-filed operator-validation walk.
+// undecidable_criterion's behaviour is UNCHANGED (still exempt, still count 0);
+// missing_live_validation_marker now fires and live_validation_marker_count is
+// 1. The original comment's claim that the criterion draws no finding is no
+// longer true and is corrected here.
 func TestAcceptancePrecheck_UndecidableCriterion_ExemptWhenDeclared(t *testing.T) {
 	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
 	body := acceptancePlanBody(t, []map[string]any{
@@ -596,6 +606,20 @@ func TestAcceptancePrecheck_UndecidableCriterion_ExemptWhenDeclared(t *testing.T
 	if entry.UndecidableCount != 0 {
 		t.Errorf("persisted undecidable_count = %d, want 0", entry.UndecidableCount)
 	}
+	// #2845: the hole. The same criterion DOES draw the new rule.
+	if got.LiveValidationMarkerCount != 1 {
+		t.Errorf("LiveValidationMarkerCount = %d, want 1 (skip_expected-with-basis must not exempt a live target)", got.LiveValidationMarkerCount)
+	}
+	f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatalf("want a missing_live_validation_marker finding in the persisted entry; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "live-forge" {
+		t.Errorf("CriterionID = %q, want live-forge", f.CriterionID)
+	}
+	if entry.LiveValidationMarkerCount != 1 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 1", entry.LiveValidationMarkerCount)
+	}
 }
 
 // (#2512 layer 3) An ordinary drivable criteria set leaves undecidable_count at
@@ -618,7 +642,190 @@ func TestAcceptancePrecheck_DrivableCriteria_ZeroUndecidableCount(t *testing.T) 
 	if got.UndecidableCount != 0 {
 		t.Errorf("UndecidableCount = %d, want 0", got.UndecidableCount)
 	}
-	if entry := lastAcceptancePrecheckEntry(t, au); entry.UndecidableCount != 0 {
+	// #2845: the same for the live-validation-marker count — a drivable set
+	// must leave it at zero so the field is a real signal, not a constant.
+	if got.LiveValidationMarkerCount != 0 {
+		t.Errorf("LiveValidationMarkerCount = %d, want 0", got.LiveValidationMarkerCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if entry.UndecidableCount != 0 {
 		t.Errorf("persisted undecidable_count = %d, want 0", entry.UndecidableCount)
+	}
+	if entry.LiveValidationMarkerCount != 0 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 0", entry.LiveValidationMarkerCount)
+	}
+	if f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker); f != nil {
+		t.Errorf("a drivable criteria set must draw no missing_live_validation_marker; got %+v", *f)
+	}
+}
+
+// (#2845 E54.31 — THE HOLE TEST at the real seam) The #2822 true positive, one
+// of the four statements the shipped detector missed, shipped through
+// runAcceptancePrecheck: the finding lands in the PERSISTED entry and
+// live_validation_marker_count is 1.
+func TestAcceptancePrecheck_LiveValidationMarker_FlaggedAndCounted(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":         "live-walk",
+			"statement":  "A live walk is recorded: one real grooming run against this repo's backlog",
+			"source":     "explicit",
+			"source_ref": "#2845",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when an acceptance stage is configured")
+	}
+	if got.LiveValidationMarkerCount != 1 {
+		t.Errorf("LiveValidationMarkerCount = %d, want 1", got.LiveValidationMarkerCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatalf("want a missing_live_validation_marker finding in the persisted entry; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "live-walk" {
+		t.Errorf("CriterionID = %q, want live-walk", f.CriterionID)
+	}
+	if entry.LiveValidationMarkerCount != 1 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 1", entry.LiveValidationMarkerCount)
+	}
+}
+
+// (#2845 E54.31 — the hole, marker-only exemption at the seam) A live-target
+// criterion marked skip_expected with a basis and NO requires_live_validation
+// is STILL flagged. This is the shape that silently lost its walk four times.
+func TestAcceptancePrecheck_LiveValidationMarker_SkipExpectedOnlyStillFlagged(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":                "live-github",
+			"statement":         "Validate against live GitHub",
+			"source":            "explicit",
+			"source_ref":        "#2845",
+			"skip_expected":     true,
+			"expectation_basis": "pinned by the fake-forge integration test",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.LiveValidationMarkerCount != 1 {
+		t.Errorf("LiveValidationMarkerCount = %d, want 1", got.LiveValidationMarkerCount)
+	}
+	// The older rule stays exempt — its behaviour is unchanged by this PR.
+	if got.UndecidableCount != 0 {
+		t.Errorf("UndecidableCount = %d, want 0 (undecidable_criterion must still exempt)", got.UndecidableCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatalf("want a missing_live_validation_marker finding in the persisted entry; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "live-github" {
+		t.Errorf("CriterionID = %q, want live-github", f.CriterionID)
+	}
+	if entry.LiveValidationMarkerCount != 1 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 1", entry.LiveValidationMarkerCount)
+	}
+}
+
+// (#2845 E54.31, exemption) requires_live_validation is the ONE exemption, and
+// it holds at the seam: no finding, and the count stays 0.
+func TestAcceptancePrecheck_LiveValidationMarker_ExemptWhenMarked(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":                       "live-walk",
+			"statement":                "A live walk is recorded: one real grooming run against this repo's backlog",
+			"source":                   "explicit",
+			"source_ref":               "#2845",
+			"requires_live_validation": true,
+			"skip_expected":            true,
+			"expectation_basis":        "pinned by the fake-tracker grooming integration test",
+		},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.LiveValidationMarkerCount != 0 {
+		t.Errorf("LiveValidationMarkerCount = %d, want 0 (requires_live_validation is the exemption)", got.LiveValidationMarkerCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker); f != nil {
+		t.Fatalf("a correctly-marked criterion must not be flagged; got %+v", *f)
+	}
+	if entry.LiveValidationMarkerCount != 0 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 0", entry.LiveValidationMarkerCount)
+	}
+}
+
+// TestShipPlan_MissingLiveValidationMarker_IsAdvisoryNotARefusal drives the REAL
+// plan-upload/admission seam (POST /v0/runs/{run_id}/plan -> handleShipPlan ->
+// runAcceptancePrecheck), not the pre-check in isolation: the new finding is
+// advisory, so the plan carrying it must still be ADMITTED to the operator gate.
+//
+// COUNTERFACTUAL: teaching handleShipPlan to refuse a plan whose acceptance
+// pre-check reports missing_live_validation_marker makes this test go RED on the
+// COMMITTED stage state. The admission assertions read committed state back
+// through the repo rather than the response, because a refusal that re-opens the
+// stage still answers 201 (trap (a)) — a response-only assertion would stay
+// green under the refusal.
+func TestShipPlan_MissingLiveValidationMarker_IsAdvisoryNotARefusal(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specWithAcceptanceStage
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":         "grooming-run",
+			"statement":  "A real backlog_grooming run against this repository reaches its approval gate",
+			"source":     "explicit",
+			"source_ref": "#2845",
+		},
+	}, nil)
+
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// COMMITTED state first: the plan was ADMITTED.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (an advisory finding must never refuse the plan)\ntransitions: %+v",
+			got, rr.stageTransitions)
+	}
+	if got := rr.stagesByID[planStage.ID].FailureCategory; got != nil {
+		t.Errorf("stage carries failure category %q; the missing_live_validation_marker rule must never fail a plan", *got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Error("run state = failed; an advisory acceptance finding must never terminate a run")
+	}
+
+	// And the advisory finding genuinely fired on THIS upload, so the admission
+	// above is not vacuously green on a plan that tripped no rule.
+	if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+		t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+	f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatalf("want a missing_live_validation_marker finding on the admitted plan; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "grooming-run" {
+		t.Errorf("CriterionID = %q, want grooming-run", f.CriterionID)
+	}
+	if entry.LiveValidationMarkerCount != 1 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 1", entry.LiveValidationMarkerCount)
 	}
 }
