@@ -80,7 +80,9 @@ The value alone. Prose in that field means the #2847 defect has returned.
 apply step to reconsider at — the gate IS the apply trigger, which is why the `apply`
 stage was removed (#2851).
 
-- `hygiene` applies (labels, fields, boarding, epic links — objective and reversible).
+- `hygiene` applies (labels, fields, boarding, epic links — objective and reversible),
+  **except a proposed `autonomy:` delegation-tier label**, which is refused with a named
+  audited skip and needs your hand or #2843 (see §7).
 - `ordering`, `dedup`, `scoping` receive no decision and apply nothing. They are
   non-delegable by construction and refused at `mode: auto` at parse time.
 
@@ -135,11 +137,21 @@ items), leaving 20 genuine human-led work items. 36 issues were re-tiered to
 
 ## 7. Hazards
 
-**A fresh groom can silently re-tier issues (#2855).** The hygiene class writes
-`autonomy:*` labels, and autonomy is the delegation control. The groomer proposed
-`autonomy:medium` for #1512 on one run and `autonomy:low` on the next. Approving a report
-can therefore undo a deliberate tier decision. Land #2855 first, or inspect the
-`autonomy:*` writes specifically before approving.
+**A groom still PROPOSES a tier; the apply refuses it (#2855, shipped).** The groomer
+proposed `autonomy:medium` for #1512 on one run and `autonomy:low` on the next, and
+autonomy is the delegation control — so approving a report used to undo a deliberate tier
+decision. It no longer can: a hygiene entry whose `fix.labels` carry an `autonomy:` label
+is recorded as an audited `delegation_tier_not_authorized` skip and applies **nothing**,
+under `mode: auto` and under a whole-report approval alike. What you still have to do:
+
+- The refusal fails the **whole entry**, so a mixed `[area:, autonomy:, phase:]` proposal
+  applies none of the three. The clerical halves need you.
+- The proposal stays fully visible — the audit row carries every proposed label, and the
+  ingest census gains a `delegation_tier_proposals` count so you can see at the gate how
+  many entries propose a tier. Apply the ones you agree with **by hand**, or wait for the
+  per-entry disposition surface (#2843) to carry the decision.
+- The entry is not suppressed: a refused proposal never enters the churn baseline, so it
+  resurfaces next run rather than disappearing.
 
 **The acceptance sandbox cannot reach a forge.** A criterion needing one must carry
 `requires_live_validation` so acceptance short-circuits it into an operator walk rather
@@ -152,7 +164,6 @@ attestations to the fix-up self-report sidecar instead.
 
 | Issue | Subject |
 |---|---|
-| #2855 | hygiene writes `autonomy:*`; unstable run-over-run — highest priority |
 | #2843 | per-entry dispositions; unblocks applying the destructive classes |
 | #2834 | prompt builder has no grooming branch (groom stage gets standard_v1 instructions) |
 | #2827 | intake scoring is margin-bound at filing time |

@@ -2348,3 +2348,136 @@ func TestGroomingIngest_AFullScanWindowIsNamed(t *testing.T) {
 		}
 	})
 }
+
+// --- E54.34 / #2855: the delegation-tier census key --------------------------
+
+// tierCensusReport builds a schema-valid report whose hygiene defects propose
+// the given label sets — one defect per set, on distinct items so the derived
+// entry ids do not collide.
+func tierCensusReport(labelSets ...[]string) *plan.GroomingReport {
+	// One ordering entry: grooming-report-v1 requires a non-empty `ordering`.
+	gr := churnReport([]int{1}, []float64{0.9}, "")
+	for i, labels := range labelSets {
+		ref := churnItem(strconv.Itoa(100 + i))
+		gr.HygieneDefects = append(gr.HygieneDefects, plan.HygieneDefect{
+			ID:      plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref),
+			ItemRef: ref, Defect: "missing_label_namespace", Detail: "no namespace label",
+			SuggestedFix: "prose suggestion",
+			Fix:          &plan.HygieneFix{Labels: labels},
+		})
+	}
+	return gr
+}
+
+// ingestCensus ships a report through the REAL signed ingest handler and decodes
+// `entry_counts` back out of the audit payload the handler actually appended —
+// the payload, not the map groomingEntryCounts returned. That round trip is
+// binding condition C3: a unit test over the builder proves the map is built,
+// not that the value survives into the recorded row.
+func ingestCensus(t *testing.T, report *plan.GroomingReport) map[string]int {
+	t.Helper()
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	entries := groomingAuditEntries(au)
+	if len(entries) != 1 {
+		t.Fatalf("grooming_report_recorded entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		EntryCounts map[string]int `json:"entry_counts"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v (%s)", err, entries[0].Payload)
+	}
+	return payload.EntryCounts
+}
+
+// TestGroomingEntryCounts_DelegationTierProposals is the DONE-MEANS test for the
+// census key: it is a rendered payload VALUE no compiler checks, so both halves
+// of the claim are asserted on the recorded audit payload.
+//
+// (1) The VALUE: a report mixing tier-proposing and clerical hygiene entries
+// carries the tier count, counting entries not labels. (2) The key is ABSENT —
+// not zero-valued — when no entry proposes a tier, which is what enforces the
+// byte-identical-payload claim rather than resting on the milestone precedent.
+//
+// COUNTERFACTUAL: delete the `if tierProposals > 0` guard and (2) reddens on the
+// present-but-zero key; delete the whole block and (1) reddens.
+func TestGroomingEntryCounts_DelegationTierProposals(t *testing.T) {
+	t.Run("value carries into the recorded payload", func(t *testing.T) {
+		counts := ingestCensus(t, tierCensusReport(
+			[]string{"area:backend", "autonomy:low"}, // counted
+			[]string{"Autonomy:High"},                // counted (case-insensitive)
+			[]string{"area:backend", "phase:alpha"},  // not counted
+		))
+		if got := counts["delegation_tier_proposals"]; got != 2 {
+			t.Errorf("entry_counts[delegation_tier_proposals] = %d, want 2 (entries, not labels): %v", got, counts)
+		}
+		if got := counts["hygiene_defects"]; got != 3 {
+			t.Errorf("entry_counts[hygiene_defects] = %d, want 3 — the census must not FILTER the report", got)
+		}
+	})
+
+	t.Run("key absent when zero", func(t *testing.T) {
+		counts := ingestCensus(t, tierCensusReport([]string{"area:backend", "phase:alpha"}))
+		if _, present := counts["delegation_tier_proposals"]; present {
+			t.Errorf("entry_counts carries delegation_tier_proposals = %v with no tier proposal; an ordinary report's payload must stay byte-identical to before this change",
+				counts["delegation_tier_proposals"])
+		}
+	})
+}
+
+// TestGroomingReportSchema_LabelsDescriptionStatesTheTierCarveOut is binding
+// condition C2. `scripts/sync-schemas` proves the canonical file and its
+// embedded mirror MATCH; it cannot prove either says the right thing — both
+// would pass while both omitted the required language. So the CANONICAL
+// docs/spec/grooming-report-v1.schema.json's `fix.labels` description is
+// asserted directly, on the load-bearing phrase and on the carve-out it names.
+//
+// COUNTERFACTUAL: remove either sentence from the canonical schema and this
+// reddens; a sync-only gate stays green.
+func TestGroomingReportSchema_LabelsDescriptionStatesTheTierCarveOut(t *testing.T) {
+	raw, err := os.ReadFile("../../../docs/spec/grooming-report-v1.schema.json")
+	if err != nil {
+		t.Fatalf("read canonical grooming-report schema: %v", err)
+	}
+	var doc struct {
+		Defs map[string]struct {
+			Properties map[string]struct {
+				Properties map[string]struct {
+					Description string `json:"description"`
+				} `json:"properties"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode canonical schema: %v", err)
+	}
+	desc := doc.Defs["hygiene-defect"].Properties["fix"].Properties["labels"].Description
+	if desc == "" {
+		t.Fatalf("no $defs/hygiene-defect/properties/fix/properties/labels description in the canonical schema")
+	}
+	for _, want := range []string{
+		// The binding phrase, verbatim.
+		"suggestion rather than a determination",
+		// And the carve-out it must name: the namespace, that it is the
+		// delegation tier, and that no whole-report approval applies it.
+		"autonomy:",
+		"DELEGATION-TIER",
+		"whole-report gate approval",
+		"delegation_tier_not_authorized",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("canonical fix.labels description does not contain %q; got:\n%s", want, desc)
+		}
+	}
+}

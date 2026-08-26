@@ -2112,7 +2112,15 @@ func applyOneHygiene(t *testing.T, h plan.HygieneDefect, states map[string]strin
 		Report:    report,
 		Decisions: []GroomingDecision{{EntryID: h.ID, Verdict: GroomingApproved}},
 		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
-		States:    states,
+		// The per-entry gate grant rule 8 (#2855) requires for a
+		// delegation-tier proposal. It is granted here so these tests keep
+		// exercising the FIX-VALUE contract they are about — including the
+		// #2847 incident's literal three-label set, which contains
+		// `autonomy:medium` — instead of settling on rule 8's refusal. Rule 8's
+		// own behaviour is pinned by the TestGroomingApply_DelegationTier* set,
+		// which drives GateApproved explicitly in both directions.
+		GateApproved: map[string]bool{h.ID: true},
+		States:       states,
 	})
 	if err != nil {
 		t.Fatalf("ApplyGrooming: %v", err)
@@ -2684,4 +2692,287 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// Containment rule 8: the delegation tier (E54.34 / #2855)
+// ---------------------------------------------------------------------------
+
+// tierHygieneEntry builds a missing_label_namespace defect proposing an
+// arbitrary label SET, which hygieneEntry's single-value shape cannot express.
+// The prose stays lexically disjoint from every structured value for the same
+// reason hygieneEntry's does.
+func tierHygieneEntry(n int, labels ...string) plan.HygieneDefect {
+	d := hygieneEntry(n, "missing_label_namespace", "placeholder")
+	d.Fix = &plan.HygieneFix{Labels: labels}
+	return d
+}
+
+// applyTierEntry runs ONE hygiene entry through the real apply layer under the
+// given mode and gate grant, and returns the settled record alongside the
+// mutator's dispatch log. State, not error identity, is the discriminating
+// observation: rule 8's whole effect is a write that did not happen.
+func applyTierEntry(t *testing.T, e plan.HygieneDefect, mode GroomingMode, gate map[string]bool,
+) (GroomingMutationRecord, *fakeGroomingMutator) {
+	t.Helper()
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{e}}
+	mut := &fakeGroomingMutator{}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#" + strings.TrimPrefix(e.ItemRef.ID, "kuhlman-labs/fishhawk#"): {State: "open", Labels: []string{"type:bug"}},
+	}}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:       groomingTarget(),
+		Report:       report,
+		Decisions:    approveAll(report),
+		Modes:        map[string]GroomingMode{"hygiene": mode},
+		GateApproved: gate,
+		States:       groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	return recordFor(t, res, e.ID), mut
+}
+
+// TestGroomingApply_DelegationTierLabelRefusedUnderModeAuto is rule 8's primary
+// failure mode: mode auto + an APPROVED entry + no per-entry grant — the exact
+// authority a whole-report gate approval carries in this repository — must NOT
+// write a delegation tier.
+//
+// COUNTERFACTUAL: delete the two-line rule in settleGroomingCandidate and the
+// entry dispatches; the zero-dispatch assertion reddens.
+func TestGroomingApply_DelegationTierLabelRefusedUnderModeAuto(t *testing.T) {
+	e := tierHygieneEntry(1, "area:backend", "autonomy:low", "phase:alpha")
+	rec, mut := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+	if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipDelegationTierNotAuthorized {
+		t.Fatalf("record = %+v, want skipped/%s", rec, GroomingSkipDelegationTierNotAuthorized)
+	}
+	// COMMITTED STATE, not just the reason string: the provider was asked to do
+	// nothing at all.
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator recorded %d dispatches, want 0 — a delegation tier reached the tracker: %+v", len(mut.calls), mut.calls)
+	}
+	// THE SUGGESTION STAYS VISIBLE (#2855 AC2): the refusal is an audited skip
+	// carrying every proposed label, not a filter that hides the defect.
+	if !equalStrings(rec.After.List, []string{"area:backend", "autonomy:low", "phase:alpha"}) {
+		t.Errorf("record After = %+v, want all three proposed labels surfaced on the refusal", rec.After)
+	}
+	// THE ONE BEHAVIOURAL COST, pinned rather than left to prose: the refusal
+	// fails the WHOLE entry, so the clerical area:/phase: halves do not land
+	// either. Same conservative direction as the invalid-label rule.
+	if len(mut.calls) != 0 {
+		t.Errorf("a mixed entry partially applied; the whole entry must be refused")
+	}
+}
+
+// TestGroomingApply_DelegationTierLabelAppliedUnderPerEntryGateApproval proves
+// this is a ROUTING change, not a blanket ban: an explicit per-entry gate
+// approval — the grant #2843's per-entry disposition surface will supply — is a
+// live authorization path that needs no further edit here.
+//
+// COUNTERFACTUAL: deleting the rule reddens this only VACUOUSLY, so the
+// discriminating deletion is removing the `!req.GateApproved[c.entryID]`
+// conjunct (the rule becomes unconditional and the applied assertion reddens),
+// which is what proves the grant is a real path rather than dead code.
+func TestGroomingApply_DelegationTierLabelAppliedUnderPerEntryGateApproval(t *testing.T) {
+	e := tierHygieneEntry(1, "area:backend", "autonomy:low", "phase:alpha")
+	rec, mut := applyTierEntry(t, e, GroomingModeAuto, map[string]bool{e.ID: true})
+
+	if rec.Outcome != GroomingOutcomeApplied {
+		t.Fatalf("record = %+v, want applied under an explicit per-entry gate approval", rec)
+	}
+	if len(mut.calls) != 1 {
+		t.Fatalf("mutator recorded %d dispatches, want exactly 1: %+v", len(mut.calls), mut.calls)
+	}
+	if !equalStrings(mut.calls[0].After.List, []string{"area:backend", "autonomy:low", "phase:alpha"}) {
+		t.Errorf("dispatched labels = %+v, want the full proposed set", mut.calls[0].After)
+	}
+}
+
+// TestGroomingApply_DelegationTierRefusalIsCaseInsensitive: a case-variant tier
+// label is still a tier proposal. A case-sensitive check is evadable, and the
+// direction an evasion fails in is a tier written with no human in the loop.
+//
+// COUNTERFACTUAL: delete the rule (or drop the ToLower from
+// LabelsSetDelegationTier) and the entry dispatches.
+func TestGroomingApply_DelegationTierRefusalIsCaseInsensitive(t *testing.T) {
+	e := tierHygieneEntry(1, "Autonomy:Low")
+	rec, mut := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+	if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipDelegationTierNotAuthorized {
+		t.Fatalf("record = %+v, want skipped/%s for a case-variant tier label", rec, GroomingSkipDelegationTierNotAuthorized)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator recorded %d dispatches, want 0 — `Autonomy:Low` evaded the tier rule: %+v", len(mut.calls), mut.calls)
+	}
+}
+
+// TestGroomingApply_ReportModeBeatsDelegationTierRefusal is a PRECEDENCE claim:
+// rule 8 sits AFTER rule 3, so a report-mode class still surfaces as
+// mode_report_surface_only rather than reporting the tier reason. That is
+// approval condition I1's ordering, undisturbed.
+//
+// COUNTERFACTUAL: deletion cannot discriminate a precedence claim (delete rule 8
+// and report mode still short-circuits correctly, leaving this green). The
+// discriminating change is a MOVE: relocate rule 8 ahead of the report-mode
+// short-circuit and the UNGRANTED case reddens on the SkipReason.
+//
+// THE UNGRANTED CASE IS THE ONE THAT DISCRIMINATES, and it is why this test does
+// not take the shape the plan sketched (report mode + a gate grant). With the
+// gate GRANTED rule 8 never fires at all, so no placement of it is observable and
+// the assertion is vacuous in exactly the way binding condition C1 called out on
+// the basis test. The granted case is kept as the companion because it pins the
+// ORIGINAL approval condition I1 claim — report mode beats an explicit gate
+// approval — which is a different claim from rule 8's position.
+func TestGroomingApply_ReportModeBeatsDelegationTierRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gate map[string]bool
+	}{
+		// Rule 8 WOULD fire here. Report mode must reach its short-circuit first.
+		{"no gate grant (discriminates rule 8's placement)", nil},
+		// Rule 8 would not fire; this pins approval condition I1's own claim.
+		{"gate granted (approval condition I1)", map[string]bool{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tierHygieneEntry(1, "autonomy:low")
+			gate := tc.gate
+			if gate != nil {
+				gate[e.ID] = true
+			}
+			rec, mut := applyTierEntry(t, e, GroomingModeReport, gate)
+
+			if rec.SkipReason != GroomingSkipReportMode {
+				t.Fatalf("SkipReason = %q, want %q — rule 8 must not preempt the report-mode short-circuit",
+					rec.SkipReason, GroomingSkipReportMode)
+			}
+			if len(mut.calls) != 0 {
+				t.Errorf("mutator recorded %d dispatches, want 0 under report mode", len(mut.calls))
+			}
+		})
+	}
+}
+
+// TestGroomingApply_DelegationTierRefusalBeatsResolutionSkip is rule 8's OTHER
+// placement claim — the half `..._ReportModeBeatsDelegationTierRefusal` does not
+// reach. That test pins the rule's position AFTER rule 3; this one pins it
+// BEFORE the resolution-skip return, so a containment refusal is never masked by
+// an item-ref resolution skip and the audit row classifies the entry by the
+// reason a human must act on.
+//
+// It matters for CLASSIFICATION, not for the write: both orderings dispatch
+// nothing. But `item_ref_unresolvable` reads as a malformed proposal an operator
+// can ignore, while `delegation_tier_not_authorized` is the tier decision #2843
+// must route to a human — so a masked refusal loses the entry in the wrong
+// audit bucket.
+//
+// COUNTERFACTUAL: deleting rule 8 cannot discriminate a precedence claim (the
+// entry still skips, on the resolution reason). The discriminating change is a
+// MOVE: relocate rule 8 below the `if reason != ""` return in
+// settleGroomingCandidate and the tier sub-case reddens on the SkipReason.
+//
+// THE NON-TIER SUB-CASE IS THE FIXTURE CONTROL, and it is what stops the tier
+// assertion being vacuous: it proves this ItemRef genuinely DOES produce a
+// resolution skip. Without it, an ItemRef that quietly stayed resolvable would
+// leave the tier assertion passing for the wrong reason — there would be no
+// resolution skip for rule 8 to beat.
+func TestGroomingApply_DelegationTierRefusalBeatsResolutionSkip(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		// The claim: the containment refusal wins over the resolution skip.
+		{"tier proposal (discriminates rule 8's placement)", []string{"area:backend", "autonomy:low"}, GroomingSkipDelegationTierNotAuthorized},
+		// The control: same unresolvable ref, no tier label — the resolution
+		// skip is real and IS what surfaces when rule 8 does not fire.
+		{"no tier proposal (fixture control)", []string{"area:backend"}, GroomingSkipItemRefUnresolvable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tierHygieneEntry(1, tc.labels...)
+			// A ref whose number is not a number: resolveGroomingRequest returns
+			// item_ref_unresolvable. The entry id was computed at construction
+			// from the ORIGINAL ref, so the decision still joins and the entry
+			// reaches the ladder.
+			e.ItemRef.ID = "kuhlman-labs/fishhawk#not-a-number"
+			rec, mut := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+			if rec.Outcome != GroomingOutcomeSkipped {
+				t.Fatalf("record = %+v, want skipped", rec)
+			}
+			if rec.SkipReason != tc.want {
+				t.Fatalf("SkipReason = %q, want %q", rec.SkipReason, tc.want)
+			}
+			// COMMITTED STATE: neither ordering may dispatch.
+			if len(mut.calls) != 0 {
+				t.Errorf("mutator recorded %d dispatches, want 0: %+v", len(mut.calls), mut.calls)
+			}
+		})
+	}
+}
+
+// TestGroomingApply_NonDelegationLabelsUnaffected is the NARROWNESS control: an
+// ordinary clerical label set still applies exactly as before. A future
+// over-broad predicate (e.g. one widened to any `:`-bearing label) reddens here
+// — the regression direction this change could plausibly take.
+func TestGroomingApply_NonDelegationLabelsUnaffected(t *testing.T) {
+	e := tierHygieneEntry(1, "area:backend", "phase:alpha")
+	rec, mut := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+	if rec.Outcome != GroomingOutcomeApplied {
+		t.Fatalf("record = %+v, want applied — rule 8 must not touch a non-tier label set", rec)
+	}
+	if len(mut.calls) != 1 {
+		t.Fatalf("mutator recorded %d dispatches, want exactly 1: %+v", len(mut.calls), mut.calls)
+	}
+	if !equalStrings(mut.calls[0].After.List, []string{"area:backend", "phase:alpha"}) {
+		t.Errorf("dispatched labels = %+v, want the clerical set unchanged", mut.calls[0].After)
+	}
+}
+
+// TestGroomingApply_DelegationTierRefusalLeavesBaselineUnaffected pins the churn
+// half of AC4 at the record level: the refused entry settles as `skipped`, never
+// `applied`, so it never enters the churn guard's decided-and-applied baseline
+// and correctly RESURFACES on the next grooming run for the human to decide.
+func TestGroomingApply_DelegationTierRefusalLeavesBaselineUnaffected(t *testing.T) {
+	e := tierHygieneEntry(1, "autonomy:medium")
+	rec, _ := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+	if rec.Outcome == GroomingOutcomeApplied {
+		t.Fatalf("record outcome = %q; a refused tier proposal recorded APPLIED would enter the churn baseline and be suppressed forever", rec.Outcome)
+	}
+	if rec.Outcome != GroomingOutcomeSkipped {
+		t.Errorf("record outcome = %q, want %q", rec.Outcome, GroomingOutcomeSkipped)
+	}
+}
+
+// TestLabelsSetDelegationTier tables the exported predicate itself, including
+// the two boundaries the prose claims: a MALFORMED tier (`autonomy:critical`,
+// which ParseAutonomyLabel normalizes to "" = non-human-led) is still a tier
+// PROPOSAL and refused, and a namespace merely CONTAINING the word (`area:autonomy`)
+// is not.
+func TestLabelsSetDelegationTier(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   bool
+	}{
+		{"recognized tier", []string{"autonomy:low"}, true},
+		{"malformed tier is still a tier proposal", []string{"autonomy:critical"}, true},
+		{"leading whitespace", []string{" autonomy:low"}, true},
+		{"upper case", []string{"AUTONOMY:HIGH"}, true},
+		{"mixed set with a tier", []string{"area:backend", "autonomy:low", "phase:alpha"}, true},
+		{"namespace containing the word", []string{"area:autonomy"}, false},
+		{"no colon", []string{"autonomy"}, false},
+		{"ordinary clerical label", []string{"phase:alpha"}, false},
+		{"empty label", []string{""}, false},
+		{"nil set", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LabelsSetDelegationTier(tc.labels); got != tc.want {
+				t.Errorf("LabelsSetDelegationTier(%q) = %v, want %v", tc.labels, got, tc.want)
+			}
+		})
+	}
 }

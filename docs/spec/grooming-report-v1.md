@@ -84,7 +84,10 @@ have different readers:
 - **`suggested_fix`** is **prose for a human**. It is rendered at the operator
   gate and is **never** read as a mutation payload.
 - **`fix`** is the **structured mutation payload** the apply path reads. Exactly
-  the member the entry's `defect` requires is populated.
+  the member the entry's `defect` requires is populated. It is a **suggestion
+  rather than a determination**: the apply layer may refuse a proposed value on
+  containment grounds and record a named skip instead of writing it (see the
+  delegation-tier carve-out below).
 
 | `defect` | mutation kind | `fix` member | example |
 |---|---|---|---|
@@ -127,6 +130,33 @@ does not read, or carries a **blank** value is recorded as the named skip
 `no_structured_fix`; one carrying an **invalid** value is recorded
 `invalid_fix_value`. Both apply **nothing**, and neither falls back to
 `suggested_fix` — however precisely that sentence names the value.
+
+### A proposed delegation tier is never applied by a whole-report approval (#2855)
+
+A label in the **`autonomy:` delegation-tier namespace** decides whether an agent
+may drive the item at all. It is therefore **not** part of what a whole-report
+gate approval or `hygiene: {mode: auto}` authorizes — those authorize the
+clerical, reversible hygiene writes. A `fix.labels` set containing one is
+recorded as the audited skip **`delegation_tier_not_authorized`** and applies
+nothing; the record carries **every** proposed label on `after`, so the
+groomer's suggestion stays visible at the gate and the entry resurfaces on the
+next run for a human to decide.
+
+Two consequences worth stating plainly:
+
+- The refusal fails the **whole entry**, matching the invalid-label rule above:
+  an entry proposing `["area:backend", "autonomy:low", "phase:alpha"]` applies
+  **none** of the three, so the clerical halves need the human too.
+- The match is on the **name**, case-insensitively and after trimming, and is
+  deliberately broader than the tier parser: `autonomy:critical` is a malformed
+  tier but still a tier **proposal**, so it is refused rather than parsed away.
+
+The entry is still **reported** exactly as before — nothing filters it — and the
+ingest audit payload's `entry_counts` gains a **`delegation_tier_proposals`**
+key (emitted only when non-zero) so the operator can see at the gate how many
+hygiene entries propose a tier and that none of them will land. Applying one
+needs an explicit **per-entry** decision, which the per-entry disposition surface
+(#2843) will carry.
 
 **`fix` is optional and additive** within `grooming_report_v1`: an entry whose
 defect has no mechanical mutation legitimately carries none, so it is not

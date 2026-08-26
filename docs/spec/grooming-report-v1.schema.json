@@ -274,7 +274,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "item_ref", "defect", "detail"],
-      "description": "One objective, reversible structural defect on an item (charter S4).",
+      "description": "One objective, reversible structural defect on an item (charter S4). Its `fix` is a suggestion rather than a determination: the apply path may refuse a proposed value on containment grounds and record a named skip \u2014 notably a proposed `autonomy:` delegation-tier label, which no whole-report approval applies (#2855).",
       "properties": {
         "id": { "$ref": "#/$defs/entry-id" },
         "item_ref": { "$ref": "#/$defs/item-ref" },
@@ -311,7 +311,7 @@
                 "type": "string",
                 "minLength": 1
               },
-              "description": "The label names to ADD, each exactly as it must appear on the forge (e.g. `phase:alpha`). No prose, no leading verb, no trailing punctuation, and NO surrounding whitespace \u2014 the name is validated exactly as written, never trimmed first: a name carrying whitespace or a control character, beginning or ending with a punctuation/symbol rune, or longer than 50 characters is refused pre-dispatch."
+              "description": "The label names to ADD, each exactly as it must appear on the forge (e.g. `phase:alpha`). No prose, no leading verb, no trailing punctuation, and NO surrounding whitespace \u2014 the name is validated exactly as written, never trimmed first: a name carrying whitespace or a control character, beginning or ending with a punctuation/symbol rune, or longer than 50 characters is refused pre-dispatch. This label set is a suggestion rather than a determination. A label in the `autonomy:` DELEGATION-TIER namespace \u2014 the label deciding whether an agent may drive the item at all \u2014 is NEVER applied under whole-report gate approval or `hygiene: {mode: auto}`: it is recorded as an audited `delegation_tier_not_authorized` skip carrying every proposed label, and needs an explicit per-entry human decision (#2855). One such label refuses the WHOLE entry, so the clerical labels beside it do not land either."
             },
             "parent_epic": {
               "type": "string",

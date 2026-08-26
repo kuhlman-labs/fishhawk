@@ -1041,3 +1041,48 @@ func TestGroomingBasisExcludesProse(t *testing.T) {
 		t.Error("class tag missing: two classes collided on an identical payload")
 	}
 }
+
+// TestGroomingHygieneBasis_LabelOrderDoesNotChangeBasis pins the property #2855
+// AC4 actually needs: ORDER INSENSITIVITY. The same label SET emitted in a
+// DIFFERENT ORDER must fingerprint identically, so a groomer that proposes
+// [area:backend, phase:alpha] on one run and [phase:alpha, area:backend] on the
+// next is NOT treated as a new defect and re-proposed forever. That reordering
+// is the live "unstable hygiene fix value" failure mode; deriving the basis
+// twice over ONE unchanged defect is not, because groomingHygieneBasis is a
+// pure function with no map iteration and the doubled call cannot fail whatever
+// the body does (binding condition C1).
+//
+// COUNTERFACTUAL: delete `sort.Strings(labels)` from groomingHygieneBasis —
+// the single line that makes the fingerprint order-independent — and the
+// order-insensitivity assertion goes RED. Observed both directions.
+func TestGroomingHygieneBasis_LabelOrderDoesNotChangeBasis(t *testing.T) {
+	withLabels := func(labels ...string) plan.HygieneDefect {
+		d := gcHygiene("1", "missing_label_namespace", "")
+		d.Fix = &plan.HygieneFix{Labels: labels}
+		return d
+	}
+
+	// THE AC4 EVIDENCE. Same set, two emission orders — one fingerprint.
+	forward := withLabels("area:backend", "autonomy:low", "phase:alpha")
+	reversed := withLabels("phase:alpha", "autonomy:low", "area:backend")
+	if groomingHygieneBasis(forward) != groomingHygieneBasis(reversed) {
+		t.Errorf("hygiene: label ORDER changed the basis (%q vs %q); an agent re-emitting one label SET in a different order would resurface as a NEW defect every run",
+			groomingHygieneBasis(forward), groomingHygieneBasis(reversed))
+	}
+
+	// COMPANION, pinning VALUE-sensitivity in the other direction: a changed
+	// tier is a changed proposal and MUST resurface rather than being suppressed
+	// under the old fingerprint. Without this an order-blind basis (e.g. one
+	// that hashed nothing at all) would satisfy the assertion above vacuously.
+	low := withLabels("area:backend", "autonomy:low")
+	medium := withLabels("area:backend", "autonomy:medium")
+	if groomingHygieneBasis(low) == groomingHygieneBasis(medium) {
+		t.Error("hygiene: a changed delegation TIER did not change the basis; a re-tiering proposal would be suppressed under the prior run's fingerprint")
+	}
+
+	// The plan's original "derive twice over one unchanged defect and compare"
+	// probe is deliberately ABSENT: groomingHygieneBasis is a pure function with
+	// no map iteration, so that comparison cannot fail whatever the body does
+	// (binding condition C1) — and staticcheck rejects it outright as SA4000.
+	// The order-insensitivity assertion above is the AC4 evidence.
+}

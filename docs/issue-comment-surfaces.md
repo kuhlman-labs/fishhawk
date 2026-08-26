@@ -1591,9 +1591,13 @@ Notes:
   idempotence_checked}`. The name reflects the family, not the outcome; read
   `outcome` to tell a landed mutation from a containment refusal, and
   `skip_reason` (the closed set in `grooming_apply.go`: `not_approved`,
-  `mode_report_surface_only`, `destructive_not_authorized`, `already_applied`,
+  `mode_report_surface_only`, `destructive_not_authorized`,
+  `delegation_tier_not_authorized`, `already_applied`,
   `manual_placement_preserved`, `icebox_column_unavailable`, …) to tell WHICH
-  rule refused it. `grooming_apply_completed` is written once per apply with
+  rule refused it. `delegation_tier_not_authorized` (#2855) is the one an
+  operator most often needs to act on by hand: the entry proposed an `autonomy:`
+  delegation-tier label, which no whole-report approval applies, and `after`
+  carries every proposed label. `grooming_apply_completed` is written once per apply with
   `{applied, failed, skipped, applied_ids, failed_ids, skipped_ids,
   audit_errors}`. Neither write is best-effort in the silent sense: a sink
   error is collected and surfaced as a `*GroomingAuditError` after the loop, so
