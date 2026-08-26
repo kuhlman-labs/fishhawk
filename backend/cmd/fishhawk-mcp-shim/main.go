@@ -52,6 +52,14 @@ type shimFlags struct {
 	child          string
 	pollInterval   time.Duration
 	quiesceTimeout time.Duration
+
+	// Diagnostic (non-spawning) mode: --status reports every live shim's swap
+	// state; --stale-only narrows that to the stale ones and is the
+	// machine-consumable form scripts/dev keys its advisory off.
+	status     bool
+	staleOnly  bool
+	stateDir   string
+	staleGrace time.Duration
 }
 
 // parseFlags parses the shim flags from args[1:]. An empty --child resolves to
@@ -64,6 +72,10 @@ func parseFlags(args []string, stderr io.Writer) (shimFlags, error) {
 	fs.StringVar(&f.child, "child", "", "path to the fishhawk-mcp child binary (default: sibling fishhawk-mcp next to this shim)")
 	fs.DurationVar(&f.pollInterval, "poll-interval", 2*time.Second, "how often to poll the child binary for a content change")
 	fs.DurationVar(&f.quiesceTimeout, "quiesce-timeout", 30*time.Second, "how long to wait for zero in-flight requests before deferring a swap")
+	fs.BoolVar(&f.status, "status", false, "report every live shim's swap state and exit, without spawning a child or reading stdin")
+	fs.BoolVar(&f.staleOnly, "stale-only", false, "with --status: print ONLY shims whose swap is stale, and nothing at all when none are")
+	fs.StringVar(&f.stateDir, "state-dir", resolveStateDir(), "directory holding per-shim swap-state snapshots (env: "+stateDirEnv+")")
+	fs.DurationVar(&f.staleGrace, "stale-grace", 60*time.Second, "how long a pending swap must have been outstanding before it counts as stale")
 	if err := fs.Parse(args[1:]); err != nil {
 		return shimFlags{}, err
 	}
@@ -92,8 +104,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		// flag already wrote the error to stderr.
 		return exitFailure
 	}
-	_, _ = fmt.Fprintf(stderr, "fishhawk-mcp-shim: starting (git_sha=%s child=%s poll=%s quiesce=%s)\n",
-		version.GitSHA, f.child, f.pollInterval, f.quiesceTimeout)
+
+	// Diagnostic mode: report and exit. It spawns no child, reads no stdin and
+	// writes no state file — a status probe must never perturb what it reports.
+	if f.status {
+		return renderStatus(stdout, stderr, f.stateDir, f.staleOnly, f.staleGrace, time.Now)
+	}
+
+	statePath := stateFilePath(f.stateDir, os.Getpid())
+	_, _ = fmt.Fprintf(stderr, "fishhawk-mcp-shim: starting (git_sha=%s child=%s poll=%s quiesce=%s state=%s)\n",
+		version.GitSHA, f.child, f.pollInterval, f.quiesceTimeout, statePath)
 
 	ctx := context.Background()
 
@@ -105,6 +125,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	w := newWatcher(f.child)
 
 	sup := newSupervisor(child, newChild, w, clientIn, stdout, stderr, f.quiesceTimeout, terminateGrace)
+	sup.childPath = f.child
+	// The state file is a DIAGNOSTIC: a read-only or full TMPDIR must degrade it,
+	// never the proxy. Log the first failure and stay quiet after that (the hook
+	// fires every poll interval), and keep serving frames either way.
+	warned := false
+	sup.publish = func(st swapState) {
+		if err := writeState(f.stateDir, st); err != nil && !warned {
+			warned = true
+			_, _ = fmt.Fprintf(stderr, "fishhawk-mcp-shim: swap-state snapshot unavailable (%v); the proxy is unaffected\n", err)
+		}
+	}
+	defer removeState(f.stateDir, os.Getpid())
+
 	ticker := time.NewTicker(f.pollInterval)
 	defer ticker.Stop()
 	sup.tick = ticker.C

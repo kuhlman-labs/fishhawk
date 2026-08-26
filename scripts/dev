@@ -864,7 +864,7 @@ _signal_mcp_activation() {
       print "================================================================"
       ;;
     auto_swap)
-      print "bin/fishhawk-mcp rebuilt; the registered fishhawk-mcp-shim hot-swaps it automatically — no /mcp needed. Verify via a version-returning tool call reflecting the new GitSHA (#1007)."
+      print "bin/fishhawk-mcp rebuilt; the registered fishhawk-mcp-shim SHOULD hot-swap it within ~2 poll intervals. Confirm with a version-returning tool call reflecting the new GitSHA (#1007) — if it still reports the old SHA the swap did not happen (#2831): run 'bin/fishhawk-mcp-shim --status' for the reason, then /mcp."
       ;;
     none|*)
       print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
@@ -968,6 +968,97 @@ _scan_operator_worktrees() {
     class="$(_classify_worktree "$porcelain" "$is_merged" "$branch")"
     print -r -- "${class}"$'\t'"${d}"
   done
+}
+
+# How long the stale-shim probe may run before it is killed and treated as a
+# degrade. Hashing a normal binary is milliseconds; anything near this bound is
+# a pathological child_path, not a slow machine.
+_SHIM_PROBE_TIMEOUT=5
+
+# Run a command with a wall-clock bound, stdout to <outfile> and stderr
+# discarded. Returns the command's own status when it finished in time, and
+# non-zero on expiry (the command is SIGTERMed) — so a caller that degrades on
+# any non-zero status treats a hang exactly like a failure.
+#
+# zsh has no portable `timeout` (macOS ships neither timeout nor gtimeout), so
+# this is the watchdog form: background the command, background a sleeper that
+# kills it, `wait` on the command, then kill the sleeper. Polling `kill -0`
+# instead would not work — a finished-but-unwaited child is a zombie and still
+# answers signal 0, so the poll would always run the full bound.
+# Args: <seconds> <outfile> <cmd> [args...]
+_run_with_timeout() {
+  local secs="$1"; shift
+  local outfile="$1"; shift
+  "$@" >"$outfile" 2>/dev/null &
+  local cmd_pid=$!
+  ( sleep "$secs"; kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
+  local watch_pid=$!
+  local rc=0
+  wait "$cmd_pid" 2>/dev/null || rc=$?
+  kill -TERM "$watch_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
+  return "$rc"
+}
+
+# Non-fatal: warn when a registered fishhawk-mcp-shim has stopped hot-swapping
+# its child, leaving the live session on a binary that is no longer on disk
+# (#2831). Mirrors _warn_stale_worktrees' shape: strictly advisory, and every
+# degrade is SILENCE — a missing/non-executable shim binary, a non-zero probe
+# exit, or empty output all return 0 with nothing printed.
+#
+# The probe is `<shim> --status --stale-only`, which is the shim's
+# MACHINE-CONSUMABLE mode: it prints stale entries on stdout and NOTHING AT ALL
+# (either stream) when nothing is stale. Probe stderr is discarded here too, so
+# a future diagnostic that starts writing to stderr can never turn this advisory
+# into per-`up` noise.
+#
+# The probe is BOUNDED (_run_with_timeout, ${_SHIM_PROBE_TIMEOUT}s). cmd_up
+# calls this before anything else, so a probe that never returns would hang
+# `scripts/dev up`/`reload` outright rather than degrade — the one failure mode
+# an advisory must not have. The shim hashes each snapshot's child_path, an
+# untrusted path that can be a stalled network mount or a very large file; the
+# Go side refuses non-regular paths, and this bound covers the rest. Expiry is
+# treated exactly like every other degrade: silence, rc 0.
+#
+# State-dir coupling (see backend/cmd/fishhawk-mcp-shim/README.md): the probe
+# reads the DEFAULT state dir unless FISHHAWK_MCP_SHIM_STATE_DIR is set in THIS
+# process's environment, which is forwarded explicitly below. A shim registered
+# with that variable set out of scripts/dev's view writes elsewhere and the
+# advisory silently finds nothing.
+# Arg 1: path to the shim binary (argument-injected so scripts/test-dev can
+# drive every branch with stub commands).
+_warn_stale_shim() {
+  local status_cmd="${1:-}"
+  if [[ -z "$status_cmd" || ! -x "$status_cmd" ]]; then
+    return 0
+  fi
+  local -a probe_args
+  probe_args=(--status --stale-only)
+  if [[ -n "${FISHHAWK_MCP_SHIM_STATE_DIR:-}" ]]; then
+    probe_args+=(--state-dir "${FISHHAWK_MCP_SHIM_STATE_DIR}")
+  fi
+  local out="" probe_tmp=""
+  if ! probe_tmp="$(mktemp "${TMPDIR:-/tmp}/fishhawk-shim-probe.XXXXXX" 2>/dev/null)"; then
+    return 0
+  fi
+  if ! _run_with_timeout "${_SHIM_PROBE_TIMEOUT}" "$probe_tmp" "$status_cmd" "${probe_args[@]}"; then
+    rm -f "$probe_tmp"
+    return 0
+  fi
+  out="$(cat "$probe_tmp" 2>/dev/null)" || out=""
+  rm -f "$probe_tmp"
+  if [[ -z "$out" ]]; then
+    return 0
+  fi
+  print -u2 ""
+  print -u2 "warning: a fishhawk-mcp-shim has stopped hot-swapping its child (#2831):"
+  local line
+  while IFS= read -r line; do
+    if [[ -z "$line" ]]; then continue; fi
+    print -u2 "  ${line}"
+  done <<< "$out"
+  print -u2 "  the live session is on a stale fishhawk-mcp binary; run /mcp to reconnect, or '${status_cmd} --status' for the full reason."
+  return 0
 }
 
 # Non-fatal: warn when any operator worktree under the main checkout's
@@ -1446,6 +1537,7 @@ _tls_down() {
 cmd_up() {
   print "up: starting"
   _warn_stale_worktrees || true
+  _warn_stale_shim "${REPO_ROOT}/bin/fishhawk-mcp-shim" || true
   local force_all=0
   local start_deps=0
   for arg in "$@"; do

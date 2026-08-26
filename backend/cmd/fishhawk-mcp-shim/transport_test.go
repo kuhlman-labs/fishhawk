@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -261,4 +262,203 @@ func TestEndToEndCrashRespawnRealChild(t *testing.T) {
 	rig.send(`{"jsonrpc":"2.0","method":"tools/call","id":2}`)
 	rig.waitFor("-32603", 5*time.Second)                           // synthesized orphan error
 	rig.waitFor("notifications/tools/list_changed", 8*time.Second) // respawn re-established the session
+}
+
+// TestPidZeroBeforeStartLivePidAfter pins the childTransport.Pid() seam the
+// swap-state snapshot names the child by (#2831): 0 before Start (no process
+// exists yet, and a diagnostic must not invent one), the real OS pid after.
+func TestPidZeroBeforeStartLivePidAfter(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "P", "")
+
+	c := newStdioChild(childPath, io.Discard)
+	if got := c.Pid(); got != 0 {
+		t.Fatalf("Pid before Start = %d, want 0", got)
+	}
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Terminate(time.Second)
+
+	pid := c.Pid()
+	if pid <= 0 {
+		t.Fatalf("Pid after Start = %d, want a live pid", pid)
+	}
+	if !processAlive(pid) {
+		t.Fatalf("Pid %d reported by the transport is not a live process", pid)
+	}
+}
+
+// TestRunPublishesStateFileAndCleansUpOnExit drives the REAL run() wiring — a
+// real exec'd child, real pipes, the real publish hook writing through
+// writeState — and pins the producer half of the #2831 diagnostic end to end:
+// a live shim's snapshot names its own child, and the file is removed when the
+// shim shuts down cleanly (which is why a LEFTOVER file always means a shim
+// that died without returning).
+func TestRunPublishesStateFileAndCleansUpOnExit(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "S", "")
+	stateDir := filepath.Join(dir, "state")
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	outC := make(chan []byte, 32)
+	go frameReader(outR, outC)
+
+	done := make(chan int, 1)
+	go func() {
+		rc := run([]string{
+			"fishhawk-mcp-shim",
+			"--child", childPath,
+			"--state-dir", stateDir,
+			"--poll-interval", "20ms",
+		}, inR, outW, io.Discard)
+		_ = outW.Close()
+		done <- rc
+	}()
+
+	if _, err := io.WriteString(inW, initReq1+"\n"); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	select {
+	case f := <-outC:
+		if !strings.Contains(string(f), `"id":1`) {
+			t.Fatalf("init response: %q", f)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the initialize response")
+	}
+
+	statePath := stateFilePath(stateDir, os.Getpid())
+	var st swapState
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, err := os.ReadFile(statePath)
+		if err == nil && json.Unmarshal(b, &st) == nil && st.HandshakeDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state file %s never reported a completed handshake (last err %v, state %+v)", statePath, err, st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st.Schema != stateSchema {
+		t.Errorf("schema = %q, want %q", st.Schema, stateSchema)
+	}
+	if st.ChildPath != childPath {
+		t.Errorf("child_path = %q, want %q", st.ChildPath, childPath)
+	}
+	if st.ChildPid <= 0 || !processAlive(st.ChildPid) {
+		t.Errorf("child_pid = %d, want a live pid", st.ChildPid)
+	}
+	if st.ChildLaunchHash != hashOf(t, childPath) {
+		t.Errorf("child_launch_hash = %q, want the on-disk hash", st.ChildLaunchHash)
+	}
+	if st.ShimPid != os.Getpid() {
+		t.Errorf("shim_pid = %d, want %d", st.ShimPid, os.Getpid())
+	}
+
+	_ = inW.Close()
+	select {
+	case rc := <-done:
+		if rc != exitOK {
+			t.Fatalf("run = %d, want %d", rc, exitOK)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after upstream EOF")
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file was not removed on clean shutdown (stat err = %v)", err)
+	}
+}
+
+// TestRunDegradesWhenStateDirUnusable pins the diagnostic's degrade path
+// through the REAL run() wiring: with --state-dir pointing at a regular file,
+// every writeState fails, and the contract is that the DIAGNOSTIC degrades, not
+// the proxy. Two things are asserted: frames keep flowing (the initialize
+// round-trip AND a later tool call both answer), and the warning appears
+// EXACTLY ONCE no matter how many poll ticks fire — the `warned` latch in
+// main.go, which would otherwise reprint the same line every poll interval for
+// the life of the session.
+//
+// Nothing here asserts that the settle window is long ENOUGH, so a slow runner
+// can only make the once-check weaker, never red.
+func TestRunDegradesWhenStateDirUnusable(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "D", "")
+
+	// A regular FILE where the state dir should be: MkdirAll cannot proceed, so
+	// every publish fails.
+	blocked := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	outC := make(chan []byte, 32)
+	go frameReader(outR, outC)
+	logs := &syncBuf{}
+
+	done := make(chan int, 1)
+	go func() {
+		rc := run([]string{
+			"fishhawk-mcp-shim",
+			"--child", childPath,
+			"--state-dir", blocked,
+			"--poll-interval", "5ms",
+		}, inR, outW, logs)
+		_ = outW.Close()
+		done <- rc
+	}()
+
+	expect := func(want string) {
+		t.Helper()
+		select {
+		case f := <-outC:
+			if !strings.Contains(string(f), want) {
+				t.Fatalf("frame = %q, want it to contain %q", f, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for a frame containing %q (stderr: %s)", want, logs.String())
+		}
+	}
+
+	if _, err := io.WriteString(inW, initReq1+"\n"); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	expect(`"id":1`)
+
+	countWarn := func() int {
+		return strings.Count(logs.String(), "swap-state snapshot unavailable")
+	}
+	waitFor(t, func() bool { return countWarn() >= 1 })
+
+	// Let many more poll ticks fire (5ms interval), then pin the latch.
+	time.Sleep(250 * time.Millisecond)
+	if got := countWarn(); got != 1 {
+		t.Fatalf("warning printed %d times, want exactly 1 (stderr: %s)", got, logs.String())
+	}
+
+	// The proxy is unaffected: a later request still round-trips.
+	if _, err := io.WriteString(inW, `{"jsonrpc":"2.0","method":"tools/call","id":2}`+"\n"); err != nil {
+		t.Fatalf("write tool call: %v", err)
+	}
+	expect(`"marker":"D"`)
+	if got := countWarn(); got != 1 {
+		t.Fatalf("warning printed %d times after continued traffic, want exactly 1", got)
+	}
+
+	_ = inW.Close()
+	select {
+	case rc := <-done:
+		if rc != exitOK {
+			t.Fatalf("run = %d, want %d (stderr: %s)", rc, exitOK, logs.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after upstream EOF")
+	}
 }

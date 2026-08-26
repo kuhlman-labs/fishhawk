@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 // Synthesized frames the shim injects. Each carries its own trailing newline so
@@ -52,15 +56,43 @@ type supervisor struct {
 	tick    <-chan time.Time
 	swapReq <-chan []byte
 
+	// childPath is the on-disk path the child is launched from, carried only so
+	// the published snapshot can name it (the supervisor never opens it).
+	childPath string
+
+	// publish receives a snapshot on every swap-state transition and every
+	// watcher tick. nil in tests that do not care; main.go wires it to the
+	// state-file writer.
+	publish func(swapState)
+
 	// --- event-loop-owned state ---
 	inFlight      map[string]bool
-	initReq       []byte // recorded client initialize request (raw bytes)
-	initIDKey     string // id key of the recorded initialize request
-	initResp      []byte // recorded child initialize response (raw bytes)
-	handshakeDone bool   // the initialize response has flowed to the client
+	inFlightSince map[string]time.Time // written/deleted in lockstep with inFlight
+	initReq       []byte               // recorded client initialize request (raw bytes)
+	initIDKey     string               // id key of the recorded initialize request
+	initResp      []byte               // recorded child initialize response (raw bytes)
+	handshakeDone bool                 // the initialize response has flowed to the client
 
-	pendingSwapHash []byte // a swap is wanted; nil = none
-	quiesceExpired  bool   // active quiesce timed out; wait passively for idle
+	// handshakePresumed records that the initialize response was never MATCHED
+	// but the child demonstrably served results, so the swap gate presumed the
+	// handshake rather than deferring forever (#2831).
+	handshakePresumed bool
+	// servedResults counts result-bearing child responses — the evidence the
+	// presumption keys on. Error-only responses deliberately do not count.
+	servedResults int
+
+	pendingSwapHash []byte    // a swap is wanted; nil = none
+	pendingSince    time.Time // when the pending swap was armed; zero = none
+	quiesceExpired  bool      // active quiesce timed out; wait passively for idle
+
+	lastSwapAt      time.Time
+	lastSwapOutcome string
+
+	// Deferral log rate limiting: log on any change of outcome, and at most once
+	// per deferralLogInterval while the same denial persists, so stderr is
+	// neither silent nor a flood.
+	lastDeferralLogged string
+	lastDeferralLogAt  time.Time
 
 	replayN     int
 	backoffCur  time.Duration
@@ -81,6 +113,7 @@ func newSupervisor(child childTransport, newChild func() childTransport, w *watc
 		sleep:          time.Sleep,
 		now:            time.Now,
 		inFlight:       map[string]bool{},
+		inFlightSince:  map[string]time.Time{},
 		backoffCur:     backoffBase,
 	}
 }
@@ -95,8 +128,10 @@ func (s *supervisor) run(ctx context.Context) error {
 	if s.watcher != nil {
 		s.watcher.setBaseline(s.child.LaunchHash())
 	}
+	s.publishState("")
 
 	for {
+		fromTick := false
 		select {
 		case frame, ok := <-s.clientIn:
 			if !ok {
@@ -109,15 +144,22 @@ func (s *supervisor) run(ctx context.Context) error {
 		case err := <-s.child.Exited():
 			s.handleCrash(ctx, err)
 		case <-s.tick:
+			fromTick = true
 			if s.watcher != nil {
 				if changed, h := s.watcher.step(); changed {
-					s.pendingSwapHash = h
+					s.armSwap(h)
 				}
 			}
+			// Publish on EVERY tick, not only on a swap transition: a swap parked in
+			// the passive-wait arm returns without changing any state, so without
+			// this the snapshot's updated_at would freeze while a leaked in-flight
+			// request holds the swap off indefinitely. maybeSwap below then
+			// overwrites the outcome with the current deferral reason.
+			s.publishState("")
 		case h := <-s.swapReq:
-			s.pendingSwapHash = h
+			s.armSwap(h)
 		}
-		s.maybeSwap(ctx)
+		s.maybeSwap(ctx, fromTick)
 	}
 }
 
@@ -133,6 +175,7 @@ func (s *supervisor) handleUpstream(frame []byte) {
 	if isReq {
 		key = p.idKey()
 		s.inFlight[key] = true
+		s.inFlightSince[key] = s.now()
 	}
 	if err := s.child.Send(frame); err != nil {
 		// The child's stdin is broken — it may have closed stdin yet still be
@@ -144,6 +187,7 @@ func (s *supervisor) handleUpstream(frame []byte) {
 		s.logf("send to child failed: %v; terminating for respawn", err)
 		if isReq {
 			delete(s.inFlight, key)
+			delete(s.inFlightSince, key)
 			s.sendClient(orphanError(key))
 		}
 		s.child.Terminate(s.grace)
@@ -165,6 +209,14 @@ func (s *supervisor) handleDownstream(frame []byte) {
 	if p.isResponse() {
 		key := p.idKey()
 		delete(s.inFlight, key)
+		delete(s.inFlightSince, key)
+		if p.hasResult() {
+			// Evidence the child completed a request successfully. An MCP server
+			// answers with a result only after the initialize lifecycle completed,
+			// so this is what lets swapGate presume a handshake it never MATCHED.
+			// Error-only responses deliberately do not count.
+			s.servedResults++
+		}
 		if !s.handshakeDone && key == s.initIDKey && s.initReq != nil {
 			s.initResp = cloneBytes(frame)
 			s.handshakeDone = true
@@ -173,14 +225,85 @@ func (s *supervisor) handleDownstream(frame []byte) {
 	s.sendClient(frame)
 }
 
-// maybeSwap advances a pending swap if one is armed and the handshake is
-// complete (a pre-handshake swap is deferred by construction — this returns
-// early until handshakeDone). It engages the admission barrier at the instant
-// in-flight reaches zero: while quiescing and swapping it never reads clientIn,
-// so incoming client frames wait in the channel and are flushed to the NEW
-// child only after the replayed handshake completes.
-func (s *supervisor) maybeSwap(ctx context.Context) {
-	if s.pendingSwapHash == nil || !s.handshakeDone {
+// armSwap records a wanted swap and stamps when it was armed. pending_since is
+// what lets a reader distinguish a swap legitimately in progress from one that
+// has been stuck for hours (#2831); it is set once per pending swap and cleared
+// when the swap completes or is cancelled.
+func (s *supervisor) armSwap(h []byte) {
+	s.pendingSwapHash = h
+	if s.pendingSince.IsZero() {
+		s.pendingSince = s.now()
+	}
+}
+
+// swapGate decides whether a pending swap may proceed, and names the reason
+// when it may not. Four arms:
+//
+//   - handshake done                       → allow;
+//   - handshake NOT observed but an initialize IS recorded and the child has
+//     demonstrably served results          → PRESUME the handshake and allow;
+//   - no initialize recorded at all        → deny (nothing to replay: a fresh
+//     child would never be initialized and the client's session would break on
+//     its next tool call, so this is the one path that refuses and says why);
+//   - handshake not observed, no evidence  → deny (the pre-handshake deferral
+//     the design deliberately keeps).
+//
+// The presumption sets handshakeDone as well as handshakePresumed, and that is
+// load-bearing: it makes spawnAndReplay take the FULL replay arm (synthetic id,
+// response swallowed) instead of the pre-handshake arm, which re-sends the
+// ORIGINAL initialize verbatim and would deliver a SECOND response under the
+// client's own JSON-RPC id — corrupting the session on every presumed swap. It
+// also retires the never-matched initialize from in-flight accounting, without
+// which the gate would open onto a permanently non-empty in-flight set and the
+// swap would simply defer forever one arm later instead.
+func (s *supervisor) swapGate() (bool, string) {
+	if s.handshakeDone {
+		return true, ""
+	}
+	if s.initReq == nil {
+		return false, outcomeDeferredNoInitialize
+	}
+	if s.servedResults < handshakeEvidenceThreshold {
+		return false, outcomeDeferredHandshakeNotSeen
+	}
+	s.handshakePresumed = true
+	s.handshakeDone = true
+	// Retire the recorded initialize from in-flight accounting. handleUpstream
+	// registers it like any other request, and handleDownstream can only clear it
+	// by MATCHING its id — which by construction never happened on this path, so
+	// the entry leaks. An MCP server answers a request with a result only after
+	// the initialize lifecycle completes, so the response either already flowed
+	// under an id the shim could not match or is never coming; either way the
+	// entry is an accounting artifact, not real outstanding work. Left in place it
+	// hands maybeSwap a permanently non-empty in-flight set, which parks every
+	// swap in the deferred_in_flight passive wait — the same forever-deferral this
+	// presumption exists to end. Dropped from accounting ONLY: no orphan error is
+	// synthesized, because the full replay re-establishes the session and the
+	// client has already received whatever the child sent under its own id.
+	if s.initIDKey != "" {
+		delete(s.inFlight, s.initIDKey)
+		delete(s.inFlightSince, s.initIDKey)
+	}
+	s.logf("initialize response never matched, but the child has served %d result(s); presuming the handshake and allowing the swap (#2831)", s.servedResults)
+	return true, ""
+}
+
+// maybeSwap advances a pending swap if one is armed and the swap gate allows
+// it. It engages the admission barrier at the instant in-flight reaches zero:
+// while quiescing and swapping it never reads clientIn, so incoming client
+// frames wait in the channel and are flushed to the NEW child only after the
+// replayed handshake completes. Every path that declines to swap RECORDS why —
+// in the published snapshot and in a rate-limited log line — so a shim that has
+// stopped swapping is never silent about it (#2831).
+//
+// fromTick reports whether this re-entry came from a watcher tick rather than a
+// proxied frame; the passive-wait arm below is the one path that keys off it.
+func (s *supervisor) maybeSwap(ctx context.Context, fromTick bool) {
+	if s.pendingSwapHash == nil {
+		return
+	}
+	if allow, outcome := s.swapGate(); !allow {
+		s.noteDeferral(outcome, s.deferralMessage(outcome))
 		return
 	}
 	if len(s.inFlight) == 0 {
@@ -190,6 +313,17 @@ func (s *supervisor) maybeSwap(ctx context.Context) {
 	if s.quiesceExpired {
 		// Passive wait: swap on the next in-flight==0 transition, handled when a
 		// future downstream response empties inFlight and re-enters maybeSwap.
+		// Republish so the snapshot stays fresh while the wait lasts — this arm
+		// changes no state, so nothing else would refresh it — but ONLY on a
+		// watcher tick. maybeSwap re-enters after EVERY select branch, so
+		// republishing unconditionally would be one atomic temp-create+rename per
+		// proxied frame for as long as a long-lived request holds the swap off:
+		// I/O amplification bounded only by the client's frame rate. The tick
+		// fires on a fixed interval regardless of traffic, so gating on it costs
+		// no freshness.
+		if fromTick {
+			s.noteDeferral(outcomeDeferredInFlight, s.deferralMessage(outcomeDeferredInFlight))
+		}
 		return
 	}
 	// Active quiesce: hold upstream (do not read clientIn) and drain in-flight
@@ -204,11 +338,110 @@ func (s *supervisor) maybeSwap(ctx context.Context) {
 			return
 		case <-timeout:
 			s.quiesceExpired = true
-			s.logf("quiesce timed out after %s with %d in-flight; deferring swap to next idle", s.quiesceTimeout, len(s.inFlight))
+			s.noteDeferral(outcomeDeferredInFlight, s.deferralMessage(outcomeDeferredInFlight))
 			return
 		}
 	}
 	s.doSwap(ctx)
+}
+
+// deferralMessage renders the operator-facing reason one swap did not happen.
+// The in-flight case deliberately names the OLDEST outstanding id and its age:
+// that is the single fact that turns "the swap is stuck" into "request 42 has
+// been open for 3h".
+func (s *supervisor) deferralMessage(outcome string) string {
+	switch outcome {
+	case outcomeDeferredNoInitialize:
+		return "swap deferred: no client initialize was ever recorded, so a fresh child could not be handshaked; run /mcp to reconnect (#2831)"
+	case outcomeDeferredHandshakeNotSeen:
+		return "swap deferred: the initialize response has not been observed and the child has served no results yet"
+	case outcomeDeferredInFlight:
+		id, since := s.oldestInFlight()
+		age := time.Duration(0)
+		if !since.IsZero() {
+			age = s.now().Sub(since)
+		}
+		return fmt.Sprintf("swap deferred: quiesce timeout %s elapsed with %d in-flight (oldest id %s, age %s); swapping at the next idle — in-flight requests are never force-orphaned",
+			s.quiesceTimeout, len(s.inFlight), id, age.Truncate(time.Second))
+	default:
+		return "swap deferred: " + outcome
+	}
+}
+
+// noteDeferral publishes the deferral snapshot on EVERY call (the
+// operator-readable channel must stay fresh even when the log is quiet) and
+// logs on any change of outcome or at most once per deferralLogInterval while
+// the same denial persists.
+func (s *supervisor) noteDeferral(outcome, msg string) {
+	s.publishState(outcome)
+	now := s.now()
+	if outcome != s.lastDeferralLogged || s.lastDeferralLogAt.IsZero() || now.Sub(s.lastDeferralLogAt) >= deferralLogInterval {
+		s.logf("%s", msg)
+		s.lastDeferralLogged = outcome
+		s.lastDeferralLogAt = now
+	}
+}
+
+// oldestInFlight returns the id and start time of the longest-outstanding
+// in-flight request, or ("", zero) when nothing is in flight. Ties break on the
+// id so the reported value is deterministic.
+func (s *supervisor) oldestInFlight() (string, time.Time) {
+	var id string
+	var at time.Time
+	for k, t := range s.inFlightSince {
+		if at.IsZero() || t.Before(at) || (t.Equal(at) && k < id) {
+			id, at = k, t
+		}
+	}
+	return id, at
+}
+
+// snapshot builds the publishable swap-state view from event-loop-owned state.
+// It is called only from the event loop, so it needs no locking.
+func (s *supervisor) snapshot() swapState {
+	st := swapState{
+		Schema:            stateSchema,
+		ShimPid:           os.Getpid(),
+		ShimGitSHA:        version.GitSHA,
+		ChildPath:         s.childPath,
+		HandshakeDone:     s.handshakeDone,
+		HandshakePresumed: s.handshakePresumed,
+		ServedResults:     s.servedResults,
+		InFlight:          len(s.inFlight),
+		QuiesceExpired:    s.quiesceExpired,
+		LastSwapOutcome:   s.lastSwapOutcome,
+		UpdatedAt:         s.now().UTC().Format(time.RFC3339),
+	}
+	if s.child != nil {
+		st.ChildPid = s.child.Pid()
+		st.ChildLaunchHash = hex.EncodeToString(s.child.LaunchHash())
+	}
+	if s.pendingSwapHash != nil {
+		st.PendingSwapHash = hex.EncodeToString(s.pendingSwapHash)
+	}
+	if !s.pendingSince.IsZero() {
+		st.PendingSince = s.pendingSince.UTC().Format(time.RFC3339)
+	}
+	if !s.lastSwapAt.IsZero() {
+		st.LastSwapAt = s.lastSwapAt.UTC().Format(time.RFC3339)
+	}
+	if id, at := s.oldestInFlight(); id != "" {
+		st.OldestInFlightID = id
+		st.OldestInFlightSince = at.UTC().Format(time.RFC3339)
+	}
+	return st
+}
+
+// publishState records the outcome (an empty outcome keeps the previous one)
+// and hands a fresh snapshot to the publish hook, if one is wired.
+func (s *supervisor) publishState(outcome string) {
+	if outcome != "" {
+		s.lastSwapOutcome = outcome
+	}
+	if s.publish == nil {
+		return
+	}
+	s.publish(s.snapshot())
 }
 
 // doSwap terminates the running child and brings up the new binary through the
@@ -216,7 +449,10 @@ func (s *supervisor) maybeSwap(ctx context.Context) {
 func (s *supervisor) doSwap(ctx context.Context) {
 	newHash := s.pendingSwapHash
 	s.pendingSwapHash = nil
+	s.pendingSince = time.Time{}
 	s.quiesceExpired = false
+	s.lastDeferralLogged = ""
+	s.lastDeferralLogAt = time.Time{}
 	s.logf("child content changed; quiesced at 0 in-flight, swapping")
 	old := s.child
 	old.Terminate(s.grace)
@@ -226,6 +462,8 @@ func (s *supervisor) doSwap(ctx context.Context) {
 	// unreaped process. Draining to exit makes that structurally impossible.
 	s.drainOldChild(old)
 	s.spawnAndReplay(ctx, newHash)
+	s.lastSwapAt = s.now()
+	s.publishState(outcomeSwapped)
 }
 
 // drainOldChild discards frames from a terminated child until it exits, so a
@@ -254,6 +492,7 @@ func (s *supervisor) handleCrash(ctx context.Context, err error) {
 	s.reapCrash(err)
 	s.applyCrashBackoff()
 	s.spawnAndReplay(ctx, nil)
+	s.publishState(outcomeCrashRespawn)
 }
 
 // reapCrash answers every in-flight request with a synthesized JSON-RPC error so
@@ -273,7 +512,9 @@ func (s *supervisor) reapCrash(err error) {
 		s.sendClient(orphanError(id))
 	}
 	s.inFlight = map[string]bool{}
+	s.inFlightSince = map[string]time.Time{}
 	s.pendingSwapHash = nil
+	s.pendingSince = time.Time{}
 	s.quiesceExpired = false
 }
 
@@ -504,6 +745,14 @@ func (p rpcPeek) method() string {
 
 func (p rpcPeek) hasID() bool {
 	t := bytes.TrimSpace(p.ID)
+	return len(t) > 0 && !bytes.Equal(t, []byte("null"))
+}
+
+// hasResult reports whether the frame carries a non-null result member — a
+// SUCCESSFUL response. An error-only response is not evidence that the child
+// completed a request, so it must not count toward the handshake presumption.
+func (p rpcPeek) hasResult() bool {
+	t := bytes.TrimSpace(p.Result)
 	return len(t) > 0 && !bytes.Equal(t, []byte("null"))
 }
 

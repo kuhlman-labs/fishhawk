@@ -52,14 +52,27 @@ else
   fail "reconnect banner should keep the ACTION REQUIRED fishhawk-mcp reconnect text (got: $out)"
 fi
 
-# auto_swap: a single line naming automatic swap + GitSHA verification, and it
-# must NOT carry the manual ACTION REQUIRED nag (the shim swaps automatically).
+# auto_swap: a single line naming the EXPECTED swap + the GitSHA check that
+# confirms or refutes it, and it must NOT carry the manual ACTION REQUIRED nag
+# (the shim swaps automatically). Since #2831 it must also NOT assert the swap
+# as an accomplished fact — scripts/dev cannot observe the harness-owned shim,
+# so a false "no /mcp needed" is exactly the silent-stale trap this closes.
 out="$(_signal_mcp_activation auto_swap)"
-if print -r -- "$out" | grep -qi 'hot-swaps' && print -r -- "$out" | grep -q 'GitSHA' \
+if print -r -- "$out" | grep -qi 'hot-swap' && print -r -- "$out" | grep -q 'GitSHA' \
    && ! print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
   pass "auto_swap note names automatic swap + GitSHA and omits ACTION REQUIRED"
 else
   fail "auto_swap note should name automatic swap + GitSHA and omit ACTION REQUIRED (got: $out)"
+fi
+if print -r -- "$out" | grep -q -- '/mcp' && print -r -- "$out" | grep -q -- '--status'; then
+  pass "auto_swap note names the /mcp fallback and the --status diagnostic"
+else
+  fail "auto_swap note should name the /mcp fallback and --status (got: $out)"
+fi
+if ! print -r -- "$out" | grep -qi 'no /mcp needed'; then
+  pass "auto_swap note does not claim the swap already happened"
+else
+  fail "auto_swap note must state the EXPECTATION, not the accomplished fact (got: $out)"
 fi
 if [[ "$(print -r -- "$out" | grep -c .)" == 1 ]]; then
   pass "auto_swap note is a single line"
@@ -2176,12 +2189,172 @@ fi
 rm -rf "$prune_dry"
 rm -rf "$prune_repo"
 
+# 18b. _warn_stale_shim (#2831): stub-driven branches for every degrade, plus
+# the stderr case and the bounded-probe case.
+# The probe is a MACHINE-CONSUMABLE mode, so anything other than non-empty stdout
+# must produce total silence — including output the probe wrote to STDERR, which
+# on a dev box that has ever run a shim is the COMMON case (dead-pid leftover
+# state files persist forever when a shim is SIGKILLed).
+shim_stub_dir="$(mktemp -d)"
+
+# (a) stale output on stdout -> a warning naming the pid text and /mcp.
+cat > "${shim_stub_dir}/stale" <<'STUB'
+#!/bin/sh
+echo "STALE: shim pid 4242 (git_sha=abc1234)"
+echo "  child pid 918273  path /tmp/bin/fishhawk-mcp"
+STUB
+chmod +x "${shim_stub_dir}/stale"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/stale" 2>&1)"; shim_rc=$?
+if [[ "$shim_out" == *"4242"* ]] && print -r -- "$shim_out" | grep -q -- '/mcp' && (( shim_rc == 0 )); then
+  pass "_warn_stale_shim warns (naming the pid and /mcp) on stale probe output"
+else
+  fail "_warn_stale_shim should warn naming the pid and /mcp (out: $shim_out rc: $shim_rc)"
+fi
+
+# (b) empty stdout -> silence.
+cat > "${shim_stub_dir}/clean" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "${shim_stub_dir}/clean"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/clean" 2>&1)"; shim_rc=$?
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
+  pass "_warn_stale_shim: empty probe output degrades to silence (rc 0)"
+else
+  fail "_warn_stale_shim should be silent+rc0 on empty output (out: $shim_out rc: $shim_rc)"
+fi
+
+# (c) probe exits non-zero -> silence (even with output).
+cat > "${shim_stub_dir}/broken" <<'STUB'
+#!/bin/sh
+echo "some output"
+exit 3
+STUB
+chmod +x "${shim_stub_dir}/broken"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/broken" 2>&1)"; shim_rc=$?
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
+  pass "_warn_stale_shim: non-zero probe exit degrades to silence (rc 0)"
+else
+  fail "_warn_stale_shim should be silent+rc0 when the probe fails (out: $shim_out rc: $shim_rc)"
+fi
+
+# (d) probe exits ZERO, prints NOTHING to stdout and DOES print to stderr ->
+# total silence. Neither (b) nor (c) can catch this: the advisory captures only
+# stdout, so probe stderr would otherwise reach the operator's terminal on every
+# `scripts/dev up` while nothing at all is stale.
+cat > "${shim_stub_dir}/noisy_stderr" <<'STUB'
+#!/bin/sh
+echo "skipped /tmp/fishhawk-mcp-shim/999.json: shim pid 999 is not running" >&2
+exit 0
+STUB
+chmod +x "${shim_stub_dir}/noisy_stderr"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/noisy_stderr" 2>&1)"; shim_rc=$?
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
+  pass "_warn_stale_shim: probe stderr never reaches the operator (total silence)"
+else
+  fail "_warn_stale_shim must swallow probe stderr (out: $shim_out rc: $shim_rc)"
+fi
+
+# (d2) probe that never returns -> the advisory must NOT hang. cmd_up calls this
+# before anything else, so an unbounded probe hangs `scripts/dev up`/`reload`
+# outright — the one failure mode an advisory must not have. The shim hashes each
+# snapshot's untrusted child_path, which can be a stalled mount or a huge file.
+# Case (b)/(c)/(d) cannot catch this: they all RETURN.
+cat > "${shim_stub_dir}/hangs" <<'STUB'
+#!/bin/sh
+echo "STALE: shim pid 4242"
+sleep 600
+STUB
+chmod +x "${shim_stub_dir}/hangs"
+# NB: as in case (g), an assignment prefix on an ASSIGNMENT is not a command
+# prefix in zsh — it would persist into case (d3) below and race its 1s stub — so
+# set and restore the bound explicitly.
+hang_saved="$_SHIM_PROBE_TIMEOUT"
+_SHIM_PROBE_TIMEOUT=1
+hang_start=$SECONDS
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/hangs" 2>&1)"; shim_rc=$?
+hang_elapsed=$(( SECONDS - hang_start ))
+_SHIM_PROBE_TIMEOUT="$hang_saved"
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]] && (( hang_elapsed < 15 )); then
+  pass "_warn_stale_shim: a hanging probe is bounded and degrades to silence (${hang_elapsed}s)"
+else
+  fail "_warn_stale_shim must bound the probe and stay silent (out: $shim_out rc: $shim_rc elapsed: ${hang_elapsed}s)"
+fi
+
+# (d3) the bound must not clip a probe that answers in time — otherwise (d2)
+# would pass with a timeout of zero and the advisory would never warn at all.
+cat > "${shim_stub_dir}/slow_ok" <<'STUB'
+#!/bin/sh
+sleep 1
+echo "STALE: shim pid 4242"
+STUB
+chmod +x "${shim_stub_dir}/slow_ok"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/slow_ok" 2>&1)"; shim_rc=$?
+if [[ "$shim_out" == *"4242"* ]] && (( shim_rc == 0 )); then
+  pass "_warn_stale_shim: a probe that answers within the bound still warns"
+else
+  fail "_warn_stale_shim clipped an in-time probe (out: $shim_out rc: $shim_rc)"
+fi
+
+# (e) missing binary -> silence, rc 0.
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/does-not-exist" 2>&1)"; shim_rc=$?
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
+  pass "_warn_stale_shim: missing shim binary degrades to silence (rc 0)"
+else
+  fail "_warn_stale_shim should be silent+rc0 with no shim binary (out: $shim_out rc: $shim_rc)"
+fi
+
+# (f) a non-executable file is not probed either.
+: > "${shim_stub_dir}/not-exec"
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/not-exec" 2>&1)"; shim_rc=$?
+if [[ -z "$shim_out" && "$shim_rc" -eq 0 ]]; then
+  pass "_warn_stale_shim: non-executable path degrades to silence (rc 0)"
+else
+  fail "_warn_stale_shim should be silent+rc0 for a non-executable path (out: $shim_out rc: $shim_rc)"
+fi
+
+# (g) the FISHHAWK_MCP_SHIM_STATE_DIR coupling: when the variable is set in this
+# process's environment it is forwarded to the probe as --state-dir, so a
+# custom-dir registration scripts/dev CAN see is still covered.
+cat > "${shim_stub_dir}/echo_args" <<'STUB'
+#!/bin/sh
+echo "STALE args: $*"
+STUB
+chmod +x "${shim_stub_dir}/echo_args"
+# NB: an assignment prefix on an ASSIGNMENT is not a command prefix in zsh — it
+# would persist into the next case — so set and unset it explicitly.
+export FISHHAWK_MCP_SHIM_STATE_DIR=/tmp/custom-state
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/echo_args" 2>&1)"
+unset FISHHAWK_MCP_SHIM_STATE_DIR
+if [[ "$shim_out" == *"--state-dir /tmp/custom-state"* ]]; then
+  pass "_warn_stale_shim forwards FISHHAWK_MCP_SHIM_STATE_DIR to the probe"
+else
+  fail "_warn_stale_shim should forward the state-dir override (out: $shim_out)"
+fi
+shim_out="$(_warn_stale_shim "${shim_stub_dir}/echo_args" 2>&1)"
+if [[ "$shim_out" != *"--state-dir"* ]]; then
+  pass "_warn_stale_shim omits --state-dir when no override is set"
+else
+  fail "_warn_stale_shim should not pass --state-dir without an override (out: $shim_out)"
+fi
+rm -rf "$shim_stub_dir"
+
 # 19. Body-greps: cmd_up -> _warn_stale_worktrees, cmd_sweep wiring, dispatch, usage.
 up_body="$(typeset -f cmd_up)"
 if print -r -- "$up_body" | grep -q '_warn_stale_worktrees'; then
   pass "cmd_up invokes _warn_stale_worktrees"
 else
   fail "cmd_up should invoke _warn_stale_worktrees"
+fi
+if print -r -- "$up_body" | grep -q '_warn_stale_shim'; then
+  pass "cmd_up invokes _warn_stale_shim"
+else
+  fail "cmd_up should invoke _warn_stale_shim (#2831)"
+fi
+if print -r -- "$up_body" | grep -q 'bin/fishhawk-mcp-shim'; then
+  pass "cmd_up points the stale-shim probe at bin/fishhawk-mcp-shim"
+else
+  fail "cmd_up should probe \${REPO_ROOT}/bin/fishhawk-mcp-shim"
 fi
 sweep_body="$(typeset -f cmd_sweep)"
 if print -r -- "$sweep_body" | grep -q 'cleanup-merged'; then
