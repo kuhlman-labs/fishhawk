@@ -194,6 +194,34 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		time.Sleep(500 * time.Millisecond)
+	case "wait_poll_tail":
+		// Emit many identical WAIT-POLL Bash calls: the verbatim signature
+		// from run 3490416b, an agent polling a backgrounded
+		// `scripts/test verify` log (#2758). Every poll is byte-identical
+		// AND its observed output is identical (absent) — reproducing
+		// exactly the window in which the stage was killed, so an
+		// observation-diffing implementation could not survive this
+		// fixture either. The wait tier must hold it well above the base
+		// threshold; a clean result follows so the stage succeeds.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"tail -2 /tmp/verify-2591.log","description":"Check verify progress"}}]}}`)
+			os.Stdout.Sync()
+			time.Sleep(2 * time.Millisecond)
+		}
+		fmt.Println(`{"type":"result","usage":{"input_tokens":5,"output_tokens":5}}`)
+	case "frozen_wait_poll":
+		// The same wait-poll signature, but from a PERMANENTLY frozen
+		// poller: it never produces a result. The wait tier is a raised
+		// bound, not an exemption, so a low WaitPollThreshold must still
+		// trip. The trailing sleep lets the harness kill us after it trips.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"tail -2 /tmp/verify-2591.log","description":"Check verify progress"}}]}}`)
+			os.Stdout.Sync()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(500 * time.Millisecond)
 	case "varied_tools":
 		// Distinct tool calls (different files / commands) interleaved with
 		// a couple of legitimate repeats — must NOT trip the detector. Ends
@@ -1513,6 +1541,11 @@ func TestInvoke_LoopDetected(t *testing.T) {
 		Cmd:           helperCommand("loop"),
 		Now:           frozenNow(),
 		LoopThreshold: 4,
+		// A deliberately HIGH wait threshold makes this test
+		// DISCRIMINATING for the #2758 tier: if `go test ./...` were
+		// misclassified as a wait-poll it would be held to 1000 and this
+		// test would go red rather than passing incidentally.
+		WaitPollThreshold: 1000,
 	}
 	res, err := inv.Invoke(context.Background(), agent.Invocation{
 		RunID: "rid-loop", Stage: "implement", Prompt: "go",
@@ -1535,6 +1568,9 @@ func TestInvoke_LoopDetected(t *testing.T) {
 	if !strings.Contains(res.FailureReason, "4 identical") {
 		t.Errorf("FailureReason = %q, want it to name the count (4)", res.FailureReason)
 	}
+	if strings.Contains(res.FailureReason, "wait-poll") {
+		t.Errorf("FailureReason = %q, must not name the wait-poll tier for a non-wait loop", res.FailureReason)
+	}
 	var loopEvents int
 	for _, ev := range res.Events {
 		if ev.Kind == "loop_detected" {
@@ -1544,6 +1580,13 @@ func TestInvoke_LoopDetected(t *testing.T) {
 			}
 			if !strings.Contains(string(ev.Payload), `"run_id":"rid-loop"`) {
 				t.Errorf("loop_detected payload missing run_id: %s", ev.Payload)
+			}
+			// The base tier is reported as such (#2758).
+			if !strings.Contains(string(ev.Payload), `"wait_poll":false`) {
+				t.Errorf("loop_detected payload missing wait_poll:false: %s", ev.Payload)
+			}
+			if !strings.Contains(string(ev.Payload), `"threshold":4`) {
+				t.Errorf("loop_detected payload missing threshold:4: %s", ev.Payload)
 			}
 		}
 	}
@@ -2060,5 +2103,308 @@ func TestIsQuotaUnavailable(t *testing.T) {
 					tc.waitErr, tc.tokens, tc.model, tc.elapsed, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestIsWaitPoll is the pure-predicate table for the #2758 wait-poll tier.
+// It carries one case per NAMED accept and reject mode, because the
+// predicate is what decides whether a signature is held to the base
+// threshold or the much higher wait threshold — a false accept is the only
+// way a mutating command reaches the higher limit.
+func TestIsWaitPoll(t *testing.T) {
+	cases := []struct {
+		name string
+		sig  string
+		want bool
+	}{
+		// ---- accept ----
+		{
+			// The verbatim signature from run 3490416b (#2758).
+			name: "issue_verbatim_tail_poll",
+			sig:  `Bash {"command":"tail -2 /tmp/verify-2591.log","description":"Check verify progress"}`,
+			want: true,
+		},
+		{
+			// BashOutput is definitionally an await of a backgrounded command.
+			name: "bash_output_tool",
+			sig:  `BashOutput {"bash_id":"abc123"}`,
+			want: true,
+		},
+		{
+			name: "sleep_then_tail_chain",
+			sig:  `Bash {"command":"sleep 30 && tail -2 /tmp/verify.log"}`,
+			want: true,
+		},
+		{
+			name: "pipeline_of_read_only_commands",
+			sig:  `Bash {"command":"tail -50 /tmp/verify.log | grep -c FAIL"}`,
+			want: true,
+		},
+		{
+			// Trailing separator leaves an empty segment; tolerated.
+			name: "trailing_separator",
+			sig:  `Bash {"command":"tail -2 /tmp/verify.log;"}`,
+			want: true,
+		},
+		// ---- reject ----
+		{
+			// BINDING ASSERTION (approval condition C1). `jobs -x cmd args`
+			// substitutes jobspecs and then EXECUTES cmd, so an allow-list
+			// carrying `jobs` would wait-class a call that deletes a tree.
+			// This case is the regression pin for the CLASS — an argv[0]
+			// allow-list cannot express "this command in a read-only mode" —
+			// and must stay green if anyone ever re-adds `jobs`.
+			name: "jobs_dash_x_executes_and_is_not_wait",
+			sig:  `Bash {"command":"jobs -x rm -rf x"}`,
+			want: false,
+		},
+		{
+			// C1(b): GNU `date -s` / BSD `date <time>` set the system clock.
+			name: "date_can_set_the_clock_and_is_not_wait",
+			sig:  `Bash {"command":"date -s 2020-01-01"}`,
+			want: false,
+		},
+		{
+			// `pgrep`, `pkill` and `pidwait` are one procps-ng binary with
+			// one shared manual page, and `--signal` is in the option set
+			// that page documents for the family — so this call can
+			// terminate every matched process while carrying no newline,
+			// redirect, backtick, `$` or bare `&`. Same CLASS as the `jobs`
+			// case above: an allow-listed NAME carries every mode it has,
+			// and `pgrep` was admitted on the (wrong) reasoning that the
+			// signalling variant is only `pkill`. Regression pin — must
+			// stay green if anyone ever re-adds `pgrep`.
+			name: "pgrep_signal_can_kill_and_is_not_wait",
+			sig:  `Bash {"command":"pgrep --signal KILL pattern"}`,
+			want: false,
+		},
+		{
+			// The consequence of the removal above: `pgrep` in ANY mode is
+			// no longer wait-classed, because the allow-list cannot
+			// distinguish its modes. `ps` and BashOutput cover the need.
+			name: "plain_pgrep_not_wait",
+			sig:  `Bash {"command":"pgrep -f scripts/test"}`,
+			want: false,
+		},
+		{
+			// Redirection mutates: `cat x > y` writes a file.
+			name: "redirect_not_wait",
+			sig:  `Bash {"command":"cat /tmp/a.log > /tmp/b.log"}`,
+			want: false,
+		},
+		{
+			name: "input_redirect_not_wait",
+			sig:  `Bash {"command":"grep FAIL < /tmp/verify.log"}`,
+			want: false,
+		},
+		{
+			name: "command_substitution_not_wait",
+			sig:  `Bash {"command":"tail -2 $(echo /tmp/verify.log)"}`,
+			want: false,
+		},
+		{
+			name: "backtick_substitution_not_wait",
+			sig:  "Bash {\"command\":\"tail -2 `echo /tmp/verify.log`\"}",
+			want: false,
+		},
+		{
+			// The expansion's value is unknown at classification time.
+			name: "parameter_expansion_not_wait",
+			sig:  `Bash {"command":"tail -2 ${LOG}"}`,
+			want: false,
+		},
+		{
+			// A BARE `$VAR` is exactly as opaque as `${VAR}` above, so the
+			// `$` sigil is rejected wholesale rather than only in its
+			// digraph forms (#2758 review).
+			name: "bare_dollar_expansion_not_wait",
+			sig:  `Bash {"command":"tail -2 $LOG"}`,
+			want: false,
+		},
+		{
+			// The positional-parameter forms are the same class.
+			name: "bare_dollar_at_not_wait",
+			sig:  `Bash {"command":"tail -2 $@"}`,
+			want: false,
+		},
+		{
+			name: "background_ampersand_not_wait",
+			sig:  `Bash {"command":"tail -f /tmp/verify.log &"}`,
+			want: false,
+		},
+		{
+			// Control for the '&' rejection: '&&' is the accepted operator,
+			// so the rejection is specific to a LONE '&'.
+			name: "double_ampersand_is_accepted",
+			sig:  `Bash {"command":"test -f /tmp/verify.log && tail -2 /tmp/verify.log"}`,
+			want: true,
+		},
+		{
+			name: "newline_not_wait",
+			sig:  `Bash {"command":"tail -2 /tmp/verify.log\nrm -rf x"}`,
+			want: false,
+		},
+		{
+			name: "non_allow_listed_argv0_not_wait",
+			sig:  `Bash {"command":"go test ./..."}`,
+			want: false,
+		},
+		{
+			// EVERY segment must be allow-listed, not merely the first.
+			name: "compound_with_mutating_second_segment",
+			sig:  `Bash {"command":"tail -2 /tmp/verify.log; rm -rf x"}`,
+			want: false,
+		},
+		{
+			name: "mutating_segment_after_double_ampersand",
+			sig:  `Bash {"command":"test -f /tmp/x && truncate -s 0 /tmp/x"}`,
+			want: false,
+		},
+		{
+			name: "mutating_segment_after_pipe",
+			sig:  `Bash {"command":"cat /tmp/list | xargs rm"}`,
+			want: false,
+		},
+		{
+			// A VAR=x prefix hides the real argv[0].
+			name: "env_assignment_prefix_not_wait",
+			sig:  `Bash {"command":"LC_ALL=C grep FAIL /tmp/verify.log"}`,
+			want: false,
+		},
+		{
+			// A path-qualified binary is not the allow-listed bare name.
+			name: "path_qualified_binary_not_wait",
+			sig:  `Bash {"command":"/bin/rm -rf x"}`,
+			want: false,
+		},
+		{
+			// Even a path-qualified ALLOW-LISTED name is rejected: the path
+			// may not resolve to the command the name implies.
+			name: "path_qualified_allow_listed_name_not_wait",
+			sig:  `Bash {"command":"/usr/bin/tail -2 /tmp/verify.log"}`,
+			want: false,
+		},
+		{
+			// A tool that is neither Bash nor BashOutput, whose input merely
+			// contains a wait-poll-looking command string.
+			name: "non_bash_tool_not_wait",
+			sig:  `Read {"file_path":"tail -2 /tmp/verify.log"}`,
+			want: false,
+		},
+		{
+			// Fail-open exactly like toolCallSignatures: an unparseable
+			// input remainder yields the base-threshold behaviour.
+			name: "unparseable_input_not_wait",
+			sig:  `Bash {"command":`,
+			want: false,
+		},
+		{
+			// A Bash call with no command field at all.
+			name: "empty_command_not_wait",
+			sig:  `Bash {"description":"nothing"}`,
+			want: false,
+		},
+		{
+			// A command made only of separators has no allow-listed
+			// segment; the segment loop finds nothing to REJECT, so the
+			// empty-chain control is what refuses it.
+			name: "only_separators_not_wait",
+			sig:  `Bash {"command":";;;"}`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isWaitPoll(tc.sig); got != tc.want {
+				t.Errorf("isWaitPoll(%q) = %v, want %v", tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInvoke_WaitPollTailSurvivesBaseThreshold is the direct regression
+// reproduction of run 3490416b (#2758): 30 identical `tail -2` polls of a
+// backgrounded verify log, with the BASE threshold lowered to 4, must NOT
+// kill the stage. Every poll is byte-identical and so is its (absent)
+// observed output, so this fixture also falsifies the rejected
+// "reset on observed-output change" alternative — that design would never
+// fire during exactly this window and would still fail here.
+func TestInvoke_WaitPollTailSurvivesBaseThreshold(t *testing.T) {
+	inv := &Invoker{
+		Cmd:           helperCommand("wait_poll_tail"),
+		Now:           frozenNow(),
+		LoopThreshold: 4,
+		// WaitPollThreshold left at 0 -> agent.DefaultWaitPollThreshold (60),
+		// which the fixture's 30 polls stay under.
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-waitpoll", Stage: "implement", Prompt: "go",
+	})
+	if errors.Is(err, agent.ErrLoopDetected) {
+		t.Fatalf("a legitimate wait-poll of a backgrounded command tripped the loop detector: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; a wait-poll below the wait threshold must not fail the stage: %q", res.FailureReason)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			t.Errorf("loop_detected event emitted on a wait-poll trace: %s", ev.Payload)
+		}
+	}
+}
+
+// TestInvoke_FrozenWaitPollTripsAtWaitThreshold proves the relaxation is
+// BOUNDED rather than an exemption: the same wait-poll signature from a
+// permanently frozen poller still fails the stage category-A once the
+// configured wait threshold is reached, and the audit payload + reason name
+// the wait tier so an operator can tell the two tiers apart.
+func TestInvoke_FrozenWaitPollTripsAtWaitThreshold(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("frozen_wait_poll"),
+		Now:               frozenNow(),
+		LoopThreshold:     100,
+		WaitPollThreshold: 6,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-frozen", Stage: "implement", Prompt: "go",
+	})
+	if !errors.Is(err, agent.ErrLoopDetected) {
+		t.Fatalf("err = %v, want wrapping ErrLoopDetected (a frozen wait-poll must still trip)", err)
+	}
+	if res.OK {
+		t.Error("OK = true on a frozen wait-poll loop")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+	if !strings.Contains(res.FailureReason, "loop detected") {
+		t.Errorf("FailureReason = %q, want the existing 'loop detected' prefix", res.FailureReason)
+	}
+	if !strings.Contains(res.FailureReason, "6 identical") {
+		t.Errorf("FailureReason = %q, want it to name the count (6)", res.FailureReason)
+	}
+	if !strings.Contains(res.FailureReason, "wait-poll tool calls") {
+		t.Errorf("FailureReason = %q, want it to name the wait-poll tier", res.FailureReason)
+	}
+	var loopEvents int
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			loopEvents++
+			if !strings.Contains(string(ev.Payload), `"count":6`) {
+				t.Errorf("loop_detected payload missing count: %s", ev.Payload)
+			}
+			if !strings.Contains(string(ev.Payload), `"wait_poll":true`) {
+				t.Errorf("loop_detected payload missing wait_poll:true: %s", ev.Payload)
+			}
+			if !strings.Contains(string(ev.Payload), `"threshold":6`) {
+				t.Errorf("loop_detected payload missing threshold:6: %s", ev.Payload)
+			}
+		}
+	}
+	if loopEvents != 1 {
+		t.Errorf("loop_detected event count = %d, want 1", loopEvents)
 	}
 }

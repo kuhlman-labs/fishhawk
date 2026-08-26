@@ -119,6 +119,15 @@ type Invoker struct {
 	// flaky command a couple of times) never false-abort real work. A
 	// per-Invoker field so tests can lower it deterministically.
 	LoopThreshold int
+
+	// WaitPollThreshold is the much higher threshold applied to a streak
+	// of WAIT-POLL tool calls — an agent awaiting a long-running
+	// backgrounded command via BashOutput or a repeated read-only log
+	// inspection (see isWaitPoll, #2758). Zero means
+	// agent.DefaultWaitPollThreshold. Setting it equal to LoopThreshold
+	// collapses the two tiers back into the pre-#2758 single threshold.
+	// A per-Invoker field so tests can lower it deterministically.
+	WaitPollThreshold int
 }
 
 // New returns an Invoker configured to use the system `claude`
@@ -411,10 +420,14 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// audit reason. The detector is per-invokeOnce (not shared across
 	// thinking-block retries) because a fresh re-spawn starts a fresh
 	// action stream.
-	loopDetector := agent.NewLoopDetector(i.LoopThreshold)
+	loopDetector := agent.NewLoopDetector(i.LoopThreshold, i.WaitPollThreshold)
 	loopHit := false
 	loopSig := ""
 	loopCount := 0
+	// loopWait/loopThreshold record which TIER tripped (#2758) so the audit
+	// payload and failure reason can name it.
+	loopWait := false
+	loopThreshold := 0
 	// resultPayload retains the terminal type=="result" event so a
 	// post-mortem can inspect is_error / api_error_status for
 	// thinking-block detection (see isThinkingBlock400).
@@ -550,16 +563,25 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			if isSanctionedWaitPoll(sig) {
 				continue
 			}
-			if loopDetector.Observe(sig) {
+			// Classify the signature so an agent legitimately AWAITING a
+			// long-running backgrounded command is held to the much higher
+			// wait-poll threshold rather than killed at ~8 polls (#2758).
+			// Unlike the #1273 skip above this is not an exemption: a
+			// wait-classed streak still accumulates and still trips.
+			if loopDetector.Observe(sig, isWaitPoll(sig)) {
 				loopHit = true
 				loopSig = sig
 				loopCount = loopDetector.Streak()
+				loopWait = loopDetector.WaitPoll()
+				loopThreshold = loopDetector.EffectiveThreshold()
 				res.Events = append(res.Events, agent.Event{
 					Kind:      "loop_detected",
 					Timestamp: now(),
 					Payload: agent.MakePayload(map[string]any{
 						"signature": loopSig,
 						"count":     loopCount,
+						"wait_poll": loopWait,
+						"threshold": loopThreshold,
 						"run_id":    inv.RunID,
 						"stage":     inv.Stage,
 					}),
@@ -655,9 +677,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		// prompt would just loop again. Classified category-A so stage-level
 		// handling treats it like any other agent failure, but the sentinel
 		// is ErrLoopDetected so callers can switch on it.
+		// The reason names the TIER that tripped (#2758) so an operator can
+		// tell a base-threshold no-progress loop from a frozen wait-poll,
+		// keeping the "loop detected: " prefix and the count so existing
+		// reason-matching stays valid.
+		kind := "tool calls"
+		if loopWait {
+			kind = "wait-poll tool calls"
+		}
 		return failureResult(res, now(), "A",
-			fmt.Sprintf("loop detected: %d identical consecutive tool calls: %s",
-				loopCount, truncateSignature(loopSig)),
+			fmt.Sprintf("loop detected: %d identical consecutive %s: %s",
+				loopCount, kind, truncateSignature(loopSig)),
 			"loop_detected",
 		), false, agent.ErrLoopDetected
 
@@ -1046,6 +1076,186 @@ func isSanctionedWaitPoll(sig string) bool {
 	// wait= must be a query parameter of the scope-amendments path: the
 	// first parameter, or one introduced by '&'.
 	return strings.HasPrefix(query, "wait=") || strings.Contains(query, "&wait=")
+}
+
+// waitPollCommands is the allow-list of command names admitted by
+// isWaitPoll's read-only chain test (#2758).
+//
+// ADMISSION RULE — read this before adding an entry. A command earns a
+// place here only if it has NO DOCUMENTED MODE that executes another
+// command or mutates system state. Check that property against the
+// command's own documentation and record the check; the list is only the
+// OUTPUT of that check, and copying the list without redoing the check is
+// how the class of bug below gets re-introduced.
+//
+// The rule exists because an argv[0] allow-list cannot express "this
+// command in a read-only mode" — an allow-listed NAME carries every mode
+// that name has, including its mutating and delegating ones. Two names
+// that read as obviously-inert were rejected on exactly that ground:
+//
+//   - `jobs`: `jobs -x command [args]` substitutes jobspecs into its
+//     arguments and then EXECUTES the command. `jobs -x rm -rf x` contains
+//     no newline, redirect, backtick, `$(` or bare `&`, and its argv[0] is
+//     `jobs` — so an allow-list carrying `jobs` would wait-class a call
+//     that deletes a tree. Verified by execution, not by reading a man
+//     page. Special-casing the `-x` flag was deliberately NOT the fix: an
+//     agent awaiting a backgrounded command uses BashOutput or reads the
+//     log, so `jobs` buys nothing that justifies parsing its flag grammar.
+//   - `date`: GNU `date -s`/`--set` and BSD `date`'s bare time argument SET
+//     THE SYSTEM CLOCK. Polling never needs `date`.
+//   - `pgrep`: procps-ng builds `pgrep`, `pkill` and `pidwait` from ONE
+//     source with ONE shared manual page, and `--signal <sig>` is in the
+//     option set that page documents for the family — so `pgrep --signal
+//     KILL pattern` is a documented signal-sending mode of an
+//     allow-listed name, reachable with no newline, redirect, backtick,
+//     `$` or bare `&`. It was admitted here on the reasoning that "the
+//     signalling variant is `pkill`", which is exactly the mistake the
+//     rule above exists to prevent: the check must be made against the
+//     command's own documentation, and the name carries every mode that
+//     documentation gives it. Narrowing to "pgrep without a signal flag"
+//     was NOT the fix, for the same reason `jobs -x` was not
+//     special-cased — matching the process of a backgrounded command is
+//     what `ps` and `BashOutput` already do.
+//
+// All three are pinned as NOT-wait-classed by TestIsWaitPoll, which must
+// stay green if anyone ever re-adds them.
+var waitPollCommands = map[string]bool{
+	"sleep": true, // suspends; no exec or mutate mode
+	"wait":  true, // shell builtin, awaits jobs; no exec or mutate mode
+	"ps":    true, // reports processes; no signal/exec mode (that is `kill`)
+	"tail":  true, // reads
+	"head":  true, // reads
+	"cat":   true, // reads (writing needs a shell redirect, rejected above)
+	"wc":    true, // reads
+	"grep":  true, // reads; no -exec analogue (that is `find`, excluded)
+	"ls":    true, // reads
+	"stat":  true, // reads
+	"test":  true, // evaluates a condition; no exec or mutate mode
+	"[":     true, // `test` under its bracket name
+	"echo":  true, // writes to stdout only
+}
+
+// isWaitPoll reports whether a tool-call signature is a WAIT-POLL: an
+// identical-by-construction call an agent issues while AWAITING a
+// long-running backgrounded command (#2758). A wait-classed streak is held
+// to agent.DefaultWaitPollThreshold instead of agent.DefaultLoopThreshold,
+// because the poll is the only instrument the agent has for the wait and
+// its output is legitimately byte-identical for minutes at a time — the
+// observed kill in run 3490416b was the signature
+//
+//	Bash {"command":"tail -2 /tmp/verify-2591.log","description":"Check verify progress"}
+//
+// repeated 8 times while `scripts/test verify` ran lint in silence.
+//
+// Two forms qualify:
+//
+//   - the BashOutput tool, which is definitionally an await of a
+//     backgrounded command; and
+//   - a Bash command that is a chain of READ-ONLY inspection commands, per
+//     isReadOnlyPollChain below.
+//
+// This is distinct from isSanctionedWaitPoll above, which grants its one
+// prompt-mandated long-poll a TOTAL exemption; a wait-poll here is still
+// counted and still trips, just at the higher threshold.
+//
+// It is FAIL-CLOSED throughout: anything it does not fully understand
+// yields false, i.e. the pre-#2758 base-threshold behaviour. A parse gap
+// can therefore only under-classify, never let a mutating command reach
+// the higher limit.
+func isWaitPoll(sig string) bool {
+	if strings.HasPrefix(sig, "BashOutput ") {
+		return true
+	}
+	const bashPrefix = "Bash "
+	if !strings.HasPrefix(sig, bashPrefix) {
+		return false
+	}
+	var input struct {
+		Command string `json:"command"`
+	}
+	// Fail-open in the same sense as toolCallSignatures: an unparseable
+	// remainder yields false, i.e. today's base-threshold behaviour.
+	if err := json.Unmarshal([]byte(sig[len(bashPrefix):]), &input); err != nil {
+		return false
+	}
+	return isReadOnlyPollChain(input.Command)
+}
+
+// isReadOnlyPollChain reports whether a shell command is a chain of
+// allow-listed read-only inspection commands. It is a deliberately NARROW
+// shell-lite parse and does NOT attempt to be a shell parser: it rejects
+// outright anything carrying a construct whose semantics it cannot fully
+// account for, and requires EVERY segment — not merely the first — to lead
+// with an allow-listed bare command name.
+//
+// Rejected constructs, each because it can introduce execution or mutation
+// the segment scan would not see: a newline (a second command line),
+// redirection (`>`/`<` — `cat x > y` mutates), a backtick, ANY `$` at all
+// (see below), and a `&` that is not part of `&&` (backgrounding).
+// Because the allow-list holds bare command names, a segment leading with
+// a `VAR=x` env-assignment prefix or a path-qualified binary (`/bin/rm`,
+// and equally `/usr/bin/tail`) is rejected by the lookup itself.
+//
+// The `$` sigil is rejected WHOLESALE rather than only in its `$(` and
+// `${` digraph forms, because the stated ground for rejecting an
+// expansion is that its value is unknown at classification time — and
+// that is as true of a bare `$LOG`, `$@` or `$*` as of `${LOG}`. Treating
+// the two differently was an inconsistency, not a security hole (every
+// segment's argv[0] must still be an allow-listed bare NAME, and `$CMD`
+// is not one), but the consistent rule is the one that can be stated in a
+// sentence and checked (#2758 review).
+//
+// Quoting is NOT interpreted: a `;`, `|`, `&&` or `||` inside single or
+// double quotes still splits the chain. That errs fail-closed — the split
+// can only manufacture a segment whose first token is not an allow-listed
+// bare name, which is a rejection — so an argument that merely LOOKS like
+// a separator costs the caller the wait tier, never grants it.
+func isReadOnlyPollChain(cmd string) bool {
+	// The '$' is rejected wholesale: `$(`, `${` and a bare `$VAR` are all
+	// values unknown at classification time.
+	if strings.ContainsAny(cmd, "\n\r><`$") {
+		return false
+	}
+	// A '&' is admissible only as the '&&' operator; a lone '&' backgrounds
+	// the preceding command and is rejected.
+	for i := 0; i < len(cmd); i++ {
+		if cmd[i] != '&' {
+			continue
+		}
+		if i+1 < len(cmd) && cmd[i+1] == '&' {
+			i++ // consume the pair
+			continue
+		}
+		return false
+	}
+	// Split on the chain separators. '&&' and '||' are replaced before the
+	// single-character forms so the two-character operators win.
+	const sep = "\x00"
+	segments := strings.Split(
+		strings.NewReplacer("&&", sep, "||", sep, ";", sep, "|", sep).Replace(cmd),
+		sep,
+	)
+	saw := false
+	for _, seg := range segments {
+		fields := strings.Fields(seg)
+		if len(fields) == 0 {
+			continue // a trailing separator leaves an empty segment
+		}
+		// The allow-list holds BARE command names only, so this lookup is
+		// also what rejects a `VAR=x cmd` env-assignment prefix (whose
+		// first token is `VAR=x`, hiding the real argv[0]) and a
+		// path-qualified binary such as `/bin/rm` or even `/usr/bin/tail`
+		// (a path need not resolve to the command its basename implies).
+		if !waitPollCommands[fields[0]] {
+			return false
+		}
+		saw = true
+	}
+	// saw is the empty-chain control: a command with no allow-listed
+	// segment at all — the empty string, or one made only of separators
+	// such as ";;;" — must NOT be wait-classed just because the segment
+	// loop found nothing to reject.
+	return saw
 }
 
 // truncateSignature bounds a signature embedded in an audit/failure reason
