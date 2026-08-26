@@ -165,6 +165,56 @@ func downThrough(t *testing.T, url, target string) {
 	}
 }
 
+// migrationNumPrefix parses the leading "NNNN" numeric prefix of a
+// migration file name (the run of digits before the first underscore).
+func migrationNumPrefix(name string) (uint64, bool) {
+	base := name
+	if i := strings.IndexByte(base, '_'); i >= 0 {
+		base = base[:i]
+	}
+	n, err := strconv.ParseUint(base, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// duplicateMigrationPrefixes returns the file names whose numeric prefix
+// repeats an earlier file sharing the same up/down suffix. The
+// map[uint64]bool sets in TestMigrations_EmbeddedFiles collapse a repeated
+// prefix to one key, so two differently named files carrying the same
+// number (e.g. 0005_a.up.sql and 0005_b.up.sql) still satisfy the
+// matching-pair and contiguous-1..N checks while masking an ambiguous
+// migration. This scans the RAW entry list before that deduplication so a
+// genuine duplicate reddens, closing the vacuity the map checks cannot see
+// (#2815).
+func duplicateMigrationPrefixes(entries []string) []string {
+	upSeen := map[uint64]bool{}
+	downSeen := map[uint64]bool{}
+	var dups []string
+	for _, e := range entries {
+		var seen map[uint64]bool
+		switch {
+		case strings.HasSuffix(e, ".up.sql"):
+			seen = upSeen
+		case strings.HasSuffix(e, ".down.sql"):
+			seen = downSeen
+		default:
+			continue
+		}
+		n, ok := migrationNumPrefix(e)
+		if !ok {
+			continue
+		}
+		if seen[n] {
+			dups = append(dups, e)
+			continue
+		}
+		seen[n] = true
+	}
+	return dups
+}
+
 // TestMigrations_EmbeddedFiles confirms the //go:embed directive
 // captured at least one .up.sql and one .down.sql migration. Catches
 // the failure mode where someone moves the migrations directory and
@@ -216,34 +266,31 @@ func TestMigrations_EmbeddedFiles(t *testing.T) {
 	// duplicates one, or (C1) introduces a 0000.
 	upNums := map[uint64]bool{}
 	downNums := map[uint64]bool{}
-	numPrefix := func(name string) (uint64, bool) {
-		base := name
-		if i := strings.IndexByte(base, '_'); i >= 0 {
-			base = base[:i]
-		}
-		n, err := strconv.ParseUint(base, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return n, true
-	}
 	for _, e := range entries {
 		switch {
 		case strings.HasSuffix(e, ".up.sql"):
-			n, ok := numPrefix(e)
+			n, ok := migrationNumPrefix(e)
 			if !ok {
 				t.Errorf("up migration %q has no numeric prefix", e)
 				continue
 			}
 			upNums[n] = true
 		case strings.HasSuffix(e, ".down.sql"):
-			n, ok := numPrefix(e)
+			n, ok := migrationNumPrefix(e)
 			if !ok {
 				t.Errorf("down migration %q has no numeric prefix", e)
 				continue
 			}
 			downNums[n] = true
 		}
+	}
+	// The upNums/downNums sets above collapse a repeated numeric prefix to
+	// one key, so a genuine duplicate (two differently named files with the
+	// same number) would satisfy the matching-pair and 1..N checks below
+	// while masking an ambiguous migration. Detect duplicates on the raw
+	// entry list, BEFORE that deduplication, so they redden here (#2815).
+	for _, dup := range duplicateMigrationPrefixes(entries) {
+		t.Errorf("migration %q duplicates the numeric prefix of an earlier file; prefixes must be unique per up/down suffix", dup)
 	}
 	for n := range upNums {
 		if !downNums[n] {
@@ -271,6 +318,57 @@ func TestMigrations_EmbeddedFiles(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// TestMigrations_DuplicatePrefixDetected pins duplicateMigrationPrefixes as a
+// counterfactual vehicle for the fix to the vacuity #2815 review flagged: the
+// map-based checks in TestMigrations_EmbeddedFiles run on the REAL embed, which
+// has no duplicates, so they can never observe a duplicate go RED. The
+// "duplicate up prefix, gapless overall" case is the exact shape the map checks
+// miss — a repeated 0002 with 1..N otherwise complete — and it must be reported.
+// Counterfactual (verified): dropping the `if seen[n]` branch in
+// duplicateMigrationPrefixes leaves that case with zero duplicates and reddens
+// this test on "want at least one".
+func TestMigrations_DuplicatePrefixDetected(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries []string
+		wantDup bool
+	}{
+		{
+			name:    "clean 1..N",
+			entries: []string{"0001_a.up.sql", "0001_a.down.sql", "0002_b.up.sql", "0002_b.down.sql"},
+			wantDup: false,
+		},
+		{
+			name: "duplicate up prefix, gapless overall",
+			entries: []string{
+				"0001_a.up.sql", "0001_a.down.sql",
+				"0002_b.up.sql", "0002_b.down.sql",
+				"0002_c.up.sql", "0002_c.down.sql",
+			},
+			wantDup: true,
+		},
+		{
+			name: "duplicate down prefix only",
+			entries: []string{
+				"0001_a.up.sql", "0001_a.down.sql",
+				"0001_b.down.sql",
+			},
+			wantDup: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := duplicateMigrationPrefixes(tc.entries)
+			switch {
+			case tc.wantDup && len(got) == 0:
+				t.Errorf("duplicateMigrationPrefixes(%v) reported no duplicates, want at least one", tc.entries)
+			case !tc.wantDup && len(got) != 0:
+				t.Errorf("duplicateMigrationPrefixes(%v) = %v, want no duplicates", tc.entries, got)
+			}
+		})
 	}
 }
 
