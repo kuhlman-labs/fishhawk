@@ -351,6 +351,21 @@ func TestMigrations_DuplicatePrefixDetected(t *testing.T) {
 			wantDup: true,
 		},
 		{
+			// Up-only duplicate: exercises the upSeen branch in
+			// isolation. The "duplicate up prefix, gapless overall" case
+			// above repeats BOTH suffixes, so it still reports a duplicate
+			// via downSeen even if up detection is broken; this case has no
+			// repeated .down.sql prefix, so it reddens only when the upSeen
+			// branch actually fires.
+			name: "duplicate up prefix only",
+			entries: []string{
+				"0001_a.up.sql", "0001_a.down.sql",
+				"0002_b.up.sql", "0002_b.down.sql",
+				"0002_c.up.sql",
+			},
+			wantDup: true,
+		},
+		{
 			name: "duplicate down prefix only",
 			entries: []string{
 				"0001_a.up.sql", "0001_a.down.sql",
