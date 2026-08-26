@@ -2165,6 +2165,28 @@ func TestIsWaitPoll(t *testing.T) {
 			want: false,
 		},
 		{
+			// `pgrep`, `pkill` and `pidwait` are one procps-ng binary with
+			// one shared manual page, and `--signal` is in the option set
+			// that page documents for the family — so this call can
+			// terminate every matched process while carrying no newline,
+			// redirect, backtick, `$` or bare `&`. Same CLASS as the `jobs`
+			// case above: an allow-listed NAME carries every mode it has,
+			// and `pgrep` was admitted on the (wrong) reasoning that the
+			// signalling variant is only `pkill`. Regression pin — must
+			// stay green if anyone ever re-adds `pgrep`.
+			name: "pgrep_signal_can_kill_and_is_not_wait",
+			sig:  `Bash {"command":"pgrep --signal KILL pattern"}`,
+			want: false,
+		},
+		{
+			// The consequence of the removal above: `pgrep` in ANY mode is
+			// no longer wait-classed, because the allow-list cannot
+			// distinguish its modes. `ps` and BashOutput cover the need.
+			name: "plain_pgrep_not_wait",
+			sig:  `Bash {"command":"pgrep -f scripts/test"}`,
+			want: false,
+		},
+		{
 			// Redirection mutates: `cat x > y` writes a file.
 			name: "redirect_not_wait",
 			sig:  `Bash {"command":"cat /tmp/a.log > /tmp/b.log"}`,
@@ -2189,6 +2211,20 @@ func TestIsWaitPoll(t *testing.T) {
 			// The expansion's value is unknown at classification time.
 			name: "parameter_expansion_not_wait",
 			sig:  `Bash {"command":"tail -2 ${LOG}"}`,
+			want: false,
+		},
+		{
+			// A BARE `$VAR` is exactly as opaque as `${VAR}` above, so the
+			// `$` sigil is rejected wholesale rather than only in its
+			// digraph forms (#2758 review).
+			name: "bare_dollar_expansion_not_wait",
+			sig:  `Bash {"command":"tail -2 $LOG"}`,
+			want: false,
+		},
+		{
+			// The positional-parameter forms are the same class.
+			name: "bare_dollar_at_not_wait",
+			sig:  `Bash {"command":"tail -2 $@"}`,
 			want: false,
 		},
 		{

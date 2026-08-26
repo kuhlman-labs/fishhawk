@@ -1103,14 +1103,26 @@ func isSanctionedWaitPoll(sig string) bool {
 //     log, so `jobs` buys nothing that justifies parsing its flag grammar.
 //   - `date`: GNU `date -s`/`--set` and BSD `date`'s bare time argument SET
 //     THE SYSTEM CLOCK. Polling never needs `date`.
+//   - `pgrep`: procps-ng builds `pgrep`, `pkill` and `pidwait` from ONE
+//     source with ONE shared manual page, and `--signal <sig>` is in the
+//     option set that page documents for the family — so `pgrep --signal
+//     KILL pattern` is a documented signal-sending mode of an
+//     allow-listed name, reachable with no newline, redirect, backtick,
+//     `$` or bare `&`. It was admitted here on the reasoning that "the
+//     signalling variant is `pkill`", which is exactly the mistake the
+//     rule above exists to prevent: the check must be made against the
+//     command's own documentation, and the name carries every mode that
+//     documentation gives it. Narrowing to "pgrep without a signal flag"
+//     was NOT the fix, for the same reason `jobs -x` was not
+//     special-cased — matching the process of a backgrounded command is
+//     what `ps` and `BashOutput` already do.
 //
-// Both are pinned as NOT-wait-classed by TestIsWaitPoll, which must stay
-// green if anyone ever re-adds them.
+// All three are pinned as NOT-wait-classed by TestIsWaitPoll, which must
+// stay green if anyone ever re-adds them.
 var waitPollCommands = map[string]bool{
 	"sleep": true, // suspends; no exec or mutate mode
 	"wait":  true, // shell builtin, awaits jobs; no exec or mutate mode
 	"ps":    true, // reports processes; no signal/exec mode (that is `kill`)
-	"pgrep": true, // matches processes; the signalling variant is `pkill`
 	"tail":  true, // reads
 	"head":  true, // reads
 	"cat":   true, // reads (writing needs a shell redirect, rejected above)
@@ -1178,17 +1190,30 @@ func isWaitPoll(sig string) bool {
 //
 // Rejected constructs, each because it can introduce execution or mutation
 // the segment scan would not see: a newline (a second command line),
-// redirection (`>`/`<` — `cat x > y` mutates), command substitution (`$(`
-// or a backtick), parameter expansion (`${`, whose value is unknown at
-// classification time), and a `&` that is not part of `&&` (backgrounding).
+// redirection (`>`/`<` — `cat x > y` mutates), a backtick, ANY `$` at all
+// (see below), and a `&` that is not part of `&&` (backgrounding).
 // Because the allow-list holds bare command names, a segment leading with
 // a `VAR=x` env-assignment prefix or a path-qualified binary (`/bin/rm`,
 // and equally `/usr/bin/tail`) is rejected by the lookup itself.
+//
+// The `$` sigil is rejected WHOLESALE rather than only in its `$(` and
+// `${` digraph forms, because the stated ground for rejecting an
+// expansion is that its value is unknown at classification time — and
+// that is as true of a bare `$LOG`, `$@` or `$*` as of `${LOG}`. Treating
+// the two differently was an inconsistency, not a security hole (every
+// segment's argv[0] must still be an allow-listed bare NAME, and `$CMD`
+// is not one), but the consistent rule is the one that can be stated in a
+// sentence and checked (#2758 review).
+//
+// Quoting is NOT interpreted: a `;`, `|`, `&&` or `||` inside single or
+// double quotes still splits the chain. That errs fail-closed — the split
+// can only manufacture a segment whose first token is not an allow-listed
+// bare name, which is a rejection — so an argument that merely LOOKS like
+// a separator costs the caller the wait tier, never grants it.
 func isReadOnlyPollChain(cmd string) bool {
-	if strings.ContainsAny(cmd, "\n\r><`") {
-		return false
-	}
-	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "${") {
+	// The '$' is rejected wholesale: `$(`, `${` and a bare `$VAR` are all
+	// values unknown at classification time.
+	if strings.ContainsAny(cmd, "\n\r><`$") {
 		return false
 	}
 	// A '&' is admissible only as the '&&' operator; a lone '&' backgrounds
