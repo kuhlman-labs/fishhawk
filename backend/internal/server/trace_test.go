@@ -6100,6 +6100,82 @@ func TestScopeProvenanceForReview_ReconstructionParity(t *testing.T) {
 	}
 }
 
+// TestScopeProvenanceForReview_ChildScopeAmendmentFold pins the #2820
+// decomposed-parent rollup at the resolver layer: a path a fan-out child was
+// authorized to touch via an approved amendment (threaded onto
+// trig.ChildAmendedScopeFiles) folds in under the "child-scope-amendment" source
+// carrying a Detail naming the authorizing amendment, is marked touched against
+// the committed diff, and shrinks the unexplained residual (the machine-
+// classification half of the done-means): UnexplainedCount is 0 WITH the fold
+// where it is 1 WITHOUT it.
+func TestScopeProvenanceForReview_ChildScopeAmendmentFold(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	amID := uuid.New().String()
+	childRunID := uuid.New().String()
+	idx := 3
+	trig := prompt.Trigger{
+		ChildAmendedScopeFiles: []prompt.ChildAmendedScopePath{
+			{Path: "backend/internal/foo/childonly.go", AmendmentID: amID, ChildRunID: childRunID, SliceIndex: &idx},
+		},
+	}
+	// DeclaredFiles = plan(1) + the child-amended path(1) = 2. Reconstructed size
+	// WITH the fold = 2 → residual 0. WITHOUT the fold it would be 1 → residual 1.
+	ev := &prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 2}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("backend/internal/foo/main.go"), trig,
+		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
+	if prov == nil {
+		t.Fatal("prov = nil, want the child-scope-amendment fold")
+	}
+	f, ok := foldByPath(prov.Folds, "backend/internal/foo/childonly.go")
+	if !ok {
+		t.Fatalf("child fold missing; folds=%+v", prov.Folds)
+	}
+	if f.Source != "child-scope-amendment" {
+		t.Errorf("fold Source = %q, want child-scope-amendment", f.Source)
+	}
+	if !f.Touched {
+		t.Error("fold Touched = false, want true (path is in the committed diff)")
+	}
+	if !strings.Contains(f.Detail, amID) {
+		t.Errorf("fold Detail = %q, want it to name the amendment id %q", f.Detail, amID)
+	}
+	if !strings.Contains(f.Detail, "child slice 3") {
+		t.Errorf("fold Detail = %q, want it to name the slice index", f.Detail)
+	}
+	if prov.UnexplainedCount != 0 {
+		t.Errorf("UnexplainedCount = %d, want 0 (the child fold accounts for the path)", prov.UnexplainedCount)
+	}
+
+	// Counterfactual arithmetic: the SAME diff + DeclaredFiles WITHOUT the child
+	// fold leaves the path unexplained (residual 1) — proving the fold is what
+	// shrinks the residual.
+	provNoFold := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("backend/internal/foo/main.go"), prompt.Trigger{},
+		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
+	if provNoFold == nil || provNoFold.UnexplainedCount != 1 {
+		t.Fatalf("without the child fold: UnexplainedCount = %v, want 1", provNoFold)
+	}
+}
+
+// TestScopeProvenanceForReview_NonDecomposed_NoChildFold pins that an ordinary
+// run (nil trig.ChildAmendedScopeFiles) produces no child-scope-amendment fold —
+// the provenance output is unchanged for the common case.
+func TestScopeProvenanceForReview_NonDecomposed_NoChildFold(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil")
+	}
+	for _, f := range prov.Folds {
+		if f.Source == "child-scope-amendment" {
+			t.Errorf("non-decomposed run must produce no child-scope-amendment fold; got %+v", f)
+		}
+	}
+}
+
 // credstoreMovePlan builds the run 933cd6ee approved-plan shape (#2398): the
 // two credstore files declared as `delete` at their old cli/ location and as
 // `create` at their new location — the exact two-delete/two-create move shape

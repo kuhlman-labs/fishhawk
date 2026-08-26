@@ -6475,6 +6475,185 @@ func TestBuild_ImplementReview_ScopeProvenance_TouchedFold_NoUntouchedMark(t *te
 	}
 }
 
+// childScopeIdx is a small helper returning a *int for a ChildAmendedScopePath
+// slice index in a test literal.
+func childScopeIdx(i int) *int { return &i }
+
+// TestBuild_ImplementReview_ChildAmendedScope_Rendered pins that a non-empty
+// ChildAmendedScopeFiles renders the #2820 "Scope authorized by child slice
+// amendments" section with every field: path, authorizing amendment id, slice
+// index, child run id, and the NOT-drift / no-ratification instructions.
+func TestBuild_ImplementReview_ChildAmendedScope_Rendered(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		ChildAmendedScopeFiles: []ChildAmendedScopePath{
+			{Path: "pkg/bar/childonly.go", AmendmentID: "amend-123", ChildRunID: "child-run-9", SliceIndex: childScopeIdx(2)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Scope authorized by child slice amendments (decomposed parent — in-scope, NOT drift)",
+		"- pkg/bar/childonly.go (authorized by approved amendment amend-123 on child slice 2, child run child-run-9)",
+		"Do NOT record a scope-drift concern for any of them",
+		"do NOT ask for a ratification amendment at parent level",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_ImplementReview_ChildAmendedScope_SliceIndexNil renders the
+// no-slice-index branch — a child amendment with SliceIndex nil names only the
+// child run.
+func TestBuild_ImplementReview_ChildAmendedScope_SliceIndexNil(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		ChildAmendedScopeFiles: []ChildAmendedScopePath{
+			{Path: "pkg/bar/childonly.go", AmendmentID: "amend-123", ChildRunID: "child-run-9"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- pkg/bar/childonly.go (authorized by approved amendment amend-123 on child run child-run-9)") {
+		t.Errorf("nil-slice-index branch not rendered:\n%s", got)
+	}
+	if strings.Contains(got, "on child slice") {
+		t.Errorf("nil-slice-index render must not name a slice in the bullet:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_ChildAmendedScope_EmptyByteIdentical is the C1
+// differential replay-stability assertion: rendering an implement_review with
+// ChildAmendedScopeFiles POPULATED vs NIL must differ by EXACTLY the new section.
+// A nil field must produce NO section heading, and removing the rendered section
+// block from the populated render must yield the byte-identical nil render — so
+// deleting the len()>0 guard (which would emit a stray section for a nil field)
+// turns this RED.
+func TestBuild_ImplementReview_ChildAmendedScope_EmptyByteIdentical(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	without, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build (nil): %v", err)
+	}
+	if strings.Contains(without, "### Scope authorized by child slice amendments") {
+		t.Fatalf("nil ChildAmendedScopeFiles must render NO child-slice-amendment section:\n%s", without)
+	}
+
+	populatedTrig := base
+	populatedTrig.ChildAmendedScopeFiles = []ChildAmendedScopePath{
+		{Path: "pkg/bar/childonly.go", AmendmentID: "amend-123", ChildRunID: "child-run-9", SliceIndex: childScopeIdx(2)},
+	}
+	with, err := Build("implement_review", populatedTrig)
+	if err != nil {
+		t.Fatalf("Build (populated): %v", err)
+	}
+
+	// The exact section block the populated render adds (heading + paragraph +
+	// one bullet + trailing blank line).
+	section := "### Scope authorized by child slice amendments (decomposed parent — in-scope, NOT drift)\n\n" +
+		"This run is a decomposed PARENT: its consolidated diff includes edits made by its fan-out " +
+		"slices. Each path below was authorized by a mid-stage scope amendment the operator APPROVED on the " +
+		"named child slice, even though it is not in this parent's plan scope.files. Touching it is expected and " +
+		"authorized. Do NOT record a scope-drift concern for any of them, and do NOT ask for a ratification " +
+		"amendment at parent level — the authorization already exists on the child:\n\n" +
+		"- pkg/bar/childonly.go (authorized by approved amendment amend-123 on child slice 2, child run child-run-9)\n\n"
+	if !strings.Contains(with, section) {
+		t.Fatalf("populated render missing the exact section block:\n%s", with)
+	}
+	if reduced := strings.Replace(with, section, "", 1); reduced != without {
+		t.Errorf("populated render differs from nil render by more than the new section:\n--- reduced ---\n%s\n--- without ---\n%s",
+			reduced, without)
+	}
+}
+
+// TestBuild_ImplementReview_GateScopeFold_DetailRendered pins that a
+// GateScopeFold.Detail renders as a parenthesized suffix after the fold source in
+// all three fold branches (touched, untouched, indeterminate-hedged) — #2820.
+func TestBuild_ImplementReview_GateScopeFold_DetailRendered(t *testing.T) {
+	t.Run("touched", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "child-scope-amendment", Touched: true, Detail: "by amend-7"}, false)
+		if !strings.Contains(got, "- pkg/x.go (folded: child-scope-amendment) (by amend-7)\n") {
+			t.Errorf("touched fold detail suffix not rendered:\n%s", got)
+		}
+	})
+	t.Run("untouched", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "child-scope-amendment", Touched: false, Detail: "by amend-7"}, false)
+		if !strings.Contains(got, "- pkg/x.go (folded: child-scope-amendment) (by amend-7) — folded, UNTOUCHED — a permission, not a work-order\n") {
+			t.Errorf("untouched fold detail suffix not rendered:\n%s", got)
+		}
+	})
+	t.Run("indeterminate", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "child-scope-amendment", Touched: false, Detail: "by amend-7"}, true)
+		if !strings.Contains(got, "- pkg/x.go (folded: child-scope-amendment) (by amend-7) — UNTOUCHED label NOT DETERMINABLE") {
+			t.Errorf("indeterminate fold detail suffix not rendered:\n%s", got)
+		}
+	})
+}
+
+// TestBuild_ImplementReview_GateScopeFold_EmptyDetailByteIdentical pins that an
+// EMPTY Detail renders each fold branch byte-identically to the pre-#2820 output
+// (no stray " ()") — so deleting the Detail emptiness guard turns this RED.
+func TestBuild_ImplementReview_GateScopeFold_EmptyDetailByteIdentical(t *testing.T) {
+	t.Run("touched", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "scope-amendment", Touched: true}, false)
+		if !strings.Contains(got, "- pkg/x.go (folded: scope-amendment)\n") {
+			t.Errorf("empty-detail touched fold not byte-identical:\n%s", got)
+		}
+		if strings.Contains(got, "()") {
+			t.Errorf("empty detail must not render empty parens:\n%s", got)
+		}
+	})
+	t.Run("untouched", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "scope-amendment", Touched: false}, false)
+		if !strings.Contains(got, "- pkg/x.go (folded: scope-amendment) — folded, UNTOUCHED — a permission, not a work-order\n") {
+			t.Errorf("empty-detail untouched fold not byte-identical:\n%s", got)
+		}
+		if strings.Contains(got, "()") {
+			t.Errorf("empty detail must not render empty parens:\n%s", got)
+		}
+	})
+	t.Run("indeterminate", func(t *testing.T) {
+		got := buildFoldRender(t, GateScopeFold{Path: "pkg/x.go", Source: "scope-amendment", Touched: false}, true)
+		if !strings.Contains(got, "- pkg/x.go (folded: scope-amendment) — UNTOUCHED label NOT DETERMINABLE") {
+			t.Errorf("empty-detail indeterminate fold not byte-identical:\n%s", got)
+		}
+	})
+}
+
+// buildFoldRender builds an implement_review prompt carrying a single fold and
+// returns the rendered prompt, so the fold-detail render branches can be
+// asserted. indeterminate flags the rename-provenance-indeterminate diff mode.
+func buildFoldRender(t *testing.T, fold GateScopeFold, indeterminate bool) string {
+	t.Helper()
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:                     1,
+				Folds:                         []GateScopeFold{fold},
+				RenameProvenanceIndeterminate: indeterminate,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return got
+}
+
 func TestBuild_ImplementReview_ScopeProvenance_UnexplainedResidual_StillFlag(t *testing.T) {
 	// #1914 real-drift preserved: a positive UnexplainedCount renders the
 	// still-flag "unexplained by provenance" line and MUST NOT render the

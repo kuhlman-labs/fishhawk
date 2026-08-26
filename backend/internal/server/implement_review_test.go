@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
 
 // runImplementReviewLoop is the count-form test entry retained for callers
@@ -398,6 +399,123 @@ func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) 
 		if !strings.Contains(got, want) {
 			t.Errorf("reviewer prompt missing %q from threaded gate evidence:\n%s", want, got)
 		}
+	}
+}
+
+// erroringScopeAmendmentRepo is a minimal scopeamendment.Repository whose
+// lookups all fail, driving the #2820 fail-open contract at the end-to-end layer:
+// a failing child amendment lookup must still yield a DISPATCHED implement review
+// (nothing downstream treats the resolver's nil as fatal). It is NOT a copy of
+// the stateful fakeScopeAmendmentRepo — it is a distinct error stub.
+type erroringScopeAmendmentRepo struct{}
+
+func (erroringScopeAmendmentRepo) Create(context.Context, scopeamendment.CreateParams) (*scopeamendment.Amendment, error) {
+	return nil, errors.New("scopeamendment unavailable")
+}
+func (erroringScopeAmendmentRepo) GetByID(context.Context, uuid.UUID) (*scopeamendment.Amendment, error) {
+	return nil, errors.New("scopeamendment unavailable")
+}
+func (erroringScopeAmendmentRepo) ListByRun(context.Context, uuid.UUID) ([]*scopeamendment.Amendment, error) {
+	return nil, errors.New("scopeamendment unavailable")
+}
+func (erroringScopeAmendmentRepo) CountByStage(context.Context, uuid.UUID) (int, error) {
+	return 0, errors.New("scopeamendment unavailable")
+}
+func (erroringScopeAmendmentRepo) Decide(context.Context, scopeamendment.DecideParams) (*scopeamendment.Amendment, error) {
+	return nil, errors.New("scopeamendment unavailable")
+}
+
+var _ scopeamendment.Repository = erroringScopeAmendmentRepo{}
+
+// TestShipTrace_ImplementReview_ChildScopeAmendment_RolledUp is the #2820
+// cross-boundary regression test the done-means names: a decomposed PARENT ships
+// its consolidated implement bundle, one of whose changed files was authorized by
+// an APPROVED mid-stage amendment on a fan-out CHILD (a path NOT in the parent's
+// plan scope.files). The captured review prompt must name the child slice
+// authorization as in-scope / NOT drift AND fold the path under
+// child-scope-amendment in the Declared-scope provenance block, rather than
+// leaving it as an unexplained residual (#2237, #2239). Crosses server resolver →
+// Trigger → rendered prompt, a seam the per-layer units do not exercise.
+func TestShipTrace_ImplementReview_ChildScopeAmendment_RolledUp(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	sar := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sar
+	// A fan-out child of the parent run holding an APPROVED amendment for a path
+	// that appears in the consolidated diff but NOT the parent's plan scope.
+	child := rr.seedDecomposedChild(runRow.ID, 4, run.StateSucceeded)
+	amID := seedAmendment(sar, child.ID, scopeamendment.StatusApproved, "backend/internal/foo/childonly.go")
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+		{"path": "backend/internal/foo/childonly.go", "status": "A"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		// The review section, its NOT-drift and no-ratification instructions.
+		"### Scope authorized by child slice amendments (decomposed parent — in-scope, NOT drift)",
+		"backend/internal/foo/childonly.go (authorized by approved amendment " + amID.String() +
+			" on child slice 4, child run " + child.ID.String() + ")",
+		"Do NOT record a scope-drift concern for any of them",
+		"do NOT ask for a ratification amendment at parent level",
+		// The Declared-scope provenance fold with its Detail — the path is folded
+		// under child-scope-amendment, NOT counted as an unexplained residual.
+		"backend/internal/foo/childonly.go (folded: child-scope-amendment) (authorized by approved amendment " +
+			amID.String() + " on child slice 4, child run " + child.ID.String() + ")",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestShipTrace_ImplementReview_ChildScopeAmendment_ListError_ReviewStillDispatches
+// is the #2820 C2 end-to-end degrade assertion: a failing child amendment lookup
+// must NOT block the parent's implement review — the review still DISPATCHES and
+// the child-amendment section is simply ABSENT. This verifies the degrade at the
+// layer the criterion names (the dispatched review), not just that the resolver
+// returns nil.
+func TestShipTrace_ImplementReview_ChildScopeAmendment_ListError_ReviewStillDispatches(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, _, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	s.cfg.ScopeAmendmentRepo = erroringScopeAmendmentRepo{} // every amendment lookup fails
+	rr.seedDecomposedChild(runRow.ID, 0, run.StateSucceeded)
+
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+		{"path": "backend/internal/foo/childonly.go", "status": "A"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("review must still dispatch under a failing amendment lookup; reviewer invoked %d times, want 1",
+			len(reviewer.calls))
+	}
+	if strings.Contains(reviewer.calls[0], "### Scope authorized by child slice amendments") {
+		t.Errorf("child-amendment section must be ABSENT when the amendment lookup fails:\n%s", reviewer.calls[0])
 	}
 }
 

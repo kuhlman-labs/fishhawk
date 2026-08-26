@@ -667,6 +667,19 @@ type Trigger struct {
 	// (the #1406 lockstep fix in reverse). Empty/nil when no path was removed
 	// or for any non-implement build; keeps the prompt byte-identical to today.
 	RemovedScopeFiles []string
+	// ChildAmendedScopeFiles is a decomposed PARENT run's view of the paths its
+	// fan-out CHILDREN were authorized to touch via an APPROVED mid-stage scope
+	// amendment (#2820). A child slice's amendment lives under the CHILD run id,
+	// so a path an operator approved on a slice reaches the parent's consolidated
+	// diff with no provenance on the parent and reads as unexplained scope drift.
+	// runImplementReviews resolves the children's approved amendments
+	// (childApprovedAmendmentScopePaths) and threads them here so
+	// buildImplementReview renders a "Scope authorized by child slice amendments"
+	// section naming the authorizing amendment per path and telling the reviewer
+	// the path is in-scope and NOT drift. It is backend-DERIVED (never
+	// bundle-carried) and nil for every non-decomposed run, keeping the prompt
+	// byte-identical for the common case (audit prompt-hash replay stability).
+	ChildAmendedScopeFiles []ChildAmendedScopePath
 	// PriorConcerns carries the stage's previously recorded review
 	// concerns for the implement-review prompt's delta-verification
 	// section (E22.X / #984): open-state concerns the reviewer must
@@ -1001,6 +1014,33 @@ type GateScopeFold struct {
 	Path    string
 	Source  string
 	Touched bool
+	// Detail is an optional free-form provenance suffix rendered in parentheses
+	// after the fold source when non-empty (e.g. the authorizing child amendment
+	// id + slice for a child-scope-amendment fold, #2820). Omitted entirely when
+	// empty, keeping every existing fold channel's output byte-identical
+	// (prompt-hash replay stability).
+	Detail string
+}
+
+// ChildAmendedScopePath is a decomposed PARENT run's view of one path a fan-out
+// CHILD was authorized to touch by an APPROVED mid-stage scope amendment on that
+// child slice (#2820). The parent's consolidated implement review renders these
+// as in-scope, operator-authorized paths (NOT drift) so a slice's approved
+// amendment — which lives under the child run id — is not flagged as an
+// unexplained residual on the parent.
+type ChildAmendedScopePath struct {
+	// Path is the repo-relative path the child amendment authorized.
+	Path string
+	// AmendmentID is the authorizing scope-amendment row's uuid string, so a
+	// reader can follow it back to the approval (it is what
+	// fishhawk_list_scope_amendments and the scope_amendment_decided audit entry
+	// key on).
+	AmendmentID string
+	// ChildRunID is the fan-out child run the amendment was approved on.
+	ChildRunID string
+	// SliceIndex is the child's 0-based sub-plan position when known, nil
+	// otherwise.
+	SliceIndex *int
 }
 
 // GateFixupSelfReportDivergence is the advisory fix-up self-report divergence
@@ -4338,6 +4378,33 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("\n")
 	}
 
+	// Scope-authorized-by-child-slice-amendments section (#2820). This run is a
+	// decomposed PARENT whose consolidated diff includes edits its fan-out slices
+	// made; each path below was authorized by an amendment the operator APPROVED
+	// on the named child slice, but that amendment lives under the CHILD run id,
+	// so the parent's own records carry no provenance for it. Naming them here is
+	// what stops the reviewer flagging a slice's operator-authorized edit as
+	// unexplained scope drift on the parent (#2237, #2239). Empty/nil for every
+	// non-decomposed run keeps the prompt byte-identical.
+	if len(t.ChildAmendedScopeFiles) > 0 {
+		b.WriteString("### Scope authorized by child slice amendments (decomposed parent — in-scope, NOT drift)\n\n")
+		b.WriteString("This run is a decomposed PARENT: its consolidated diff includes edits made by its fan-out " +
+			"slices. Each path below was authorized by a mid-stage scope amendment the operator APPROVED on the " +
+			"named child slice, even though it is not in this parent's plan scope.files. Touching it is expected and " +
+			"authorized. Do NOT record a scope-drift concern for any of them, and do NOT ask for a ratification " +
+			"amendment at parent level — the authorization already exists on the child:\n\n")
+		for _, p := range t.ChildAmendedScopeFiles {
+			if p.SliceIndex != nil {
+				fmt.Fprintf(&b, "- %s (authorized by approved amendment %s on child slice %d, child run %s)\n",
+					p.Path, p.AmendmentID, *p.SliceIndex, p.ChildRunID)
+			} else {
+				fmt.Fprintf(&b, "- %s (authorized by approved amendment %s on child run %s)\n",
+					p.Path, p.AmendmentID, p.ChildRunID)
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	// Prior-concerns delta-verification section (#984). Rendered only on a
 	// re-review of a stage that already has recorded concerns (a fix-up
 	// pass, a re-pack) — a first review has none and the section is
@@ -4730,15 +4797,22 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		if len(p.Folds) > 0 {
 			b.WriteString("- folded (non-plan) effective-scope entries — permissions, not work-orders:\n")
 			for _, f := range p.Folds {
+				// Optional per-fold provenance suffix rendered in parentheses after
+				// the source (#2820); empty Detail keeps every existing fold
+				// channel's line byte-identical.
+				detail := ""
+				if f.Detail != "" {
+					detail = " (" + f.Detail + ")"
+				}
 				switch {
 				case f.Touched:
-					fmt.Fprintf(b, "  - %s (folded: %s)\n", f.Path, f.Source)
+					fmt.Fprintf(b, "  - %s (folded: %s)%s\n", f.Path, f.Source, detail)
 				case p.RenameProvenanceIndeterminate:
-					fmt.Fprintf(b, "  - %s (folded: %s) — UNTOUCHED label NOT DETERMINABLE under this diff mode "+
-						"(rename/copy rows carry no source path); do NOT assert it as untouched\n", f.Path, f.Source)
+					fmt.Fprintf(b, "  - %s (folded: %s)%s — UNTOUCHED label NOT DETERMINABLE under this diff mode "+
+						"(rename/copy rows carry no source path); do NOT assert it as untouched\n", f.Path, f.Source, detail)
 				default:
-					fmt.Fprintf(b, "  - %s (folded: %s) — folded, UNTOUCHED — a permission, not a work-order\n",
-						f.Path, f.Source)
+					fmt.Fprintf(b, "  - %s (folded: %s)%s — folded, UNTOUCHED — a permission, not a work-order\n",
+						f.Path, f.Source, detail)
 				}
 			}
 		}
