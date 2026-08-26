@@ -10377,70 +10377,181 @@ func TestBuild_SwitchCasesCoveredByEnvelopeMatrix(t *testing.T) {
 	}
 }
 
-// untrustedTriggerFieldReaders returns, per untrusted Trigger field name, the
-// set of prompt.go function names that read it as a selector expression.
-func untrustedTriggerFieldReaders(t *testing.T) map[string]map[string]bool {
+// untrustedFieldRead is one selector-expression read of an untrusted Trigger
+// field in prompt.go, classified by its enclosing function AND by its
+// SYNTACTIC USE. The use classification is what makes the allow-list a real
+// control: a function allow-list alone cannot tell a sanctioned enveloping
+// call apart from a raw render performed INSIDE an allowed function, so a
+// revert of writeIssueContext to b.WriteString(t.IssueBody) — or a new,
+// conditional raw IssueComments render the fixture matrix never activates —
+// would keep every reader on the allow-list and pass.
+type untrustedFieldRead struct {
+	Field string
+	Func  string
+	// Use is how the read is consumed, for the failure message: the
+	// enveloping call's name, "presence-test" for a comparison against "",
+	// or a description of the raw consumer.
+	Use string
+	// Sanctioned is true only for a read passed to that field's enveloping
+	// writer, or for a non-rendering presence test.
+	Sanctioned bool
+	Pos        string
+}
+
+// envelopingWriterFor maps each untrusted Trigger field to the ONE writer that
+// is allowed to consume it — the writer that wraps it in a quarantine envelope.
+var envelopingWriterFor = map[string]string{
+	"IssueBody":     "writeUntrustedIssueBody",
+	"IssueComments": "writeIssueComments",
+}
+
+// untrustedTriggerFieldReads parses prompt.go and returns every selector-expression
+// read of an untrusted Trigger field, classified by use. A read is sanctioned
+// when it is a direct argument to that field's enveloping writer, or when it is
+// an operand of a comparison against "" (a presence test renders nothing).
+// Anything else — an argument to strings.Builder.WriteString, to fmt.Fprintf, to
+// the OTHER field's writer, an assignment, a range clause — is a raw use.
+func untrustedTriggerFieldReads(t *testing.T) []untrustedFieldRead {
 	t.Helper()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "prompt.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse prompt.go: %v", err)
 	}
-	watched := map[string]bool{"IssueBody": true, "IssueComments": true}
-	readers := map[string]map[string]bool{}
+	fieldOf := func(n ast.Node) (string, bool) {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return "", false
+		}
+		if _, watched := envelopingWriterFor[sel.Sel.Name]; !watched {
+			return "", false
+		}
+		return sel.Sel.Name, true
+	}
+
+	var reads []untrustedFieldRead
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			continue
 		}
-		name := fn.Name.Name
+		// Pass 1 — collect the sanctioned selector NODES and how each is used.
+		sanctioned := map[ast.Node]string{}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok || !watched[sel.Sel.Name] {
+			switch e := n.(type) {
+			case *ast.CallExpr:
+				callee, ok := e.Fun.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				for _, arg := range e.Args {
+					field, ok := fieldOf(arg)
+					if !ok {
+						continue
+					}
+					if callee.Name == envelopingWriterFor[field] {
+						sanctioned[arg] = callee.Name
+					}
+				}
+			case *ast.BinaryExpr:
+				if e.Op != token.EQL && e.Op != token.NEQ {
+					return true
+				}
+				for operand, other := range map[ast.Expr]ast.Expr{e.X: e.Y, e.Y: e.X} {
+					if _, ok := fieldOf(operand); !ok {
+						continue
+					}
+					lit, ok := other.(*ast.BasicLit)
+					if ok && lit.Kind == token.STRING && lit.Value == `""` {
+						sanctioned[operand] = "presence-test"
+					}
+				}
+			}
+			return true
+		})
+		// Pass 2 — classify EVERY read, sanctioned or not.
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			field, ok := fieldOf(n)
+			if !ok {
 				return true
 			}
-			if readers[sel.Sel.Name] == nil {
-				readers[sel.Sel.Name] = map[string]bool{}
+			use, isSanctioned := sanctioned[n]
+			if !isSanctioned {
+				use = "a raw read (not passed to " + envelopingWriterFor[field] + ")"
 			}
-			readers[sel.Sel.Name][name] = true
+			reads = append(reads, untrustedFieldRead{
+				Field:      field,
+				Func:       fn.Name.Name,
+				Use:        use,
+				Sanctioned: isSanctioned,
+				Pos:        fset.Position(n.Pos()).String(),
+			})
 			return true
 		})
 	}
-	return readers
+	return reads
 }
 
 // TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters is the AST
-// allow-list guard: BOTH untrusted Trigger channels — IssueBody and
-// IssueComments — may be read only by the two enveloping writers. Covering only
-// the body would leave the no-raw-render-path criterion half enforced: a new RAW
-// COMMENT render behind a condition the fixture matrix does not activate would
-// evade both halves.
+// allow-list guard over BOTH untrusted Trigger channels — IssueBody and
+// IssueComments. Covering only the body would leave the no-raw-render-path
+// criterion half enforced: a new RAW COMMENT render behind a condition the
+// fixture matrix does not activate would evade both halves.
 //
-// Goes RED when any other function in the package reads either field — including
-// a revert of writeIssueContext to a raw b.WriteString(t.IssueBody).
+// The guard has TWO halves, and the second is what makes it non-vacuous:
+//
+//  1. WHO may read: only writeIssueContext / writeReviewIssueContext.
+//  2. HOW they may read it: every read inside those writers must be a direct
+//     argument to that field's enveloping writer (writeUntrustedIssueBody for
+//     the body, writeIssueComments for the comments), or a non-rendering
+//     presence test against "". A function allow-list ALONE cannot see the
+//     difference between an enveloped call and a raw render performed inside an
+//     allowed function, so it would stay GREEN under the very counterfactual
+//     this guard claims to detect.
+//
+// Goes RED when any other function reads either field, AND when an allowed
+// writer renders either field raw — including a revert of writeIssueContext to
+// b.WriteString(t.IssueBody), which half 2 catches and half 1 does not.
 func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 	allowed := map[string]bool{
 		"writeIssueContext":       true,
 		"writeReviewIssueContext": true,
 	}
-	readers := untrustedTriggerFieldReaders(t)
+	reads := untrustedTriggerFieldReads(t)
 	for _, field := range []string{"IssueBody", "IssueComments"} {
-		got := readers[field]
-		if len(got) == 0 {
+		enveloped := map[string]bool{}
+		seen := 0
+		for _, r := range reads {
+			if r.Field != field {
+				continue
+			}
+			seen++
+			if !allowed[r.Func] {
+				t.Errorf("%s is read by %s (%s), which is not an enveloping writer. "+
+					"Untrusted issue text must reach a prompt only through writeUntrustedIssueBody "+
+					"(body) or writeIssueComments (comments); route the render through "+
+					"writeIssueContext/writeReviewIssueContext instead of adding a raw read.",
+					field, r.Func, r.Pos)
+				continue
+			}
+			if !r.Sanctioned {
+				t.Errorf("%s: %s reads %s as %s — that is a RAW render inside an allowed writer. "+
+					"Pass the field to %s instead so it reaches the prompt inside its quarantine envelope.",
+					r.Pos, r.Func, field, r.Use, envelopingWriterFor[field])
+				continue
+			}
+			if r.Use == envelopingWriterFor[field] {
+				enveloped[r.Func] = true
+			}
+		}
+		if seen == 0 {
 			t.Errorf("no reader of %s found in prompt.go — the allow-list guard is vacuous", field)
 			continue
 		}
-		for fn := range got {
-			if !allowed[fn] {
-				t.Errorf("%s is read by %s, which is not an enveloping writer. "+
-					"Untrusted issue text must reach a prompt only through writeUntrustedIssueBody "+
-					"(body) or writeIssueComments (comments); route the render through "+
-					"writeIssueContext/writeReviewIssueContext instead of adding a raw read.", field, fn)
-			}
-		}
 		for fn := range allowed {
-			if !got[fn] {
-				t.Errorf("%s expects a read of %s but found none — the guard's allow-list is stale", fn, field)
+			if !enveloped[fn] {
+				t.Errorf("%s expects a read of %s passed to %s but found none — "+
+					"the guard's allow-list is stale", fn, field, envelopingWriterFor[field])
 			}
 		}
 	}

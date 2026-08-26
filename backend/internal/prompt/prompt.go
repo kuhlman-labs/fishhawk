@@ -5256,7 +5256,9 @@ func writeUntrustedIssueBody(b *strings.Builder, body string) {
 // writeIssueComments, which owns their own envelope. Only the Fishhawk-rendered
 // metadata (number, title) is written raw. Do NOT reintroduce a direct
 // t.IssueBody write here — TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters
-// is the AST allow-list that enforces it.
+// is the AST allow-list that enforces it, and it classifies each read by USE
+// (enveloping-call argument or presence test), so a raw render INSIDE this
+// allowed writer fails it too, not only a read from some other function.
 func writeIssueContext(b *strings.Builder, t Trigger) {
 	if t.IssueNumber == 0 && t.IssueTitle == "" && t.IssueBody == "" {
 		b.WriteString("(no issue context provided)\n\n")
