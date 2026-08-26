@@ -3397,6 +3397,17 @@ func buildPlan(t Trigger) string {
 // any-document-present check would wave through.
 func buildGroomingPropose(t Trigger) (string, error) {
 	// (H2 mirror) Fail closed before any text is composed.
+	//
+	// An EMPTY declared charter path can never anchor a grooming report, and it
+	// must be refused BEFORE the identity match below — not left to it. A
+	// zero-value GroomingContext leaves CharterPath == "", and an injected
+	// document whose Path is likewise empty would then SATISFY `d.Path ==
+	// t.Grooming.CharterPath` and emit an unanchored grooming prompt, defeating
+	// this layer's fail-closed guarantee for exactly the future caller that omits
+	// server L2 that guarantee exists to protect.
+	if t.Grooming.CharterPath == "" {
+		return "", fmt.Errorf("%w: no charter path was declared for this grooming run", ErrCharterNotInjected)
+	}
 	charterInjected := false
 	for _, d := range t.InjectedDocuments {
 		if d.Path == t.Grooming.CharterPath {

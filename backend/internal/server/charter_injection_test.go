@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -1390,6 +1392,18 @@ func TestGroomingPrompt_CharterCheckPrecedesBuild(t *testing.T) {
 		stageIsPlan: true,
 	})
 
+	// Capture the server's error log. reason ALONE cannot tell the two
+	// charter_not_injected sources apart: L2 (which runs BEFORE Build) and
+	// buildGroomingPropose's own ErrCharterNotInjected mapping in
+	// handleGetStagePrompt both write reason=charter_not_injected, so
+	// chAssertReason(body, reasonCharterNotInjected) passes for EITHER ordering.
+	// The distinguishing human message is redacted from the 5xx body (only the
+	// allow-listed `reason` survives, #2587), so it reaches us only through the
+	// un-redacted "http error response" log record's details — that is where the
+	// two messages are told apart below.
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 	// The handler refuses rather than serving any prompt.
 	w := promptRequest(t, s, runID, stageID, priv, "")
 	if w.Code == http.StatusOK {
@@ -1403,6 +1417,24 @@ func TestGroomingPrompt_CharterCheckPrecedesBuild(t *testing.T) {
 		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
 	}
 	chAssertReason(t, body, reasonCharterNotInjected)
+
+	// LOAD-BEARING ordering assertion, keyed on the refusal's `details.error`
+	// (the un-redacted cause in the log record) — NOT the handler `message`,
+	// which is the identical "required charter document was not injected" for
+	// both sources and so cannot discriminate. The served refusal must be L2's:
+	// its cause names "none of the ... injected documents". It must NOT be
+	// buildGroomingPropose's own ErrCharterNotInjected mapping, whose cause is
+	// unique in "grooming propose stage has no charter". Because Trigger.Grooming
+	// is only ever the value assertCharterInjected returns, a future edit that let
+	// Build refuse ahead of L2 (or made L2 stop refusing on this condition) would
+	// swap the logged cause — where a reason-only check stays green.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "none of the") {
+		t.Errorf("served refusal is not L2's — its \"none of the ... injected documents\" wording is absent from the error log:\n%s", logged)
+	}
+	if strings.Contains(logged, "grooming propose stage has no charter") {
+		t.Errorf("served refusal carries the prompt-layer mapping cause (prompt.ErrCharterNotInjected) — Build refused ahead of L2:\n%s", logged)
+	}
 
 	// The guard the handler invokes before Build is L2 — its message identifies
 	// it. buildGroomingPropose's own fail-closed carries a DIFFERENT message

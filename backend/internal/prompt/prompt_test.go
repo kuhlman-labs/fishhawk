@@ -9629,6 +9629,30 @@ func TestBuild_GroomingPropose_NoCharterInjected_Refuses(t *testing.T) {
 	}
 }
 
+// TestBuild_GroomingPropose_EmptyCharterPath_Refuses is the COUNTERFACTUAL for
+// the empty-path guard: a grooming run whose declared CharterPath is empty must
+// be refused even when an injected document's Path is ALSO empty. The document
+// is self-paired with the declared path (both ""), so a bare `d.Path ==
+// CharterPath` identity match would wave it through — this is the case the guard
+// exists to catch. Deleting the guard reddens here: the match succeeds and Build
+// returns a non-empty, unanchored grooming prompt with a nil error.
+func TestBuild_GroomingPropose_EmptyCharterPath_Refuses(t *testing.T) {
+	tr := groomingTriggerWithCharter()
+	tr.Grooming.CharterPath = ""
+	tr.InjectedDocuments = []InjectedDocument{{
+		Path:    "", // self-paired with the (empty) declared charter path
+		Heading: "Not a charter",
+		Body:    "an injected document with no path\n",
+	}}
+	got, err := Build("plan", tr)
+	if !errors.Is(err, ErrCharterNotInjected) {
+		t.Fatalf("err = %v, want ErrCharterNotInjected", err)
+	}
+	if got != "" {
+		t.Errorf("refused grooming build returned a non-empty prompt:\n%s", got)
+	}
+}
+
 // TestBuild_GroomingPropose_ActionClassMatrix pins the action-class matrix and
 // the registry-drift guard (step 7): the rendered prompt names the four class
 // literals — asserted EQUAL to backend/internal/spec's exported ActionGroom*
@@ -9756,13 +9780,24 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 
 	t.Run("truncated", func(t *testing.T) {
 		tr := groomingTriggerWithCharter()
-		big := strings.Repeat("x", 13000)   // over MaxRejectionFeedbackBytes (12000)
-		medium := strings.Repeat("y", 5000) // over the 4000 caps
+		big := strings.Repeat("x", 13000) // over MaxRejectionFeedbackBytes (12000)
+		// Each 4000-byte-capped channel gets a DISTINCT over-cap payload (a unique
+		// fill char), so its truncated rendering — payload[:4000] + the marker — is
+		// a byte-unique fragment locatable in the output. A shared payload plus a
+		// single document-wide marker check would stay green with truncation
+		// removed from any three of the four channels; asserting each channel's own
+		// fragment fails closed on exactly that regression.
+		const cap4000 = 4000
+		const marker = "...[truncated]"
+		schemaErr := strings.Repeat("s", 5000)
+		revBase := strings.Repeat("b", 5000)
+		revConstraint := strings.Repeat("c", 5000)
+		answers := strings.Repeat("a", 5000)
 		tr.PriorRejectionFeedback = &big
-		tr.PriorSchemaValidationError = &medium
-		tr.RevisionConstraint = &medium
-		tr.RevisionBasePlan = &medium
-		tr.ApprovalConditions = &medium
+		tr.PriorSchemaValidationError = &schemaErr
+		tr.RevisionConstraint = &revConstraint
+		tr.RevisionBasePlan = &revBase
+		tr.ApprovalConditions = &answers
 		got, err := Build("plan", tr)
 		if err != nil {
 			t.Fatalf("Build: %v", err)
@@ -9771,9 +9806,26 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		if !strings.Contains(got, "TRUNCATED") {
 			t.Errorf("oversized rejection feedback did not draw the truncation notice:\n%s", got)
 		}
-		// The 4000-byte-capped channels append the truncation marker.
-		if !strings.Contains(got, "...[truncated]") {
-			t.Errorf("an oversized 4000-byte-capped channel was not truncated:\n%s", got)
+		// Every 4000-byte channel is truncated INDEPENDENTLY: assert each one's own
+		// cut-to-cap-plus-marker fragment, not just that a marker exists somewhere.
+		for _, ch := range []struct {
+			name    string
+			payload string
+		}{
+			{"prior schema-validation failure", schemaErr},
+			{"revision base report", revBase},
+			{"revision constraint", revConstraint},
+			{"clarification answers", answers},
+		} {
+			want := ch.payload[:cap4000] + marker
+			if !strings.Contains(got, want) {
+				t.Errorf("the %s channel was not truncated at its own cap+marker fragment:\n%s", ch.name, got)
+			}
+			// And the FULL untruncated payload must never appear — a channel that
+			// skipped truncation would emit all 5000 bytes.
+			if strings.Contains(got, ch.payload) {
+				t.Errorf("the %s channel rendered its full untruncated payload:\n%s", ch.name, got)
+			}
 		}
 	})
 }
