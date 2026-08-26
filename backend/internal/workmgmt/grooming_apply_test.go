@@ -2854,6 +2854,64 @@ func TestGroomingApply_ReportModeBeatsDelegationTierRefusal(t *testing.T) {
 	}
 }
 
+// TestGroomingApply_DelegationTierRefusalBeatsResolutionSkip is rule 8's OTHER
+// placement claim — the half `..._ReportModeBeatsDelegationTierRefusal` does not
+// reach. That test pins the rule's position AFTER rule 3; this one pins it
+// BEFORE the resolution-skip return, so a containment refusal is never masked by
+// an item-ref resolution skip and the audit row classifies the entry by the
+// reason a human must act on.
+//
+// It matters for CLASSIFICATION, not for the write: both orderings dispatch
+// nothing. But `item_ref_unresolvable` reads as a malformed proposal an operator
+// can ignore, while `delegation_tier_not_authorized` is the tier decision #2843
+// must route to a human — so a masked refusal loses the entry in the wrong
+// audit bucket.
+//
+// COUNTERFACTUAL: deleting rule 8 cannot discriminate a precedence claim (the
+// entry still skips, on the resolution reason). The discriminating change is a
+// MOVE: relocate rule 8 below the `if reason != ""` return in
+// settleGroomingCandidate and the tier sub-case reddens on the SkipReason.
+//
+// THE NON-TIER SUB-CASE IS THE FIXTURE CONTROL, and it is what stops the tier
+// assertion being vacuous: it proves this ItemRef genuinely DOES produce a
+// resolution skip. Without it, an ItemRef that quietly stayed resolvable would
+// leave the tier assertion passing for the wrong reason — there would be no
+// resolution skip for rule 8 to beat.
+func TestGroomingApply_DelegationTierRefusalBeatsResolutionSkip(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		// The claim: the containment refusal wins over the resolution skip.
+		{"tier proposal (discriminates rule 8's placement)", []string{"area:backend", "autonomy:low"}, GroomingSkipDelegationTierNotAuthorized},
+		// The control: same unresolvable ref, no tier label — the resolution
+		// skip is real and IS what surfaces when rule 8 does not fire.
+		{"no tier proposal (fixture control)", []string{"area:backend"}, GroomingSkipItemRefUnresolvable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tierHygieneEntry(1, tc.labels...)
+			// A ref whose number is not a number: resolveGroomingRequest returns
+			// item_ref_unresolvable. The entry id was computed at construction
+			// from the ORIGINAL ref, so the decision still joins and the entry
+			// reaches the ladder.
+			e.ItemRef.ID = "kuhlman-labs/fishhawk#not-a-number"
+			rec, mut := applyTierEntry(t, e, GroomingModeAuto, nil)
+
+			if rec.Outcome != GroomingOutcomeSkipped {
+				t.Fatalf("record = %+v, want skipped", rec)
+			}
+			if rec.SkipReason != tc.want {
+				t.Fatalf("SkipReason = %q, want %q", rec.SkipReason, tc.want)
+			}
+			// COMMITTED STATE: neither ordering may dispatch.
+			if len(mut.calls) != 0 {
+				t.Errorf("mutator recorded %d dispatches, want 0: %+v", len(mut.calls), mut.calls)
+			}
+		})
+	}
+}
+
 // TestGroomingApply_NonDelegationLabelsUnaffected is the NARROWNESS control: an
 // ordinary clerical label set still applies exactly as before. A future
 // over-broad predicate (e.g. one widened to any `:`-bearing label) reddens here
