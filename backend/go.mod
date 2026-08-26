@@ -20,7 +20,7 @@ require (
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260606222916-3bdc667bf430
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260622095901-47e0c4255798
 	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
