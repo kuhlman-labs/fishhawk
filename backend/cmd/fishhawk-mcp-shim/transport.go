@@ -38,6 +38,10 @@ type childTransport interface {
 	Terminate(grace time.Duration)
 	// LaunchHash is the sha-256 of the binary this child was launched from.
 	LaunchHash() []byte
+	// Pid is the OS process id of the running child, or 0 before Start (and for
+	// a transport with no process of its own). It is what lets the shim's
+	// diagnostic name the same child pid a `ps` table names (#2831).
+	Pid() int
 }
 
 // stdioChild is the os/exec implementation of childTransport: it spawns the
@@ -141,6 +145,15 @@ func (c *stdioChild) waitLoop() {
 func (c *stdioChild) Send(frame []byte) error {
 	_, err := c.stdin.Write(frame)
 	return err
+}
+
+// Pid returns the child's OS process id, or 0 before Start (c.cmd nil) or when
+// the process was never created.
+func (c *stdioChild) Pid() int {
+	if c.cmd == nil || c.cmd.Process == nil {
+		return 0
+	}
+	return c.cmd.Process.Pid
 }
 
 func (c *stdioChild) Frames() <-chan []byte { return c.frames }

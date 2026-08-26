@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +65,122 @@ func TestParseFlagsDefaults(t *testing.T) {
 	}
 	if f.child != defaultChildPath() {
 		t.Errorf("child default = %q, want sibling %q", f.child, defaultChildPath())
+	}
+	if f.status || f.staleOnly {
+		t.Errorf("diagnostic mode must be off by default (status=%v stale-only=%v)", f.status, f.staleOnly)
+	}
+	if f.stateDir != resolveStateDir() {
+		t.Errorf("state-dir default = %q, want %q", f.stateDir, resolveStateDir())
+	}
+	if f.staleGrace != 60*time.Second {
+		t.Errorf("stale-grace default = %s, want 60s", f.staleGrace)
+	}
+}
+
+// TestDefaultStateDirMatchesShellConvention pins that Go and zsh agree on the
+// default state dir with no configuration: os.TempDir honours $TMPDIR, which is
+// the same resolution the shell side's ${TMPDIR:-/tmp} performs.
+func TestDefaultStateDirMatchesShellConvention(t *testing.T) {
+	want := filepath.Join(os.TempDir(), "fishhawk-mcp-shim")
+	if got := defaultStateDir(); got != want {
+		t.Fatalf("defaultStateDir = %q, want %q", got, want)
+	}
+}
+
+// TestResolveStateDirHonoursEnvOverride pins the FISHHAWK_MCP_SHIM_STATE_DIR
+// override the shell advisory forwards (see the state-dir coupling note in
+// README.md).
+func TestResolveStateDirHonoursEnvOverride(t *testing.T) {
+	t.Setenv(stateDirEnv, "/tmp/custom-shim-state")
+	if got := resolveStateDir(); got != "/tmp/custom-shim-state" {
+		t.Fatalf("resolveStateDir = %q, want the env override", got)
+	}
+	t.Setenv(stateDirEnv, "")
+	if got := resolveStateDir(); got != defaultStateDir() {
+		t.Fatalf("empty override should fall back to the default, got %q", got)
+	}
+}
+
+// TestParseFlagsStatusMode pins the diagnostic flag set.
+func TestParseFlagsStatusMode(t *testing.T) {
+	f, err := parseFlags([]string{
+		"fishhawk-mcp-shim", "--status", "--stale-only",
+		"--state-dir", "/tmp/x", "--stale-grace", "5s",
+	}, os.Stderr)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !f.status || !f.staleOnly || f.stateDir != "/tmp/x" || f.staleGrace != 5*time.Second {
+		t.Fatalf("status flags not parsed: %+v", f)
+	}
+}
+
+// failReader fails the test if it is ever read: --status must not touch stdin.
+type failReader struct{ t *testing.T }
+
+func (r failReader) Read([]byte) (int, error) {
+	r.t.Error("--status read stdin; it must not")
+	return 0, io.EOF
+}
+
+// TestStatusRendersSupervisorPublishedState is the cross-boundary proof that
+// the PRODUCER (a real supervisor publishing through the real writeState) and
+// the CONSUMER (the real --status CLI path) agree on the file format — and that
+// --status returns exitOK WITHOUT spawning a child or reading stdin.
+func TestStatusRendersSupervisorPublishedState(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	childPath := filepath.Join(dir, "child.bin")
+	if err := os.WriteFile(childPath, []byte("rebuilt bytes"), 0o755); err != nil { //nolint:gosec // fixture binary
+		t.Fatalf("write child fixture: %v", err)
+	}
+
+	// A real supervisor publishing through the real state-file writer.
+	child := newFake("A", false)
+	child.pid = 4711
+	sup := newSupervisor(child, func() childTransport { return newFake("B", true) },
+		nil, make(chan []byte), io.Discard, io.Discard, 30*time.Second, time.Second)
+	sup.childPath = childPath
+	sup.publish = func(st swapState) {
+		if err := writeState(stateDir, st); err != nil {
+			t.Errorf("writeState: %v", err)
+		}
+	}
+	// A swap armed two hours ago that never happened — the #2831 shape.
+	sup.armSwap([]byte{0xde, 0xad})
+	sup.pendingSince = time.Now().Add(-2 * time.Hour)
+	sup.publishState(outcomeDeferredInFlight)
+
+	var out, errOut bytes.Buffer
+	rc := run([]string{
+		"fishhawk-mcp-shim", "--status", "--stale-only",
+		"--state-dir", stateDir, "--stale-grace", "0",
+		// A child path that could not possibly start: if --status ever spawned,
+		// run() would take the failure path instead of returning exitOK.
+		"--child", filepath.Join(dir, "definitely-not-here"),
+	}, failReader{t: t}, &out, &errOut)
+	if rc != exitOK {
+		t.Fatalf("run(--status) = %d, want %d (stderr: %s)", rc, exitOK, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		strconv.Itoa(os.Getpid()),
+		strconv.Itoa(child.pid),
+		childPath,
+		hex.EncodeToString(child.LaunchHash())[:12],
+		outcomeDeferredInFlight,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status output missing %q\n---\n%s", want, got)
+		}
+	}
+	// --status must not write a state file of its own.
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("--status perturbed the state dir: %v", entries)
 	}
 }
 

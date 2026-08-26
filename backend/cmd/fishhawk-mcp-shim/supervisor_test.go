@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +16,7 @@ import (
 type fakeChild struct {
 	marker      string
 	hash        []byte
+	pid         int // injectable marker pid returned by Pid()
 	autoRespond bool
 	failStart   bool // when set, Start returns an error instead of launching
 
@@ -81,6 +81,10 @@ func (f *fakeChild) Frames() <-chan []byte { return f.frames }
 func (f *fakeChild) Exited() <-chan error  { return f.exited }
 func (f *fakeChild) LaunchHash() []byte    { return f.hash }
 
+// Pid satisfies the childTransport seam with an injectable marker pid, so the
+// supervisor's snapshot can be asserted without an os/exec child.
+func (f *fakeChild) Pid() int { return f.pid }
+
 func (f *fakeChild) Terminate(grace time.Duration) {
 	f.mu.Lock()
 	f.terminated = true
@@ -125,12 +129,101 @@ func (s *frameSink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// syncBuf is a mutex-guarded log sink: the supervisor writes from its event
+// loop while the test reads from its own goroutine.
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// pubLog captures every published swap-state snapshot. Publishes happen on the
+// event-loop goroutine, so access is mutex-guarded.
+type pubLog struct {
+	mu     sync.Mutex
+	states []swapState
+}
+
+func (p *pubLog) add(st swapState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.states = append(p.states, st)
+}
+
+// count returns how many published snapshots satisfy pred.
+func (p *pubLog) count(pred func(swapState) bool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, st := range p.states {
+		if pred(st) {
+			n++
+		}
+	}
+	return n
+}
+
+// waitFor blocks until a published snapshot satisfies pred, returning it, or
+// fails the test on timeout.
+func (p *pubLog) waitFor(t *testing.T, what string, pred func(swapState) bool) swapState {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		for i := len(p.states) - 1; i >= 0; i-- {
+			if pred(p.states[i]) {
+				st := p.states[i]
+				p.mu.Unlock()
+				return st
+			}
+		}
+		p.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t.Fatalf("timed out waiting for a published snapshot with %s; got %+v", what, p.states)
+	return swapState{}
+}
+
+// fakeClock is an injectable, mutex-guarded clock for the deferral rate limiter.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
 type harness struct {
 	t    *testing.T
 	sup  *supervisor
 	in   chan []byte
 	out  *frameSink
 	swap chan []byte
+	tick chan time.Time
+	pub  *pubLog
+	log  *syncBuf
 }
 
 // newHarness wires a supervisor over the given first child plus a factory queue
@@ -150,9 +243,14 @@ func newHarness(t *testing.T, child0 *fakeChild, rest ...*fakeChild) *harness {
 		idx++
 		return c
 	}
-	sup := newSupervisor(child0, factory, nil, in, out, io.Discard, 30*time.Second, time.Second)
+	logs := &syncBuf{}
+	pub := &pubLog{}
+	sup := newSupervisor(child0, factory, nil, in, out, logs, 30*time.Second, time.Second)
 	sup.swapReq = swap
-	return &harness{t: t, sup: sup, in: in, out: out, swap: swap}
+	sup.publish = pub.add
+	tick := make(chan time.Time)
+	sup.tick = tick
+	return &harness{t: t, sup: sup, in: in, out: out, swap: swap, tick: tick, pub: pub, log: logs}
 }
 
 func (h *harness) start() {
@@ -162,6 +260,12 @@ func (h *harness) start() {
 func (h *harness) send(frame string)       { h.in <- []byte(frame + "\n") }
 func (h *harness) sendRaw(frame []byte)    { h.in <- frame }
 func (h *harness) triggerSwap(hash string) { h.swap <- []byte(hash) }
+
+// pollTick fires one watcher poll through the real tick path.
+func (h *harness) pollTick() { h.tick <- time.Time{} }
+
+// logs returns everything the supervisor has written to its stderr writer.
+func (h *harness) logs() string { return h.log.String() }
 
 // expect returns the next client-facing frame or fails on timeout.
 func (h *harness) expect() string {
@@ -848,5 +952,279 @@ func TestCleanShutdownOnUpstreamEOF(t *testing.T) {
 	}
 	if !child0.isTerminated() {
 		t.Fatal("child should be terminated on shutdown")
+	}
+}
+
+// --- #2831: the swap gate no longer defers forever on an unmatched handshake ---
+
+// TestSwapProceedsOnServedRequestEvidence is the AC1/AC4 done-means: a session
+// whose initialize response was never MATCHED (the child answered under a
+// different id) but whose child has demonstrably served results must still
+// swap. The state is reached the way it is reached in the field — a
+// pre-handshake crash clears in-flight and re-sends the original initialize,
+// and the replacement answers under an id the shim cannot match — so no stored
+// initialize RESPONSE exists at swap time.
+//
+// It also pins the arm the swap takes: the FULL replay (synthetic id, response
+// swallowed), NOT the pre-handshake arm's verbatim re-send, which would deliver
+// a second response under the client's own JSON-RPC id and corrupt the session.
+func TestSwapProceedsOnServedRequestEvidence(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false) // answers with a MISMATCHED id
+	child2 := newFake("C", true)  // the swap target: auto-answers the synthetic replay
+	h := newHarness(t, child0, child1, child2)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+
+	// initialize is recorded, then the child dies before answering it.
+	h.send(initReq1)
+	child0.crash(errors.New("pre-handshake boom"))
+
+	// child1 gets the original initialize re-sent, but answers under an id the
+	// shim cannot match: handshakeDone stays false and no initResp is stored.
+	waitFor(t, func() bool { return len(child1.sentFrames()) > 0 })
+	child1.pushFrame(`{"jsonrpc":"2.0","id":"1-coerced","result":{"serverInfo":{"name":"fake"}}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, "1-coerced") {
+		t.Fatalf("expected the mismatched init response to flow through, got %q", r)
+	}
+
+	// The client's normal traffic is served fine — that is the evidence.
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":2}`)
+	waitFor(t, func() bool { return len(child1.sentFrames()) > 1 })
+	child1.pushFrame(`{"jsonrpc":"2.0","id":2,"result":{"marker":"B"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"marker":"B"`) {
+		t.Fatalf("expected the served result, got %q", r)
+	}
+
+	// A confirmed content change now arrives. Before #2831 this deferred forever.
+	h.triggerSwap("hash-C")
+
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected the swap to complete with list_changed, got %q", lc)
+	}
+	if !child1.isTerminated() {
+		t.Fatal("the old child should have been terminated by the swap")
+	}
+
+	sent := child2.sentFrames()
+	var sawSynthetic, sawInitialized, sawVerbatim bool
+	for _, f := range sent {
+		if strings.Contains(f, "fishhawk-shim/replay/") {
+			sawSynthetic = true
+		}
+		if strings.Contains(f, "notifications/initialized") {
+			sawInitialized = true
+		}
+		if strings.Contains(f, `"method":"initialize"`) && strings.Contains(f, `"id":1,`) {
+			sawVerbatim = true
+		}
+	}
+	if !sawSynthetic || !sawInitialized {
+		t.Fatalf("expected the FULL replay against the new child, got %v", sent)
+	}
+	if sawVerbatim {
+		t.Fatalf("the presumed-handshake swap must NOT re-send the ORIGINAL initialize (it would duplicate a response under the client's own id): %v", sent)
+	}
+	// The swallowed synthetic response must not reach the client.
+	h.expectNone()
+
+	st := h.pub.waitFor(t, "handshake_presumed", func(st swapState) bool { return st.HandshakePresumed })
+	if !st.HandshakeDone {
+		t.Error("a presumed handshake must also read handshake_done (it is what selects the full replay arm)")
+	}
+	if st.ServedResults < handshakeEvidenceThreshold {
+		t.Errorf("served_results = %d, want at least %d", st.ServedResults, handshakeEvidenceThreshold)
+	}
+}
+
+// waitFor spins until cond holds or the deadline passes.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for a condition")
+}
+
+// TestSwapStillDeferredWithoutServedEvidence pins that the fallback is EVIDENCE
+// based, not a blanket permission: an initialize recorded but never answered,
+// with zero served results, still defers — and now SAYS SO.
+func TestSwapStillDeferredWithoutServedEvidence(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	h.send(initReq1) // recorded; the child never answers
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 0 })
+
+	h.triggerSwap("hash-B")
+	st := h.pub.waitFor(t, "deferred_handshake_not_observed", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeDeferredHandshakeNotSeen
+	})
+	if st.HandshakePresumed {
+		t.Error("handshake must not be presumed without a served result")
+	}
+	if child0.isTerminated() {
+		t.Fatal("a swap with no handshake evidence must be deferred, not executed")
+	}
+}
+
+// TestSwapDeferredWhenNoInitializeRecorded pins the refusal arm: without a
+// recorded initialize there is nothing to replay, so a fresh child would never
+// be initialized. The swap is refused AND the refusal is reported — the one
+// path where the operator is told "why not" instead of getting a swap.
+func TestSwapDeferredWhenNoInitializeRecorded(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	// A live child serving results, with NO initialize ever recorded.
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":5}`)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 0 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":5,"result":{"marker":"A"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"marker":"A"`) {
+		t.Fatalf("served result: %q", r)
+	}
+
+	h.triggerSwap("hash-B")
+	st := h.pub.waitFor(t, "deferred_no_initialize_recorded", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeDeferredNoInitialize
+	})
+	if st.HandshakePresumed {
+		t.Error("handshake must not be presumed with no initialize recorded")
+	}
+	if child0.isTerminated() {
+		t.Fatal("a swap with no recorded initialize must be refused, not executed")
+	}
+	waitFor(t, func() bool { return strings.Contains(h.logs(), "no client initialize was ever recorded") })
+}
+
+// TestErrorOnlyResponsesAreNotHandshakeEvidence pins that evidence means a
+// SUCCESSFUL result, not any response frame: a child answering only JSON-RPC
+// errors has not demonstrated a completed initialize lifecycle.
+func TestErrorOnlyResponsesAreNotHandshakeEvidence(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	h.send(initReq1)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 0 })
+	// Mismatched-id error response: not a handshake match, and not evidence.
+	child0.pushFrame(`{"jsonrpc":"2.0","id":"1-coerced","error":{"code":-32603,"message":"nope"}}` + "\n")
+	h.expect()
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":2}`)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 1 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"still nope"}}` + "\n")
+	h.expect()
+
+	h.triggerSwap("hash-B")
+	st := h.pub.waitFor(t, "deferred_handshake_not_observed", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeDeferredHandshakeNotSeen
+	})
+	if st.ServedResults != 0 {
+		t.Errorf("served_results = %d, want 0 (error-only responses are not evidence)", st.ServedResults)
+	}
+	if child0.isTerminated() {
+		t.Fatal("error-only responses must not unlock the swap")
+	}
+}
+
+// TestQuiesceDeferralPublishesOldestInFlight pins the in-flight leak
+// instrumentation: a swap held off by a long-running request names WHICH
+// request and for how long, in the snapshot and in the log. In-flight requests
+// are deliberately never force-orphaned — legitimate stdio calls in this repo
+// block for hours — so visibility is the whole remedy.
+func TestQuiesceDeferralPublishesOldestInFlight(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	timeoutCh := make(chan time.Time, 1)
+	h.sup.after = func(time.Duration) <-chan time.Time { return timeoutCh }
+	h.start()
+
+	h.send(initReq1)
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	h.expect()
+
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":7}`)
+	timeoutCh <- time.Time{}
+	h.triggerSwap("hash-B")
+
+	st := h.pub.waitFor(t, "deferred_in_flight", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeDeferredInFlight
+	})
+	if st.InFlight != 1 {
+		t.Errorf("in_flight = %d, want 1", st.InFlight)
+	}
+	if st.OldestInFlightID != "7" {
+		t.Errorf("oldest_in_flight_id = %q, want \"7\"", st.OldestInFlightID)
+	}
+	if st.OldestInFlightSince == "" {
+		t.Error("oldest_in_flight_since must be stamped")
+	}
+	if child0.isTerminated() {
+		t.Fatal("a deferral must never kill the in-flight child")
+	}
+	waitFor(t, func() bool {
+		l := h.logs()
+		return strings.Contains(l, "oldest id 7") && strings.Contains(l, "age ")
+	})
+}
+
+// TestDeferralLogRateLimited pins that a persistent deferral logs on the
+// transition and then at most once per deferralLogInterval, while EVERY
+// re-entry republishes the snapshot. The re-entries are driven by watcher
+// TICKS, because the passive-wait arm returns without changing state — the tick
+// publish is the only thing keeping the operator-readable channel fresh.
+func TestDeferralLogRateLimited(t *testing.T) {
+	clock := &fakeClock{t: time.Date(2026, 8, 26, 9, 0, 0, 0, time.UTC)}
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.sup.now = clock.now
+	timeoutCh := make(chan time.Time, 1)
+	h.sup.after = func(time.Duration) <-chan time.Time { return timeoutCh }
+	h.start()
+
+	h.send(initReq1)
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	h.expect()
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":3}`)
+	timeoutCh <- time.Time{}
+	h.triggerSwap("hash-B")
+
+	isDeferral := func(st swapState) bool { return st.LastSwapOutcome == outcomeDeferredInFlight }
+	h.pub.waitFor(t, "deferred_in_flight", isDeferral)
+	countLogs := func() int { return strings.Count(h.logs(), "swap deferred: quiesce timeout") }
+	if got := countLogs(); got != 1 {
+		t.Fatalf("log lines after the first deferral = %d, want 1", got)
+	}
+	before := h.pub.count(isDeferral)
+
+	// Two ticks within the interval: republished every time, logged neither.
+	h.pollTick()
+	h.pollTick()
+	waitFor(t, func() bool { return h.pub.count(isDeferral) >= before+2 })
+	if got := countLogs(); got != 1 {
+		t.Fatalf("log lines while rate-limited = %d, want 1", got)
+	}
+
+	// Past the interval: the same persistent denial logs once more.
+	clock.advance(deferralLogInterval + time.Second)
+	h.pollTick()
+	waitFor(t, func() bool { return countLogs() == 2 })
+	if got := countLogs(); got != 2 {
+		t.Fatalf("log lines after the interval elapsed = %d, want 2", got)
+	}
+	if child0.isTerminated() {
+		t.Fatal("the child must still be alive: the request never completed")
 	}
 }
