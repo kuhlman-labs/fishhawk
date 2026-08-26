@@ -711,6 +711,10 @@ func TestMissingLiveValidationMarker_NearMissDrivableStatements(t *testing.T) {
 //
 // Narrowing was applied per C2's resolution — narrowing what M1 CONSIDERS, NOT
 // editing unevaluableCapabilities' phrase strings, which stay byte-identical.
+// SCOPE, added by the fix-up pass: the marker must sit in the SAME CLAUSE as
+// the phrase. This row is a single clause carrying both, so it is still green;
+// the mixed-clause rows below are what prove the negation is no longer a
+// whole-statement kill switch.
 func TestMissingLiveValidationMarker_M1SandboxMarkerNegation(t *testing.T) {
 	v := Verification{
 		AcceptanceCriteria: []AcceptanceCriterion{
@@ -719,6 +723,70 @@ func TestMissingLiveValidationMarker_M1SandboxMarkerNegation(t *testing.T) {
 	}
 	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
 		t.Fatalf("an M1 phrase in prose naming its own stand-in must not fire; got %+v", got)
+	}
+}
+
+// (M1 FALSE-NEGATIVE HOLE — fix-up concern 1, high/regression) A WHOLE-statement
+// sandbox-marker negation is itself a defect: any stray "fake" / "mock" /
+// "preview" / "sandbox" anywhere in a sentence disabled M1 outright, even when
+// the sentence named a genuine live target — recreating the very hole #2845
+// exists to close. The negation is therefore scoped to the CLAUSE the phrase
+// sits in.
+//
+// Each row below is a MIXED statement: one clause names a genuine live target
+// with no stand-in, a NEIGHBOURING clause names a stand-in. All must FIRE. A
+// stand-in in a different clause does not make the live target
+// sandbox-validatable.
+//
+// LOAD-BEARING, and this is the counterfactual vehicle for the scoping: widen
+// liveTargetCorpusMatch's negation back to the whole statement
+// (`if containsSandboxMarker(lowered) { return false }`) and every row here goes
+// RED while TestMissingLiveValidationMarker_M1SandboxMarkerNegation — whose
+// marker and phrase share ONE clause — stays green. That pair is what pins the
+// scope rather than the mere presence of a negation.
+func TestMissingLiveValidationMarker_M1MarkerInAnotherClauseStillFires(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		// Comma clause boundary; the live forge round-trip is genuine and the
+		// "fake transport" belongs to a contrast clause about the unit test.
+		{"forge vs fake transport", "a live GitHub round-trip closes the issue, unlike the fake transport used in the unit test"},
+		// Semicolon boundary; the deployed environment is genuinely exercised
+		// and the preview build is a separate, independently-checked thing.
+		{"deployed vs preview build", "the deployed environment serves the new endpoint; the preview build is verified separately"},
+		// Colon boundary, marker FIRST — order must not matter.
+		{"mock listed first", "the mock forge covers the parse path: a real GitHub API call still reconciles the run"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+			if len(got) != 1 {
+				t.Fatalf("a live target in a clause of its own must still fire, whatever a neighbouring clause mentions; %q got %d: %+v", tc.statement, len(got), got)
+			}
+			if got[0].CriterionID != "a1" {
+				t.Errorf("CriterionID = %q, want a1", got[0].CriterionID)
+			}
+		})
+	}
+}
+
+// (clause-split boundary) '.' is deliberately NOT a clause boundary: splitting
+// on it would cut the liveTarget corpus phrase "against github.com" in half and
+// M1 would lose a true positive to its own splitter. This pins that carve-out —
+// adding '.' to clauseBoundary turns this test RED.
+func TestMissingLiveValidationMarker_DotIsNotAClauseBoundary(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "the run is reconciled against github.com", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("the against-github.com corpus phrase must survive the clause split; got %d: %+v", len(got), got)
 	}
 }
 
@@ -943,6 +1011,70 @@ func TestMissingLiveValidationMarker_M1AndM2FireIndependently(t *testing.T) {
 	}}
 	if got := findingsFor(EvaluateAcceptanceCriteria(m2), RuleMissingLiveValidationMarker); len(got) != 1 {
 		t.Fatalf("M2 must fire alone; got %+v", got)
+	}
+}
+
+// (TOKENIZER BRANCHES — fix-up concern 2, low/untested-path) Two M2 rows that
+// each drive a tokenizer/corpus branch no other fixture reaches. Patch coverage
+// showed both lines "covered" only because the TrimSuffix calls are
+// unconditional statements; nothing asserted the BEHAVIOUR, so a tokenizer
+// change could have dropped either silently.
+//
+// Each row is written so the branch is LOAD-BEARING — the branch's own output
+// is the only thing that satisfies a conjunct:
+//
+//   - curly possessive: "the repo’s default branch" is the ONLY external-target
+//     noun inside the against-window, so conjunct 2 holds only if the U+2019
+//     TrimSuffix("’s") strips it to "repo". Deleting that TrimSuffix reddens the
+//     row. (The hyphenated corpus fixtures all use the ASCII apostrophe, and
+//     "A live walk is recorded: one real grooming run against this repo's
+//     backlog" would still fire off "backlog" even with the possessive intact —
+//     which is why this row uses a different tail.)
+//   - bare "trip": "a real round trip" is the un-hyphenated spelling, so
+//     conjunct 1 holds only via the standalone "trip" entry in liveActionNouns
+//     — "round-trip" never forms as one token here. Deleting "trip" from
+//     liveActionNouns reddens the row.
+func TestMissingLiveValidationMarker_TokenizerBranches(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+	}{
+		{"curly possessive", "a real grooming run against the repo’s default branch is recorded"},
+		{"un-hyphenated round trip", "a real round trip against github closes the issue"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: tc.statement, Source: CriterionSourceExplicit, SourceRef: "#2845"},
+				},
+			}
+			// M2 is the matcher under test: assert M1 does NOT carry the row,
+			// so a corpus phrase cannot mask a broken tokenizer branch.
+			if liveTargetCorpusMatch(strings.ToLower(tc.statement)) {
+				t.Fatalf("premise broken: %q must not match M1, or the row would not test the tokenizer", tc.statement)
+			}
+			got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+			if len(got) != 1 {
+				t.Fatalf("want exactly 1 missing_live_validation_marker for %q; got %d: %+v", tc.statement, len(got), got)
+			}
+			if got[0].CriterionID != "a1" {
+				t.Errorf("CriterionID = %q, want a1", got[0].CriterionID)
+			}
+		})
+	}
+}
+
+// (tokenizer — ASCII possessive) The ASCII half of the same branch pair, kept
+// beside the curly one so a change that drops EITHER TrimSuffix is caught. Same
+// statement shape, `repo's` with U+0027.
+func TestMissingLiveValidationMarker_AsciiPossessiveToken(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a real grooming run against the repo's default branch is recorded", Source: CriterionSourceExplicit, SourceRef: "#2845"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("the ASCII possessive must normalize to repo; got %d: %+v", len(got), got)
 	}
 }
 

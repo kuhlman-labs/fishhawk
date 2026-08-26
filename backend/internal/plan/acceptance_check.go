@@ -581,11 +581,44 @@ func tokenIn(tok string, set []string) bool {
 	return false
 }
 
-// containsSandboxMarker reports whether a lowercased statement names a stand-in
-// ANYWHERE. It is M1's negation: M1 has no proximity window to scope, so the
-// whole statement is the right span. M2 uses the narrower windowed form below.
+// containsSandboxMarker reports whether a lowercased span names a stand-in
+// ANYWHERE within it. It is the primitive behind M1's negation; the SPAN M1
+// hands it is one CLAUSE, not the whole statement (see acceptanceClauses and
+// liveTargetCorpusMatch). M2 uses the narrower token-windowed form below.
 func containsSandboxMarker(lowered string) bool {
 	return containsAnyPhrase(lowered, sandboxMarkers)
+}
+
+// clauseBoundary reports whether r ends a clause for acceptanceClauses.
+//
+// '.' is DELIBERATELY absent: splitting on it would cut "against github.com" —
+// a liveTarget corpus phrase — in half, so the corpus entry could never match
+// and M1 would lose a true positive to the clause split itself.
+func clauseBoundary(r rune) bool {
+	switch r {
+	case ',', ';', ':', '\n', '\r', '—', '–':
+		return true
+	}
+	return false
+}
+
+// acceptanceClauses splits a lowercased statement into clauses at ordinary
+// clause punctuation. It exists so M1's sandbox-marker negation can be scoped
+// to the clause the live-target phrase actually sits in.
+//
+// WHY THE SCOPE MATTERS. A whole-statement negation is a false-NEGATIVE hole:
+// "a live GitHub round-trip closes the issue, unlike the fake transport used in
+// the unit test" names a genuine live target, yet a single "fake" anywhere in
+// the sentence used to disable M1 outright — recreating the exact defect #2845
+// exists to close. A stand-in mentioned in a DIFFERENT clause does not make the
+// live target sandbox-validatable, so it must not disarm the rule.
+//
+// RESIDUAL, stated honestly: a corpus phrase that straddles a clause boundary
+// ("a live, real-forge round-trip") no longer matches. That shape does not
+// occur in the corpus, whose phrases are short adjacent word pairs, and the
+// fail direction is a missed advisory finding rather than a false refusal.
+func acceptanceClauses(lowered string) []string {
+	return strings.FieldsFunc(lowered, clauseBoundary)
 }
 
 // windowHasSandboxMarker reports whether any token in tokens[lo:hi] (clamped)
@@ -669,20 +702,32 @@ func qualifierNearAction(tokens []string) bool {
 // fire. The negation narrows what M1 CONSIDERS without touching a single phrase
 // string, keeping UnevaluableCriteria byte-identical.
 //
-// RESIDUAL, stated honestly: the negation rescues a statement that names its
-// stand-in ("the github api client retries in the fake transport test") but NOT
-// one that carries a live-target phrase in sandbox-validatable prose with no
-// marker at all — "the deployed environment config template is rendered" still
-// fires. Narrowing further (say, also demanding a live-action noun) would drop
-// the genuine true positive "the deployed environment serves the new endpoint",
-// so the residual is accepted and pinned by a test rather than papered over.
+// THE NEGATION IS SCOPED TO ONE CLAUSE, not to the whole statement. A
+// whole-statement negation is itself a false-NEGATIVE hole: any stray "fake" /
+// "mock" / "preview" anywhere in a sentence disabled M1 even when the sentence
+// named a genuine live target, which recreates the defect this rule closes. So
+// M1 asks the question per clause — a clause carrying a liveTarget phrase and
+// NO stand-in of its own fires, however many stand-ins the neighbouring clauses
+// mention. A marker only disarms the rule where it plausibly qualifies the
+// target: in the same clause as the phrase.
+//
+// RESIDUAL, stated honestly: the negation rescues a statement whose clause
+// names its own stand-in ("the github api client retries in the fake transport
+// test") but NOT one that carries a live-target phrase in sandbox-validatable
+// prose with no marker at all — "the deployed environment config template is
+// rendered" still fires. Narrowing further (say, also demanding a live-action
+// noun) would drop the genuine true positive "the deployed environment serves
+// the new endpoint", so the residual is accepted and pinned by a test rather
+// than papered over.
 func liveTargetCorpusMatch(lowered string) bool {
-	if containsSandboxMarker(lowered) {
-		return false
-	}
-	for _, uc := range unevaluableCapabilities {
-		if uc.liveTarget && containsAnyPhrase(lowered, uc.phrases) {
-			return true
+	for _, clause := range acceptanceClauses(lowered) {
+		if containsSandboxMarker(clause) {
+			continue
+		}
+		for _, uc := range unevaluableCapabilities {
+			if uc.liveTarget && containsAnyPhrase(clause, uc.phrases) {
+				return true
+			}
 		}
 	}
 	return false
@@ -697,7 +742,8 @@ func liveTargetCorpusMatch(lowered string) bool {
 // A criterion is flagged when EITHER matcher fires:
 //
 //	M1 — the statement contains a phrase from a liveTarget entry of the shared
-//	     unevaluableCapabilities corpus (and names no sandbox stand-in).
+//	     unevaluableCapabilities corpus, in a CLAUSE that names no sandbox
+//	     stand-in of its own.
 //	M2 — the three-conjunct liveness-proximity matcher fires, catching the
 //	     named-system prose ("a real backlog_grooming run against this
 //	     repository") that no fixed phrase list anticipates.
