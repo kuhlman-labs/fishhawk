@@ -308,6 +308,38 @@ advertised to fishhawkd as `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE` in
 the ConfigMap (pre-existing in `serve.go`, only newly surfaced by the
 chart).
 
+The GitHub App is **all-or-nothing at the fishhawkd level**: `serve.go`
+requires `config.githubAppId` (`FISHHAWKD_GITHUB_APP_ID`) **and** a
+mounted, parseable PEM together, or neither. With only one set it exits
+at boot (`github app misconfigured: both --github-app-id and
+--github-app-private-key-file required`); with neither set it logs a
+Warn (`FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side
+actions will be disabled`) and runs with GitHub-side actions off.
+
+`values-local.yaml` ships the App **OFF**
+(`config.githubAppId: ""` + `secrets.githubApp.privateKeyFile.enabled:
+false`, no `secrets.values.githubAppPrivateKey`) because a placeholder
+PEM cannot parse and fishhawkd parses it **eagerly at boot** — so a
+committed placeholder is not a render-only concern, it crashloops the
+pod ([#2914](https://github.com/kuhlman-labs/fishhawk/issues/2914)). A
+real deploy with a typo'd key still refuses to boot rather than silently
+degrading; the eager parse is deliberately left fail-closed.
+
+To turn the App on for a local cluster, generate a **throwaway** key and
+pass it at install time (never commit a key to the repo):
+
+```sh
+openssl genrsa 2048 > /tmp/fh-dev-key.pem   # LibreSSL on macOS emits PKCS#1; do NOT pass OpenSSL 3's -traditional (LibreSSL rejects it)
+helm upgrade --install fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-local.yaml \
+  --set config.githubAppId=<your-app-id> \
+  --set secrets.githubApp.privateKeyFile.enabled=true \
+  --set-file secrets.values.githubAppPrivateKey=/tmp/fh-dev-key.pem
+```
+
+A throwaway key authenticates to nothing — it only gets fishhawkd past
+the PEM parse, not onto GitHub. `githubapp.NewSignerFromPEM` accepts
+both PKCS#1 (`BEGIN RSA PRIVATE KEY`) and PKCS#8, so either form works.
+
 ### Deploy-time secrets guard
 
 `fishhawk.validateSecrets` — included once from whichever serve

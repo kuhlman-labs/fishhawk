@@ -107,6 +107,29 @@ all-three-or-none and exits at `oauth misconfigured` on a partial set,
 complete trio and boots. Leave `config.oauthClientId` empty for an OAuth-OFF
 install (fishhawkd then serves `/v0/auth/github/*` as `503`).
 
+### GitHub App (local)
+
+The GitHub App is all-three-or-none in the same shape: fishhawkd requires
+`config.githubAppId` (`FISHHAWKD_GITHUB_APP_ID`) **and** a mounted, parseable
+PEM together, or neither, and it parses the PEM **eagerly at boot** — a
+placeholder key crashloops the pod
+([#2914](https://github.com/kuhlman-labs/fishhawk/issues/2914)). So
+`values-local.yaml` now ships the App **off** (`config.githubAppId: ""` +
+`secrets.githubApp.privateKeyFile.enabled: false`, no committed PEM), and the
+shipped local values boot unmodified. To enable it for a local cluster, generate
+a throwaway key and pass it at install time (never commit a key):
+
+```sh
+openssl genrsa 2048 > /tmp/fh-dev-key.pem
+helm upgrade --install fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-local.yaml \
+  --set config.githubAppId=<your-app-id> \
+  --set secrets.githubApp.privateKeyFile.enabled=true \
+  --set-file secrets.values.githubAppPrivateKey=/tmp/fh-dev-key.pem
+```
+
+See the chart README's "GitHub App private key" section for the full recipe. A
+throwaway key gets fishhawkd past the parse, not onto GitHub.
+
 For any `FISHHAWKD_*` env var the chart has no dedicated field for, use
 `config.extraEnv` — a map of NON-SECRET name → value merged verbatim into the
 ConfigMap (a collision with a chart-managed key or an invalid env identifier
@@ -209,7 +232,8 @@ The chart ships four worked override files (see the chart row in
 | `profile` | `local` (permits dev-only conveniences) | `prod` |
 | Postgres / MinIO | in-cluster (`postgres.enabled`, `minio.enabled`) | external DB / S3 |
 | Jaeger (tracing) | in-cluster (`jaeger.enabled`) | off (dev-only) |
-| Secrets | `chartManaged` dev Secret with placeholders | `existing` / `externalSecrets` |
+| Secrets | `chartManaged` dev Secret with dev values | `existing` / `externalSecrets` |
+| GitHub App | off (generate a throwaway key to enable — see above) | App id + PEM in the Secret |
 | Ingress / TLS | off (port-forward / NodePort) | Ingress + cert-manager TLS on |
 
 Two more ship alongside them, both complete as written (real IngressClass, real
