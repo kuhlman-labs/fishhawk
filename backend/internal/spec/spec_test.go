@@ -643,6 +643,30 @@ workflows:
 	}
 }
 
+// TestStageRefResolutionConstantsPinnedVerbatim locks the E52.13 / #2323
+// constants extracted from validate.go's duplicate-stage-id and from_stage
+// checks to their exact shipped bytes, so the extraction cannot be silently
+// reworded into agreement with a drifted CLI copy (a literal pin, not a circular
+// assert-through-the-constant). The graph-shape rejection tests above prove the
+// call sites RENDER these; this proves the bytes.
+func TestStageRefResolutionConstantsPinnedVerbatim(t *testing.T) {
+	if spec.MsgFmtFromStageUnknown != "from_stage %q does not match any stage id in workflow %q" {
+		t.Errorf("MsgFmtFromStageUnknown drifted: %q", spec.MsgFmtFromStageUnknown)
+	}
+	if spec.MsgFmtFromStageNotEarlier != "from_stage %q must be a stage earlier in the workflow (got index %d, this stage is index %d)" {
+		t.Errorf("MsgFmtFromStageNotEarlier drifted: %q", spec.MsgFmtFromStageNotEarlier)
+	}
+	if spec.MsgFmtDuplicateStageID != "duplicate stage id %q (also at /workflows/%s/stages/%d/id)" {
+		t.Errorf("MsgFmtDuplicateStageID drifted: %q", spec.MsgFmtDuplicateStageID)
+	}
+	if spec.PathFmtFromStage != "/workflows/%s/stages/%d/inputs/%d/from_stage" {
+		t.Errorf("PathFmtFromStage drifted: %q", spec.PathFmtFromStage)
+	}
+	if spec.PathFmtStageID != "/workflows/%s/stages/%d/id" {
+		t.Errorf("PathFmtStageID drifted: %q", spec.PathFmtStageID)
+	}
+}
+
 func TestParse_UndefinedApproverRole(t *testing.T) {
 	_, err := spec.ParseBytes([]byte(`
 version: "0.3"

@@ -134,11 +134,8 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 	for i, stage := range wf.Stages {
 		if prev, ok := seen[stage.ID]; ok {
 			return &ValidationError{
-				Path: stagePath(i, "/id"),
-				Message: fmt.Sprintf(
-					"duplicate stage id %q (also at /workflows/%s/stages/%d/id)",
-					stage.ID, name, prev,
-				),
+				Path:    fmt.Sprintf(PathFmtStageID, name, i),
+				Message: fmt.Sprintf(MsgFmtDuplicateStageID, stage.ID, name, prev),
 			}
 		}
 		seen[stage.ID] = i
@@ -343,11 +340,8 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			}
 			if _, ok := seen[in.FromStage]; !ok {
 				return &ValidationError{
-					Path: stagePath(i, fmt.Sprintf("/inputs/%d/from_stage", j)),
-					Message: fmt.Sprintf(
-						"from_stage %q does not match any stage id in workflow %q",
-						in.FromStage, name,
-					),
+					Path:    fmt.Sprintf(PathFmtFromStage, name, i, j),
+					Message: fmt.Sprintf(MsgFmtFromStageUnknown, in.FromStage, name),
 				}
 			}
 			// Cannot reference self or a later stage; runs are
@@ -355,11 +349,8 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			refIdx := seen[in.FromStage]
 			if refIdx >= i {
 				return &ValidationError{
-					Path: stagePath(i, fmt.Sprintf("/inputs/%d/from_stage", j)),
-					Message: fmt.Sprintf(
-						"from_stage %q must be a stage earlier in the workflow (got index %d, this stage is index %d)",
-						in.FromStage, refIdx, i,
-					),
+					Path:    fmt.Sprintf(PathFmtFromStage, name, i, j),
+					Message: fmt.Sprintf(MsgFmtFromStageNotEarlier, in.FromStage, refIdx, i),
 				}
 			}
 		}
@@ -510,6 +501,37 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 	}
 	return nil
 }
+
+// The stage-reference-resolution rules (E52.13 / #2323) — duplicate stage id
+// and inputs[].from_stage resolution — extracted to constants so the CLI's
+// independent port in cli/internal/spec/graphshape.go can carry byte-identical
+// copies. The two Go modules cannot share a package, so parity of BOTH the
+// message text AND the reported JSON-pointer path is held mechanically by
+// TestGraphShapeMessageParity, which reads this file, v2shape.go and
+// graphshape.go over the repo root and requires each declaration verbatim.
+// They must therefore stay single-line `const … = "…"` declarations.
+//
+// MsgFmtDuplicateStageID's arguments are the duplicated id, the workflow name
+// and the index of the earlier occurrence. PathFmtStageID formats the reported
+// path from the workflow name and the current stage index; PathFmtFromStage
+// from the workflow name, the stage index and the inputs index. Each is a
+// single-line `const … = "…"` declaration because the parity test matches it
+// verbatim.
+
+// MsgFmtFromStageUnknown rejects an inputs[].from_stage naming no declared stage.
+const MsgFmtFromStageUnknown = "from_stage %q does not match any stage id in workflow %q"
+
+// MsgFmtFromStageNotEarlier rejects an inputs[].from_stage naming self or a later stage.
+const MsgFmtFromStageNotEarlier = "from_stage %q must be a stage earlier in the workflow (got index %d, this stage is index %d)"
+
+// MsgFmtDuplicateStageID rejects a workflow declaring two stages with one id.
+const MsgFmtDuplicateStageID = "duplicate stage id %q (also at /workflows/%s/stages/%d/id)"
+
+// PathFmtFromStage is the reported path for a from_stage rejection (wf, stage, input index).
+const PathFmtFromStage = "/workflows/%s/stages/%d/inputs/%d/from_stage"
+
+// PathFmtStageID is the reported path for a duplicate-stage-id rejection (wf, stage index).
+const PathFmtStageID = "/workflows/%s/stages/%d/id"
 
 // MsgAppliesToChangeKindUnsupported is the rejection for a `change_kind`
 // criterion inside a workflow's `applies_to` (E53.3 / #2226). It is

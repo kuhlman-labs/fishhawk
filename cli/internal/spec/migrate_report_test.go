@@ -298,11 +298,20 @@ func TestReport_UnnamedStage(t *testing.T) {
 	}
 }
 
-// TestReport_NamesServerSideAuthority: the codemod validates the spec
-// document, not `needs` / `from_stage` referent resolution, and the
-// report says so.
+// TestReport_NamesServerSideAuthority: since E52.13 / #2323 the codemod's
+// R0/R7 ValidateBytes gates resolve stage references, so the footer names the
+// stage-binding rules as the residual rather than disclaiming referent
+// resolution. Assert BOTH the corrected framing and the absence of the old
+// "not `needs` / `from_stage` referent resolution" disclaimer.
 func TestReport_NamesServerSideAuthority(t *testing.T) {
-	if got := reportFor(t, minimalV1); !strings.Contains(got, "Server-side validation remains the authority") {
-		t.Errorf("the report must state the limit of its own authority\n---\n%s", got)
+	got := reportFor(t, minimalV1)
+	if !strings.Contains(got, "Server-side validation remains the authority for the stage-binding rules") {
+		t.Errorf("the report must name the stage-binding rules as the residual authority\n---\n%s", got)
+	}
+	if !strings.Contains(got, "stage-reference\nresolution") {
+		t.Errorf("the report must state that the ValidateBytes gate now covers stage-reference resolution\n---\n%s", got)
+	}
+	if strings.Contains(got, "not `needs` / `from_stage` referent resolution") {
+		t.Errorf("the report still carries the retired referent-resolution disclaimer\n---\n%s", got)
 	}
 }

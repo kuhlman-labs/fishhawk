@@ -371,6 +371,20 @@ workflows:
 	}
 }
 
+// TestNeedsConstantsPinnedVerbatim locks the E52.13 / #2323 constants extracted
+// from expandNeeds to their exact shipped bytes, so the extraction cannot be
+// silently reworded into agreement with a drifted CLI copy (a literal pin, not a
+// circular assert-through-the-constant). TestParseV2_NeedsRejectionModes above
+// proves the call site RENDERS these; this proves the bytes.
+func TestNeedsConstantsPinnedVerbatim(t *testing.T) {
+	if MsgFmtNeedsNoDefaultArtifact != "needs %q references a %q stage, which has no default input artifact; declare the wiring longhand with inputs: [{artifact: …, from_stage: %s}]" {
+		t.Errorf("MsgFmtNeedsNoDefaultArtifact drifted from shipped text: %q", MsgFmtNeedsNoDefaultArtifact)
+	}
+	if PathFmtNeeds != "/workflows/%s/stages/%d/needs/%d" {
+		t.Errorf("PathFmtNeeds drifted from shipped path: %q", PathFmtNeeds)
+	}
+}
+
 // TestParseV2_NeedsToReviewNamesLonghandEscape pins that the one error the
 // normalizer itself raises tells the author what to do instead.
 func TestParseV2_NeedsToReviewNamesLonghandEscape(t *testing.T) {

@@ -95,8 +95,15 @@ const noApprovalGatesLine = "\nThis document declares no approval gates.\n"
 // serverSideAuthorityFooter states the limit of the codemod's own authority.
 // It describes the DOCUMENT, so every report shape emits it — including the
 // zero-gate and nil-receiver ones.
-const serverSideAuthorityFooter = "\nServer-side validation remains the authority for cross-stage wiring: this report and the\n" +
-	"codemod's schema gate cover the spec document, not `needs` / `from_stage` referent resolution.\n"
+//
+// Since E52.13 / #2323 the codemod's R0/R7 `ValidateBytes` gates DO resolve
+// stage references (duplicate ids, `needs`, `from_stage`), so the footer no
+// longer disclaims referent resolution — it names what genuinely remains
+// server-side: the stage-binding rules.
+const serverSideAuthorityFooter = "\nServer-side validation remains the authority for the stage-binding rules: this report and the\n" +
+	"codemod's ValidateBytes gate cover the spec document — schema, reuse resolution and stage-reference\n" +
+	"resolution (duplicate ids, needs, from_stage) — but not the type/executor/constraint,\n" +
+	"produces-artifact and plan-schema bindings, which are checked server-side at run creation.\n"
 
 // Render writes the report as plain text for stdout.
 //

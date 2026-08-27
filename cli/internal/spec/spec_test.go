@@ -2117,6 +2117,127 @@ func TestResolveReuse_LowerMajorsPassThrough(t *testing.T) {
 	}
 }
 
+// needsBearingV2Doc is a v2 document whose implement stage carries the `needs:`
+// shorthand, for the regression guard below.
+const needsBearingV2Doc = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan]
+        produces:
+          - artifact: pull_request
+`
+
+// TestResolveReuse_UnaffectedByGraphShapeExpansion is the regression guard for
+// the ASSUMPTION that ValidateBytes' in-place `needs`→`inputs` expansion (E52.13
+// / #2323) is not observable from ResolveReuse. `fishhawk doctor`'s
+// execution-path rungs read ResolveReuse's re-marshalled document, so if the
+// expansion leaked into it they would see a folded shape. It cannot: each call
+// decodes its own document. Assert the re-marshalled output still carries
+// `needs:` and no derived `inputs`/`from_stage` entry — before AND after a
+// ValidateBytes call on the same bytes.
+func TestResolveReuse_UnaffectedByGraphShapeExpansion(t *testing.T) {
+	assertResolved := func(t *testing.T) {
+		t.Helper()
+		out, err := spec.ResolveReuse([]byte(needsBearingV2Doc))
+		if err != nil {
+			t.Fatalf("ResolveReuse = %v, want nil", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "needs:") {
+			t.Errorf("ResolveReuse output dropped `needs:` — expansion leaked:\n%s", s)
+		}
+		if strings.Contains(s, "from_stage:") {
+			t.Errorf("ResolveReuse output carries a derived `from_stage:` — expansion leaked:\n%s", s)
+		}
+	}
+	assertResolved(t)
+	if err := spec.ValidateBytes([]byte(needsBearingV2Doc)); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil", err)
+	}
+	assertResolved(t)
+}
+
+// TestGraphShapeMessageParity is the MECHANICAL drift guard for the seven
+// hand-duplicated strings this change introduces — the four Msg* rejections and
+// the three Path* format strings (C1: the two sides must agree on the reported
+// PATH as well as the message, or they can accept/reject different documents or
+// report the same message at a different pointer). The two spec packages live
+// in separate Go modules and cannot share a constant, so parity is asserted by
+// reading each declaring source file over the repo root and requiring the
+// identical `const … = "…"` line, exactly as TestAppliesToChangeKindMessageParity
+// does for its single constant.
+func TestGraphShapeMessageParity(t *testing.T) {
+	const cliGraphShape = "../../../cli/internal/spec/graphshape.go"
+	const backendValidate = "../../../backend/internal/spec/validate.go"
+	const backendV2Shape = "../../../backend/internal/spec/v2shape.go"
+	cases := []struct {
+		name    string
+		value   string
+		backend string // the backend file that must also declare it verbatim
+	}{
+		{"MsgFmtFromStageUnknown", spec.MsgFmtFromStageUnknown, backendValidate},
+		{"MsgFmtFromStageNotEarlier", spec.MsgFmtFromStageNotEarlier, backendValidate},
+		{"MsgFmtDuplicateStageID", spec.MsgFmtDuplicateStageID, backendValidate},
+		{"PathFmtFromStage", spec.PathFmtFromStage, backendValidate},
+		{"PathFmtStageID", spec.PathFmtStageID, backendValidate},
+		{"MsgFmtNeedsNoDefaultArtifact", spec.MsgFmtNeedsNoDefaultArtifact, backendV2Shape},
+		{"PathFmtNeeds", spec.PathFmtNeeds, backendV2Shape},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := "const " + tc.name + " = " + strconv.Quote(tc.value)
+			for _, path := range []string{cliGraphShape, tc.backend} {
+				src, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read %s: %v", path, err)
+				}
+				if !strings.Contains(string(src), want) {
+					t.Errorf("%s does not declare %s verbatim;\nwant the line: %s\n"+
+						"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text or paths for the same spec error.", path, tc.name, want)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateBytes_RepoSpecAndPresetsStillValid asserts that this change did
+// not newly reject any spec the repo actually ships: its own governing spec and
+// all three shipped presets pass ValidateBytes with the stage-reference
+// resolution wired in (they declare only resolving references — the presets
+// round-trip through Generate → ValidateBytes, so a regression here also fails
+// preset_test.go).
+func TestValidateBytes_RepoSpecAndPresetsStillValid(t *testing.T) {
+	paths := []string{
+		"../../../.fishhawk/workflows.yaml",
+		"../../../docs/spec/workflow-preset-low.yaml",
+		"../../../docs/spec/workflow-preset-medium.yaml",
+		"../../../docs/spec/workflow-preset-high.yaml",
+	}
+	for _, p := range paths {
+		t.Run(p, func(t *testing.T) {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatalf("read %s: %v", p, err)
+			}
+			if err := spec.ValidateBytes(data); err != nil {
+				t.Errorf("ValidateBytes(%s) = %v, want nil", p, err)
+			}
+		})
+	}
+}
+
 // TestResolveReuse_ParseErrors: malformed YAML and an empty document each
 // return *ParseError.
 func TestResolveReuse_ParseErrors(t *testing.T) {

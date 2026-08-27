@@ -4,6 +4,28 @@ import (
 	"fmt"
 )
 
+// The `needs`-referent no-default-artifact rejection (E52.13 / #2323), extracted
+// to constants so the CLI's independent port in cli/internal/spec/graphshape.go
+// can carry byte-identical copies. The two Go modules cannot share a package, so
+// parity of BOTH the message text AND the reported JSON-pointer path is held
+// mechanically by TestGraphShapeMessageParity, which reads validate.go, this
+// file and graphshape.go over the repo root. They must therefore stay single-line
+// `const … = "…"` declarations.
+//
+// MsgFmtNeedsNoDefaultArtifact's arguments are the referent id, its stage type
+// and (again) the referent id, in the longhand-escape suggestion. PathFmtNeeds
+// formats the reported path from the workflow name, the stage index and the
+// `needs` entry index — the NEEDS index, deliberately distinct from the
+// post-expansion inputs index the from_stage rules report at. Each is a
+// single-line `const … = "…"` declaration because the parity test matches it
+// verbatim.
+
+// MsgFmtNeedsNoDefaultArtifact rejects a `needs` referent whose type has no default input artifact.
+const MsgFmtNeedsNoDefaultArtifact = "needs %q references a %q stage, which has no default input artifact; declare the wiring longhand with inputs: [{artifact: …, from_stage: %s}]"
+
+// PathFmtNeeds is the reported path for a no-default-artifact rejection (wf, stage, needs index).
+const PathFmtNeeds = "/workflows/%s/stages/%d/needs/%d"
+
 // workflow-v2 shape normalization (E52.6 / #2218).
 //
 // v2 reshapes three surfaces for legibility without changing what any of
@@ -199,11 +221,8 @@ func expandNeeds(stage map[string]any, types map[string]string, wfName string, s
 			a, hasDefault := defaultInputArtifact(typ)
 			if !hasDefault {
 				return &ValidationError{
-					Path: fmt.Sprintf("/workflows/%s/stages/%d/needs/%d", wfName, stageIdx, j),
-					Message: fmt.Sprintf(
-						"needs %q references a %q stage, which has no default input artifact; declare the wiring longhand with inputs: [{artifact: …, from_stage: %s}]",
-						id, typ, id,
-					),
+					Path:    fmt.Sprintf(PathFmtNeeds, wfName, stageIdx, j),
+					Message: fmt.Sprintf(MsgFmtNeedsNoDefaultArtifact, id, typ, id),
 				}
 			}
 			artifact = a

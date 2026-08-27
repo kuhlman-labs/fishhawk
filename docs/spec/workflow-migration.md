@@ -140,7 +140,7 @@ A gate with neither enumerable members nor unresolved predicates prints the expl
 
 ## Limits
 
-`cli/internal/spec` performs no typed decode and no graph-shape pass, so the codemod's `ValidateBytes` gate catches schema, removed-form and reuse-resolution errors but **not** `needs` / `from_stage` referent errors, which surface server-side at run creation. The codemod never rewrites input wiring, so it introduces no new referent — but server-side validation remains the authority, and the report says so.
+Since E52.13 / #2323 the codemod's `ValidateBytes` gate (R0 source, R7 output) resolves stage references — duplicate ids, the `needs:` shorthand, and `inputs[].from_stage` referents/ordering — in addition to schema, removed-form and reuse-resolution errors. So a **source** carrying a dangling `from_stage` is now refused at R0 rather than migrated (the correct answer — the backend would reject it at run creation anyway). What still surfaces server-side only is the stage-BINDING class (type/executor/constraint, produces-artifact, plan schema, `max_autonomy`). The codemod never rewrites input wiring, so it introduces no new referent — but server-side validation remains the authority for the binding rules, and the report says so.
 
 ## Golden fixture
 
