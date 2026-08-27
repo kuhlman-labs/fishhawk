@@ -37,6 +37,12 @@ func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) 
 			{Number: 42, Title: "slice B", Autonomy: "high"},
 		},
 		Edges: []DependsEdge{{From: 42, To: 41}},
+		// A closed-and-completed out-of-epic target the provider elided (#2953):
+		// the dispatch-carrying test below obtains it ONLY through the interface,
+		// so this proves SatisfiedEdges survives the cross-provider boundary.
+		SatisfiedEdges: []SatisfiedEdge{
+			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
+		},
 	}, nil
 }
 
@@ -229,5 +235,53 @@ func TestEpicChild_CarriesBodyAndURLForAdoption(t *testing.T) {
 	}
 	if strings.HasPrefix(got.URL, "https://github.com/") {
 		t.Errorf("EpicChild.URL must not be composed from a github.com prefix: %q", got.URL)
+	}
+}
+
+// TestDropReasonWireValues pins the string values of the two #2953 drop reasons.
+// They are the CONTRACT the server details keys and the fishhawk-mcp remedy
+// renderer branch on, so a rename here silently breaks the operator remedy. A
+// literal assertion (not a re-derivation) is the whole point.
+func TestDropReasonWireValues(t *testing.T) {
+	if DropTargetClosedIncomplete != "target_closed_incomplete" {
+		t.Errorf("DropTargetClosedIncomplete = %q, want target_closed_incomplete", DropTargetClosedIncomplete)
+	}
+	if DropTargetStateUnreadable != "target_state_unreadable" {
+		t.Errorf("DropTargetStateUnreadable = %q, want target_state_unreadable", DropTargetStateUnreadable)
+	}
+}
+
+// TestSatisfiedEdgeCarriedThroughDispatch drives the SatisfiedEdges channel
+// across the REAL registry dispatch seam (Register → Get → EpicChildrenQuerier
+// type-assertion → EpicChildren) rather than reading back a literal in place: a
+// registered provider PRODUCES the elided edge and the caller obtains it ONLY
+// through the interface, so the field must survive the cross-provider interface
+// boundary the campaign path relies on (#2953). It goes RED if EpicChildrenResult
+// or EpicChildrenQuerier ever stops carrying the observed target state — the
+// contract this package owns; the field-POPULATION logic is driven end to end in
+// the github provider tests (TestResolveDependenciesClosedCompletedTargetSatisfied).
+func TestSatisfiedEdgeCarriedThroughDispatch(t *testing.T) {
+	fp := &fakeProvider{name: "test_provider_satisfied_edge"}
+	Register(fp)
+	p, err := Get("test_provider_satisfied_edge")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	q, ok := p.(EpicChildrenQuerier)
+	if !ok {
+		t.Fatalf("provider does not implement EpicChildrenQuerier")
+	}
+	res, err := q.EpicChildren(context.Background(), EpicChildrenRequest{
+		Target: Target{Scope: forge.FromGitHubInstallationID(7), Repo: Repo{Owner: "o", Name: "r"}},
+		Epic:   "#2953",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if len(res.SatisfiedEdges) != 1 {
+		t.Fatalf("SatisfiedEdges = %+v, want one carried through dispatch", res.SatisfiedEdges)
+	}
+	if e := res.SatisfiedEdges[0]; e != (SatisfiedEdge{From: 2032, To: 1639, State: "closed", StateReason: "completed"}) {
+		t.Errorf("SatisfiedEdge = %+v, want {2032 1639 closed completed}", e)
 	}
 }

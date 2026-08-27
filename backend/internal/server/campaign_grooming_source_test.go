@@ -1065,6 +1065,42 @@ func TestCreateCampaign_GroomingSource_DanglingNamesProvenance(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_GroomingSource_ClosedTargetElided_201 is the #2953
+// reproducer at the grooming source: a grooming-ordered batch whose depends_on
+// targets are OUT-OF-ORDER and closed-and-completed now assembles SUCCESSFULLY
+// (201) with the edges elided, where before #2953 it 422'd
+// campaign_dangling_dependency with unactionable widen-the-limit advice. The
+// response surfaces the elision and no dangling refusal is emitted.
+func TestCreateCampaign_GroomingSource_ClosedTargetElided_201(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{
+		approvals: []approval.Decision{approval.DecisionApprove},
+		// #2032 and #2801 are in the batch; each depends on an out-of-batch target
+		// (#1639/#2822) the provider already classified closed-and-completed.
+		children: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{{Number: 2032}, {Number: 2801}},
+			SatisfiedEdges: []workmgmt.SatisfiedEdge{
+				{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
+				{From: 2801, To: 2822, State: "closed", StateReason: "completed"},
+			},
+		},
+	}, 2032, 2801)
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	if len(created.SatisfiedDependencies) != 2 {
+		t.Fatalf("satisfied_dependencies = %+v, want 2 elided edges", created.SatisfiedDependencies)
+	}
+	if n := f.audit.count(auditCampaignDependencyElided); n != 1 {
+		t.Errorf("%s audit entries = %d, want exactly 1", auditCampaignDependencyElided, n)
+	}
+}
+
 // TestCreateCampaign_GroomingSource_SetMismatchIs500 pins the ReorderByPriority
 // failure at the handler: a provider that resolved a set the order did not name
 // is a BUG, not operator input, so it is a 500 and nothing is persisted.

@@ -108,12 +108,86 @@ func TestFilterToSubset_IncludedDependsOnExcludedComplete_DroppedSilently(t *tes
 	if len(res.DroppedEdges) != 0 {
 		t.Fatalf("DroppedEdges = %+v, want none (excluded #100 is complete → satisfied)", res.DroppedEdges)
 	}
+	// #2953: the elision is no longer SILENT — it is recorded as a SatisfiedEdge
+	// carrying the closed/completed state, so an operator can see it.
+	want := workmgmt.SatisfiedEdge{From: 101, To: 100, State: "closed", StateReason: "completed"}
+	if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
+		t.Fatalf("SatisfiedEdges = %+v, want [%+v] (excluded-complete elision recorded)", res.SatisfiedEdges, want)
+	}
 	a, err := campaign.Assemble("issue:99", res)
 	if err != nil {
 		t.Fatalf("Assemble(satisfied dep) = %v, want success", err)
 	}
 	if len(a.Items) != 1 || a.Items[0].IssueRef != "issue:101" {
 		t.Fatalf("assembled items = %+v, want [issue:101]", a.Items)
+	}
+}
+
+// TestFilterToSubset_CarriesInboundSatisfiedEdgesAtMostOnce pins #2953 condition
+// 3: an inbound SatisfiedEdge (an out-of-EPIC target the provider already elided)
+// is carried through untouched, and FilterToSubset does NOT re-add an edge already
+// present in res.SatisfiedEdges — every satisfied edge appears AT MOST ONCE.
+func TestFilterToSubset_CarriesInboundSatisfiedEdgesAtMostOnce(t *testing.T) {
+	in := fullDAG()
+	// #100 is complete: the included #101->#100 excluded edge will be elided.
+	in.Children[0].Complete = true
+	// Seed an inbound satisfied edge that COLLIDES with the elision the subset
+	// filter is about to record, to prove the at-most-once dedup.
+	in.SatisfiedEdges = []workmgmt.SatisfiedEdge{
+		{From: 101, To: 100, State: "closed", StateReason: "completed"},
+		{From: 102, To: 1639, State: "closed", StateReason: "completed"}, // out-of-epic, From excluded
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:101"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	// Count occurrences of each (From,To): none may appear more than once.
+	seen := map[[2]int]int{}
+	for _, s := range res.SatisfiedEdges {
+		seen[[2]int{s.From, s.To}]++
+	}
+	for k, n := range seen {
+		if n > 1 {
+			t.Errorf("satisfied edge %v appears %d times, want at most once", k, n)
+		}
+	}
+	// The colliding inbound 101->100 must be present exactly once (not doubled by
+	// the excluded-complete elision).
+	if seen[[2]int{101, 100}] != 1 {
+		t.Errorf("101->100 count = %d, want exactly 1 (inbound + elision deduped)", seen[[2]int{101, 100}])
+	}
+	// The inbound out-of-epic 102->1639 is carried through untouched.
+	if seen[[2]int{102, 1639}] != 1 {
+		t.Errorf("inbound 102->1639 missing from carried SatisfiedEdges: %+v", res.SatisfiedEdges)
+	}
+}
+
+// TestFilterToSubset_DedupsInboundDuplicateSatisfiedEdges pins #2953 condition 3
+// at the CONSUMER boundary: even if a producer emits the SAME satisfied edge
+// twice in res.SatisfiedEdges, FilterToSubset carries it through exactly ONCE.
+// The provider now collapses duplicate depends_on tokens at the source, but the
+// consumer dedup makes the at-most-once invariant hold for ANY inbound producer.
+//
+// COUNTERFACTUAL: revert the inbound carry to `append(satisfied, res.SatisfiedEdges...)`
+// (no per-(From,To) dedup) → the duplicate survives → this goes RED.
+func TestFilterToSubset_DedupsInboundDuplicateSatisfiedEdges(t *testing.T) {
+	in := fullDAG()
+	// A producer-emitted duplicate of the SAME out-of-epic satisfied edge (From
+	// #101 is included in the subset below), plus a distinct one.
+	in.SatisfiedEdges = []workmgmt.SatisfiedEdge{
+		{From: 101, To: 1639, State: "closed", StateReason: "completed"},
+		{From: 101, To: 1639, State: "closed", StateReason: "completed"},
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:101"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	seen := map[[2]int]int{}
+	for _, s := range res.SatisfiedEdges {
+		seen[[2]int{s.From, s.To}]++
+	}
+	if seen[[2]int{101, 1639}] != 1 || len(res.SatisfiedEdges) != 1 {
+		t.Fatalf("SatisfiedEdges = %+v, want exactly one 101->1639 (inbound duplicate collapsed)", res.SatisfiedEdges)
 	}
 }
 

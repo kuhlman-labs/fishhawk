@@ -237,36 +237,76 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to sweep every child", ae.Message, in.EpicRef)
 			case "campaign_dangling_dependency":
 				// Branch the operator remedy on which categories the backend
-				// enriched into details (#2120): an out-of-epic target keeps the
-				// "not a fellow child" fix-the-edges wording; an excluded-but-
-				// incomplete subset sibling names the include-in-items / omit-items
-				// remedy. Render both when both are present; fall back to the
-				// not_child wording when details are absent (older backend).
-				// A grooming-order batch has its OWN remedy pair, so branch on the
-				// provenance detail first: the operator cannot "fix the epic's
-				// edges" for a batch that has no epic — they widen the batch or
-				// drop the edge (#2238 AC7).
-				if src, _ := ae.Details["dangling_source"].(string); src == "grooming_order" {
-					edges, _ := ae.Details["dangling_not_child"].([]any)
-					return nil, StartCampaignOutput{}, fmt.Errorf(
-						"campaign_dangling_dependency: %s — the grooming order's batch (from run %v) contains an item whose depends_on targets an issue OUTSIDE the batch%s; either WIDEN the batch so the dependency is included (raise or drop grooming_order_limit, which is currently %v), or DROP the edge on the depending issue",
-						ae.Message, ae.Details["grooming_run_id"], formatDanglingEdges(edges), ae.Details["grooming_order_limit"])
-				}
+				// enriched into details (#2120, #2953). Render EVERY present
+				// category (multi-cause composition), so a mixed refusal names each
+				// applicable remedy. Four causes: an out-of-epic/out-of-batch OPEN
+				// target ("not a fellow child" / WIDEN); an excluded-but-incomplete
+				// subset sibling (include-in-items / omit-items); a closed-but-not-
+				// completed target (reopen/replace/drop — no widen, #2953); an
+				// unreadable target (retry, #2953). Fall back to the not_child
+				// wording when details are absent (older backend).
 				_, notChild := ae.Details["dangling_not_child"]
 				_, excluded := ae.Details["dangling_excluded_incomplete"]
+				_, closedIncomplete := ae.Details["dangling_closed_incomplete"]
+				_, unreadable := ae.Details["dangling_state_unreadable"]
 				const notChildRemedy = "an epic child declares a depends_on that is not a fellow child of %s; fix the epic's dependency edges and retry"
 				const excludedRemedy = "an included item's depends_on targets a sibling excluded from items that is not yet complete; include it in items, or omit items to sweep every child so a completed dependency auto-settles"
-				switch {
-				case excluded && notChild:
+				// #2953: a closed-but-not-completed target has NO widen-the-batch
+				// remedy. Deliberately avoids the literal "grooming_order_limit" so a
+				// closed-only refusal message can assert its absence — the operator
+				// condition-1/7 requirement that a done-but-not_planned dependency is
+				// NOT offered a limit change it can never satisfy.
+				const closedIncompleteRemedy = "a depends_on targets an issue closed WITHOUT completing (not_planned/duplicate); its work did not land, so widening the batch cannot include it — reopen or replace the dependency, or drop the edge"
+				const unreadableRemedy = "a depends_on target's state could not be read, so assembly refused rather than assume satisfaction; retry"
+
+				// A grooming-order / no-epic batch has its OWN not_child remedy: the
+				// operator cannot "fix the epic's edges" for a batch that has no epic
+				// — an OPEN out-of-batch target is fixed by WIDENING the batch (raise
+				// or drop grooming_order_limit) or dropping the edge (#2238 AC7). The
+				// widen clause renders ONLY when dangling_not_child is present (the one
+				// case widening reaches); the closed/unreadable clauses are shared.
+				if src, _ := ae.Details["dangling_source"].(string); src == "grooming_order" {
+					var clauses []string
+					if notChild {
+						edges, _ := ae.Details["dangling_not_child"].([]any)
+						clauses = append(clauses, fmt.Sprintf("contains an item whose depends_on targets an issue OUTSIDE the batch%s; either WIDEN the batch so the dependency is included (raise or drop grooming_order_limit, which is currently %v), or DROP the edge on the depending issue", formatDanglingEdges(edges), ae.Details["grooming_order_limit"]))
+					}
+					if closedIncomplete {
+						clauses = append(clauses, closedIncompleteRemedy)
+					}
+					if unreadable {
+						clauses = append(clauses, unreadableRemedy)
+					}
+					if len(clauses) == 0 {
+						// Older backend sent no categories under the grooming source:
+						// keep the widen fallback so the operator still has a remedy.
+						clauses = append(clauses, fmt.Sprintf("contains an item whose depends_on targets an issue OUTSIDE the batch; either WIDEN the batch (raise or drop grooming_order_limit, which is currently %v), or DROP the edge on the depending issue", ae.Details["grooming_order_limit"]))
+					}
 					return nil, StartCampaignOutput{}, fmt.Errorf(
-						"campaign_dangling_dependency: %s — two causes: (1) "+notChildRemedy+"; (2) "+excludedRemedy, ae.Message, in.EpicRef)
-				case excluded:
-					return nil, StartCampaignOutput{}, fmt.Errorf(
-						"campaign_dangling_dependency: %s — "+excludedRemedy, ae.Message)
-				default:
-					return nil, StartCampaignOutput{}, fmt.Errorf(
-						"campaign_dangling_dependency: %s — "+notChildRemedy, ae.Message, in.EpicRef)
+						"campaign_dangling_dependency: %s — the grooming order's batch (from run %v) %s",
+						ae.Message, ae.Details["grooming_run_id"], strings.Join(clauses, "; "))
 				}
+
+				var clauses []string
+				if notChild {
+					clauses = append(clauses, fmt.Sprintf(notChildRemedy, in.EpicRef))
+				}
+				if excluded {
+					clauses = append(clauses, excludedRemedy)
+				}
+				if closedIncomplete {
+					clauses = append(clauses, closedIncompleteRemedy)
+				}
+				if unreadable {
+					clauses = append(clauses, unreadableRemedy)
+				}
+				if len(clauses) == 0 {
+					// Older backend / no categories: keep the pre-#2120 not_child
+					// wording so the message still names a remedy.
+					clauses = append(clauses, fmt.Sprintf(notChildRemedy, in.EpicRef))
+				}
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"campaign_dangling_dependency: %s — %s", ae.Message, strings.Join(clauses, "; "))
 			case "grooming_order_superseded":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"grooming_order_superseded: %s — a NEWER approved grooming run (%v) has superseded this order. Start the campaign from that run instead, or set grooming_allow_superseded=true to build from the older ratified order deliberately",

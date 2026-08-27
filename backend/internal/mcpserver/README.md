@@ -191,6 +191,17 @@ The ladder is resolved SERVER-SIDE, in `handleStartCampaignItemRun`:
 
 `nextActionsFor` stamps the binding onto the params of every emitted action whose verb is one of the four (`foldWorkingDirParams`), and does nothing for an unbound run — so a driving loop propagates the binding without re-deriving it, and an unbound run never advertises an empty-string path.
 
+### `campaign_dangling_dependency` remedy branches ([#2953](https://github.com/kuhlman-labs/fishhawk/issues/2953))
+
+`startCampaign` maps a `422 campaign_dangling_dependency` onto an operator-actionable message by branching on the backend's per-cause details keys, rendering EVERY present cause (multi-cause composition):
+
+- `dangling_not_child` — an OPEN out-of-set/out-of-batch target. For an epic campaign: "fix the epic's dependency edges". For a **grooming/no-epic** batch: WIDEN the batch (raise or drop `grooming_order_limit`) or drop the edge — the ONLY case where offering `grooming_order_limit` is correct.
+- `dangling_excluded_incomplete` — an included item depending on an excluded, not-yet-complete sibling: include it in `items`, or omit `items` to sweep every child.
+- `dangling_closed_incomplete` (#2953) — the target is CLOSED WITHOUT completing (not_planned/duplicate). Its work did not land, so **no `grooming_order_limit` value can include it** — the message says reopen/replace the dependency or drop the edge, and deliberately does NOT offer widening. This retires the old unactionable "raise the limit" advice for a closed target.
+- `dangling_state_unreadable` (#2953) — the target's state could not be read: the message says assembly refused rather than assume satisfaction, and to retry.
+
+A closed-AND-completed target never reaches this path — the backend elides it and reports it in the create response's `satisfied_dependencies` block (mirrored on the MCP `Campaign` as `SatisfiedDependencies`). Pinned by `TestStartCampaignGroomingClosedTargetOmitsLimitRemedy` (a closed-only refusal omits `grooming_order_limit`), `TestStartCampaignGroomingMixedCausesRenderBoth` (mixed causes render both the widen and closed clauses), and the source-to-consumer tests threading the REAL `server.DanglingDependencyDetails` map into the renderer.
+
 ## Progress notifications (`fishhawk_run_stage`)
 
 `fishhawk_run_stage` spawns the runner and relays its stderr JSONL lines as MCP `notifications/progress` updates — but **only when a `progressToken` is present** on the call. A `progressToken` is client-supplied MCP request metadata, **not a tool input**: a tool-calling caller cannot set it, so whether live streaming is available is a property of your MCP client, not a knob you can reach (the MCP opt-in progress model). The durable signal is unaffected either way: the runner's events are still returned post-hoc in the final result's `events` list, and in the audit log and signed trace bundle.

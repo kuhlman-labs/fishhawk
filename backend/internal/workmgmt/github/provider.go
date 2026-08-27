@@ -615,6 +615,18 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
+	var satisfied []workmgmt.SatisfiedEdge
+	// Memoize the out-of-set target state read across every edge in this one
+	// query, so N depends_on references to the same closed target cost ONE
+	// GetIssue (#2953).
+	stateCache := map[int]targetState{}
+	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// (`Depends on: #1639, #1639` — an untrusted body preserves every
+	// occurrence) yields AT MOST ONE edge in whichever slice it classifies into
+	// (#2953 condition 3). Keyed by (From,To); an unresolvable ref keys (From,0),
+	// so duplicate cross-repo tokens collapse too (they are indistinguishable
+	// To=0 unreadable entries).
+	seenEdge := map[[2]int]bool{}
 	for _, s := range subs {
 		children = append(children, workmgmt.EpicChild{
 			Number:   s.Number,
@@ -638,30 +650,155 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			URL:  s.URL,
 		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
-			if isChild[dep] {
-				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
+			if seenEdge[[2]int{s.Number, dep.Number}] {
+				continue // duplicate depends_on token: classify (From,To) once.
+			}
+			seenEdge[[2]int{s.Number, dep.Number}] = true
+			if dep.Resolvable && isChild[dep.Number] {
+				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep.Number})
+				continue
+			}
+			// A depends_on reference that is NOT an in-set fellow child: a typo'd
+			// number, a genuine cross-epic dependency, a cross-epic prerequisite
+			// that is already done, or a cross-repo/unparseable ref. Classify it
+			// (#2953): a closed-and-completed target is a satisfied dependency
+			// (elided from the DAG), while an open/incomplete/unreadable one — and
+			// any UNRESOLVABLE cross-repo ref — is dangling and fails closed. A
+			// closed-and-completed FELLOW child stays an in-set Edge above and is
+			// never classified here — condition 3's one-layer rule.
+			cls, cerr := p.classifyOutOfSetTarget(ctx, scope, repo, dep, stateCache)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if cls.satisfied {
+				satisfied = append(satisfied, workmgmt.SatisfiedEdge{
+					From: s.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
+				})
 			} else {
-				// A depends_on reference to a non-child: a typo'd number or a
-				// real cross-epic dependency. Surface it as a dropped edge
-				// stamped DropNotChild (campaign assembly fails closed on it,
-				// keeping the "not a fellow child" wording) rather than silently
-				// discarding it.
-				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep, Reason: workmgmt.DropNotChild})
+				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep.Number, Reason: cls.reason})
 			}
 		}
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Number < children[j].Number })
-	sortEdges := func(es []workmgmt.DependsEdge) {
-		sort.Slice(es, func(i, j int) bool {
-			if es[i].From != es[j].From {
-				return es[i].From < es[j].From
-			}
-			return es[i].To < es[j].To
-		})
-	}
 	sortEdges(edges)
 	sortEdges(dropped)
-	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped}, nil
+	sortSatisfiedEdges(satisfied)
+	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
+}
+
+// targetState is the memoized classification of one out-of-set depends_on
+// target, cached per resolution call so repeated references to the same target
+// cost a single GetIssue (#2953).
+type targetState struct {
+	satisfied   bool
+	reason      workmgmt.DropReason
+	state       string
+	stateReason string
+}
+
+// classifyOutOfSetTarget reads a depends_on target that is OUTSIDE the assembled
+// set and classifies it into a satisfied/dangling outcome, fail-closed by
+// construction (#2953). It is shared by BOTH campaign source paths (EpicChildren
+// and ResolveDependencies) so "satisfied" means exactly one thing across the
+// codebase. It takes the PARSED reference (dependsOnRef), not a bare int, so the
+// same-repo-numeric provenance parseDependsOnMarker established is available here
+// rather than lost at the boundary. Rules:
+//   - an UNRESOLVABLE ref (a cross-repo `owner/repo#N` ref, an owner-qualified
+//     ref, or an unparseable token — Resolvable=false) stamps
+//     DropTargetStateUnreadable WITHOUT a forge call: calling GetIssue with a
+//     locally-reduced number could read an UNRELATED same-repo issue's state and
+//     FALSELY satisfy the edge, the one failure mode this change must not have
+//     (operator condition 2 / the routed cross-repo security concerns);
+//   - a non-positive number (defensive; a resolvable ref always carries a positive
+//     number) likewise stamps DropTargetStateUnreadable WITHOUT a forge call;
+//   - a GetIssue error yields DropTargetStateUnreadable (never satisfied — an
+//     unreadable target is not evidence of satisfaction);
+//   - a nil issue (no error) yields DropTargetStateUnreadable (the nil-issue
+//     guard, distinct from the error branch so each is independently deletable);
+//   - closed AND completed (case-insensitive, since GetIssue's REST payload is
+//     lowercase) yields satisfied — the SAME rule EpicChild.Complete encodes;
+//   - a closed issue with any other state_reason (not_planned/duplicate) yields
+//     DropTargetClosedIncomplete;
+//   - anything else (open) keeps DropNotChild.
+//
+// The result is memoized in cache keyed by number, so the GetIssue call is made
+// at most once per distinct target across the whole resolution. An unresolvable
+// ref is NOT cached (it carries no meaningful number key and costs no forge call).
+func (p *Provider) classifyOutOfSetTarget(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, ref dependsOnRef, cache map[int]targetState) (targetState, error) {
+	// An unresolvable ref must NEVER reach GetIssue: reducing a cross-repo token to
+	// a local number and reading that unrelated same-repo issue could FALSELY
+	// satisfy the edge (operator condition 2). Fail closed WITHOUT a forge call,
+	// ahead of the cache and number guards, so the provenance is honored before any
+	// numeric reasoning.
+	if !ref.Resolvable {
+		return targetState{reason: workmgmt.DropTargetStateUnreadable}, nil
+	}
+	number := ref.Number
+	if cached, ok := cache[number]; ok {
+		return cached, nil
+	}
+	// Guard the forge call: only a positive same-repo numeric target is safe to
+	// GetIssue. A non-positive number is defensive here — parseDependsOnMarker only
+	// marks a ref Resolvable when it captured `[1-9]\d*` — but keep it so a
+	// direct/synthetic non-positive ref never reads an arbitrary issue.
+	if number <= 0 {
+		ts := targetState{reason: workmgmt.DropTargetStateUnreadable}
+		cache[number] = ts
+		return ts, nil
+	}
+	issue, err := p.api.GetIssue(ctx, scope, repo, number)
+	if err != nil {
+		// Unreadable: the read failed. Never satisfied. Distinct from the nil
+		// branch below so deleting either control is independently observable
+		// (operator condition 4).
+		ts := targetState{reason: workmgmt.DropTargetStateUnreadable}
+		cache[number] = ts
+		return ts, nil
+	}
+	if issue == nil {
+		// Unreadable: the forge returned no issue and no error. Fail closed.
+		ts := targetState{reason: workmgmt.DropTargetStateUnreadable}
+		cache[number] = ts
+		return ts, nil
+	}
+	var ts targetState
+	switch {
+	case strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"):
+		// Closed AND completed: the prerequisite landed. Satisfied — the same
+		// rule EpicChild.Complete encodes, case-insensitively (REST is lowercase).
+		ts = targetState{satisfied: true, state: issue.State, stateReason: issue.StateReason}
+	case strings.EqualFold(issue.State, "closed"):
+		// Closed but not completed (not_planned/duplicate): work did not land, so
+		// no batch-widening knob can satisfy the edge.
+		ts = targetState{reason: workmgmt.DropTargetClosedIncomplete, state: issue.State, stateReason: issue.StateReason}
+	default:
+		// Open (or any non-closed state): the pre-#2953 dangling refusal.
+		ts = targetState{reason: workmgmt.DropNotChild, state: issue.State, stateReason: issue.StateReason}
+	}
+	cache[number] = ts
+	return ts, nil
+}
+
+// sortEdges deterministically orders depends_on edges by (From, To) so an
+// EpicChildrenResult is stable across runs.
+func sortEdges(es []workmgmt.DependsEdge) {
+	sort.Slice(es, func(i, j int) bool {
+		if es[i].From != es[j].From {
+			return es[i].From < es[j].From
+		}
+		return es[i].To < es[j].To
+	})
+}
+
+// sortSatisfiedEdges deterministically orders elided (satisfied) edges by
+// (From, To), matching sortEdges so the whole result is stable (#2953).
+func sortSatisfiedEdges(es []workmgmt.SatisfiedEdge) {
+	sort.Slice(es, func(i, j int) bool {
+		if es[i].From != es[j].From {
+			return es[i].From < es[j].From
+		}
+		return es[i].To < es[j].To
+	})
 }
 
 // ResolveDependencies resolves the depends_on edges over an ARBITRARY,
@@ -675,15 +812,19 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 // *workmgmt.EpicChildrenResult shape campaign.Assemble consumes.
 //
 // The named set IS the sibling set: a parsed depends_on ref pointing at a
-// member is an Edge; a ref pointing OUTSIDE the named set is a DroppedEdge
-// stamped DropNotChild — the issue-literal contract fails closed on EVERY
-// out-of-set target (a dangling dependency the campaign cannot honor within the
-// batch), deliberately WITHOUT the #2120 excluded-but-completed refinement the
-// epic path applies (there is no epic child set to derive an out-of-set target's
-// completion state from). Children are returned ascending by number and both
-// edge slices are deterministically sorted (by From, then To), mirroring
-// EpicChildren. It validates the target repo + installation (fail closed with
-// File's actionable style).
+// member is an Edge; a ref pointing OUTSIDE the named set is CLASSIFIED by
+// reading the target's issue state (#2953, via classifyOutOfSetTarget): a
+// closed-AND-completed target is a SatisfiedEdge (its work landed, so the
+// dependency is satisfied and the edge is elided from the wave DAG), while an
+// OPEN target (DropNotChild), a closed-but-incomplete not_planned/duplicate
+// target (DropTargetClosedIncomplete), or an unreadable target
+// (DropTargetStateUnreadable) is a DroppedEdge the campaign fails closed on.
+// This is the #2953 refinement of the older fail-closed-on-EVERY-out-of-set
+// contract, so a batch whose prerequisite is already done assembles instead of
+// refusing with unactionable advice. Children are returned ascending by number
+// and all edge slices are deterministically sorted (by From, then To),
+// mirroring EpicChildren. It validates the target repo + installation (fail
+// closed with File's actionable style).
 func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/github: provider missing API client")
@@ -719,6 +860,16 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 
 	children := make([]workmgmt.EpicChild, 0, len(numbers))
 	var edges, dropped []workmgmt.DependsEdge
+	var satisfied []workmgmt.SatisfiedEdge
+	// Memoize the out-of-set target state read across every edge in this one
+	// resolution, so N depends_on references to the same closed target cost ONE
+	// GetIssue (#2953). The in-set issue fetches below are separate (each named
+	// issue is fetched once via the inSet dedup already applied).
+	stateCache := map[int]targetState{}
+	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// (`Depends on: #1639, #1639`) yields AT MOST ONE edge in whichever slice it
+	// classifies into (#2953 condition 3) — the same guard EpicChildren applies.
+	seenEdge := map[[2]int]bool{}
 	for _, n := range numbers {
 		issue, err := p.api.GetIssue(ctx, scope, repo, n)
 		if err != nil {
@@ -735,29 +886,38 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
 		})
 		for _, dep := range parseDependsOnMarker(issue.Body) {
-			if inSet[dep] {
-				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep})
+			if seenEdge[[2]int{issue.Number, dep.Number}] {
+				continue // duplicate depends_on token: classify (From,To) once.
+			}
+			seenEdge[[2]int{issue.Number, dep.Number}] = true
+			if dep.Resolvable && inSet[dep.Number] {
+				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep.Number})
+				continue
+			}
+			// A depends_on reference that is NOT an in-set named issue: a typo'd
+			// number, a genuine cross-batch dependency, a prerequisite that is
+			// already done, or a cross-repo/unparseable ref. Classify it (#2953): a
+			// closed-and-completed target is a satisfied dependency (elided from the
+			// DAG), while an open/incomplete/unreadable one — and any UNRESOLVABLE
+			// cross-repo ref — is dangling and campaign assembly fails closed on it.
+			cls, cerr := p.classifyOutOfSetTarget(ctx, scope, repo, dep, stateCache)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if cls.satisfied {
+				satisfied = append(satisfied, workmgmt.SatisfiedEdge{
+					From: issue.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
+				})
 			} else {
-				// A depends_on reference to an issue outside the named set: a typo'd
-				// number or a genuine cross-batch dependency. Surface it as a dropped
-				// edge stamped DropNotChild — campaign assembly fails closed on it,
-				// keeping the fail-dangling-for-all-out-of-set contract (#2051).
-				dropped = append(dropped, workmgmt.DependsEdge{From: issue.Number, To: dep, Reason: workmgmt.DropNotChild})
+				dropped = append(dropped, workmgmt.DependsEdge{From: issue.Number, To: dep.Number, Reason: cls.reason})
 			}
 		}
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Number < children[j].Number })
-	sortEdges := func(es []workmgmt.DependsEdge) {
-		sort.Slice(es, func(i, j int) bool {
-			if es[i].From != es[j].From {
-				return es[i].From < es[j].From
-			}
-			return es[i].To < es[j].To
-		})
-	}
 	sortEdges(edges)
 	sortEdges(dropped)
-	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped}, nil
+	sortSatisfiedEdges(satisfied)
+	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
 }
 
 // dependsOnMarkerRE matches the depends_on body marker line and captures the
@@ -810,30 +970,62 @@ func ensureDependsOnMarker(body string, refs []string) string {
 	return strings.TrimRight(body, "\n") + "\n\n" + marker
 }
 
-// parseDependsOnMarker parses the depends_on body marker line into the
-// referenced issue numbers. It reads the FIRST `Depends on:` line, splits the
-// captured list on commas, and parses each token as a positive-integer issue
-// reference; non-matching tokens are skipped. Returns nil when no marker is
-// present. Paired with renderDependsOnMarker as the single source of truth for
-// the marker round trip.
-func parseDependsOnMarker(body string) []int {
+// dependsOnRef is one parsed token from the depends_on marker list, carrying the
+// parse/repository provenance the out-of-set classifier needs to fail closed on a
+// non-same-repo target (#2953, operator condition 2). Resolvable is true ONLY for
+// a bare same-repo numeric reference (`#N` or `N`), in which case Number is the
+// positive issue number safe to GetIssue against the ambient repo. It is false for
+// any OTHER non-empty token — a cross-repo `owner/repo#N` ref, an owner-qualified
+// ref, or an otherwise unparseable token — so the classifier can stamp
+// DropTargetStateUnreadable WITHOUT a forge call instead of either silently
+// omitting the edge or reducing the token to a local number and reading an
+// unrelated same-repo issue's state. An owner-qualified ref is treated as
+// unresolvable even when its owner/name would match the ambient repo: only a BARE
+// number is unambiguously same-repo, and fail-closed is the safe direction.
+type dependsOnRef struct {
+	Number     int
+	Resolvable bool
+}
+
+// parseDependsOnMarker parses the depends_on body marker line into its referenced
+// targets. It reads the FIRST `Depends on:` line and splits the captured list on
+// commas; each NON-EMPTY token becomes a dependsOnRef — a bare `#N`/`N` token is a
+// Resolvable same-repo numeric reference, and every OTHER non-empty token (a
+// cross-repo `owner/repo#N` ref, an owner-qualified ref, or garbage) is carried
+// through UNRESOLVABLE rather than silently dropped, so the classifier fails the
+// campaign closed on it instead of letting a cross-repo dependency vanish (#2953,
+// operator condition 2). Genuinely empty tokens (a trailing comma, surrounding
+// whitespace) are skipped — they are not references at all. Returns nil when no
+// marker is present. Paired with renderDependsOnMarker as the single source of
+// truth for the marker round trip.
+func parseDependsOnMarker(body string) []dependsOnRef {
 	m := dependsOnMarkerRE.FindStringSubmatch(body)
 	if m == nil {
 		return nil
 	}
-	var nums []int
+	var refs []dependsOnRef
 	for _, tok := range strings.Split(m[1], ",") {
+		if strings.TrimSpace(tok) == "" {
+			continue // trailing comma / whitespace: not a reference at all.
+		}
 		rm := dependsOnRefRE.FindStringSubmatch(tok)
 		if rm == nil {
+			// A non-empty token that is NOT a bare same-repo numeric ref — a
+			// cross-repo `owner/repo#N`, an owner-qualified ref, or garbage. Carry
+			// it through as UNRESOLVABLE so the classifier fails it closed rather
+			// than dropping it (a dropped cross-repo ref would let the dependency
+			// vanish and the campaign assemble on an unsatisfied prerequisite).
+			refs = append(refs, dependsOnRef{Resolvable: false})
 			continue
 		}
 		n, err := strconv.Atoi(rm[1])
 		if err != nil {
+			refs = append(refs, dependsOnRef{Resolvable: false})
 			continue
 		}
-		nums = append(nums, n)
+		refs = append(refs, dependsOnRef{Number: n, Resolvable: true})
 	}
-	return nums
+	return refs
 }
 
 // parseAutonomyLabel delegates to workmgmt.ParseAutonomyLabel — the single

@@ -42,12 +42,22 @@ type DanglingDependencyError struct {
 	// child excluded from the items subset that is not yet complete
 	// (DropExcludedIncomplete).
 	ExcludedIncomplete []workmgmt.DependsEdge
+	// ClosedIncomplete are edges whose out-of-set target is CLOSED but NOT
+	// completed — closed as not_planned/duplicate (DropTargetClosedIncomplete,
+	// #2953). Its work did not land, so widening the batch cannot satisfy it.
+	ClosedIncomplete []workmgmt.DependsEdge
+	// StateUnreadable are edges whose out-of-set target's issue state could not
+	// be read (DropTargetStateUnreadable, #2953), so satisfaction is UNPROVEN
+	// and the refusal stands.
+	StateUnreadable []workmgmt.DependsEdge
 }
 
 // Error renders one clause per non-empty category. The not_child clause keeps
 // the pre-#2120 "not a fellow child of the epic" wording (an out-of-epic cause);
 // the excluded_incomplete clause names the real cause and the include/omit
-// remedy.
+// remedy; the closed_incomplete clause (#2953) says the target closed without
+// completing so widening cannot satisfy it; the state_unreadable clause (#2953)
+// says the target's state could not be read so the dependency is unproven.
 func (e *DanglingDependencyError) Error() string {
 	var clauses []string
 	if len(e.NotChild) > 0 {
@@ -55,6 +65,12 @@ func (e *DanglingDependencyError) Error() string {
 	}
 	if len(e.ExcludedIncomplete) > 0 {
 		clauses = append(clauses, fmt.Sprintf("%v depend on a sibling excluded from items that is not yet complete — include it in items, or omit items to sweep every child so a completed dependency auto-settles", formatEdges(e.ExcludedIncomplete)))
+	}
+	if len(e.ClosedIncomplete) > 0 {
+		clauses = append(clauses, fmt.Sprintf("%v target an issue that is closed WITHOUT completing (not_planned/duplicate) — its work did not land, so widening the batch cannot satisfy it; reopen or replace the dependency, or drop the edge", formatEdges(e.ClosedIncomplete)))
+	}
+	if len(e.StateUnreadable) > 0 {
+		clauses = append(clauses, fmt.Sprintf("%v target an issue whose state could not be read, so the dependency is UNPROVEN and assembly refused rather than assume satisfaction — retry", formatEdges(e.StateUnreadable)))
 	}
 	return fmt.Sprintf("%s: %s", ErrDanglingDependency.Error(), strings.Join(clauses, "; "))
 }
@@ -116,6 +132,15 @@ type Assembly struct {
 	// grooming-sourced (every epic_ref / explicit-items campaign). The server
 	// marshals it; the campaign package never interprets these bytes.
 	GroomingSource []byte
+	// SatisfiedDependencies are the depends_on edges elided during assembly
+	// because their out-of-set target was already closed-and-completed (#2953),
+	// carried verbatim from the resolved EpicChildrenResult.SatisfiedEdges. It is
+	// a PURE passthrough: Assemble never builds a DAG edge or wave dependency
+	// from it — that is exactly what "excluded from the wave DAG" means. It is
+	// NOT persisted; the server renders it into the create-response-only
+	// satisfied_dependencies block and a best-effort audit so an operator can
+	// tell "this dependency is done" from "this dependency was ignored".
+	SatisfiedDependencies []workmgmt.SatisfiedEdge
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -152,13 +177,18 @@ func issueRef(number int) string {
 // 0-based index and back.
 //
 // It fails closed in two ways:
-//   - any DroppedEdges (a depends_on target that is not a fellow child, or an
-//     excluded-but-incomplete subset sibling) yields a *DanglingDependencyError
-//     (which wraps ErrDanglingDependency) categorizing the mis-targeted edges by
-//     cause, so a missing dependency blocks assembly rather than being silently
-//     dropped;
+//   - any DroppedEdges (a depends_on target that is not a fellow child, an
+//     excluded-but-incomplete subset sibling, a closed-but-not-completed target,
+//     or an unreadable target) yields a *DanglingDependencyError (which wraps
+//     ErrDanglingDependency) categorizing the mis-targeted edges by cause, so a
+//     missing dependency blocks assembly rather than being silently dropped;
 //   - a cycle or out-of-range edge surfaced by plan.Waves yields a wrapped
 //     ErrCycle.
+//
+// A closed-AND-completed out-of-set target is NOT dangling (#2953): the provider
+// records it in res.SatisfiedEdges (never DroppedEdges), and Assemble carries it
+// through to Assembly.SatisfiedDependencies without building any DAG edge from
+// it — so a batch whose prerequisite is already done assembles cleanly.
 func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, error) {
 	if res == nil {
 		return nil, errors.New("campaign: nil epic-children result")
@@ -175,9 +205,16 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 	if len(res.DroppedEdges) > 0 {
 		derr := &DanglingDependencyError{}
 		for _, e := range res.DroppedEdges {
-			if e.Reason == workmgmt.DropExcludedIncomplete {
+			switch e.Reason {
+			case workmgmt.DropExcludedIncomplete:
 				derr.ExcludedIncomplete = append(derr.ExcludedIncomplete, e)
-			} else {
+			case workmgmt.DropTargetClosedIncomplete:
+				derr.ClosedIncomplete = append(derr.ClosedIncomplete, e)
+			case workmgmt.DropTargetStateUnreadable:
+				derr.StateUnreadable = append(derr.StateUnreadable, e)
+			default:
+				// DropNotChild, or an empty/unknown reason defensively, keeps the
+				// pre-existing not_child wording so nothing pre-#2120 changes.
 				derr.NotChild = append(derr.NotChild, e)
 			}
 		}
@@ -252,7 +289,15 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 		}
 	}
 
-	return &Assembly{EpicRef: epicRef, Items: items, Waves: waves}, nil
+	return &Assembly{
+		EpicRef: epicRef,
+		Items:   items,
+		Waves:   waves,
+		// Pure passthrough of the elided-because-already-satisfied edges (#2953):
+		// no DAG edge was built from any of them above, so surfacing them here is
+		// visibility only.
+		SatisfiedDependencies: res.SatisfiedEdges,
+	}, nil
 }
 
 // normalizeAutonomy maps an autonomy tier to the set the campaign_items.autonomy

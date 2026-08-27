@@ -183,6 +183,45 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_SatisfiedDependencies_SurviveDecode is the MCP-boundary
+// half of the #2953 seam (operator condition 5): a create response carrying a
+// satisfied_dependencies block must survive the client decode and reach the tool
+// output — not merely be emitted by the server. It drives the REAL startCampaign
+// so the field flows all the way into StartCampaignOutput.Campaign.
+func TestCreateCampaign_SatisfiedDependencies_SurviveDecode(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignResp = Campaign{
+		ID: uuid.NewString(), Repo: "x/y", EpicRef: "#25", State: "pending",
+		PausePolicy: "pause_campaign",
+		SatisfiedDependencies: []campaignSatisfiedDependency{
+			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	got := out.Campaign.SatisfiedDependencies
+	want := campaignSatisfiedDependency{From: 2032, To: 1639, State: "closed", StateReason: "completed"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("decoded Campaign.SatisfiedDependencies = %+v, want [%+v]", got, want)
+	}
+
+	// A response with nothing elided decodes to no entries (omitempty on the wire).
+	fb2, srv2 := newFakeBackend(t)
+	r2 := newResolver(srv2, nil)
+	_, out2, err := r2.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err != nil {
+		t.Fatalf("startCampaign (no elision): %v", err)
+	}
+	if len(out2.Campaign.SatisfiedDependencies) != 0 {
+		t.Errorf("SatisfiedDependencies = %+v, want none when the response omits the block", out2.Campaign.SatisfiedDependencies)
+	}
+	_ = fb2
+}
+
 // TestFiledWorkItem_DecodesLabelCompleteness pins the MCP-side wire contract
 // for the #1616 LOUD label-completeness report: a work-items response carrying
 // defaulted_labels + missing_label_namespaces decodes into FiledWorkItem so the

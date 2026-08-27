@@ -507,10 +507,15 @@ wave-orders the DAG, and persists the campaign — the batch counterpart to
   `campaign_dangling_dependency` (omit `items` to sweep every child).
 - **WITHOUT `epic_ref`** (`items` alone, #2051) it assembles over exactly the
   named issues — the NO-EPIC variant. An included item whose `depends_on` points
-  at an issue OUTSIDE the list fails `campaign_dangling_dependency` (the no-epic
-  path fails-dangling for EVERY out-of-set target; it does NOT apply the #2120
-  completion-satisfied refinement). A provider that cannot resolve an arbitrary
-  issue set fails `issue_set_resolution_unsupported` (501).
+  at an OPEN, closed-but-not-completed, or unreadable issue OUTSIDE the list fails
+  `campaign_dangling_dependency`. A closed-AND-completed out-of-set target is
+  instead treated as a SATISFIED dependency (#2953): the edge is elided and
+  reported in the create response's `satisfied_dependencies` block, so a batch
+  whose prerequisite already landed assembles. The refusal message names the
+  cause: a CLOSED-but-not-completed (not_planned/duplicate) target is NOT offered
+  the widen/`grooming_order_limit` remedy — no limit value can include a closed
+  issue; reopen/replace the dependency or drop the edge. A provider that cannot
+  resolve an arbitrary issue set fails `issue_set_resolution_unsupported` (501).
 
 Neither `epic_ref` nor `items` fails `validation_failed`; an un-installed repo
 fails `repo_not_installed`.

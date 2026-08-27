@@ -1739,6 +1739,17 @@ Notes:
   The audit entry exists so an operator can `fishhawk_await_audit` on the
   category and so the chain carries the decision; a campaign whose append failed
   is still created and still names its source on every read of the row.
+- The campaign **dependency-elision** marker — `campaign_dependency_elided`
+  (#2953) — is an **INTERNAL, audit-only category and NOT an issue-comment
+  surface**, of the same family as `campaign_grooming_source_resolved`. It has no
+  Notifier method, nothing in `issuecomment` posts it, and it renders no comment.
+  It is written ONCE per campaign whose assembly elided at least one `depends_on`
+  edge because the target was already closed-and-completed, by
+  `handleCreateCampaign` through `emitCampaignAudit`, on the GLOBAL chain (payload
+  `{campaign_id, repo, elided:[{from, to, state, state_reason}]}`). It is a
+  best-effort SECOND copy of the create response's `satisfied_dependencies` block
+  — the response is the convenience, this is the durable-enough chain record — so
+  a campaign whose append failed is still created. Nothing is elided → no entry.
 - The campaign **issue-restart** marker — `campaign_issue_restarted` (E32.9 /
   #1729) — is a fourth **system-actor GLOBAL-chain audit kind, NOT an
   issue-comment surface**, of the same family as the three above. The

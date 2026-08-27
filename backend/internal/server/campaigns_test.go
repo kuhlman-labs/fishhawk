@@ -890,6 +890,110 @@ func TestCreateCampaign_SubsetExcludesCompletedDepChild_201(t *testing.T) {
 	}
 }
 
+// satisfiedDepDAG is a two-item DAG whose child #100 depends on an out-of-set
+// target #1639 that the provider already classified as closed-and-completed and
+// recorded in SatisfiedEdges (#2953). The elision is not dangling.
+func satisfiedDepDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 100, Title: "first"}, {Number: 101, Title: "second"}},
+		Edges:    []workmgmt.DependsEdge{{From: 101, To: 100}},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 100, To: 1639, State: "closed", StateReason: "completed"},
+		},
+	}
+}
+
+// TestCreateCampaign_SatisfiedDependenciesSurfaced is the cross-boundary seam
+// (#2953): a resolved result carrying SatisfiedEdges yields 201 whose body's
+// satisfied_dependencies block carries the OBSERVED state, AND a
+// campaign_dependency_elided audit is appended — proving provider -> Assemble ->
+// Assembly -> response -> audit is wired end to end, not just each layer alone.
+func TestCreateCampaign_SatisfiedDependenciesSurfaced(t *testing.T) {
+	fp := &fakeEpicProvider{result: satisfiedDepDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: repo, AuditRepo: aud}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	want := satisfiedDependencyPayload{From: 100, To: 1639, State: "closed", StateReason: "completed"}
+	if len(created.SatisfiedDependencies) != 1 || created.SatisfiedDependencies[0] != want {
+		t.Fatalf("satisfied_dependencies = %+v, want [%+v]", created.SatisfiedDependencies, want)
+	}
+	if n := aud.count(auditCampaignDependencyElided); n != 1 {
+		t.Errorf("%s audit entries = %d, want exactly 1", auditCampaignDependencyElided, n)
+	}
+}
+
+// TestCreateCampaign_NoElision_OmitsSatisfiedBlockAndAudit is the negative
+// control: a result with NO SatisfiedEdges yields a 201 with no
+// satisfied_dependencies key and no elided audit — the block is create-only and
+// only when something was actually elided (#2953).
+func TestCreateCampaign_NoElision_OmitsSatisfiedBlockAndAudit(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: repo, AuditRepo: aud})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "satisfied_dependencies") {
+		t.Errorf("body carries satisfied_dependencies with nothing elided: %s", w.Body.String())
+	}
+	if n := aud.count(auditCampaignDependencyElided); n != 0 {
+		t.Errorf("%s audit entries = %d, want 0 (nothing elided)", auditCampaignDependencyElided, n)
+	}
+}
+
+// TestCreateCampaign_NewDropReasons_422DetailsKeys asserts the two new #2953
+// drop reasons surface as the new campaign_dangling_dependency details keys, so
+// the MCP consumer can branch its remedy on them.
+func TestCreateCampaign_NewDropReasons_422DetailsKeys(t *testing.T) {
+	result := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 100, Title: "A"}, {Number: 101, Title: "B"}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 100, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete},
+			{From: 101, To: 1700, Reason: workmgmt.DropTargetStateUnreadable},
+		},
+	}
+	fp := &fakeEpicProvider{result: result}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+	if env.Error.Code != "campaign_dangling_dependency" {
+		t.Fatalf("code = %q, want campaign_dangling_dependency", env.Error.Code)
+	}
+	if _, ok := env.Error.Details["dangling_closed_incomplete"]; !ok {
+		t.Errorf("details missing dangling_closed_incomplete: %+v", env.Error.Details)
+	}
+	if _, ok := env.Error.Details["dangling_state_unreadable"]; !ok {
+		t.Errorf("details missing dangling_state_unreadable: %+v", env.Error.Details)
+	}
+}
+
 // TestCreateCampaign_OmittedItems_SweepsAllChildren is the backward-compat
 // regression guard: omitting items assembles the campaign over EVERY child,
 // unchanged from the pre-subset behavior.
