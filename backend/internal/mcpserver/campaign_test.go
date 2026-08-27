@@ -575,6 +575,93 @@ func TestStartCampaign_DanglingDetails_SourceToConsumer(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_DanglingClosedIncompleteUnreadable_SourceToConsumer threads a
+// REAL categorized DanglingDependencyError carrying the two #2953 causes through
+// the REAL server details-map builder into the MCP remedy renderer, asserting the
+// closed-incomplete remedy (reopen/replace/drop, no widen) and the unreadable
+// retry remedy both render — and that neither wrongly offers the include/omit
+// (excluded) remedy.
+func TestStartCampaign_DanglingClosedIncompleteUnreadable_SourceToConsumer(t *testing.T) {
+	de := &campaign.DanglingDependencyError{
+		ClosedIncomplete: []workmgmt.DependsEdge{{From: 1642, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete}},
+		StateUnreadable:  []workmgmt.DependsEdge{{From: 2032, To: 1700, Reason: workmgmt.DropTargetStateUnreadable}},
+	}
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "campaign_dangling_dependency",
+			"message": de.Error(),
+			"details": server.DanglingDependencyDetails(de, "#25"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = string(body)
+	r := newResolver(srv, nil)
+
+	_, _, gotErr := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if gotErr == nil {
+		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
+	}
+	msg := gotErr.Error()
+	for _, want := range []string{"closed WITHOUT completing", "reopen or replace", "could not be read", "retry"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("err %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "include it in items") {
+		t.Errorf("err %q wrongly offers the excluded (include/omit) remedy", msg)
+	}
+}
+
+// TestStartCampaignGroomingClosedTargetOmitsLimitRemedy pins operator condition
+// 1/7: a grooming-source refusal whose ONLY cause is a closed-but-not-completed
+// target must NOT offer raising grooming_order_limit — no limit value can include
+// a not_planned close.
+func TestStartCampaignGroomingClosedTargetOmitsLimitRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	// A closed-ONLY grooming details map (no dangling_not_child).
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"batch edge closed","details":{"dangling_source":"grooming_order","grooming_run_id":"abc","grooming_order_limit":3,"dangling_closed_incomplete":["issue:1642->issue:1641"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", GroomingRunID: "11111111-1111-1111-1111-111111111111"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	if strings.Contains(err.Error(), "grooming_order_limit") {
+		t.Fatalf("closed-target grooming refusal offered grooming_order_limit: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reopen or replace") {
+		t.Errorf("err %q missing the reopen/replace remedy", err.Error())
+	}
+}
+
+// TestStartCampaignGroomingMixedCausesRenderBoth is the multi-cause composition
+// pin (operator condition 7): a grooming refusal carrying BOTH an OPEN out-of-
+// batch target (dangling_not_child) and a closed-incomplete target renders BOTH
+// the WIDEN clause (offering grooming_order_limit) AND the closed clause.
+func TestStartCampaignGroomingMixedCausesRenderBoth(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"batch edges","details":{"dangling_source":"grooming_order","grooming_run_id":"abc","grooming_order_limit":3,"dangling_not_child":["issue:5->issue:9"],"dangling_closed_incomplete":["issue:1642->issue:1641"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", GroomingRunID: "11111111-1111-1111-1111-111111111111"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "WIDEN the batch") || !strings.Contains(msg, "grooming_order_limit") {
+		t.Errorf("mixed refusal %q missing the widen clause", msg)
+	}
+	if !strings.Contains(msg, "reopen or replace") {
+		t.Errorf("mixed refusal %q missing the closed clause", msg)
+	}
+}
+
 func TestStartCampaign_RepoUnconfigured_MapsActionableError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.createCampaignStatus = http.StatusServiceUnavailable

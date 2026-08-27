@@ -231,3 +231,36 @@ func TestEpicChild_CarriesBodyAndURLForAdoption(t *testing.T) {
 		t.Errorf("EpicChild.URL must not be composed from a github.com prefix: %q", got.URL)
 	}
 }
+
+// TestDropReasonWireValues pins the string values of the two #2953 drop reasons.
+// They are the CONTRACT the server details keys and the fishhawk-mcp remedy
+// renderer branch on, so a rename here silently breaks the operator remedy. A
+// literal assertion (not a re-derivation) is the whole point.
+func TestDropReasonWireValues(t *testing.T) {
+	if DropTargetClosedIncomplete != "target_closed_incomplete" {
+		t.Errorf("DropTargetClosedIncomplete = %q, want target_closed_incomplete", DropTargetClosedIncomplete)
+	}
+	if DropTargetStateUnreadable != "target_state_unreadable" {
+		t.Errorf("DropTargetStateUnreadable = %q, want target_state_unreadable", DropTargetStateUnreadable)
+	}
+}
+
+// TestSatisfiedEdgeCarriedOnResult asserts the new SatisfiedEdges channel on
+// EpicChildrenResult carries the observed target state verbatim (#2953) — the
+// field campaign.Assemble passes through to the create-response satisfied_
+// dependencies block, so its shape is part of the cross-provider contract.
+func TestSatisfiedEdgeCarriedOnResult(t *testing.T) {
+	res := &EpicChildrenResult{
+		Children: []EpicChild{{Number: 2032}},
+		SatisfiedEdges: []SatisfiedEdge{
+			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
+		},
+	}
+	if len(res.SatisfiedEdges) != 1 {
+		t.Fatalf("SatisfiedEdges = %+v, want one entry", res.SatisfiedEdges)
+	}
+	e := res.SatisfiedEdges[0]
+	if e.From != 2032 || e.To != 1639 || e.State != "closed" || e.StateReason != "completed" {
+		t.Errorf("SatisfiedEdge = %+v, want {2032 1639 closed completed}", e)
+	}
+}

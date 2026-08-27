@@ -91,6 +91,19 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 		}
 	}
 
+	// Carry the provider-recorded satisfied (elided) edges through untouched,
+	// and seed a dedup set from them so an edge already recorded as satisfied is
+	// never re-added by the excluded-complete branch below (#2953 condition 3:
+	// an edge appears in SatisfiedEdges AT MOST ONCE). These inbound entries are
+	// for out-of-EPIC targets, disjoint from the excluded-CHILD elisions below,
+	// but the guard keeps the at-most-once invariant robust.
+	satisfied := make([]workmgmt.SatisfiedEdge, 0, len(res.SatisfiedEdges))
+	satisfied = append(satisfied, res.SatisfiedEdges...)
+	seenSatisfied := make(map[[2]int]struct{}, len(res.SatisfiedEdges))
+	for _, s := range res.SatisfiedEdges {
+		seenSatisfied[[2]int{s.From, s.To}] = struct{}{}
+	}
+
 	// Re-partition the edges against the included set. Carry a pre-existing
 	// dropped edge through only when its From is IN the subset; an excluded
 	// item's dropped (cross-epic/dangling) edge is dropped silently, mirroring
@@ -111,14 +124,19 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 		case fromIn && !toIn:
 			// An included item depends on an EXCLUDED fellow child. If that
 			// excluded target is already closed-and-completed, its dependency is
-			// satisfied — drop the edge silently, the same result the full
-			// all-children sweep produces via closed-child auto-settle (#2120).
-			// Otherwise the dependency cannot be honored within the campaign, so
-			// surface it as a dropped edge stamped DropExcludedIncomplete.
+			// satisfied — elide the edge, RECORDING it as a SatisfiedEdge (#2953)
+			// rather than dropping it silently, so the same elision the full
+			// all-children sweep performs (#2120) is now visible/auditable.
 			// childByNumber indexes ALL children (included and excluded), so the
 			// lookup resolves; an unexpectedly-missing target fails closed
 			// (treated as excluded-incomplete) rather than panicking.
 			if child, ok := childByNumber[e.To]; ok && child.Complete {
+				if _, seen := seenSatisfied[[2]int{e.From, e.To}]; !seen {
+					seenSatisfied[[2]int{e.From, e.To}] = struct{}{}
+					satisfied = append(satisfied, workmgmt.SatisfiedEdge{
+						From: e.From, To: e.To, State: "closed", StateReason: "completed",
+					})
+				}
 				continue
 			}
 			e.Reason = workmgmt.DropExcludedIncomplete
@@ -130,9 +148,10 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 	}
 
 	return &workmgmt.EpicChildrenResult{
-		Children:     children,
-		Edges:        edges,
-		DroppedEdges: dropped,
+		Children:       children,
+		Edges:          edges,
+		DroppedEdges:   dropped,
+		SatisfiedEdges: satisfied,
 	}, nil
 }
 

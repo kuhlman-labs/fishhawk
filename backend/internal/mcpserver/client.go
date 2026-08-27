@@ -2548,8 +2548,29 @@ type Campaign struct {
 	// reflection, and json.RawMessage would surface as type:array. Omitted on
 	// every epic_ref / explicit-items campaign.
 	GroomingSource map[string]any `json:"grooming_source,omitempty" jsonschema:"provenance of a campaign built from an approved grooming order: source_run_id, source_stage_id, report_artifact_id, report_content_hash, ordered_refs, excluded (with reasons), limit, omitted_by_limit, superseded_by. Absent unless the campaign was created from a grooming order"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	// SatisfiedDependencies are the depends_on edges elided at assembly because
+	// their out-of-set target was already closed-and-completed (#2953): a
+	// prerequisite that already landed, so the campaign assembled instead of
+	// failing with an unactionable dangling-dependency error. Typed struct (NOT
+	// map[string]any / json.RawMessage) so the MCP SDK's reflection-built output
+	// schema stays an object array. CREATE-response-only — the backend does not
+	// persist it, so a later read of the campaign omits it.
+	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed (its work landed, so the dependency is satisfied). Present only on the create response, only when at least one edge was elided"`
+	CreatedAt             time.Time                     `json:"created_at"`
+	UpdatedAt             time.Time                     `json:"updated_at"`
+}
+
+// campaignSatisfiedDependency mirrors the backend's satisfiedDependencyPayload
+// (#2953): one elided depends_on edge — the depending issue (from) → the
+// already-completed target (to) — plus the target's observed state, so an
+// operator can tell "this dependency is done" from "this dependency was ignored".
+// Unexported (its FIELDS are exported for JSON) so it stays off the frozen MCP
+// export surface while still decoding and reflecting into the tool output schema.
+type campaignSatisfiedDependency struct {
+	From        int    `json:"from" jsonschema:"the depending issue number"`
+	To          int    `json:"to" jsonschema:"the already-completed target issue number the edge was elided against"`
+	State       string `json:"state" jsonschema:"the target's observed issue state (e.g. closed)"`
+	StateReason string `json:"state_reason" jsonschema:"the target's observed state_reason (e.g. completed)"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused

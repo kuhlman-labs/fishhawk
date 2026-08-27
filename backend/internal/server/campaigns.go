@@ -76,6 +76,24 @@ type campaignResponse struct {
 	// list responses too — not just the create response. Omitted (omitempty) for
 	// every epic_ref / explicit-items campaign.
 	GroomingSource json.RawMessage `json:"grooming_source,omitempty"`
+	// SatisfiedDependencies are the depends_on edges elided at assembly because
+	// their out-of-set target was already closed-and-completed (#2953). Like
+	// Idempotent it is a CREATE-response-only assembly artifact: it is not
+	// persisted (no column), so GET/list responses omit it. omitempty so a
+	// campaign that elided nothing (and every read) carries no key.
+	SatisfiedDependencies []satisfiedDependencyPayload `json:"satisfied_dependencies,omitempty"`
+}
+
+// satisfiedDependencyPayload is one elided-because-already-satisfied depends_on
+// edge in the create response (#2953): the depending issue (from) → the
+// already-completed target (to), plus the target's OBSERVED state so an operator
+// can tell "this dependency is done" from "this dependency was ignored". Mirrors
+// docs/api/v0.openapi.yaml's SatisfiedDependency schema.
+type satisfiedDependencyPayload struct {
+	From        int    `json:"from"`
+	To          int    `json:"to"`
+	State       string `json:"state"`
+	StateReason string `json:"state_reason"`
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -810,7 +828,37 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	s.writeJSON(w, r, http.StatusCreated, toCampaignResponse(created))
+	// Render the elided-because-already-satisfied depends_on edges into the
+	// CREATE-response-only satisfied_dependencies block (#2953), and emit a
+	// best-effort second copy as an audit entry so the elision is auditable
+	// beyond the transient response. Empty = nothing was elided → no key, no audit.
+	resp := toCampaignResponse(created)
+	if elided := satisfiedDependencyPayloads(assembly.SatisfiedDependencies); len(elided) > 0 {
+		resp.SatisfiedDependencies = elided
+		s.emitCampaignAudit(r.Context(), auditCampaignDependencyElided, map[string]any{
+			"campaign_id": created.ID.String(),
+			"repo":        created.Repo,
+			"elided":      elided,
+		})
+	}
+
+	s.writeJSON(w, r, http.StatusCreated, resp)
+}
+
+// satisfiedDependencyPayloads maps the assembly's elided edges onto the wire
+// payload (#2953). Returns nil for an empty slice so the caller omits both the
+// response key and the audit.
+func satisfiedDependencyPayloads(edges []workmgmt.SatisfiedEdge) []satisfiedDependencyPayload {
+	if len(edges) == 0 {
+		return nil
+	}
+	out := make([]satisfiedDependencyPayload, 0, len(edges))
+	for _, e := range edges {
+		out = append(out, satisfiedDependencyPayload{
+			From: e.From, To: e.To, State: e.State, StateReason: e.StateReason,
+		})
+	}
+	return out
 }
 
 // Detail keys the campaign_dangling_dependency error carries, one per cause
@@ -822,7 +870,22 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 const (
 	danglingNotChildKey           = "dangling_not_child"
 	danglingExcludedIncompleteKey = "dangling_excluded_incomplete"
+	// danglingClosedIncompleteKey / danglingStateUnreadableKey are the #2953
+	// causes: a closed-but-not-completed target (no widen-the-batch remedy) and
+	// an unreadable target (retry). Like the two above they are the CONTRACT with
+	// the fishhawk-mcp remedy renderer.
+	danglingClosedIncompleteKey = "dangling_closed_incomplete"
+	danglingStateUnreadableKey  = "dangling_state_unreadable"
 )
+
+// auditCampaignDependencyElided is written once per create whose assembly elided
+// at least one depends_on edge because its out-of-set target was already
+// closed-and-completed (#2953). It is a best-effort SECOND copy of the create
+// response's satisfied_dependencies block (the response is the convenience; this
+// is the durable-enough chain record) — matching the campaign_grooming_source_
+// resolved posture. It is an INTERNAL audit category, NOT an issue-comment
+// surface.
+const auditCampaignDependencyElided = "campaign_dependency_elided"
 
 // DanglingDependencyDetails builds the campaign_dangling_dependency error's
 // details map from a (possibly-wrapped) assembly error, categorizing the
@@ -843,6 +906,12 @@ func DanglingDependencyDetails(err error, epicRef string) map[string]any {
 		}
 		if refs := edgeRefs(de.ExcludedIncomplete); len(refs) > 0 {
 			details[danglingExcludedIncompleteKey] = refs
+		}
+		if refs := edgeRefs(de.ClosedIncomplete); len(refs) > 0 {
+			details[danglingClosedIncompleteKey] = refs
+		}
+		if refs := edgeRefs(de.StateUnreadable); len(refs) > 0 {
+			details[danglingStateUnreadableKey] = refs
 		}
 	}
 	return details

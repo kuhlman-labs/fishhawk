@@ -76,10 +76,13 @@ type NumberDiscoverer interface {
 // capability; a provider that does not implement it yields no children.
 //
 // EpicChildren returns the children and the depends_on edges restricted to
-// the sibling (children) set — a child body's reference to an issue that is
-// NOT a child of the queried epic is dropped, because the campaign wave DAG
-// (plan.Waves) is over the epic's own children. The result is the input
-// E25.3 feeds to plan.Waves.
+// the sibling (children) set. A child body's reference to an issue that is
+// NOT a child of the queried epic is CLASSIFIED by reading its state (#2953):
+// a closed-and-completed cross-epic target is a satisfied dependency
+// (SatisfiedEdges, elided from the DAG), while an open/incomplete/unreadable
+// one is dangling (DroppedEdges) — because the campaign wave DAG (plan.Waves)
+// is over the epic's own children. The result is the input E25.3 feeds to
+// plan.Waves.
 type EpicChildrenQuerier interface {
 	EpicChildren(ctx context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error)
 }
@@ -108,11 +111,12 @@ type EpicChildrenRequest struct {
 //
 // ResolveDependencies emits the SAME *EpicChildrenResult shape Assemble already
 // consumes: Children are the named issues ascending by number, Edges are the
-// in-set depends_on edges, and DroppedEdges are edges whose target is NOT in the
-// named set (stamped DropNotChild — the issue-literal contract fails closed on
-// EVERY out-of-set target, deliberately WITHOUT the #2120 excluded-but-completed
-// refinement the epic path applies, since there is no epic child set to derive
-// completion state for an out-of-set target from).
+// in-set depends_on edges, and DroppedEdges/SatisfiedEdges are edges whose target
+// is NOT in the named set — CLASSIFIED by reading the target's issue state
+// (#2953): a closed-and-completed target is a SATISFIED dependency (recorded in
+// SatisfiedEdges and elided from the wave DAG, so a batch whose prerequisite is
+// already done assembles instead of failing closed), while an OPEN, closed-but-
+// incomplete, or unreadable target keeps the fail-closed refusal in DroppedEdges.
 type IssueSetDependencyResolver interface {
 	ResolveDependencies(ctx context.Context, req IssueSetRequest) (*EpicChildrenResult, error)
 }
@@ -134,14 +138,39 @@ type EpicChildrenResult struct {
 	Children []EpicChild
 	Edges    []DependsEdge
 	// DroppedEdges are the parsed depends_on edges whose target is NOT a
-	// fellow child of the queried epic — a dangling/mis-targeted reference
-	// (a typo'd number or a real cross-epic dependency). They are kept out of
-	// Edges (the wave DAG is over the epic's own children) but surfaced here
-	// rather than silently discarded, so campaign assembly (E25.3) can fail
-	// closed on a missing dependency instead of dropping it. Like Edges, it is
-	// deterministically sorted by (From, To). Empty when every depends_on
-	// reference points at a sibling.
+	// fellow child of the queried epic AND is not an already-satisfied
+	// dependency — a genuinely dangling edge: the target is OPEN, closed-but-
+	// incomplete (not_planned/duplicate), or its state could not be read
+	// (#2953). They are kept out of Edges (the wave DAG is over the epic's own
+	// children) but surfaced here rather than silently discarded, so campaign
+	// assembly (E25.3) can fail closed on a missing dependency instead of
+	// dropping it. Like Edges, it is deterministically sorted by (From, To).
+	// Empty when every depends_on reference points at a sibling or an
+	// already-completed target.
 	DroppedEdges []DependsEdge
+	// SatisfiedEdges are depends_on edges deliberately elided from BOTH the
+	// DroppedEdges dangling check AND the wave DAG because the target is a
+	// closed-AND-completed issue outside the assembled set (#2953): its work
+	// already landed, so the dependency is genuinely satisfied and eliding it
+	// lets the batch assemble rather than fail closed with an unactionable
+	// dangling-dependency error. Each entry carries the state actually observed
+	// (State/StateReason) so the elision is auditable rather than silent. Like
+	// Edges/DroppedEdges it is deterministically sorted by (From, To). Empty
+	// when no out-of-set target was already completed.
+	SatisfiedEdges []SatisfiedEdge
+}
+
+// SatisfiedEdge is one depends_on edge whose out-of-set target is already
+// closed-and-completed, so the dependency is satisfied and the edge is elided
+// from the wave DAG rather than treated as dangling (#2953). From/To are issue
+// numbers; State/StateReason carry the target's OBSERVED issue state
+// ("closed"/"completed") so the elision is auditable — an operator can tell
+// "this dependency is done" from "this dependency was ignored".
+type SatisfiedEdge struct {
+	From        int
+	To          int
+	State       string
+	StateReason string
 }
 
 // EpicChild is one child issue of an epic: its number, title, autonomy tier,
@@ -197,6 +226,18 @@ const (
 	// remedy is to include it in items, or omit items to sweep every child so a
 	// completed dependency auto-settles (#2120).
 	DropExcludedIncomplete DropReason = "excluded_incomplete"
+	// DropTargetClosedIncomplete marks an edge whose out-of-set target is CLOSED
+	// but NOT completed — closed as not_planned or duplicate (#2953). Its work
+	// did not land, so the dependency is genuinely unsatisfied; no batch-widening
+	// knob can make a not_planned close satisfy the edge, so the remedy is to
+	// reopen/replace the dependency or drop the edge (NOT to widen the batch).
+	DropTargetClosedIncomplete DropReason = "target_closed_incomplete"
+	// DropTargetStateUnreadable marks an edge whose out-of-set target's issue
+	// state could not be read — a GetIssue error, a nil issue, or a ref that is
+	// not a resolvable same-repo numeric target (#2953). Satisfaction is
+	// UNPROVEN, so the edge fails closed and the refusal stands: an unreadable
+	// target is NEVER evidence of satisfaction. The remedy is to retry.
+	DropTargetStateUnreadable DropReason = "target_state_unreadable"
 )
 
 // DependsEdge is one depends_on edge over the sibling set: From depends on

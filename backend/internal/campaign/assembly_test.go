@@ -150,6 +150,81 @@ func TestAssemble_DanglingDependency_ZeroReasonIsNotChild(t *testing.T) {
 	}
 }
 
+// TestAssemble_DanglingDependency_ClosedIncompleteAndUnreadable pins the two
+// new #2953 drop categories: a DropTargetClosedIncomplete edge lands in
+// ClosedIncomplete with a clause that does NOT offer widening, and a
+// DropTargetStateUnreadable edge lands in StateUnreadable with a retry clause.
+func TestAssemble_DanglingDependency_ClosedIncompleteAndUnreadable(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 41}, {Number: 42}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 41, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete},
+			{From: 42, To: 1700, Reason: workmgmt.DropTargetStateUnreadable},
+		},
+	}
+	_, err := campaign.Assemble("issue:40", res)
+	var de *campaign.DanglingDependencyError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want *DanglingDependencyError", err)
+	}
+	if len(de.ClosedIncomplete) != 1 || de.ClosedIncomplete[0].To != 1641 {
+		t.Errorf("ClosedIncomplete = %+v, want the #1641 edge", de.ClosedIncomplete)
+	}
+	if len(de.StateUnreadable) != 1 || de.StateUnreadable[0].To != 1700 {
+		t.Errorf("StateUnreadable = %+v, want the #1700 edge", de.StateUnreadable)
+	}
+	if len(de.NotChild) != 0 || len(de.ExcludedIncomplete) != 0 {
+		t.Errorf("NotChild/ExcludedIncomplete should be empty, got %+v / %+v", de.NotChild, de.ExcludedIncomplete)
+	}
+	msg := err.Error()
+	// closed-incomplete clause names the reopen/replace/drop remedy and its edge,
+	// and does NOT tell the operator to widen/include.
+	if !strings.Contains(msg, "closed WITHOUT completing") || !strings.Contains(msg, "issue:41->issue:1641") {
+		t.Errorf("message %q missing closed_incomplete clause", msg)
+	}
+	if strings.Contains(msg, "include it in items") {
+		t.Errorf("message %q wrongly offers the widen/include remedy for a closed-incomplete target", msg)
+	}
+	// state-unreadable clause names retry and its edge.
+	if !strings.Contains(msg, "could not be read") || !strings.Contains(msg, "issue:42->issue:1700") {
+		t.Errorf("message %q missing state_unreadable clause", msg)
+	}
+}
+
+// TestAssemble_SatisfiedEdgesCarriedNotInDAG asserts a SatisfiedEdge (an elided,
+// already-completed out-of-set target) is carried onto Assembly.SatisfiedDependencies
+// verbatim while NO DAG edge or wave dependency is built from it — the elided
+// target must not appear in any item's DependsOn (#2953). This is the pure-layer
+// proof that "excluded from the wave DAG" is real, not just documented.
+func TestAssemble_SatisfiedEdgesCarriedNotInDAG(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 41}, {Number: 42}},
+		Edges:    []workmgmt.DependsEdge{{From: 42, To: 41}},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 41, To: 1639, State: "closed", StateReason: "completed"},
+		},
+	}
+	asm, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if len(asm.SatisfiedDependencies) != 1 || asm.SatisfiedDependencies[0] != res.SatisfiedEdges[0] {
+		t.Fatalf("SatisfiedDependencies = %+v, want the carried edge verbatim", asm.SatisfiedDependencies)
+	}
+	// The elided target #1639 must not be a dependency of any item; only the real
+	// in-set edge 42->41 survives into the DAG.
+	for _, it := range asm.Items {
+		for _, dep := range it.DependsOn {
+			if dep == "issue:1639" {
+				t.Errorf("item %s depends on the elided target issue:1639, want it excluded from the DAG", it.IssueRef)
+			}
+		}
+		if it.IssueRef == "issue:42" && (len(it.DependsOn) != 1 || it.DependsOn[0] != "issue:41") {
+			t.Errorf("item issue:42 DependsOn = %v, want only [issue:41]", it.DependsOn)
+		}
+	}
+}
+
 // TestAssemble_NilResult covers the defensive nil-result guard.
 func TestAssemble_NilResult(t *testing.T) {
 	if _, err := campaign.Assemble("issue:40", nil); err == nil {

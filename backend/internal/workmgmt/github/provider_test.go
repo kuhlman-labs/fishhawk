@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,13 @@ type fakeAPI struct {
 	// when set, is returned for every GetIssue call (the fetch-fails branch).
 	getIssues   map[int]*githubclient.Issue
 	getIssueErr error
+	// getIssueErrs maps a specific issue number -> an error GetIssue returns for
+	// THAT number only. When the same number is also in getIssues, GetIssue
+	// returns (that issue, that error) — a NON-nil issue ALONGSIDE the error — so
+	// the classifier's error branch can be counterfactually distinguished from
+	// its nil-issue branch (#2953 operator condition 4): deleting the error
+	// branch would then fall through to a completed issue and wrongly satisfy.
+	getIssueErrs map[int]error
 	// getIssueCalls records how many times GetIssue was called per number, so a
 	// test can assert the duplicate-ref dedup fetches each named issue exactly once.
 	getIssueCalls map[int]int
@@ -257,6 +265,11 @@ func (f *fakeAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubc
 		f.getIssueCalls = map[int]int{}
 	}
 	f.getIssueCalls[number]++
+	// A per-number error may accompany a canned issue: return BOTH so the
+	// classifier's error branch is independently observable (#2953 condition 4).
+	if err, ok := f.getIssueErrs[number]; ok && err != nil {
+		return f.getIssues[number], err
+	}
 	if f.getIssueErr != nil {
 		return nil, f.getIssueErr
 	}
@@ -483,6 +496,13 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", Labels: []string{"type:feature", "autonomy:medium"}, State: "OPEN"},
 			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", Labels: []string{"autonomy:low"}, State: "CLOSED", StateReason: "COMPLETED"},
 			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n", State: "CLOSED", StateReason: "NOT_PLANNED"},
+		},
+		// #999 is an out-of-epic (non-child) target the #43 body references. It is
+		// classified by reading its state (#2953): OPEN → DropNotChild, preserving
+		// the pre-#2953 "not a fellow child" refusal for a genuine cross-epic
+		// dependency that has not landed.
+		getIssues: map[int]*githubclient.Issue{
+			999: {Number: 999, Title: "cross-epic", State: "open"},
 		},
 	}
 	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
@@ -776,6 +796,9 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 			100: {Number: 100, Title: "a", Body: "no deps", State: "open"},
 			101: {Number: 101, Title: "b", Body: "no deps", State: "open"},
 			102: {Number: 102, Title: "c", Body: "Depends on: #100, #101, #999", State: "open"},
+			// #999 is out of the named set and OPEN -> classified DropNotChild
+			// (#2953: an open out-of-set target keeps the pre-#2953 refusal).
+			999: {Number: 999, Title: "outside", State: "open"},
 		}}
 		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("issue:100", "issue:101", "issue:102"))
 		if err != nil {
@@ -786,7 +809,7 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 		if len(res.Edges) != len(wantEdges) || res.Edges[0] != wantEdges[0] || res.Edges[1] != wantEdges[1] {
 			t.Fatalf("edges = %+v, want %+v", res.Edges, wantEdges)
 		}
-		// #999 is not in the named set -> dropped, stamped DropNotChild.
+		// #999 is not in the named set and OPEN -> dropped, stamped DropNotChild.
 		wantDropped := []workmgmt.DependsEdge{{From: 102, To: 999, Reason: workmgmt.DropNotChild}}
 		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != wantDropped[0] {
 			t.Fatalf("dropped = %+v, want %+v", res.DroppedEdges, wantDropped)
@@ -889,6 +912,313 @@ func TestProvider_ResolveDependencies_FailClosed(t *testing.T) {
 		api := &fakeAPI{getIssueErr: errors.New("github rejected the request")}
 		if _, err := New(api).ResolveDependencies(context.Background(), good); err == nil || !strings.Contains(err.Error(), "get issue #100") {
 			t.Fatalf("want get-issue error, got %v", err)
+		}
+	})
+}
+
+// resolveResult drives the REAL ResolveDependencies over a two-issue set where
+// the in-set item #from depends on the out-of-set target #to, whose canned state
+// is (state, stateReason). It returns the resolved result so a test can assert
+// how the out-of-set target was classified (#2953).
+func resolveResult(t *testing.T, from, to int, toState, toReason string) *workmgmt.EpicChildrenResult {
+	t.Helper()
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		from: {Number: from, Title: "in-set", Body: "Depends on: #" + strconv.Itoa(to), State: "open"},
+		to:   {Number: to, Title: "target", State: toState, StateReason: toReason},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq(strconv.Itoa(from)))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	return res
+}
+
+// TestResolveDependenciesClosedCompletedTargetSatisfied is the DONE-MEANS
+// behavioral test (#2953): the issue's reproducer shape — an in-set item (#2032)
+// whose body carries `Depends on: #1639` where #1639 is CLOSED/COMPLETED and out
+// of set — assembles instead of failing closed. DroppedEdges is EMPTY,
+// SatisfiedEdges carries exactly that edge with the OBSERVED state, and
+// campaign.Assemble over the result SUCCEEDS with the elided target absent from
+// every item's DependsOn.
+//
+// COUNTERFACTUAL (operator condition 4 / plan B1): delete the closed-and-
+// completed satisfied branch in classifyOutOfSetTarget → every out-of-set target
+// drops → this test goes RED.
+func TestResolveDependenciesClosedCompletedTargetSatisfied(t *testing.T) {
+	res := resolveResult(t, 2032, 1639, "closed", "completed")
+	if len(res.DroppedEdges) != 0 {
+		t.Fatalf("DroppedEdges = %+v, want none (target closed+completed → satisfied)", res.DroppedEdges)
+	}
+	want := workmgmt.SatisfiedEdge{From: 2032, To: 1639, State: "closed", StateReason: "completed"}
+	if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
+		t.Fatalf("SatisfiedEdges = %+v, want [%+v]", res.SatisfiedEdges, want)
+	}
+	// The elided target must not become a DAG dependency of any item.
+	asm, err := campaign.Assemble("", res)
+	if err != nil {
+		t.Fatalf("Assemble over a satisfied-edge result: %v", err)
+	}
+	for _, it := range asm.Items {
+		if len(it.DependsOn) != 0 {
+			t.Errorf("item %s DependsOn = %v, want none (satisfied edge excluded from the DAG)", it.IssueRef, it.DependsOn)
+		}
+	}
+	// The satisfied edge is carried onto the assembly for surfacing.
+	if len(asm.SatisfiedDependencies) != 1 || asm.SatisfiedDependencies[0] != want {
+		t.Errorf("Assembly.SatisfiedDependencies = %+v, want [%+v]", asm.SatisfiedDependencies, want)
+	}
+}
+
+// TestResolveDependenciesOpenTargetStillRefuses is the preserved-refusal half of
+// done-means: an OPEN out-of-set target keeps DropNotChild, so a genuine
+// unshipped cross-batch dependency still fails assembly closed.
+//
+// COUNTERFACTUAL: delete the open-target arm's DropNotChild stamp → this goes RED.
+func TestResolveDependenciesOpenTargetStillRefuses(t *testing.T) {
+	res := resolveResult(t, 2032, 1639, "open", "")
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (open target is not satisfied)", res.SatisfiedEdges)
+	}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropNotChild}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
+	}
+}
+
+// TestResolveDependenciesClosedNotPlannedRefuses: a closed-but-not-completed
+// (not_planned) out-of-set target is DropTargetClosedIncomplete — its work did
+// not land, so the dependency is genuinely unsatisfied.
+//
+// COUNTERFACTUAL: delete the closed-but-not-completed branch (so a not_planned
+// close is treated as satisfied) → this goes RED.
+func TestResolveDependenciesClosedNotPlannedRefuses(t *testing.T) {
+	res := resolveResult(t, 1642, 1641, "closed", "not_planned")
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (not_planned is not satisfied)", res.SatisfiedEdges)
+	}
+	want := workmgmt.DependsEdge{From: 1642, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
+	}
+}
+
+// TestResolveDependenciesUnreadableTargetRefuses: a GetIssue ERROR on the
+// out-of-set target is DropTargetStateUnreadable — never satisfied. The fake
+// returns a NON-nil closed+completed issue ALONGSIDE the error, so the error
+// branch is independently observable (#2953 condition 4): deleting the error
+// branch would fall through to that completed issue and wrongly satisfy, which
+// this assertion (DroppedEdges non-empty + DropTargetStateUnreadable) catches.
+//
+// COUNTERFACTUAL: delete the GetIssue-error branch → this goes RED (it would
+// otherwise satisfy on the non-nil completed issue the fake returns).
+func TestResolveDependenciesUnreadableTargetRefuses(t *testing.T) {
+	api := &fakeAPI{
+		getIssues: map[int]*githubclient.Issue{
+			2032: {Number: 2032, Title: "in-set", Body: "Depends on: #1639", State: "open"},
+			// A NON-nil closed+completed issue returned alongside the error below:
+			// if the error branch is deleted, the classifier would satisfy on this.
+			1639: {Number: 1639, Title: "target", State: "closed", StateReason: "completed"},
+		},
+		getIssueErrs: map[int]error{1639: errors.New("github rejected the read")},
+	}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (unreadable target is never satisfied)", res.SatisfiedEdges)
+	}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
+	}
+}
+
+// TestResolveDependenciesNilIssueRefuses: GetIssue returning (nil, nil) for the
+// out-of-set target is DropTargetStateUnreadable via the nil-issue guard. The
+// (nil, nil) is seeded BY CONSTRUCTION (the number is absent from getIssues, so
+// the fake's default returns not-found... so we route through getIssueErrs=nil
+// but present in getIssues=nil): here we use a target number present in NEITHER
+// map but forced nil via a dedicated fake path.
+//
+// COUNTERFACTUAL: delete the nil-issue guard → a nil deref panics → RED.
+func TestResolveDependenciesNilIssueRefuses(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: #1639", State: "open"},
+		// #1639 maps to a nil issue with NO error — the (nil, nil) forge return.
+		1639: nil,
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (nil issue is never satisfied)", res.SatisfiedEdges)
+	}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
+	}
+}
+
+// TestClassifyOutOfSetTargetInvalidRefFailsClosed pins operator condition 2: the
+// classifier calls GetIssue ONLY for a positive same-repo numeric target; a
+// non-positive number (an unparseable / cross-repo / owner-mismatch ref that
+// cannot be safely resolved) stamps DropTargetStateUnreadable WITHOUT any forge
+// call — calling GetIssue with the wrong target could read an unrelated issue's
+// state and FALSELY satisfy the edge.
+//
+// COUNTERFACTUAL: delete the number<=0 guard → GetIssue is called with 0/negative
+// and this test's call-count assertion (zero calls) goes RED.
+func TestClassifyOutOfSetTargetInvalidRefFailsClosed(t *testing.T) {
+	api := &fakeAPI{}
+	repo := forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}
+	for _, n := range []int{0, -7} {
+		cache := map[int]targetState{}
+		ts, err := New(api).classifyOutOfSetTarget(context.Background(), forge.FromGitHubInstallationID(99), repo, n, cache)
+		if err != nil {
+			t.Fatalf("classifyOutOfSetTarget(%d): %v", n, err)
+		}
+		if ts.satisfied || ts.reason != workmgmt.DropTargetStateUnreadable {
+			t.Errorf("classify(%d) = %+v, want unsatisfied DropTargetStateUnreadable", n, ts)
+		}
+	}
+	if len(api.getIssueCalls) != 0 {
+		t.Errorf("GetIssue called %v times, want ZERO for a non-positive ref (no forge read on an unresolvable target)", api.getIssueCalls)
+	}
+}
+
+// TestResolveDependenciesMemoizesTargetRead pins the per-call memoization
+// (#2953): three in-set items each depending on the SAME closed target cost
+// exactly ONE GetIssue for that target.
+//
+// COUNTERFACTUAL: remove the cache lookup/store in classifyOutOfSetTarget → the
+// call count for #1639 becomes 3 and this goes RED.
+func TestResolveDependenciesMemoizesTargetRead(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		1: {Number: 1, Title: "a", Body: "Depends on: #1639", State: "open"},
+		2: {Number: 2, Title: "b", Body: "Depends on: #1639", State: "open"},
+		3: {Number: 3, Title: "c", Body: "Depends on: #1639", State: "open"},
+		// out-of-set closed+completed target referenced by all three.
+		1639: {Number: 1639, Title: "done", State: "closed", StateReason: "completed"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("1", "2", "3"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.SatisfiedEdges) != 3 {
+		t.Fatalf("SatisfiedEdges = %+v, want three (one per depending item)", res.SatisfiedEdges)
+	}
+	if got := api.getIssueCalls[1639]; got != 1 {
+		t.Errorf("GetIssue(#1639) called %d times, want exactly 1 (memoized)", got)
+	}
+}
+
+// TestResolveDependenciesNoOutOfSetEdgesMakesNoExtraReads: a batch with NO
+// out-of-set edges makes NO extra GetIssue call beyond the one-per-named-issue
+// in-set fetches, so the common-path API cost is unchanged (#2953).
+func TestResolveDependenciesNoOutOfSetEdgesMakesNoExtraReads(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Title: "a", Body: "no deps", State: "open"},
+		101: {Number: 101, Title: "b", Body: "Depends on: #100", State: "open"},
+	}}
+	if _, err := New(api).ResolveDependencies(context.Background(), resolveReq("100", "101")); err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	// Exactly the two in-set fetches, nothing more.
+	if api.getIssueCalls[100] != 1 || api.getIssueCalls[101] != 1 || len(api.getIssueCalls) != 2 {
+		t.Errorf("getIssueCalls = %v, want exactly {100:1,101:1} (no out-of-set read)", api.getIssueCalls)
+	}
+}
+
+// epicChildrenResult drives the REAL EpicChildren where child #from depends on
+// the out-of-EPIC target #to, whose canned GetIssue state is (state, reason).
+func epicChildrenResult(t *testing.T, from, to int, toState, toReason string) *workmgmt.EpicChildrenResult {
+	t.Helper()
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: from, NodeID: "N", Title: "child", Body: "Depends on: #" + strconv.Itoa(to), State: "OPEN"},
+		},
+		getIssues: map[int]*githubclient.Issue{
+			to: {Number: to, Title: "target", State: toState, StateReason: toReason},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	return res
+}
+
+// TestEpicChildrenOutOfEpicTargetClassification mirrors the five classified
+// outcomes onto the EPIC source path, so both campaign sources are pinned to the
+// SAME shared classifier (#2953 ratified judgement: extend the fix to the epic
+// path too). Each case asserts THAT branch's observable output.
+func TestEpicChildrenOutOfEpicTargetClassification(t *testing.T) {
+	t.Run("closed+completed → satisfied", func(t *testing.T) {
+		res := epicChildrenResult(t, 43, 999, "closed", "completed")
+		if len(res.DroppedEdges) != 0 {
+			t.Fatalf("DroppedEdges = %+v, want none", res.DroppedEdges)
+		}
+		want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed"}
+		if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
+			t.Fatalf("SatisfiedEdges = %+v, want [%+v]", res.SatisfiedEdges, want)
+		}
+	})
+	t.Run("open → DropNotChild", func(t *testing.T) {
+		res := epicChildrenResult(t, 43, 999, "open", "")
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropNotChild}
+		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
+			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
+		}
+	})
+	t.Run("closed+not_planned → DropTargetClosedIncomplete", func(t *testing.T) {
+		res := epicChildrenResult(t, 43, 999, "closed", "not_planned")
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetClosedIncomplete}
+		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
+			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
+		}
+	})
+	t.Run("GetIssue error → DropTargetStateUnreadable", func(t *testing.T) {
+		api := &fakeAPI{
+			parentNode:     "EPIC_NODE",
+			listSubResults: []githubclient.SubIssue{{Number: 43, NodeID: "N", Title: "c", Body: "Depends on: #999", State: "OPEN"}},
+			// non-nil completed issue alongside the error (condition 4).
+			getIssues:    map[int]*githubclient.Issue{999: {Number: 999, State: "closed", StateReason: "completed"}},
+			getIssueErrs: map[int]error{999: errors.New("read failed")},
+		}
+		res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+			Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+			Epic:   "#1005",
+		})
+		if err != nil {
+			t.Fatalf("EpicChildren: %v", err)
+		}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable}
+		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
+			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
+		}
+	})
+	t.Run("nil issue → DropTargetStateUnreadable", func(t *testing.T) {
+		api := &fakeAPI{
+			parentNode:     "EPIC_NODE",
+			listSubResults: []githubclient.SubIssue{{Number: 43, NodeID: "N", Title: "c", Body: "Depends on: #999", State: "OPEN"}},
+			getIssues:      map[int]*githubclient.Issue{999: nil},
+		}
+		r2, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+			Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+			Epic:   "#1005",
+		})
+		if err != nil {
+			t.Fatalf("EpicChildren: %v", err)
+		}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable}
+		if len(r2.DroppedEdges) != 1 || r2.DroppedEdges[0] != want || len(r2.SatisfiedEdges) != 0 {
+			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", r2.DroppedEdges, r2.SatisfiedEdges, want)
 		}
 	})
 }

@@ -2263,8 +2263,44 @@ components:
             existing campaign, returned `200` instead of `201`. Omitted on a
             fresh create (201) and on GET/list/status, so those are
             byte-identical to pre-E25.13 output.
+        satisfied_dependencies:
+          type: array
+          description: |
+            The `depends_on` edges elided at assembly because their out-of-set
+            target was already closed-and-completed (#2953): a prerequisite that
+            already landed, so the campaign assembled instead of failing closed
+            with `campaign_dangling_dependency`. Like `idempotent` this is a
+            CREATE-response-only assembly artifact — it is NOT persisted, so
+            GET/list/status responses omit it. Omitted on a create that elided
+            nothing. Each entry names the depending issue, the already-completed
+            target, and the target's observed state, so an operator can tell
+            "this dependency is done" from "this dependency was ignored".
+          items:
+            $ref: '#/components/schemas/SatisfiedDependency'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    SatisfiedDependency:
+      type: object
+      description: |
+        One `depends_on` edge elided at campaign assembly because the target was
+        already closed-and-completed (#2953).
+      required: [from, to, state, state_reason]
+      properties:
+        from:
+          type: integer
+          description: The depending issue number.
+        to:
+          type: integer
+          description: The already-completed target issue number the edge was elided against.
+        state:
+          type: string
+          description: The target's observed issue state (e.g. `closed`).
+          example: closed
+        state_reason:
+          type: string
+          description: The target's observed `state_reason` (e.g. `completed`).
+          example: completed
 
     CampaignItem:
       type: object
