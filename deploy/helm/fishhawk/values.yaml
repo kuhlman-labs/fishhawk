@@ -425,10 +425,17 @@ postgres:
 minio:
   enabled: false
   image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-  # mc client image for the bucket-bootstrap Job. Pinned to the same release as
-  # the server image (mc and the server are co-versioned) per CLAUDE.md's
-  # run-time image-pinning rule.
-  mcImage: minio/mc:RELEASE.2025-01-20T14-49-07Z
+  # mc client image for the bucket-bootstrap Job. mc and the MinIO server are NOT
+  # co-versioned — minio/mc does not publish a tag for every minio/minio server
+  # release (the 2025-01-20 server tag has no matching mc tag), so this is pinned
+  # INDEPENDENTLY of minio.image and must be a tag that actually EXISTS in the
+  # registry. A nonexistent tag ships silently: the bucket Job is a Helm HOOK, so
+  # an ImagePullBackOff there surfaces only as a `helm upgrade` timeout (#2913).
+  # scripts/test-helm-render r15 fail-closes the render gate on an unpublished
+  # tag, and `scripts/dev k8s` dumps hook pod state on a helm failure. Verify a
+  # new pin is pullable before bumping, per CLAUDE.md's run-time image-pinning
+  # rule.
+  mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
   pullPolicy: IfNotPresent
   rootUser: fishhawk
   rootPassword: fishhawk-dev-secret

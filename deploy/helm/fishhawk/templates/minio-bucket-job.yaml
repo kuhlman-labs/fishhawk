@@ -1,9 +1,13 @@
 {{- if and .Values.minio.enabled .Values.minio.createBucket }}
 # Bucket-bootstrap Job: creates the trace bucket in the in-cluster MinIO after
-# install/upgrade. The mc image is pinned to the same release as the server
-# (co-versioned) per CLAUDE.md's run-time image-pinning rule. The command retries
-# `mc alias set` against the Service until MinIO is accepting connections, then
-# `mc mb --ignore-existing` so re-runs are idempotent.
+# install/upgrade. minio.mcImage is pinned INDEPENDENTLY of minio.image — mc and
+# the MinIO server are NOT co-versioned, so it must name a tag that actually
+# exists (see values.yaml; scripts/test-helm-render r15). This Job is a
+# post-install/post-upgrade HOOK, so a pull failure here surfaces to the operator
+# ONLY as a `helm upgrade` timeout, never as a named ImagePullBackOff (#2913) —
+# which is why `scripts/dev k8s` dumps hook pod state on a helm failure. The
+# command retries `mc alias set` against the Service until MinIO is accepting
+# connections, then `mc mb --ignore-existing` so re-runs are idempotent.
 apiVersion: batch/v1
 kind: Job
 metadata:

@@ -857,6 +857,90 @@ else
   fail "cmd_k8s_up should record the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
 fi
 
+# 9b-bis (#2913). The helm leg must catch its OWN failure. The minio
+# bucket-bootstrap Job is a post-install/post-upgrade HOOK, so a nonexistent
+# mcImage tag makes `helm upgrade` block until its --timeout and exit non-zero
+# reporting only a timeout — with no named ImagePullBackOff. So cmd_k8s_up must
+# wrap helm in an `if ! helm upgrade` guard that dumps hook pod state and exits 1,
+# mirroring the rollout and /healthz legs. Body-greps first; deleting the guard
+# reddens these.
+if print -r -- "$k8s_up_body" | grep -q 'if ! helm upgrade'; then
+  pass "cmd_k8s_up guards the helm upgrade failure with an 'if ! helm upgrade' branch"
+else
+  fail "cmd_k8s_up should wrap helm upgrade in an 'if ! helm upgrade' failure guard"
+fi
+if print -r -- "$k8s_up_body" | grep -q '_k8s_dump_hook_diagnostics'; then
+  pass "cmd_k8s_up dumps hook pod state on a helm failure"
+else
+  fail "cmd_k8s_up should call _k8s_dump_hook_diagnostics on a helm failure"
+fi
+
+# 9b-ter. FUNCTIONAL test of _k8s_dump_hook_diagnostics against a FAKE kubectl on
+# PATH. Fixture 1: a hook pod stuck in ImagePullBackOff on the exact nonexistent
+# mc tag from #2913 — stderr must name BOTH ImagePullBackOff and the offending
+# image. Same subshell-exit-status contract as the git-stub fixtures above (a
+# pass/fail inside the subshell would increment a discarded counter copy).
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  bad_img="minio/mc:RELEASE.2025-01-20T14-49-07Z"
+  cat > "${kstub}/kubectl" <<STUB
+#!/usr/bin/env zsh
+case "\$*" in
+  "get jobs"*)             print "NAME                     STATUS   COMPLETIONS"; print "fishhawk-minio-bucket    Running  0/1"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-minio-bucket-abc   0/1   ImagePullBackOff   0   3m"; exit 0 ;;
+  "get pods"*)             print "NAME                          READY   STATUS             RESTARTS   AGE"; print "fishhawk-minio-bucket-abc     0/1     ImagePullBackOff   0          3m"; exit 0 ;;
+  "describe pod "*)        print "    State:          Waiting"; print "      Reason:       ImagePullBackOff"; print "    Image:          ${bad_img}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
+  ok=0
+  if ! print -r -- "$diag_err" | grep -q 'ImagePullBackOff'; then
+    print "  (stderr did not name ImagePullBackOff: $diag_err)"; ok=1
+  fi
+  if ! print -r -- "$diag_err" | grep -qF -- "$bad_img"; then
+    print "  (stderr did not name the offending image $bad_img: $diag_err)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "_k8s_dump_hook_diagnostics names ImagePullBackOff + the offending image for a stuck hook pod"
+else
+  fail "_k8s_dump_hook_diagnostics should name the pull failure and image (see diagnostic above)"
+fi
+
+# Fixture 2: all pods Running — the diagnostic must NOT invent a pull-failure line.
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  cat > "${kstub}/kubectl" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  "get jobs"*)             print "NAME    STATUS    COMPLETIONS"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-abc   1/1   Running   0   3m"; exit 0 ;;
+  "get pods"*)             print "NAME           READY   STATUS    RESTARTS   AGE"; print "fishhawk-abc   1/1     Running   0          3m"; exit 0 ;;
+  "describe pod "*)        print "    State:          Running"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
+  ok=0
+  if print -r -- "$diag_err" | grep -q 'image pull failed'; then
+    print "  (unexpected pull-failure line with all pods Running: $diag_err)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "_k8s_dump_hook_diagnostics names no pull failure when every pod is Running"
+else
+  fail "_k8s_dump_hook_diagnostics should not report a pull failure for healthy pods (see diagnostic above)"
+fi
+
 # 9c. cmd_k8s_down teardown: a genuine helm error must not be swallowed and
 # misreported as 'nothing to uninstall'. Only an absent release ('not found')
 # is a no-op; any other failure exits non-zero.

@@ -1375,6 +1375,193 @@ else
   fail "r14o helm lint complete-GitLab fixture: $(printf '%s' "$lint_out" | tail -3)"
 fi
 
+# ---------------------------------------------------------------------------
+# r15 — REGISTRY EXISTENCE of every third-party image the chart RENDERS (#2913).
+#       A rendered-output gate structurally CANNOT catch a nonexistent tag: the
+#       manifest is valid YAML naming an image that does not exist, and the
+#       minio bucket Job is a Helm HOOK, so the pull failure surfaces to the
+#       operator only as a `helm upgrade` timeout, never a named
+#       ImagePullBackOff — exactly why the bad minio/mc pin shipped past every
+#       render assertion above. This case extracts each rendered image ref (from
+#       `helm template` output, NOT grepped from values.yaml) and classifies it
+#       against the registry by an anonymous Docker Hub registry-v2 manifest HEAD.
+#
+#       SKIP CONTRACT: curl-absent, or a SENTINEL that does not classify
+#       `missing` (registry unreachable / rate-limited, or the known-bad tag
+#       became published), prints a reason and skips the LIVE probes without
+#       failing — an offline or throttled host is not red-lined, the same
+#       residual shape as the helm-absent skip. The cost is honest: the chart's
+#       image pins are UNGUARDED on such a host.
+#
+#       NOTE: numbered r15 because r14 above is the GitLab family (E45.32 /
+#       #2922); the approved plan called this block "r14" before that landed.
+# ---------------------------------------------------------------------------
+# Registry endpoints are OVERRIDABLE so the indeterminate/skip path is
+# exercisable without host-level DNS/network manipulation (binding condition 5).
+# _registry_probe resolves FISHHAWK_REGISTRY_AUTH_URL / FISHHAWK_REGISTRY_URL at
+# CALL time (not once at load), so an inline `FISHHAWK_REGISTRY_AUTH_URL=... probe`
+# override on a single call takes effect. Default to Docker Hub's anonymous-pull
+# token service + registry.
+
+# _registry_verdict <http-code> — PURE classifier. Directly table-testable with
+# synthetic codes, no network. Exactly one of: exists (200), missing (404),
+# indeterminate (everything else — curl's 000 connection failure, 401 after a
+# token fetch, 429 rate limit, any 5xx).
+_registry_verdict() {
+  case "$1" in
+    200) echo exists ;;
+    404) echo missing ;;
+    *)   echo indeterminate ;;
+  esac
+}
+
+# _registry_probe <image-ref> — classify a rendered image ref by an anonymous
+# Docker Hub registry-v2 manifest HEAD. Echoes exists / missing / indeterminate
+# / unsupported.
+#   * A digest-pinned (@sha256:...) or a tagless ref -> unsupported.
+#   * A non-Docker-Hub registry (first path element carries a dot or colon, e.g.
+#     ghcr.io/...) -> unsupported, so a future non-Hub pin is skipped with a
+#     reason rather than silently mis-verdicted.
+#   * A single-segment repo is normalized to the library/ namespace (registry v2
+#     requires library/postgres, not postgres).
+#   * A failed token fetch -> indeterminate (the deterministic skip branch that
+#     the REGISTRY_AUTH_URL override exercises).
+# A real HEAD via `curl -I`, NOT `curl -X HEAD`: -X HEAD makes curl expect a body
+# the server omits and abort with exit 18 (transfer closed), misreading as 000.
+_registry_probe() {
+  local ref="$1"
+  local auth_url="${FISHHAWK_REGISTRY_AUTH_URL:-https://auth.docker.io}"
+  local base_url="${FISHHAWK_REGISTRY_URL:-https://registry-1.docker.io}"
+  case "$ref" in
+    *@*) echo unsupported; return ;;   # digest-pinned
+  esac
+  case "$ref" in
+    *:*) : ;;                          # carries a tag
+    *)   echo unsupported; return ;;   # tagless
+  esac
+  local repo="${ref%:*}" tag="${ref##*:}"
+  local first="${repo%%/*}"
+  case "$first" in
+    *.*|*:*) echo unsupported; return ;;   # non-Docker-Hub registry host
+  esac
+  case "$repo" in
+    */*) : ;;
+    *)   repo="library/$repo" ;;           # official single-segment -> library/
+  esac
+  local token
+  token=$(curl -sS "$auth_url/token?service=registry.docker.io&scope=repository:${repo}:pull" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  if [ -z "$token" ]; then echo indeterminate; return; fi
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.oci.image.index.v1+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+    -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    "$base_url/v2/${repo}/manifests/${tag}" 2>/dev/null)
+  _registry_verdict "$code"
+}
+
+# _r15_extract_refs <render-output> — every third-party `image:` value at YAML
+# key position, dropping the locally-built fishhawkd image (no published
+# dev-local tag). Image refs carry no whitespace, so the value match is safe.
+_r15_extract_refs() {
+  printf '%s' "$1" \
+    | grep -oE '^[[:space:]]*image:[[:space:]]*"?[^"[:space:]]+"?[[:space:]]*$' \
+    | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/"//g; s/[[:space:]]*$//' \
+    | grep -v '^ghcr\.io/kuhlman-labs/fishhawkd' \
+    | sort -u
+}
+
+# _r15_probe_refs <render-output> — the LOAD-BEARING detector r15c asserts passes
+# and r15d asserts fails. Probes each extracted third-party ref: echoes one line
+# `<ref> missing` for a DEFINITE 404, prints an indeterminate/unsupported ref as
+# a skip on stderr, and returns 1 iff at least one ref is missing. Deleting the
+# `missing` accumulation line reddens r15d (the counterfactual) while leaving
+# r15c green — the deletion-observed control.
+_r15_probe_refs() {
+  local rendered="$1" r v found_missing=0
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    v="$(_registry_probe "$r")"
+    case "$v" in
+      missing) echo "$r missing"; found_missing=1 ;;
+      exists)  : ;;
+      *)       echo "r15: $r probed '$v' (registry unreachable/unsupported) — SKIPPING this ref" >&2 ;;
+    esac
+  done <<< "$(_r15_extract_refs "$rendered")"
+  return "$found_missing"
+}
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "scripts/test-helm-render: curl absent from PATH — skipping the r15 registry-existence check"
+else
+  # r15a THE PURE CLASSIFIER TABLE — one assertion per named verdict, synthetic
+  # codes, no network.
+  assert_equals "r15a classifier 200 -> exists"        "$(_registry_verdict 200)" "exists"
+  assert_equals "r15a classifier 404 -> missing"       "$(_registry_verdict 404)" "missing"
+  assert_equals "r15a classifier 429 -> indeterminate" "$(_registry_verdict 429)" "indeterminate"
+  assert_equals "r15a classifier 000 -> indeterminate" "$(_registry_verdict 000)" "indeterminate"
+  assert_equals "r15a classifier 500 -> indeterminate" "$(_registry_verdict 500)" "indeterminate"
+  assert_equals "r15a classifier 401 -> indeterminate" "$(_registry_verdict 401)" "indeterminate"
+
+  # r15a probe DEGRADES — one case per named degrade of _registry_probe.
+  assert_equals "r15a probe non-Docker-Hub ref -> unsupported" \
+    "$(_registry_probe ghcr.io/kuhlman-labs/fishhawkd:dev-local)" "unsupported"
+  assert_equals "r15a probe digest-pinned ref -> unsupported" \
+    "$(_registry_probe minio/mc@sha256:0000000000000000000000000000000000000000000000000000000000000000)" "unsupported"
+  assert_equals "r15a probe tagless ref -> unsupported" \
+    "$(_registry_probe minio/mc)" "unsupported"
+  # Binding condition 5: the REGISTRY_AUTH_URL override makes the token-fetch
+  # failure (-> indeterminate) deterministically testable. 127.0.0.1:1 refuses,
+  # so the token is empty and the probe short-circuits to indeterminate.
+  assert_equals "r15a probe unreachable token endpoint -> indeterminate" \
+    "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
+
+  # r15b THE SENTINEL / ANTI-VACUITY GUARD. Probe the known-bad ref from #2913 and
+  # require `missing`. Anything else prints the reason and SKIPS the live checks,
+  # so an unreachable registry can never green r15c. SHARED-DEPENDENCE RESIDUAL
+  # (binding condition 4): this sentinel AND r15d's counterfactual both hinge on a
+  # live 404 for this exact tag. If Docker Hub ever publishes it, r15b skips and
+  # r15d skips with it, silently removing the counterfactual guard with no signal.
+  # Recorded in scripts/README.md's r15 row.
+  SENTINEL_REF="minio/mc:RELEASE.2025-01-20T14-49-07Z"
+  sentinel_verdict="$(_registry_probe "$SENTINEL_REF")"
+  if [ "$sentinel_verdict" != "missing" ]; then
+    echo "scripts/test-helm-render: r15 sentinel $SENTINEL_REF classified '$sentinel_verdict', not 'missing' — registry unreachable/rate-limited or the tag became published; SKIPPING the live registry probes (chart image pins UNGUARDED on this host)"
+  else
+    pass "r15b sentinel known-bad ref classifies missing (anti-vacuity guard is live)"
+
+    # r15c THE LIVE CHECK. Render values-local (enables minio, postgres, jaeger),
+    # extract every third-party image ref, and require the detector to find none
+    # missing. Extraction is sanity-checked first (the mc image must be present),
+    # so an empty extraction cannot vacuously pass.
+    render -f "$CHART/values-local.yaml"
+    assert_render_ok "r15c values-local renders for image extraction"
+    r15c_refs="$(_r15_extract_refs "$out")"
+    assert_contains "r15c extraction finds the minio/mc image (extraction works)" "$r15c_refs" "minio/mc:"
+    assert_absent "r15c extraction drops the locally-built fishhawkd image" "$r15c_refs" "fishhawkd"
+    if r15c_missing="$(_r15_probe_refs "$out")"; then
+      pass "r15c every rendered third-party image resolves exists (or skipped indeterminate)"
+    else
+      fail "r15c a rendered third-party image is MISSING from the registry: $r15c_missing"
+    fi
+
+    # r15d THE COUNTERFACTUAL. Render with the exact nonexistent tag from #2913
+    # and assert the SAME detector reports it missing — the condition that shipped
+    # this bug is now detected. Deleting the `missing` accumulation in
+    # _r15_probe_refs makes the detector return 0 here, so the else-branch fires
+    # and r15d goes RED (observed by execution), while r15c stays green.
+    render -f "$CHART/values-local.yaml" --set minio.mcImage="$SENTINEL_REF"
+    assert_render_ok "r15d values-local + bad mc tag renders (the manifest is valid; only the tag is bogus)"
+    if r15d_missing="$(_r15_probe_refs "$out")"; then
+      fail "r15d counterfactual FAILED to detect the nonexistent mc tag $SENTINEL_REF (the missing-detection branch is broken)"
+    else
+      assert_contains "r15d counterfactual: the detector reports the shipped-bug mc tag missing" "$r15d_missing" "$SENTINEL_REF"
+    fi
+  fi
+fi
+
 echo
 echo "scripts/test-helm-render: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
