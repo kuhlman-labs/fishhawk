@@ -103,17 +103,27 @@ func TestRunAccountCreate_WritesRowAndIsIdempotent(t *testing.T) {
 		t.Errorf("display_name = %q, want Acme", displayName)
 	}
 
-	// Idempotent re-run: still exactly one row.
+	// Idempotent re-run WITHOUT --display-name: still exactly one row, and the
+	// cosmetic display_name is now NULL. CreateAccount passes a nil DisplayName
+	// when the flag is omitted, and UpsertAccount's ON CONFLICT sets
+	// display_name = EXCLUDED.display_name — so a re-run of the documented
+	// bootstrap without the flag ERASES the name. Pin that behavior explicitly
+	// (a silent switch to a COALESCE-preserving upsert would flip this).
 	out.Reset()
 	if got := runAccount([]string{"create", "--db", url, "--provider", "gitlab", "--account-key", "acme"}, &out); got != exitOK {
 		t.Fatalf("second create exit = %d, want %d; log:\n%s", got, exitOK, out.String())
 	}
+	var reDisplayName *string
 	if err := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM accounts WHERE provider = $1 AND account_key = $2`, "gitlab", "acme").Scan(&count); err != nil {
+		`SELECT count(*), max(display_name) FROM accounts WHERE provider = $1 AND account_key = $2`,
+		"gitlab", "acme").Scan(&count, &reDisplayName); err != nil {
 		t.Fatalf("recount: %v", err)
 	}
 	if count != 1 {
 		t.Errorf("after idempotent re-run, account row count = %d, want 1", count)
+	}
+	if reDisplayName != nil {
+		t.Errorf("display_name after re-run without --display-name = %q, want NULL (erased by ON CONFLICT)", *reDisplayName)
 	}
 }
 

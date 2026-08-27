@@ -86,8 +86,10 @@ func TestRunInstallationRegister_ValidationErrors(t *testing.T) {
 	}{
 		{"unknown provider", []string{"--provider", "bitbucket", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, `"bitbucket"`},
 		{"malformed gitlab ref", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:abc"}, `"gitlab:abc"`},
+		{"non-positive gitlab id", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:0"}, `"gitlab:0"`},
 		{"github ref wrong prefix", []string{"--provider", "github", "--account-key", "acme", "--installation-ref", "github:42"}, `"github:42"`},
 		{"non-https forge base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--forge-base-url", "http://insecure.example"}, "https"},
+		{"non-https oauth base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--oauth-base-url", "http://insecure.example"}, "https"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -199,6 +201,12 @@ func TestRunInstallationRegister_RefusesUnknownAccount(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "fishhawkd account create") {
 		t.Errorf("log %q does not name the `fishhawkd account create` remedy", out.String())
+	}
+	// The error must NAME the missing account key, not just a generic remedy —
+	// the quoted `"ghost"` appears only in the account_key %q clause, so a
+	// regression to a generic message would turn this red.
+	if !strings.Contains(out.String(), `"ghost"`) {
+		t.Errorf("log %q does not name the missing account_key \"ghost\"", out.String())
 	}
 
 	pool, err := pgxpool.New(context.Background(), url)

@@ -156,27 +156,51 @@ func TestValidateInstallationRef_Accepts(t *testing.T) {
 	}
 }
 
-// TestRegisterInstallation_BadBaseURL asserts a non-https base URL is a
-// validation error wrapping ErrValidation, and the write is never reached.
+// TestRegisterInstallation_BadBaseURL covers every base-URL rejection branch —
+// a non-https SCHEME and a syntactically MALFORMED url (the url.Parse failure
+// path), on BOTH the forge and the oauth override fields. The oauth field is
+// validated by a SEPARATE block in RegisterInstallation, so it gets its own
+// cases; each must wrap ErrValidation and never reach the write.
 func TestRegisterInstallation_BadBaseURL(t *testing.T) {
-	fake := &fakeRegistryQueries{}
-	_, err := RegisterInstallation(context.Background(), fake, RegisterInstallationRequest{
-		Provider:        "gitlab",
-		AccountKey:      "acme",
-		InstallationRef: "gitlab:4242",
-		ForgeBaseURL:    "http://insecure.example",
-	})
-	if err == nil {
-		t.Fatalf("RegisterInstallation with http base url = nil error, want validation error")
+	// "https://\x7f" is a DEL control byte in the host — url.Parse rejects it,
+	// exercising ValidateResolvedBaseURL's malformed (parse-error) branch rather
+	// than the scheme branch a plain http:// value hits.
+	const malformedURL = "https://\x7f"
+	cases := []struct {
+		name    string
+		req     RegisterInstallationRequest
+		wantSub string
+	}{
+		{"forge non-https scheme",
+			RegisterInstallationRequest{Provider: "gitlab", AccountKey: "acme", InstallationRef: "gitlab:4242", ForgeBaseURL: "http://insecure.example"},
+			"https"},
+		{"forge malformed url",
+			RegisterInstallationRequest{Provider: "gitlab", AccountKey: "acme", InstallationRef: "gitlab:4242", ForgeBaseURL: malformedURL},
+			"malformed"},
+		{"oauth non-https scheme",
+			RegisterInstallationRequest{Provider: "gitlab", AccountKey: "acme", InstallationRef: "gitlab:4242", OAuthBaseURL: "http://insecure.example"},
+			"https"},
+		{"oauth malformed url",
+			RegisterInstallationRequest{Provider: "gitlab", AccountKey: "acme", InstallationRef: "gitlab:4242", OAuthBaseURL: malformedURL},
+			"malformed"},
 	}
-	if !errors.Is(err, ErrValidation) {
-		t.Errorf("error %v does not wrap ErrValidation", err)
-	}
-	if !strings.Contains(err.Error(), "https") {
-		t.Errorf("error %q does not name the https requirement", err.Error())
-	}
-	if fake.upsertInstallationCalls != 0 {
-		t.Errorf("UpsertInstallation was called %d times on a validation failure, want 0", fake.upsertInstallationCalls)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeRegistryQueries{}
+			_, err := RegisterInstallation(context.Background(), fake, tc.req)
+			if err == nil {
+				t.Fatalf("RegisterInstallation with bad base url = nil error, want validation error")
+			}
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("error %v does not wrap ErrValidation", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q does not name %q", err.Error(), tc.wantSub)
+			}
+			if fake.upsertInstallationCalls != 0 {
+				t.Errorf("UpsertInstallation was called %d times on a validation failure, want 0", fake.upsertInstallationCalls)
+			}
+		})
 	}
 }
 
@@ -202,6 +226,13 @@ func TestRegisterInstallation_UnknownAccountRefuses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fishhawkd account create") {
 		t.Errorf("error %q does not name the `fishhawkd account create` remedy", err.Error())
+	}
+	// The acceptance criterion requires the error to name the MISSING account
+	// key, not merely a generic remedy — the quoted `"acme"` appears only in the
+	// account_key %q clause (the remedy command spells it unquoted), so this
+	// stays red if the message regresses to a generic form.
+	if !strings.Contains(err.Error(), `"acme"`) {
+		t.Errorf("error %q does not name the missing account_key \"acme\"", err.Error())
 	}
 	if fake.upsertInstallationCalls != 0 {
 		t.Errorf("UpsertInstallation was called %d times on an unknown account, want 0", fake.upsertInstallationCalls)
