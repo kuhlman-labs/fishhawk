@@ -857,6 +857,175 @@ else
   fail "cmd_k8s_up should record the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
 fi
 
+# 9b-bis (#2913). The helm leg must catch its OWN failure. The minio
+# bucket-bootstrap Job is a post-install/post-upgrade HOOK, so a nonexistent
+# mcImage tag makes `helm upgrade` block until its --timeout and exit non-zero
+# reporting only a timeout — with no named ImagePullBackOff. So cmd_k8s_up must
+# wrap helm in an `if ! helm upgrade` guard that dumps hook pod state and exits 1,
+# mirroring the rollout and /healthz legs. Body-greps first; deleting the guard
+# reddens these.
+if print -r -- "$k8s_up_body" | grep -q 'if ! helm upgrade'; then
+  pass "cmd_k8s_up guards the helm upgrade failure with an 'if ! helm upgrade' branch"
+else
+  fail "cmd_k8s_up should wrap helm upgrade in an 'if ! helm upgrade' failure guard"
+fi
+if print -r -- "$k8s_up_body" | grep -q '_k8s_dump_hook_diagnostics'; then
+  pass "cmd_k8s_up dumps hook pod state on a helm failure"
+else
+  fail "cmd_k8s_up should call _k8s_dump_hook_diagnostics on a helm failure"
+fi
+
+# 9b-ter. FUNCTIONAL test of _k8s_dump_hook_diagnostics against a FAKE kubectl on
+# PATH. Fixture 1: a hook pod stuck in ImagePullBackOff on the exact nonexistent
+# mc tag from #2913 — stderr must name BOTH ImagePullBackOff and the offending
+# image. Same subshell-exit-status contract as the git-stub fixtures above (a
+# pass/fail inside the subshell would increment a discarded counter copy).
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  bad_img="minio/mc:RELEASE.2025-01-20T14-49-07Z"
+  cat > "${kstub}/kubectl" <<STUB
+#!/usr/bin/env zsh
+case "\$*" in
+  "get jobs"*)             print "NAME                     STATUS   COMPLETIONS"; print "fishhawk-minio-bucket    Running  0/1"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-minio-bucket-abc   0/1   ImagePullBackOff   0   3m"; exit 0 ;;
+  "get pods"*)             print "NAME                          READY   STATUS             RESTARTS   AGE"; print "fishhawk-minio-bucket-abc     0/1     ImagePullBackOff   0          3m"; exit 0 ;;
+  "describe pod "*)        print "    State:          Waiting"; print "      Reason:       ImagePullBackOff"; print "    Image:          ${bad_img}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
+  ok=0
+  if ! print -r -- "$diag_err" | grep -q 'ImagePullBackOff'; then
+    print "  (stderr did not name ImagePullBackOff: $diag_err)"; ok=1
+  fi
+  if ! print -r -- "$diag_err" | grep -qF -- "$bad_img"; then
+    print "  (stderr did not name the offending image $bad_img: $diag_err)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "_k8s_dump_hook_diagnostics names ImagePullBackOff + the offending image for a stuck hook pod"
+else
+  fail "_k8s_dump_hook_diagnostics should name the pull failure and image (see diagnostic above)"
+fi
+
+# Fixture 2: all pods Running — the diagnostic must NOT invent a pull-failure line.
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  cat > "${kstub}/kubectl" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  "get jobs"*)             print "NAME    STATUS    COMPLETIONS"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-abc   1/1   Running   0   3m"; exit 0 ;;
+  "get pods"*)             print "NAME           READY   STATUS    RESTARTS   AGE"; print "fishhawk-abc   1/1     Running   0          3m"; exit 0 ;;
+  "describe pod "*)        print "    State:          Running"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
+  ok=0
+  if print -r -- "$diag_err" | grep -q 'image pull failed'; then
+    print "  (unexpected pull-failure line with all pods Running: $diag_err)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "_k8s_dump_hook_diagnostics names no pull failure when every pod is Running"
+else
+  fail "_k8s_dump_hook_diagnostics should not report a pull failure for healthy pods (see diagnostic above)"
+fi
+
+# Fixture 3 (#2913 coverage gap): a pod in CrashLoopBackOff (a NON-pull failure)
+# whose `describe pod` itself EXITS 1 (empty output). Two properties: (a) the
+# ImagePullBackOff/ErrImagePull grep must NOT match, so no 'image pull failed'
+# line is invented for a non-pull failure; (b) the `|| true` guards keep the
+# diagnostic from aborting under set -e even when describe fails.
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  cat > "${kstub}/kubectl" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  "get jobs"*)             print "NAME                     STATUS    COMPLETIONS"; print "fishhawk-minio-bucket    Running   0/1"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-minio-bucket-abc   0/1   CrashLoopBackOff   3   4m"; exit 0 ;;
+  "get pods"*)             print "NAME                        READY   STATUS             RESTARTS   AGE"; print "fishhawk-minio-bucket-abc   0/1     CrashLoopBackOff   3          4m"; exit 0 ;;
+  "describe pod "*)        exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
+  ok=0
+  if print -r -- "$diag_err" | grep -q 'image pull failed'; then
+    print "  (invented a pull-failure line for a CrashLoopBackOff pod: $diag_err)"; ok=1
+  fi
+  # No-abort under set -e even with a failing describe: the `|| true` guards must
+  # keep the diagnostic returning 0 rather than tripping ERR_EXIT.
+  if ! ( set -e; _k8s_dump_hook_diagnostics >/dev/null 2>&1 ); then
+    print "  (_k8s_dump_hook_diagnostics aborted/failed under set -e with a failing describe)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "_k8s_dump_hook_diagnostics: CrashLoopBackOff + failing describe -> no pull line, no set -e abort"
+else
+  fail "_k8s_dump_hook_diagnostics should report no pull failure and not abort for CrashLoopBackOff / failing describe (see diagnostic above)"
+fi
+
+# 9b-quater (#2913). BEHAVIORAL test of cmd_k8s_up's helm-failure LEG (not just the
+# 9b-bis body-greps that prove the guard is wired): a real cmd_k8s_up invocation
+# with docker stubbed to succeed, helm stubbed to FAIL, and kubectl stubbed to the
+# ImagePullBackOff hook-pod fixture must (a) name the helm failure, (b) drive the
+# hook diagnostics (stderr carries ImagePullBackOff + the offending image), and
+# (c) return non-zero. cmd_k8s_up's helm-fail branch runs before any port-forward
+# or mkdir, so the stubbed run has no side effects on the real repo. Same
+# subshell-exit-status contract as the fixtures above.
+if (
+  set +e
+  kstub="$(mktemp -d)"
+  bad_img="minio/mc:RELEASE.2025-01-20T14-49-07Z"
+  print -r -- $'#!/usr/bin/env zsh\nexit 0' > "${kstub}/docker"   # docker build succeeds
+  print -r -- $'#!/usr/bin/env zsh\nexit 1' > "${kstub}/helm"     # helm upgrade fails
+  cat > "${kstub}/kubectl" <<STUB
+#!/usr/bin/env zsh
+case "\$*" in
+  "get jobs"*)             print "NAME                     STATUS   COMPLETIONS"; print "fishhawk-minio-bucket    Running  0/1"; exit 0 ;;
+  "get pods --no-headers") print "fishhawk-minio-bucket-abc   0/1   ImagePullBackOff   0   3m"; exit 0 ;;
+  "get pods"*)             print "NAME                        READY   STATUS             RESTARTS   AGE"; print "fishhawk-minio-bucket-abc   0/1     ImagePullBackOff   0          3m"; exit 0 ;;
+  "describe pod "*)        print "    State:          Waiting"; print "      Reason:       ImagePullBackOff"; print "    Image:          ${bad_img}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${kstub}/docker" "${kstub}/helm" "${kstub}/kubectl"
+  PATH="${kstub}:$PATH"
+  k8s_err="$(cmd_k8s_up 2>&1 1>/dev/null)"
+  k8s_rc=$?
+  ok=0
+  if (( k8s_rc == 0 )); then print "  (cmd_k8s_up returned 0 despite helm failing)"; ok=1; fi
+  if ! print -r -- "$k8s_err" | grep -q 'helm upgrade --install fishhawk failed'; then
+    print "  (stderr did not name the helm failure: $k8s_err)"; ok=1
+  fi
+  if ! print -r -- "$k8s_err" | grep -q 'ImagePullBackOff'; then
+    print "  (diagnostics did not run — no ImagePullBackOff in stderr: $k8s_err)"; ok=1
+  fi
+  if ! print -r -- "$k8s_err" | grep -qF -- "$bad_img"; then
+    print "  (diagnostics did not name the offending image: $k8s_err)"; ok=1
+  fi
+  rm -rf "$kstub"
+  exit $ok
+); then
+  pass "cmd_k8s_up: a failing helm names the failure, invokes hook diagnostics (ImagePullBackOff + image), and returns non-zero"
+else
+  fail "cmd_k8s_up should name the helm failure, invoke diagnostics, and fail non-zero when helm fails (see diagnostic above)"
+fi
+
 # 9c. cmd_k8s_down teardown: a genuine helm error must not be swallowed and
 # misreported as 'nothing to uninstall'. Only an absent release ('not found')
 # is a no-op; any other failure exits non-zero.

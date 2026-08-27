@@ -332,6 +332,36 @@ _k8s_healthz_url() {
   print "http://localhost:${port}/healthz"
 }
 
+# _k8s_dump_hook_diagnostics — on a helm failure, surface WHY. Helm blocks on a
+# hook resource until it is ready and reports only a --timeout on failure, hiding
+# an ImagePullBackOff on a hook pod. The minio bucket-bootstrap Job is a
+# post-install/post-upgrade HOOK, so a nonexistent mcImage tag turns into a
+# six-minute unexplained `helm upgrade` hang with no named cause (#2913). This
+# dumps Jobs + Pods to stderr, then for every pod NOT in a healthy state
+# describes it and, on an image-pull failure, prints a one-line named cause with
+# the offending image. Every kubectl is guarded with `|| true` so the diagnostic
+# path itself can never abort under `set -e` + the ZERR trap before the intended
+# error line and exit code run (#631).
+_k8s_dump_hook_diagnostics() {
+  print -u2 "hook/pod state (a hook Job that cannot pull its image reports only a Helm timeout):"
+  kubectl get jobs >&2 || true
+  kubectl get pods >&2 || true
+  # NB: `status` is a read-only special parameter in zsh (alias of $?), so the
+  # pod phase is read into pod_status, not status.
+  local name ready pod_status rest describe img
+  while IFS=$' \t' read -r name ready pod_status rest; do
+    [[ -n "$name" ]] || continue
+    case "$pod_status" in
+      Running|Completed|Succeeded) continue ;;
+    esac
+    describe="$(kubectl describe pod "$name" 2>/dev/null || true)"
+    if print -r -- "$describe" | grep -qE 'ImagePullBackOff|ErrImagePull'; then
+      img="$(print -r -- "$describe" | grep -E '^[[:space:]]*Image:' | head -1 | sed -E 's/^[[:space:]]*Image:[[:space:]]*//')"
+      print -u2 "  pod ${name}: image pull failed (ImagePullBackOff/ErrImagePull) for image ${img:-<unknown>}"
+    fi
+  done < <(kubectl get pods --no-headers 2>/dev/null || true)
+}
+
 # Poll <url> until fishhawkd <pid> answers GET /healthz, for up to <deadline>
 # seconds (default 10). Returns 0 on the first healthy response. Returns 1 early
 # if the process has already exited (kill -0 fails — spawn-then-die fails fast
@@ -1967,10 +1997,20 @@ cmd_k8s_up() {
   (cd "${REPO_ROOT}" && docker build --build-arg GIT_SHA="$(_dev_git_sha)" -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
 
   print "helm upgrade --install fishhawk..."
-  helm upgrade --install fishhawk "${REPO_ROOT}/deploy/helm/fishhawk" \
+  # Catch the helm failure ourselves: a hook Job whose pod cannot pull its image
+  # (the minio bucket-bootstrap Job is a post-install/post-upgrade HOOK) makes
+  # `helm upgrade` block until its --timeout and exit non-zero, reporting only a
+  # timeout with no named cause (#2913). Dump hook Job + pod state and name the
+  # image-pull reason before exiting, mirroring the rollout and /healthz legs'
+  # fail-loud contract below.
+  if ! helm upgrade --install fishhawk "${REPO_ROOT}/deploy/helm/fishhawk" \
     -f "${REPO_ROOT}/deploy/helm/fishhawk/values-local.yaml" \
     --set image.tag=dev-local \
-    --set image.pullPolicy=IfNotPresent
+    --set image.pullPolicy=IfNotPresent; then
+    print -u2 "error: helm upgrade --install fishhawk failed — a hook Job that cannot pull its image reports only a Helm timeout here"
+    _k8s_dump_hook_diagnostics
+    exit 1
+  fi
 
   print "waiting for rollout..."
   # Catch the rollout failure ourselves: a stuck/CrashLoopBackOff pod makes

@@ -463,8 +463,18 @@ external DB/S3). Each is a single-replica Deployment + `ReadWriteOnce`
 PVC + ClusterIP Service (`<fullname>-postgres` on 5432,
 `<fullname>-minio` on 9000/9001), plus a post-install/upgrade
 bucket-bootstrap Job (`minio.createBucket`) that retries
-`mc alias set` then `mc mb --ignore-existing` (the mc image pinned to
-the same `RELEASE.2025-01-20T14-49-07Z` tag as the server).
+`mc alias set` then `mc mb --ignore-existing`.
+
+`minio.mcImage` is pinned **independently** of `minio.image` — mc and
+the MinIO server are **not** co-versioned, so `minio/mc` has no tag for
+every `minio/minio` release, and the pin must name a tag that actually
+exists in the registry. Because the bucket Job is a Helm **hook**, a
+nonexistent tag surfaces only as a `helm upgrade` timeout (never a named
+`ImagePullBackOff`) — the class of failure #2913 reports.
+`scripts/test-helm-render` **r15** fail-closes the render gate on an
+unpublished third-party image tag, and `scripts/dev k8s` dumps hook Job
++ pod state (naming the pull reason) on a helm failure. Verify a new
+pin is pullable before bumping.
 
 When `postgres.enabled`, the fishhawkd Deployment gets an explicit
 container-level `FISHHAWKD_DATABASE_URL` env pointing at the in-cluster
@@ -539,7 +549,13 @@ the OAuth-trio positive + OFF posture (r10) and one case per named
 passthrough with its collision / identifier guards and an anti-drift
 loop pinning `fishhawk.managedConfigKeys` to the rendered ConfigMap
 (r12), a cross-boundary grep pinning the trio claim to `serve.go` (r13),
-and a render + lint of every profile. It **skips with a printed reason
+the GitLab family (r14), a **registry-existence check** over every
+third-party image the chart RENDERS (r15 — extracted from
+`helm template` output, classified by an anonymous Docker Hub
+registry-v2 manifest HEAD into exists/missing/indeterminate, fail-closed
+only on a definite 404 and guarded by a known-bad **sentinel** so an
+unreachable registry can never green the case), and a render + lint of
+every profile. It **skips with a printed reason
 and exits 0** when `helm` is absent from PATH, so a helm-less host is
 not red-lined; the cost is honest — on such a host the chart is
 unguarded, the same residual the zsh guard already accepts for
