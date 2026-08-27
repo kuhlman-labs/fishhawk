@@ -620,6 +620,13 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	// query, so N depends_on references to the same closed target cost ONE
 	// GetIssue (#2953).
 	stateCache := map[int]targetState{}
+	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// (`Depends on: #1639, #1639` — an untrusted body preserves every
+	// occurrence) yields AT MOST ONE edge in whichever slice it classifies into
+	// (#2953 condition 3). Keyed by (From,To); an unresolvable ref keys (From,0),
+	// so duplicate cross-repo tokens collapse too (they are indistinguishable
+	// To=0 unreadable entries).
+	seenEdge := map[[2]int]bool{}
 	for _, s := range subs {
 		children = append(children, workmgmt.EpicChild{
 			Number:   s.Number,
@@ -643,6 +650,10 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			URL:  s.URL,
 		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
+			if seenEdge[[2]int{s.Number, dep.Number}] {
+				continue // duplicate depends_on token: classify (From,To) once.
+			}
+			seenEdge[[2]int{s.Number, dep.Number}] = true
 			if dep.Resolvable && isChild[dep.Number] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep.Number})
 				continue
@@ -855,6 +866,10 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	// GetIssue (#2953). The in-set issue fetches below are separate (each named
 	// issue is fetched once via the inSet dedup already applied).
 	stateCache := map[int]targetState{}
+	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// (`Depends on: #1639, #1639`) yields AT MOST ONE edge in whichever slice it
+	// classifies into (#2953 condition 3) — the same guard EpicChildren applies.
+	seenEdge := map[[2]int]bool{}
 	for _, n := range numbers {
 		issue, err := p.api.GetIssue(ctx, scope, repo, n)
 		if err != nil {
@@ -871,6 +886,10 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
 		})
 		for _, dep := range parseDependsOnMarker(issue.Body) {
+			if seenEdge[[2]int{issue.Number, dep.Number}] {
+				continue // duplicate depends_on token: classify (From,To) once.
+			}
+			seenEdge[[2]int{issue.Number, dep.Number}] = true
 			if dep.Resolvable && inSet[dep.Number] {
 				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep.Number})
 				continue

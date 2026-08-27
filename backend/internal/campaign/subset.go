@@ -91,17 +91,24 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 		}
 	}
 
-	// Carry the provider-recorded satisfied (elided) edges through untouched,
-	// and seed a dedup set from them so an edge already recorded as satisfied is
-	// never re-added by the excluded-complete branch below (#2953 condition 3:
-	// an edge appears in SatisfiedEdges AT MOST ONCE). These inbound entries are
-	// for out-of-EPIC targets, disjoint from the excluded-CHILD elisions below,
-	// but the guard keeps the at-most-once invariant robust.
+	// Carry the provider-recorded satisfied (elided) edges through, DEDUPING by
+	// (From,To) as they are copied so a duplicate already present in the inbound
+	// slice collapses to one entry, and seed the same dedup set so an edge already
+	// recorded as satisfied is never re-added by the excluded-complete branch
+	// below (#2953 condition 3: an edge appears in SatisfiedEdges AT MOST ONCE).
+	// The provider now collapses duplicate depends_on tokens at the source, but
+	// deduping here too makes the at-most-once invariant hold for ANY inbound
+	// producer rather than relying on every producer to dedup first. These inbound
+	// entries are for out-of-EPIC targets, disjoint from the excluded-CHILD
+	// elisions below.
 	satisfied := make([]workmgmt.SatisfiedEdge, 0, len(res.SatisfiedEdges))
-	satisfied = append(satisfied, res.SatisfiedEdges...)
 	seenSatisfied := make(map[[2]int]struct{}, len(res.SatisfiedEdges))
 	for _, s := range res.SatisfiedEdges {
+		if _, dup := seenSatisfied[[2]int{s.From, s.To}]; dup {
+			continue
+		}
 		seenSatisfied[[2]int{s.From, s.To}] = struct{}{}
+		satisfied = append(satisfied, s)
 	}
 
 	// Re-partition the edges against the included set. Carry a pre-existing

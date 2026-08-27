@@ -37,6 +37,12 @@ func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) 
 			{Number: 42, Title: "slice B", Autonomy: "high"},
 		},
 		Edges: []DependsEdge{{From: 42, To: 41}},
+		// A closed-and-completed out-of-epic target the provider elided (#2953):
+		// the dispatch-carrying test below obtains it ONLY through the interface,
+		// so this proves SatisfiedEdges survives the cross-provider boundary.
+		SatisfiedEdges: []SatisfiedEdge{
+			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
+		},
 	}, nil
 }
 
@@ -245,22 +251,37 @@ func TestDropReasonWireValues(t *testing.T) {
 	}
 }
 
-// TestSatisfiedEdgeCarriedOnResult asserts the new SatisfiedEdges channel on
-// EpicChildrenResult carries the observed target state verbatim (#2953) — the
-// field campaign.Assemble passes through to the create-response satisfied_
-// dependencies block, so its shape is part of the cross-provider contract.
-func TestSatisfiedEdgeCarriedOnResult(t *testing.T) {
-	res := &EpicChildrenResult{
-		Children: []EpicChild{{Number: 2032}},
-		SatisfiedEdges: []SatisfiedEdge{
-			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
-		},
+// TestSatisfiedEdgeCarriedThroughDispatch drives the SatisfiedEdges channel
+// across the REAL registry dispatch seam (Register → Get → EpicChildrenQuerier
+// type-assertion → EpicChildren) rather than reading back a literal in place: a
+// registered provider PRODUCES the elided edge and the caller obtains it ONLY
+// through the interface, so the field must survive the cross-provider interface
+// boundary the campaign path relies on (#2953). It goes RED if EpicChildrenResult
+// or EpicChildrenQuerier ever stops carrying the observed target state — the
+// contract this package owns; the field-POPULATION logic is driven end to end in
+// the github provider tests (TestResolveDependenciesClosedCompletedTargetSatisfied).
+func TestSatisfiedEdgeCarriedThroughDispatch(t *testing.T) {
+	fp := &fakeProvider{name: "test_provider_satisfied_edge"}
+	Register(fp)
+	p, err := Get("test_provider_satisfied_edge")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	q, ok := p.(EpicChildrenQuerier)
+	if !ok {
+		t.Fatalf("provider does not implement EpicChildrenQuerier")
+	}
+	res, err := q.EpicChildren(context.Background(), EpicChildrenRequest{
+		Target: Target{Scope: forge.FromGitHubInstallationID(7), Repo: Repo{Owner: "o", Name: "r"}},
+		Epic:   "#2953",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
 	}
 	if len(res.SatisfiedEdges) != 1 {
-		t.Fatalf("SatisfiedEdges = %+v, want one entry", res.SatisfiedEdges)
+		t.Fatalf("SatisfiedEdges = %+v, want one carried through dispatch", res.SatisfiedEdges)
 	}
-	e := res.SatisfiedEdges[0]
-	if e.From != 2032 || e.To != 1639 || e.State != "closed" || e.StateReason != "completed" {
+	if e := res.SatisfiedEdges[0]; e != (SatisfiedEdge{From: 2032, To: 1639, State: "closed", StateReason: "completed"}) {
 		t.Errorf("SatisfiedEdge = %+v, want {2032 1639 closed completed}", e)
 	}
 }

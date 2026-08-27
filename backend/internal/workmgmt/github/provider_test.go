@@ -1303,6 +1303,116 @@ func TestEpicChildrenOutOfEpicTargetClassification(t *testing.T) {
 	})
 }
 
+// countEdges tallies how many times each (From,To) pair appears across a slice
+// of DependsEdge, so a test can assert AT-MOST-ONCE per pair.
+func countEdges(es []workmgmt.DependsEdge) map[[2]int]int {
+	m := map[[2]int]int{}
+	for _, e := range es {
+		m[[2]int{e.From, e.To}]++
+	}
+	return m
+}
+
+// countSatisfied tallies how many times each (From,To) pair appears across a
+// slice of SatisfiedEdge.
+func countSatisfied(es []workmgmt.SatisfiedEdge) map[[2]int]int {
+	m := map[[2]int]int{}
+	for _, e := range es {
+		m[[2]int{e.From, e.To}]++
+	}
+	return m
+}
+
+// TestResolveDependenciesDuplicateTokenCollapses pins #2953 condition 3 at the
+// no-epic provider path: an untrusted body carrying a REPEATED depends_on token
+// (`Depends on: #1639, #1639`) yields AT MOST ONE edge per (From,To) in whichever
+// slice it classifies into — satisfied, dropped, or in-set — never one entry per
+// occurrence. Before the dedup, parseDependsOnMarker preserved both occurrences
+// and the classify loop appended twice, doubling the visible elision/audit entry.
+//
+// COUNTERFACTUAL: delete the seenEdge guard in ResolveDependencies → each repeated
+// token appends again → every "want exactly 1" assertion below goes RED.
+func TestResolveDependenciesDuplicateTokenCollapses(t *testing.T) {
+	t.Run("repeated satisfied token → one SatisfiedEdge", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			2032: {Number: 2032, Title: "in-set", Body: "Depends on: #1639, #1639", State: "open"},
+			1639: {Number: 1639, Title: "done", State: "closed", StateReason: "completed"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		if got := countSatisfied(res.SatisfiedEdges); got[[2]int{2032, 1639}] != 1 || len(res.SatisfiedEdges) != 1 {
+			t.Fatalf("SatisfiedEdges = %+v, want exactly one 2032->1639", res.SatisfiedEdges)
+		}
+		// The memoized read also holds: the repeated token costs one GetIssue.
+		if got := api.getIssueCalls[1639]; got != 1 {
+			t.Errorf("GetIssue(#1639) called %d times, want exactly 1 (memoized)", got)
+		}
+	})
+	t.Run("repeated dropped token → one DroppedEdge", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			2032: {Number: 2032, Title: "in-set", Body: "Depends on: #1641, #1641", State: "open"},
+			1641: {Number: 1641, Title: "abandoned", State: "closed", StateReason: "not_planned"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		if got := countEdges(res.DroppedEdges); got[[2]int{2032, 1641}] != 1 || len(res.DroppedEdges) != 1 {
+			t.Fatalf("DroppedEdges = %+v, want exactly one 2032->1641", res.DroppedEdges)
+		}
+	})
+	t.Run("repeated in-set token → one Edge", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			100: {Number: 100, Title: "dep", Body: "no deps", State: "open"},
+			101: {Number: 101, Title: "leaf", Body: "Depends on: #100, #100", State: "open"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100", "101"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		if got := countEdges(res.Edges); got[[2]int{101, 100}] != 1 || len(res.Edges) != 1 {
+			t.Fatalf("Edges = %+v, want exactly one 101->100", res.Edges)
+		}
+	})
+}
+
+// TestEpicChildrenDuplicateTokenCollapses mirrors the duplicate-token dedup onto
+// the EPIC provider path (#2953 condition 3): a child body repeating a depends_on
+// token yields at most one edge per (From,To).
+//
+// COUNTERFACTUAL: delete the seenEdge guard in EpicChildren → the repeated token
+// doubles the SatisfiedEdges entry → this goes RED.
+func TestEpicChildrenDuplicateTokenCollapses(t *testing.T) {
+	res := epicChildrenResultBody(t, 43, "Depends on: #999, #999", map[int]*githubclient.Issue{
+		999: {Number: 999, Title: "done", State: "closed", StateReason: "completed"},
+	})
+	want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed"}
+	if got := countSatisfied(res.SatisfiedEdges); got[[2]int{43, 999}] != 1 || len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
+		t.Fatalf("SatisfiedEdges = %+v, want exactly one [%+v]", res.SatisfiedEdges, want)
+	}
+}
+
+// epicChildrenResultBody drives the REAL EpicChildren for a single child #from
+// with the given raw body and canned out-of-epic target issues.
+func epicChildrenResultBody(t *testing.T, from int, body string, targets map[int]*githubclient.Issue) *workmgmt.EpicChildrenResult {
+	t.Helper()
+	api := &fakeAPI{
+		parentNode:     "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{{Number: from, NodeID: "N", Title: "child", Body: body, State: "OPEN"}},
+		getIssues:      targets,
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	return res
+}
+
 // TestDependsOnMarker_RoundTrip asserts the render/parse helper pair is a
 // faithful round trip (the single-source-of-truth drift guard) and that an
 // empty ref list renders no marker.

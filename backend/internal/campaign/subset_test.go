@@ -162,6 +162,35 @@ func TestFilterToSubset_CarriesInboundSatisfiedEdgesAtMostOnce(t *testing.T) {
 	}
 }
 
+// TestFilterToSubset_DedupsInboundDuplicateSatisfiedEdges pins #2953 condition 3
+// at the CONSUMER boundary: even if a producer emits the SAME satisfied edge
+// twice in res.SatisfiedEdges, FilterToSubset carries it through exactly ONCE.
+// The provider now collapses duplicate depends_on tokens at the source, but the
+// consumer dedup makes the at-most-once invariant hold for ANY inbound producer.
+//
+// COUNTERFACTUAL: revert the inbound carry to `append(satisfied, res.SatisfiedEdges...)`
+// (no per-(From,To) dedup) → the duplicate survives → this goes RED.
+func TestFilterToSubset_DedupsInboundDuplicateSatisfiedEdges(t *testing.T) {
+	in := fullDAG()
+	// A producer-emitted duplicate of the SAME out-of-epic satisfied edge (From
+	// #101 is included in the subset below), plus a distinct one.
+	in.SatisfiedEdges = []workmgmt.SatisfiedEdge{
+		{From: 101, To: 1639, State: "closed", StateReason: "completed"},
+		{From: 101, To: 1639, State: "closed", StateReason: "completed"},
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:101"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	seen := map[[2]int]int{}
+	for _, s := range res.SatisfiedEdges {
+		seen[[2]int{s.From, s.To}]++
+	}
+	if seen[[2]int{101, 1639}] != 1 || len(res.SatisfiedEdges) != 1 {
+		t.Fatalf("SatisfiedEdges = %+v, want exactly one 101->1639 (inbound duplicate collapsed)", res.SatisfiedEdges)
+	}
+}
+
 // TestFilterToSubset_ExcludedTargetMissingFromChildren_FailsClosed covers the
 // defensive fallback (#2120): if an included item's depends_on edge points at a
 // number that is not in childByNumber at all (an unexpected state the provider
