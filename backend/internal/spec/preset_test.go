@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/bmatcuk/doublestar/v4"
 )
 
 // allPresets is the closed set the library ships.
@@ -422,5 +424,153 @@ func TestShippedPresetsCarryControlSurfaceStarters(t *testing.T) {
 func TestPresetBytesUnknown(t *testing.T) {
 	if _, err := PresetBytes(Preset("bogus")); err == nil {
 		t.Fatal("PresetBytes with unknown preset must error")
+	}
+}
+
+// --- the forge-neutral self-modification guard --------------------------------
+
+// forbiddenPathsOfImplement returns the implement stage's resolved
+// forbidden_paths list from a parsed preset. It fails LOUDLY — not
+// vacuously — when the implement stage, its constraints, or the
+// forbidden_paths kind is absent, so a preset that dropped the guard
+// entirely cannot silently satisfy an emptiness-tolerant assertion.
+//
+// workflow-v2 spells constraints as one OBJECT which the parser
+// normalizes into a one-element []Constraint (see the Constraint doc in
+// spec.go), so this walks the list rather than assuming index 0.
+func forbiddenPathsOfImplement(t *testing.T, p Preset) []string {
+	t.Helper()
+	s := parsePreset(t, p)
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatalf("preset %q has no feature_change workflow", p)
+	}
+	for _, st := range wf.Stages {
+		if st.ID != "implement" {
+			continue
+		}
+		if len(st.Constraints) == 0 {
+			t.Fatalf("preset %q implement stage declares no constraints", p)
+		}
+		for _, c := range st.Constraints {
+			if len(c.ForbiddenPaths) > 0 {
+				return c.ForbiddenPaths
+			}
+		}
+		t.Fatalf("preset %q implement stage declares no forbidden_paths constraint: %+v", p, st.Constraints)
+	}
+	t.Fatalf("preset %q has no implement stage", p)
+	return nil
+}
+
+// TestPresetsForbidBothForgeCIEntryPoints is the done-means assertion on
+// the PARSED constraint value (never a text substring, which would pass
+// on a commented-out entry): the shipped implement stage may not rewrite
+// its own executor configuration on EITHER forge. One assertion per
+// named failure mode, including the additive mode — the pre-existing
+// governance and legal entries must survive, so the change cannot have
+// rewritten the list instead of extending it.
+func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{"github entry point", ".github/workflows/**"},
+		{"gitlab entry point", ".gitlab-ci.yml"},
+		{"gitlab include fragments", ".gitlab/ci/**"},
+		{"additive: governance survived", ".fishhawk/**"},
+		{"additive: LICENSE survived", "LICENSE"},
+		{"additive: NOTICE survived", "NOTICE"},
+	} {
+		tc := tc
+		for _, p := range allPresets {
+			p := p
+			t.Run(string(p)+"/"+tc.mode, func(t *testing.T) {
+				got := forbiddenPathsOfImplement(t, p)
+				for _, entry := range got {
+					if entry == tc.want {
+						return
+					}
+				}
+				t.Errorf("preset %q implement forbidden_paths is missing %q (%s): %v", p, tc.want, tc.mode, got)
+			})
+		}
+	}
+}
+
+// forgeGuardMustBlock / forgeGuardMustNotBlock are the shipped-behavior
+// table: which repository paths the implement stage may not write, and
+// — the over-broad-pattern failure mode — which it must stay free to.
+//
+// The two .gitlab/ template rows and the nested sub/project row are
+// load-bearing, not decorative. The templates pin the ratified
+// `.gitlab/ci/**`-not-`.gitlab/**` breadth decision, so a later widening
+// fails here and must be re-decided explicitly rather than drifting in.
+// The nested row pins the root-anchoring claim the guard's residual
+// analysis rests on: a bare-filename pattern must NOT match a nested
+// path of the same name, because GitLab reads the pipeline definition
+// from the repository root and a nested file of that name executes
+// nothing.
+var (
+	forgeGuardMustBlock = []string{
+		".github/workflows/fishhawk.yml",
+		".gitlab-ci.yml",
+		".gitlab/ci/build.yml",
+		".gitlab/ci/nested/fragment.yml",
+		".fishhawk/workflows.yaml",
+		"LICENSE",
+		"NOTICE",
+	}
+	forgeGuardMustNotBlock = []string{
+		"backend/internal/spec/preset.go",
+		"docs/deploy/gitlab.md",
+		"site/src/content/docs/concepts/constraint.md",
+		".gitlab/issue_templates/bug.md",
+		".gitlab/merge_request_templates/default.md",
+		"sub/project/.gitlab-ci.yml",
+	}
+)
+
+// matchesAnyForbidden evaluates a path against a forbidden_paths list
+// with doublestar.PathMatch — the IDENTICAL call the runner's
+// enforcement makes in runner/internal/constraint/constraint.go
+// (checkForbidden), so the constraint VALUE declared in the spec
+// document is checked through the SAME matcher production enforces
+// with, rather than each side being assumed correct alone.
+func matchesAnyForbidden(t *testing.T, pats []string, path string) (bool, string) {
+	t.Helper()
+	for _, pat := range pats {
+		ok, err := doublestar.PathMatch(pat, path)
+		if err != nil {
+			t.Fatalf("doublestar.PathMatch(%q, %q): %v", pat, path, err)
+		}
+		if ok {
+			return true, pat
+		}
+	}
+	return false, ""
+}
+
+// TestPresetForbiddenPathsBlockBothForgeEntryPoints asserts the SHIPPED
+// OBSERVABLE BEHAVIOR of the guard — which files the implement stage is
+// actually refused — rather than the presence of an edited line. A
+// comment-only or no-op preset touch that satisfied the scope
+// completeness gate fails here.
+func TestPresetForbiddenPathsBlockBothForgeEntryPoints(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			pats := forbiddenPathsOfImplement(t, p)
+			for _, path := range forgeGuardMustBlock {
+				if ok, _ := matchesAnyForbidden(t, pats, path); !ok {
+					t.Errorf("MUST-BLOCK %q is not matched by any forbidden_paths pattern of preset %q: %v", path, p, pats)
+				}
+			}
+			for _, path := range forgeGuardMustNotBlock {
+				if ok, pat := matchesAnyForbidden(t, pats, path); ok {
+					t.Errorf("MUST-NOT-BLOCK %q is blocked by pattern %q of preset %q — the guard is over-broad", path, pat, p)
+				}
+			}
+		})
 	}
 }
