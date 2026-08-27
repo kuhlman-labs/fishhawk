@@ -1061,30 +1061,110 @@ func TestResolveDependenciesNilIssueRefuses(t *testing.T) {
 	}
 }
 
-// TestClassifyOutOfSetTargetInvalidRefFailsClosed pins operator condition 2: the
-// classifier calls GetIssue ONLY for a positive same-repo numeric target; a
-// non-positive number (an unparseable / cross-repo / owner-mismatch ref that
-// cannot be safely resolved) stamps DropTargetStateUnreadable WITHOUT any forge
-// call — calling GetIssue with the wrong target could read an unrelated issue's
-// state and FALSELY satisfy the edge.
+// TestClassifyOutOfSetTargetInvalidRefFailsClosed pins operator condition 2 at the
+// classifier unit boundary: the classifier calls GetIssue ONLY for a Resolvable
+// positive same-repo numeric target. An UNRESOLVABLE ref (a cross-repo /
+// owner-qualified / unparseable token) and a synthetic non-positive number both
+// stamp DropTargetStateUnreadable WITHOUT any forge call — calling GetIssue with a
+// locally-reduced/wrong target could read an unrelated issue's state and FALSELY
+// satisfy the edge. This is the UNIT half; the real cross-repo marker is driven
+// through both provider paths in TestResolveDependenciesCrossRepoRefFailsClosed /
+// TestEpicChildrenCrossRepoRefFailsClosed.
 //
-// COUNTERFACTUAL: delete the number<=0 guard → GetIssue is called with 0/negative
-// and this test's call-count assertion (zero calls) goes RED.
+// COUNTERFACTUAL (unresolvable arm): delete the `!ref.Resolvable` guard → an
+// unresolvable ref (Number 0) falls to the number<=0 guard, still no forge call,
+// so this unit test alone would stay green — which is exactly why the provider-path
+// tests below are load-bearing. COUNTERFACTUAL (number guard): delete the
+// number<=0 guard → GetIssue is called with 0/negative and the zero-call assertion
+// goes RED.
 func TestClassifyOutOfSetTargetInvalidRefFailsClosed(t *testing.T) {
 	api := &fakeAPI{}
 	repo := forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}
-	for _, n := range []int{0, -7} {
+	refs := []dependsOnRef{
+		{Resolvable: false},            // a cross-repo / unparseable ref.
+		{Number: 0, Resolvable: true},  // defensive: a resolvable-but-zero number.
+		{Number: -7, Resolvable: true}, // defensive: a resolvable-but-negative number.
+	}
+	for _, ref := range refs {
 		cache := map[int]targetState{}
-		ts, err := New(api).classifyOutOfSetTarget(context.Background(), forge.FromGitHubInstallationID(99), repo, n, cache)
+		ts, err := New(api).classifyOutOfSetTarget(context.Background(), forge.FromGitHubInstallationID(99), repo, ref, cache)
 		if err != nil {
-			t.Fatalf("classifyOutOfSetTarget(%d): %v", n, err)
+			t.Fatalf("classifyOutOfSetTarget(%+v): %v", ref, err)
 		}
 		if ts.satisfied || ts.reason != workmgmt.DropTargetStateUnreadable {
-			t.Errorf("classify(%d) = %+v, want unsatisfied DropTargetStateUnreadable", n, ts)
+			t.Errorf("classify(%+v) = %+v, want unsatisfied DropTargetStateUnreadable", ref, ts)
 		}
 	}
 	if len(api.getIssueCalls) != 0 {
-		t.Errorf("GetIssue called %v times, want ZERO for a non-positive ref (no forge read on an unresolvable target)", api.getIssueCalls)
+		t.Errorf("GetIssue called %v times, want ZERO for an unresolvable/non-positive ref (no forge read on an unresolvable target)", api.getIssueCalls)
+	}
+}
+
+// TestResolveDependenciesCrossRepoRefFailsClosed drives a REAL ResolveDependencies
+// provider path with an in-set item whose body carries a CROSS-REPO depends_on ref
+// (`Depends on: other/repo#1639`) where #1639 ALSO exists as a closed+completed
+// SAME-REPO issue. It is the load-bearing proof for the routed high+medium security
+// concerns and operator condition 2: the untrusted marker boundary must NOT reduce
+// the cross-repo token to the local number 1639 and read that unrelated issue's
+// state to falsely satisfy the edge. Asserts ZERO GetIssue(#1639), no SatisfiedEdge,
+// and a DropTargetStateUnreadable DroppedEdge from the depending item.
+//
+// COUNTERFACTUAL: revert parseDependsOnMarker to SKIP non-numeric tokens (the pre-
+// fixup behavior) → the cross-repo edge VANISHES → DroppedEdges empty → this goes
+// RED. Alternatively, make the parser extract 1639 from the cross-repo token →
+// GetIssue(#1639) is called and a SatisfiedEdge appears → also RED.
+func TestResolveDependenciesCrossRepoRefFailsClosed(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: other/repo#1639", State: "open"},
+		// A closed+completed SAME-REPO #1639: if the cross-repo token were reduced
+		// to 1639, the classifier would read THIS and wrongly satisfy the edge.
+		1639: {Number: 1639, Title: "unrelated same-repo issue", State: "closed", StateReason: "completed"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if got := api.getIssueCalls[1639]; got != 0 {
+		t.Errorf("GetIssue(#1639) called %d times, want ZERO (a cross-repo ref must not read the local #1639)", got)
+	}
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (a cross-repo ref is never satisfied)", res.SatisfiedEdges)
+	}
+	if len(res.DroppedEdges) != 1 ||
+		res.DroppedEdges[0].From != 2032 ||
+		res.DroppedEdges[0].Reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("DroppedEdges = %+v, want one {From:2032 DropTargetStateUnreadable}", res.DroppedEdges)
+	}
+}
+
+// TestEpicChildrenCrossRepoRefFailsClosed mirrors the cross-repo fail-closed proof
+// onto the EPIC provider path: a child whose body carries `Depends on: other/repo#999`
+// where #999 exists as a closed+completed same-repo issue must not read #999 and must
+// stamp DropTargetStateUnreadable. Same COUNTERFACTUALS as the ResolveDependencies twin.
+func TestEpicChildrenCrossRepoRefFailsClosed(t *testing.T) {
+	api := &fakeAPI{
+		parentNode:     "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{{Number: 43, NodeID: "N", Title: "c", Body: "Depends on: other/repo#999", State: "OPEN"}},
+		// closed+completed same-repo #999: a reduce-to-999 bug would satisfy on this.
+		getIssues: map[int]*githubclient.Issue{999: {Number: 999, State: "closed", StateReason: "completed"}},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if got := api.getIssueCalls[999]; got != 0 {
+		t.Errorf("GetIssue(#999) called %d times, want ZERO (a cross-repo ref must not read the local #999)", got)
+	}
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("SatisfiedEdges = %+v, want none (a cross-repo ref is never satisfied)", res.SatisfiedEdges)
+	}
+	if len(res.DroppedEdges) != 1 ||
+		res.DroppedEdges[0].From != 43 ||
+		res.DroppedEdges[0].Reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("DroppedEdges = %+v, want one {From:43 DropTargetStateUnreadable}", res.DroppedEdges)
 	}
 }
 
@@ -1234,12 +1314,32 @@ func TestDependsOnMarker_RoundTrip(t *testing.T) {
 		t.Errorf("render = %q", got)
 	}
 	body := "## Summary\n\nx\n\n" + renderDependsOnMarker([]string{"41", "#42"})
-	nums := parseDependsOnMarker(body)
-	if len(nums) != 2 || nums[0] != 41 || nums[1] != 42 {
-		t.Errorf("parse round trip = %v, want [41 42]", nums)
+	refs := parseDependsOnMarker(body)
+	if len(refs) != 2 ||
+		refs[0] != (dependsOnRef{Number: 41, Resolvable: true}) ||
+		refs[1] != (dependsOnRef{Number: 42, Resolvable: true}) {
+		t.Errorf("parse round trip = %+v, want two resolvable refs [41 42]", refs)
 	}
 	if parseDependsOnMarker("## Summary\n\nno marker here\n") != nil {
 		t.Errorf("parse of a body with no marker should be nil")
+	}
+	// A cross-repo / owner-qualified token is carried through UNRESOLVABLE, not
+	// silently dropped and not reduced to a local number (#2953, condition 2): so a
+	// cross-repo dependency fails the campaign closed rather than vanishing. An
+	// empty token (trailing comma) is skipped entirely.
+	mixed := parseDependsOnMarker("Depends on: #7, other/repo#1639, , owner/name#3")
+	want := []dependsOnRef{
+		{Number: 7, Resolvable: true},
+		{Resolvable: false},
+		{Resolvable: false},
+	}
+	if len(mixed) != len(want) {
+		t.Fatalf("parse of mixed marker = %+v, want %+v", mixed, want)
+	}
+	for i := range want {
+		if mixed[i] != want[i] {
+			t.Errorf("mixed[%d] = %+v, want %+v", i, mixed[i], want[i])
+		}
 	}
 }
 
