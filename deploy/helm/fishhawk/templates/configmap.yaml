@@ -100,6 +100,30 @@ data:
   {{- with .Values.singleTenant.provider }}
   FISHHAWKD_SINGLE_TENANT_PROVIDER: {{ . | quote }}
   {{- end }}
+  {{- /* GitLab NON-secret env (E45.32 / #2922). The three SECRET halves
+         (FISHHAWKD_GITLAB_TOKEN, _WEBHOOK_SECRET, _OAUTH_CLIENT_SECRET) are
+         records in fishhawk.secretKeySpec and arrive via the Secret, not here.
+         Unset keys stay unset. baseUrl ALONE is a supported login-gate posture
+         (group auto-join on the signing-in user's OAuth token); the OAuth trio
+         (oauthClientId/oauthCallbackUrl + the client secret) and the device leg
+         (deviceClientId, a SEPARATE non-Confidential application) are opt-in on
+         top. fishhawk.validateGitLabOAuthTrio mirrors fishhawkd's
+         resolveGitLabOAuth all-three-or-none + base-URL contract at render time. */}}
+  {{- with .Values.gitlab.baseUrl }}
+  FISHHAWKD_GITLAB_BASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gitlab.oauthClientId }}
+  FISHHAWKD_GITLAB_OAUTH_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gitlab.oauthCallbackUrl }}
+  FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gitlab.deviceClientId }}
+  FISHHAWKD_GITLAB_DEVICE_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gitlab.installationHostAllowlist }}
+  FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST: {{ . | quote }}
+  {{- end }}
   {{- /* config.extraEnv passthrough — any FISHHAWKD_* key the chart has no
          dedicated field for. Validated by fishhawk.validateExtraEnv (included
          from service.yaml): a collision with a chart-managed key or an invalid

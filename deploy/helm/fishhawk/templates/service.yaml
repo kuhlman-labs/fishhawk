@@ -15,8 +15,18 @@
        config.oauthCallbackUrl OR enable the ingress); once the callback is
        reachable it is SILENT and validateSecretContract owns the
        id-set-but-secret-missing case, so there is still one message per
-       condition, not two guards racing. */ -}}
+       condition, not two guards racing.
+
+       validateGitLabOAuthTrio (E45.32 / #2922) runs here too, after the GitHub
+       trio and BEFORE validateSecretContract, for the same reason: an operator
+       who sets only gitlab.oauthClientId has both an empty callback and (by the
+       derived requiredness of FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET) a missing
+       secret, so running the contract guard first would surface the missing
+       secret while hiding the more actionable callback/base-URL remedy. It
+       mirrors fishhawkd's resolveGitLabOAuth all-three-or-none rule plus its
+       base-URL requirement. */ -}}
 {{- include "fishhawk.validateOAuthTrio" . -}}
+{{- include "fishhawk.validateGitLabOAuthTrio" . -}}
 {{- include "fishhawk.validateSecretContract" . -}}
 {{- include "fishhawk.validateExtraEnv" . -}}
 apiVersion: v1

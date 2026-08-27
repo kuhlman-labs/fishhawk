@@ -125,6 +125,68 @@ mirrors that whole contract instead of encoding half of it:
   `values-single-tenant` ship a substitute-me client id (their enabled ingress
   derives the callback and their `existing` Secret carries the client secret).
 
+### GitLab ([E45.32 / #2922](https://github.com/kuhlman-labs/fishhawk/issues/2922))
+
+The chart wires the whole `FISHHAWKD_GITLAB_*` family so a chart-installed
+deployment can turn GitLab on. The **non-secret** half is a top-level `gitlab:`
+block (a profile-scoped family, sibling of `singleTenant:` / `cell:`), rendered
+into the ConfigMap; the **secret** half is three `fishhawk.secretKeySpec` records
+travelling the same secrets machinery in all three modes.
+
+| `gitlab.*` value | ConfigMap env | Notes |
+|---|---|---|
+| `baseUrl` | `FISHHAWKD_GITLAB_BASE_URL` | GitLab instance host. **Alone** is a supported login-gate posture (group auto-join on the signing-in user's OAuth token); also the host the browser sign-in redirect reaches |
+| `oauthClientId` | `FISHHAWKD_GITLAB_OAUTH_CLIENT_ID` | Confidential browser-sign-in application; the **enablement signal** for the trio |
+| `oauthCallbackUrl` | `FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL` | public URL of `/v0/auth/gitlab/callback`. **Explicit-only** — deliberately NOT derived from the ingress (an ungated derivation would give every ingress-enabled GitHub-only install a non-empty GitLab callback and fire the id-empty guard spuriously) |
+| `deviceClientId` | `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` | a **SEPARATE, non-Confidential** application for the RFC 8628 device flow (`fishhawk token login --provider gitlab`), with **no fallback** to `oauthClientId` (`serve.go`, E66.4 / #2392) |
+| `installationHostAllowlist` | `FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST` | Mode-2 per-installation base-URL host allowlist; genuinely non-secret, so the ConfigMap is correct for it |
+
+| `secrets.values` field | Secret key | Required when |
+|---|---|---|
+| `gitlabToken` | `FISHHAWKD_GITLAB_TOKEN` | **never** — supplied-or-not |
+| `gitlabWebhookSecret` | `FISHHAWKD_GITLAB_WEBHOOK_SECRET` | **never** — supplied-or-not |
+| `gitlabOauthClientSecret` | `FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET` | `gitlab.oauthClientId` is set |
+
+The three credentials go through the **Secret** in every mode
+(`secrets.values.gitlab*` in `chartManaged`, `secrets.externalSecrets.data[]` in
+`externalSecrets`, the pre-created Secret in `existing`) — **never**
+`config.extraEnv`, whose suffix guard refuses any key ending in `_SECRET` /
+`_TOKEN` by design (#2915).
+
+Why the token and webhook secret are **never** required: `serve.go` WARNS and
+leaves the gitlab forge/work-item provider disabled (`501`) on a
+base-URL-without-token config rather than refusing, and documents base-URL-alone
+as a supported login-gate posture; the webhook receiver is inert without a
+secret. Mandating either would refuse every GitHub-only deploy — the #2915 shape
+#2922 asks us not to repeat (mandating one half of a trio the chart cannot
+complete). Only the OAuth client secret is required, and only when the client id
+is set (the same derived requiredness the GitHub client secret uses).
+
+**`fishhawk.validateGitLabOAuthTrio`** (included from `service.yaml`, after the
+GitHub trio and before `validateSecretContract`) mirrors fishhawkd's own
+`resolveGitLabOAuth` contract — all-three-or-none PLUS the base-URL requirement —
+failing the render on every OBSERVABLE partial combination. Branches, in
+evaluation order (helm `fail` halts at the first match):
+
+1. `gitlab.oauthClientId` set + `gitlab.oauthCallbackUrl` empty → names the
+   explicit-callback route and states the chart does **not** derive it from the
+   ingress.
+2. `gitlab.oauthCallbackUrl` set + `gitlab.oauthClientId` empty.
+3. a GitLab OAuth client secret OBSERVABLY supplied + `gitlab.oauthClientId`
+   empty (`chartManaged` reads `secrets.values.gitlabOauthClientSecret`;
+   `externalSecrets` reads `data[]`; `existing` leaves the secret half UNKNOWN).
+4. `gitlab.oauthClientId` set + `gitlab.baseUrl` empty → the extra refusal
+   fishhawkd makes (no host to send the OAuth redirect to).
+
+The id-set-but-secret-missing case is produced by `validateSecretContract` via
+the derived requiredness above — one message per condition, not two guards
+racing.
+
+**Residual (honest):** the chart makes GitLab **configurable**; a GitLab repo
+still cannot produce a run until an `installations` row exists
+(`gitLabProjectRegistry`, `serve.go`), which has no CLI or API route today — the
+separate onboarding gap #2922 itself flags.
+
 ## Secrets ([#849](https://github.com/kuhlman-labs/fishhawk/issues/849))
 
 Sensitive env arrives via `envFrom` `secretRef` whose name is resolved
@@ -172,6 +234,9 @@ env-keyed map had no home for it and silently left it unvalidated.
 | `secrets.githubApp.privateKeyFile.secretKey` (dotted, default `github-app-private-key.pem`) | `githubAppPrivateKey` | **file** (projected volume) | `secrets.githubApp.privateKeyFile.enabled` |
 | `FISHHAWKD_HANDOFF_SECRET` | `handoffSecret` | env | `cell.homeRegion` is set |
 | `FISHHAWKD_MODEL_API_KEY` | `modelApiKey` | env | `cell.modelBaseUrl` is set |
+| `FISHHAWKD_GITLAB_TOKEN` | `gitlabToken` | env | **never** (see "GitLab") |
+| `FISHHAWKD_GITLAB_WEBHOOK_SECRET` | `gitlabWebhookSecret` | env | **never** (see "GitLab") |
+| `FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET` | `gitlabOauthClientSecret` | env | `gitlab.oauthClientId` is set |
 
 Requiredness is **derived**, not hardcoded. A blanket "always required"
 would break the local profile: in-cluster Postgres supplies
@@ -607,6 +672,15 @@ helm template fishhawk deploy/helm/fishhawk --set secrets.mode=existing --set ex
 # confirm the OAuth trio guard fails each partial combination (all-three-or-none):
 helm template fishhawk deploy/helm/fishhawk --set config.oauthClientId=cid   # id without a callback
 helm template fishhawk deploy/helm/fishhawk --set config.oauthCallbackUrl=https://x/cb   # callback without an id
+# confirm the GitLab OAuth trio guard mirrors resolveGitLabOAuth (all-three-or-none + base URL):
+helm template fishhawk deploy/helm/fishhawk --set gitlab.baseUrl=https://gl.x --set gitlab.oauthClientId=cid   # id without a callback
+helm template fishhawk deploy/helm/fishhawk --set gitlab.oauthClientId=cid --set gitlab.oauthCallbackUrl=https://x/cb   # id without a base URL
+# GitLab is off by default (GitHub-only emits zero GitLab keys); a complete config renders all of them:
+helm template fishhawk deploy/helm/fishhawk | grep -c FISHHAWKD_GITLAB_   # → 0
+helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-local.yaml \
+  --set gitlab.baseUrl=https://gl.x --set gitlab.oauthClientId=cid \
+  --set gitlab.oauthCallbackUrl=https://gl.x/v0/auth/gitlab/callback \
+  --set secrets.values.gitlabOauthClientSecret=s | grep FISHHAWKD_GITLAB_
 # confirm the extraEnv guards fire on a collision and an invalid identifier:
 helm template fishhawk deploy/helm/fishhawk --set config.extraEnv.FISHHAWKD_ADDR=x   # collides
 helm template fishhawk deploy/helm/fishhawk --set config.extraEnv.9bad=x              # invalid identifier
