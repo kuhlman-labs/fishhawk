@@ -99,6 +99,19 @@ func resolveSharedMinIO() sharedMinIOState {
 	return sharedMinIO
 }
 
+// finalExitCode is TestMain's exit-code policy for a shared-container
+// termination failure (item A, #2948). A cleanup failure is SURFACED on stderr
+// by the caller but MUST NOT escalate a passing suite to a failure: otherwise a
+// transient Docker hiccup during Terminate turns tracestore red, which turns
+// `scripts/test verify` red, which discards an unrelated package's local fix-up
+// — the exact class of failure this issue exists to eliminate (done-means 2). So
+// the suite's own exit code is returned unchanged regardless of terminateErr; a
+// leaked container is made observable by the stderr line, not by the exit code.
+func finalExitCode(testCode int, terminateErr error) int {
+	_ = terminateErr // reported on stderr by the caller; never escalates the code.
+	return testCode
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	// Terminate the shared container using a FRESH context — the 90s start
@@ -109,18 +122,14 @@ func TestMain(m *testing.M) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := sharedMinIO.container.Terminate(ctx)
 		cancel()
-		// Do not silently discard a termination failure: with Ryuk disabled
-		// (scripts/test sets TESTCONTAINERS_RYUK_DISABLED=true) nothing else
-		// reaps this container, so a failed Terminate leaks an orphan. Report it
-		// on stderr and, if the tests themselves passed, fail the package so the
-		// leak is observable rather than hidden behind a green suite. A pre-
-		// existing test failure keeps its exit code.
+		// Surface a possible orphan on stderr: with Ryuk disabled (scripts/test
+		// sets TESTCONTAINERS_RYUK_DISABLED=true) nothing else reaps this
+		// container, so a failed Terminate leaks one. Reporting only — the exit
+		// code is decided by finalExitCode, which deliberately does NOT escalate.
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tracestore: shared MinIO container terminate failed (possible orphan): %v\n", err)
-			if code == 0 {
-				code = 1
-			}
 		}
+		code = finalExitCode(code, err)
 	}
 	os.Exit(code)
 }
@@ -534,6 +543,26 @@ func flattenStrategies(s wait.Strategy) []wait.Strategy {
 	return []wait.Strategy{s}
 }
 
+// strategyResolvesPort reports whether a leaf wait strategy resolves the
+// published port mapping (retries MappedPort until it appears — the #2948 fix).
+// A *wait.HostPortStrategy always does. A *wait.HTTPStrategy does so ONLY when it
+// carries a port: a portless HTTP wait probes a default port and is NOT proof
+// the published mapping resolved, so counting it would let a portless HTTP wait
+// satisfy the requirement vacuously. This is the guard counterfactual (b)
+// reverts; it is shared by the main test and the portless-HTTP sub-case so a
+// revert to an unconditional `havePort = true` reddens the sub-case (item B).
+func strategyResolvesPort(s wait.Strategy) bool {
+	switch v := s.(type) {
+	case *wait.HostPortStrategy:
+		return v.Port != ""
+	case *wait.HTTPStrategy:
+		// nat.Port.Port() returns "" for a zero-value (no port set).
+		return v.Port.Port() != ""
+	default:
+		return false
+	}
+}
+
 // TestMinioRunOptions_IncludeAPortResolvingWait is the done-means test: the
 // change's correctness is configuration, not compilation, so presence-of-touch
 // proves nothing. It pre-seeds req.WaitingFor with a log-only stand-in, applies
@@ -542,6 +571,17 @@ func flattenStrategies(s wait.Strategy) []wait.Strategy {
 // the replacing WithWaitStrategy(wait.ForLog(...)) drops the seeded strategy and
 // fails here, which is what makes counterfactual (i) meaningful. It needs no
 // Docker, so it runs everywhere including CI.
+//
+// The portless-HTTP sub-case pins the strategyResolvesPort guard (item B, #2948).
+// Counterfactual (b) — reverting that guard's HTTPStrategy arm to an
+// unconditional `return true` — observed RED:
+//
+//	--- FAIL: TestMinioRunOptions_IncludeAPortResolvingWait/portless_HTTP_wait_does_not_satisfy_the_port_requirement (0.00s)
+//	    s3_test.go:670: a portless HTTP wait must not count as port-resolving; the guard v.Port.Port() != "" was bypassed
+//
+// The parent test's own assertions stayed GREEN under that revert (the shipped
+// config carries no portless HTTP wait), which is exactly why the sub-case is
+// required to make the guard falsifiable.
 func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 	const seededLog = "seeded-log-sentinel"
 	req := testcontainers.GenericContainerRequest{
@@ -563,31 +603,13 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 
 	var haveSeededLog, havePort, haveNonSeededLog bool
 	for _, s := range strategies {
-		switch v := s.(type) {
-		case *wait.LogStrategy:
-			if v.Log == seededLog {
-				haveSeededLog = true
-			} else {
-				haveNonSeededLog = true
-			}
-		case *wait.HostPortStrategy:
-			if v.Port != "" {
-				havePort = true
-			}
-			haveNonSeededLog = true
-		case *wait.HTTPStrategy:
-			// An HTTP wait resolves a mapped port before probing ONLY when it
-			// carries one, so require a non-empty Port before counting it as
-			// port-resolving. A portless HTTP wait would probe the default port
-			// and is NOT proof the published mapping resolved — counting it would
-			// let a portless HTTP strategy satisfy the assertion vacuously.
-			// network.Port.Port() returns "" for a zero-value (no port set).
-			if v.Port.Port() != "" {
-				havePort = true
-			}
-			haveNonSeededLog = true
-		default:
-			haveNonSeededLog = true
+		if lg, ok := s.(*wait.LogStrategy); ok && lg.Log == seededLog {
+			haveSeededLog = true
+			continue
+		}
+		haveNonSeededLog = true
+		if strategyResolvesPort(s) {
+			havePort = true
 		}
 	}
 
@@ -600,6 +622,57 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 	if !haveNonSeededLog {
 		t.Error("wait strategy set is log-only; the port-mapping wait was dropped")
 	}
+
+	// Sub-case (item B, #2948): a PORTLESS HTTP wait must NOT count as
+	// port-resolving. The shipped configuration contains no portless HTTP wait,
+	// so the strategyResolvesPort guard is otherwise unfalsifiable and a revert
+	// to an unconditional true would redden no test. Seed a portless
+	// wait.ForHTTP("/health") ALONGSIDE the log strategy, apply the shipped
+	// options, and assert the port requirement is satisfied by the
+	// ForListeningPort HostPortStrategy — never by the portless HTTP wait.
+	t.Run("portless HTTP wait does not satisfy the port requirement", func(t *testing.T) {
+		req := testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Env: map[string]string{},
+				WaitingFor: wait.ForAll(
+					wait.ForLog(seededLog),
+					wait.ForHTTP("/health"),
+				),
+			},
+		}
+		for _, opt := range minioRunOptions() {
+			if err := opt.Customize(&req); err != nil {
+				t.Fatalf("customize: %v", err)
+			}
+		}
+
+		var portFromHostPort, sawPortlessHTTP, portlessHTTPResolvesPort bool
+		for _, s := range flattenStrategies(req.WaitingFor) {
+			switch v := s.(type) {
+			case *wait.HostPortStrategy:
+				if strategyResolvesPort(s) {
+					portFromHostPort = true
+				}
+			case *wait.HTTPStrategy:
+				if v.Port.Port() == "" {
+					sawPortlessHTTP = true
+					if strategyResolvesPort(s) {
+						portlessHTTPResolvesPort = true
+					}
+				}
+			}
+		}
+
+		if !sawPortlessHTTP {
+			t.Fatal("fixture lost the seeded portless HTTP wait; the assertion would be vacuous")
+		}
+		if portlessHTTPResolvesPort {
+			t.Error(`a portless HTTP wait must not count as port-resolving; the guard v.Port.Port() != "" was bypassed`)
+		}
+		if !portFromHostPort {
+			t.Error("expected the ForListeningPort HostPortStrategy to satisfy the port requirement")
+		}
+	})
 }
 
 // TestMinioSkipReason asserts one case per named branch of the fail-soft
@@ -699,4 +772,31 @@ func TestMinioSkipReason(t *testing.T) {
 			t.Errorf("plain error must not skip; got reason %q", reason)
 		}
 	})
+}
+
+// TestFinalExitCode_TerminateFailureDoesNotEscalate pins item A (#2948): a
+// shared-container termination failure must NOT turn a passing suite red, so a
+// transient Docker cleanup hiccup cannot discard an unrelated package's fix-up.
+//
+// Counterfactual (a) — restoring the escalation inside finalExitCode:
+//
+//	func finalExitCode(testCode int, terminateErr error) int {
+//	    if terminateErr != nil && testCode == 0 { return 1 }
+//	    return testCode
+//	}
+//
+// observed RED:
+//
+//	--- FAIL: TestFinalExitCode_TerminateFailureDoesNotEscalate (0.00s)
+//	    s3_test.go:794: terminate failure must not escalate a passing suite: got exit 1, want 0
+func TestFinalExitCode_TerminateFailureDoesNotEscalate(t *testing.T) {
+	if got := finalExitCode(0, errors.New("terminate boom")); got != 0 {
+		t.Errorf("terminate failure must not escalate a passing suite: got exit %d, want 0", got)
+	}
+	if got := finalExitCode(1, nil); got != 1 {
+		t.Errorf("existing failure code must be preserved: got %d, want 1", got)
+	}
+	if got := finalExitCode(2, errors.New("terminate boom")); got != 2 {
+		t.Errorf("existing failure code must survive a concurrent terminate error: got %d, want 2", got)
+	}
 }
