@@ -825,6 +825,34 @@ assert_render_fails "r11f just-client-id message names the ingress-derivation ro
 assert_absent "r11f the secret-contract message did NOT pre-empt the callback remedy" "$err" \
   "requires a non-empty secrets.values.oauthClientSecret"
 
+# r11g THE EXPLICIT-NULL OAUTH-OFF EDGE (untested-edge concern, #2915). An
+# operator who writes `config.oauthClientId: null` (or `--set config.oauthClientId=null`)
+# means OAuth OFF — the same posture configmap.yaml and fishhawk.oauthCallbackUrl
+# already give a null id. Without the `| default ""` normalization in
+# fishhawk.secretKeySpec + fishhawk.validateOAuthTrio, `toString nil` is "<nil>",
+# which reads as OAuth-ON: the client secret is marked required and validateOAuthTrio
+# branch (i) fires, so the render FAILS on a secret nothing emits. With it the
+# render succeeds and NO client-id key is emitted. Deleting either `| default ""`
+# reddens this case.
+cat > "$tmproot/r11g.yaml" <<'YAML'
+profile: local
+config:
+  oauthClientId: null
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11g.yaml"
+assert_render_ok "r11g explicit-null oauthClientId is treated as OAuth-off and renders (no secret required, trio silent)"
+render -f "$tmproot/r11g.yaml" --show-only templates/configmap.yaml
+assert_field_absent "r11g explicit-null oauthClientId emits no FISHHAWKD_OAUTH_CLIENT_ID" "$out" "FISHHAWKD_OAUTH_CLIENT_ID"
+
 # ---------------------------------------------------------------------------
 # r12 — config.extraEnv passthrough + its three guards + the ANTI-DRIFT loop.
 # ---------------------------------------------------------------------------

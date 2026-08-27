@@ -332,11 +332,16 @@ fishhawk.validateSecretContract (validates against it), NOTES.txt (prints it).
        OAuth is off, the secret is genuinely not needed, and hardcoding required
        here would refuse every OAuth-off deploy. fishhawk.validateOAuthTrio
        covers the OTHER partial combinations. */ -}}
+{{- /* `| default ""` normalizes an explicitly-null config.oauthClientId to "":
+       `toString nil` is the literal "<nil>", which `ne … ""` would misread as a
+       supplied id and mark the secret required, while configmap.yaml and
+       fishhawk.oauthCallbackUrl treat the same null as unset — an inconsistent
+       OAuth-off edge that fails the render on a secret nothing emits. */ -}}
 {{- $records = append $records (dict
       "secretKey" "FISHHAWKD_OAUTH_CLIENT_SECRET"
       "valuesField" "oauthClientSecret"
       "envDelivered" true
-      "required" (ne (toString $v.config.oauthClientId) "")) -}}
+      "required" (ne (toString ($v.config.oauthClientId | default "")) "")) -}}
 {{- $records = append $records (dict
       "secretKey" "FISHHAWKD_ANTHROPIC_API_KEY"
       "valuesField" "anthropicApiKey"
@@ -527,7 +532,10 @@ produce it with its existing message, so there is one message per condition
 rather than two guards racing.
 */}}
 {{- define "fishhawk.validateOAuthTrio" -}}
-{{- $id := toString .Values.config.oauthClientId -}}
+{{- /* `| default ""` normalizes an explicitly-null config.oauthClientId to "":
+       `toString nil` is "<nil>", which would read as OAuth-ON and fire branch (i)
+       for an id that configmap.yaml / fishhawk.oauthCallbackUrl treat as unset. */ -}}
+{{- $id := toString (.Values.config.oauthClientId | default "") -}}
 {{- $cb := include "fishhawk.oauthCallbackUrl" . -}}
 {{- $secret := false -}}
 {{- $mode := .Values.secrets.mode -}}
