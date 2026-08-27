@@ -2,9 +2,11 @@
 //
 // Subcommands:
 //
-//	fishhawkd serve          start the HTTP server (default if no subcommand)
-//	fishhawkd migrate up     apply pending DB migrations
-//	fishhawkd migrate down   roll back the most recent migration (dev only)
+//	fishhawkd serve                 start the HTTP server (default if no subcommand)
+//	fishhawkd migrate up            apply pending DB migrations
+//	fishhawkd migrate down          roll back the most recent migration (dev only)
+//	fishhawkd account create|list   register / inventory tenancy accounts (GitLab authz gate)
+//	fishhawkd installation register|list  register / inventory installations (GitLab authz gate)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -42,6 +44,10 @@ func run(args []string, logSink io.Writer) int {
 		return runAuditRehash(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
+	case "account":
+		return runAccount(rest, logSink)
+	case "installation":
+		return runInstallation(rest, logSink)
 	case "-h", "--help", "help":
 		printUsage(logSink)
 		return exitOK
@@ -67,15 +73,19 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation] [flags]",
 		"",
 		"Subcommands:",
-		"  serve         Run the HTTP server (default).",
-		"  migrate up    Apply pending DB migrations.",
-		"  migrate down  Roll back the most recent migration (dev only).",
-		"  audit-rehash  Rewrite audit_entries.entry_hash with the canonical algorithm (#302).",
-		"  token issue   Mint a bootstrap API token for an identity.",
-		"  token migrate Promote pre-#526 operator tokens to the current default scope set.",
+		"  serve                  Run the HTTP server (default).",
+		"  migrate up             Apply pending DB migrations.",
+		"  migrate down           Roll back the most recent migration (dev only).",
+		"  audit-rehash           Rewrite audit_entries.entry_hash with the canonical algorithm (#302).",
+		"  token issue            Mint a bootstrap API token for an identity.",
+		"  token migrate          Promote pre-#526 operator tokens to the current default scope set.",
+		"  account create         Register a tenancy account (the GitLab run-creation authorization gate).",
+		"  account list           Inventory registered tenancy accounts.",
+		"  installation register  Register an installation under an account (the GitLab authorization gate).",
+		"  installation list      Inventory registered installations with their owning account_key.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}

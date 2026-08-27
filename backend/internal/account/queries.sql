@@ -60,6 +60,14 @@ SELECT * FROM accounts
  WHERE account_key = $1
  ORDER BY provider ASC;
 
+-- name: ListAccounts :many
+-- The operator inventory read behind `fishhawkd account list` (E45.33 / #2923):
+-- every registered account in stable (provider, account_key) order. No filter —
+-- the CLI filters by --provider in Go so one query serves both the unfiltered
+-- and provider-scoped forms. Supports the auth-change checklist's impact
+-- inventory: list what exists before tightening anything.
+SELECT * FROM accounts ORDER BY provider ASC, account_key ASC;
+
 -- name: PinAccountHomeRegion :one
 -- The cell-side region pin (ADR-062 A2.3, E44.7 / #1831). First-write-wins is
 -- enforced HERE, in SQL, rather than as a check-then-act read/write pair in Go:
@@ -95,6 +103,19 @@ RETURNING *;
 
 -- name: GetInstallationByRef :one
 SELECT * FROM installations WHERE provider = $1 AND installation_ref = $2;
+
+-- name: ListInstallations :many
+-- The operator inventory read behind `fishhawkd installation list` (E45.33 /
+-- #2923): every registered installation JOINed with its owning account's
+-- account_key, so the operator's real question — which project is registered
+-- under which namespace — is answered in one row. EXPLICIT column list (not
+-- i.*) so the joined account_key is carried and the scan order is pinned. Supports
+-- the auth-change checklist's impact-inventory habit: list what exists before
+-- tightening anything.
+SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.created_at, i.updated_at, a.account_key
+  FROM installations i
+  JOIN accounts a ON a.id = i.account_id
+ ORDER BY i.provider ASC, i.installation_ref ASC;
 
 -- name: UpsertAccountMember :one
 -- Idempotent create-or-update keyed on (account_id, provider, member_ref).

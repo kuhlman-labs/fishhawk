@@ -36,6 +36,39 @@ func TestRun_UnknownSubcommand(t *testing.T) {
 	}
 }
 
+// TestRun_AccountInstallationDispatch pins that the two new subcommands are
+// dispatched to their own usage path (not the top-level `unknown subcommand`
+// error): a bare `account` / `installation` reaches its own usage banner.
+func TestRun_AccountInstallationDispatch(t *testing.T) {
+	for _, cmd := range []string{"account", "installation"} {
+		t.Run(cmd, func(t *testing.T) {
+			var out strings.Builder
+			got := run([]string{cmd}, &out)
+			if got != exitUsage {
+				t.Fatalf("run(%s) exit = %d, want %d", cmd, got, exitUsage)
+			}
+			if strings.Contains(out.String(), "unknown subcommand") && !strings.Contains(out.String(), cmd+":") {
+				t.Errorf("run(%s) hit the top-level unknown-subcommand path, want the %s usage banner: %s", cmd, cmd, out.String())
+			}
+			if !strings.Contains(out.String(), "Usage: fishhawkd "+cmd) {
+				t.Errorf("run(%s) output missing the %s usage line: %s", cmd, cmd, out.String())
+			}
+		})
+	}
+}
+
+// TestPrintUsage_NamesNewSubcommands asserts the banner advertises the account
+// and installation subcommands.
+func TestPrintUsage_NamesNewSubcommands(t *testing.T) {
+	var out strings.Builder
+	printUsage(&out)
+	for _, want := range []string{"account create", "account list", "installation register", "installation list"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("printUsage output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
 func TestRun_ServeBadFlag(t *testing.T) {
 	if got := run([]string{"serve", "--no-such-flag"}, io.Discard); got != exitFailure {
 		t.Errorf("run(serve --no-such-flag) = %d, want %d", got, exitFailure)

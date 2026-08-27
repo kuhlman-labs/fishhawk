@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const getAccount = `-- name: GetAccount :one
@@ -104,6 +105,98 @@ func (q *Queries) GetInstallationByRef(ctx context.Context, arg GetInstallationB
 		&i.OauthBaseUrl,
 	)
 	return i, err
+}
+
+const listAccounts = `-- name: ListAccounts :many
+SELECT id, provider, account_key, display_name, granularity, home_region, created_at, updated_at FROM accounts ORDER BY provider ASC, account_key ASC
+`
+
+// The operator inventory read behind ` + "`fishhawkd account list`" + ` (E45.33 / #2923):
+// every registered account in stable (provider, account_key) order. No filter —
+// the CLI filters by --provider in Go so one query serves both the unfiltered
+// and provider-scoped forms. Supports the auth-change checklist's impact
+// inventory: list what exists before tightening anything.
+func (q *Queries) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := q.db.Query(ctx, listAccounts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Account
+	for rows.Next() {
+		var i Account
+		if err := rows.Scan(
+			&i.ID,
+			&i.Provider,
+			&i.AccountKey,
+			&i.DisplayName,
+			&i.Granularity,
+			&i.HomeRegion,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listInstallations = `-- name: ListInstallations :many
+SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.created_at, i.updated_at, a.account_key
+  FROM installations i
+  JOIN accounts a ON a.id = i.account_id
+ ORDER BY i.provider ASC, i.installation_ref ASC
+`
+
+type ListInstallationsRow struct {
+	ID              uuid.UUID          `json:"id"`
+	AccountID       uuid.UUID          `json:"account_id"`
+	Provider        string             `json:"provider"`
+	InstallationRef string             `json:"installation_ref"`
+	ForgeBaseUrl    *string            `json:"forge_base_url"`
+	OauthBaseUrl    *string            `json:"oauth_base_url"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AccountKey      string             `json:"account_key"`
+}
+
+// The operator inventory read behind ` + "`fishhawkd installation list`" + ` (E45.33 /
+// #2923): every registered installation JOINed with its owning account's
+// account_key, so the operator's real question — which project is registered
+// under which namespace — is answered in one row. EXPLICIT column list (not
+// i.*) so the joined account_key is carried and the scan order is pinned.
+func (q *Queries) ListInstallations(ctx context.Context) ([]ListInstallationsRow, error) {
+	rows, err := q.db.Query(ctx, listInstallations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListInstallationsRow
+	for rows.Next() {
+		var i ListInstallationsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Provider,
+			&i.InstallationRef,
+			&i.ForgeBaseUrl,
+			&i.OauthBaseUrl,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.AccountKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listAccountMembers = `-- name: ListAccountMembers :many

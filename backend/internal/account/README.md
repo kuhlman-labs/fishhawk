@@ -215,3 +215,70 @@ account actually admits a member — real bootstrap, then the real
 (`TestMembershipResolver_AdmitsViaSingleTenantBootstrap`, plus a
 non-matching-granularity negative twin). Operator guide:
 `docs/deploy/self-hosted.md`.
+
+## Operator registry surface (`registry.go`, E45.33 / #2923)
+
+`registry.go` is the multi-tenant analog of the single-tenant bootstrap: the
+supported write path for the `accounts` / `installations` rows that GitLab run
+creation is authorization-gated on. `gitLabProjectRegistry.AuthorizedGitLabProject`
+(`backend/cmd/fishhawkd/serve.go`) admits a GitLab trigger only when an
+`installations` row (provider `gitlab`, `installation_ref` `gitlab:<project-id>`)
+resolves to an `accounts` row whose `account_key` equals the project path's
+namespace segment — yet `UpsertInstallation` / `UpsertAccount` had no production
+caller, so operators were reduced to hand-written SQL. `CreateAccount` /
+`RegisterInstallation` back the `fishhawkd account create|list` /
+`installation register|list` subcommands (`backend/cmd/fishhawkd/`), which stay
+thin flag-parsing shells over this domain surface so the logic is unit-testable
+against the `RegistryQueries` fake.
+
+Both validation vocabularies are reused from `singletenant.go`: `accountProviders`
+/ `accountGranularities` (the `accounts_provider_check` /
+`accounts_granularity_check` mirrors) are now package-scoped and shared, so the
+constraint literals live in exactly one place.
+
+### `CreateAccount` deliberately does NOT write `auto_join_role`
+
+`auto_join_role` is the single-tenant profile's concept — `UpsertSingleTenantAccount`
+is its only writer. A multi-tenant account admits members via invited grants, not
+an auto-join policy, so `CreateAccount` calls `UpsertAccount` (which never touches
+that column) with a `nil` `DisplayName` for the empty case. Granularity defaults
+per provider: `organization` for github, `group` for gitlab (a GitLab namespace is
+a group), exported as `DefaultGranularityGitHub` / `DefaultGranularityGitLab`.
+
+### The account-existence check is a DISTINCT control, not FK reliance
+
+`RegisterInstallation` resolves the owning account by `(provider, account_key)` and,
+on `pgx.ErrNoRows`, refuses with an error wrapping `ErrAccountNotFound` that names
+the `fishhawkd account create` remedy — it NEVER materializes the account. This is
+the load-bearing gate: a GitLab payload is authenticated by a shared token with no
+signature over the body, so the project it names is untrusted and authorization
+must be an operator decision recorded server-side; a path that conjured the account
+would hollow that out.
+
+This check is **not redundant** with the composite
+`FOREIGN KEY (account_id, provider) REFERENCES accounts (id, provider)` (migration
+`0052`). Both reject the write, but the FK surfaces only an opaque SQLSTATE 23503 an
+operator cannot act on and a typo'd namespace would read as an infrastructure fault.
+This is why the counterfactual test (`TestRegisterInstallation_UnknownAccountRefuses`
+and its CLI twin) asserts error IDENTITY (the message naming the key and the remedy)
+**plus** a zero-row state read — deleting the Go check leaves the command still
+exiting non-zero, so a bare non-zero-exit assertion would read as a false GREEN.
+
+### Fail-closed branches
+
+| Branch | Result |
+|---|---|
+| Empty account key / provider not in `accountProviders` / granularity not in `accountGranularities` | error wrapping `ErrValidation`, naming the offending value |
+| `installation_ref` not matching the per-provider shape (`gitlab:<+int>` / bare `+int`) | error wrapping `ErrValidation` (`ValidateInstallationRef`) |
+| Non-`https` / malformed `--forge-base-url` / `--oauth-base-url` | error wrapping `ErrValidation` (via `ValidateResolvedBaseURL`) |
+| Named account does not exist | error wrapping `ErrAccountNotFound`, naming the `account create` remedy; installation write never reached |
+| Any other DB fault from `GetAccountByKey` | propagated verbatim (neither validation nor not-found), so the CLI maps it to a failure exit |
+
+`ErrValidation` and `ErrAccountNotFound` are exported so the CLI switches on error
+KIND (`errors.Is`) for its usage-vs-failure exit-code split rather than matching a
+message that could be reworded. `registry_test.go` pins one case per branch; the
+committed-state, idempotence, and cross-boundary tests
+(`TestInstallationRegister_AdmitsGitLabProjectThroughTheGate`, driving the CLI
+through to the shipped `gitLabProjectRegistry`) live in
+`backend/cmd/fishhawkd/{account,installation}_test.go`. Operator guide:
+`docs/deploy/gitlab.md`.

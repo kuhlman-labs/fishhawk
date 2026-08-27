@@ -1,7 +1,38 @@
 # fishhawkd
 
 Fishhawk control-plane daemon binary: the backend HTTP API server plus its operational subcommands
-(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`).
+(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`).
+
+## Tenancy registration subcommands (`account` / `installation`, E45.33 / #2923)
+
+The operator write path for the ADR-057 tenancy `accounts` / `installations` rows that GitLab run
+creation is authorization-gated on. Like `token`, they talk to Postgres directly (`--db` /
+`FISHHAWKD_DATABASE_URL`), side-stepping the running server, and back the domain surface in
+`backend/internal/account/registry.go`. Before this existed the only path was hand-written SQL
+(`docs/deploy/gitlab.md`).
+
+| Command | Flags | Effect |
+|---|---|---|
+| `account create` | `--db`, `--provider` (**required**, `github`\|`gitlab`), `--account-key` (**required**), `--display-name`, `--granularity` | Upsert one `accounts` row (idempotent on `provider,account_key`). `--granularity` defaults per provider — `organization` for github, `group` for gitlab — and must be one of `enterprise\|organization\|group`. |
+| `account list` | `--db`, `--provider` (filter) | Render the registered accounts. |
+| `installation register` | `--db`, `--provider` (**required**), `--account-key` (**required**), `--installation-ref` (**required**), `--forge-base-url`, `--oauth-base-url` | Upsert one `installations` row under the named account (idempotent on `provider,installation_ref`). **FAILS CLOSED** naming the `account create` remedy when the account does not exist — it never materializes it. |
+| `installation list` | `--db`, `--provider` (filter) | Render each installation with its owning `account_key` (the impact-inventory read the auth-change checklist asks for). |
+
+**`--provider` is required with no default** on both write commands: a GitLab namespace silently
+created as a `github` account would satisfy every local constraint and then be invisible to the
+GitLab authorization gate — the exact symptom this closes.
+
+**Per-provider `installation_ref` shape** (validated against the shipped forge parser):
+
+- `gitlab` — `gitlab:<project-id>`, a base-10 **positive** integer id (e.g. `gitlab:4242`).
+- `github` — a **BARE** base-10 positive installation id with no `github:` prefix (e.g. `77`).
+
+**Exit-code contract.** A missing-required flag or any input-shape validation failure (bad provider,
+out-of-set granularity, malformed ref, non-`https` base URL) exits `2` (usage). An unknown-account
+refusal and any database fault exit `1` (failure) — so a mis-typed flag is distinguishable from a
+broken database by exit code alone. The split is driven by typed error kinds (`account.ErrValidation`
+/ `account.ErrAccountNotFound`, `errors.Is`), not message matching. Long-form domain contract:
+`backend/internal/account/README.md`; operator quickstart: `docs/deploy/gitlab.md`.
 
 ## Webhook receiver secrets
 
