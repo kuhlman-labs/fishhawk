@@ -107,8 +107,20 @@ func TestMain(m *testing.M) {
 	// existed), so a skip host cannot turn a clean skip into a package failure.
 	if sharedMinIO.container != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = sharedMinIO.container.Terminate(ctx)
+		err := sharedMinIO.container.Terminate(ctx)
 		cancel()
+		// Do not silently discard a termination failure: with Ryuk disabled
+		// (scripts/test sets TESTCONTAINERS_RYUK_DISABLED=true) nothing else
+		// reaps this container, so a failed Terminate leaks an orphan. Report it
+		// on stderr and, if the tests themselves passed, fail the package so the
+		// leak is observable rather than hidden behind a green suite. A pre-
+		// existing test failure keeps its exit code.
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tracestore: shared MinIO container terminate failed (possible orphan): %v\n", err)
+			if code == 0 {
+				code = 1
+			}
+		}
 	}
 	os.Exit(code)
 }
@@ -564,11 +576,15 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 			}
 			haveNonSeededLog = true
 		case *wait.HTTPStrategy:
-			// An HTTP wait always resolves a mapped port before probing, so its
-			// presence is a port-resolving strategy. (network.Port has no string
-			// comparison; the HostPortStrategy above is the primary proof here.)
-			_ = v
-			havePort = true
+			// An HTTP wait resolves a mapped port before probing ONLY when it
+			// carries one, so require a non-empty Port before counting it as
+			// port-resolving. A portless HTTP wait would probe the default port
+			// and is NOT proof the published mapping resolved — counting it would
+			// let a portless HTTP strategy satisfy the assertion vacuously.
+			// network.Port.Port() returns "" for a zero-value (no port set).
+			if v.Port.Port() != "" {
+				havePort = true
+			}
 			haveNonSeededLog = true
 		default:
 			haveNonSeededLog = true
@@ -659,6 +675,16 @@ func TestMinioSkipReason(t *testing.T) {
 		err := errdefs.ErrNotFound.WithMessage("No such image: minio/minio:latest")
 		if reason, ok := minioSkipReason(err); ok {
 			t.Errorf("ErrNotFound with an unrelated message must not skip; got reason %q", reason)
+		}
+	})
+
+	t.Run("errdefs.ErrNotFound different port does not skip", func(t *testing.T) {
+		// Pins the port-specific narrowness: the conjunction keys on the 9000/tcp
+		// message, so a not-found naming a DIFFERENT port (e.g. postgres 5432)
+		// must fall through and fatal, not be swallowed as ours.
+		err := errdefs.ErrNotFound.WithMessage(`port "5432/tcp" not found`)
+		if reason, ok := minioSkipReason(err); ok {
+			t.Errorf("ErrNotFound naming a different port must not skip; got reason %q", reason)
 		}
 	})
 
