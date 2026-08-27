@@ -18,6 +18,7 @@ it.
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
 | Split filing refusal (#2412) | _(none at the comment; the sibling `split_filing_refused` marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` → `refuseSplitFilingOverCapPhase` (plan-gate approve of a `split_proposal` whose phase is over the implement cap) | on refusal to file any children (a phase declares more files than the resolved `max_files_changed` cap) | No (best-effort; the `split_filing_refused` marker is persisted BEFORE this comment, so once it is durable a re-approval of the still-over-cap proposal no-ops at the prior-refusal gate and never re-posts) |
+| Split parent close (#2062) | _(none at the comment; the parent thread's own stamped `fishhawk-split-parent-close` marker is the dedup record)_ | _(none)_ | `Server.handleContractChildClosed` (`issues.closed` on a filed split's contract child) | when the contract child closes as landed (any `state_reason` except `not_planned` / `duplicate`) | No (best-effort; the comment is posted BEFORE the close and deduped by re-reading the parent thread for the `fishhawk-split-parent-close` marker, so a redelivery finds the marker and posts nothing — the residual is a duplicate under two GENUINELY CONCURRENT deliveries, deliberately accepted over a lock) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 | Run not applicable (applies_to) | _(none at notifier; global-chain `run_rejected_applies_to` on the dispatcher)_ | _(none)_ | `Dispatcher.refusedByAppliesTo` applies_to admission gate (E53.10 / #2361) | dispatch refusal (workflow's `applies_to` labels/trigger not satisfied) | No (each refusal posts its own comment) |
 
@@ -823,6 +824,19 @@ Notes:
   one PR." Best-effort: a nil `Audit` or an append failure logs at WARN and never
   unwinds the settle. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The parent-close observation kind — `split_parent_closed` (E50.6 / #2062) —
+  is an **internal, system-actor OBSERVATION on the global audit chain, NOT an
+  issue-comment surface**. `Server.handleContractChildClosed` writes it AFTER
+  the forge writes, recording what one `issues.closed` delivery did to a split
+  parent: payload `{parent_repo, parent_issue, contract_child, state_reason,
+  outcome, commented}` plus `parent_candidates` on the ambiguous branch, with
+  `outcome` one of `closed`, `already_closed`, `child_not_landed`,
+  `close_failed`, `no_installation`, `ambiguous_linkage`. **Nothing reads it to
+  decide whether to act** — the forge's own issue state and comment thread are
+  the sole authority for that — so an append failure logs at WARN and changes
+  nothing. Listed here only so a reader grepping the audit categories doesn't
+  mistake it for a comment surface; the comment it accompanies is the "Split
+  parent close (#2062)" row in the table above.
 - The slice-integration audit kinds — `slices_integrated` and
   `slice_integration_conflict` (ADR-041 / #1142) — are **system-actor audit
   kinds with no dedicated Notifier method**, but as of E24.7 (#1147) both ALSO

@@ -592,6 +592,19 @@ func TestFileSplitProposalChildren_HappyPath_DeleteOnly(t *testing.T) {
 	if payload.CapException != nil {
 		t.Errorf("delete-only must carry no cap-exception draft, got %+v", payload.CapException)
 	}
+	// E50.6 LINKAGE (#2062): the completion marker must carry the parent's repo
+	// and issue number, because the parent-close watcher resolves "which parent
+	// does this closed contract child belong to?" as a PURE READ of THIS
+	// payload — no run, no forge call. A done-means assertion for the producer
+	// half: the payload's correctness is not structurally enforced by
+	// compilation, so without this a comment-only touch of split_filing.go would
+	// satisfy the scope gate while the watcher matched nothing forever.
+	if payload.ParentRepo != "o/r" {
+		t.Errorf("parent_repo = %q, want %q (runRow.Repo verbatim)", payload.ParentRepo, "o/r")
+	}
+	if payload.ParentIssue != splitParentIssue {
+		t.Errorf("parent_issue = %d, want %d (parsed from the run's trigger ref)", payload.ParentIssue, splitParentIssue)
+	}
 }
 
 // TestFileSplitProposalChildren_GovernedException asserts the governed-exception

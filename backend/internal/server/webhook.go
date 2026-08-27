@@ -170,5 +170,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.handleIssueLifecycleBoardSync(r.Context(), ev)
 	}
 
+	// `issues.closed` ALSO drives the E50.6 parent-close watcher (#2062): when
+	// the closed issue is the contract-phase child of a filed split proposal,
+	// the parent issue is linked and closed automatically, retiring the manual
+	// step the #2057 acceptance-carrier comment asks the operator to perform.
+	// It is a SIBLING of — not a replacement for — the board-sync reconciler
+	// above on the same event: that one moves a card, this one closes a parent.
+	// Best-effort; it never influences the 202.
+	if ev.Type == "issues" && ev.Action == "closed" {
+		s.handleContractChildClosed(r.Context(), ev)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }

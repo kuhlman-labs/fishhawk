@@ -236,3 +236,45 @@ func TestStampComment_IsStampOnce(t *testing.T) {
 		t.Fatalf("re-stamping changed the body:\nonce:  %q\ntwice: %q", once, twice)
 	}
 }
+
+// TestParentCloseCommentKey_Determinism pins the four properties the E50.6
+// parent-close dedup rests on (#2062). The key is re-derived by a LATER
+// delivery from forge facts alone — there is no run to key on — so a key that
+// varied across processes, or that collided across repositories, would either
+// re-post the linking comment forever or suppress a legitimate post.
+func TestParentCloseCommentKey_Determinism(t *testing.T) {
+	base := ParentCloseCommentKey("o/r", 100, 103)
+	if again := ParentCloseCommentKey("o/r", 100, 103); again != base {
+		t.Errorf("key not deterministic: %q vs %q", base, again)
+	}
+	// The REPO is inside the digest: the same numbers in a different repository
+	// must never mint the same marker (issue numbers are per-repo).
+	if other := ParentCloseCommentKey("other/repo", 100, 103); other == base {
+		t.Errorf("key must differ when only parentRepo differs, both = %q", base)
+	}
+	if other := ParentCloseCommentKey("o/r", 900, 103); other == base {
+		t.Errorf("key must differ when only parentIssue differs, both = %q", base)
+	}
+	if other := ParentCloseCommentKey("o/r", 100, 999); other == base {
+		t.Errorf("key must differ when only contractChildNumber differs, both = %q", base)
+	}
+	// It must not collide with the sibling run-keyed acceptance-carrier key.
+	if base == SplitCommentKey("o/r", CommentKindAcceptance) {
+		t.Errorf("parent-close key collides with the acceptance-carrier key: %q", base)
+	}
+}
+
+// TestParentCloseCommentKey_StampThenFind closes the OUTBOUND/INBOUND loop the
+// watcher drives: a body stamped with the parent-close key is found by
+// ThreadHasComment when the thread is re-read on a redelivery, and a body
+// stamped with a DIFFERENT key is not.
+func TestParentCloseCommentKey_StampThenFind(t *testing.T) {
+	key := ParentCloseCommentKey("o/r", 100, 103)
+	body := StampComment("Closing this issue: contract child #103 landed.", key)
+	if !ThreadHasComment([]string{"unrelated", body}, key) {
+		t.Errorf("stamped body not found by ThreadHasComment: %q", body)
+	}
+	if ThreadHasComment([]string{body}, ParentCloseCommentKey("other/repo", 100, 103)) {
+		t.Error("a body stamped for o/r must not satisfy the other/repo key")
+	}
+}

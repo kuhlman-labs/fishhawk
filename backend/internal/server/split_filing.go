@@ -103,6 +103,17 @@ type splitChildrenFiledPayload struct {
 	ContractChildNumber    int                     `json:"contract_child_number"`
 	DeferralIssue          int                     `json:"deferral_issue"`
 	CapException           *splitCapExceptionDraft `json:"cap_exception,omitempty"`
+	// ParentRepo and ParentIssue are the E50.6 parent-close LINKAGE (#2062):
+	// they let the `issues.closed` watcher answer "is this closed issue some
+	// split's contract child, and which parent does it belong to?" as a PURE
+	// PAYLOAD READ, with no run resolution and no forge call. ParentRepo is
+	// runRow.Repo verbatim — the same "owner/name" string webhook.Event.Repo
+	// carries — so the watcher's repo scoping is a plain string equality with
+	// nothing re-derived. Both are `omitempty` and purely additive: an entry
+	// written before #2062 decodes fine and simply matches nothing, which is
+	// the correct fail-quiet direction for a best-effort watcher.
+	ParentRepo  string `json:"parent_repo,omitempty"`
+	ParentIssue int    `json:"parent_issue,omitempty"`
 }
 
 // SplitChildrenFiledPayload is an exported alias of the completion-marker payload
@@ -422,7 +433,7 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	// carrier comment is posted at most once for a completed filing. (If the
 	// completion append itself fails, a re-approval re-enters and may re-post — a
 	// narrow best-effort residual on that one interleaving, not a guarantee.)
-	s.writeSplitChildrenFiledAudit(ctx, runRow, classification, children, contractChildNumber, capDraft)
+	s.writeSplitChildrenFiledAudit(ctx, runRow, classification, children, contractChildNumber, capDraft, runRow.Repo, parentIssue)
 	s.postSplitParentComment(ctx, runRow, owner, name, parentIssue, contractChildNumber)
 }
 
@@ -676,12 +687,14 @@ func (s *Server) writeSplitChildFiledMarker(ctx context.Context, runRow *run.Run
 
 // writeSplitChildrenFiledAudit emits the ONE completion marker after every child
 // is filed. Best-effort: an append failure logs but never unwinds the approval.
-func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.Run, classification splitfiling.ContractClassification, children []splitFilingChild, contractChildNumber int, draft *splitfiling.CapExceptionDraft) {
+func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.Run, classification splitfiling.ContractClassification, children []splitFilingChild, contractChildNumber int, draft *splitfiling.CapExceptionDraft, parentRepo string, parentIssue int) {
 	payload := splitChildrenFiledPayload{
 		ContractClassification: string(classification),
 		Children:               children,
 		ContractChildNumber:    contractChildNumber,
 		DeferralIssue:          splitfiling.DeferralIssue,
+		ParentRepo:             parentRepo,
+		ParentIssue:            parentIssue,
 	}
 	if draft != nil {
 		payload.CapException = &splitCapExceptionDraft{SpecDiff: draft.SpecDiff, PRBody: draft.PRBody}

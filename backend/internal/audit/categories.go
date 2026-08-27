@@ -44,7 +44,11 @@ import "sort"
 // #2412 added split_filing_refused, the on-approval hook's refusal marker when a
 // split_proposal has a phase whose own declared scope.files count exceeds the
 // resolved implement cap (the hook files ZERO children rather than emit a lead
-// phase that would itself fail the implement cap). E67.24 / #2621 added
+// phase that would itself fail the implement cap). E50.6 / #2062 added
+// split_parent_closed, the parent-close watcher's OBSERVATION of what an
+// `issues.closed` delivery for a filed split's contract child did to the parent
+// (server/split_parent_close.go) — recorded on the global chain and read by
+// nothing: it gates no behavior, the forge's own state does. E67.24 / #2621 added
 // approval_comment_refused, the issue-comment approval channel's marker for an
 // over-cap approve comment refused before Submit — the breadcrumb that makes the
 // deliberately SILENT reply-comment refusal (no reply, no approval row) visible
@@ -277,6 +281,7 @@ var KnownCategories = map[string]struct{}{
 	"slices_integrated":                       {},
 	"split_children_filed":                    {},
 	"split_filing_refused":                    {},
+	"split_parent_closed":                     {},
 	"spend_alert":                             {},
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
