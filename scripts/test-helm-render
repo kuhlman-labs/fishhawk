@@ -914,6 +914,48 @@ assert_render_fails "r12c secret-key message says it is delivered via the Secret
 # nothing rendered, but assert the value never reached stdout regardless.
 assert_absent "r12c the secret value never renders into the ConfigMap" "$out" "leak-me"
 
+# r12d an UNMAPPED secret-shaped key is rejected by the SUFFIX guard (#2915,
+# operator-authored). r12c above only covers keys the chart already knows via
+# fishhawk.secretKeySpec — but config.extraEnv exists precisely for the keys it
+# does NOT know, so that deny-list is structurally the wrong population. The
+# concrete case: the chart has no field for FISHHAWKD_GITLAB_* (#2922), which
+# routes an operator straight to this escape hatch holding a client secret.
+# COUNTERFACTUAL: delete the suffix `range` in fishhawk.validateExtraEnv and this
+# render SUCCEEDS with FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET: "leak-me-too" in the
+# ConfigMap. Verified by execution, not reasoned.
+cat > "$tmproot/r12d.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET: "leak-me-too"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12d.yaml"
+assert_render_fails "r12d extraEnv carrying an unmapped secret-shaped key is rejected, naming the key" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+assert_render_fails "r12d suffix message names the matched suffix" "ends in \"_SECRET\""
+assert_absent "r12d the unmapped secret value never renders into the ConfigMap" "$out" "leak-me-too"
+
+# r12e the suffix guard must NOT false-positive on an ordinary non-secret key.
+# Bare "_KEY" is deliberately absent from the suffix list because it matches
+# names like a partition or sort key; "_PRIVATE_KEY"/"_API_KEY" carry the same
+# signal without that cost. This case is what stops a later widening to "_KEY"
+# from landing silently.
+cat > "$tmproot/r12e.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_PARTITION_KEY: "p1"
+    FISHHAWKD_SOME_FLAG: "on"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12e.yaml"
+assert_render_ok "r12e an ordinary _KEY-suffixed non-secret key still renders"
+assert_contains "r12e the non-secret key reaches the ConfigMap" "$out" "FISHHAWKD_PARTITION_KEY"
+
 # ANTI-DRIFT (binding condition 4): the fixture enables an ingress AND sets a
 # client id so the DERIVED keys (FISHHAWKD_OAUTH_CLIENT_ID / _CALLBACK_URL /
 # _EXTERNAL_URL) are in the emitted set — otherwise the loop under-covers exactly

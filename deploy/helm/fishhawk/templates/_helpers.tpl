@@ -641,5 +641,23 @@ message names the offending key and the way out.
 {{- if has $k $secretKeys -}}
 {{- fail (printf "config.extraEnv key %q is a SECRET-bearing key the chart delivers via the Secret, not the ConfigMap. config.extraEnv writes to the ConfigMap (readable by any principal with `get configmaps`), so putting a secret there would expose its value in plaintext. Supply it through the Secret instead: secrets.values.<field> (chartManaged), secrets.externalSecrets.data[] (externalSecrets), or the pre-created existingSecret — and remove it from config.extraEnv." $k) -}}
 {{- end -}}
+{{- /*
+     Suffix guard. The $secretKeys deny-list above only covers keys the chart
+     ALREADY KNOWS, but config.extraEnv exists precisely for keys it does not —
+     so that list is structurally the wrong population. The concrete case is the
+     GitLab family (#2922): the chart has no field for FISHHAWKD_GITLAB_*, which
+     routes an operator straight to this escape hatch with a client secret in
+     hand. Refuse anything secret-SHAPED as well, so an unmapped credential
+     fails loudly instead of landing in a world-readable ConfigMap.
+
+     Bare "_KEY" is deliberately NOT in this list: it false-positives on ordinary
+     non-secret names such as a partition or sort key. "_PRIVATE_KEY" and
+     "_API_KEY" carry the same signal without that cost.
+*/ -}}
+{{- range $suffix := list "_SECRET" "_TOKEN" "_PASSWORD" "_CREDENTIAL" "_CREDENTIALS" "_PRIVATE_KEY" "_API_KEY" -}}
+{{- if hasSuffix $suffix $k -}}
+{{- fail (printf "config.extraEnv key %q ends in %q, which marks it as secret-bearing. config.extraEnv renders into the ConfigMap, which is readable by any principal with `get configmaps`, so a secret placed here would be exposed in plaintext. Deliver it through the Secret instead: secrets.values.<field> (chartManaged), secrets.externalSecrets.data[] (externalSecrets), or the pre-created existingSecret." $k $suffix) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}

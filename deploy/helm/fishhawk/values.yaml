@@ -195,6 +195,16 @@ config:
   # (fishhawk.validateExtraEnv). Values are coerced to strings (a ConfigMap data
   # value must be a string). NEVER put secrets here — the ConfigMap is readable by
   # anyone with `get configmaps`; secrets belong in the Secret.
+  #
+  # That last rule is ENFORCED, not merely advised, in two layers. A key the chart
+  # knows to be secret-borne (any fishhawk.secretKeySpec key) is refused; so is any
+  # key whose NAME ends in _SECRET / _TOKEN / _PASSWORD / _CREDENTIAL(S) /
+  # _PRIVATE_KEY / _API_KEY. The second rule exists because the first can only
+  # cover keys the chart already has a field for, and this escape hatch is for the
+  # ones it does not — e.g. the FISHHAWKD_GITLAB_* family (#2922), where an
+  # operator would otherwise be routed here holding a client secret.
+  #
+  # Bare _KEY is deliberately allowed (a partition or sort key is not a secret).
   extraEnv: {}
 
 # Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833). The
