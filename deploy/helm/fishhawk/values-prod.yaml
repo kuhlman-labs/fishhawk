@@ -21,7 +21,9 @@ image:
   tag: ""
 
 # Public ingress + cert-manager TLS. config.externalUrl / config.oauthCallbackUrl
-# below are left empty so they DERIVE from ingress.host (https, since tls is on):
+# below are left empty so they DERIVE from ingress.host (https, since tls is on);
+# config.oauthClientId below is what makes the callback derive (OAuth all-or-none):
+#   FISHHAWKD_OAUTH_CLIENT_ID     = <your OAuth App client id>
 #   FISHHAWKD_EXTERNAL_URL        = https://app.fishhawk.example
 #   FISHHAWKD_OAUTH_CALLBACK_URL  = https://app.fishhawk.example/v0/auth/github/callback
 ingress:
@@ -39,6 +41,12 @@ config:
   # to override the derived value (e.g. a separate SPA origin for externalUrl).
   externalUrl: ""
   oauthCallbackUrl: ""
+  # Substitute your own GitHub OAuth App client id (public, not a secret; the
+  # matching client secret goes in the Secret named by existingSecret as
+  # FISHHAWKD_OAUTH_CLIENT_SECRET). Setting it makes the callback URL above derive
+  # from ingress.host and makes the client secret required. Clear it (and
+  # config.oauthCallbackUrl) for an OAuth-OFF install.
+  oauthClientId: "substitute-your-oauth-client-id"
 
 # Split topology for horizontal scale-out (commented; allInOne is the default).
 # Uncomment to run a multi-replica API tier plus a single-replica worker tier.

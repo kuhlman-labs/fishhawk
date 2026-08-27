@@ -5,6 +5,15 @@
        render in split mode and secret.yaml does not render outside
        chartManaged, so neither can host a guard that must always run. */}}
 {{- include "fishhawk.validateSecretContract" . -}}
+{{- /* OAuth trio + extraEnv guards (E69.4 / #2915) live here for the same
+       reason: service.yaml is the only template rendering in every topology mode
+       and every secrets mode, so a guard that must always run cannot live in
+       deployment.yaml (skipped in split mode) or secret.yaml (skipped outside
+       chartManaged). validateOAuthTrio runs AFTER validateSecretContract so the
+       id-set-but-secret-missing case surfaces once, with the contract guard's
+       message, rather than racing this one. */ -}}
+{{- include "fishhawk.validateOAuthTrio" . -}}
+{{- include "fishhawk.validateExtraEnv" . -}}
 apiVersion: v1
 kind: Service
 metadata:

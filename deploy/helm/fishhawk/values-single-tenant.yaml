@@ -14,7 +14,9 @@ image:
   tag: ""
 
 # Public ingress + cert-manager TLS. config.externalUrl / oauthCallbackUrl are
-# left empty so they DERIVE from ingress.host (https, since tls is on):
+# left empty so they DERIVE from ingress.host (https, since tls is on);
+# config.oauthClientId is what makes the callback derive (OAuth all-or-none):
+#   FISHHAWKD_OAUTH_CLIENT_ID    = <your OAuth App client id>
 #   FISHHAWKD_EXTERNAL_URL       = https://fishhawk.acme.example
 #   FISHHAWKD_OAUTH_CALLBACK_URL = https://fishhawk.acme.example/v0/auth/github/callback
 ingress:
@@ -28,6 +30,11 @@ ingress:
 config:
   externalUrl: ""
   oauthCallbackUrl: ""
+  # Substitute your own GitHub OAuth App client id (public; the matching client
+  # secret goes in the Secret named by existingSecret as
+  # FISHHAWKD_OAUTH_CLIENT_SECRET). Setting it derives the callback URL above and
+  # makes the client secret required.
+  oauthClientId: "substitute-your-oauth-client-id"
 
 # accountKey ALONE is the enablement signal. The chart renders each key it is
 # given VERBATIM and does not default an empty one — so a half-configured

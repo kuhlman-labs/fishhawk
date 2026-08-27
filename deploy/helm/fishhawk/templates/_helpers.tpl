@@ -98,14 +98,19 @@ key stays unset (ignore-if-unset semantics).
 {{/*
 OAuth callback URL consumed by the ConfigMap (FISHHAWKD_OAUTH_CALLBACK_URL).
 Explicit config.oauthCallbackUrl always wins. Otherwise, when the ingress is
-enabled with a host, derive `<scheme>://<host>/v0/auth/github/callback` — the
-path fishhawkd registers the GitHub OAuth callback handler at (serve.go). Empty
-when neither an explicit value nor an enabled ingress host exists.
+enabled with a host AND config.oauthClientId is set, derive
+`<scheme>://<host>/v0/auth/github/callback` — the path fishhawkd registers the
+GitHub OAuth callback handler at (serve.go). The client-id gate is load-bearing:
+without it, enabling an ingress for an OAuth-OFF install would emit a LONE
+callback key and fishhawkd would exit at startup ("oauth misconfigured",
+serve.go — client id + client secret + callback URL are all-or-none). Empty when
+no explicit value exists and either the ingress is off/host-less or OAuth is off
+(no client id).
 */}}
 {{- define "fishhawk.oauthCallbackUrl" -}}
 {{- if .Values.config.oauthCallbackUrl -}}
 {{- .Values.config.oauthCallbackUrl -}}
-{{- else if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- else if and .Values.config.oauthClientId .Values.ingress.enabled .Values.ingress.host -}}
 {{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled -}}
 {{- printf "%s://%s/v0/auth/github/callback" $scheme .Values.ingress.host -}}
 {{- end -}}
@@ -319,11 +324,19 @@ fishhawk.validateSecretContract (validates against it), NOTES.txt (prints it).
       "valuesField" "githubWebhookSecret"
       "envDelivered" true
       "required" true) -}}
+{{- /* The OAuth client secret is one leg of an all-three-or-none feature (client
+       id + client secret + callback URL, serve.go): OAuth is a feature that can
+       be OFF. So its requiredness is DERIVED from config.oauthClientId — the
+       public ENABLEMENT SIGNAL — exactly like the AWS pair derives from
+       config.s3Bucket and the cell credentials from cell.*. With no client id
+       OAuth is off, the secret is genuinely not needed, and hardcoding required
+       here would refuse every OAuth-off deploy. fishhawk.validateOAuthTrio
+       covers the OTHER partial combinations. */ -}}
 {{- $records = append $records (dict
       "secretKey" "FISHHAWKD_OAUTH_CLIENT_SECRET"
       "valuesField" "oauthClientSecret"
       "envDelivered" true
-      "required" true) -}}
+      "required" (ne (toString $v.config.oauthClientId) "")) -}}
 {{- $records = append $records (dict
       "secretKey" "FISHHAWKD_ANTHROPIC_API_KEY"
       "valuesField" "anthropicApiKey"
@@ -482,6 +495,125 @@ live drill in the chart README records the observed time-to-Failed.
        an accident of which comparison operator was reached for. */ -}}
 {{- if le (int $deadline) (int $timeToFail) -}}
 {{- fail (printf "migrate.activeDeadlineSeconds=%d would fire AT OR BEFORE the moment the Job controller can mark the migration Failed (derived time-to-Failed %ds from backoffLimit=%d and assumedAttemptSeconds=%d, a LOWER bound), so Helm would report DeadlineExceeded and hide the migration error. Raise the deadline above %ds, lower migrate.backoffLimit/assumedAttemptSeconds, or leave activeDeadlineSeconds unset (the default)." (int $deadline) (int $timeToFail) $n (int .Values.migrate.assumedAttemptSeconds) (int $timeToFail)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+OAuth trio guard (E69.4 / #2915). `include`d once from service.yaml — the only
+template rendering in EVERY topology mode AND every secrets mode, which is why
+validateMode / validateSecretContract already live there. It mirrors fishhawkd's
+own all-three-or-none contract (serve.go: if any of client id / client secret /
+callback URL is set, all three must be, else it logs "oauth misconfigured" and
+exits) by failing the render on every OBSERVABLE partial combination, so the
+operator sees a named message at `helm template` time instead of a pod that
+exits at startup.
+
+What is observable is MODE-DEPENDENT. The id is public (config.oauthClientId)
+and the callback is a rendered ConfigMap value, so both are always visible. The
+SECRET half is not:
+  chartManaged    — secrets.values.oauthClientSecret is visible (same `| default
+                    dict` untyped-nil defence validateSecretContract documents).
+  externalSecrets — the DECLARED data[] mapping is visible; the guard reads the
+                    SAME `.secretKey` field validateSecretContract inspects, so
+                    the two cannot drift.
+  existing        — the chart can see NOTHING about a pre-created Secret at render
+                    time (see the README's "Why `existing` mode has no render-time
+                    key check"), so the secret half is UNKNOWN and this guard
+                    checks only the id/callback pair there.
+The id-set-but-secret-MISSING case is deliberately NOT re-implemented here — the
+derived requiredness in fishhawk.secretKeySpec makes validateSecretContract
+produce it with its existing message, so there is one message per condition
+rather than two guards racing.
+*/}}
+{{- define "fishhawk.validateOAuthTrio" -}}
+{{- $id := toString .Values.config.oauthClientId -}}
+{{- $cb := include "fishhawk.oauthCallbackUrl" . -}}
+{{- $secret := false -}}
+{{- $mode := .Values.secrets.mode -}}
+{{- if eq $mode "chartManaged" -}}
+{{- $values := .Values.secrets.values | default dict -}}
+{{- if ne (toString (index $values "oauthClientSecret")) "" -}}{{- $secret = true -}}{{- end -}}
+{{- else if eq $mode "externalSecrets" -}}
+{{- range .Values.secrets.externalSecrets.data -}}
+{{- if eq (toString .secretKey) "FISHHAWKD_OAUTH_CLIENT_SECRET" -}}{{- $secret = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* (i) id set, callback unreachable. Name BOTH routes out: an enabled ingress
+       DERIVES the callback, so an operator on a non-ingress install must either
+       set config.oauthCallbackUrl explicitly OR enable the ingress that derives
+       it. A guard that refuses without naming the remedy is the failure this
+       change exists to close. */ -}}
+{{- if and (ne $id "") (eq $cb "") -}}
+{{- fail "config.oauthClientId is set but the OAuth callback URL is empty. fishhawkd requires all three of client id, client secret and callback URL, or none (serve.go). Either set config.oauthCallbackUrl explicitly, or enable the ingress (ingress.enabled + ingress.host) that DERIVES it as <scheme>://<host>/v0/auth/github/callback. To turn OAuth off instead, clear config.oauthClientId." -}}
+{{- end -}}
+{{- /* (ii) callback set, id empty. */ -}}
+{{- if and (eq $id "") (ne $cb "") -}}
+{{- fail "an OAuth callback URL is configured (config.oauthCallbackUrl or the ingress derivation) but config.oauthClientId is empty. fishhawkd requires all three of client id, client secret and callback URL, or none (serve.go). Set config.oauthClientId, or clear config.oauthCallbackUrl (and disable the ingress derivation) to leave OAuth off." -}}
+{{- end -}}
+{{- /* (iii) secret OBSERVABLY supplied, id empty. */ -}}
+{{- if and (eq $id "") $secret -}}
+{{- fail "an OAuth client secret is supplied (FISHHAWKD_OAUTH_CLIENT_SECRET, via secrets.values.oauthClientSecret or secrets.externalSecrets.data[]) but config.oauthClientId is empty. fishhawkd requires all three of client id, client secret and callback URL, or none (serve.go). Set config.oauthClientId, or remove the client secret to leave OAuth off." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Every ConfigMap key the chart itself renders (E69.4 / #2915). Hand-authored, so
+it is a DRIFT risk — scripts/test-helm-render r12 renders an all-config-keys-set
+ConfigMap, extracts every emitted FISHHAWKD_* key, and asserts the collision
+guard below fires for EACH, so a key added to configmap.yaml without a matching
+entry here reddens the gate. Consumed by fishhawk.validateExtraEnv.
+*/}}
+{{- define "fishhawk.managedConfigKeys" -}}
+{{- $keys := list
+      "FISHHAWKD_ADDR"
+      "FISHHAWKD_S3_REGION"
+      "FISHHAWKD_S3_ENDPOINT"
+      "FISHHAWKD_S3_BUCKET"
+      "FISHHAWKD_EXTERNAL_URL"
+      "FISHHAWKD_OAUTH_CLIENT_ID"
+      "FISHHAWKD_OAUTH_CALLBACK_URL"
+      "FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN"
+      "FISHHAWKD_OIDC_AUDIENCE"
+      "FISHHAWKD_OIDC_JWKS_URL"
+      "FISHHAWKD_GITHUB_APP_ID"
+      "FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE"
+      "FISHHAWKD_PLAN_REVIEW_MODEL"
+      "FISHHAWKD_BUDGET_TIMEZONE"
+      "FISHHAWKD_GITHUB_API_URL"
+      "FISHHAWKD_GITHUB_UPLOAD_URL"
+      "FISHHAWKD_OAUTH_AUTHORIZE_URL"
+      "FISHHAWKD_OAUTH_TOKEN_URL"
+      "FISHHAWKD_OAUTH_USER_URL"
+      "FISHHAWKD_OAUTH_ORGS_URL"
+      "FISHHAWKD_HOME_REGION"
+      "FISHHAWKD_MODEL_BASE_URL"
+      "FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY"
+      "FISHHAWKD_SINGLE_TENANT_GRANULARITY"
+      "FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE"
+      "FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME"
+      "FISHHAWKD_SINGLE_TENANT_PROVIDER" -}}
+{{- toYaml $keys -}}
+{{- end -}}
+
+{{/*
+config.extraEnv guard (E69.4 / #2915). `include`d once from service.yaml. Ranges
+over config.extraEnv and `fail`s when a key is (i) not a valid env identifier
+(^[A-Za-z_][A-Za-z0-9_]*$ — a ConfigMap could carry it, but the pod's envFrom
+would silently skip it, so it would never reach fishhawkd) or (ii) collides with
+a chart-managed key (fishhawk.managedConfigKeys) — a duplicate map key in the
+rendered ConfigMap data is resolved last-one-wins or rejected outright, either
+way silently discarding the operator's intent. Each message names the offending
+key and the way out.
+*/}}
+{{- define "fishhawk.validateExtraEnv" -}}
+{{- $managed := fromYamlArray (include "fishhawk.managedConfigKeys" .) -}}
+{{- range $k, $v := .Values.config.extraEnv -}}
+{{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $k) -}}
+{{- fail (printf "config.extraEnv key %q is not a valid environment variable identifier (must match ^[A-Za-z_][A-Za-z0-9_]*$): the pod's envFrom would skip it, so it would never reach fishhawkd. Rename it." $k) -}}
+{{- end -}}
+{{- if has $k $managed -}}
+{{- fail (printf "config.extraEnv key %q collides with a chart-managed ConfigMap key: the chart already renders it from its own values field, and a duplicate would be silently resolved last-one-wins. Remove it from config.extraEnv and set the chart value that owns it instead." $k) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

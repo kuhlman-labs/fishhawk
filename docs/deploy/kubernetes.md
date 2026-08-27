@@ -92,6 +92,26 @@ Point the static SPA's API base URL at the chart's `config.externalUrl`:
 The OAuth callback host (`config.oauthCallbackUrl`) must match the SPA host so
 the sign-in redirect returns to the served origin.
 
+A working GitHub sign-in needs all THREE OAuth parts, or none (fishhawkd enforces
+all-three-or-none and exits at `oauth misconfigured` on a partial set,
+`serve.go`; the chart mirrors that via `fishhawk.validateOAuthTrio`):
+
+- **client id** — `config.oauthClientId` (public; rendered into the ConfigMap as
+  `FISHHAWKD_OAUTH_CLIENT_ID`). It is the enablement signal: setting it makes the
+  client secret required and makes the ingress-derived callback URL render.
+- **client secret** — `FISHHAWKD_OAUTH_CLIENT_SECRET`, in the Secret.
+- **callback URL** — `config.oauthCallbackUrl`, or the ingress derivation when
+  `config.oauthClientId` is set.
+
+`values-local.yaml` now ships a dev client id so the local stack renders a
+complete trio and boots. Leave `config.oauthClientId` empty for an OAuth-OFF
+install (fishhawkd then serves `/v0/auth/github/*` as `503`).
+
+For any `FISHHAWKD_*` env var the chart has no dedicated field for, use
+`config.extraEnv` — a map of NON-SECRET name → value merged verbatim into the
+ConfigMap (a collision with a chart-managed key or an invalid env identifier
+fails the render; secrets belong in the Secret, not here).
+
 Serving the SPA from an in-cluster nginx Deployment is intentionally out of
 scope (decided against on #853), keeping the chart image-build-free per #846.
 
