@@ -190,3 +190,54 @@ func TestGroomingValue_EqualAndContains(t *testing.T) {
 		t.Error("Contains must not be satisfied when an element is absent")
 	}
 }
+
+// TestGroomingMutationResult_ExactlyOneOfThree is the exhaustive contract table
+// for the tri-state result (#2237 review, widened by #2860): EXACTLY ONE of
+// Applied, Skipped and Refused must be true. All EIGHT boolean combinations are
+// enumerated, so the three well-formed states and the five rejected ones are
+// each named rather than sampled.
+//
+// It drives the SAME predicate settleGroomingCandidate consults
+// (GroomingMutationResult.WellFormed), so the validator and the test that pins
+// it cannot drift apart — a rule restated independently in the test is a rule
+// that can pass while the shipped validator disagrees.
+func TestGroomingMutationResult_ExactlyOneOfThree(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		applied, skipped, refused, wellOK bool
+	}{
+		{"all false (zero value)", false, false, false, false},
+		{"applied only", true, false, false, true},
+		{"skipped only", false, true, false, true},
+		{"refused only", false, false, true, true},
+		{"applied+skipped", true, true, false, false},
+		{"applied+refused", true, false, true, false},
+		{"skipped+refused", false, true, true, false},
+		{"all true", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := GroomingMutationResult{Applied: tc.applied, Skipped: tc.skipped, Refused: tc.refused}
+			if got := res.WellFormed(); got != tc.wellOK {
+				t.Errorf("WellFormed() = %t, want %t for applied=%t skipped=%t refused=%t",
+					got, tc.wellOK, tc.applied, tc.skipped, tc.refused)
+			}
+		})
+	}
+}
+
+// TestGroomingMutationResult_RefusedCarriesItsOwnReasonField asserts the
+// REFUSE reason is a field of its own rather than reusing SkipReason. That is
+// what makes a refusal distinguishable from an idempotent no-op in the audit
+// (#2860) — the whole point of the third state.
+func TestGroomingMutationResult_RefusedCarriesItsOwnReasonField(t *testing.T) {
+	res := GroomingMutationResult{Refused: true, RefuseReason: "not on board"}
+	if !res.WellFormed() {
+		t.Fatalf("a refused-only result is not well formed: %+v", res)
+	}
+	if res.SkipReason != "" {
+		t.Errorf("SkipReason = %q, want empty on a refusal", res.SkipReason)
+	}
+	if res.RefuseReason != "not on board" {
+		t.Errorf("RefuseReason = %q", res.RefuseReason)
+	}
+}

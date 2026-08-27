@@ -174,11 +174,17 @@ type GroomingApplyRequest struct {
 // GroomingOutcome is what happened to one candidate.
 type GroomingOutcome string
 
-// The three outcomes. Every settled candidate carries exactly one.
+// The four outcomes. Every settled candidate carries exactly one.
+//
+// Refused is distinct from Skipped ON PURPOSE (#2860). A skip is a no-op the
+// layer observed as already-satisfied; a refusal is a requested write that
+// DECLINED to happen and left nothing correct behind. Collapsing the two is
+// how an 0/8 apply rate stayed invisible across three grooming walks.
 const (
 	GroomingOutcomeApplied GroomingOutcome = "applied"
 	GroomingOutcomeFailed  GroomingOutcome = "failed"
 	GroomingOutcomeSkipped GroomingOutcome = "skipped"
+	GroomingOutcomeRefused GroomingOutcome = "refused"
 )
 
 // The closed set of skip reasons. Every deliberate no-op names one, so an
@@ -270,6 +276,7 @@ type GroomingMutationRecord struct {
 	After              GroomingValue        `json:"after,omitempty"`
 	Outcome            GroomingOutcome      `json:"outcome"`
 	SkipReason         string               `json:"skip_reason,omitempty"`
+	RefuseReason       string               `json:"refuse_reason,omitempty"`
 	Error              string               `json:"error,omitempty"`
 	ProviderResponse   string               `json:"provider_response,omitempty"`
 	IdempotenceChecked bool                 `json:"idempotence_checked"`
@@ -281,9 +288,11 @@ type GroomingApplySummary struct {
 	Applied     int      `json:"applied"`
 	Failed      int      `json:"failed"`
 	Skipped     int      `json:"skipped"`
+	Refused     int      `json:"refused"`
 	AppliedIDs  []string `json:"applied_ids,omitempty"`
 	FailedIDs   []string `json:"failed_ids,omitempty"`
 	SkippedIDs  []string `json:"skipped_ids,omitempty"`
+	RefusedIDs  []string `json:"refused_ids,omitempty"`
 	AuditErrors []string `json:"audit_errors,omitempty"`
 }
 
@@ -293,6 +302,7 @@ type GroomingApplyResult struct {
 	Applied []GroomingMutationRecord `json:"applied,omitempty"`
 	Failed  []GroomingMutationRecord `json:"failed,omitempty"`
 	Skipped []GroomingMutationRecord `json:"skipped,omitempty"`
+	Refused []GroomingMutationRecord `json:"refused,omitempty"`
 	Summary GroomingApplySummary     `json:"summary"`
 }
 
@@ -690,7 +700,7 @@ func groomingValidLabel(name string) bool {
 // the body markers persist, accepting BOTH wire forms the schema admits — a
 // bare `389` and a hashed `#389` (approval condition C4).
 //
-// It is deliberately EXPLICIT rather than routed through groomingNormalizeRef,
+// It is deliberately EXPLICIT rather than routed through NormalizeIssueRef,
 // which returns an unparseable value trimmed-but-unchanged so that
 // normalization never collapses two different values into one. That is the
 // right behaviour for the read side and the WRONG behaviour here: prose like
@@ -867,7 +877,12 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 		case GroomingOutcomeFailed:
 			result.Failed = append(result.Failed, rec)
 			result.Summary.FailedIDs = append(result.Summary.FailedIDs, rec.EntryID)
+		case GroomingOutcomeRefused:
+			result.Refused = append(result.Refused, rec)
+			result.Summary.RefusedIDs = append(result.Summary.RefusedIDs, rec.EntryID)
 		default:
+			// Skipped stays the DEFAULT arm deliberately: an unknown future
+			// outcome lands in a bucket rather than being dropped.
 			result.Skipped = append(result.Skipped, rec)
 			result.Summary.SkippedIDs = append(result.Summary.SkippedIDs, rec.EntryID)
 		}
@@ -881,6 +896,7 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 	result.Summary.Applied = len(result.Applied)
 	result.Summary.Failed = len(result.Failed)
 	result.Summary.Skipped = len(result.Skipped)
+	result.Summary.Refused = len(result.Refused)
 	result.Summary.AuditErrors = auditErrs
 
 	if err := sink.RecordGroomingApplyCompleted(ctx, result.Summary); err != nil {
@@ -1012,7 +1028,11 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 			return groomingSkipped(rec, GroomingSkipAlreadyApplied)
 		}
 		if c.kind.BoardPlacement() && !groomingPlacementAllowed(c.expectedFrom, item, req.States) {
-			return groomingSkipped(rec, GroomingSkipManualPlacementPreserved)
+			// REFUSED, not skipped (#2860). This is the SAME refusal the
+			// provider makes in its own defence-in-depth re-check, decided one
+			// layer earlier; the two must agree in the audit or the outcome
+			// would depend on which layer noticed first.
+			return groomingRefused(rec, GroomingSkipManualPlacementPreserved)
 		}
 	}
 
@@ -1026,23 +1046,29 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 		// nothing; recording it applied would be a fabrication.
 		rec.Outcome = GroomingOutcomeFailed
 		rec.Error = "provider returned no result and no error"
-	case res.Applied == res.Skipped:
-		// MALFORMED RESULT STATE (#2237 review). GroomingMutationResult's
-		// contract is that EXACTLY ONE of Applied/Skipped is true, and the
-		// apply layer validates it rather than trusting it, because the
-		// outcome it produces is the load-bearing audit record.
+	case !res.WellFormed():
+		// MALFORMED RESULT STATE (#2237 review, widened to three states by
+		// #2860). GroomingMutationResult's contract is that EXACTLY ONE of
+		// Applied/Skipped/Refused is true, and the apply layer validates it
+		// rather than trusting it, because the outcome it produces is the
+		// load-bearing audit record.
 		//
-		// Both FALSE is the dangerous one: a zero-value result reports that
-		// nothing was applied and nothing was deliberately skipped, and a
-		// switch whose applied arm is the DEFAULT would fabricate
-		// GroomingOutcomeApplied out of it — an audit row claiming a tracker
-		// write that provably did not happen. Both TRUE is self-contradictory
-		// and was silently classified skipped, hiding a provider that thinks
-		// it wrote. Neither is a state a caller can act on, so both fail.
+		// ALL FALSE is the dangerous one: a zero-value result reports no
+		// write, no observed no-op and no refusal, and a switch whose applied
+		// arm is the DEFAULT would fabricate GroomingOutcomeApplied out of it —
+		// an audit row claiming a tracker write that provably did not happen.
+		// Any MULTI-true combination is self-contradictory: applied+skipped
+		// claims both a write and a no-op, applied+refused claims a write the
+		// provider also declined, and skipped+refused claims the very
+		// distinction #2860 exists to draw in both directions at once. None is
+		// a state a caller can act on, so all fail.
 		rec.Outcome = GroomingOutcomeFailed
 		rec.ProviderResponse = res.ProviderResponse
-		rec.Error = fmt.Sprintf("provider returned a malformed result (applied=%t skipped=%t); exactly one must be true",
-			res.Applied, res.Skipped)
+		rec.Error = fmt.Sprintf("provider returned a malformed result (applied=%t skipped=%t refused=%t); exactly one must be true",
+			res.Applied, res.Skipped, res.Refused)
+	case res.Refused:
+		rec.ProviderResponse = res.ProviderResponse
+		return groomingRefused(rec, res.RefuseReason)
 	case res.Skipped:
 		rec.ProviderResponse = res.ProviderResponse
 		return groomingSkipped(rec, res.SkipReason)
@@ -1210,23 +1236,35 @@ func groomingSatisfied(kind GroomingMutationKind, observed, after GroomingValue)
 	// observed.Scalar is retained as the fallback so a marker whose value is
 	// not ref-shaped still compares as it did before.
 	if kind == GroomingKindEpicLink || kind == GroomingKindDependsOnAdd {
-		want := groomingNormalizeRef(after.Scalar)
+		want := NormalizeIssueRef(after.Scalar)
 		for _, got := range observed.List {
 			if got == want {
 				return true
 			}
 		}
-		return groomingNormalizeRef(observed.Scalar) == want
+		return NormalizeIssueRef(observed.Scalar) == want
 	}
 	return observed.Equal(after)
 }
 
-// groomingNormalizeRef normalizes an issue reference to the `#N` shape the
+// NormalizeIssueRef normalizes an issue reference to the `#N` shape the
 // body markers persist, so `1437` and `#1437` compare equal. Anything that is
 // not a bare or hashed positive integer is returned trimmed but otherwise
 // UNCHANGED — normalization must never collapse two genuinely different values
 // into one.
-func groomingNormalizeRef(s string) string {
+//
+// It is EXPORTED because it is the SINGLE cross-layer home for issue-reference
+// normalization (#2860): both `backend/internal/workmgmt` (the grooming apply
+// and churn paths) and `backend/internal/workmgmt/github` (the provider's
+// marker render, its membership read and its additive append) name THIS
+// function. #2860 is a defect of two layers DISAGREEING about whether a ref is
+// already recorded, so a second normalization function in either layer — even
+// one believed to agree — would rebuild that defect one level down. A local
+// EMPTINESS guard (e.g. `renderDependsOnMarker` skipping a token that is empty
+// after stripping its `#`) is not a competing normalizer: it decides whether a
+// token is emitted at all, never the SHAPE of what is emitted. Deciding the
+// emitted shape — the hash prefixing — is this function's job alone.
+func NormalizeIssueRef(s string) string {
 	t := strings.TrimSpace(s)
 	digits := strings.TrimSpace(strings.TrimPrefix(t, "#"))
 	if digits == "" {
@@ -1261,7 +1299,7 @@ func groomingMarkerObserved(body, marker string) GroomingValue {
 	var refs []string
 	for _, v := range values {
 		for _, tok := range strings.Split(v, ",") {
-			if ref := groomingNormalizeRef(tok); ref != "" {
+			if ref := NormalizeIssueRef(tok); ref != "" {
 				refs = append(refs, ref)
 			}
 		}
@@ -1354,5 +1392,16 @@ func groomingResolveItemRef(ref plan.ItemRef, target Target) (string, string) {
 func groomingSkipped(rec GroomingMutationRecord, reason string) GroomingMutationRecord {
 	rec.Outcome = GroomingOutcomeSkipped
 	rec.SkipReason = reason
+	return rec
+}
+
+// groomingRefused stamps a record as a REQUESTED WRITE THAT DID NOT HAPPEN —
+// declined, not already-satisfied (#2860). It stamps RefuseReason and leaves
+// SkipReason empty, so an audit reader filtering on `outcome` or reading the
+// reason field can tell a refusal from an idempotent no-op without reading the
+// provider source.
+func groomingRefused(rec GroomingMutationRecord, reason string) GroomingMutationRecord {
+	rec.Outcome = GroomingOutcomeRefused
+	rec.RefuseReason = reason
 	return rec
 }

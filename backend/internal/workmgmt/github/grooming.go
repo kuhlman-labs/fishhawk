@@ -404,10 +404,20 @@ func parentEpicMarkerValues(body string) []string {
 	return out
 }
 
-// groomingAddDependsOn records a depends_on edge on the item's body, reusing
-// the existing idempotent ensureDependsOnMarker. A body already carrying a
-// marker is returned unchanged by that helper, which this reports as a
-// provider-side SKIP rather than writing an identical body.
+// groomingAddDependsOn records a depends_on edge on the item's body, MERGING it
+// into any marker line the body already carries (#2860). It calls the amend
+// path's appendDependsOnRef, NOT the filing path's ensureDependsOnMarker, whose
+// coarser PRESENCE check refused every SECOND edge out of an item and reported
+// that refusal as an ordinary no-op — the 0/8 apply rate this issue removes.
+// The question is MEMBERSHIP (is THIS ref already recorded?), not presence (is
+// there a marker at all?), which is what the layer above already asks.
+//
+// The `depends_on ref already present` skip below is reachable only when the
+// CORE and the PROVIDER DISAGREE — ApplyGrooming's groomingSatisfied asks the
+// same membership question BEFORE dispatch and short-circuits to
+// `already_applied`, so a body would have to be mutated between that read and
+// this write to reach here. It is defence in depth, and is pinned by a unit
+// test on appendDependsOnRef rather than end to end through ApplyGrooming.
 func (p *Provider) groomingAddDependsOn(ctx context.Context, req workmgmt.GroomingMutationRequest,
 	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
 	dep := strings.TrimSpace(req.After.Scalar)
@@ -418,11 +428,11 @@ func (p *Provider) groomingAddDependsOn(ctx context.Context, req workmgmt.Groomi
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: read body of #%d: %w", number, err)
 	}
-	updated := ensureDependsOnMarker(issue.Body, []string{dep})
+	updated, changed := appendDependsOnRef(issue.Body, dep)
 	observed := workmgmt.GroomingValue{Scalar: dep}
-	if updated == issue.Body {
-		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "depends_on marker already present",
-			ProviderResponse: fmt.Sprintf("#%d already carries a depends_on marker", number),
+	if !changed {
+		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "depends_on ref already present",
+			ProviderResponse: fmt.Sprintf("#%d already records depends_on %s", number, dep),
 			Observed:         observed}, nil
 	}
 	if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
@@ -512,7 +522,10 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 	}
 	observed := workmgmt.GroomingValue{Scalar: item.Status}
 	if !groomingSourceAllows(req.ExpectedFrom, item, req.States) {
-		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "manual_placement_preserved",
+		// REFUSED, not skipped (#2860): a board move the provider DECLINED to
+		// perform because a human placed the card elsewhere. That is not an
+		// idempotent no-op and must not read as one in the audit.
+		return &workmgmt.GroomingMutationResult{Refused: true, RefuseReason: "manual_placement_preserved",
 			ProviderResponse: fmt.Sprintf("#%d sits at %q, outside the expected source set", number, labelOrUnset(item.Status)),
 			Observed:         observed}, nil
 	}
@@ -619,7 +632,11 @@ func (p *Provider) groomingSetField(ctx context.Context, req workmgmt.GroomingMu
 		return nil, fmt.Errorf("workmgmt/github: read project item for #%d: %w", number, err)
 	}
 	if !item.OnBoard {
-		return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "not on board",
+		// REFUSED, not skipped (#2860): the requested field write did not
+		// happen and the value was not already correct — there is no card to
+		// write it to. An operator reading `skipped` would read that as
+		// already-satisfied.
+		return &workmgmt.GroomingMutationResult{Refused: true, RefuseReason: "not on board",
 			ProviderResponse: fmt.Sprintf("#%d carries no card on the project, so there is no %s field to write", number, fieldName)}, nil
 	}
 	if err := p.api.SetProjectItemSingleSelect(ctx, req.Target.Scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {

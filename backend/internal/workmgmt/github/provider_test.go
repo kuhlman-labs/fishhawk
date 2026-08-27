@@ -2388,3 +2388,209 @@ func TestProviderFile_CreateRequestCarriesIdempotencyMarker(t *testing.T) {
 		t.Errorf("create body carries the key %d times, want exactly 1:\n%s", got, sent.Body)
 	}
 }
+
+// TestRenderDependsOnMarker_RoutesShapeThroughTheSharedNormalizer asserts that
+// routing renderDependsOnMarker's ref-SHAPE decision through
+// workmgmt.NormalizeIssueRef (#2860) is byte-preserving for the numeric refs
+// the marker actually carries, persists a NON-NUMERIC ref as written rather
+// than hashing it, and still skips a token that is no reference at all.
+//
+// The non-numeric row is the load-bearing one: the old inline
+// `"#"+TrimPrefix(...)` emitted `#other/repo#1639` where the membership read
+// observes `other/repo#1639`, so the write and the later read could never
+// agree — which is #2860 one level down.
+//
+// The bare-`#` row pins the EMPTINESS guard the normalizer does not provide:
+// NormalizeIssueRef("#") returns the trimmed original `"#"`, which is
+// non-empty, so without dependsOnRefStripped a bare `#` would start being
+// emitted as a reference.
+func TestRenderDependsOnMarker_RoutesShapeThroughTheSharedNormalizer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		refs []string
+		want string
+	}{
+		{"numeric refs are byte-identical to before", []string{"#41", "42"}, "Depends on: #41, #42"},
+		{"non-numeric ref persists as written", []string{"other/repo#1639"}, "Depends on: other/repo#1639"},
+		{"hashed non-numeric ref persists as written", []string{"#other/repo#1639"}, "Depends on: #other/repo#1639"},
+		{"a bare # is skipped, not emitted", []string{"#", "41"}, "Depends on: #41"},
+		{"a bare # alone renders no marker", []string{"#"}, ""},
+		{"whitespace tokens are skipped", []string{"  ", "\t"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderDependsOnMarker(tc.refs); got != tc.want {
+				t.Errorf("renderDependsOnMarker(%q) = %q, want %q", tc.refs, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEnsureDependsOnMarker_FilingPathStillNeverDoubleStamps pins the FILING
+// path's contract (E34.3 / #1594) with its OWN test: ensureDependsOnMarker must
+// NOT acquire the amend path's additive behaviour. A body already carrying a
+// marker, handed a DIFFERENT ref, comes back BYTE-IDENTICAL.
+func TestEnsureDependsOnMarker_FilingPathStillNeverDoubleStamps(t *testing.T) {
+	body := "## Summary\n\nx\n\nDepends on: #5\n"
+	if got := ensureDependsOnMarker(body, []string{"#6"}); got != body {
+		t.Errorf("filing path became additive:\n got %q\nwant %q (unchanged)", got, body)
+	}
+}
+
+// TestAppendDependsOnRef_MergesIntoExistingMarker asserts the amend path is
+// ADDITIVE — the #2860 fix — and that the splice rewrites NOTHING outside the
+// marker line's captured value. The whole resulting body is compared byte for
+// byte, so surrounding prose, the blank lines and the final newline are all
+// pinned.
+func TestAppendDependsOnRef_MergesIntoExistingMarker(t *testing.T) {
+	body := "## Summary\n\nWork item.\n\nDepends on: #1639, #1640, #1641\n\nParent epic: #1600\n"
+	want := "## Summary\n\nWork item.\n\nDepends on: #1639, #1640, #1641, #2032\n\nParent epic: #1600\n"
+	got, changed := appendDependsOnRef(body, "#2032")
+	if !changed {
+		t.Fatalf("changed = false, want true")
+	}
+	if got != want {
+		t.Errorf("body =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// TestAppendDependsOnRef_PreservesCRLFLineEndings asserts the trailing-CR
+// handling. dependsOnMarkerRE's `(.+)` capture ENDS WITH the carriage return on
+// a CRLF body (Go's `(?m)$` anchors before `\n` only, and `.` matches `\r`), so
+// a raw append at the capture end would emit `#1641<CR>, #2032` and corrupt the
+// line. The whole body is compared byte for byte and the corrupt sequence is
+// asserted absent.
+func TestAppendDependsOnRef_PreservesCRLFLineEndings(t *testing.T) {
+	body := "## Summary\r\n\r\nWork item.\r\n\r\nDepends on: #1639, #1640, #1641\r\n\r\nParent epic: #1600\r\n"
+	want := "## Summary\r\n\r\nWork item.\r\n\r\nDepends on: #1639, #1640, #1641, #2032\r\n\r\nParent epic: #1600\r\n"
+	got, changed := appendDependsOnRef(body, "#2032")
+	if !changed {
+		t.Fatalf("changed = false, want true")
+	}
+	if got != want {
+		t.Errorf("body =\n%q\nwant\n%q", got, want)
+	}
+	if strings.Contains(got, "#1641\r") {
+		t.Errorf("carriage return spliced into the middle of the ref list:\n%q", got)
+	}
+	if !strings.Contains(got, "Depends on: #1639, #1640, #1641, #2032\r\n") {
+		t.Errorf("marker line does not end in CRLF:\n%q", got)
+	}
+}
+
+// TestAppendDependsOnRef_AlreadyAMemberIsANoOp asserts the genuine idempotent
+// no-op: a ref the body ALREADY records returns the body unchanged with
+// changed=false, whatever wire form it arrives in.
+//
+// This is a UNIT test on the helper and is NOT expected to surface end to end
+// through ApplyGrooming: the core's groomingSatisfied asks the same membership
+// question BEFORE dispatch and short-circuits to `already_applied`, so the
+// provider-side skip is reachable only when the two layers DISAGREE — a body
+// mutated between the read and the write.
+func TestAppendDependsOnRef_AlreadyAMemberIsANoOp(t *testing.T) {
+	body := "## Summary\n\nx\n\nDepends on: #1639, #2032\n"
+	for _, ref := range []string{"2032", "#2032", "  #2032  "} {
+		got, changed := appendDependsOnRef(body, ref)
+		if changed {
+			t.Errorf("appendDependsOnRef(_, %q) reported changed for a ref already recorded", ref)
+		}
+		if got != body {
+			t.Errorf("appendDependsOnRef(_, %q) mutated the body:\n%q", ref, got)
+		}
+	}
+}
+
+// TestAppendDependsOnRef_MarkerFreeBodyDelegatesToEnsure asserts the
+// no-marker branch delegates rather than hand-rolling the append-a-new-marker
+// case, producing exactly what the filing path would.
+func TestAppendDependsOnRef_MarkerFreeBodyDelegatesToEnsure(t *testing.T) {
+	body := "## Summary\n\nx\n"
+	got, changed := appendDependsOnRef(body, "2032")
+	if !changed {
+		t.Fatalf("changed = false, want true for a marker-free body")
+	}
+	if want := ensureDependsOnMarker(body, []string{"2032"}); got != want {
+		t.Errorf("body =\n%q\nwant (ensureDependsOnMarker)\n%q", got, want)
+	}
+	if !strings.Contains(got, "Depends on: #2032") {
+		t.Errorf("no marker line was appended:\n%q", got)
+	}
+}
+
+// TestAppendDependsOnRef_InvalidRefIsANoOpOnBothBodyShapes pins operator
+// approval condition 1. A ref whose stripped form is empty — a bare `#`, an
+// empty string, whitespace — is NOT a reference, and the amend path must treat
+// it as a no-op returning changed=false.
+//
+// BOTH body shapes are covered because the two paths fail DIFFERENTLY without
+// the guard: with an existing marker the splice appends a meaningless `, #`,
+// and WITHOUT one the delegation to ensureDependsOnMarker returns the body
+// unchanged (renderDependsOnMarker skips the token) while still reporting
+// changed=true — a body that did not change, audited as applied, which is the
+// exact "refusal reads as success" failure #2860 exists to kill.
+func TestAppendDependsOnRef_InvalidRefIsANoOpOnBothBodyShapes(t *testing.T) {
+	bodies := map[string]string{
+		"marker-bearing": "## Summary\n\nx\n\nDepends on: #1639\n",
+		"marker-free":    "## Summary\n\nx\n",
+	}
+	for shape, body := range bodies {
+		for _, ref := range []string{"#", "", "   ", " # ", "#  "} {
+			got, changed := appendDependsOnRef(body, ref)
+			if changed {
+				t.Errorf("%s body: appendDependsOnRef(_, %q) reported changed for a non-reference", shape, ref)
+			}
+			if got != body {
+				t.Errorf("%s body: appendDependsOnRef(_, %q) mutated the body:\n%q", shape, ref, got)
+			}
+		}
+	}
+}
+
+// TestAppendDependsOnRef_SplicesOnlyTheFirstMarkerLine asserts the splice
+// targets the FIRST marker line while the membership READ sees EVERY line —
+// the same breadth the core's groomingMarkerObserved reads, so the two layers
+// cannot disagree about membership.
+func TestAppendDependsOnRef_SplicesOnlyTheFirstMarkerLine(t *testing.T) {
+	body := "Depends on: #1\n\nprose\n\nDepends on: #2\n"
+	got, changed := appendDependsOnRef(body, "#3")
+	if !changed {
+		t.Fatalf("changed = false, want true")
+	}
+	if want := "Depends on: #1, #3\n\nprose\n\nDepends on: #2\n"; got != want {
+		t.Errorf("body =\n%q\nwant\n%q", got, want)
+	}
+	// A ref present ONLY on the second marker line is still a member.
+	if got, changed := appendDependsOnRef(body, "2"); changed || got != body {
+		t.Errorf("ref on the second marker line was not recognised as a member: changed=%t body=%q", changed, got)
+	}
+}
+
+// TestDependsOnMarkerRefs_ReadsEveryLineNormalized pins the membership read
+// itself: every marker line, every non-empty token, each normalized through the
+// SHARED normalizer, in body order — and a CRLF body's last token carries no
+// stray carriage return.
+func TestDependsOnMarkerRefs_ReadsEveryLineNormalized(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"no marker", "## Summary\n\nx\n", nil},
+		{"both wire forms normalize", "Depends on: 41, #42\n", []string{"#41", "#42"}},
+		{"every line, body order", "Depends on: #1\nprose\nDepends on: #2, #3\n", []string{"#1", "#2", "#3"}},
+		{"non-numeric refs pass through unchanged", "Depends on: other/repo#1639\n", []string{"other/repo#1639"}},
+		{"empty tokens and a bare # are skipped", "Depends on: #7, , #, 8\n", []string{"#7", "#8"}},
+		{"CRLF leaves no stray carriage return", "Depends on: #7, #8\r\n", []string{"#7", "#8"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dependsOnMarkerRefs(tc.body)
+			if len(got) != len(tc.want) {
+				t.Fatalf("dependsOnMarkerRefs = %q, want %q", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("dependsOnMarkerRefs = %q, want %q", got, tc.want)
+				}
+			}
+		})
+	}
+}

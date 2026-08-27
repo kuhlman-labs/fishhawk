@@ -289,15 +289,23 @@ func (f *statefulGroomingForge) ApplyGroomingMutation(_ context.Context, req Gro
 		// Normalized to `#N`, as renderParentEpicMarker does.
 		it.Body += "\nParent epic: #" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
 	case GroomingKindDependsOnAdd:
-		// Same single-marker semantics: ensureDependsOnMarker returns a
-		// marker-bearing body unchanged and groomingAddDependsOn reports a
-		// provider SKIP. It does NOT merge a second ref into the existing
-		// line — the residual TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip
-		// pins.
-		if bodyCarriesMarker(it.Body, "Depends on:") {
-			return &GroomingMutationResult{Skipped: true, SkipReason: "depends_on marker already present"}, nil
+		// ADDITIVE, mirroring the provider's appendDependsOnRef (#2860): a
+		// second edge out of the same item MERGES into the existing marker
+		// line. A ref already recorded there is the genuine idempotent no-op
+		// and reports a provider SKIP. The fake reproduces the SHAPE of the
+		// production behaviour deliberately as an independent implementation,
+		// so the core's own membership diff is not tested against itself.
+		ref := "#" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
+		if line, ok := markerLine(it.Body, "Depends on:"); ok {
+			for _, tok := range strings.Split(line, ",") {
+				if "#"+strings.TrimPrefix(strings.TrimSpace(tok), "#") == ref {
+					return &GroomingMutationResult{Skipped: true, SkipReason: "depends_on ref already present"}, nil
+				}
+			}
+			it.Body = strings.Replace(it.Body, "Depends on: "+line, "Depends on: "+line+", "+ref, 1)
+			break
 		}
-		it.Body += "\nDepends on: " + req.After.Scalar
+		it.Body += "\nDepends on: " + ref
 	case GroomingKindBoardPlace, GroomingKindIcebox:
 		it.OnBoard = true
 		it.BoardColumn = req.After.Scalar
@@ -325,6 +333,20 @@ func bodyCarriesMarker(body, marker string) bool {
 	return false
 }
 
+// markerLine returns the FIRST marker line's value, case-insensitively — the
+// fake's independent counterpart to the provider's dependsOnMarkerRE capture,
+// so the fake's additive merge is not written in terms of the helper under
+// test.
+func markerLine(body, marker string) (string, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) >= len(marker) && strings.EqualFold(trimmed[:len(marker)], marker) {
+			return strings.TrimSpace(trimmed[len(marker):]), true
+		}
+	}
+	return "", false
+}
+
 // countMarkerLines counts the body lines opening with marker, case-insensitively.
 func countMarkerLines(body, marker string) int {
 	n := 0
@@ -338,7 +360,7 @@ func countMarkerLines(body, marker string) int {
 
 func recordFor(t *testing.T, res *GroomingApplyResult, entryID string) GroomingMutationRecord {
 	t.Helper()
-	for _, bucket := range [][]GroomingMutationRecord{res.Applied, res.Failed, res.Skipped} {
+	for _, bucket := range [][]GroomingMutationRecord{res.Applied, res.Failed, res.Skipped, res.Refused} {
 		for _, r := range bucket {
 			if r.EntryID == entryID {
 				return r
@@ -1353,9 +1375,15 @@ func TestApplyGrooming_ManualBoardPlacementIsPreserved(t *testing.T) {
 				t.Fatalf("mutator call log = %+v, want ZERO dispatches", mut.calls)
 			}
 			// TRIED AND WAS REFUSED, not did-not-try: the record names the
-			// guard, and the reader was consulted.
-			if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipManualPlacementPreserved {
-				t.Errorf("record outcome=%q reason=%q, want skipped/%s", rec.Outcome, rec.SkipReason, GroomingSkipManualPlacementPreserved)
+			// guard, and the reader was consulted. The outcome is REFUSED
+			// rather than skipped since #2860 — a declined write, not an
+			// already-satisfied no-op — and SkipReason must stay EMPTY so the
+			// two audit facts cannot be conflated.
+			if rec.Outcome != GroomingOutcomeRefused || rec.RefuseReason != GroomingSkipManualPlacementPreserved {
+				t.Errorf("record outcome=%q refuse_reason=%q, want refused/%s", rec.Outcome, rec.RefuseReason, GroomingSkipManualPlacementPreserved)
+			}
+			if rec.SkipReason != "" {
+				t.Errorf("record SkipReason = %q, want empty — a refusal is not a skip", rec.SkipReason)
 			}
 			if len(reader.reads) != 1 || !reader.reads[0].ResolveBoardState {
 				t.Errorf("reader saw %+v, want one board-state-resolving read (proof the candidate was evaluated, not dropped earlier)", reader.reads)
@@ -1609,19 +1637,20 @@ func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
 	}
 }
 
-// TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip states the
-// remaining depends_on residual as BEHAVIOUR rather than prose (#2237 fix-up).
+// TestApplyGrooming_SecondDependencyEdgeIsWrittenAdditively is the #2860 fix
+// stated as behaviour, replacing the residual this test used to pin.
 //
-// `ensureDependsOnMarker` writes a marker only when the body carries NONE — it
-// never merges a second ref into an existing line — so a second approved edge
-// out of the same item is settled by the PROVIDER's skip, not by the core's
-// idempotence diff, and it re-dispatches on every apply. That is defence in
-// depth working: no duplicate write ever reaches the tracker (the body still
-// carries exactly one marker line). The cost is a redundant round trip and an
-// audit row reading `depends_on marker already present` instead of
-// `already_applied`, which is why it is pinned here and stated in the README
-// residuals rather than left to be rediscovered.
-func TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip(t *testing.T) {
+// BEFORE: `ensureDependsOnMarker` wrote a marker only when the body carried
+// NONE, so every SECOND approved edge out of the same item was refused by the
+// provider and audited as `depends_on marker already present` — a refusal
+// indistinguishable from an idempotent no-op, which is how an 0/8 apply rate
+// went unnoticed across three grooming walks.
+//
+// NOW: the second edge is MERGED into the existing marker line and is APPLIED.
+// A re-apply then settles BOTH edges by the CORE's membership diff
+// (`already_applied`) with ZERO further dispatch — the AC7 zero-dispatch
+// property, reached through membership rather than through a provider refusal.
+func TestApplyGrooming_SecondDependencyEdgeIsWrittenAdditively(t *testing.T) {
 	first := dependencyEntry(1, 5)
 	second := dependencyEntry(1, 6)
 	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{first, second}}
@@ -1640,12 +1669,19 @@ func TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip(t *testing
 	if err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	if rec := recordFor(t, res, first.ID); rec.Outcome != GroomingOutcomeApplied {
-		t.Errorf("first edge = %+v, want applied", rec)
+	for _, e := range []plan.DependencyEdge{first, second} {
+		if rec := recordFor(t, res, e.ID); rec.Outcome != GroomingOutcomeApplied {
+			t.Errorf("edge %s outcome=%q reason=%q, want applied — the second edge is no longer refused",
+				e.ID, rec.Outcome, rec.SkipReason)
+		}
 	}
-	if rec := recordFor(t, res, second.ID); rec.Outcome != GroomingOutcomeSkipped ||
-		rec.SkipReason != "depends_on marker already present" {
-		t.Errorf("second edge outcome=%q reason=%q, want the PROVIDER skip", rec.Outcome, rec.SkipReason)
+	// ONE marker line carrying BOTH refs: additive, not double-stamped.
+	body := forge.items["#1"].Body
+	if got := countMarkerLines(body, "Depends on:"); got != 1 {
+		t.Errorf("#1 carries %d depends-on marker lines, want exactly 1 — body: %q", got, body)
+	}
+	if !strings.Contains(body, "Depends on: #5, #6") {
+		t.Errorf("second ref was not merged into the marker line — body: %q", body)
 	}
 
 	forge.calls = nil
@@ -1653,17 +1689,15 @@ func TestApplyGrooming_SecondDependencyEdgeIsSettledByTheProviderSkip(t *testing
 	if err != nil {
 		t.Fatalf("re-apply: %v", err)
 	}
-	// The FIRST edge is now settled by the core diff — that is the membership
-	// observation working, and it must not regress to a provider skip.
-	if rec := recordFor(t, res, first.ID); rec.SkipReason != GroomingSkipAlreadyApplied {
-		t.Errorf("first edge re-apply reason = %q, want %q", rec.SkipReason, GroomingSkipAlreadyApplied)
+	for _, e := range []plan.DependencyEdge{first, second} {
+		rec := recordFor(t, res, e.ID)
+		if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipAlreadyApplied {
+			t.Errorf("edge %s re-apply outcome=%q reason=%q, want skipped/%s",
+				e.ID, rec.Outcome, rec.SkipReason, GroomingSkipAlreadyApplied)
+		}
 	}
-	if len(forge.calls) != 1 || forge.calls[0].EntryID != second.ID {
-		t.Fatalf("re-apply dispatched %+v, want exactly the SECOND edge (the stated residual)", forge.calls)
-	}
-	// The residual is bounded: no duplicate write landed.
-	if got := countMarkerLines(forge.items["#1"].Body, "Depends on:"); got != 1 {
-		t.Errorf("#1 carries %d depends-on marker lines, want exactly 1 — body: %q", got, forge.items["#1"].Body)
+	if len(forge.calls) != 0 {
+		t.Fatalf("re-apply dispatched %+v, want ZERO — both edges are settled by the core membership diff", forge.calls)
 	}
 }
 
@@ -1683,12 +1717,12 @@ func TestGroomingNormalizeRef_LeavesNonRefsAlone(t *testing.T) {
 		{"#12x", "#12x"},
 	}
 	for _, tc := range cases {
-		if got := groomingNormalizeRef(tc.in); got != tc.want {
-			t.Errorf("groomingNormalizeRef(%q) = %q, want %q", tc.in, got, tc.want)
+		if got := NormalizeIssueRef(tc.in); got != tc.want {
+			t.Errorf("NormalizeIssueRef(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 	// The pair that must NOT collapse, stated as behaviour rather than shape.
-	if groomingNormalizeRef("1437") == groomingNormalizeRef("1438") {
+	if NormalizeIssueRef("1437") == NormalizeIssueRef("1438") {
 		t.Error("normalization collapsed two different issue numbers")
 	}
 }
@@ -2159,7 +2193,7 @@ func TestDeriveGroomingMutations_LabelFixNamesEveryLabel(t *testing.T) {
 // validator against BOTH forms the schema admits — a bare `389` and a hashed
 // `#389` (approval condition C4) — and against the prose shapes that must not
 // dispatch. The validator is explicit rather than delegated to
-// groomingNormalizeRef, which returns an unparseable value UNCHANGED and would
+// NormalizeIssueRef, which returns an unparseable value UNCHANGED and would
 // therefore hand `Link as a sub-issue of E22 #389.` straight to the forge.
 func TestDeriveGroomingMutations_EpicFixAcceptsBothWireForms(t *testing.T) {
 	cases := []struct {
@@ -2974,5 +3008,184 @@ func TestLabelsSetDelegationTier(t *testing.T) {
 				t.Errorf("LabelsSetDelegationTier(%q) = %v, want %v", tc.labels, got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Refused outcome (#2860)
+// ---------------------------------------------------------------------------
+
+// TestApplyGrooming_ProviderRefusalIsNotASkip is the #2860 audit done-means: a
+// provider REFUSAL — a requested write that did not happen and left nothing
+// correct behind — must be observable as its own outcome, not folded into the
+// skipped bucket where it reads as benign idempotence.
+//
+// It asserts BOTH the count (bucketing happened) and that the entry ID SURVIVES
+// into Summary.RefusedIDs (approval condition 2): a count alone does not name
+// WHICH edges were refused, and not naming them is precisely why an 0/8 apply
+// rate went unnoticed for three grooming walks.
+func TestApplyGrooming_ProviderRefusalIsNotASkip(t *testing.T) {
+	entry := hygieneEntry(1, "missing_estimate", "5")
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{entry}}
+	mut := &fakeGroomingMutator{result: &GroomingMutationResult{
+		Refused: true, RefuseReason: "not on board", ProviderResponse: "#1 carries no card",
+	}}
+	sink := &fakeGroomingSink{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if got := len(res.Refused); got != 1 {
+		t.Fatalf("refused bucket has %d records, want 1 (result = %+v)", got, res)
+	}
+	if res.Summary.Refused != 1 || res.Summary.Skipped != 0 || res.Summary.Applied != 0 {
+		t.Errorf("summary applied=%d skipped=%d refused=%d, want 0/0/1",
+			res.Summary.Applied, res.Summary.Skipped, res.Summary.Refused)
+	}
+	// Approval condition 2: the ENTRY ID, not just the count.
+	if len(res.Summary.RefusedIDs) != 1 || res.Summary.RefusedIDs[0] != entry.ID {
+		t.Errorf("Summary.RefusedIDs = %q, want [%q]", res.Summary.RefusedIDs, entry.ID)
+	}
+	rec := recordFor(t, res, entry.ID)
+	if rec.Outcome != GroomingOutcomeRefused {
+		t.Errorf("outcome = %q, want %q", rec.Outcome, GroomingOutcomeRefused)
+	}
+	if rec.RefuseReason != "not on board" {
+		t.Errorf("RefuseReason = %q, want %q", rec.RefuseReason, "not on board")
+	}
+	if rec.SkipReason != "" {
+		t.Errorf("SkipReason = %q, want empty — a refusal is not a skip", rec.SkipReason)
+	}
+	if rec.ProviderResponse != "#1 carries no card" {
+		t.Errorf("ProviderResponse = %q", rec.ProviderResponse)
+	}
+	// The refusal reaches the AUDIT, both per-mutation and in the summary.
+	if len(sink.summaries) != 1 || sink.summaries[0].Refused != 1 ||
+		len(sink.summaries[0].RefusedIDs) != 1 || sink.summaries[0].RefusedIDs[0] != entry.ID {
+		t.Errorf("audited summary = %+v, want refused=1 with the entry id", sink.summaries)
+	}
+}
+
+// TestApplyGrooming_MalformedResultFailsForEachRejectedCombination names ONE
+// case per rejected (Applied, Skipped, Refused) combination — not the happy
+// path plus a subset. Each must record FAILED with an error naming ALL THREE
+// booleans, because the message is what an operator reads to tell which
+// provider misreported.
+func TestApplyGrooming_MalformedResultFailsForEachRejectedCombination(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  *GroomingMutationResult
+	}{
+		{"all false (zero value)", &GroomingMutationResult{}},
+		{"applied+skipped", &GroomingMutationResult{Applied: true, Skipped: true}},
+		{"applied+refused", &GroomingMutationResult{Applied: true, Refused: true}},
+		{"skipped+refused", &GroomingMutationResult{Skipped: true, Refused: true}},
+		{"all true", &GroomingMutationResult{Applied: true, Skipped: true, Refused: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := hygieneEntry(1, "missing_estimate", "5")
+			report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{entry}}
+			mut := &fakeGroomingMutator{result: tc.res}
+			res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, &fakeGroomingSink{},
+				GroomingApplyRequest{
+					Target:    groomingTarget(),
+					Report:    report,
+					Decisions: approveAll(report),
+					Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+					States:    groomingStates(),
+				})
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			rec := recordFor(t, res, entry.ID)
+			if rec.Outcome != GroomingOutcomeFailed {
+				t.Fatalf("outcome = %q, want %q (record %+v)", rec.Outcome, GroomingOutcomeFailed, rec)
+			}
+			for _, want := range []string{
+				fmt.Sprintf("applied=%t", tc.res.Applied),
+				fmt.Sprintf("skipped=%t", tc.res.Skipped),
+				fmt.Sprintf("refused=%t", tc.res.Refused),
+				"exactly one must be true",
+			} {
+				if !strings.Contains(rec.Error, want) {
+					t.Errorf("error %q does not name %q", rec.Error, want)
+				}
+			}
+		})
+	}
+}
+
+// TestApplyGrooming_ManualPlacementGuardIsRefusedNotSkipped pins the CORE's
+// pre-dispatch placement guard. It is the SAME refusal the provider makes in
+// its own defence-in-depth re-check, decided one layer earlier, and the two
+// must agree in the audit — otherwise the outcome would depend on which layer
+// happened to notice first.
+func TestApplyGrooming_ManualPlacementGuardIsRefusedNotSkipped(t *testing.T) {
+	entry := hygieneEntry(1, "unboarded", CanonicalStateBacklog)
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{entry}}
+	// The card sits at a column OUTSIDE the expected source set: a human put it
+	// there, so the move is declined.
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", OnBoard: true, BoardColumn: "In Progress"},
+	}}
+	mut := &fakeGroomingMutator{}
+	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := recordFor(t, res, entry.ID)
+	if rec.Outcome != GroomingOutcomeRefused || rec.RefuseReason != GroomingSkipManualPlacementPreserved {
+		t.Errorf("outcome=%q refuse_reason=%q skip_reason=%q, want refused/%s",
+			rec.Outcome, rec.RefuseReason, rec.SkipReason, GroomingSkipManualPlacementPreserved)
+	}
+	if res.Summary.Refused != 1 || len(res.Summary.RefusedIDs) != 1 || res.Summary.RefusedIDs[0] != entry.ID {
+		t.Errorf("summary refused=%d ids=%q, want 1 and [%q]", res.Summary.Refused, res.Summary.RefusedIDs, entry.ID)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("dispatched %v, want ZERO — the guard refuses BEFORE dispatch", mut.kinds())
+	}
+}
+
+// TestNormalizeIssueRef_IsTheOnlyNormalizer states the SHARED-normalizer
+// property #2860 turns on: one exported function decides the emitted ref SHAPE,
+// named by both `workmgmt` and `workmgmt/github`. A second copy in either layer
+// — even one believed to agree — would rebuild the two-layers-disagree defect
+// one level down.
+//
+// The non-numeric rows are the discriminating ones: a normalizer that
+// unconditionally prefixed `#` would map `owner/repo#123` and `#owner/repo#123`
+// onto ONE value, so the layer that writes and the layer that reads would
+// silently disagree about membership.
+func TestNormalizeIssueRef_IsTheOnlyNormalizer(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"1437", "#1437"},
+		{"#1437", "#1437"},
+		{"owner/repo#123", "owner/repo#123"},
+		{"#owner/repo#123", "#owner/repo#123"},
+		{"", ""},
+		{"   ", ""},
+		{"#", "#"},
+	} {
+		if got := NormalizeIssueRef(tc.in); got != tc.want {
+			t.Errorf("NormalizeIssueRef(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if NormalizeIssueRef("1437") == NormalizeIssueRef("1438") {
+		t.Error("normalization collapsed two different issue numbers")
+	}
+	if NormalizeIssueRef("owner/repo#123") == NormalizeIssueRef("#owner/repo#123") {
+		t.Error("normalization collapsed two different non-numeric refs — the two-normalizer defect")
 	}
 }
