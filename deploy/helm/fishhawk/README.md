@@ -64,7 +64,7 @@ Empty keys are omitted to match fishhawkd's ignore-if-unset semantics.
 | Value | ConfigMap key | Notes |
 |---|---|---|
 | `config.oauthClientId` | `FISHHAWKD_OAUTH_CLIENT_ID` | the PUBLIC half of the OAuth sign-in trio (not a secret) and its ENABLEMENT SIGNAL: set it and `FISHHAWKD_OAUTH_CLIENT_SECRET` becomes required AND the ingress-derived callback URL renders; empty → OAuth off (see "OAuth trio" below) |
-| `config.extraEnv` | *(map, verbatim)* | escape hatch — a map of NON-SECRET `FISHHAWKD_*` name → value merged into the ConfigMap for any key the chart has no dedicated field for; a collision with a chart-managed key or an invalid env identifier fails the render (`fishhawk.validateExtraEnv`); values are coerced to strings; NEVER put secrets here |
+| `config.extraEnv` | *(map, verbatim)* | escape hatch — a map of NON-SECRET `FISHHAWKD_*` name → value merged into the ConfigMap for any key the chart has no dedicated field for; values are coerced to strings. `fishhawk.validateExtraEnv` fails the render on a collision with a chart-managed key, an invalid env identifier, **or a known SECRET-bearing key** (any `fishhawk.secretKeySpec` key such as `FISHHAWKD_OAUTH_CLIENT_SECRET`) — the ConfigMap is readable by anyone with `get configmaps`, so a secret routed here would leak in plaintext; supply secrets through the Secret (see below), never here |
 | `config.githubApiUrl` | `FISHHAWKD_GITHUB_API_URL` | GHES REST + App API base (E44.2 / [#1826](https://github.com/kuhlman-labs/fishhawk/issues/1826)); empty → `api.github.com` |
 | `config.githubUploadUrl` | `FISHHAWKD_GITHUB_UPLOAD_URL` | release-asset upload host |
 | `config.oauthAuthorizeUrl` | `FISHHAWKD_OAUTH_AUTHORIZE_URL` | GHES/EMU OAuth authorize URL |
@@ -103,7 +103,14 @@ mirrors that whole contract instead of encoding half of it:
   set the client id on a **non-ingress** install and the callback is empty, the
   message names BOTH ways out: set `config.oauthCallbackUrl` explicitly, **or**
   enable the ingress (`ingress.enabled` + `ingress.host`) that derives it as
-  `<scheme>://<host>/v0/auth/github/callback`.
+  `<scheme>://<host>/v0/auth/github/callback`. It runs **before**
+  `validateSecretContract` on purpose: setting only the client id leaves BOTH
+  the callback empty AND (since the id makes the client secret required) the
+  secret missing, so running the contract guard first would fail on the missing
+  secret and hide the callback remedy. Because the trio's empty-callback branch
+  fires only when the callback is empty, the operator sees the callback remedy
+  first; once the callback is reachable that branch is silent and the contract
+  guard owns the id-set-but-secret-missing message.
 - **What the guard can OBSERVE is mode-dependent.** In `chartManaged` it reads
   `secrets.values.oauthClientSecret`; in `externalSecrets` it reads the same
   `secrets.externalSecrets.data[].secretKey` field `validateSecretContract`

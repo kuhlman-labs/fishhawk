@@ -533,7 +533,13 @@ rather than two guards racing.
 {{- $mode := .Values.secrets.mode -}}
 {{- if eq $mode "chartManaged" -}}
 {{- $values := .Values.secrets.values | default dict -}}
-{{- if ne (toString (index $values "oauthClientSecret")) "" -}}{{- $secret = true -}}{{- end -}}
+{{- /* Truthiness, NOT `ne (toString …) ""`: `index` returns nil for an ABSENT
+       key (a null/empty secrets.values map), and `toString nil` is the literal
+       string "<nil>", which `ne … ""` would misread as a supplied secret and
+       fire branch (iii) falsely. `if index …` is false for both nil and the
+       empty string, so $secret is true only for a genuinely non-empty value —
+       the same nil-safe idiom validateSecretContract uses. */ -}}
+{{- if index $values "oauthClientSecret" -}}{{- $secret = true -}}{{- end -}}
 {{- else if eq $mode "externalSecrets" -}}
 {{- range .Values.secrets.externalSecrets.data -}}
 {{- if eq (toString .secretKey) "FISHHAWKD_OAUTH_CLIENT_SECRET" -}}{{- $secret = true -}}{{- end -}}
@@ -600,20 +606,32 @@ entry here reddens the gate. Consumed by fishhawk.validateExtraEnv.
 config.extraEnv guard (E69.4 / #2915). `include`d once from service.yaml. Ranges
 over config.extraEnv and `fail`s when a key is (i) not a valid env identifier
 (^[A-Za-z_][A-Za-z0-9_]*$ — a ConfigMap could carry it, but the pod's envFrom
-would silently skip it, so it would never reach fishhawkd) or (ii) collides with
+would silently skip it, so it would never reach fishhawkd), (ii) collides with
 a chart-managed key (fishhawk.managedConfigKeys) — a duplicate map key in the
 rendered ConfigMap data is resolved last-one-wins or rejected outright, either
-way silently discarding the operator's intent. Each message names the offending
-key and the way out.
+way silently discarding the operator's intent — or (iii) is a SECRET-bearing key
+the chart delivers via the Secret (fishhawk.secretKeySpec, the same source of
+truth validateSecretContract uses, so the two cannot drift). config.extraEnv is
+merged into the ConfigMap, which is readable by any principal with `get
+configmaps`; routing a known secret key (e.g. FISHHAWKD_OAUTH_CLIENT_SECRET)
+through it would write the value there in plaintext, defeating the Secret. Each
+message names the offending key and the way out.
 */}}
 {{- define "fishhawk.validateExtraEnv" -}}
 {{- $managed := fromYamlArray (include "fishhawk.managedConfigKeys" .) -}}
+{{- $secretKeys := list -}}
+{{- range fromYamlArray (include "fishhawk.secretKeySpec" .) -}}
+{{- $secretKeys = append $secretKeys (toString .secretKey) -}}
+{{- end -}}
 {{- range $k, $v := .Values.config.extraEnv -}}
 {{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $k) -}}
 {{- fail (printf "config.extraEnv key %q is not a valid environment variable identifier (must match ^[A-Za-z_][A-Za-z0-9_]*$): the pod's envFrom would skip it, so it would never reach fishhawkd. Rename it." $k) -}}
 {{- end -}}
 {{- if has $k $managed -}}
 {{- fail (printf "config.extraEnv key %q collides with a chart-managed ConfigMap key: the chart already renders it from its own values field, and a duplicate would be silently resolved last-one-wins. Remove it from config.extraEnv and set the chart value that owns it instead." $k) -}}
+{{- end -}}
+{{- if has $k $secretKeys -}}
+{{- fail (printf "config.extraEnv key %q is a SECRET-bearing key the chart delivers via the Secret, not the ConfigMap. config.extraEnv writes to the ConfigMap (readable by any principal with `get configmaps`), so putting a secret there would expose its value in plaintext. Supply it through the Secret instead: secrets.values.<field> (chartManaged), secrets.externalSecrets.data[] (externalSecrets), or the pre-created existingSecret — and remove it from config.extraEnv." $k) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
