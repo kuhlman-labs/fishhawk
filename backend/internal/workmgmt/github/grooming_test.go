@@ -1529,42 +1529,67 @@ func TestApplyGroomingMutation_SecondDependsOnEdgeIsWrittenThenSettles(t *testin
 }
 
 // TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericRefs
-// is the ONE-SHARED-NORMALIZER property driven end to end over bodies that
-// CARRY non-numeric refs — the shapes on which a second normalizer disagrees.
+// is the ONE-SHARED-NORMALIZER property asserted AT THE CORE/PROVIDER SEAM,
+// over the ref shapes on which a second normalizer disagrees.
 //
-// SCOPE NOTE, verified against the shipped code rather than assumed: a
-// non-numeric ref cannot be DISPATCHED through ApplyGrooming at all.
+// WHAT IS AND IS NOT REACHABLE, verified against the shipped code rather than
+// assumed. A non-numeric ref cannot be DISPATCHED through ApplyGrooming at all:
 // groomingResolveItemRef refuses a depends_on target outside the apply's repo
-// and emits `#N` for one inside it, so After.Scalar reaching the provider is
-// always bare-numeric. What IS reachable — and what actually broke — is a body
-// that already CARRIES a non-numeric ref (the filing path writes exactly those)
-// being read by both layers. Both must reach the same membership verdict over
-// it, or the core dispatches while the provider reports already-present.
+// and emits `#N` for one inside it, so the After.Scalar reaching the provider
+// is always bare-numeric. There is therefore no end-to-end apply whose OUTCOME
+// turns on how a non-numeric PROPOSAL normalizes, and a test asserting one
+// cannot be written. What IS reachable — and what actually broke — is a body
+// that already CARRIES non-numeric refs (the filing path writes exactly those)
+// being READ by both layers.
 //
-// A `#`-prefixing provider normalizer collapses `other/repo#1639` and
-// `#other/repo#1639` onto one value and mangles them into `#other/repo#1639`
-// on the way out; both rows below read the PERSISTED bytes, so that mutation
-// reddens on the body, not merely on a count.
+// So the seam this test pins is the MEMBERSHIP READ, on both sides of it, over
+// the same bytes:
+//
+//   - the CORE's observed ref set, taken end to end out of the real
+//     ApplyGrooming through the audited record's `Before.List` (which is what
+//     groomingSatisfied tests membership against); and
+//   - the PROVIDER's observed ref set, `dependsOnMarkerRefs`, which is what
+//     appendDependsOnRef tests membership against before it splices.
+//
+// Both are asserted against ONE hard-coded literal — not against each other
+// alone, and not against NormalizeIssueRef re-applied in the test, either of
+// which could agree on a wrong answer — and then against each other, which is
+// the seam claim itself.
+//
+// This is what makes the rows non-vacuous. Each seeded body carries BOTH
+// collapsible shapes of the same cross-repo ref, `other/repo#1639` and
+// `#other/repo#1639`. The rejected two-normalizer design — a provider-side
+// normalizer that unconditionally prefixes `#` — maps those two DISTINCT refs
+// onto the single value `#other/repo#1639`, so the provider's observed set
+// stops equalling the core's and both rows go red. The outcome and persisted-
+// body assertions alone would NOT catch that: the proposal is numeric, so the
+// core's verdict is unchanged, and the splice preserves the surrounding bytes.
 func TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericRefs(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		seededRefs  string
 		proposedRef string
-		wantOutcome workmgmt.GroomingOutcome
-		wantBody    string // "" means: byte-identical to the seeded body
+		// wantObserved is the normalized ref set BOTH layers must read out of
+		// the seeded body, spelled literally. The two non-numeric entries are
+		// distinct refs and must stay distinct.
+		wantObserved []string
+		wantOutcome  workmgmt.GroomingOutcome
+		wantBody     string // "" means: byte-identical to the seeded body
 	}{
 		{
-			name:        "numeric member of a mixed line is already applied",
-			seededRefs:  "other/repo#1639, #owner/repo#7, #2032",
-			proposedRef: "kuhlman-labs/fishhawk#2032",
-			wantOutcome: workmgmt.GroomingOutcomeSkipped,
+			name:         "numeric member of a mixed line is already applied",
+			seededRefs:   "other/repo#1639, #other/repo#1639, #2032",
+			proposedRef:  "kuhlman-labs/fishhawk#2032",
+			wantObserved: []string{"other/repo#1639", "#other/repo#1639", "#2032"},
+			wantOutcome:  workmgmt.GroomingOutcomeSkipped,
 		},
 		{
-			name:        "numeric non-member is appended BESIDE the non-numeric refs, unmangled",
-			seededRefs:  "other/repo#1639, #owner/repo#7",
-			proposedRef: "kuhlman-labs/fishhawk#2032",
-			wantOutcome: workmgmt.GroomingOutcomeApplied,
-			wantBody:    "## Summary\n\nDepends on: other/repo#1639, #owner/repo#7, #2032\n",
+			name:         "numeric non-member is appended BESIDE the non-numeric refs, unmangled",
+			seededRefs:   "other/repo#1639, #other/repo#1639",
+			proposedRef:  "kuhlman-labs/fishhawk#2032",
+			wantObserved: []string{"other/repo#1639", "#other/repo#1639"},
+			wantOutcome:  workmgmt.GroomingOutcomeApplied,
+			wantBody:     "## Summary\n\nDepends on: other/repo#1639, #other/repo#1639, #2032\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1578,6 +1603,26 @@ func TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericR
 				t.Fatalf("ApplyGrooming: %v", err)
 			}
 			rec := dependsOnRecord(t, res, entryID)
+
+			// THE SEAM. coreRefs is the core's membership set, produced by the
+			// REAL core inside the REAL apply; providerRefs is the provider's,
+			// over the SAME seeded bytes. A second normalizer in either layer
+			// separates them.
+			coreRefs := rec.Before.List
+			providerRefs := dependsOnMarkerRefs(seeded)
+			if !slices.Equal(coreRefs, tc.wantObserved) {
+				t.Errorf("CORE observed %q, want %q — the core normalized a non-numeric ref differently",
+					coreRefs, tc.wantObserved)
+			}
+			if !slices.Equal(providerRefs, tc.wantObserved) {
+				t.Errorf("PROVIDER observed %q, want %q — a second normalizer is deciding ref shape",
+					providerRefs, tc.wantObserved)
+			}
+			if !slices.Equal(coreRefs, providerRefs) {
+				t.Fatalf("the layers DISAGREE about membership over %q: core=%q provider=%q",
+					seeded, coreRefs, providerRefs)
+			}
+
 			if rec.Outcome != tc.wantOutcome {
 				t.Fatalf("outcome=%q skip=%q refuse=%q, want %q — the layers disagreed about membership",
 					rec.Outcome, rec.SkipReason, rec.RefuseReason, tc.wantOutcome)
