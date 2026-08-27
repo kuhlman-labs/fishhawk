@@ -130,6 +130,78 @@ explicitly instead. See [the migration doc](workflow-migration.md).
 The repo's own `.fishhawk/workflows.yaml` is intentionally NOT a preset
 mirror: it keeps `@kuhlman-labs` and `scripts/test verify`.
 
+### The forge-neutral self-modification guard
+
+The implement stage ships this `forbidden_paths` list (E45.31 / #2921;
+parent epic #1852):
+
+```yaml
+forbidden_paths:
+  - ".github/workflows/**"
+  - ".gitlab-ci.yml"
+  - ".gitlab/ci/**"
+  - ".fishhawk/**"
+  - "LICENSE"
+  - "NOTICE"
+```
+
+Two of those six guard the agent's own **execution**, and they are
+forge-neutral on purpose. `.github/workflows/**` covers the App-onboarded
+GitHub Actions workflow; `.gitlab-ci.yml` (plus `.gitlab/ci/**`) covers
+the GitLab pipeline the backend triggers. The onboarding templates
+document the two as each other's analogues —
+`backend/internal/onboarding/templates/fishhawk.yml` (installed as
+`.github/workflows/fishhawk.yml`) and
+`backend/internal/onboarding/templates/.gitlab-ci.yml` — so a GitLab
+repo scaffolded from a preset gets the same control surface a GitHub repo
+does at the same declared autonomy tier. Before #2921 it did not: only
+the GitHub entry point was listed, so a GitLab implement stage could
+rewrite the file that executes it.
+
+`.fishhawk/**` is the matching guard one level up: it protects the
+agent's own **governance** (the workflow spec that decides what the
+stage may do) as these two protect its own **execution**. `LICENSE` and
+`NOTICE` are neither, but are likewise not the agent's to edit.
+
+**Breadth: `.gitlab/ci/**`, not `.gitlab/**`.** GitLab's `include:`
+documentation uses `.gitlab/ci/*.yml` as the conventional location for
+local pipeline fragments, but `.gitlab/` as a whole also holds
+non-executing configuration — `.gitlab/issue_templates/`,
+`.gitlab/merge_request_templates/` — that an agent has legitimate reason
+to edit and that cannot execute it. Blocking those would make a
+scaffolded repo need an operator to *loosen* the preset for ordinary
+work, and a loosened preset is a blunter control than a precise one, for
+zero security gain. The decision is pinned, not merely commented: both
+template paths are MUST-NOT-BLOCK rows in
+`TestPresetForbiddenPathsBlockBothForgeEntryPoints` on both embed sides,
+so widening to `.gitlab/**` fails that test and has to be re-decided
+explicitly rather than drifting in.
+
+**Root anchoring.** `.gitlab-ci.yml` is a bare-filename pattern, and
+`doublestar.PathMatch` — the identical call the runner enforces with in
+`runner/internal/constraint/constraint.go` (`checkForbidden`) — matches
+it against the repository-root file ONLY, not a nested
+`sub/project/.gitlab-ci.yml`. That is intended rather than incidental:
+GitLab reads the pipeline definition from the repository root by default
+(the CI/CD configuration path is a project *setting*, not a repository
+convention), so a nested file of that name executes nothing. The claim is
+tested, not assumed — `sub/project/.gitlab-ci.yml` is a MUST-NOT-BLOCK
+row alongside the template paths.
+
+**Residual, stated rather than papered over.** No glob is complete here.
+A GitLab `include: local:` may reference ANY path in the repository, so a
+pipeline that delegates to a fragment outside `.gitlab/ci/` remains
+writable by the implement stage. The shipped scaffold shape is fully
+covered — `backend/internal/onboarding/templates/.gitlab-ci.yml` uses no
+`include:` at all — so this applies only to an operator who later adds
+one, and such an operator must extend the list. A preset is a starting
+document, not a finished policy.
+
+Note what this change does *not* touch: presets are copied into
+`.fishhawk/workflows.yaml` at `fishhawk init` / onboarding time, so
+already-scaffolded repositories keep whatever list they were seeded with.
+Only newly scaffolded repos pick up the two additional entries.
+
 ### Commented control-surface starters
 
 Each preset ships two **commented** control-surface starters under the
