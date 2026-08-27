@@ -22,6 +22,9 @@ data:
   {{- with (include "fishhawk.externalUrl" .) }}
   FISHHAWKD_EXTERNAL_URL: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.oauthClientId }}
+  FISHHAWKD_OAUTH_CLIENT_ID: {{ . | quote }}
+  {{- end }}
   {{- with (include "fishhawk.oauthCallbackUrl" .) }}
   FISHHAWKD_OAUTH_CALLBACK_URL: {{ . | quote }}
   {{- end }}
@@ -96,4 +99,13 @@ data:
   {{- end }}
   {{- with .Values.singleTenant.provider }}
   FISHHAWKD_SINGLE_TENANT_PROVIDER: {{ . | quote }}
+  {{- end }}
+  {{- /* config.extraEnv passthrough — any FISHHAWKD_* key the chart has no
+         dedicated field for. Validated by fishhawk.validateExtraEnv (included
+         from service.yaml): a collision with a chart-managed key or an invalid
+         env identifier fails the render. Values are coerced to strings because a
+         ConfigMap data value MUST be a string — an unquoted int/bool would
+         render an invalid manifest. */}}
+  {{- range $k, $v := .Values.config.extraEnv }}
+  {{ $k }}: {{ $v | toString | quote }}
   {{- end }}

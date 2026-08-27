@@ -179,9 +179,15 @@ fi
 #      Each bad state is seeded BY CONSTRUCTION in a values file, not by calling
 #      the guard in the setup, so the RED lands on the behavioural assertion.
 # ---------------------------------------------------------------------------
-# r2a chartManaged, a required field ABSENT from secrets.values.
+# r2a chartManaged, a required field ABSENT from secrets.values. config.oauthClientId
+# is set so FISHHAWKD_OAUTH_CLIENT_SECRET is REQUIRED (derived requiredness,
+# #2915) and this case still pins the absent-required-field failure rather than
+# passing because OAuth is off.
 cat > "$tmproot/r2a.yaml" <<'YAML'
 profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://r2a.example/v0/auth/github/callback"
 secrets:
   mode: chartManaged
   values:
@@ -198,6 +204,9 @@ assert_render_fails "r2a chartManaged, required secrets.values field ABSENT" \
 # distinct from r2a: present-but-empty must not pass.
 cat > "$tmproot/r2b.yaml" <<'YAML'
 profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://r2b.example/v0/auth/github/callback"
 secrets:
   mode: chartManaged
   values:
@@ -214,6 +223,9 @@ assert_render_fails "r2b chartManaged, required secrets.values field EMPTY STRIN
 # r2c externalSecrets, a required secretKey not covered by data[].
 cat > "$tmproot/r2c.yaml" <<'YAML'
 profile: prod
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://r2c.example/v0/auth/github/callback"
 secrets:
   mode: externalSecrets
   githubApp:
@@ -244,6 +256,8 @@ assert_render_fails "r2d existing, existingSecret empty" \
 
 # r2e the PEM record participates in the contract at all — the C7 defect was that
 # an env-keyed map had NO entry for the dotted PEM key, so it was never validated.
+# No oauthClientSecret and no client id: OAuth is entirely off, so validateOAuthTrio
+# is silent and the RED lands on the PEM contract, not an incidental partial trio.
 cat > "$tmproot/r2e.yaml" <<'YAML'
 profile: local
 secrets:
@@ -251,7 +265,6 @@ secrets:
   values:
     databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
     githubWebhookSecret: "w"
-    oauthClientSecret: "o"
     anthropicApiKey: "a"
     githubAppPrivateKey: ""
 YAML
@@ -378,6 +391,9 @@ assert_absent "r5 cell model API key is NOT in the ConfigMap" "$out" "FISHHAWKD_
 # other modes reject a cell profile that omits them.
 cat > "$tmproot/r5cell-cm.yaml" <<'YAML'
 profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://cell.example/v0/auth/github/callback"
 cell:
   homeRegion: us
   modelBaseUrl: https://inference.us.example
@@ -396,6 +412,9 @@ render -f "$tmproot/r5cell-cm.yaml"
 assert_render_fails "r5 cell profile, chartManaged missing FISHHAWKD_HANDOFF_SECRET" "FISHHAWKD_HANDOFF_SECRET"
 cat > "$tmproot/r5cell-es.yaml" <<'YAML'
 profile: prod
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://cell.example/v0/auth/github/callback"
 cell:
   homeRegion: us
   modelBaseUrl: https://inference.us.example
@@ -451,6 +470,9 @@ assert_contains "r5 local chartManaged Secret still carries the DB URL key" "$ou
 # required (r6's local profile renders); without it, it IS.
 cat > "$tmproot/r5db.yaml" <<'YAML'
 profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://db.example/v0/auth/github/callback"
 secrets:
   mode: chartManaged
   githubApp:
@@ -489,6 +511,9 @@ render -f "$tmproot/r5cell-es-ok.yaml"
 assert_render_ok "r6 cell profile, secrets.mode=externalSecrets"
 cat > "$tmproot/r6cell-cm.yaml" <<'YAML'
 profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://cell.example/v0/auth/github/callback"
 cell:
   homeRegion: us
   modelBaseUrl: https://inference.us.example
@@ -609,6 +634,418 @@ envblock=$(printf '%s' "$out" | awk '/Env keys \(delivered via envFrom\)/{f=1;ne
 assert_absent "r9 NOTES omits the cell handoff secret off a cell profile" "$envblock" "FISHHAWKD_HANDOFF_SECRET"
 assert_absent "r9 NOTES omits the cell model key off a cell profile" "$envblock" "FISHHAWKD_MODEL_API_KEY"
 assert_contains "r9 NOTES still lists the baseline required keys off a cell profile" "$envblock" "- FISHHAWKD_DATABASE_URL"
+
+# ---------------------------------------------------------------------------
+# r10 — THE OAUTH TRIO, POSITIVE + OFF POSTURE (E69.4 / #2915). fishhawkd
+#       enforces all-three-or-none (client id + client secret + callback URL,
+#       serve.go); the chart must configure the trio COMPLETELY or leave it
+#       entirely off. "It rendered" is not the criterion — assert the three
+#       halves land together in the shipped ConfigMap + Secret.
+# ---------------------------------------------------------------------------
+render -f "$CHART/values-local.yaml" --show-only templates/configmap.yaml
+assert_contains "r10 values-local ConfigMap carries FISHHAWKD_OAUTH_CLIENT_ID" "$out" \
+  'FISHHAWKD_OAUTH_CLIENT_ID: "dev-oauth-client-id"'
+assert_contains "r10 values-local ConfigMap carries the callback URL" "$out" \
+  'FISHHAWKD_OAUTH_CALLBACK_URL: "http://localhost:8080/v0/auth/github/callback"'
+render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+assert_contains "r10 values-local chartManaged Secret carries FISHHAWKD_OAUTH_CLIENT_SECRET" "$out" \
+  "FISHHAWKD_OAUTH_CLIENT_SECRET"
+# values-prod: id present, callback DERIVED from the host (the client-id gate is
+# what makes the callback derive at all).
+render -f "$CHART/values-prod.yaml" --show-only templates/configmap.yaml
+assert_contains "r10 values-prod ConfigMap carries FISHHAWKD_OAUTH_CLIENT_ID" "$out" \
+  'FISHHAWKD_OAUTH_CLIENT_ID: "substitute-your-oauth-client-id"'
+assert_contains "r10 values-prod derived callback matches the host" "$out" \
+  "FISHHAWKD_OAUTH_CALLBACK_URL: \"https://$PROD_HOST/v0/auth/github/callback\""
+
+# OFF posture: no client id + an ENABLED ingress renders NO client id and NO
+# callback (the client-id gate on the derivation), and renders SUCCESSFULLY with
+# secrets.values.oauthClientSecret ABSENT — the derived-requiredness
+# discriminator (a hardcoded `required: true` fails this render on the missing
+# secret; reverting the callback gate leaks a lone callback key here).
+cat > "$tmproot/r10-off.yaml" <<'YAML'
+profile: local
+ingress:
+  enabled: true
+  host: off.fishhawk.example
+  tls:
+    enabled: true
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r10-off.yaml"
+assert_render_ok "r10 OFF posture renders with no client id and no client secret (derived requiredness)"
+render -f "$tmproot/r10-off.yaml" --show-only templates/configmap.yaml
+assert_field_absent "r10 OFF posture emits no FISHHAWKD_OAUTH_CLIENT_ID" "$out" "FISHHAWKD_OAUTH_CLIENT_ID"
+assert_field_absent "r10 OFF posture emits no FISHHAWKD_OAUTH_CALLBACK_URL even with the ingress enabled" "$out" "FISHHAWKD_OAUTH_CALLBACK_URL"
+
+# ---------------------------------------------------------------------------
+# r11 — THE OAUTH TRIO, ONE CASE PER NAMED FAILURE MODE. Each partial
+#       combination is seeded BY CONSTRUCTION and asserts BOTH a non-zero exit
+#       AND the guard's named message, so a render failing for an unrelated
+#       reason cannot green it.
+# ---------------------------------------------------------------------------
+# r11a id set + callback empty (ingress off, no explicit callback) -> validateOAuthTrio (i).
+cat > "$tmproot/r11a.yaml" <<'YAML'
+profile: local
+config:
+  oauthClientId: "cid"
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11a.yaml"
+assert_render_fails "r11a id set + callback empty is rejected" \
+  "config.oauthClientId is set but the OAuth callback URL is empty"
+# Binding condition 3: the message must name BOTH ways out.
+assert_render_fails "r11a message names the explicit-callback route" "set config.oauthCallbackUrl"
+assert_render_fails "r11a message names the ingress-derivation route" "enable the ingress"
+
+# r11b explicit callback set + id empty (existing mode) -> validateOAuthTrio (ii).
+# Also the risk-note case: existing mode + explicit callback + no id must fail.
+cat > "$tmproot/r11b.yaml" <<'YAML'
+profile: prod
+config:
+  oauthCallbackUrl: "https://r11b.example/v0/auth/github/callback"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r11b.yaml"
+assert_render_fails "r11b explicit callback + id empty is rejected" "an OAuth callback URL is configured"
+assert_render_fails "r11b message names config.oauthClientId as the missing piece" "config.oauthClientId is empty"
+
+# r11c chartManaged secret supplied + id empty -> validateOAuthTrio (iii).
+cat > "$tmproot/r11c.yaml" <<'YAML'
+profile: local
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11c.yaml"
+assert_render_fails "r11c chartManaged secret supplied + id empty is rejected" "an OAuth client secret is supplied"
+
+# r11d externalSecrets data[] maps the secret + id empty -> validateOAuthTrio (iii).
+cat > "$tmproot/r11d.yaml" <<'YAML'
+profile: prod
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+      - secretKey: FISHHAWKD_OAUTH_CLIENT_SECRET
+        remoteRef: {key: fishhawk/oauth}
+YAML
+render -f "$tmproot/r11d.yaml"
+assert_render_fails "r11d externalSecrets data[] maps the secret + id empty is rejected" "an OAuth client secret is supplied"
+
+# r11e id set + chartManaged secret ABSENT -> validateSecretContract's DERIVED
+# requiredness (proving the derivation turns the secret requirement ON), NOT a
+# second trio branch. One message per condition.
+cat > "$tmproot/r11e.yaml" <<'YAML'
+profile: local
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://r11e.example/v0/auth/github/callback"
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11e.yaml"
+assert_render_fails "r11e id set + chartManaged secret absent -> validateSecretContract (derived requiredness)" \
+  "FISHHAWKD_OAUTH_CLIENT_SECRET"
+
+# r11f THE "JUST THE CLIENT ID" PATH (#2915 binding condition 3 + the untested-edge
+# concern). Only config.oauthClientId is set: callback empty (no ingress, no
+# explicit callback) AND the client secret ABSENT (the id makes it required). Both
+# validateOAuthTrio branch (i) AND validateSecretContract would fire; the guards
+# must be ORDERED so the operator sees the CALLBACK remedy (naming both routes),
+# not the secret-contract message. validateOAuthTrio runs before
+# validateSecretContract in service.yaml precisely for this case. Asserting the
+# trio message is present (helm `fail` halts at the first, so only one message
+# reaches stderr) proves the trio guard won the ordering.
+cat > "$tmproot/r11f.yaml" <<'YAML'
+profile: local
+config:
+  oauthClientId: "cid"
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11f.yaml"
+assert_render_fails "r11f just-client-id surfaces the callback remedy, not the secret-contract failure" \
+  "config.oauthClientId is set but the OAuth callback URL is empty"
+assert_render_fails "r11f just-client-id message names the explicit-callback route" "set config.oauthCallbackUrl"
+assert_render_fails "r11f just-client-id message names the ingress-derivation route" "enable the ingress"
+# And the secret-contract message is NOT what surfaced (proves the ordering, not
+# just that SOME guard fired). Without the reorder this would be the message.
+assert_absent "r11f the secret-contract message did NOT pre-empt the callback remedy" "$err" \
+  "requires a non-empty secrets.values.oauthClientSecret"
+
+# r11g THE EXPLICIT-NULL OAUTH-OFF EDGE (untested-edge concern, #2915). An
+# operator who writes `config.oauthClientId: null` (or `--set config.oauthClientId=null`)
+# means OAuth OFF — the same posture configmap.yaml and fishhawk.oauthCallbackUrl
+# already give a null id. Without the `| default ""` normalization in
+# fishhawk.secretKeySpec + fishhawk.validateOAuthTrio, `toString nil` is "<nil>",
+# which reads as OAuth-ON: the client secret is marked required and validateOAuthTrio
+# branch (i) fires, so the render FAILS on a secret nothing emits. With it the
+# render succeeds and NO client-id key is emitted. Deleting either `| default ""`
+# reddens this case.
+cat > "$tmproot/r11g.yaml" <<'YAML'
+profile: local
+config:
+  oauthClientId: null
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r11g.yaml"
+assert_render_ok "r11g explicit-null oauthClientId is treated as OAuth-off and renders (no secret required, trio silent)"
+render -f "$tmproot/r11g.yaml" --show-only templates/configmap.yaml
+assert_field_absent "r11g explicit-null oauthClientId emits no FISHHAWKD_OAUTH_CLIENT_ID" "$out" "FISHHAWKD_OAUTH_CLIENT_ID"
+
+# ---------------------------------------------------------------------------
+# r12 — config.extraEnv passthrough + its three guards + the ANTI-DRIFT loop.
+# ---------------------------------------------------------------------------
+# A passthrough key renders verbatim in the ConfigMap (r5 already proves envFrom
+# delivers the whole ConfigMap to the pod). Values are coerced to strings.
+render --set config.extraEnv.FISHHAWKD_CUSTOM_THING=hello \
+       --set config.extraEnv.FISHHAWKD_NUMERIC=5 \
+       --set config.extraEnv.FISHHAWKD_BOOL=true \
+       --show-only templates/configmap.yaml
+assert_render_ok "r12 extraEnv passthrough renders"
+assert_contains "r12 extraEnv string value renders verbatim" "$out" 'FISHHAWKD_CUSTOM_THING: "hello"'
+assert_contains "r12 extraEnv numeric value is coerced to a quoted string" "$out" 'FISHHAWKD_NUMERIC: "5"'
+assert_contains "r12 extraEnv bool value is coerced to a quoted string" "$out" 'FISHHAWKD_BOOL: "true"'
+# helm lint the passthrough so the coercion is proven against the linter too.
+if lint_out=$("$(command -v helm)" lint "$CHART" --set config.extraEnv.FISHHAWKD_NUMERIC=5 2>&1); then
+  pass "r12 helm lint accepts a numeric extraEnv value (coerced to a string)"
+else
+  fail "r12 helm lint rejected a numeric extraEnv value: $(printf '%s' "$lint_out" | tail -3)"
+fi
+
+# r12a a key colliding with a chart-managed key fails, naming the key.
+render --set config.extraEnv.FISHHAWKD_ADDR=x
+assert_render_fails "r12a extraEnv key colliding with a chart-managed key is rejected" "FISHHAWKD_ADDR"
+assert_render_fails "r12a collision message says so" "collides with a chart-managed ConfigMap key"
+
+# r12b a key that is not a valid env identifier fails, naming the rule.
+cat > "$tmproot/r12b.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    "1INVALID": "x"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12b.yaml"
+assert_render_fails "r12b extraEnv key that is not a valid identifier is rejected" "1INVALID"
+assert_render_fails "r12b invalid-identifier message names the rule" "not a valid environment variable identifier"
+
+# r12c a SECRET-bearing key routed through config.extraEnv is rejected (#2915
+# security concern): FISHHAWKD_OAUTH_CLIENT_SECRET is a fishhawk.secretKeySpec key
+# but NOT a fishhawk.managedConfigKeys key, so the collision guard alone would let
+# it through and write the secret into the ConfigMap in plaintext. The fixture is
+# `existing` mode with a set existingSecret and no OAuth id/callback so the other
+# guards pass and the RED lands on validateExtraEnv, not an unrelated failure.
+cat > "$tmproot/r12c.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_OAUTH_CLIENT_SECRET: "leak-me"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12c.yaml"
+assert_render_fails "r12c extraEnv carrying a known secret key is rejected, naming the key" "FISHHAWKD_OAUTH_CLIENT_SECRET"
+assert_render_fails "r12c secret-key message says it is delivered via the Secret" "SECRET-bearing key the chart delivers via the Secret"
+# The leaked value must NOT appear in the rendered output — the render failed, so
+# nothing rendered, but assert the value never reached stdout regardless.
+assert_absent "r12c the secret value never renders into the ConfigMap" "$out" "leak-me"
+
+# r12d an UNMAPPED secret-shaped key is rejected by the SUFFIX guard (#2915,
+# operator-authored). r12c above only covers keys the chart already knows via
+# fishhawk.secretKeySpec — but config.extraEnv exists precisely for the keys it
+# does NOT know, so that deny-list is structurally the wrong population. The
+# concrete case: the chart has no field for FISHHAWKD_GITLAB_* (#2922), which
+# routes an operator straight to this escape hatch holding a client secret.
+# COUNTERFACTUAL: delete the suffix `range` in fishhawk.validateExtraEnv and this
+# render SUCCEEDS with FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET: "leak-me-too" in the
+# ConfigMap. Verified by execution, not reasoned.
+cat > "$tmproot/r12d.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET: "leak-me-too"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12d.yaml"
+assert_render_fails "r12d extraEnv carrying an unmapped secret-shaped key is rejected, naming the key" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+assert_render_fails "r12d suffix message names the matched suffix" "ends in \"_SECRET\""
+assert_absent "r12d the unmapped secret value never renders into the ConfigMap" "$out" "leak-me-too"
+
+# r12e the suffix guard must NOT false-positive on an ordinary non-secret key.
+# Bare "_KEY" is deliberately absent from the suffix list because it matches
+# names like a partition or sort key; "_PRIVATE_KEY"/"_API_KEY" carry the same
+# signal without that cost. This case is what stops a later widening to "_KEY"
+# from landing silently.
+cat > "$tmproot/r12e.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_PARTITION_KEY: "p1"
+    FISHHAWKD_SOME_FLAG: "on"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12e.yaml"
+assert_render_ok "r12e an ordinary _KEY-suffixed non-secret key still renders"
+assert_contains "r12e the non-secret key reaches the ConfigMap" "$out" "FISHHAWKD_PARTITION_KEY"
+
+# ANTI-DRIFT (binding condition 4): the fixture enables an ingress AND sets a
+# client id so the DERIVED keys (FISHHAWKD_OAUTH_CLIENT_ID / _CALLBACK_URL /
+# _EXTERNAL_URL) are in the emitted set — otherwise the loop under-covers exactly
+# the keys this change adds. Render the all-config-keys ConfigMap, extract every
+# emitted FISHHAWKD_* key at KEY position (a comment naming a key must not count),
+# and assert `--set config.extraEnv.<KEY>=x` collides for EACH. A key added to
+# configmap.yaml without a fishhawk.managedConfigKeys entry reddens this loop.
+cat > "$tmproot/r12-allkeys.yaml" <<'YAML'
+profile: local
+ingress:
+  enabled: true
+  host: allkeys.fishhawk.example
+  tls:
+    enabled: true
+config:
+  addr: ":8080"
+  s3Region: "us-east-1"
+  s3Endpoint: "http://m:9000"
+  s3Bucket: "b"
+  oauthClientId: "cid"
+  oauthRedirectAfterLogin: "/"
+  oidcAudience: "aud"
+  oidcJwksUrl: "https://jwks.example"
+  githubAppId: "1"
+  planReviewModel: "m"
+  budgetTimezone: "UTC"
+  githubApiUrl: "https://a/api/v3"
+  githubUploadUrl: "https://a/uploads"
+  oauthAuthorizeUrl: "https://a/authorize"
+  oauthTokenUrl: "https://a/token"
+  oauthUserUrl: "https://a/user"
+  oauthOrgsUrl: "https://a/orgs"
+cell:
+  homeRegion: us
+  modelBaseUrl: "https://inf.example"
+singleTenant:
+  accountKey: acme
+  granularity: enterprise
+  autoJoinRole: member
+  displayName: Acme
+  provider: github
+secrets:
+  mode: chartManaged
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    oauthClientSecret: "o"
+    anthropicApiKey: "a"
+    awsAccessKeyId: "ak"
+    awsSecretAccessKey: "sk"
+    githubAppPrivateKey: "pem"
+    handoffSecret: "h"
+    modelApiKey: "mk"
+YAML
+render -f "$tmproot/r12-allkeys.yaml" --show-only templates/configmap.yaml
+assert_render_ok "r12 all-config-keys fixture renders"
+emitted_keys=$(printf '%s' "$out" | grep -oE '^[[:space:]]*FISHHAWKD_[A-Z0-9_]+:' | sed 's/[[:space:]:]//g' | sort -u)
+# Sanity (binding condition 4): the derived keys this change adds MUST be in the
+# emitted set, or the loop below silently under-covers them.
+assert_contains "r12 anti-drift fixture emits the derived FISHHAWKD_OAUTH_CLIENT_ID" "$emitted_keys" "FISHHAWKD_OAUTH_CLIENT_ID"
+assert_contains "r12 anti-drift fixture emits the derived FISHHAWKD_OAUTH_CALLBACK_URL" "$emitted_keys" "FISHHAWKD_OAUTH_CALLBACK_URL"
+drift_ok=1
+while IFS= read -r k; do
+  [ -n "$k" ] || continue
+  render -f "$tmproot/r12-allkeys.yaml" --set "config.extraEnv.$k=x"
+  if [ "$status" -eq 0 ]; then
+    fail "r12 anti-drift: config.extraEnv.$k did NOT collide (fishhawk.managedConfigKeys is missing $k)"
+    drift_ok=0
+  fi
+done <<< "$emitted_keys"
+if [ "$drift_ok" -eq 1 ]; then
+  pass "r12 anti-drift: every emitted FISHHAWKD_* key collides with config.extraEnv (managedConfigKeys is complete)"
+fi
+
+# ---------------------------------------------------------------------------
+# r13 — CROSS-BOUNDARY. The chart configures a SEPARATE binary, so pin the
+#       joint-validation claim to the contract it mirrors: fishhawkd reads
+#       FISHHAWKD_OAUTH_CLIENT_ID and enforces all-three-or-none at startup
+#       (serve.go). Same technique r1 uses for the callback path.
+# ---------------------------------------------------------------------------
+if grep -rqF "FISHHAWKD_OAUTH_CLIENT_ID" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r13 FISHHAWKD_OAUTH_CLIENT_ID is the env source fishhawkd reads"
+else
+  fail "r13 FISHHAWKD_OAUTH_CLIENT_ID not found in backend/cmd/fishhawkd/"
+fi
+if grep -rqF "must all be set" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r13 fishhawkd enforces the all-three-or-none OAuth refusal the chart mirrors"
+else
+  fail "r13 all-three-or-none OAuth refusal text not found in backend/cmd/fishhawkd/"
+fi
 
 echo
 echo "scripts/test-helm-render: $PASS passed, $FAIL failed"

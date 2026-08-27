@@ -63,6 +63,8 @@ Empty keys are omitted to match fishhawkd's ignore-if-unset semantics.
 
 | Value | ConfigMap key | Notes |
 |---|---|---|
+| `config.oauthClientId` | `FISHHAWKD_OAUTH_CLIENT_ID` | the PUBLIC half of the OAuth sign-in trio (not a secret) and its ENABLEMENT SIGNAL: set it and `FISHHAWKD_OAUTH_CLIENT_SECRET` becomes required AND the ingress-derived callback URL renders; empty → OAuth off (see "OAuth trio" below) |
+| `config.extraEnv` | *(map, verbatim)* | escape hatch — a map of NON-SECRET `FISHHAWKD_*` name → value merged into the ConfigMap for any key the chart has no dedicated field for; values are coerced to strings. `fishhawk.validateExtraEnv` fails the render on a collision with a chart-managed key, an invalid env identifier, **or a known SECRET-bearing key** (any `fishhawk.secretKeySpec` key such as `FISHHAWKD_OAUTH_CLIENT_SECRET`) — the ConfigMap is readable by anyone with `get configmaps`, so a secret routed here would leak in plaintext; supply secrets through the Secret (see below), never here |
 | `config.githubApiUrl` | `FISHHAWKD_GITHUB_API_URL` | GHES REST + App API base (E44.2 / [#1826](https://github.com/kuhlman-labs/fishhawk/issues/1826)); empty → `api.github.com` |
 | `config.githubUploadUrl` | `FISHHAWKD_GITHUB_UPLOAD_URL` | release-asset upload host |
 | `config.oauthAuthorizeUrl` | `FISHHAWKD_OAUTH_AUTHORIZE_URL` | GHES/EMU OAuth authorize URL |
@@ -80,6 +82,48 @@ while `accountKey` is empty makes fishhawkd REFUSE to start (naming the
 missing key) rather than degrade to hosted multi-tenant — a deployment
 with no admitting account is one nobody can sign in to. Operator guide:
 [docs/deploy/self-hosted.md](../../../docs/deploy/self-hosted.md).
+
+### OAuth trio: all three or none ([#2915](https://github.com/kuhlman-labs/fishhawk/issues/2915))
+
+GitHub OAuth sign-in is a three-part credential — **client id**
+(`config.oauthClientId`, public, in the ConfigMap), **client secret**
+(`FISHHAWKD_OAUTH_CLIENT_SECRET`, in the Secret), and **callback URL**
+(`config.oauthCallbackUrl` or the ingress derivation, in the ConfigMap).
+fishhawkd enforces all-three-or-none at startup: if any one is set they must
+all be, else it logs `oauth misconfigured` and exits (`serve.go`). The chart
+mirrors that whole contract instead of encoding half of it:
+
+- **`config.oauthClientId` is the enablement signal.** Set it and the client
+  secret becomes required (see the derived-requiredness note below) and the
+  ingress-derived callback URL renders. Leave it empty and OAuth is OFF —
+  fishhawkd serves `/v0/auth/github/*` as `503` rather than exiting, and the
+  client secret is not required.
+- **`fishhawk.validateOAuthTrio`** (included from `service.yaml`) fails the
+  render on every OBSERVABLE partial combination with a named message. If you
+  set the client id on a **non-ingress** install and the callback is empty, the
+  message names BOTH ways out: set `config.oauthCallbackUrl` explicitly, **or**
+  enable the ingress (`ingress.enabled` + `ingress.host`) that derives it as
+  `<scheme>://<host>/v0/auth/github/callback`. It runs **before**
+  `validateSecretContract` on purpose: setting only the client id leaves BOTH
+  the callback empty AND (since the id makes the client secret required) the
+  secret missing, so running the contract guard first would fail on the missing
+  secret and hide the callback remedy. Because the trio's empty-callback branch
+  fires only when the callback is empty, the operator sees the callback remedy
+  first; once the callback is reachable that branch is silent and the contract
+  guard owns the id-set-but-secret-missing message.
+- **What the guard can OBSERVE is mode-dependent.** In `chartManaged` it reads
+  `secrets.values.oauthClientSecret`; in `externalSecrets` it reads the same
+  `secrets.externalSecrets.data[].secretKey` field `validateSecretContract`
+  inspects (so the two cannot drift); in `existing` mode the chart can see
+  NOTHING about a pre-created Secret at render time (see "Why `existing` mode
+  has no render-time key check"), so it checks only the id/callback pair there.
+  The id-set-but-secret-missing case is produced by `validateSecretContract`
+  via derived requiredness, so there is one message per condition, not two
+  guards racing.
+- **Chart default is OAuth-off** (no ingress, no client id). `values-local`
+  ships a complete dev trio; `values-prod` / `values-cell` /
+  `values-single-tenant` ship a substitute-me client id (their enabled ingress
+  derives the callback and their `existing` Secret carries the client secret).
 
 ## Secrets ([#849](https://github.com/kuhlman-labs/fishhawk/issues/849))
 
@@ -121,7 +165,7 @@ env-keyed map had no home for it and silently left it unvalidated.
 |---|---|---|---|
 | `FISHHAWKD_DATABASE_URL` | `databaseUrl` | env (`envFrom`) | `postgres.enabled` is **false** |
 | `FISHHAWKD_GITHUB_WEBHOOK_SECRET` | `githubWebhookSecret` | env | always |
-| `FISHHAWKD_OAUTH_CLIENT_SECRET` | `oauthClientSecret` | env | always |
+| `FISHHAWKD_OAUTH_CLIENT_SECRET` | `oauthClientSecret` | env | `config.oauthClientId` is set (OAuth is a feature that can be off — see "OAuth trio") |
 | `FISHHAWKD_ANTHROPIC_API_KEY` | `anthropicApiKey` | env | always |
 | `AWS_ACCESS_KEY_ID` | `awsAccessKeyId` | env | `config.s3Bucket` is set |
 | `AWS_SECRET_ACCESS_KEY` | `awsSecretAccessKey` | env | `config.s3Bucket` is set |
@@ -133,6 +177,9 @@ Requiredness is **derived**, not hardcoded. A blanket "always required"
 would break the local profile: in-cluster Postgres supplies
 `FISHHAWKD_DATABASE_URL` through a container-level env entry that
 overrides `envFrom`, so the Secret key is genuinely optional there.
+`FISHHAWKD_OAUTH_CLIENT_SECRET` derives the same way (#2915): OAuth is a
+feature that can be off, so it is required only when `config.oauthClientId`
+is set — a blanket "always required" would refuse every OAuth-off deploy.
 
 Four consumers read that one spec and nothing else:
 `templates/secret.yaml` ranges it to render `chartManaged` keys,
@@ -422,6 +469,11 @@ rendered output — the credential-contract failure modes (one case per
 named mode), the migrate Job's timing and `restartPolicy`, the
 `envFrom` wiring across all three workload shapes plus the migrate Job,
 the derived ingress URLs, the Mode-1 half-configured fail-closed case,
+the OAuth-trio positive + OFF posture (r10) and one case per named
+`fishhawk.validateOAuthTrio` failure mode (r11), the `config.extraEnv`
+passthrough with its collision / identifier guards and an anti-drift
+loop pinning `fishhawk.managedConfigKeys` to the rendered ConfigMap
+(r12), a cross-boundary grep pinning the trio claim to `serve.go` (r13),
 and a render + lint of every profile. It **skips with a printed reason
 and exits 0** when `helm` is absent from PATH, so a helm-less host is
 not red-lined; the cost is honest — on such a host the chart is
@@ -514,6 +566,26 @@ Drill 4's schema observable is deliberately the same one
 cluster run checks the invariant the docs claim rather than the weaker
 `dirty`-plus-refusal.
 
+### chartManaged boot walk — OPERATOR GATE, not a sandbox check ([#2915](https://github.com/kuhlman-labs/fishhawk/issues/2915))
+
+That a `chartManaged` install with a complete OAuth trio actually BOOTS
+is not something the render gate or the default-deny acceptance sandbox
+can verify — it needs a live cluster. The operator walk is a concrete
+command, not "install it somewhere and check health":
+
+```sh
+scripts/dev k8s   # builds the image into Docker Desktop's shared store,
+                  # helm-installs with values-local.yaml, waits for the
+                  # rollout, port-forwards svc/fishhawk 8080:8080, and gates
+                  # on /healthz
+curl -fsS http://localhost:8080/healthz   # then probe health directly
+```
+
+`values-local.yaml` now ships a complete trio (client id +
+`chartManaged` client secret + explicit callback), so this produces a
+fishhawkd that starts rather than exiting at `oauth misconfigured`. This
+is an operator gate walked at merge, not part of `scripts/test verify`.
+
 ## Verify
 
 `values-local.yaml` is a localhost-flavored override that turns
@@ -532,6 +604,12 @@ helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-singl
 helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-cell.yaml           # ADR-057 Mode 2
 # confirm the credential contract fails a missing required key:
 helm template fishhawk deploy/helm/fishhawk --set secrets.mode=existing --set existingSecret=
+# confirm the OAuth trio guard fails each partial combination (all-three-or-none):
+helm template fishhawk deploy/helm/fishhawk --set config.oauthClientId=cid   # id without a callback
+helm template fishhawk deploy/helm/fishhawk --set config.oauthCallbackUrl=https://x/cb   # callback without an id
+# confirm the extraEnv guards fire on a collision and an invalid identifier:
+helm template fishhawk deploy/helm/fishhawk --set config.extraEnv.FISHHAWKD_ADDR=x   # collides
+helm template fishhawk deploy/helm/fishhawk --set config.extraEnv.9bad=x              # invalid identifier
 # confirm the migrate timing guard rejects a deadline that would win the race,
 # including the boundary case equal to the derived (lower-bound) figure:
 helm template fishhawk deploy/helm/fishhawk --set migrate.activeDeadlineSeconds=60

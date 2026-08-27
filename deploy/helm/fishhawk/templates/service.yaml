@@ -1,10 +1,24 @@
 {{- include "fishhawk.validateMode" . -}}
-{{- /* Credential-contract guard (E62.2 / #2301). service.yaml is the only
-       template that renders in EVERY topology mode AND every secrets mode,
-       which is why validateMode already lives here: deployment.yaml does not
-       render in split mode and secret.yaml does not render outside
-       chartManaged, so neither can host a guard that must always run. */}}
+{{- /* OAuth trio + credential-contract + extraEnv guards (E62.2 / #2301, E69.4 /
+       #2915) all live here for the same reason validateMode does: service.yaml
+       is the only template rendering in EVERY topology mode AND every secrets
+       mode, so a guard that must always run cannot live in deployment.yaml
+       (skipped in split mode) or secret.yaml (skipped outside chartManaged).
+
+       validateOAuthTrio runs BEFORE validateSecretContract on purpose (#2915):
+       an operator who sets ONLY config.oauthClientId on a non-ingress install
+       has BOTH an empty callback AND (since the id makes the client secret
+       required) a missing secret. Running the contract guard first would fail on
+       the missing FISHHAWKD_OAUTH_CLIENT_SECRET and the operator would never see
+       the callback remedy. validateOAuthTrio branch (i) fires only when the
+       callback is empty, so it speaks the more actionable message first (set
+       config.oauthCallbackUrl OR enable the ingress); once the callback is
+       reachable it is SILENT and validateSecretContract owns the
+       id-set-but-secret-missing case, so there is still one message per
+       condition, not two guards racing. */ -}}
+{{- include "fishhawk.validateOAuthTrio" . -}}
 {{- include "fishhawk.validateSecretContract" . -}}
+{{- include "fishhawk.validateExtraEnv" . -}}
 apiVersion: v1
 kind: Service
 metadata:

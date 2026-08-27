@@ -37,6 +37,11 @@ config:
   s3Endpoint: "http://fishhawk-minio:9000"
   s3Bucket: "fishhawk-traces"
   externalUrl: "http://localhost:5173"
+  # Dev OAuth client id — the PUBLIC enablement signal that completes the local
+  # trio (id here, client secret in secrets.values below, callback explicit). The
+  # local stack now renders a COMPLETE trio, so `scripts/dev k8s` produces a
+  # fishhawkd that boots. Not a real client id — replace for a real GitHub App.
+  oauthClientId: "dev-oauth-client-id"
   oauthCallbackUrl: "http://localhost:8080/v0/auth/github/callback"
   oauthRedirectAfterLogin: "http://localhost:5173/"
   oidcAudience: "fishhawkd-local"
