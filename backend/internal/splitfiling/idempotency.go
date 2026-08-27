@@ -25,6 +25,12 @@ const (
 	splitChildKeyNamespace = "fishhawk-split-child"
 	// splitCommentKeyNamespace namespaces the parent-comment keys.
 	splitCommentKeyNamespace = "fishhawk-split-comment"
+	// splitParentCloseKeyNamespace namespaces the parent-close linking-comment
+	// keys the E50.6 watcher stamps (#2062). It is deliberately DISTINCT from
+	// splitCommentKeyNamespace: the acceptance-carrier comment and the
+	// parent-close comment land on the same parent thread and must never dedup
+	// against each other.
+	splitParentCloseKeyNamespace = "fishhawk-split-parent-close"
 )
 
 // Comment kinds passed to SplitCommentKey. They are distinct so the acceptance
@@ -50,6 +56,26 @@ func SplitChildKey(runID string, phaseIndex int) string {
 // parent-thread comments this hook posts (see the CommentKind* constants).
 func SplitCommentKey(runID, kind string) string {
 	return workmgmt.MintIdempotencyKey(splitCommentKeyNamespace, runID, kind)
+}
+
+// ParentCloseCommentKey mints the deterministic idempotency key for the ONE
+// linking comment the parent-close watcher posts on a split parent before
+// closing it (#2062, E50.6).
+//
+// It takes NO RUN ID, deliberately asymmetric with [SplitCommentKey] above.
+// The watcher is driven by an `issues.closed` webhook and resolves its linkage
+// as a pure audit-payload read — it never resolves a run — so it must be able
+// to re-derive the EXACT key a prior delivery stamped from forge facts alone:
+// the parent's repository, the parent's issue number, and the contract child's
+// number. A run-keyed key would be underivable on that path, leaving the dedup
+// permanently inert and re-posting the comment on every redelivery.
+//
+// parentRepo is inside the digest, so the same (parent, child) numbers in a
+// DIFFERENT repository mint a different key — issue numbers are per-repo, and a
+// cross-repo collision must never look like an already-posted comment.
+func ParentCloseCommentKey(parentRepo string, parentIssue, contractChildNumber int) string {
+	return workmgmt.MintIdempotencyKey(splitParentCloseKeyNamespace, parentRepo,
+		strconv.Itoa(parentIssue), strconv.Itoa(contractChildNumber))
 }
 
 // StampComment returns body with the hidden idempotency marker for key
