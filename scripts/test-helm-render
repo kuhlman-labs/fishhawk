@@ -141,6 +141,11 @@ envfrom_ref() {
   '
 }
 
+# r1–r14 are the render/lint suite. When re-invoked as the r15e degraded-network
+# SELF-TEST (FISHHAWK_HELM_RENDER_SELFTEST=1), skip them and re-enter only the r15
+# registry block below — the self-test exercises the r15b sentinel skip branch and
+# must stay cheap (no re-render of the whole chart) and must not recurse.
+if [ -z "${FISHHAWK_HELM_RENDER_SELFTEST:-}" ]; then
 # ---------------------------------------------------------------------------
 # r1 — values-prod renders, carries no copy-paste caveat, and its DERIVED URLs
 #      and ingress wiring match the chosen hostname. "It rendered" is not the
@@ -1375,6 +1380,8 @@ else
   fail "r14o helm lint complete-GitLab fixture: $(printf '%s' "$lint_out" | tail -3)"
 fi
 
+fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)
+
 # ---------------------------------------------------------------------------
 # r15 — REGISTRY EXISTENCE of every third-party image the chart RENDERS (#2913).
 #       A rendered-output gate structurally CANNOT catch a nonexistent tag: the
@@ -1517,6 +1524,15 @@ else
   # so the token is empty and the probe short-circuits to indeterminate.
   assert_equals "r15a probe unreachable token endpoint -> indeterminate" \
     "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
+  # The MANIFEST-HEAD failure branch (the token twin): with the default auth
+  # endpoint the token fetch succeeds, then FISHHAWK_REGISTRY_URL=http://127.0.0.1:1
+  # refuses the HEAD, so `curl -I` reports 000 and the probe maps to indeterminate
+  # LIVE (not only via the pure classifier). This also confirms the `curl -I`
+  # exit-18 concern does not leak as a non-000 code. On an offline host the token
+  # fetch itself fails first, still yielding indeterminate, so the assertion holds
+  # either way.
+  assert_equals "r15a probe reachable auth + unreachable manifest endpoint -> indeterminate" \
+    "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
 
   # r15b THE SENTINEL / ANTI-VACUITY GUARD. Probe the known-bad ref from #2913 and
   # require `missing`. Anything else prints the reason and SKIPS the live checks,
@@ -1558,6 +1574,31 @@ else
       fail "r15d counterfactual FAILED to detect the nonexistent mc tag $SENTINEL_REF (the missing-detection branch is broken)"
     else
       assert_contains "r15d counterfactual: the detector reports the shipped-bug mc tag missing" "$r15d_missing" "$SENTINEL_REF"
+    fi
+  fi
+
+  # r15e THE END-TO-END DEGRADED-NETWORK RUN (verification concern). A normal run
+  # never exercises the r15b sentinel SKIP branch, because the sentinel classifies
+  # `missing` on a reachable registry. Re-exec the WHOLE harness with an
+  # unreachable auth endpoint so the sentinel classifies `indeterminate`, the r15b
+  # skip branch fires, and assert the complete harness STILL exits 0 while printing
+  # the skip reason — the degraded-network path must not red-line verify. The
+  # FISHHAWK_HELM_RENDER_SELFTEST flag makes the child skip r1–r14 and re-enter
+  # only this r15 block (so the self-exec is cheap and cannot recurse). The
+  # FISHHAWK_REGISTRY_* overrides carry no credentials beyond the anonymous pull
+  # token (scripts/README.md r15 row); they exist for exactly this skip-path test.
+  if [ -z "${FISHHAWK_HELM_RENDER_SELFTEST:-}" ]; then
+    selftest_out="$(FISHHAWK_HELM_RENDER_SELFTEST=1 FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 "$0" 2>&1)"
+    selftest_rc=$?
+    if [ "$selftest_rc" -eq 0 ]; then
+      pass "r15e degraded-network harness run (unreachable auth endpoint) exits 0"
+    else
+      fail "r15e degraded-network harness run should exit 0 (got rc=$selftest_rc): $(printf '%s' "$selftest_out" | tail -3)"
+    fi
+    if printf '%s' "$selftest_out" | grep -qF 'SKIPPING the live registry probes'; then
+      pass "r15e degraded-network run exercises the r15b sentinel skip branch (prints the skip reason)"
+    else
+      fail "r15e degraded-network run should print the r15b skip reason (got: $(printf '%s' "$selftest_out" | tail -3))"
     fi
   fi
 fi
