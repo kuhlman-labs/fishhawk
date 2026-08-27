@@ -1439,6 +1439,13 @@ _registry_probe() {
   local ref="$1"
   local auth_url="${FISHHAWK_REGISTRY_AUTH_URL:-https://auth.docker.io}"
   local base_url="${FISHHAWK_REGISTRY_URL:-https://registry-1.docker.io}"
+  # BOTH curls below carry --connect-timeout AND --max-time (overridable) so a
+  # degraded endpoint that ACCEPTS a connection but never responds cannot block
+  # the verify harness indefinitely (high untested-path concern, #2913): the max
+  # time bounds a post-connect stall, the connect timeout a pre-connect one. On a
+  # stall curl aborts with an empty body / code 000, which maps to indeterminate.
+  local ct="${FISHHAWK_REGISTRY_CONNECT_TIMEOUT:-10}"
+  local mt="${FISHHAWK_REGISTRY_MAX_TIME:-30}"
   case "$ref" in
     *@*) echo unsupported; return ;;   # digest-pinned
   esac
@@ -1456,11 +1463,11 @@ _registry_probe() {
     *)   repo="library/$repo" ;;           # official single-segment -> library/
   esac
   local token
-  token=$(curl -sS "$auth_url/token?service=registry.docker.io&scope=repository:${repo}:pull" 2>/dev/null \
+  token=$(curl -sS --connect-timeout "$ct" --max-time "$mt" "$auth_url/token?service=registry.docker.io&scope=repository:${repo}:pull" 2>/dev/null \
     | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
   if [ -z "$token" ]; then echo indeterminate; return; fi
   local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+  code=$(curl -sS --connect-timeout "$ct" --max-time "$mt" -o /dev/null -w '%{http_code}' -I \
     -H "Authorization: Bearer $token" \
     -H "Accept: application/vnd.oci.image.index.v1+json" \
     -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
@@ -1485,19 +1492,98 @@ _r15_extract_refs() {
 # `<ref> missing` for a DEFINITE 404, prints an indeterminate/unsupported ref as
 # a skip on stderr, and returns 1 iff at least one ref is missing. Deleting the
 # `missing` accumulation line reddens r15d (the counterfactual) while leaving
-# r15c green — the deletion-observed control.
+# r15c green — the deletion-observed control. It ALSO echoes a trailing
+# `__r15_exists__ <n>` line counting refs that positively probed `exists`, so r15c
+# can distinguish "every ref verified exists" from "every ref was SKIPPED
+# indeterminate" — the two outcomes its return-0 pass branch otherwise collapses
+# (low untested-path concern, #2913): a per-ref 429 rate-limit landing AFTER the
+# r15b sentinel passed would otherwise let r15c claim verification with zero refs
+# actually confirmed. The count is a distinct sentinel-prefixed stdout line, so
+# r15d's substring assertion on the missing ref is unaffected.
 _r15_probe_refs() {
-  local rendered="$1" r v found_missing=0
+  local rendered="$1" r v found_missing=0 exists=0
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     v="$(_registry_probe "$r")"
     case "$v" in
       missing) echo "$r missing"; found_missing=1 ;;
-      exists)  : ;;
+      exists)  exists=$((exists+1)) ;;
       *)       echo "r15: $r probed '$v' (registry unreachable/unsupported) — SKIPPING this ref" >&2 ;;
     esac
   done <<< "$(_r15_extract_refs "$rendered")"
+  echo "__r15_exists__ $exists"
   return "$found_missing"
+}
+
+# _r15_mock_server <mode> — TEST-ONLY fixture (high/low untested-path, #2913)
+# proving _registry_probe's curl --connect-timeout/--max-time actually bound a
+# stalled endpoint and deterministically exercising the manifest-HEAD failure
+# branch. Starts a localhost TCP server on an ephemeral port and echoes
+# "<port> <pid>"; returns 1 if python3 is absent or the port never materializes.
+# Modes:
+#   blackhole — accept every connection and NEVER respond for 20s (stalls the
+#               token curl; 20s >> the tests' timing threshold so a MISSING
+#               --max-time is observable as a slow return, not a silent pass).
+#   token-ok  — answer /token with a valid pull token, then STALL every other
+#               request for 20s (stalls the manifest HEAD live).
+# The server self-exits after 30s so a killed test never leaks a listener; callers
+# also kill the pid once done.
+_r15_mock_server() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  local mode="$1" portfile
+  portfile="$(mktemp "${TMPDIR:-/tmp}/fishhawk-r15-port.XXXXXX")" || return 1
+  # Detach the child's stdout/stderr from any capture pipe: this helper is called
+  # as `srv="$(_r15_mock_server ...)"`, and a backgrounded child that inherits the
+  # command-substitution pipe both wedges `$(...)` (it waits for pipe EOF) and can
+  # take a SIGPIPE when the substitution closes it. The port travels via the file.
+  python3 - "$mode" "$portfile" >/dev/null 2>&1 <<'PY' &
+import socket, sys, time
+mode, portfile = sys.argv[1], sys.argv[2]
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+with open(portfile, "w") as f:
+    f.write(str(srv.getsockname()[1])); f.flush()
+srv.settimeout(1)
+deadline = time.time() + 30
+while time.time() < deadline:
+    try:
+        conn, _ = srv.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        conn.settimeout(2)
+        try:
+            req = conn.recv(4096).decode("latin-1", "replace")
+        except OSError:
+            req = ""
+        if mode == "token-ok" and "/token" in req:
+            body = b'{"token":"r15stalltest"}'
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        else:
+            # STALL: never respond; hold the socket open so the caller's --max-time
+            # (not the peer closing) is what ends the request.
+            time.sleep(20)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+PY
+  local pid=$! port= i=0
+  while [ "$i" -lt 100 ]; do
+    port="$(cat "$portfile" 2>/dev/null || true)"
+    [ -n "$port" ] && break
+    sleep 0.05; i=$((i+1))
+  done
+  rm -f "$portfile"
+  if [ -z "$port" ]; then kill "$pid" 2>/dev/null || true; return 1; fi
+  printf '%s %s\n' "$port" "$pid"
 }
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -1534,6 +1620,79 @@ else
   assert_equals "r15a probe reachable auth + unreachable manifest endpoint -> indeterminate" \
     "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
 
+  # r15a STALL + DETERMINISTIC-MANIFEST branches (high + low untested-path, #2913).
+  # The 127.0.0.1:1 cases above REFUSE immediately, so they never exercise the
+  # accept-but-never-respond stall the timeouts exist to bound. These do — via a
+  # localhost mock listener — and assert the probe RETURNS PROMPTLY (well under the
+  # 20s server stall), which is what a present --max-time guarantees and a missing
+  # one would violate (the deletion-observed control). python3-guarded: absent →
+  # skip with a reason (honest residual, like the helm/curl-absent skips). Gated
+  # out of the r15e self-exec child so the self-test stays cheap.
+  if [ -z "${FISHHAWK_HELM_RENDER_SELFTEST:-}" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "scripts/test-helm-render: python3 absent — SKIPPING the r15a stall/deterministic-manifest tests (curl timeouts UNEXERCISED on this host)"
+    else
+      _r15_good_ref="minio/mc:RELEASE.2025-08-13T08-35-41Z"
+      # (1) TOKEN-curl stall: a blackhole auth endpoint that ACCEPTS but never
+      # responds. With --max-time the probe returns ~2s; without it, ~20s.
+      if _r15_bh="$(_r15_mock_server blackhole)"; then
+        _r15_bh_port="${_r15_bh%% *}"; _r15_bh_pid="${_r15_bh##* }"
+        _r15_t0=$(date +%s)
+        _r15_v="$(FISHHAWK_REGISTRY_MAX_TIME=2 FISHHAWK_REGISTRY_CONNECT_TIMEOUT=2 \
+              FISHHAWK_REGISTRY_AUTH_URL="http://127.0.0.1:$_r15_bh_port" \
+              _registry_probe "$_r15_good_ref")"
+        _r15_dt=$(( $(date +%s) - _r15_t0 ))
+        kill "$_r15_bh_pid" 2>/dev/null || true
+        assert_equals "r15a stalled token endpoint classifies indeterminate" "$_r15_v" "indeterminate"
+        if [ "$_r15_dt" -lt 10 ]; then
+          pass "r15a stalled token endpoint is bounded by curl --max-time (returned in ${_r15_dt}s < 10s)"
+        else
+          fail "r15a stalled token probe took ${_r15_dt}s — curl --max-time is not bounding the token fetch"
+        fi
+      else
+        echo "scripts/test-helm-render: r15a blackhole mock unavailable — SKIPPING the token-stall assertion"
+      fi
+      # (2) MANIFEST-curl stall: token-ok mock answers /token, then stalls the
+      # manifest HEAD. Proves the SECOND curl's --max-time bounds a post-connect
+      # stall (the token curl having succeeded first).
+      if _r15_tk="$(_r15_mock_server token-ok)"; then
+        _r15_tk_port="${_r15_tk%% *}"; _r15_tk_pid="${_r15_tk##* }"
+        _r15_auth="http://127.0.0.1:$_r15_tk_port"
+        _r15_t0=$(date +%s)
+        _r15_v="$(FISHHAWK_REGISTRY_MAX_TIME=2 FISHHAWK_REGISTRY_CONNECT_TIMEOUT=2 \
+              FISHHAWK_REGISTRY_AUTH_URL="$_r15_auth" FISHHAWK_REGISTRY_URL="$_r15_auth" \
+              _registry_probe "$_r15_good_ref")"
+        _r15_dt=$(( $(date +%s) - _r15_t0 ))
+        kill "$_r15_tk_pid" 2>/dev/null || true
+        assert_equals "r15a stalled manifest endpoint classifies indeterminate" "$_r15_v" "indeterminate"
+        if [ "$_r15_dt" -lt 10 ]; then
+          pass "r15a stalled manifest endpoint is bounded by curl --max-time (returned in ${_r15_dt}s < 10s)"
+        else
+          fail "r15a stalled manifest probe took ${_r15_dt}s — curl --max-time is not bounding the HEAD"
+        fi
+      else
+        echo "scripts/test-helm-render: r15a token-ok mock unavailable — SKIPPING the manifest-stall assertion"
+      fi
+      # (3) MANIFEST 000 branch, DETERMINISTIC (low untested-path concern): a
+      # token-ok mock guarantees the token fetch SUCCEEDS, so the probe reaches the
+      # manifest HEAD, which a REFUSING registry (127.0.0.1:1) fails with code 000 →
+      # indeterminate. Unlike the offline-fragile r15a twin above (whose token
+      # fetch may fail first), this ALWAYS exercises the manifest-HEAD branch, and
+      # confirms the `curl -I` exit-18 concern does not leak as a non-000 code.
+      if _r15_tk="$(_r15_mock_server token-ok)"; then
+        _r15_tk_port="${_r15_tk%% *}"; _r15_tk_pid="${_r15_tk##* }"
+        _r15_v="$(FISHHAWK_REGISTRY_MAX_TIME=5 \
+              FISHHAWK_REGISTRY_AUTH_URL="http://127.0.0.1:$_r15_tk_port" \
+              FISHHAWK_REGISTRY_URL="http://127.0.0.1:1" \
+              _registry_probe "$_r15_good_ref")"
+        kill "$_r15_tk_pid" 2>/dev/null || true
+        assert_equals "r15a token-OK + refusing manifest endpoint -> indeterminate (manifest 000 branch exercised deterministically)" "$_r15_v" "indeterminate"
+      else
+        echo "scripts/test-helm-render: r15a token-ok mock unavailable — SKIPPING the deterministic manifest-000 assertion"
+      fi
+    fi
+  fi
+
   # r15b THE SENTINEL / ANTI-VACUITY GUARD. Probe the known-bad ref from #2913 and
   # require `missing`. Anything else prints the reason and SKIPS the live checks,
   # so an unreachable registry can never green r15c. SHARED-DEPENDENCE RESIDUAL
@@ -1557,9 +1716,20 @@ else
     r15c_refs="$(_r15_extract_refs "$out")"
     assert_contains "r15c extraction finds the minio/mc image (extraction works)" "$r15c_refs" "minio/mc:"
     assert_absent "r15c extraction drops the locally-built fishhawkd image" "$r15c_refs" "fishhawkd"
-    if r15c_missing="$(_r15_probe_refs "$out")"; then
-      pass "r15c every rendered third-party image resolves exists (or skipped indeterminate)"
+    if r15c_out="$(_r15_probe_refs "$out")"; then
+      # No ref probed `missing`. But return-0 alone collapses "all exist" with
+      # "all SKIPPED indeterminate" (a post-sentinel 429 storm) — so require at
+      # least one ref to have positively probed `exists`. The r15b sentinel just
+      # proved the registry reachable, so zero-exists here is a real anomaly, not
+      # the honest unreachable-skip (which r15b already caught upstream).
+      r15c_exists="$(printf '%s\n' "$r15c_out" | sed -n 's/^__r15_exists__ //p')"
+      if [ "${r15c_exists:-0}" -ge 1 ]; then
+        pass "r15c every rendered third-party image resolves exists ($r15c_exists verified, none missing)"
+      else
+        fail "r15c reported no MISSING images but positively verified ZERO exists — the registry likely rate-limited every ref after the sentinel passed; nothing was actually confirmed"
+      fi
     else
+      r15c_missing="$(printf '%s\n' "$r15c_out" | grep ' missing$' || true)"
       fail "r15c a rendered third-party image is MISSING from the registry: $r15c_missing"
     fi
 
