@@ -130,18 +130,21 @@ writes it into the project's default branch as `.gitlab-ci.yml`.
 
 Run creation from a GitLab trigger is live as of #2043. To turn it on for a deployment:
 
-1. **Register the project as an installation.** GitLab run creation is authorization-gated and FAILS CLOSED: fishhawkd acts only on projects an operator has registered, because a GitLab delivery is authenticated by a shared `X-Gitlab-Token` with no signature over the body — the project a payload names proves nothing on its own. Insert an `installations` row for the project under an account whose `account_key` is the project path's namespace segment:
+1. **Register the project as an installation.** GitLab run creation is authorization-gated and FAILS CLOSED: fishhawkd acts only on projects an operator has registered, because a GitLab delivery is authenticated by a shared `X-Gitlab-Token` with no signature over the body — the project a payload names proves nothing on its own. Register an `installations` row for the project under an account whose `account_key` is the project path's namespace segment, using the `fishhawkd` subcommands (E45.33 / #2923) — direct-DB, no running server, so run them wherever `FISHHAWKD_DATABASE_URL` reaches Postgres:
 
-   ```sql
-   -- account_key is the namespace segment of path_with_namespace ("acme" for acme/widgets)
-   INSERT INTO accounts (id, provider, account_key, display_name, granularity)
-        VALUES (gen_random_uuid(), 'gitlab', 'acme', 'Acme', 'org')
-   ON CONFLICT (provider, account_key) DO NOTHING;
+   ```sh
+   # account_key is the namespace segment of path_with_namespace ("acme" for acme/widgets).
+   # --granularity defaults to "group" for gitlab; pass it explicitly to override.
+   fishhawkd account create \
+     --db "$FISHHAWKD_DATABASE_URL" \
+     --provider gitlab --account-key acme --display-name Acme
 
-   INSERT INTO installations (id, account_id, provider, installation_ref)
-        SELECT gen_random_uuid(), id, 'gitlab', 'gitlab:4242' FROM accounts
-         WHERE provider = 'gitlab' AND account_key = 'acme';
+   fishhawkd installation register \
+     --db "$FISHHAWKD_DATABASE_URL" \
+     --provider gitlab --account-key acme --installation-ref gitlab:4242
    ```
+
+   `installation register` FAILS CLOSED if no `acme` account exists yet, naming the `account create` line to run first — it never conjures the account, because the account is the operator's authorization decision. Verify what is registered with `fishhawkd installation list` (it renders each `installation_ref` alongside its owning `account_key`).
 
    `gitlab:4242` is `gitlab:<numeric project id>` — the same string the run row's `installation_ref` carries. Without a matching row (or without a database at all) an admitted GitLab trigger is refused before the spec is read and before any pipeline is created, and a `run_rejected_misconfigured` audit row records the reason (`gitlab_project_not_registered`, `gitlab_project_registry_unwired`, or `gitlab_project_authorization_lookup_failed`). A registered project id paired with a project path OUTSIDE that account's namespace is refused too — both halves of the payload identity are bound.
 

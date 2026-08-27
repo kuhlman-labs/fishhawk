@@ -64,13 +64,15 @@ const (
 var ErrSingleTenantMissingAccountKey = errors.New(
 	"account: single-tenant profile is partially configured: set --single-tenant-account-key (FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY) or unset every other --single-tenant-* flag")
 
-// singleTenantGranularities / singleTenantProviders mirror the
+// accountGranularities / accountProviders mirror the
 // accounts_granularity_check / accounts_provider_check CHECK constraints
 // (migrations 0052 / 0055). Validating in Go turns a raw SQLSTATE 23514 at
-// boot into a message naming the flag and the accepted values.
+// boot into a message naming the flag and the accepted values. Shared by both
+// the single-tenant bootstrap (below) and the operator registry surface
+// (registry.go), so the constraint literals live in exactly one place.
 var (
-	singleTenantGranularities = []string{"enterprise", "organization", "group"}
-	singleTenantProviders     = []string{"github", "gitlab"}
+	accountGranularities = []string{"enterprise", "organization", "group"}
+	accountProviders     = []string{"github", "gitlab"}
 )
 
 // SingleTenantConfig is the deployment configuration of the profile, as
@@ -142,13 +144,13 @@ func (c SingleTenantConfig) Validate() error {
 	if c.AccountKey == "" {
 		return ErrSingleTenantMissingAccountKey
 	}
-	if !slices.Contains(singleTenantProviders, c.Provider) {
+	if !slices.Contains(accountProviders, c.Provider) {
 		return fmt.Errorf("account: single-tenant provider %q is not one of %s (--single-tenant-provider)",
-			c.Provider, strings.Join(singleTenantProviders, ", "))
+			c.Provider, strings.Join(accountProviders, ", "))
 	}
-	if !slices.Contains(singleTenantGranularities, c.Granularity) {
+	if !slices.Contains(accountGranularities, c.Granularity) {
 		return fmt.Errorf("account: single-tenant granularity %q is not one of %s (--single-tenant-granularity)",
-			c.Granularity, strings.Join(singleTenantGranularities, ", "))
+			c.Granularity, strings.Join(accountGranularities, ", "))
 	}
 	if c.AutoJoinRole == "" {
 		// A NULL auto_join_role is invisible to ListAutoJoinAccountsByKeys,
