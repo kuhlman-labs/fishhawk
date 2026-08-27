@@ -252,6 +252,54 @@ cell:
   # (#2107) rather than egress out of region.
   modelBaseUrl: ""
 
+# GitLab forge/identity profile (E45.32 / #2922). This block carries ONLY the
+# NON-secret half of the FISHHAWKD_GITLAB_* family, rendered into the ConfigMap;
+# all default empty and an empty key stays unset (the github.com-only posture).
+#
+# The three SECRET halves are deliberately NOT here: FISHHAWKD_GITLAB_TOKEN,
+# FISHHAWKD_GITLAB_WEBHOOK_SECRET and FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET are
+# records in fishhawk.secretKeySpec and travel the SAME secrets machinery as
+# every other credential in all three modes — supply them via
+# secrets.values.gitlab* (chartManaged), the pre-created Secret in `existing`, or
+# secrets.externalSecrets.data[] in externalSecrets. They can NEVER go through
+# config.extraEnv (its suffix guard refuses any key ending in _SECRET / _TOKEN).
+#
+# Enablement is graduated, mirroring fishhawkd (serve.go):
+#   * baseUrl ALONE is a supported posture — it enables login-gate group
+#     auto-join on the signing-in user's OAuth token (the forge/work-item
+#     provider stays 501 until FISHHAWKD_GITLAB_TOKEN is also supplied, WARN-only,
+#     never a refusal — so gitlabToken is never marked required).
+#   * oauthClientId is the ENABLEMENT SIGNAL for the browser sign-in trio: set it
+#     and secrets.values.gitlabOauthClientSecret becomes required
+#     (fishhawk.validateSecretContract) AND both oauthCallbackUrl and baseUrl must
+#     be set (fishhawk.validateGitLabOAuthTrio, mirroring resolveGitLabOAuth's
+#     all-three-or-none + base-URL rule).
+#   * oauthCallbackUrl is EXPLICIT-ONLY — deliberately NOT derived from the
+#     ingress (unlike the GitHub callback). An ungated derivation would give every
+#     ingress-enabled GitHub-only install a non-empty GitLab callback and fire the
+#     id-empty guard spuriously.
+#   * deviceClientId is a SEPARATE, NON-Confidential GitLab application for the
+#     RFC 8628 device flow (fishhawk token login --provider gitlab), with NO
+#     fallback to oauthClientId (serve.go, E66.4 / #2392).
+gitlab:
+  # GitLab instance URL → FISHHAWKD_GITLAB_BASE_URL. Empty leaves GitLab off.
+  # Setting it alone enables the login-gate group lister; the OAuth trio needs
+  # this set too (it is the host the browser sign-in redirect reaches).
+  baseUrl: ""
+  # Confidential browser-sign-in OAuth application client id →
+  # FISHHAWKD_GITLAB_OAUTH_CLIENT_ID. The enablement signal for the trio.
+  oauthClientId: ""
+  # Public URL of /v0/auth/gitlab/callback → FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL.
+  # Explicit-only; not derived from the ingress.
+  oauthCallbackUrl: ""
+  # Non-Confidential device-flow application client id →
+  # FISHHAWKD_GITLAB_DEVICE_CLIENT_ID. Separate application from the browser trio.
+  deviceClientId: ""
+  # Mode-2 per-installation base-URL host allowlist →
+  # FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST. Non-secret; empty → scheme/parse
+  # validation only.
+  installationHostAllowlist: ""
+
 # Background-worker enable toggles → FISHHAWKD_ENABLE_*. All default false so a
 # fresh deploy doesn't race the timers. These workers are singletons: exactly one
 # instance may run them. In allInOne mode that means keeping replicaCount=1 while
@@ -486,6 +534,14 @@ secrets:
     # modelApiKey when cell.modelBaseUrl is set.
     handoffSecret: ""         # FISHHAWKD_HANDOFF_SECRET
     modelApiKey: ""           # FISHHAWKD_MODEL_API_KEY
+    # GitLab credentials (E45.32 / #2922). gitlabToken and gitlabWebhookSecret
+    # are NEVER required by the contract — supplied-or-not, like any optional
+    # credential (serve.go warns and disables the gitlab provider on a partial
+    # config rather than refusing). gitlabOauthClientSecret is required exactly
+    # when gitlab.oauthClientId is set (the browser-sign-in enablement signal).
+    gitlabToken: ""              # FISHHAWKD_GITLAB_TOKEN
+    gitlabWebhookSecret: ""      # FISHHAWKD_GITLAB_WEBHOOK_SECRET
+    gitlabOauthClientSecret: ""  # FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET
 
   # `externalSecrets` mode: emit an ExternalSecret CR (no inline Secret).
   # secretStoreRef.name MUST be set (the guard fails an empty one). apiVersion is

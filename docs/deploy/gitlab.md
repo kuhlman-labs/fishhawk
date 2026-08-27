@@ -85,6 +85,31 @@ Under **Settings → CI/CD → Variables**, configure:
   `agent=claude-code`.
 - **`OPENAI_API_KEY`** (masked) — forwarded to the Codex CLI when `agent=codex`.
 
+### Backend deployment configuration (Helm)
+
+The CI/CD variables above configure the **GitLab side** (the runner's push
+credential and the agent API keys). The **backend** (`fishhawkd`) is configured
+separately through the Helm chart's `FISHHAWKD_GITLAB_*` family (E45.32 / #2922):
+
+- Non-secret values — the `gitlab.*` block: `baseUrl`, `oauthClientId`,
+  `oauthCallbackUrl`, `deviceClientId`, `installationHostAllowlist`.
+- Secret values — `secrets.values.gitlab*`: `gitlabToken`
+  (`FISHHAWKD_GITLAB_TOKEN`), `gitlabWebhookSecret`
+  (`FISHHAWKD_GITLAB_WEBHOOK_SECRET`), `gitlabOauthClientSecret`
+  (`FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET`).
+
+**Mind the near-identical names.** `FISHHAWK_GITLAB_TOKEN` (the CI/CD variable
+above) is the **runner's** push credential — it pushes the run branch and opens
+the merge request. `FISHHAWKD_GITLAB_TOKEN` (chart secret, note the trailing
+`D`) is the **backend's** REST credential — it gates the forge/work-item provider
+and the login-gate group lister. They read alike and serve different sides; set
+whichever the side you are configuring needs.
+
+See [`deploy/helm/fishhawk/README.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/deploy/helm/fishhawk/README.md)
+(the "GitLab" section) for the full chart contract: the graduated enablement
+(base-URL-alone is a supported login-gate posture), the all-three-or-none OAuth
+trio guard, and which secrets are required when.
+
 ## Onboarding the file
 
 Unlike the GitHub App-PR scaffold — which seeds four files including

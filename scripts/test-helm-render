@@ -917,13 +917,34 @@ assert_absent "r12c the secret value never renders into the ConfigMap" "$out" "l
 # r12d an UNMAPPED secret-shaped key is rejected by the SUFFIX guard (#2915,
 # operator-authored). r12c above only covers keys the chart already knows via
 # fishhawk.secretKeySpec — but config.extraEnv exists precisely for the keys it
-# does NOT know, so that deny-list is structurally the wrong population. The
-# concrete case: the chart has no field for FISHHAWKD_GITLAB_* (#2922), which
-# routes an operator straight to this escape hatch holding a client secret.
-# COUNTERFACTUAL: delete the suffix `range` in fishhawk.validateExtraEnv and this
-# render SUCCEEDS with FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET: "leak-me-too" in the
-# ConfigMap. Verified by execution, not reasoned.
+# does NOT know, so that deny-list is structurally the wrong population. The key
+# must be one the chart genuinely has no secretKeySpec record for, or it would be
+# caught by the KNOWN-key guard (r12c) first and never reach the suffix range:
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET is NOW a mapped key (E45.32 / #2922), so
+# this case uses a still-unmapped secret-shaped key (an integration token the
+# chart has no field for). COUNTERFACTUAL: delete the suffix `range` in
+# fishhawk.validateExtraEnv and this render SUCCEEDS with
+# FISHHAWKD_JIRA_API_TOKEN: "leak-me-too" in the ConfigMap. Verified by execution.
 cat > "$tmproot/r12d.yaml" <<'YAML'
+profile: prod
+config:
+  extraEnv:
+    FISHHAWKD_JIRA_API_TOKEN: "leak-me-too"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r12d.yaml"
+assert_render_fails "r12d extraEnv carrying an unmapped secret-shaped key is rejected, naming the key" "FISHHAWKD_JIRA_API_TOKEN"
+assert_render_fails "r12d suffix message names the matched suffix" "ends in \"_TOKEN\""
+assert_absent "r12d the unmapped secret value never renders into the ConfigMap" "$out" "leak-me-too"
+
+# r12f the newly-mapped GitLab client secret is now caught by the KNOWN-key guard,
+# NOT the suffix guard — E45.32 / #2922 turned it into a fishhawk.secretKeySpec
+# record. Pin that transition so r12d's key choice stays honest: routing it through
+# extraEnv draws the "SECRET-bearing key the chart delivers via the Secret"
+# message, the same as any other mapped secret key.
+cat > "$tmproot/r12f.yaml" <<'YAML'
 profile: prod
 config:
   extraEnv:
@@ -932,10 +953,10 @@ secrets:
   mode: existing
 existingSecret: fishhawk-secrets
 YAML
-render -f "$tmproot/r12d.yaml"
-assert_render_fails "r12d extraEnv carrying an unmapped secret-shaped key is rejected, naming the key" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
-assert_render_fails "r12d suffix message names the matched suffix" "ends in \"_SECRET\""
-assert_absent "r12d the unmapped secret value never renders into the ConfigMap" "$out" "leak-me-too"
+render -f "$tmproot/r12f.yaml"
+assert_render_fails "r12f a now-mapped GitLab secret routed through extraEnv is rejected as a known secret key" \
+  "SECRET-bearing key the chart delivers via the Secret"
+assert_absent "r12f the GitLab secret value never renders into the ConfigMap" "$out" "leak-me-too"
 
 # r12e the suffix guard must NOT false-positive on an ordinary non-secret key.
 # Bare "_KEY" is deliberately absent from the suffix list because it matches
@@ -997,6 +1018,12 @@ singleTenant:
   autoJoinRole: member
   displayName: Acme
   provider: github
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  oauthClientId: "gl-cid"
+  oauthCallbackUrl: "https://allkeys.fishhawk.example/v0/auth/gitlab/callback"
+  deviceClientId: "gl-dev"
+  installationHostAllowlist: "gitlab.example.com"
 secrets:
   mode: chartManaged
   values:
@@ -1009,6 +1036,9 @@ secrets:
     githubAppPrivateKey: "pem"
     handoffSecret: "h"
     modelApiKey: "mk"
+    gitlabToken: "glt"
+    gitlabWebhookSecret: "glw"
+    gitlabOauthClientSecret: "gls"
 YAML
 render -f "$tmproot/r12-allkeys.yaml" --show-only templates/configmap.yaml
 assert_render_ok "r12 all-config-keys fixture renders"
@@ -1017,6 +1047,11 @@ emitted_keys=$(printf '%s' "$out" | grep -oE '^[[:space:]]*FISHHAWKD_[A-Z0-9_]+:
 # emitted set, or the loop below silently under-covers them.
 assert_contains "r12 anti-drift fixture emits the derived FISHHAWKD_OAUTH_CLIENT_ID" "$emitted_keys" "FISHHAWKD_OAUTH_CLIENT_ID"
 assert_contains "r12 anti-drift fixture emits the derived FISHHAWKD_OAUTH_CALLBACK_URL" "$emitted_keys" "FISHHAWKD_OAUTH_CALLBACK_URL"
+# And the five GitLab ConfigMap keys this change adds, so the anti-drift loop
+# below actually exercises the managedConfigKeys entries for them (E45.32 / #2922).
+for glk in FISHHAWKD_GITLAB_BASE_URL FISHHAWKD_GITLAB_OAUTH_CLIENT_ID FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL FISHHAWKD_GITLAB_DEVICE_CLIENT_ID FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST; do
+  assert_contains "r12 anti-drift fixture emits $glk" "$emitted_keys" "$glk"
+done
 drift_ok=1
 while IFS= read -r k; do
   [ -n "$k" ] || continue
@@ -1045,6 +1080,299 @@ if grep -rqF "must all be set" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; 
   pass "r13 fishhawkd enforces the all-three-or-none OAuth refusal the chart mirrors"
 else
   fail "r13 all-three-or-none OAuth refusal text not found in backend/cmd/fishhawkd/"
+fi
+# GitLab cross-boundary (E45.32 / #2922): the chart mirrors resolveGitLabOAuth's
+# base-URL requirement, so pin that the env var AND the refusal text the guard's
+# branch (iv) quotes actually live in the binary — not a plausible invention.
+if grep -rqF "FISHHAWKD_GITLAB_BASE_URL" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r13 FISHHAWKD_GITLAB_BASE_URL is the env source fishhawkd reads"
+else
+  fail "r13 FISHHAWKD_GITLAB_BASE_URL not found in backend/cmd/fishhawkd/"
+fi
+if grep -rqF "must name the GitLab instance host" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r13 fishhawkd's resolveGitLabOAuth base-URL refusal is the contract the chart's branch (iv) mirrors"
+else
+  fail "r13 resolveGitLabOAuth base-URL refusal text not found in backend/cmd/fishhawkd/"
+fi
+
+# ---------------------------------------------------------------------------
+# r14 — THE GITLAB FAMILY (E45.32 / #2922). The chart must make GitLab
+#       CONFIGURABLE (ConfigMap + Secret) without disturbing a GitHub-only
+#       deploy, and mirror fishhawkd's resolveGitLabOAuth all-three-or-none +
+#       base-URL contract at render time. Every case asserts SHIPPED RENDERED
+#       OUTPUT; each failure case asserts BOTH a non-zero exit AND the
+#       branch-specific message. Bad state is seeded BY CONSTRUCTION (a values
+#       file omitting a field), so a RED lands on the render assertion.
+# ---------------------------------------------------------------------------
+# A chartManaged baseline used by several r14 cases (GitHub OAuth off, PEM off).
+r14_base='profile: local
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"'
+
+# r14a THE GITHUB-ONLY CLAIM (binding condition 1, restated): a deploy that sets
+# NO gitlab.* emits NO FISHHAWKD_GITLAB_* key in the ConfigMap and NO GitLab key
+# in the chartManaged Secret. assert_field_absent matches at YAML KEY position, so
+# the explanatory comment block that names the keys cannot green it. values-local
+# is chartManaged with the full baseline but no gitlab config — the real
+# GitHub-only posture.
+render -f "$CHART/values-local.yaml" --show-only templates/configmap.yaml
+assert_render_ok "r14a GitHub-only ConfigMap renders"
+for glk in FISHHAWKD_GITLAB_BASE_URL FISHHAWKD_GITLAB_OAUTH_CLIENT_ID FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL FISHHAWKD_GITLAB_DEVICE_CLIENT_ID FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST; do
+  assert_field_absent "r14a GitHub-only ConfigMap omits $glk" "$out" "$glk"
+done
+render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+assert_absent "r14a GitHub-only chartManaged Secret carries no GitLab key" "$out" "FISHHAWKD_GITLAB"
+
+# r14b A COMPLETE GITLAB CONFIG renders all five ConfigMap keys with their values
+# AND all three secret keys inside the Secret's stringData block.
+cat > "$tmproot/r14b.yaml" <<'YAML'
+profile: local
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  oauthClientId: "gl-cid"
+  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"
+  deviceClientId: "gl-dev"
+  installationHostAllowlist: "gitlab.example.com,gitlab.internal"
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+    gitlabToken: "glt"
+    gitlabWebhookSecret: "glw"
+    gitlabOauthClientSecret: "gls"
+YAML
+render -f "$tmproot/r14b.yaml" --show-only templates/configmap.yaml
+assert_render_ok "r14b complete GitLab config ConfigMap renders"
+assert_contains "r14b ConfigMap base URL" "$out" 'FISHHAWKD_GITLAB_BASE_URL: "https://gitlab.example.com"'
+assert_contains "r14b ConfigMap OAuth client id" "$out" 'FISHHAWKD_GITLAB_OAUTH_CLIENT_ID: "gl-cid"'
+assert_contains "r14b ConfigMap callback URL" "$out" 'FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL: "https://app.example/v0/auth/gitlab/callback"'
+assert_contains "r14b ConfigMap device client id" "$out" 'FISHHAWKD_GITLAB_DEVICE_CLIENT_ID: "gl-dev"'
+assert_contains "r14b ConfigMap installation host allowlist" "$out" 'FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST: "gitlab.example.com,gitlab.internal"'
+render -f "$tmproot/r14b.yaml" --show-only templates/secret.yaml
+secretblk=$(yaml_block "$out" "stringData")
+assert_contains "r14b Secret carries FISHHAWKD_GITLAB_TOKEN" "$secretblk" '"FISHHAWKD_GITLAB_TOKEN": "glt"'
+assert_contains "r14b Secret carries FISHHAWKD_GITLAB_WEBHOOK_SECRET" "$secretblk" '"FISHHAWKD_GITLAB_WEBHOOK_SECRET": "glw"'
+assert_contains "r14b Secret carries FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET" "$secretblk" '"FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET": "gls"'
+
+# r14c THE LOGIN-GATE-ONLY POSTURE (binding condition 5, the anti-#2915 case):
+# gitlab.baseUrl set, everything else empty, no gitlabToken supplied — must render
+# OK and emit FISHHAWKD_GITLAB_BASE_URL. This is the case that goes RED if anyone
+# later hardcodes required:true on the gitlabToken record: the chart must not
+# mandate a half it cannot complete.
+printf '%s\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n' "$r14_base" > "$tmproot/r14c.yaml"
+render -f "$tmproot/r14c.yaml"
+assert_render_ok "r14c login-gate-only posture (baseUrl alone, no token) renders"
+render -f "$tmproot/r14c.yaml" --show-only templates/configmap.yaml
+assert_contains "r14c login-gate-only posture emits FISHHAWKD_GITLAB_BASE_URL" "$out" 'FISHHAWKD_GITLAB_BASE_URL: "https://gitlab.example.com"'
+assert_field_absent "r14c login-gate-only posture emits no client id" "$out" "FISHHAWKD_GITLAB_OAUTH_CLIENT_ID"
+
+# r14d validateGitLabOAuthTrio branch (i): id set + callback empty. baseUrl is SET
+# so branch (iv) does NOT also match — the case is unambiguous about which message
+# it pins (binding condition 3). Asserts the callback message AND that it names
+# the explicit-only route (deliberately no ingress derivation).
+printf '%s\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n  oauthClientId: "cid"\n' "$r14_base" > "$tmproot/r14d.yaml"
+render -f "$tmproot/r14d.yaml"
+assert_render_fails "r14d branch (i) id set + callback empty is rejected" \
+  "gitlab.oauthClientId is set but gitlab.oauthCallbackUrl is empty"
+assert_render_fails "r14d branch (i) names the explicit-callback route" "Set gitlab.oauthCallbackUrl explicitly"
+assert_render_fails "r14d branch (i) states the callback is NOT ingress-derived" "does NOT derive it from the ingress"
+
+# r14e validateGitLabOAuthTrio branch (ii): callback set + id empty.
+printf '%s\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"\n' "$r14_base" > "$tmproot/r14e.yaml"
+render -f "$tmproot/r14e.yaml"
+assert_render_fails "r14e branch (ii) callback set + id empty is rejected" \
+  "gitlab.oauthCallbackUrl is set but gitlab.oauthClientId is empty"
+
+# r14f validateGitLabOAuthTrio branch (iii): chartManaged secret supplied + id empty.
+printf '%s\n    gitlabOauthClientSecret: "gls"\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n' "$r14_base" > "$tmproot/r14f.yaml"
+render -f "$tmproot/r14f.yaml"
+assert_render_fails "r14f branch (iii) chartManaged secret supplied + id empty is rejected" \
+  "a GitLab OAuth client secret is supplied"
+
+# r14g validateGitLabOAuthTrio branch (iv): id set + baseUrl empty, with a COMPLETE
+# trio (id + callback + secret all set) so ONLY branch (iv) matches — no ordering
+# ambiguity (binding condition 3).
+printf '%s\n    gitlabOauthClientSecret: "gls"\ngitlab:\n  oauthClientId: "cid"\n  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"\n' "$r14_base" > "$tmproot/r14g.yaml"
+render -f "$tmproot/r14g.yaml"
+assert_render_fails "r14g branch (iv) complete trio + baseUrl empty is rejected" \
+  "gitlab.oauthClientId is set but gitlab.baseUrl is empty"
+assert_render_fails "r14g branch (iv) names FISHHAWKD_GITLAB_BASE_URL as the missing host" "FISHHAWKD_GITLAB_BASE_URL"
+
+# r14h chartManaged DERIVED requiredness: id set + client secret ABSENT (callback +
+# baseUrl set so the trio guard is silent) surfaces validateSecretContract naming
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET — proving the derivation turned requiredness
+# ON. Setting the record to required:false reddens this.
+printf '%s\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n  oauthClientId: "cid"\n  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"\n' "$r14_base" > "$tmproot/r14h.yaml"
+render -f "$tmproot/r14h.yaml"
+assert_render_fails "r14h chartManaged id set + client secret absent -> validateSecretContract (derived requiredness)" \
+  "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+
+# r14i externalSecrets analog of branch (iii): data[] maps
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET with gitlab.oauthClientId empty.
+cat > "$tmproot/r14i.yaml" <<'YAML'
+profile: prod
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+      - secretKey: FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET
+        remoteRef: {key: fishhawk/gitlab-oauth}
+YAML
+render -f "$tmproot/r14i.yaml"
+assert_render_fails "r14i externalSecrets data[] maps the GitLab secret + id empty is rejected" \
+  "a GitLab OAuth client secret is supplied"
+
+# r14j THE EXPLICIT-NULL EDGE: gitlab.oauthClientId: null renders OK with no
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_ID key and no secret demanded. Deleting either
+# `| default ""` (in fishhawk.secretKeySpec or fishhawk.validateGitLabOAuthTrio)
+# reddens this — `toString nil` is "<nil>", which would read as GitLab-OAuth-ON.
+cat > "$tmproot/r14j.yaml" <<'YAML'
+profile: local
+gitlab:
+  oauthClientId: null
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+YAML
+render -f "$tmproot/r14j.yaml"
+assert_render_ok "r14j explicit-null gitlab.oauthClientId is treated as OAuth-off and renders"
+render -f "$tmproot/r14j.yaml" --show-only templates/configmap.yaml
+assert_field_absent "r14j explicit-null gitlab.oauthClientId emits no FISHHAWKD_GITLAB_OAUTH_CLIENT_ID" "$out" "FISHHAWKD_GITLAB_OAUTH_CLIENT_ID"
+
+# r14k a NON-required GitLab secret record still emits when supplied:
+# gitlabToken/gitlabWebhookSecret with no OAuth config render into the chartManaged
+# Secret. Proves secret.yaml's range emits on `supplied`, not on `required`.
+printf '%s\n    gitlabToken: "glt"\n    gitlabWebhookSecret: "glw"\ngitlab:\n  baseUrl: "https://gitlab.example.com"\n' "$r14_base" > "$tmproot/r14k.yaml"
+render -f "$tmproot/r14k.yaml" --show-only templates/secret.yaml
+assert_render_ok "r14k non-required GitLab secrets render"
+secretblk=$(yaml_block "$out" "stringData")
+assert_contains "r14k Secret carries the supplied non-required FISHHAWKD_GITLAB_TOKEN" "$secretblk" '"FISHHAWKD_GITLAB_TOKEN": "glt"'
+assert_contains "r14k Secret carries the supplied non-required FISHHAWKD_GITLAB_WEBHOOK_SECRET" "$secretblk" '"FISHHAWKD_GITLAB_WEBHOOK_SECRET": "glw"'
+
+# r14l POSITIVE externalSecrets (binding condition 2): data[] carrying all three
+# GitLab keys, with the GitLab OAuth trio complete, renders OK — proving the same
+# machinery works in externalSecrets mode, not just chartManaged.
+cat > "$tmproot/r14l.yaml" <<'YAML'
+profile: prod
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  oauthClientId: "gl-cid"
+  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+      - secretKey: FISHHAWKD_GITLAB_TOKEN
+        remoteRef: {key: fishhawk/gitlab-token}
+      - secretKey: FISHHAWKD_GITLAB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/gitlab-webhook}
+      - secretKey: FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET
+        remoteRef: {key: fishhawk/gitlab-oauth}
+YAML
+render -f "$tmproot/r14l.yaml"
+assert_render_ok "r14l positive externalSecrets: all three GitLab keys in data[] renders OK"
+render -f "$tmproot/r14l.yaml" --show-only templates/externalsecret.yaml
+assert_contains "r14l ExternalSecret maps FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET" "$out" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+
+# r14m POSITIVE existing-secret (binding condition 2): the GitLab OAuth trio
+# complete in `existing` mode renders OK — the secret half is UNKNOWN at render
+# time (the chart sees nothing about a pre-created Secret), so the trio guard's
+# secret branch stays silent and the id/callback/baseUrl combination is what is
+# checked. Proves the same machinery works in existing mode too.
+cat > "$tmproot/r14m.yaml" <<'YAML'
+profile: prod
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  oauthClientId: "gl-cid"
+  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"
+secrets:
+  mode: existing
+existingSecret: fishhawk-secrets
+YAML
+render -f "$tmproot/r14m.yaml"
+assert_render_ok "r14m positive existing-secret: complete GitLab trio renders OK"
+render -f "$tmproot/r14m.yaml" --show-only templates/configmap.yaml
+assert_contains "r14m existing-mode ConfigMap carries the GitLab OAuth client id" "$out" 'FISHHAWKD_GITLAB_OAUTH_CLIENT_ID: "gl-cid"'
+
+# r14n externalSecrets DERIVED requiredness (binding condition 4): id set,
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET ABSENT from data[] (callback + baseUrl set so
+# the trio guard is silent) surfaces validateSecretContract naming the missing key
+# — the externalSecrets twin of r14h. externalSecrets is the mode a real operator
+# is most likely to use, so it gets its own case.
+cat > "$tmproot/r14n.yaml" <<'YAML'
+profile: prod
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  oauthClientId: "gl-cid"
+  oauthCallbackUrl: "https://app.example/v0/auth/gitlab/callback"
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+YAML
+render -f "$tmproot/r14n.yaml"
+assert_render_fails "r14n externalSecrets id set + client secret absent from data[] -> validateSecretContract" \
+  "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+
+# r14o helm lint the complete-GitLab fixture, so the additions are proven against
+# the linter too.
+if lint_out=$("$(command -v helm)" lint "$CHART" -f "$tmproot/r14b.yaml" 2>&1); then
+  pass "r14o helm lint the complete-GitLab fixture"
+else
+  fail "r14o helm lint complete-GitLab fixture: $(printf '%s' "$lint_out" | tail -3)"
 fi
 
 echo

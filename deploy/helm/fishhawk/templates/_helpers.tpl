@@ -372,6 +372,47 @@ fishhawk.validateSecretContract (validates against it), NOTES.txt (prints it).
       "valuesField" "modelApiKey"
       "envDelivered" true
       "required" (ne (toString $v.cell.modelBaseUrl) "")) -}}
+{{- /* GitLab credentials (E45.32 / #2922). The three SECRET halves of the
+       GitLab family — the browser-sign-in client secret, the deployment REST
+       token, and the webhook shared secret — are records here so they travel
+       the SAME machinery as every other credential in all three modes, NEVER
+       config.extraEnv (whose suffix guard refuses any key ending in _SECRET /
+       _TOKEN by design). The non-secret half lives in the ConfigMap (gitlab.*).
+
+       Requiredness is DERIVED, never hardcoded, and only the OAuth client secret
+       is ever required:
+         - FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET derives from gitlab.oauthClientId,
+           the public ENABLEMENT SIGNAL, exactly as the GitHub client secret
+           derives from config.oauthClientId. `| default ""` normalizes an
+           explicitly-null id to "" for the same reason the GitHub leg documents:
+           `toString nil` is the literal "<nil>", which `ne … ""` would misread
+           as a supplied id and mark a secret required that configmap.yaml emits
+           nothing for.
+         - FISHHAWKD_GITLAB_TOKEN and _WEBHOOK_SECRET are NEVER required.
+           serve.go WARNS and leaves the gitlab forge/work-item provider disabled
+           (501) on a base-URL-without-token config rather than refusing, and
+           documents base-URL-alone as a supported login-gate posture; the
+           webhook receiver is inert without a secret. Hardcoding either required
+           would refuse every GitHub-only deploy — the #2915 shape #2922 asks us
+           not to repeat (mandating one half of a trio the chart cannot complete).
+       validateSecretContract produces the id-set-but-secret-MISSING message from
+       the derived requiredness below, and fishhawk.validateGitLabOAuthTrio covers
+       the other partial combinations — one message per condition, no racing. */ -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_GITLAB_TOKEN"
+      "valuesField" "gitlabToken"
+      "envDelivered" true
+      "required" false) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_GITLAB_WEBHOOK_SECRET"
+      "valuesField" "gitlabWebhookSecret"
+      "envDelivered" true
+      "required" false) -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
+      "valuesField" "gitlabOauthClientSecret"
+      "envDelivered" true
+      "required" (ne (toString ($v.gitlab.oauthClientId | default "")) "")) -}}
 {{- toYaml $records -}}
 {{- end -}}
 
@@ -572,6 +613,90 @@ rather than two guards racing.
 {{- end -}}
 
 {{/*
+GitLab OAuth trio guard (E45.32 / #2922). `include`d once from service.yaml,
+immediately after fishhawk.validateOAuthTrio and BEFORE
+fishhawk.validateSecretContract, for the same reason those live there:
+service.yaml is the only template rendering in EVERY topology mode AND every
+secrets mode. It mirrors fishhawkd's own resolveGitLabOAuth contract (serve.go):
+the GitLab browser-sign-in client id, client secret and callback URL are
+all-three-or-none, PLUS the EXTRA refusal fishhawkd makes when the trio is set
+with an empty base URL (there is then no GitLab host to send the OAuth redirect
+to). Each observable partial combination fails the render with a named message
+instead of a pod that exits at startup.
+
+What is observable is MODE-DEPENDENT, exactly as validateOAuthTrio documents. The
+id (gitlab.oauthClientId), callback (gitlab.oauthCallbackUrl) and base URL
+(gitlab.baseUrl) are ConfigMap-side values and always visible; the SECRET half is
+not:
+  chartManaged    — secrets.values.gitlabOauthClientSecret is visible (same
+                    `| default dict` untyped-nil defence + `if index …`
+                    truthiness the GitHub leg uses; NOT `ne (toString …) ""`,
+                    which misreads an absent key's nil as "<nil>").
+  externalSecrets — the DECLARED data[] mapping is visible; this reads the SAME
+                    `.secretKey` field validateSecretContract inspects, so the
+                    two cannot drift.
+  existing        — the chart sees NOTHING about a pre-created Secret at render
+                    time, so the secret half is UNKNOWN and only the
+                    id/callback/baseUrl combinations are checked there.
+
+EVALUATION ORDER is (i) → (ii) → (iii) → (iv); helm `fail` halts at the first
+match. Ordering is only observable when more than one branch could match, and the
+only such overlap is an id set with BOTH the callback and the base URL empty:
+there (i) wins and the operator sees the callback remedy first. That is a decided
+choice, not an accident — r14 supplies a COMPLETE trio to the branch-(iv) case so
+its assertion is unambiguous about which message it pins.
+
+The id-set-but-secret-MISSING case is deliberately NOT re-implemented here — the
+derived requiredness in fishhawk.secretKeySpec makes validateSecretContract
+produce it with its existing message, so there is one message per condition
+rather than two guards racing (the same division of labour the GitHub trio uses).
+*/}}
+{{- define "fishhawk.validateGitLabOAuthTrio" -}}
+{{- /* `| default ""` normalizes an explicitly-null gitlab.oauthClientId to "":
+       `toString nil` is "<nil>", which would read as GitLab-OAuth-ON and fire a
+       branch for an id configmap.yaml treats as unset. */ -}}
+{{- $id := toString (.Values.gitlab.oauthClientId | default "") -}}
+{{- $cb := toString (.Values.gitlab.oauthCallbackUrl | default "") -}}
+{{- $base := toString (.Values.gitlab.baseUrl | default "") -}}
+{{- $secret := false -}}
+{{- $mode := .Values.secrets.mode -}}
+{{- if eq $mode "chartManaged" -}}
+{{- $values := .Values.secrets.values | default dict -}}
+{{- /* Truthiness, NOT `ne (toString …) ""`: `index` returns nil for an ABSENT
+       key, and `toString nil` is the literal "<nil>", which `ne … ""` would
+       misread as a supplied secret and fire branch (iii) falsely. `if index …`
+       is false for both nil and the empty string. */ -}}
+{{- if index $values "gitlabOauthClientSecret" -}}{{- $secret = true -}}{{- end -}}
+{{- else if eq $mode "externalSecrets" -}}
+{{- range .Values.secrets.externalSecrets.data -}}
+{{- if eq (toString .secretKey) "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET" -}}{{- $secret = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* (i) id set, callback empty. Unlike the GitHub callback, the chart does NOT
+       derive the GitLab callback from the ingress, so name the explicit route
+       and say the derivation does not exist rather than leaving the operator
+       hunting for an ingress toggle. */ -}}
+{{- if and (ne $id "") (eq $cb "") -}}
+{{- fail "gitlab.oauthClientId is set but gitlab.oauthCallbackUrl is empty. fishhawkd requires all three of the GitLab OAuth client id, client secret and callback URL, or none (serve.go resolveGitLabOAuth). Set gitlab.oauthCallbackUrl explicitly — the chart deliberately does NOT derive it from the ingress (unlike the GitHub callback), so there is no ingress toggle that fills it in. To turn the GitLab browser sign-in off instead, clear gitlab.oauthClientId." -}}
+{{- end -}}
+{{- /* (ii) callback set, id empty. */ -}}
+{{- if and (eq $id "") (ne $cb "") -}}
+{{- fail "gitlab.oauthCallbackUrl is set but gitlab.oauthClientId is empty. fishhawkd requires all three of the GitLab OAuth client id, client secret and callback URL, or none (serve.go). Set gitlab.oauthClientId, or clear gitlab.oauthCallbackUrl to leave the GitLab browser sign-in off." -}}
+{{- end -}}
+{{- /* (iii) secret OBSERVABLY supplied, id empty. */ -}}
+{{- if and (eq $id "") $secret -}}
+{{- fail "a GitLab OAuth client secret is supplied (FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET, via secrets.values.gitlabOauthClientSecret or secrets.externalSecrets.data[]) but gitlab.oauthClientId is empty. fishhawkd requires all three of the GitLab OAuth client id, client secret and callback URL, or none (serve.go). Set gitlab.oauthClientId, or remove the client secret to leave the GitLab browser sign-in off." -}}
+{{- end -}}
+{{- /* (iv) id set, base URL empty — the EXTRA refusal fishhawkd itself makes
+       (serve.go: "FISHHAWKD_GITLAB_BASE_URL must name the GitLab instance host
+       for the browser sign-in flow"): with no host there is nowhere to send the
+       OAuth redirect. */ -}}
+{{- if and (ne $id "") (eq $base "") -}}
+{{- fail "gitlab.oauthClientId is set but gitlab.baseUrl is empty. fishhawkd requires FISHHAWKD_GITLAB_BASE_URL to name the GitLab instance host for the browser sign-in flow (serve.go resolveGitLabOAuth) — with no host there is nowhere to send the OAuth redirect. Set gitlab.baseUrl to the GitLab instance URL, or clear gitlab.oauthClientId to leave the GitLab browser sign-in off." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Every ConfigMap key the chart itself renders (E69.4 / #2915). Hand-authored, so
 it is a DRIFT risk — scripts/test-helm-render r12 renders an all-config-keys-set
 ConfigMap, extracts every emitted FISHHAWKD_* key, and asserts the collision
@@ -606,7 +731,12 @@ entry here reddens the gate. Consumed by fishhawk.validateExtraEnv.
       "FISHHAWKD_SINGLE_TENANT_GRANULARITY"
       "FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE"
       "FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME"
-      "FISHHAWKD_SINGLE_TENANT_PROVIDER" -}}
+      "FISHHAWKD_SINGLE_TENANT_PROVIDER"
+      "FISHHAWKD_GITLAB_BASE_URL"
+      "FISHHAWKD_GITLAB_OAUTH_CLIENT_ID"
+      "FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL"
+      "FISHHAWKD_GITLAB_DEVICE_CLIENT_ID"
+      "FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST" -}}
 {{- toYaml $keys -}}
 {{- end -}}
 
