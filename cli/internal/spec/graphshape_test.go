@@ -275,11 +275,13 @@ workflows:
 	})
 }
 
-func TestValidateBytes_GraphShape_NeedsAndInputsCombineCleanly(t *testing.T) {
+func TestValidateBytes_GraphShape_NeedsDedupesAgainstLonghand(t *testing.T) {
 	// A `needs` entry whose derived (artifact, from_stage) pair is already
-	// declared longhand dedupes to the identical resolved set, so the document
-	// validates clean.
-	doc := `version: "2"
+	// declared longhand is DROPPED, so `needs` + longhand resolve to the
+	// identical input set however the author spelled it.
+	t.Run("clean", func(t *testing.T) {
+		// The deduped set carries exactly one plan input, so the document validates.
+		doc := `version: "2"
 workflows:
   feature_change:
     stages:
@@ -301,9 +303,123 @@ workflows:
         produces:
           - artifact: pull_request
 `
-	if err := spec.ValidateBytes([]byte(doc)); err != nil {
-		t.Fatalf("ValidateBytes: want nil, got %v", err)
-	}
+		if err := spec.ValidateBytes([]byte(doc)); err != nil {
+			t.Fatalf("ValidateBytes: want nil, got %v", err)
+		}
+	})
+
+	t.Run("dedup_observed_via_index", func(t *testing.T) {
+		// LOAD-BEARING observation of the resolved set (the fix for the formerly
+		// vacuous nil-only assertion): `needs: [plan, nope]` alongside a longhand
+		// plan input. The `plan` derivation duplicates the declared input and is
+		// DROPPED, so the surviving unknown `nope` derivation lands at
+		// post-expansion index len(declared) = 1 and is reported at
+		// /inputs/1/from_stage. WITHOUT dedup the un-dropped `plan` duplicate
+		// would push `nope` to index 2, so this assertion fails when
+		// deduplication is disabled — the reported index observes the resolved
+		// input set's cardinality, which a nil-only check never does.
+		doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan, nope]
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+`
+		entries := graphErrors(t, doc)
+		requireEntry(t, entries,
+			fmt.Sprintf(spec.PathFmtFromStage, "feature_change", 1, 1),
+			fmt.Sprintf(spec.MsgFmtFromStageUnknown, "nope", "feature_change"))
+	})
+}
+
+func TestValidateBytes_GraphShape_NeedsMixesValidAndArtifactless(t *testing.T) {
+	// Concern-2 mixing branch (C2(a)): a stage whose `needs` combines a VALID
+	// referent (`plan`, which derives cleanly) with an artifactless one (`ref`,
+	// a review stage). expandNeeds processes entries in order and RETURNS on the
+	// first no-default referent before applying any derived entries, mirroring
+	// the backend's first-error posture — so the no-default rejection is reported
+	// at the referent's /needs/<j> index (here j=1, NOT 0), pinning that the loop
+	// advances past the valid entry and reports at the offending index. The
+	// existing M5 case only exercises a SINGLE artifactless referent at index 0.
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: ref
+        type: review
+        executor:
+          human: true
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan, ref]
+        produces:
+          - artifact: pull_request
+`
+	entries := graphErrors(t, doc)
+	requireEntry(t, entries,
+		fmt.Sprintf(spec.PathFmtNeeds, "feature_change", 2, 1),
+		fmt.Sprintf(spec.MsgFmtNeedsNoDefaultArtifact, "ref", "review", "ref"))
+}
+
+func TestValidateBytes_GraphShape_NeedsAppendsAfterNonMatchingLonghand(t *testing.T) {
+	// Concern-2 index branch (C2(a)): ONE declared longhand input that is NOT a
+	// verbatim match for the derived entry, plus an unknown `needs` referent. The
+	// derived entry is appended at post-expansion index len(declared) = 1, so the
+	// unknown referent is reported at /inputs/1/from_stage. This pins the
+	// append-AFTER-declared order the M4 path promise depends on: reversing the
+	// append order, or dropping the declared input, moves the reported index and
+	// reddens this assertion. The only other M4 case has zero declared inputs, so
+	// its index 0 is trivially right and cannot catch the arithmetic.
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [nope]
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+`
+	entries := graphErrors(t, doc)
+	requireEntry(t, entries,
+		fmt.Sprintf(spec.PathFmtFromStage, "feature_change", 1, 1),
+		fmt.Sprintf(spec.MsgFmtFromStageUnknown, "nope", "feature_change"))
 }
 
 func TestValidateBytes_GraphShape_WellFormedWorkflowIsClean(t *testing.T) {
