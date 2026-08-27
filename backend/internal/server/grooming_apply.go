@@ -112,13 +112,16 @@ const (
 // row written when the apply did NOT run. It is a SUPERSET of
 // workmgmt.GroomingApplySummary's count fields, so one category filter returns
 // both the ran and the did-not-run cases and a reader can tell them apart by
-// `degraded`. No grooming_mutation_applied row is ever written on a degrade
+// `degraded`. `refused` (#2860) is part of that superset and serializes as its
+// zero value on a degrade, which is the correct fact: nothing was dispatched,
+// so nothing was refused. No grooming_mutation_applied row is ever written on a degrade
 // path, so the churn guard's disposition baseline is unaffected and every entry
 // correctly resurfaces on the next grooming run.
 type groomingApplyDegradePayload struct {
 	Applied       int    `json:"applied"`
 	Failed        int    `json:"failed"`
 	Skipped       int    `json:"skipped"`
+	Refused       int    `json:"refused"`
 	Degraded      bool   `json:"degraded"`
 	DegradeReason string `json:"degrade_reason"`
 }
@@ -372,6 +375,7 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		slog.Int("applied", result.Summary.Applied),
 		slog.Int("failed", result.Summary.Failed),
 		slog.Int("skipped", result.Summary.Skipped),
+		slog.Int("refused", result.Summary.Refused),
 	)
 }
 

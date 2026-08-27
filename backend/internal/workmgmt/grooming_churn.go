@@ -397,7 +397,7 @@ func groomingHygieneBasis(e plan.HygieneDefect) string {
 			}
 		}
 		sort.Strings(labels)
-		epic = groomingNormalizeRef(e.Fix.ParentEpic)
+		epic = NormalizeIssueRef(e.Fix.ParentEpic)
 		// Lower-cased to agree with groomingResolveBoardState's
 		// case-insensitive lookup: fingerprinting `Backlog` and `backlog`
 		// identically while resolving them differently is the idempotence

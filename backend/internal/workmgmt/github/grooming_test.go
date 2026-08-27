@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -610,23 +611,51 @@ func TestApplyGroomingMutation_DependsOnAddStampsTheMarker(t *testing.T) {
 	}
 }
 
-// TestApplyGroomingMutation_DependsOnAlreadyMarkedSkips pins the idempotent
-// arm of ensureDependsOnMarker: a body already carrying a marker writes
-// nothing rather than re-PATCHing an identical body.
-func TestApplyGroomingMutation_DependsOnAlreadyMarkedSkips(t *testing.T) {
-	api := groomingAPI("Backlog", true)
-	api.getIssues[2237].Body = "## Summary\n\nbody\n\nDepends on: #2236"
-	res, err := New(api).ApplyGroomingMutation(context.Background(),
-		groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
-	if err != nil {
-		t.Fatalf("ApplyGroomingMutation: %v", err)
-	}
-	if !res.Skipped {
-		t.Errorf("result = %+v, want skipped", res)
-	}
-	if len(api.updateIssueCalls) != 0 {
-		t.Errorf("UpdateIssue calls = %d, want 0", len(api.updateIssueCalls))
-	}
+// TestApplyGroomingMutation_DependsOnMembershipDecidesTheSkip pins the amend
+// path's MEMBERSHIP semantics (#2860), replacing the presence check this test
+// used to assert.
+//
+// A ref the body ALREADY records writes nothing — the genuine idempotent no-op.
+// A DIFFERENT ref against the same marker-bearing body is MERGED into the line
+// with exactly one PATCH; that row is the defect this issue removes, where the
+// old presence check refused every second edge out of an item and audited the
+// refusal as an ordinary skip.
+func TestApplyGroomingMutation_DependsOnMembershipDecidesTheSkip(t *testing.T) {
+	const seeded = "## Summary\n\nbody\n\nDepends on: #2236"
+	t.Run("a ref already recorded is a no-op", func(t *testing.T) {
+		api := groomingAPI("Backlog", true)
+		api.getIssues[2237].Body = seeded
+		res, err := New(api).ApplyGroomingMutation(context.Background(),
+			groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2236"}))
+		if err != nil {
+			t.Fatalf("ApplyGroomingMutation: %v", err)
+		}
+		if !res.Skipped || res.SkipReason != "depends_on ref already present" {
+			t.Errorf("result = %+v, want skipped/depends_on ref already present", res)
+		}
+		if len(api.updateIssueCalls) != 0 {
+			t.Errorf("UpdateIssue calls = %d, want 0", len(api.updateIssueCalls))
+		}
+	})
+	t.Run("a SECOND ref is merged into the existing line", func(t *testing.T) {
+		api := groomingAPI("Backlog", true)
+		api.getIssues[2237].Body = seeded
+		res, err := New(api).ApplyGroomingMutation(context.Background(),
+			groomingRequest(workmgmt.GroomingKindDependsOnAdd, workmgmt.GroomingValue{Scalar: "#2999"}))
+		if err != nil {
+			t.Fatalf("ApplyGroomingMutation: %v", err)
+		}
+		if !res.Applied {
+			t.Fatalf("result = %+v, want applied — a second edge is no longer refused", res)
+		}
+		if len(api.updateIssueCalls) != 1 {
+			t.Fatalf("UpdateIssue calls = %d, want 1", len(api.updateIssueCalls))
+		}
+		body := api.updateIssueCalls[0].params.Body
+		if body == nil || *body != "## Summary\n\nbody\n\nDepends on: #2236, #2999" {
+			t.Errorf("written body = %v, want the ref merged into the existing marker line", body)
+		}
+	})
 }
 
 // TestApplyGroomingMutation_BoardMoves is the placement table. It carries an
@@ -648,6 +677,7 @@ func TestApplyGroomingMutation_BoardMoves(t *testing.T) {
 		onBoard       bool
 		wantOption    string // "" = no write expected
 		wantSkip      string
+		wantRefuse    string
 	}{
 		{
 			name: "board_place onto an off-board item", kind: workmgmt.GroomingKindBoardPlace,
@@ -656,7 +686,7 @@ func TestApplyGroomingMutation_BoardMoves(t *testing.T) {
 		{
 			name: "board_place refused: a human already boarded it", kind: workmgmt.GroomingKindBoardPlace,
 			column: "Backlog", currentStatus: "In Progress", onBoard: true,
-			wantSkip: "manual_placement_preserved",
+			wantRefuse: "manual_placement_preserved",
 		},
 		{
 			name: "icebox from Backlog", kind: workmgmt.GroomingKindIcebox,
@@ -676,13 +706,13 @@ func TestApplyGroomingMutation_BoardMoves(t *testing.T) {
 			name: "icebox refused: a human moved it to In Progress", kind: workmgmt.GroomingKindIcebox,
 			expectedFrom:  []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateUpNext},
 			column:        "Icebox",
-			currentStatus: "In Progress", onBoard: true, wantSkip: "manual_placement_preserved",
+			currentStatus: "In Progress", onBoard: true, wantRefuse: "manual_placement_preserved",
 		},
 		{
 			name: "icebox refused: the item carries no card at all", kind: workmgmt.GroomingKindIcebox,
 			expectedFrom:  []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateUpNext},
 			column:        "Icebox",
-			currentStatus: "", onBoard: false, wantSkip: "manual_placement_preserved",
+			currentStatus: "", onBoard: false, wantRefuse: "manual_placement_preserved",
 		},
 		{
 			// Reachable only when the card's current column is BOTH an
@@ -703,9 +733,30 @@ func TestApplyGroomingMutation_BoardMoves(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ApplyGroomingMutation: %v", err)
 			}
+			// REFUSED and SKIPPED are DISTINCT audit facts (#2860): a
+			// manual-placement guard DECLINED the move, while
+			// `already at target column` observed the move as unnecessary.
+			// Each row asserts its own state and that the other is false, so
+			// collapsing the two reddens here.
+			if tc.wantRefuse != "" {
+				if !res.Refused || res.RefuseReason != tc.wantRefuse {
+					t.Errorf("result = %+v, want REFUSED %q", res, tc.wantRefuse)
+				}
+				if res.Skipped || res.SkipReason != "" {
+					t.Errorf("result = %+v, want the refusal NOT reported as a skip", res)
+				}
+				if api.setOptionID != "" {
+					t.Errorf("SetProjectItemSingleSelect reached with option %q; the guard must refuse BEFORE the write",
+						api.setOptionID)
+				}
+				return
+			}
 			if tc.wantSkip != "" {
 				if !res.Skipped || res.SkipReason != tc.wantSkip {
 					t.Errorf("result = %+v, want skipped %q", res, tc.wantSkip)
+				}
+				if res.Refused {
+					t.Errorf("result = %+v, want an observed no-op NOT reported as a refusal", res)
 				}
 				if api.setOptionID != "" {
 					t.Errorf("SetProjectItemSingleSelect reached with option %q; the guard must refuse BEFORE the write",
@@ -759,17 +810,27 @@ func TestApplyGroomingMutation_ValueSetKindsWriteFields(t *testing.T) {
 	}
 }
 
-// TestApplyGroomingMutation_FieldWriteOnOffBoardItemSkips pins the field
+// TestApplyGroomingMutation_FieldWriteOnOffBoardItemRefuses pins the field
 // write's off-board branch: an item with no card has no field to write, so it
-// SKIPS rather than resolving a card that does not exist.
-func TestApplyGroomingMutation_FieldWriteOnOffBoardItemSkips(t *testing.T) {
+// REFUSES rather than resolving a card that does not exist.
+//
+// REFUSED, not skipped, since #2860: the requested write did not happen AND the
+// value was not already correct. Audited as `skipped` an operator reads it as
+// already-satisfied, which is how an 0/8 apply rate stayed invisible.
+func TestApplyGroomingMutation_FieldWriteOnOffBoardItemRefuses(t *testing.T) {
 	api := groomingAPI("", false)
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
 		groomingRequest(workmgmt.GroomingKindRankSet, workmgmt.GroomingValue{Scalar: "3"}))
 	if err != nil {
 		t.Fatalf("ApplyGroomingMutation: %v", err)
 	}
-	if !res.Skipped || res.SkipReason != "not on board" {
+	if !res.Refused || res.Skipped || res.Applied {
+		t.Errorf("result = %+v, want REFUSED (not skipped): the write did not happen and nothing was already correct", res)
+	}
+	if res.SkipReason != "" {
+		t.Errorf("SkipReason = %q, want empty on a refusal", res.SkipReason)
+	}
+	if res.RefuseReason != "not on board" {
 		t.Errorf("result = %+v, want a not-on-board skip", res)
 	}
 	if api.setOptionID != "" {
@@ -1324,4 +1385,297 @@ func countOp(ops []string, want string) int {
 		}
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// depends_on: additive amend + cross-layer membership agreement (#2860)
+// ---------------------------------------------------------------------------
+
+// dependsOnForge is a BODY-STATEFUL fake forge: a PATCH persists the body, so
+// the next GET returns what the provider actually wrote. That is what makes the
+// re-apply assertions below a real round trip rather than a canned reply — the
+// same discipline TestApplyGroomingMutation_EpicLinkReapplyIsANoOp follows.
+type dependsOnForge struct {
+	bodies  map[int]string
+	patches []string
+}
+
+// newDependsOnForge stands up the client + fake for a depends_on apply over one
+// issue whose body is seeded by construction.
+func newDependsOnForge(t *testing.T, number int, body string) (*githubclient.Client, *dependsOnForge) {
+	t.Helper()
+	fx := &dependsOnForge{bodies: map[int]string{number: body}}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("number"))
+		enc, _ := json.Marshal(fx.bodies[n])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"number":%d,"node_id":"ISSUE_NODE","title":"t","body":%s,"state":"open","labels":[{"name":"type:feature"}]}`,
+			n, enc))
+	})
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("number"))
+		var params struct {
+			Body *string `json:"body"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &params)
+		fx.patches = append(fx.patches, string(raw))
+		if params.Body != nil {
+			fx.bodies[n] = *params.Body
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"number":%d,"state":"open","labels":[{"name":"type:feature"}]}`, n))
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	return c, fx
+}
+
+// dependsOnApplyRequest builds a whole-report apply for ONE approved
+// depends_on edge from `from` to `to`, driving the REAL core.
+func dependsOnApplyRequest(from int, to string) (workmgmt.GroomingApplyRequest, string) {
+	fromRef := groomingItemRef(from)
+	toRef := plan.ItemRef{Type: "github_issue", ID: to}
+	edge := plan.DependencyEdge{
+		ID:    plan.GroomingEntryID(plan.GroomingClassDependency, "", fromRef, toRef),
+		From:  fromRef,
+		To:    toRef,
+		Basis: "shared seam",
+		Kind:  "depends_on",
+	}
+	report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{edge}}
+	return workmgmt.GroomingApplyRequest{
+		Target: workmgmt.Target{
+			Scope: forge.FromGitHubInstallationID(99),
+			Repo:  workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		},
+		Report:    report,
+		Decisions: []workmgmt.GroomingDecision{{EntryID: edge.ID, Verdict: workmgmt.GroomingApproved}},
+		Modes:     map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+		States:    groomingStates,
+	}, edge.ID
+}
+
+// dependsOnRecord finds the settled record for entryID in any bucket.
+func dependsOnRecord(t *testing.T, res *workmgmt.GroomingApplyResult, entryID string) workmgmt.GroomingMutationRecord {
+	t.Helper()
+	for _, b := range [][]workmgmt.GroomingMutationRecord{res.Applied, res.Failed, res.Skipped, res.Refused} {
+		for _, r := range b {
+			if r.EntryID == entryID {
+				return r
+			}
+		}
+	}
+	t.Fatalf("no record for %q in %+v", entryID, res)
+	return workmgmt.GroomingMutationRecord{}
+}
+
+// TestApplyGroomingMutation_SecondDependsOnEdgeIsWrittenThenSettles is the
+// #2860 done-means driven END TO END through the REAL core and the REAL
+// provider over a body-stateful forge.
+//
+// BEFORE: ensureDependsOnMarker refused every write against a marker-bearing
+// body, so an item recording three dependencies could never gain a fourth, and
+// the refusal was audited as an ordinary skip — the measured 0/8 apply rate.
+//
+// NOW: the fourth ref is MERGED into the existing line by exactly ONE PATCH.
+// Re-applying the SAME approved report then settles it through the CORE's
+// membership diff (`already_applied`) with ZERO further PATCHes — the AC7
+// zero-dispatch property, reached through membership rather than through a
+// provider refusal.
+func TestApplyGroomingMutation_SecondDependsOnEdgeIsWrittenThenSettles(t *testing.T) {
+	const seeded = "## Summary\n\nWork item.\n\nDepends on: #1639, #1640, #1641\n"
+	c, fx := newDependsOnForge(t, 1642, seeded)
+	provider := New(c)
+	req, entryID := dependsOnApplyRequest(1642, "kuhlman-labs/fishhawk#2032")
+
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if rec := dependsOnRecord(t, res, entryID); rec.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("first apply outcome=%q skip=%q refuse=%q, want applied — the second edge is no longer refused",
+			rec.Outcome, rec.SkipReason, rec.RefuseReason)
+	}
+	if len(fx.patches) != 1 {
+		t.Fatalf("UpdateIssue calls = %d (%v), want exactly 1", len(fx.patches), fx.patches)
+	}
+	want := "## Summary\n\nWork item.\n\nDepends on: #1639, #1640, #1641, #2032\n"
+	if got := fx.bodies[1642]; got != want {
+		t.Errorf("persisted body =\n%q\nwant\n%q", got, want)
+	}
+
+	// RE-APPLY the same approved report against the now-mutated forge.
+	fx.patches = nil
+	res, err = workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("re-apply: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeSkipped || rec.SkipReason != workmgmt.GroomingSkipAlreadyApplied {
+		t.Errorf("re-apply outcome=%q reason=%q, want skipped/%s — the CORE's membership diff must settle it",
+			rec.Outcome, rec.SkipReason, workmgmt.GroomingSkipAlreadyApplied)
+	}
+	if len(fx.patches) != 0 {
+		t.Errorf("re-apply PATCHed the issue again: %v — AC7 requires ZERO dispatch", fx.patches)
+	}
+}
+
+// TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericRefs
+// is the ONE-SHARED-NORMALIZER property asserted AT THE CORE/PROVIDER SEAM,
+// over the ref shapes on which a second normalizer disagrees.
+//
+// WHAT IS AND IS NOT REACHABLE, verified against the shipped code rather than
+// assumed. A non-numeric ref cannot be DISPATCHED through ApplyGrooming at all:
+// groomingResolveItemRef refuses a depends_on target outside the apply's repo
+// and emits `#N` for one inside it, so the After.Scalar reaching the provider
+// is always bare-numeric. There is therefore no end-to-end apply whose OUTCOME
+// turns on how a non-numeric PROPOSAL normalizes, and a test asserting one
+// cannot be written. What IS reachable — and what actually broke — is a body
+// that already CARRIES non-numeric refs (the filing path writes exactly those)
+// being READ by both layers.
+//
+// So the seam this test pins is the MEMBERSHIP READ, on both sides of it, over
+// the same bytes:
+//
+//   - the CORE's observed ref set, taken end to end out of the real
+//     ApplyGrooming through the audited record's `Before.List` (which is what
+//     groomingSatisfied tests membership against); and
+//   - the PROVIDER's observed ref set, `dependsOnMarkerRefs`, which is what
+//     appendDependsOnRef tests membership against before it splices.
+//
+// Both are asserted against ONE hard-coded literal — not against each other
+// alone, and not against NormalizeIssueRef re-applied in the test, either of
+// which could agree on a wrong answer — and then against each other, which is
+// the seam claim itself.
+//
+// This is what makes the rows non-vacuous. Each seeded body carries BOTH
+// collapsible shapes of the same cross-repo ref, `other/repo#1639` and
+// `#other/repo#1639`. The rejected two-normalizer design — a provider-side
+// normalizer that unconditionally prefixes `#` — maps those two DISTINCT refs
+// onto the single value `#other/repo#1639`, so the provider's observed set
+// stops equalling the core's and both rows go red. The outcome and persisted-
+// body assertions alone would NOT catch that: the proposal is numeric, so the
+// core's verdict is unchanged, and the splice preserves the surrounding bytes.
+func TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericRefs(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		seededRefs  string
+		proposedRef string
+		// wantObserved is the normalized ref set BOTH layers must read out of
+		// the seeded body, spelled literally. The two non-numeric entries are
+		// distinct refs and must stay distinct.
+		wantObserved []string
+		wantOutcome  workmgmt.GroomingOutcome
+		wantBody     string // "" means: byte-identical to the seeded body
+	}{
+		{
+			name:         "numeric member of a mixed line is already applied",
+			seededRefs:   "other/repo#1639, #other/repo#1639, #2032",
+			proposedRef:  "kuhlman-labs/fishhawk#2032",
+			wantObserved: []string{"other/repo#1639", "#other/repo#1639", "#2032"},
+			wantOutcome:  workmgmt.GroomingOutcomeSkipped,
+		},
+		{
+			name:         "numeric non-member is appended BESIDE the non-numeric refs, unmangled",
+			seededRefs:   "other/repo#1639, #other/repo#1639",
+			proposedRef:  "kuhlman-labs/fishhawk#2032",
+			wantObserved: []string{"other/repo#1639", "#other/repo#1639"},
+			wantOutcome:  workmgmt.GroomingOutcomeApplied,
+			wantBody:     "## Summary\n\nDepends on: other/repo#1639, #other/repo#1639, #2032\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seeded := "## Summary\n\nDepends on: " + tc.seededRefs + "\n"
+			c, fx := newDependsOnForge(t, 1642, seeded)
+			provider := New(c)
+			req, entryID := dependsOnApplyRequest(1642, tc.proposedRef)
+
+			res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			rec := dependsOnRecord(t, res, entryID)
+
+			// THE SEAM. coreRefs is the core's membership set, produced by the
+			// REAL core inside the REAL apply; providerRefs is the provider's,
+			// over the SAME seeded bytes. A second normalizer in either layer
+			// separates them.
+			coreRefs := rec.Before.List
+			providerRefs := dependsOnMarkerRefs(seeded)
+			if !slices.Equal(coreRefs, tc.wantObserved) {
+				t.Errorf("CORE observed %q, want %q — the core normalized a non-numeric ref differently",
+					coreRefs, tc.wantObserved)
+			}
+			if !slices.Equal(providerRefs, tc.wantObserved) {
+				t.Errorf("PROVIDER observed %q, want %q — a second normalizer is deciding ref shape",
+					providerRefs, tc.wantObserved)
+			}
+			if !slices.Equal(coreRefs, providerRefs) {
+				t.Fatalf("the layers DISAGREE about membership over %q: core=%q provider=%q",
+					seeded, coreRefs, providerRefs)
+			}
+
+			if rec.Outcome != tc.wantOutcome {
+				t.Fatalf("outcome=%q skip=%q refuse=%q, want %q — the layers disagreed about membership",
+					rec.Outcome, rec.SkipReason, rec.RefuseReason, tc.wantOutcome)
+			}
+			if tc.wantOutcome == workmgmt.GroomingOutcomeSkipped {
+				if rec.SkipReason != workmgmt.GroomingSkipAlreadyApplied {
+					t.Errorf("skip reason = %q, want %q", rec.SkipReason, workmgmt.GroomingSkipAlreadyApplied)
+				}
+				if len(fx.patches) != 0 {
+					t.Errorf("an already-recorded ref still PATCHed: %v", fx.patches)
+				}
+				if got := fx.bodies[1642]; got != seeded {
+					t.Errorf("body mutated:\n%q", got)
+				}
+				return
+			}
+			if len(fx.patches) != 1 {
+				t.Fatalf("UpdateIssue calls = %d (%v), want exactly 1", len(fx.patches), fx.patches)
+			}
+			if got := fx.bodies[1642]; got != tc.wantBody {
+				t.Errorf("persisted body =\n%q\nwant\n%q", got, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestAppendDependsOnRef_DoesNotCollapseNonNumericShapes is the DISCRIMINATING
+// unit for the one-shared-normalizer property, at the layer where a non-numeric
+// ref is actually reachable: a marker line the FILING path wrote.
+//
+// A provider-side normalizer that unconditionally prefixed `#` — the rejected
+// two-normalizer design — would map `other/repo#1639` and `#other/repo#1639`
+// onto ONE value, so the second would be reported as already a member of a body
+// carrying only the first, and an append would emit the mangled
+// `#other/repo#1639`. Both directions are asserted on the resulting BYTES.
+func TestAppendDependsOnRef_DoesNotCollapseNonNumericShapes(t *testing.T) {
+	for _, tc := range []struct{ seeded, proposed, want string }{
+		{"other/repo#1639", "#other/repo#1639", "Depends on: other/repo#1639, #other/repo#1639\n"},
+		{"#other/repo#1639", "other/repo#1639", "Depends on: #other/repo#1639, other/repo#1639\n"},
+	} {
+		body := "Depends on: " + tc.seeded + "\n"
+		got, changed := appendDependsOnRef(body, tc.proposed)
+		if !changed {
+			t.Errorf("appending %q to a line holding %q reported no change — the two shapes were collapsed",
+				tc.proposed, tc.seeded)
+		}
+		if got != tc.want {
+			t.Errorf("body =\n%q\nwant\n%q", got, tc.want)
+		}
+		// The same-shape control: appending the SEEDED ref to ITSELF must be a
+		// no-op, so the assertion above cannot pass merely by never comparing.
+		if got, changed := appendDependsOnRef(body, tc.seeded); changed || got != body {
+			t.Errorf("appending %q to itself changed the body: changed=%t body=%q", tc.seeded, changed, got)
+		}
+	}
 }

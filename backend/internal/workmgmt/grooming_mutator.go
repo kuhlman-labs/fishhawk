@@ -287,26 +287,50 @@ type GroomingMutationRequest struct {
 }
 
 // GroomingMutationResult is what a provider reports for one dispatched
-// mutation. Applied is true when the tracker changed. Skipped with a
-// SkipReason is a provider-side deliberate no-op (its own defence-in-depth
-// expected-source re-check, an already-present value it observed at write
-// time). ProviderResponse is the short provider-side description the audit row
-// carries; Observed is the state the provider read at write time, when it read
-// one.
+// mutation. ProviderResponse is the short provider-side description the audit
+// row carries; Observed is the state the provider read at write time, when it
+// read one.
 //
-// EXACTLY ONE of Applied and Skipped MUST be true, and a provider that
-// returns any other combination is treated as having FAILED (#2237 review).
-// The two rejected states are not symmetric in how they were reached, but they
-// are equally unusable: a zero-value result (both false) claims neither a
-// write nor a deliberate no-op, and a result with both set claims both. The
-// apply layer VALIDATES this rather than assuming it, because
-// settleGroomingCandidate turns this struct straight into the audit outcome —
-// so a both-false result reaching an applied-by-default arm would record a
-// tracker write that never happened.
+// EXACTLY ONE OF THREE — Applied, Skipped, Refused — MUST be true, and a
+// provider that returns any other combination is treated as having FAILED
+// (#2237 review, widened to three by #2860). The three states are distinct
+// AUDIT FACTS and the distinction is the point:
+//
+//   - Applied: the tracker CHANGED.
+//   - Skipped: a deliberate no-op the provider OBSERVED as already-satisfied —
+//     the value it was asked to write is the value already there.
+//   - Refused: a requested write the provider DECLINED to perform. Nothing
+//     changed AND nothing was already correct. This is NOT benign idempotence
+//     and must not read as it (#2860): folding a refusal into Skipped is how a
+//     0/8 apply rate went unnoticed across three grooming walks, because every
+//     refused edge was audited as an ordinary no-op.
+//
+// The apply layer VALIDATES this rather than assuming it, because
+// settleGroomingCandidate turns this struct straight into the load-bearing
+// audit outcome. Every other combination — including ALL-FALSE — is FAILED: a
+// zero-value result claims no write, no observed no-op and no refusal, and a
+// switch whose applied arm is the DEFAULT would fabricate an audit row
+// claiming a tracker write that provably did not happen.
 type GroomingMutationResult struct {
 	Applied          bool          `json:"applied"`
 	Skipped          bool          `json:"skipped"`
+	Refused          bool          `json:"refused"`
 	SkipReason       string        `json:"skip_reason,omitempty"`
+	RefuseReason     string        `json:"refuse_reason,omitempty"`
 	ProviderResponse string        `json:"provider_response,omitempty"`
 	Observed         GroomingValue `json:"observed,omitempty"`
+}
+
+// WellFormed reports whether EXACTLY ONE of Applied, Skipped and Refused is
+// true — the contract stated on the type. It is a method rather than an inline
+// count in settleGroomingCandidate so the validator and the test that pins it
+// cannot drift apart.
+func (r GroomingMutationResult) WellFormed() bool {
+	n := 0
+	for _, b := range []bool{r.Applied, r.Skipped, r.Refused} {
+		if b {
+			n++
+		}
+	}
+	return n == 1
 }

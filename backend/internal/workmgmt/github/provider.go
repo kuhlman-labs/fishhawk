@@ -933,18 +933,31 @@ var dependsOnMarkerRE = regexp.MustCompile(`(?im)^Depends on:\s*(.+)$`)
 var dependsOnRefRE = regexp.MustCompile(`^\s*#?([1-9]\d*)\s*$`)
 
 // renderDependsOnMarker renders the depends_on body marker line for refs as
-// `Depends on: #X, #Y`. Each ref is normalized to `#N` (a bare `N` gains the
-// `#`). It is the single source of truth for the marker format, paired with
+// `Depends on: #X, #Y`. It is the single source of truth for the marker
+// FORMAT (the `Depends on: ` prefix and the comma-separated join), paired with
 // parseDependsOnMarker so write and read cannot drift. Returns "" when refs is
 // empty, so an item with no depends_on carries no marker.
+//
+// The SHAPE of each emitted ref is decided by workmgmt.NormalizeIssueRef and
+// nowhere else (#2860). This function used to inline its own
+// trim/strip/`#`-prefix, which was a THIRD copy of that decision and disagreed
+// with the normalizer on a non-numeric token: it emitted `#owner/repo#123`
+// where the membership read observes `owner/repo#123`, so what the filing path
+// WROTE and what a later read OBSERVED could never match. For every numeric
+// token the emitted bytes are IDENTICAL to before (`#41`->`#41`, `42`->`#42`).
+//
+// The empty-after-strip guard below is NOT a competing normalizer — it decides
+// whether a token is emitted AT ALL, not what shape it takes. It must stay:
+// NormalizeIssueRef("#") returns the trimmed original `"#"`, which is
+// non-empty, so without this guard a bare `#` token would start being emitted
+// as a reference.
 func renderDependsOnMarker(refs []string) string {
 	var parts []string
 	for _, r := range refs {
-		s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r), "#"))
-		if s == "" {
+		if dependsOnRefStripped(r) == "" {
 			continue
 		}
-		parts = append(parts, "#"+s)
+		parts = append(parts, workmgmt.NormalizeIssueRef(r))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -952,10 +965,60 @@ func renderDependsOnMarker(refs []string) string {
 	return "Depends on: " + strings.Join(parts, ", ")
 }
 
+// dependsOnRefStripped is the depends_on marker's VALIDITY test, spelled once
+// so the render path and the amend path cannot disagree about which tokens are
+// references at all. It returns the ref with surrounding whitespace and ONE
+// optional leading `#` removed; an empty result means the token carries no
+// reference (an empty string, whitespace, or a bare `#`) and must be skipped.
+//
+// It decides EMPTINESS only, never SHAPE — shape is workmgmt.NormalizeIssueRef's
+// job alone (#2860).
+func dependsOnRefStripped(ref string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
+}
+
+// dependsOnMarkerRefs is the AMEND path's MEMBERSHIP read: every depends_on ref
+// the body already records, normalized through workmgmt.NormalizeIssueRef and
+// returned in body order.
+//
+// It walks EVERY marker line, not just the first, mirroring the core's
+// groomingMarkerObserved — the two layers must observe the SAME ref set or
+// #2860 reappears as a disagreement about membership.
+//
+// It deliberately does NOT reuse parseDependsOnMarker: that reads only the
+// FIRST marker line and collapses every non-bare-numeric token to
+// dependsOnRef{Resolvable: false}, DISCARDING the token text, so a cross-repo
+// ref could not be compared at all.
+func dependsOnMarkerRefs(body string) []string {
+	var out []string
+	for _, m := range dependsOnMarkerRE.FindAllStringSubmatch(body, -1) {
+		// The `(.+)` capture swallows a trailing carriage return on a CRLF
+		// body (Go's `(?m)$` anchors before `\n` only, and `.` matches `\r`),
+		// so trim it before splitting or the last token would be `#123` plus a
+		// stray CR and would never compare equal.
+		for _, tok := range strings.Split(strings.TrimSuffix(m[1], "\r"), ",") {
+			if dependsOnRefStripped(tok) == "" {
+				continue
+			}
+			out = append(out, workmgmt.NormalizeIssueRef(tok))
+		}
+	}
+	return out
+}
+
 // ensureDependsOnMarker appends the depends_on marker line to body when refs
 // is non-empty and body does not already carry a marker. Idempotent: a body
 // that already has a `Depends on:` line is returned unchanged, so re-filing
 // never double-stamps the marker.
+//
+// This is the FILING path's helper (E34.3 / #1594) and its never-double-stamp
+// contract is CORRECT there: filing an item re-sends its whole declared
+// depends_on set, so a body that already carries a marker already carries them.
+// It is deliberately NOT widened to be additive — the grooming AMEND path,
+// which adds ONE new edge to an item that may already record others, uses the
+// separately-named appendDependsOnRef instead (#2860). Two named helpers, not
+// one helper with a mode flag, so neither path can silently acquire the
+// other's behaviour.
 func ensureDependsOnMarker(body string, refs []string) string {
 	marker := renderDependsOnMarker(refs)
 	if marker == "" {
@@ -968,6 +1031,55 @@ func ensureDependsOnMarker(body string, refs []string) string {
 		return marker
 	}
 	return strings.TrimRight(body, "\n") + "\n\n" + marker
+}
+
+// appendDependsOnRef MERGES one depends_on ref into the body, additively. It is
+// the grooming AMEND path's counterpart to the filing path's
+// ensureDependsOnMarker, and is what #2860 fixes: ensureDependsOnMarker refuses
+// EVERY write against a marker-bearing body, so an item recording one
+// dependency could never gain a second, and that refusal was audited as an
+// indistinguishable no-op.
+//
+// It returns the new body and whether the body actually CHANGED. changed is
+// never true for a body that did not change — reporting a refusal as a success
+// is the exact failure #2860 exists to kill.
+//
+//   - A ref that is not a reference at all (empty, whitespace, a bare `#`) is a
+//     no-op returning changed=false. Both body shapes must be covered here:
+//     with a marker the splice would append a meaningless `, #`, and WITHOUT one
+//     the delegation below would return the body unchanged (renderDependsOnMarker
+//     skips the token) while still reporting changed=true.
+//   - A ref the body ALREADY records is the genuine idempotent no-op.
+//   - A body with NO marker delegates to ensureDependsOnMarker rather than
+//     hand-rolling the append-a-whole-new-marker case.
+//   - Otherwise the ref is spliced into the FIRST marker line's captured value.
+//
+// TRAILING-CR HANDLING. Go's `(?m)$` anchors immediately before a `\n` only —
+// it does not treat `\r\n` as one terminator — and `.` matches every byte but
+// `\n`, including a carriage return. So on a CRLF body dependsOnMarkerRE's
+// capture ENDS WITH the CR, and appending at the raw capture end would emit
+// `#1641<CR>, #2032` and corrupt the line. The CR is therefore trimmed before
+// appending and re-emitted after, preserving the line ending byte for byte.
+// Nothing outside the capture group is rewritten, so surrounding body bytes,
+// any other marker lines and the body's final newline are untouched.
+func appendDependsOnRef(body, ref string) (string, bool) {
+	if dependsOnRefStripped(ref) == "" {
+		return body, false
+	}
+	want := workmgmt.NormalizeIssueRef(ref)
+	for _, got := range dependsOnMarkerRefs(body) {
+		if got == want {
+			return body, false
+		}
+	}
+	loc := dependsOnMarkerRE.FindStringSubmatchIndex(body)
+	if loc == nil {
+		return ensureDependsOnMarker(body, []string{ref}), true
+	}
+	val := body[loc[2]:loc[3]]
+	core := strings.TrimSuffix(val, "\r")
+	cr := val[len(core):]
+	return body[:loc[2]] + core + ", " + want + cr + body[loc[3]:], true
 }
 
 // dependsOnRef is one parsed token from the depends_on marker list, carrying the

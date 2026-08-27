@@ -196,6 +196,8 @@ type groomingApplyMutator struct {
 	// block makes the first dispatch wait for the context (or the duration),
 	// which is how the bounded-context test wedges a forge.
 	block time.Duration
+	// refuse makes every dispatch return a REFUSAL carrying this reason.
+	refuse string
 }
 
 func (m *groomingApplyMutator) ApplyGroomingMutation(ctx context.Context, req workmgmt.GroomingMutationRequest) (*workmgmt.GroomingMutationResult, error) {
@@ -212,6 +214,13 @@ func (m *groomingApplyMutator) ApplyGroomingMutation(ctx context.Context, req wo
 	}
 	if err != nil {
 		return nil, err
+	}
+	m.mu.Lock()
+	refuse := m.refuse
+	m.mu.Unlock()
+	if refuse != "" {
+		return &workmgmt.GroomingMutationResult{Refused: true, RefuseReason: refuse,
+			ProviderResponse: "refused " + string(req.Kind)}, nil
 	}
 	return &workmgmt.GroomingMutationResult{Applied: true, ProviderResponse: "applied " + string(req.Kind)}, nil
 }
@@ -301,6 +310,9 @@ type groomingApplyOpts struct {
 	mutatorFailure error
 	// mutatorBlock wedges each dispatch on the context.
 	mutatorBlock time.Duration
+	// mutatorRefusal makes every dispatch return a provider REFUSAL carrying
+	// this reason — the third result state (#2860).
+	mutatorRefusal string
 }
 
 type groomingApplyFixture struct {
@@ -361,7 +373,7 @@ func newGroomingApplyFixture(t *testing.T, opts groomingApplyOpts) *groomingAppl
 		ArtifactRepo: arts,
 	})
 
-	mut := &groomingApplyMutator{err: opts.mutatorFailure, block: opts.mutatorBlock}
+	mut := &groomingApplyMutator{err: opts.mutatorFailure, block: opts.mutatorBlock, refuse: opts.mutatorRefusal}
 	rdr := &groomingApplyReader{}
 
 	prevConv := conventionsLoader
@@ -1311,5 +1323,123 @@ func TestApproveGroomStage_DelegationTierLabelNotApplied(t *testing.T) {
 	}
 	if !clericalApplied {
 		t.Errorf("the clerical hygiene entry %q did not round-trip as applied; the tier entry's absence proves nothing if the decoder read nothing", ids.hygiene)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The refused outcome, through the SHIPPED serialization (#2860)
+// ---------------------------------------------------------------------------
+
+// TestApplyApprovedGrooming_RefusedIDsReachTheCompletedPayload is operator
+// approval condition 2, and it asserts the RENDERED JSON rather than the Go
+// struct — a fact no compiler enforces.
+//
+// A COUNT proves bucketing happened; it does not prove the entry ID survived
+// into the payload an operator actually reads. Not naming WHICH edges were
+// refused is precisely why an 0/8 apply rate went unnoticed across three
+// grooming walks, so the assertion is on `refused_ids` in the serialized
+// grooming_apply_completed row, decoded through the SAME bare decode
+// priorGroomingDispositions uses.
+func TestApplyApprovedGrooming_RefusedIDsReachTheCompletedPayload(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorRefusal: "not on board"})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	rows := f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)
+	if len(rows) != 1 {
+		t.Fatalf("grooming_apply_completed rows = %d, want exactly 1", len(rows))
+	}
+	// The RAW bytes must carry both keys — a struct-only assertion would still
+	// pass if a json tag were renamed or dropped.
+	raw := string(rows[0].Payload)
+	for _, key := range []string{`"refused"`, `"refused_ids"`} {
+		if !strings.Contains(raw, key) {
+			t.Errorf("serialized payload is missing %s: %s", key, raw)
+		}
+	}
+	var summary workmgmt.GroomingApplySummary
+	if err := json.Unmarshal(rows[0].Payload, &summary); err != nil {
+		t.Fatalf("decode grooming_apply_completed payload: %v (%s)", err, raw)
+	}
+	if summary.Refused == 0 {
+		t.Fatalf("summary refused = 0, want the dispatched candidates counted: %s", raw)
+	}
+	if summary.Applied != 0 {
+		t.Errorf("summary applied = %d, want 0 — every dispatch was refused: %s", summary.Applied, raw)
+	}
+	// The IDS, not just the count: every dispatched entry is NAMED.
+	if len(summary.RefusedIDs) != summary.Refused {
+		t.Errorf("refused_ids = %v but refused = %d — the count and the ids disagree", summary.RefusedIDs, summary.Refused)
+	}
+	named := map[string]bool{}
+	for _, id := range summary.RefusedIDs {
+		named[id] = true
+	}
+	for _, id := range f.mutator.dialedEntryIDs() {
+		if !named[id] {
+			t.Errorf("entry %q was dispatched and refused but is absent from refused_ids %v", id, summary.RefusedIDs)
+		}
+	}
+
+	// The PER-MUTATION row carries the refusal as its own audit fact, with an
+	// EMPTY skip_reason so a reader cannot mistake it for an idempotent no-op.
+	recs := f.mutationRecords(t)
+	for _, id := range f.mutator.dialedEntryIDs() {
+		rec, ok := recs[id]
+		if !ok {
+			t.Fatalf("no grooming_mutation_applied row for refused entry %q", id)
+		}
+		if rec.Outcome != workmgmt.GroomingOutcomeRefused {
+			t.Errorf("entry %q outcome = %q, want %q", id, rec.Outcome, workmgmt.GroomingOutcomeRefused)
+		}
+		if rec.RefuseReason != "not on board" {
+			t.Errorf("entry %q refuse_reason = %q, want %q", id, rec.RefuseReason, "not on board")
+		}
+		if rec.SkipReason != "" {
+			t.Errorf("entry %q skip_reason = %q, want empty — a refusal is not a skip", id, rec.SkipReason)
+		}
+	}
+}
+
+// TestApplyApprovedGrooming_DegradePayloadCarriesRefusedZero pins the DEGRADE
+// half of the same key. groomingApplyDegradePayload is a strict superset of
+// GroomingApplySummary's count fields so ONE category filter returns both
+// shapes; `refused` must therefore serialize on a degrade too, as its zero
+// value — which is the correct fact, since nothing was dispatched.
+func TestApplyApprovedGrooming_DegradePayloadCarriesRefusedZero(t *testing.T) {
+	// An unparseable report degrades before anything is dispatched. (A MISSING
+	// artifact is silent by design — it means "not a grooming stage" — and
+	// writes no row at all.)
+	f := newGroomingApplyFixture(t, groomingApplyOpts{badReport: true})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	rows := f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)
+	if len(rows) != 1 {
+		t.Fatalf("grooming_apply_completed rows = %d, want exactly 1", len(rows))
+	}
+	raw := string(rows[0].Payload)
+	if !strings.Contains(raw, `"refused":0`) {
+		t.Errorf("degrade payload does not carry `\"refused\":0`: %s", raw)
+	}
+	var got groomingApplyDegradePayload
+	if err := json.Unmarshal(rows[0].Payload, &got); err != nil {
+		t.Fatalf("decode degrade payload: %v (%s)", err, raw)
+	}
+	if !got.Degraded {
+		t.Errorf("payload = %s, want degraded:true", raw)
+	}
+	if got.Refused != 0 {
+		t.Errorf("degrade payload refused = %d, want 0 — nothing was dispatched", got.Refused)
+	}
+	// One filter, both shapes: the summary decode must also succeed on this row.
+	var summary workmgmt.GroomingApplySummary
+	if err := json.Unmarshal(rows[0].Payload, &summary); err != nil {
+		t.Fatalf("the degrade row is not decodable as a summary: %v (%s)", err, raw)
+	}
+	if summary.Refused != 0 {
+		t.Errorf("summary-decoded refused = %d, want 0", summary.Refused)
 	}
 }

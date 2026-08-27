@@ -1601,19 +1601,34 @@ Notes:
   `grooming_mutation_applied` is written once per **SETTLED** candidate —
   applied, failed AND skipped alike, so one category filter returns the whole
   apply — carrying `{entry_id, class, report_class, kind, item_ref, before,
-  after, outcome, skip_reason | error, provider_response,
+  after, outcome, skip_reason | refuse_reason | error, provider_response,
   idempotence_checked}`. The name reflects the family, not the outcome; read
-  `outcome` to tell a landed mutation from a containment refusal, and
-  `skip_reason` (the closed set in `grooming_apply.go`: `not_approved`,
-  `mode_report_surface_only`, `destructive_not_authorized`,
-  `delegation_tier_not_authorized`, `already_applied`,
-  `manual_placement_preserved`, `icebox_column_unavailable`, …) to tell WHICH
-  rule refused it. `delegation_tier_not_authorized` (#2855) is the one an
-  operator most often needs to act on by hand: the entry proposed an `autonomy:`
-  delegation-tier label, which no whole-report approval applies, and `after`
-  carries every proposed label. `grooming_apply_completed` is written once per apply with
-  `{applied, failed, skipped, applied_ids, failed_ids, skipped_ids,
-  audit_errors}`. Neither write is best-effort in the silent sense: a sink
+  `outcome` — one of `applied`, `failed`, `skipped`, `refused` — to tell a
+  landed mutation from a containment refusal, and `skip_reason` (the closed set
+  in `grooming_apply.go`: `not_approved`, `mode_report_surface_only`,
+  `destructive_not_authorized`, `delegation_tier_not_authorized`,
+  `already_applied`, `icebox_column_unavailable`, …) to tell WHICH rule refused
+  it. **`refused` is DISTINCT from `skipped` (#2860)**: a skip is a no-op the
+  layer OBSERVED as already-satisfied, while `refused` is a requested write the
+  provider DECLINED — nothing changed and nothing was already correct — and it
+  carries `refuse_reason` instead of `skip_reason`. Collapsing the two is how a
+  measured 0/8 grooming apply rate went unnoticed across three walks, so the
+  distinction is load-bearing rather than cosmetic. The current refuse reasons
+  are `manual_placement_preserved` (raised by the provider's expected-source
+  re-check AND by the core's pre-dispatch placement guard, which agree) and
+  `not on board`. Provider-side SKIP reasons — `labels already present`,
+  `parent epic marker already present`, `already at target column`,
+  `depends_on ref already present` — stay skips: each is a state the provider
+  observed as already-satisfied. `delegation_tier_not_authorized` (#2855) is the
+  one an operator most often needs to act on by hand: the entry proposed an
+  `autonomy:` delegation-tier label, which no whole-report approval applies, and
+  `after` carries every proposed label. `grooming_apply_completed` is written
+  once per apply with `{applied, failed, skipped, refused, applied_ids,
+  failed_ids, skipped_ids, refused_ids, audit_errors}`. `refused_ids` NAMES
+  which entries were declined rather than only counting them — not naming them
+  is what made the 0/8 rate invisible — and the server-authored degrade payload
+  is a strict superset of these count fields, so `refused` serializes as `0` on
+  a did-not-run row and one category filter still returns both shapes. Neither write is best-effort in the silent sense: a sink
   error is collected and surfaced as a `*GroomingAuditError` after the loop, so
   the apply still completes (continue-and-report) but nothing is silently
   unaudited. Listed here so a future reader grepping the audit categories

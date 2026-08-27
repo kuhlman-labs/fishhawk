@@ -38,7 +38,7 @@ Why a GitHub App installation token can't board Project #7:
 |---|---|---|
 | `label_set` | `GetIssue` → `AddIssueLabels` (POST `.../labels`) | **Additive, not a union PATCH — see below.** The payload carries only the labels being added; GitHub merges server-side. A label already present is a provider-side skip, not a write. |
 | `epic_link` | `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | The sub-issues path `File`'s `linkEpic` uses, **plus** the `Parent epic: #N` body marker — see below. A body already naming the PROPOSED parent is a skip; one naming a DIFFERENT parent is a typed `*ParentEpicConflictError`, never a skip. |
-| `depends_on_add` | `GetIssue` → `ensureDependsOnMarker` → `UpdateIssue(body)` | Reuses the existing idempotent body-marker helper; a body already carrying a marker is a skip. |
+| `depends_on_add` | `GetIssue` → `appendDependsOnRef` → `UpdateIssue(body)` | **ADDITIVE (#2860) — see below.** Merges the ref into an existing `Depends on:` line; only a ref the body ALREADY records is a skip. The filing path's `ensureDependsOnMarker` is untouched and keeps its never-double-stamp contract. |
 | `close_duplicate` | `UpdateIssue(state=closed, state_reason=duplicate)` | **Destructive.** |
 | `close_not_planned` | `UpdateIssue(state=closed, state_reason=not_planned)` | **Destructive.** Never `completed`, which would misreport a descoped item as delivered work. |
 | `board_place` | `ProjectFields` → `IssueNodeID` → `ProjectItemStatus` → `placeIssueOnBoard` | Empty expected-source set ⇒ proceeds only while the item is genuinely OFF-board. |
@@ -121,3 +121,68 @@ Both campaign source paths — `EpicChildren` (the epic sweep) and `ResolveDepen
 - anything else (open) → `DropNotChild`.
 
 The `cache map[int]targetState` is created once per resolution call, so N references to one closed target cost ONE `GetIssue`, and a batch with no out-of-set edges makes ZERO extra calls (the pre-#2953 API-call profile for the common case is unchanged). `EpicChildren` classifies only targets ABSENT from `ListSubIssues` (true non-children); a closed-and-completed FELLOW child stays an in-set `Edge`, and the excluded-fellow-child elision is recorded by the campaign `FilterToSubset` layer instead — so the closed-complete fellow-child edge has exactly one owner (no double-recording in `SatisfiedEdges`). This SUPERSEDES the pre-#2953 contract (`DropNotChild` for every out-of-set target); it exists so a campaign whose prerequisite already landed assembles instead of refusing with advice that could never include a closed issue. Pinned by `TestResolveDependencies*`, `TestEpicChildrenOutOfEpicTargetClassification`, `TestClassifyOutOfSetTargetInvalidRefFailsClosed`, and the memoization/no-extra-read call-count tests in `provider_test.go`.
+
+## The depends_on amend path is additive, and CRLF-aware (#2860)
+
+`ensureDependsOnMarker` returns ANY marker-bearing body unchanged. That is
+CORRECT for the FILING path it was written for (E34.3 / #1594): filing re-sends
+an item's whole declared `depends_on` set, so a body already carrying a marker
+already carries them. It is WRONG for the grooming AMEND path, which adds ONE
+new edge to an item that may already record others — every SECOND approved edge
+out of an item was refused, and the refusal was reported as
+`depends_on marker already present`, indistinguishable from an idempotent no-op.
+A measured 0/8 apply rate survived three grooming walks that way.
+
+The amend path is `appendDependsOnRef`, a SEPARATELY NAMED sibling — two named
+helpers, not one helper with a mode flag, so neither path can silently acquire
+the other's behaviour. It returns `(newBody, changed)` and `changed` is never
+true for a body that did not change:
+
+- A ref that is not a reference at all (empty, whitespace, a bare `#`) is a
+  no-op returning `changed == false`. BOTH body shapes matter: with a marker the
+  splice would append a meaningless `, #`; WITHOUT one the delegation below
+  returns the body unchanged (`renderDependsOnMarker` skips the token) while
+  still reporting a change — a body that did not change, audited as applied.
+- A ref the body already records is the genuine idempotent no-op.
+- A marker-free body delegates to `ensureDependsOnMarker`.
+- Otherwise the ref is spliced into the FIRST marker line's captured value.
+
+**The splice is trailing-CR aware.** Go's `(?m)$` anchors immediately before a
+`\n` only — it does not treat `\r\n` as one terminator — and `.` matches every
+byte but `\n`, including a carriage return. So on a CRLF body
+`dependsOnMarkerRE`'s `(.+)` capture ENDS WITH the CR, and appending at the raw
+capture end would emit `#1641<CR>, #2032` and corrupt the line. The CR is
+trimmed before appending and re-emitted after, preserving the line ending byte
+for byte. Nothing outside the capture group is rewritten, so surrounding prose,
+other marker lines and the final newline are untouched.
+`TestAppendDependsOnRef_MergesIntoExistingMarker` and
+`..._PreservesCRLFLineEndings` assert the ENTIRE resulting body, byte for byte.
+
+**One normalizer decides ref SHAPE, across both packages.** `renderDependsOnMarker`,
+`dependsOnMarkerRefs` (the membership read, which walks EVERY marker line the way
+the core's `groomingMarkerObserved` does) and `appendDependsOnRef` all route
+through `workmgmt.NormalizeIssueRef`. #2860 is a defect of two layers disagreeing
+about whether a ref is already recorded, so a second normalization function here
+— even one believed to agree — would rebuild it one level down. The render path's
+empty-after-strip guard (`dependsOnRefStripped`) is NOT a competing normalizer: it
+decides whether a token is emitted at all, never what shape it takes.
+`NormalizeIssueRef("#")` returns the trimmed original `"#"`, which is non-empty,
+so that guard must stay or a bare `#` would start being emitted as a reference.
+
+One consequence is deliberate: a NON-NUMERIC ref on the filing path now persists
+as written (`other/repo#1639`) rather than hashed (`#other/repo#1639`), which is
+what makes the write and the later membership read agree. `parseDependsOnMarker`
+classifies both shapes identically as `dependsOnRef{Resolvable: false}`, so
+#2953's out-of-set classifier is unaffected and previously-filed bodies stay
+readable.
+
+## `manual_placement_preserved` and `not on board` are REFUSALS, not skips
+
+Both are requested writes this provider DECLINED — nothing changed and nothing
+was already correct — so since #2860 they return `Refused: true` with a
+`RefuseReason` rather than `Skipped`. `labels already present`,
+`parent epic marker already present`, `already at target column` and
+`depends_on ref already present` stay SKIPS: those are states the provider
+OBSERVED as already-satisfied. The core reports the same refusal for its own
+pre-dispatch placement guard, so the audit reads the same whichever layer
+noticed first.
