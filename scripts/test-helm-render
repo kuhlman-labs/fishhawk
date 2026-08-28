@@ -1648,6 +1648,7 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
 
   # r17c — each Deployment's selector identity set EQUALS its pod-template identity
   # set; the primary Deployment additionally carries the full expected set.
+  local found_primary_dep=0
   while IFS= read -r -d '' doc; do
     name=$(doc_name "$doc")
     local dsel dpod
@@ -1655,10 +1656,20 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
     dpod=$(identity_labels "$(pod_labels_block "$doc")")
     assert_equals "r17c ($mode) Deployment $name selector identity set equals its pod-template set" "$dsel" "$dpod"
     if [ "$name" = "$primary_dep" ]; then
+      found_primary_dep=1
       assert_equals "r17c ($mode) Deployment $name carries the full expected {name,instance,component=$svc_comp} set" \
         "$dsel" "$expected_primary"
     fi
   done < <(docs_of_kind "$manifest" Deployment)
+  # Loud skip guard (low/untested-path): the full-set pin above fires ONLY when a
+  # Deployment's rendered fullname equals $primary_dep. A release-name or
+  # fullnameOverride drift would silently never run it, leaving the primary
+  # selector's full-set property unasserted. Fail rather than skip.
+  if [ "$found_primary_dep" -eq 1 ]; then
+    pass "r17c ($mode) primary Deployment $primary_dep was found and its full-set pin ran"
+  else
+    fail "r17c ($mode) no Deployment matched primary name $primary_dep — full-set pin never ran"
+  fi
 
   # r17d — no pod set satisfies two DISTINCT Deployment selectors (condition 3:
   # distinct pairs; self-pairs are excluded so M0 can pass).
@@ -1689,15 +1700,32 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
   # Job pod components asserted BY RENDERED VALUE (plan step 7): neither equals
   # server/api/worker, which is what makes r17a's "exactly one workload" a property
   # over ALL shipped pods rather than Deployments only.
-  local comp
+  #
+  # test_vacuity (high): the case match below fires an assertion ONLY when a Job's
+  # rendered name matches one of the two patterns. If either Job is absent, not
+  # parsed, or renamed out of the pattern, its component assertion silently never
+  # runs and the Job-collision coverage goes vacuous while the universe-size check
+  # still passes on the Deployments alone. So track that each expected Job was found
+  # AND checked, and fail loudly if either was not — in BOTH render modes.
+  local comp found_migrate=0 found_minio=0
   while IFS= read -r -d '' doc; do
     name=$(doc_name "$doc")
     comp=$(identity_lines "$(pod_labels_block "$doc")" | sed -n 's#^app.kubernetes.io/component: ##p')
     case "$name" in
-      *-migrate)       assert_equals "r17 ($mode) migrate Job pod component is migrate" "$comp" "migrate" ;;
-      *-minio-bucket)  assert_equals "r17 ($mode) minio-bucket Job pod component is minio-bucket" "$comp" "minio-bucket" ;;
+      *-migrate)       found_migrate=1; assert_equals "r17 ($mode) migrate Job pod component is migrate" "$comp" "migrate" ;;
+      *-minio-bucket)  found_minio=1;   assert_equals "r17 ($mode) minio-bucket Job pod component is minio-bucket" "$comp" "minio-bucket" ;;
     esac
   done < <(docs_of_kind "$manifest" Job)
+  if [ "$found_migrate" -eq 1 ]; then
+    pass "r17 ($mode) migrate Job pod template was found and its component asserted"
+  else
+    fail "r17 ($mode) migrate Job pod template absent/unparsed/renamed — component assertion never ran"
+  fi
+  if [ "$found_minio" -eq 1 ]; then
+    pass "r17 ($mode) minio-bucket Job pod template was found and its component asserted"
+  else
+    fail "r17 ($mode) minio-bucket Job pod template absent/unparsed/renamed — component assertion never ran"
+  fi
 }
 r17_assertions allInOne fishhawk server -f "$CHART/values-local.yaml"
 r17_assertions split fishhawk-api api -f "$CHART/values-local.yaml" --set deployment.mode=split
