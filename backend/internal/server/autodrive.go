@@ -697,13 +697,17 @@ func (s *Server) reportMatrixProposals(ctx context.Context, runRow *run.Run, id 
 		if !live {
 			continue
 		}
-		// Fold a re-open discriminator into the occurrence key so a gate that
-		// CLOSED and RE-OPENED on a fresh review round (a fix-up round trip) is
-		// a DISTINCT occurrence and re-surfaces the proposal, while a gate that
-		// stays continuously live keeps ONE key across polls (at most once per
-		// genuine occurrence). This is what keeps a required proposal from being
-		// suppressed on a later, materially-changed occurrence of the same gate.
-		occurrence = s.reportOccurrenceKey(ctx, runRow, anchor, occurrence)
+		// Fold a re-occurrence discriminator into the occurrence key so a gate
+		// that CLOSED and RE-OPENED (a fresh review round for approve/route_fixup/
+		// waive, a subsequent distinct FAILURE of the same stage for retry, a
+		// re-becoming-ready merge gate for merge) is a DISTINCT occurrence and
+		// re-surfaces the proposal, while a gate that stays continuously live
+		// keeps ONE key across polls (at most once per genuine occurrence). This
+		// is what keeps a required proposal from being suppressed on a later,
+		// materially-changed occurrence of the same gate. The discriminator is
+		// dispatched on the ACTION CLASS (reportOccurrenceKey), not on the
+		// anchor's type.
+		occurrence = s.reportOccurrenceKey(ctx, runRow, action, anchor, occurrence)
 		// A declared `when` must be MET. A report entry whose `when` names
 		// another class's condition produces no Reports decision at all, so the
 		// not-found branch is the same fail-closed skip.
@@ -798,29 +802,128 @@ func reportGateOccurrence(action string, runRow *run.Run, stages []*run.Stage, o
 // stageOccurrence names the BASE identity of a stage-anchored gate: the stage
 // plus the state it is parked in. On its own this key treats a gate that
 // closes and re-opens into the same state on the same stage (a fix-up round
-// trip) as the SAME occurrence — which would suppress a fresh proposal even
-// after the gate's evidence (the review round) materially changed. That is
-// why reportOccurrenceKey folds the review-round count on top of this base:
-// the base holds duplicate poll cycles to one row; the round makes a genuine
+// trip, or a stage that fails, is retried and fails AGAIN) as the SAME
+// occurrence — which would suppress a fresh proposal even after the gate's
+// evidence materially changed. That is why reportOccurrenceKey folds a
+// per-class re-occurrence discriminator on top of this base: the base holds
+// duplicate poll cycles to one row; the discriminator makes a genuine
 // re-opening a distinct occurrence.
 func stageOccurrence(st *run.Stage) string {
 	return "stage:" + st.ID.String() + ":" + string(st.State)
 }
 
-// reportOccurrenceKey folds a re-open discriminator into a REVIEW-anchored
-// gate's base occurrence key. A gate that closes and re-opens on a fresh
-// review round (a fix-up round trip that produced a new *_review_started
-// round) advances the round count and is therefore a DISTINCT occurrence, so
-// the proposal re-surfaces — while a gate that stays continuously live keeps
-// ONE key across polls, so a report is still emitted at most once per genuine
-// occurrence. Non-review gates (a run-level merge, a failed-stage retry with
-// no review surface) have no round to fold and keep the base key.
-func (s *Server) reportOccurrenceKey(ctx context.Context, runRow *run.Run, anchor *run.Stage, base string) string {
-	round, ok := s.reviewRoundCount(ctx, runRow.ID, anchor)
-	if !ok {
+// reportOccurrenceKey folds a per-CLASS re-occurrence discriminator into a
+// gate's base occurrence key, so every gate class re-surfaces its proposal on
+// a genuine re-occurrence while a gate that stays continuously live keeps ONE
+// key across polls (a report at most once per genuine occurrence). The
+// discriminator is dispatched on the ACTION, not the anchor's type:
+//
+//   - retry folds the count of the anchored stage's retries (stage_retried +
+//     stage_override_retried), the signal that distinguishes one FAILURE of a
+//     stage from the next. A failed plan/implement stage previously picked up
+//     the review-round fold incidentally, because dispatch keyed on the
+//     anchor's TYPE; the retry count is the discriminator that actually tracks
+//     a re-occurrence of the failure.
+//   - merge folds a ready-transition proxy (the run's approval_submitted
+//     count), which advances exactly when a re-closed gate lets the merge gate
+//     become ready again (see mergeReadyRoundCount for why this is sound).
+//   - every other class (approve / route_fixup / waive) folds the review-round
+//     count unchanged.
+//
+// Every discriminator degrades to the BASE key (via the ok=false arms of its
+// counter) on an audit read failure or a zero count, so an unreadable
+// discriminator at worst UNDER-emits a re-surfaced proposal — the safe
+// direction (silence, never a flood).
+func (s *Server) reportOccurrenceKey(ctx context.Context, runRow *run.Run, action string, anchor *run.Stage, base string) string {
+	switch action {
+	case delegation.ActionRetry:
+		if n, ok := s.stageRetryCount(ctx, runRow.ID, anchor); ok {
+			return base + ":retry:" + strconv.Itoa(n)
+		}
+		return base
+	case delegation.ActionMerge:
+		if n, ok := s.mergeReadyRoundCount(ctx, runRow.ID); ok {
+			return base + ":approvals:" + strconv.Itoa(n)
+		}
+		return base
+	default:
+		if round, ok := s.reviewRoundCount(ctx, runRow.ID, anchor); ok {
+			return base + ":round:" + strconv.Itoa(round)
+		}
 		return base
 	}
-	return base + ":round:" + strconv.Itoa(round)
+}
+
+// stageRetryCount returns how many times the anchored stage has been retried
+// (its stage_retried + stage_override_retried audit entries, keyed to the
+// stage), and ok=false when the anchor is nil, EITHER read errors, or the
+// total is zero. ListForRunByCategory is RUN-scoped, so the count is filtered
+// on Entry.StageID — the same stage-keyed filter countFixupPasses uses — so a
+// SIBLING stage's retry cannot advance THIS stage's key and emit a second row
+// inside one occurrence (the flooding direction). The override-retry category
+// counts too: an operator override re-dispatch re-opens the same stage, and
+// its next failure is a genuinely-distinct occurrence.
+//
+// ORDERING (retry.go:492): a stage_retried row is written only AFTER
+// run.RetryStage has flipped the stage out of `failed`, so a poll that reads
+// count=N also sees a stage that has left `failed` for the Nth time — the
+// count and the failed state are coupled by that ordering, and the count
+// advances across distinct FAILURES rather than within one continuously-failed
+// span. A read failure returning ok=false keeps the BASE key (under-emission).
+func (s *Server) stageRetryCount(ctx context.Context, runID uuid.UUID, anchor *run.Stage) (int, bool) {
+	if anchor == nil {
+		return 0, false
+	}
+	retried, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageRetried)
+	if err != nil {
+		return 0, false
+	}
+	overridden, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageOverrideRetried)
+	if err != nil {
+		return 0, false
+	}
+	n := 0
+	for _, e := range retried {
+		if e.StageID != nil && *e.StageID == anchor.ID {
+			n++
+		}
+	}
+	for _, e := range overridden {
+		if e.StageID != nil && *e.StageID == anchor.ID {
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// mergeReadyRoundCount returns the run's approval_submitted count as a proxy
+// for how many times the merge gate has become ready, and ok=false on a read
+// error or a zero count. This is a SOUND ready-transition proxy: mergeGateReady
+// requires that NO stage is parked in awaiting_approval, and an
+// approval_submitted row can only be appended against a stage that IS parked
+// there (both append sites — approvals.go and issue_approval.go via
+// findAwaitingApprovalStage — resolve a stage at the approval gate first). So
+// the count cannot advance during a continuously-merge-ready window (the
+// flooding guarantee holds) and DOES advance across the un-ready/re-ready cycle
+// a re-opened gate produces.
+//
+// RESIDUAL (known limitation): a merge gate that re-becomes ready WITHOUT an
+// intervening approval — a gate re-closed by a retry or a fix-up re-dispatch —
+// keeps the same key and UNDER-emits. That is the same safe direction the
+// review-round fold takes; closing it would need a new audit category recording
+// a stage entering/leaving awaiting_approval, and summing today's signals would
+// break the flooding guarantee (mergeGateReady ignores failed stages, so a
+// stage_retried row can land while the gate is continuously ready). A read
+// failure returning ok=false keeps the BASE key (under-emission).
+func (s *Server) mergeReadyRoundCount(ctx context.Context, runID uuid.UUID) (int, bool) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil || len(entries) == 0 {
+		return 0, false
+	}
+	return len(entries), true
 }
 
 // reviewRoundCount returns the number of review rounds started for the anchor
