@@ -710,7 +710,8 @@ _decide_mcp_signal() {
   # A schema-MAJOR bump (#1422) forces the banner even when mcp was not rebuilt
   # and even when the merge diff misses mcp source: the LIVE stdio MCP server
   # validates the spec locally, so a new major it doesn't recognize breaks every
-  # start_run until the operator reconnects. This OR is BEFORE the
+  # start_run until the child is refreshed — by an operator /mcp, or by a
+  # registered ADR-060 shim's hot-swap (#2349). This OR is BEFORE the
   # mcp-not-rebuilt early return on purpose.
   if (( workflow_major_changed )); then
     print 1
@@ -817,8 +818,15 @@ _detect_shim_registered() {
 # precedence order. Args:
 #   <schema_major 0|1> <shim_signal 0|1> <mcp_signal 0|1> <shim_registered 0|1>
 #   1. schema_major — a workflow-spec MAJOR bump (#1422) breaks every start_run
-#      against the live server's stale embedded schema, regardless of transport;
-#      unconditional and first.
+#      against the live server's stale embedded schema, UNLESS a registered
+#      ADR-060 shim has already hot-swapped the child (kind 1b); unconditional
+#      and first.
+#   1b. schema_major_shim — the same bump, but the shim IS registered and the
+#      shim binary itself was NOT rebuilt this run, so the swapped child is
+#      expected to carry the new major (#2349). Same precedence slot; only the
+#      body text differs — it asks the operator to VERIFY rather than reconnect.
+#      The shim_signal==0 conjunct is fail-safe: a rebuilt shim binary keeps its
+#      open inode and needs a manual /mcp regardless, so the stern kind wins.
 #   2. shim_rebuilt — the shim binary itself changed. The shim swaps its CHILD,
 #      not itself, so a shim-binary change still needs one manual /mcp (a
 #      reconnect also covers any simultaneous mcp change).
@@ -833,7 +841,14 @@ _select_mcp_banner() {
   local mcp_signal="$3"
   local shim_registered="$4"
 
-  if (( schema_major )); then print "schema_major"; return; fi
+  if (( schema_major )); then
+    if (( shim_registered )) && (( ! shim_signal )); then
+      print "schema_major_shim"
+    else
+      print "schema_major"
+    fi
+    return
+  fi
   if (( shim_signal )); then print "shim_rebuilt"; return; fi
   if (( mcp_signal )); then
     if (( shim_registered )); then
@@ -848,11 +863,13 @@ _select_mcp_banner() {
 
 # Emits the MCP-activation signal — must be the LAST thing printed by up/reload
 # so it is unmissable. Arg 1: the banner KIND from _select_mcp_banner
-# (schema_major | shim_rebuilt | reconnect | auto_swap | none). scripts/dev
-# cannot restart the MCP server (the Claude Code harness owns that process), so
-# on a change that leaves the live server stale the only lever is to tell the
-# operator, unmissably, what manual action is required — EXCEPT the auto_swap
-# case, where a registered fishhawk-mcp-shim refreshes the child with no /mcp.
+# (schema_major | schema_major_shim | shim_rebuilt | reconnect | auto_swap |
+# none). scripts/dev cannot restart the MCP server (the Claude Code harness owns
+# that process), so on a change that leaves the live server stale the only lever
+# is to tell the operator, unmissably, what manual action is required — EXCEPT
+# the auto_swap and schema_major_shim cases, where a registered
+# fishhawk-mcp-shim is EXPECTED to have refreshed the child, so the banner names
+# the verification and the refutation path instead of demanding a reconnect.
 _signal_mcp_activation() {
   local kind="${1:-none}"
   case "$kind" in
@@ -867,6 +884,25 @@ _signal_mcp_activation() {
       print "  major. scripts/dev cannot restart the MCP server — the Claude"
       print "  Code harness owns that process. Run /mcp to reconnect NOW, or"
       print "  the loop stays broken in this session."
+      print "################################################################"
+      ;;
+    schema_major_shim)
+      print ""
+      print "################################################################"
+      print "  VERIFY (not reconnect): the schema MAJOR of"
+      print "  .fishhawk/workflows.yaml changed in this pull (#1422 / #2349)."
+      print ""
+      print "  The LIVE fishhawk-mcp validates the spec locally, but the"
+      print "  registered fishhawk-mcp-shim SHOULD have hot-swapped the"
+      print "  rebuilt child, so the new major is expected to be live"
+      print "  already. scripts/dev cannot observe the harness-owned shim,"
+      print "  so CONFIRM it: a fishhawk_doctor call reporting"
+      print "  spec.valid: true, or a version-returning tool call"
+      print "  reflecting the new GitSHA (#1007)."
+      print ""
+      print "  If that check fails the swap did not happen (#2831): run"
+      print "  'bin/fishhawk-mcp-shim --status' for the recorded reason,"
+      print "  then /mcp."
       print "################################################################"
       ;;
     shim_rebuilt)
@@ -1719,10 +1755,12 @@ cmd_up() {
   fi
 
   # Schema-MAJOR bump detection (#1422): a `.fishhawk/workflows.yaml` version
-  # MAJOR change breaks every fishhawk_start_run because the live stdio MCP
-  # validates the spec locally on the (now stale) binary. This is independent of
+  # MAJOR change breaks every fishhawk_start_run whose live stdio MCP is still
+  # the stale pre-bump binary, because it validates the spec locally; a
+  # registered ADR-060 shim that hot-swapped the child is the exception the
+  # schema_major_shim banner covers (#2349). This is independent of
   # the mcp-rebuild / merge-diff signal above — a plain `up` that rebuilt nothing
-  # still needs a reconnect when the pulled spec's major moved. Read the pre-pull
+  # still needs the banner when the pulled spec's major moved. Read the pre-pull
   # and post-pull spec text via git show; each as an if-condition so a missing
   # file / unresolvable reflog branches to empty text (treated as no-version)
   # rather than aborting cmd_up under set -e.
@@ -1840,9 +1878,11 @@ cmd_up() {
   fi
 
   # Last line(s): tell the operator what MCP-activation step (if any) this run
-  # requires. The kind selects among the schema-major banner (#1422), the
-  # distinct shim-rebuilt banner, the plain mcp reconnect banner, the one-line
-  # auto-swap note (registered shim, ADR-060 / #1922), or the no-op line.
+  # requires. The kind selects among the schema-major banner (#1422), its
+  # registered-shim sibling that asks you to VERIFY rather than reconnect
+  # (#2349), the distinct shim-rebuilt banner, the plain mcp reconnect banner,
+  # the one-line auto-swap note (registered shim, ADR-060 / #1922), or the
+  # no-op line.
   _signal_mcp_activation "$mcp_banner_kind"
 }
 

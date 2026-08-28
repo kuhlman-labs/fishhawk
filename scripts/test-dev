@@ -28,13 +28,71 @@ orig_repo_root="$REPO_ROOT"
 orig_pwd="$PWD"
 
 # 1. _signal_mcp_activation is now KIND-form (ADR-060 / #1922): one banner per
-# kind (schema_major | shim_rebuilt | reconnect | auto_swap | none). Assert the
-# shipped text of each, not mere helper presence.
+# kind (schema_major | schema_major_shim | shim_rebuilt | reconnect | auto_swap
+# | none). Assert the shipped text of each, not mere helper presence.
+#
+# schema_major is the UNREGISTERED-shim wording. Since #2349 it has a sibling
+# kind, so pin it POSITIVELY on the stern claims it must KEEP — without this the
+# two kinds are not discriminated and a softening edit to the wrong body passes.
 out="$(_signal_mcp_activation schema_major)"
 if print -r -- "$out" | grep -q 'schema MAJOR'; then
   pass "schema_major banner names the schema MAJOR bump"
 else
   fail "schema_major banner should name the schema MAJOR bump (got: $out)"
+fi
+if print -r -- "$out" | grep -q 'ACTION REQUIRED' \
+   && print -r -- "$out" | grep -qi 'loop stays broken' \
+   && print -r -- "$out" | grep -q -- '/mcp'; then
+  pass "schema_major banner keeps ACTION REQUIRED, 'loop stays broken' and /mcp"
+else
+  fail "schema_major banner should keep ACTION REQUIRED, 'loop stays broken' and /mcp (got: $out)"
+fi
+
+# schema_major_shim (#2349): the SAME loud detection, but the registered shim is
+# expected to have hot-swapped the child, so the body must drop the two stale
+# claims (ACTION REQUIRED / 'loop stays broken' / 'every fishhawk_start_run will
+# fail') and instead name the verification + the refutation path. The negative
+# grep is scoped to the actual stale SENTENCE, not the bare fragment 'will fail'
+# — the correct body legitimately hedges with "If that check fails".
+out="$(_signal_mcp_activation schema_major_shim)"
+if print -r -- "$out" | grep -q 'schema MAJOR'; then
+  pass "schema_major_shim banner names the schema MAJOR bump"
+else
+  fail "schema_major_shim banner should name the schema MAJOR bump (got: $out)"
+fi
+if ! print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+  pass "schema_major_shim banner omits the ACTION REQUIRED nag"
+else
+  fail "schema_major_shim banner must not carry ACTION REQUIRED (got: $out)"
+fi
+if ! print -r -- "$out" | grep -qi 'loop stays broken'; then
+  pass "schema_major_shim banner drops the 'loop stays broken' claim"
+else
+  fail "schema_major_shim banner must not claim the loop stays broken (got: $out)"
+fi
+if ! print -r -- "$out" | tr '\n' ' ' | grep -qi 'every fishhawk_start_run will fail'; then
+  pass "schema_major_shim banner drops the 'every fishhawk_start_run will fail' claim"
+else
+  fail "schema_major_shim banner must not claim every fishhawk_start_run will fail (got: $out)"
+fi
+if print -r -- "$out" | grep -q 'spec.valid' && print -r -- "$out" | grep -q 'GitSHA'; then
+  pass "schema_major_shim banner names the verification (spec.valid / GitSHA)"
+else
+  fail "schema_major_shim banner should name spec.valid and GitSHA (got: $out)"
+fi
+if print -r -- "$out" | grep -q -- '--status' && print -r -- "$out" | grep -q -- '/mcp'; then
+  pass "schema_major_shim banner names the --status + /mcp fallback"
+else
+  fail "schema_major_shim banner should name --status and /mcp (got: $out)"
+fi
+# The hedge token is a fixed LITERAL, reused by the body, this assertion and the
+# #2349 counterfactual: scripts/dev cannot observe the harness-owned shim, so a
+# banner asserting the swap as fact would trade one false claim for another.
+if print -r -- "$out" | grep -q 'SHOULD have hot-swapped' \
+   && ! print -r -- "$out" | grep -qi 'no /mcp needed'; then
+  pass "schema_major_shim banner states the swap as an expectation, not a fact"
+else
+  fail "schema_major_shim banner should say 'SHOULD have hot-swapped' and never 'no /mcp needed' (got: $out)"
 fi
 
 out="$(_signal_mcp_activation shim_rebuilt)"
@@ -577,6 +635,29 @@ if [[ "$(_select_mcp_banner 0 0 0 0)" == none ]]; then
   pass "_select_mcp_banner: none kind"
 else
   fail "_select_mcp_banner: nothing-changed should select none"
+fi
+# Registration matrix on the schema-major row (#2349): the body text is
+# registration-aware, so the kind splits — but only when the shim BINARY was not
+# itself rebuilt (a rebuilt shim keeps its open inode and needs a manual /mcp).
+if [[ "$(_select_mcp_banner 1 0 0 1)" == schema_major_shim ]]; then
+  pass "_select_mcp_banner: schema_major_shim kind (schema major, shim registered)"
+else
+  fail "_select_mcp_banner: schema major + registered shim should select schema_major_shim"
+fi
+if [[ "$(_select_mcp_banner 1 0 0 0)" == schema_major ]]; then
+  pass "_select_mcp_banner: unregistered shim keeps the stern schema_major kind"
+else
+  fail "_select_mcp_banner: schema major + unregistered shim should select schema_major"
+fi
+if [[ "$(_select_mcp_banner 1 0 1 1)" == schema_major_shim ]]; then
+  pass "_select_mcp_banner: schema_major_shim beats auto_swap"
+else
+  fail "_select_mcp_banner: schema major should outrank auto_swap when the shim is registered"
+fi
+if [[ "$(_select_mcp_banner 1 1 0 1)" == schema_major ]]; then
+  pass "_select_mcp_banner: a rebuilt shim binary keeps the stern schema_major kind"
+else
+  fail "_select_mcp_banner: schema major + rebuilt shim binary should select schema_major"
 fi
 # Contested precedences: schema_major beats shim_rebuilt; shim_rebuilt beats auto_swap.
 if [[ "$(_select_mcp_banner 1 1 1 1)" == schema_major ]]; then
