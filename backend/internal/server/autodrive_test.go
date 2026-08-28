@@ -2082,3 +2082,520 @@ func TestAutoDriveRunGate_Merge_AcceptanceUndecidable_Merges(t *testing.T) {
 		t.Errorf("merger called %d times, want 1 — an undecidable acceptance must not block the delegated merge (#2512)", merger.called)
 	}
 }
+
+// --- report-mode per-class re-occurrence discriminators (E52.15 / #2337) -----
+
+// seedStageRetry appends n retry audit entries of the given category keyed to
+// the stage, so stageRetryCount reads back n prior retries — the durable
+// record retry.go's writeRetryAudit / writeOverrideRetryAudit writes. The
+// entries carry the stage id (stageRetryCount filters on StageID) but need no
+// payload.
+func seedStageRetry(t *testing.T, au *auditFake, runID, stageID uuid.UUID, category string, n int) {
+	t.Helper()
+	rid := runID
+	sid := stageID
+	for i := 0; i < n; i++ {
+		au.seeded = append(au.seeded, &audit.Entry{
+			RunID: &rid, StageID: &sid, Sequence: int64(2000 + i),
+			Category: category, Payload: []byte("{}"),
+			Timestamp: time.Now().UTC(),
+		})
+	}
+}
+
+// startRetryReportRun sets up a run declaring `retry: {mode: report}` (bare, so
+// the delegated retry knob is empty and the evaluator does not read the review
+// surface), with the implement stage FAILED on a retryable failure so the retry
+// report gate is live. Returns the run id and the failed implement stage.
+func startRetryReportRun(t *testing.T, s *Server, repo *autoDriveRepo) (uuid.UUID, *run.Stage) {
+	t.Helper()
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      retry:
+        mode: report`))
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateFailed
+	cat := run.FailureA
+	reason := "verify command \"scripts/test\" still failing: verify_infra_flake_retry"
+	impl.FailureCategory = &cat
+	impl.FailureReason = &reason
+	if _, err := repo.TransitionRun(context.Background(), runID, run.StateFailed); err != nil {
+		t.Fatalf("TransitionRun -> failed: %v", err)
+	}
+	return runID, impl
+}
+
+// TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure is the issue's
+// done-means for the retry class: a stage that fails, is retried and fails
+// AGAIN must re-surface the retry proposal. The first failure reports at the
+// base key; a re-poll of the SAME occurrence adds nothing (the within-occurrence
+// flooding guard); then the durable stage_retried record a real retry writes is
+// seeded (count 1) while the stage is failed again — a genuinely distinct
+// occurrence — and a SECOND act:report row is emitted. Exactly two rows.
+func TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, impl := startRetryReportRun(t, s, repo)
+
+	// First failure occurrence: retry count 0 -> base key.
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported || out.Action != delegation.ActionRetry {
+		t.Fatalf("pass 1 outcome = %+v, want reported retry", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// Re-poll the SAME occurrence: the flooding guard holds (no second row).
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second report on the same occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// The stage was retried and failed AGAIN: the durable stage_retried record
+	// persists (count 1) and the stage is failed once more. A DISTINCT occurrence.
+	seedStageRetry(t, au, runID, impl.ID, CategoryStageRetried, 1)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 2: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 2 outcome = %+v, want the proposal re-surfaced on the second failure", out)
+	}
+	if n := countReportRows(t, au); n != 2 {
+		t.Errorf("act:report rows after second failure = %d, want 2 (one per occurrence; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_RetryResurfacesOnOverrideRetry is the same shape
+// seeding stage_override_retried: an operator override re-dispatch re-opens the
+// same stage, and its next failure is a genuinely-distinct occurrence that must
+// re-surface.
+func TestAutoDrive_ReportMode_RetryResurfacesOnOverrideRetry(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, impl := startRetryReportRun(t, s, repo)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+
+	seedStageRetry(t, au, runID, impl.ID, CategoryStageOverrideRetried, 1)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 2: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 2 outcome = %+v, want the proposal re-surfaced after an override retry", out)
+	}
+	if n := countReportRows(t, au); n != 2 {
+		t.Errorf("act:report rows after override retry = %d, want 2 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_RetrySiblingStageDoesNotAdvanceKey pins the
+// stage-ID filter in stageRetryCount. ListForRunByCategory is run-scoped, so an
+// UNFILTERED count would let a SIBLING stage's retry advance this stage's key
+// and emit a second row inside one occurrence — the flooding direction. A
+// stage_retried entry keyed to a DIFFERENT stage leaves the retry count 0, the
+// key at the base, and emits no second row.
+func TestAutoDrive_ReportMode_RetrySiblingStageDoesNotAdvanceKey(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startRetryReportRun(t, s, repo)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+
+	// A retry of an UNRELATED sibling stage must not advance this stage's key.
+	seedStageRetry(t, au, runID, uuid.New(), CategoryStageRetried, 1)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second report from a sibling stage's retry", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows after a sibling retry = %d, want still 1 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_RetryCountAdvancesOnlyAfterStageLeavesFailed is the
+// ordering-coupling guard (binding condition 1, as corrected by the routed
+// reason). It supersedes the earlier RetriedWhileFailedDoesNotDoubleEmit, whose
+// premise was wrong: that test seeded the retry receipt (count=1) BEFORE the
+// first poll, so every poll keyed on :retry:1 and it only re-tested ordinary
+// same-key dedup — it never drove the base -> :retry:1 transition. And the
+// "a stage_retried row present WHILE the stage is failed must not double-emit"
+// property it claimed is not true of the report code and must not be made true:
+// a genuine count advance is exactly what re-surfaces a distinct occurrence
+// (TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure).
+//
+// What IS true, and is what this pins, is the ORDERING that makes the count
+// advance safe. retryStageAs calls run.RetryStage FIRST (retry.go:491-492),
+// which flips the stage OUT of `failed`, and only THEN writes the stage_retried
+// receipt (retry.go:509-518 — "Audit first" is about ordering relative to the
+// orchestrator handoff, not the state flip). So the (failed, count>=1) state is
+// unreachable: any poll that reads count=1 also sees a stage that has left
+// `failed`, retryableFailedStage returns nil, and the retry gate is CLOSED. The
+// count reaching 1 is therefore never a within-occurrence event — it is the
+// signature of a SECOND failure (the stage came back to `failed`), which
+// re-surfaces correctly and is covered separately.
+//
+// This test drives that real ordering: the base-key row is emitted while the
+// stage is failed (count=0), a re-poll of that same occurrence adds nothing,
+// then the retry is applied in retry.go's ORDER — the stage leaves `failed`
+// FIRST, then the count-1 receipt lands — and the poll at that instant emits NO
+// second row because the gate is closed. It is load-bearing: were the report
+// path to surface a retry proposal without the liveness gate (or were retry.go
+// reordered to write the receipt before the state flip), the count=1 poll would
+// key on :retry:1 while the base occurrence is still open and emit a
+// within-occurrence second row — the flood this issue closes.
+func TestAutoDrive_ReportMode_RetryCountAdvancesOnlyAfterStageLeavesFailed(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, impl := startRetryReportRun(t, s, repo)
+
+	// First failure occurrence, retry count 0 -> base key.
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported || out.Action != delegation.ActionRetry {
+		t.Fatalf("pass 1 outcome = %+v, want reported retry at the base key", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// Re-poll the SAME failed occurrence (count still 0): the within-occurrence
+	// flooding guard holds.
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second row on the same occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// Apply the retry the way retry.go does: run.RetryStage flips the stage out
+	// of `failed` (to pending, retry.go:274) FIRST, and only THEN is the
+	// stage_retried receipt written. Reproduce exactly that order — the stage
+	// leaves `failed`, then the count-1 receipt lands.
+	impl.State = run.StageStatePending
+	seedStageRetry(t, au, runID, impl.ID, CategoryStageRetried, 1)
+
+	// At the instant count=1 exists, the stage is no longer `failed`: the retry
+	// gate is closed, so the advancing count produces NO within-occurrence
+	// second row. (A genuine SECOND failure — the stage returning to `failed`
+	// with count=1 — is a distinct occurrence and re-surfaces; see
+	// TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure.)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate post-retry: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("post-retry outcome = %+v, want no report: the count advanced only after the stage left `failed`, closing the gate", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows after the retry transition = %d, want exactly 1 — the retry count advanced only after the gate closed (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// startMergeReportRun sets up a run declaring `merge: {mode: report}` (bare)
+// with both stages succeeded and a PR open, so the merge report gate is ready.
+func startMergeReportRun(t *testing.T, s *Server, repo *autoDriveRepo) (uuid.UUID, []*run.Stage) {
+	t.Helper()
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      merge:
+        mode: report`))
+	stages[0].State = run.StageStateSucceeded
+	stages[1].State = run.StageStateSucceeded
+	if _, err := repo.TransitionRun(context.Background(), runID, run.StateRunning); err != nil {
+		t.Fatalf("TransitionRun -> running: %v", err)
+	}
+	if _, err := repo.SetRunPullRequestURL(context.Background(), runID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	return runID, stages
+}
+
+// TestAutoDrive_ReportMode_MergeResurfacesOnReReadyGate is the issue's
+// done-means for the merge class: a merge gate that becomes ready, un-becomes
+// ready and re-becomes ready must re-surface the proposal. The first ready
+// window reports; a re-poll adds nothing (the within-occurrence flooding
+// guard); un-readying the gate reports nothing; then an approval_submitted row
+// (the ready-transition proxy) plus a return to ready is a DISTINCT occurrence
+// and emits a second row. Exactly two rows.
+func TestAutoDrive_ReportMode_MergeResurfacesOnReReadyGate(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startMergeReportRun(t, s, repo)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported || out.Action != delegation.ActionMerge {
+		t.Fatalf("pass 1 outcome = %+v, want reported merge", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// Re-poll the SAME ready window: the flooding guard holds (no second row).
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second report inside one ready window", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// The gate un-readies (a stage returns to awaiting_approval): no report.
+	stages[0].State = run.StageStateAwaitingApproval
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate un-ready: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("un-ready outcome = %+v, want no report while the merge gate is not ready", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows while un-ready = %d, want still 1", n)
+	}
+
+	// An approval lands (the ready-transition proxy advances) and the gate
+	// re-becomes ready: a DISTINCT occurrence, the proposal re-surfaces.
+	seedReviewEntry(t, au, runID, 6, "approval_submitted", map[string]any{"decision": "approve"})
+	stages[0].State = run.StageStateSucceeded
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 2: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 2 outcome = %+v, want the proposal re-surfaced on the re-ready gate", out)
+	}
+	if n := countReportRows(t, au); n != 2 {
+		t.Errorf("act:report rows after re-ready = %d, want 2 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// reportCategoryErrAudit fails ListForRunByCategory for a specific SET of
+// categories, passing every other category through to the embedded auditFake.
+// Unlike reportDedupeErrAudit (which fails only run_auto_driven), this lets a
+// test fail a discriminator's own read (a *_review_started / stage_retried /
+// approval_submitted category) while leaving the dedupe read intact — so the
+// discriminator's read-failure degrade branch is exercised, not an
+// evaluation/dedupe failure upstream of it.
+type reportCategoryErrAudit struct {
+	*auditFake
+	failCategories map[string]bool
+	err            error
+}
+
+func (a *reportCategoryErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.failCategories[category] {
+		return nil, a.err
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestReviewRoundCount_DegradeBranches is a direct table over reviewRoundCount
+// asserting ok=false on EACH of its four named degrade branches, so every one
+// falls back to the base key (under-emission) rather than a flood.
+func TestReviewRoundCount_DegradeBranches(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report`))
+	plan := mkAutoDriveStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)
+
+	t.Run("nil anchor", func(t *testing.T) {
+		if n, ok := s.reviewRoundCount(context.Background(), runID, nil); ok || n != 0 {
+			t.Errorf("reviewRoundCount(nil) = (%d, %v), want (0, false)", n, ok)
+		}
+	})
+	t.Run("stage type with no review surface", func(t *testing.T) {
+		review := mkAutoDriveStage(2, run.StageTypeReview, run.StageStateAwaitingApproval)
+		if n, ok := s.reviewRoundCount(context.Background(), runID, review); ok || n != 0 {
+			t.Errorf("reviewRoundCount(review stage) = (%d, %v), want (0, false)", n, ok)
+		}
+	})
+	t.Run("zero review-started entries", func(t *testing.T) {
+		if n, ok := s.reviewRoundCount(context.Background(), runID, plan); ok || n != 0 {
+			t.Errorf("reviewRoundCount(no rounds) = (%d, %v), want (0, false)", n, ok)
+		}
+	})
+	t.Run("audit read error", func(t *testing.T) {
+		seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+		s.cfg.AuditRepo = &reportCategoryErrAudit{
+			auditFake:      au,
+			failCategories: map[string]bool{"plan_review_started": true, "implement_review_started": true},
+			err:            errors.New("boom"),
+		}
+		if n, ok := s.reviewRoundCount(context.Background(), runID, plan); ok || n != 0 {
+			t.Errorf("reviewRoundCount(read error) = (%d, %v), want (0, false)", n, ok)
+		}
+	})
+}
+
+// TestAutoDrive_ReportMode_ReviewRoundReadFailureFallsBackToBaseKey is the
+// behavioural counterpart: with the review-started read failing FROM THE START,
+// the approve report gate reports once at the BASE key, and a fresh review
+// round seeded afterward does NOT re-surface the proposal — the discriminator
+// degrades to the base key and under-emits (the documented safe direction),
+// asserted on committed audit rows read back after each call. Because the
+// approve entry is BARE (no `when`), the delegated approve knob is empty and the
+// evaluator does not read the review surface, so this failure is the
+// discriminator's own degrade branch and not an evaluation failure upstream.
+//
+// Counterfactual vehicle: make the fake's review-started read SUCCEED and the
+// count advances across the fresh round, changing the key and emitting a second
+// row — the test then fails on the 2-rows assertion.
+func TestAutoDrive_ReportMode_ReviewRoundReadFailureFallsBackToBaseKey(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+	s.cfg.AuditRepo = &reportCategoryErrAudit{
+		auditFake:      au,
+		failCategories: map[string]bool{"plan_review_started": true, "implement_review_started": true},
+		err:            errors.New("boom"),
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported at the base key", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+
+	// A fresh review round arrives, but the read still fails: the key stays at
+	// the base and the proposal does NOT re-surface (under-emission).
+	seedReviewEntry(t, au, runID, 4, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no re-surface while the review read fails", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows after a fresh round with the read failing = %d, want still 1 (under-emission; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_RetryCountReadFailureFallsBackToBaseKey pins
+// stageRetryCount's read-error degrade: with the stage_retried read failing
+// from the start, the retry report gate reports once at the base key, and a
+// seeded stage_retried record does NOT re-surface the proposal (under-emission).
+// Counterfactual vehicle: make the fake's stage_retried read succeed and the
+// count advances across the seeded retry, emitting a second row.
+func TestAutoDrive_ReportMode_RetryCountReadFailureFallsBackToBaseKey(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, impl := startRetryReportRun(t, s, repo)
+	s.cfg.AuditRepo = &reportCategoryErrAudit{
+		auditFake:      au,
+		failCategories: map[string]bool{CategoryStageRetried: true, CategoryStageOverrideRetried: true},
+		err:            errors.New("boom"),
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported at the base key", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+
+	seedStageRetry(t, au, runID, impl.ID, CategoryStageRetried, 1)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no re-surface while the retry-count read fails", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows with the retry read failing = %d, want still 1 (under-emission; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_MergeCountReadFailureFallsBackToBaseKey pins
+// mergeReadyRoundCount's read-error degrade: with the approval_submitted read
+// failing from the start, the merge report gate reports once at the base key,
+// and a re-ready cycle carrying a seeded approval does NOT re-surface the
+// proposal (under-emission). Counterfactual vehicle: make the fake's
+// approval_submitted read succeed and the count advances across the re-ready,
+// emitting a second row.
+func TestAutoDrive_ReportMode_MergeCountReadFailureFallsBackToBaseKey(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startMergeReportRun(t, s, repo)
+	s.cfg.AuditRepo = &reportCategoryErrAudit{
+		auditFake:      au,
+		failCategories: map[string]bool{"approval_submitted": true},
+		err:            errors.New("boom"),
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported at the base key", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+
+	// Un-ready then re-ready the gate with an approval seeded: the read still
+	// fails, so the key stays at the base and the proposal does not re-surface.
+	stages[0].State = run.StageStateAwaitingApproval
+	if _, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil); err != nil {
+		t.Fatalf("AutoDriveRunGate un-ready: %v", err)
+	}
+	seedReviewEntry(t, au, runID, 6, "approval_submitted", map[string]any{"decision": "approve"})
+	stages[0].State = run.StageStateSucceeded
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-ready: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-ready outcome = %+v, want no re-surface while the approval read fails", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows with the approval read failing = %d, want still 1 (under-emission; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
