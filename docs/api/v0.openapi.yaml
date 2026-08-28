@@ -80,6 +80,64 @@ components:
   # canonical types every endpoint returns.
   # -------------------------------------------------------------------------
   schemas:
+    GroomingDispositions:
+      type: object
+      description: |
+        The recorded per-entry grooming dispositions for ONE grooming_report
+        artifact (E54.30 / #2843). Returned by BOTH the capture POST and the
+        read-back GET — they share one server-side projection, so the echo and
+        the read-back are the same bytes by construction.
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        artifact_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: |
+            The run's NEWEST grooming_report artifact, which these dispositions
+            attach to. Resolved server-side; recorded on every audit payload so
+            a later consumer can distinguish captures across artifacts.
+        stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The plan stage that shipped the resolved artifact.
+        content_hash:
+          type: string
+          description: The resolved artifact's content hash.
+        dispositions:
+          type: array
+          description: |
+            One row per DISPOSITIONED entry, collapsed last-wins by audit
+            sequence and sorted by entry_id.
+          items:
+            type: object
+            properties:
+              entry_id:
+                type: string
+                description: The grooming-report entry's stable derived id.
+              entry_class:
+                type: string
+                description: |
+                  The entry's class — the typed array it appeared in
+                  (ordering, duplicate, hygiene, dependency, vision_drift,
+                  decomposition, or one of the three milestone_scope classes).
+              verdict:
+                type: string
+                enum: [approved, rejected, amended]
+              close_target:
+                type: string
+                description: Present only when the operator supplied one.
+              recorded_at:
+                type: string
+                format: date-time
+                description: Timestamp of the audit row that won the last-wins collapse.
+              recorded_by:
+                type: string
+                description: The operator token subject that recorded the verdict.
+              audit_sequence:
+                type: integer
+                format: int64
+                description: |
+                  Chain sequence of the winning row, so a reader can order
+                  captures without re-listing the chain.
+
     Error:
       type: object
       required: [error]
@@ -7463,6 +7521,201 @@ paths:
           description: |
             The run/audit repositories are not wired (`merge_unconfigured`) or
             the merge seam is unconfigured (`merge_seam_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/grooming-dispositions:
+    post:
+      operationId: recordGroomingDispositions
+      summary: Record per-entry grooming dispositions (operator-only)
+      description: |
+        Capture the operator's verdicts on individual entries of a run's
+        grooming report (E54.30 / #2843). Each disposition names one entry by
+        its stable DERIVED entry id, a verdict (`approved` / `rejected` /
+        `amended`), and an optional `close_target`, and persists as one chained
+        `grooming_disposition_recorded` audit row.
+
+        The category is DELIBERATELY distinct from `grooming_mutation_applied`:
+        this row is what the OPERATOR DECIDED; that one is what was APPLIED, and
+        the second derives from the first.
+
+        **Nothing consumes these dispositions.** This endpoint is CAPTURE only:
+        recording an approval applies nothing, closes no duplicate and re-ranks
+        no backlog. The consumption half — the apply stage and its concurrency
+        protocol — is #2991. Until it lands, a recorded disposition is inert,
+        forward-compatible audit history.
+
+        **Which report.** The dispositions attach to the run's NEWEST
+        `grooming_report` artifact, resolved server-side as the maximum by
+        `(created_at, id)` across the run's plan stages. The resolved
+        `artifact_id` and `content_hash` come back in the response and ride on
+        every audit payload. GET uses the same resolver, so capture and
+        read-back agree on WHICH report by construction.
+
+        **Batch-atomic.** The WHOLE batch is validated before ANY row is
+        appended: a request naming one unknown `entry_id` records NOTHING, so a
+        partially-recorded capture is unreachable.
+
+        **Supersession.** An `entry_id` may not repeat WITHIN one request
+        (ambiguous intent, `400 validation_failed`), but a LATER request on the
+        same entry SUPERSEDES the earlier one (last wins by audit sequence).
+        Both rows stay in the chain, so the correction is itself auditable.
+
+        **Authorization.** Operator-only, with TWO refusals. A run-bound MCP
+        token (subject `mcp:run:<uuid>`) is rejected outright
+        (`403 run_token_forbidden`), even for its own run. A DELEGATED
+        operator-agent token (subject prefix `operator-agent/`) is rejected too
+        (`403 operator_agent_forbidden`): the grooming report is agent-authored,
+        so an agent dispositioning it would convert the operator gate into a
+        self-approval. `write:approvals` is required and enforced
+        unconditionally — no cookie-session bypass — because a disposition is an
+        approval-class judgment.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [dispositions]
+              properties:
+                dispositions:
+                  type: array
+                  minItems: 1
+                  description: |
+                    One entry per decided grooming-report entry. Validated
+                    atomically: one unknown `entry_id` records nothing.
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [entry_id, verdict]
+                    properties:
+                      entry_id:
+                        type: string
+                        description: |
+                          The grooming-report entry's stable DERIVED id. It must
+                          be an id the run's newest `grooming_report` declares.
+                      verdict:
+                        type: string
+                        enum: [approved, rejected, amended]
+                        description: The operator's verdict for this entry.
+                      close_target:
+                        type: string
+                        description: |
+                          Optional. For an approved duplicate, which item the
+                          pair collapses onto. Recorded verbatim; interpreted by
+                          nothing in this slice (see #2991).
+      responses:
+        '200':
+          description: |
+            The batch was recorded. The body carries the resolved report
+            artifact plus the FULL current disposition set for it, so the
+            read-back rides along with the capture.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroomingDispositions' }
+        '400':
+          description: |
+            One of two cases. (1) `validation_failed` — a malformed body, an
+            empty `dispositions` array, an empty `entry_id`, or an `entry_id`
+            repeated within ONE batch. (2) `grooming_verdict_invalid` — a
+            verdict outside the closed set; `details` carry the offending value
+            and the allowed set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of three cases. (1) A run-bound MCP token attempted the capture
+            — `run_token_forbidden` (rejected outright, even for its own run).
+            (2) A delegated operator-agent token attempted it —
+            `operator_agent_forbidden`. (3) The identity lacks `write:approvals`
+            — `insufficient_scope` (enforced unconditionally, no cookie-session
+            bypass).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The run carries no `grooming_report` artifact, so there is nothing
+            to disposition (`grooming_report_absent`). Distinct from a report
+            that exists but cannot be read, which is a 500.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One or more `entry_id` values are not declared by the run's newest
+            `grooming_report` (`grooming_entry_unknown`); `details.unknown_entry_ids`
+            names every one. NO disposition was recorded — the batch is atomic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            The run's `grooming_report` artifact could not be read or parsed
+            (`internal_error`). Deliberately distinct from the 409 above:
+            "absent" and "unreadable" are different states, and collapsing them
+            would let a capture silently attach to the wrong report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run / artifact / audit repositories are not wired
+            (`grooming_dispositions_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      operationId: listGroomingDispositions
+      summary: Read back the recorded grooming dispositions for a run
+      description: |
+        Returns the current disposition set for the run's NEWEST
+        `grooming_report` artifact (E54.30 / #2843), resolved through the same
+        server-side rule the capture uses.
+
+        Repeats on one `entry_id` are collapsed LAST-WINS by audit sequence, so
+        a corrected verdict reads back while both rows stay in the chain. A row
+        whose payload cannot be decoded is SKIPPED, contributing no disposition
+        — the fail-safe direction. Output is sorted by `entry_id`.
+
+        **Authorization.** Read access only. The operator-only posture is scoped
+        to CAPTURE: the underlying `grooming_report` artifact is already
+        agent-readable, so refusing the read would add a failure mode with no
+        matching hazard.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The recorded dispositions for the run's newest grooming report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroomingDispositions' }
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: The run carries no `grooming_report` artifact (`grooming_report_absent`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The run's `grooming_report` artifact could not be read or parsed (`internal_error`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: The run / artifact / audit repositories are not wired (`grooming_dispositions_unconfigured`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

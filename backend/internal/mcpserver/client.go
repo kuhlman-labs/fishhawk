@@ -1633,6 +1633,54 @@ func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason strin
 	return &out, nil
 }
 
+// groomingDispositionRequestBody mirrors the backend's capture request body
+// (`backend/internal/server/grooming_dispositions.go::groomingDispositionRequest`).
+type groomingDispositionRequestBody struct {
+	Dispositions []GroomingDispositionEntry `json:"dispositions"`
+}
+
+// RecordGroomingDispositions records a batch of per-entry grooming verdicts via
+// `POST /v0/runs/{run_id}/grooming-dispositions` (E54.30 / #2843). The batch is
+// validated ATOMICALLY server-side: a request naming one unknown entry id
+// records NOTHING. 4xx/5xx surfaces:
+//   - 400 validation_failed (unparseable body, empty batch, empty entry_id,
+//     an entry_id repeated within one batch)
+//   - 400 grooming_verdict_invalid (a verdict outside approved/rejected/amended)
+//   - 403 run_token_forbidden (a run-bound agent token, even for its own run)
+//   - 403 operator_agent_forbidden (a delegated operator-agent token)
+//   - 403 insufficient_scope (token lacks write:approvals)
+//   - 409 grooming_report_absent (the run shipped no grooming_report)
+//   - 422 grooming_entry_unknown (an id the newest report does not declare)
+//   - 503 grooming_dispositions_unconfigured
+func (c *apiClient) RecordGroomingDispositions(ctx context.Context, runID uuid.UUID,
+	dispositions []GroomingDispositionEntry) (*RecordGroomingDispositionsOutput, error) {
+	body, err := json.Marshal(groomingDispositionRequestBody{Dispositions: dispositions})
+	if err != nil {
+		return nil, fmt.Errorf("marshal grooming dispositions: %w", err)
+	}
+	var out RecordGroomingDispositionsOutput
+	if err := c.do(ctx, http.MethodPost,
+		"/v0/runs/"+runID.String()+"/grooming-dispositions", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListGroomingDispositions reads back the recorded dispositions for the run's
+// NEWEST grooming_report artifact via
+// `GET /v0/runs/{run_id}/grooming-dispositions` (E54.30 / #2843). Read access
+// only — the operator-only posture is scoped to CAPTURE. 4xx/5xx surfaces:
+//   - 409 grooming_report_absent
+//   - 503 grooming_dispositions_unconfigured
+func (c *apiClient) ListGroomingDispositions(ctx context.Context, runID uuid.UUID) (*ListGroomingDispositionsOutput, error) {
+	var out ListGroomingDispositionsOutput
+	if err := c.do(ctx, http.MethodGet,
+		"/v0/runs/"+runID.String()+"/grooming-dispositions", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // deferConcernRequest mirrors the backend's defer 200 request body
 // (`backend/internal/server/defer_concern.go::deferConcernRequest`). The
 // follow-up body is auto-drafted server-side; the operator supplies only

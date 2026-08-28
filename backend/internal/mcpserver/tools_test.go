@@ -3093,7 +3093,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E67.55 (#2712) adds exactly ONE tool — fishhawk_reconcile_reviews, the
 	// on-demand recovery for a review round orphaned by a fishhawkd restart
 	// (the boot sweep's operator-reachable twin) — taking the total 50 -> 51.
-	const wantToolCount = 51
+	// E54.30 (#2843) adds exactly ONE tool —
+	// fishhawk_record_grooming_dispositions, the operator-only CAPTURE of
+	// per-entry grooming verdicts as auditable facts (consumed by nothing until
+	// #2991) — taking the total 51 -> 52.
+	const wantToolCount = 52
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3126,6 +3130,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGateView {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
+	}
+
+	// fishhawk_record_grooming_dispositions (#2843) must be wire-visible — a
+	// registration regression would otherwise drop the operator-only grooming
+	// capture verb without tripping the count if another tool were added in the
+	// same change.
+	var sawGroomingDispositions bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_record_grooming_dispositions" {
+			sawGroomingDispositions = true
+			break
+		}
+	}
+	if !sawGroomingDispositions {
+		t.Error("fishhawk_record_grooming_dispositions is not registered/visible over ListTools")
 	}
 
 	// fishhawk_reconcile_reviews (#2712) must be wire-visible: it is the only

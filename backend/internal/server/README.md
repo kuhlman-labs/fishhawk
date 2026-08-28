@@ -1171,6 +1171,44 @@ C1's placement is itself part of the control: the call sits in `finishApprovalAd
 
 **Known operational residual.** This repository's Project #7 is USER-owned, and a GitHub App installation token cannot reach a user-owned Projects v2 board — board placement routes onto `FISHHAWKD_PROJECTS_TOKEN` instead ([#1114](https://github.com/kuhlman-labs/fishhawk/issues/1114)). With that token unset, the `unboarded` and `missing_estimate` hygiene defects dispatch and are recorded outcome `failed`, not `applied`. That is correct continue-and-report behaviour, not a defect: label-set and epic-link mutations land first. It doubles as a **kill switch without a deploy** — leave the token unset, or reject the groom gate instead of approving it.
 
+## Per-entry grooming disposition capture (`grooming_dispositions.go`, E54.30 / [#2843](https://github.com/kuhlman-labs/fishhawk/issues/2843))
+
+`POST` / `GET /v0/runs/{run_id}/grooming-dispositions` record and read back an operator's verdict on INDIVIDUAL entries of a run's grooming report, keyed by the entry's stable DERIVED id. Each disposition persists as one chained `grooming_disposition_recorded` audit row.
+
+**The category is deliberately distinct from `grooming_mutation_applied`.** This row is what the OPERATOR DECIDED; that one is what was APPLIED, and the second derives from the first. Collapsing them would make "the operator approved this and the apply then failed" indistinguishable from "the operator never decided" — which is exactly the state the churn guard's baseline (`priorGroomingDispositions`) reads. `TestGroomingDispositionAuditCategoryDistinct` pins the literal category string, its registry membership, and that capture writes ZERO apply-family rows.
+
+**Nothing consumes these dispositions.** This slice is CAPTURE ONLY. Recording an approval applies nothing, closes no duplicate and re-ranks no backlog. The consumption half — the apply stage, the watermark/ordering/batch-atomicity concurrency protocol between capture and apply, and unlocking the gated destructive classes — is [#2991](https://github.com/kuhlman-labs/fishhawk/issues/2991), and this file specifies no consumption ordering. A row written here is inert, forward-compatible audit history. That is also WHY the concurrency protocol is absent rather than deferred: with nothing consuming dispositions, capture and apply do not race for the same gate, so the race has no incorrect outcome to produce.
+
+**Which report a capture attaches to.** `newestGroomingReportArtifact` resolves the run's NEWEST `grooming_report` artifact — the maximum by `(CreatedAt, ID)` across the run's plan stages, a TOTAL order so two artifacts written in the same clock tick still order stably regardless of repository return order. BOTH verbs resolve through it, which is what makes `POST` and `GET` agree on WHICH report by construction rather than by convention. The resolved `artifact_id` + `content_hash` come back in the response and ride on every audit payload, so a later consumer can still distinguish captures across artifacts. It keeps three outcomes distinct exactly as `priorGroomingReport` does — found / genuinely absent / read-or-parse failure — because collapsing absent and unreadable is how a capture would silently attach to the wrong report. `TestGroomingDispositionsNewestArtifactWins` seeds two artifacts and fails if either verb attaches to the older one.
+
+**The valid-entry-id set has one owner.** `plan.GroomingEntryIDs` / `plan.GroomingEntryClasses` are thin exports over the EXISTING unexported `collectGroomingEntries` — the same collector `groomingSemanticCheck` walks — so the ids capture accepts cannot drift from the ids `ValidateGroomingReport` already proved the report declares. A class added to the report domain without being routed through the shared derivation fails in `plan`'s own table test, not here.
+
+**The ladder is eight rungs, every one evaluated BEFORE any write.**
+
+| # | Rung | Status / code | Counterfactual test |
+|---|---|---|---|
+| G0 | Repositories unwired | `503 grooming_dispositions_unconfigured` | `TestGroomingDispositionsUnconfigured` |
+| G1 | Anonymous | `401 authentication_required` | `TestGroomingDispositionsAnonymousRejected` |
+| G2 | Run-bound agent token (`mcp:run:<uuid>`), even for its OWN run | `403 run_token_forbidden` | `TestGroomingDispositionsRunBoundTokenRejected` |
+| G3 | Delegated operator-agent token (`operator-agent/` prefix) | `403 operator_agent_forbidden` | `TestGroomingDispositionsOperatorAgentRejected` |
+| G4 | Missing `write:approvals`, enforced unconditionally | `403 insufficient_scope` | `TestGroomingDispositionsMissingScopeRejected` + `..._ScopeRungIsReachableThroughTheMux` |
+| G5 | Unparseable body, empty batch, empty `entry_id`, intra-batch duplicate | `400 validation_failed` | `TestGroomingDispositionsEmptyBatchRejected`, `..._IntraBatchDuplicateRejected`, `..._EmptyEntryIDRejected`, `..._MalformedBodyRejected` |
+| G6 | Verdict outside the closed `workmgmt` set | `400 grooming_verdict_invalid` | `TestGroomingDispositionsInvalidVerdictRejected` |
+| G7 | No report vs an unreadable report | `409 grooming_report_absent` vs `500 internal_error` | `TestGroomingDispositionsNoReportRejected`, `..._ReportUnparseableIs500`, `..._StageListErrorIs500` |
+| G8 | An `entry_id` the newest report does not declare | `422 grooming_entry_unknown` | `TestGroomingDispositionsUnknownEntryRejected` (identity) + `..._UnknownEntryLeavesNoRows` (committed state) |
+
+**Batch-atomic validation.** The WHOLE batch is validated before ANY row is appended, so a request naming one unknown `entry_id` records NOTHING and a partially-recorded capture is unreachable. This control's effect is COMMITTED STATE, not error identity: the 422 bytes are byte-identical whether or not the first disposition leaked into the chain, so the counterfactual vehicle is `TestGroomingDispositionsUnknownEntryLeavesNoRows` (pgtest-backed), which READS the rows after the call returns and asserts zero. Moving the append inside the per-entry loop leaves the identity test GREEN and reddens only that one — verified empirically, not asserted.
+
+**Last-wins supersession.** An `entry_id` may not repeat WITHIN one request — one request carrying two verdicts for one entry states no verdict, so it is `400 validation_failed`, not a supersession. A LATER request on the same entry DOES supersede, collapsed last-wins by audit sequence. Both rows stay in the chain, so the correction is itself auditable; refusing the repeat instead would make an operator's corrected verdict unrecordable. `TestGroomingDispositionsReadBackLastWins` fails if the read-back returns the earlier verdict or if either row is missing.
+
+**The projection is tolerant in the fail-safe direction.** `projectGroomingDispositions` skips a row whose payload cannot be decoded — contributing no disposition, mirroring `priorGroomingDispositions` — and keeps only rows whose `artifact_id` matches the resolved artifact, so a capture against an older report never leaks into a newer report's read-back. Output is sorted by `entry_id` for a deterministic body. Both branches are pinned by `TestProjectGroomingDispositions_SkipsUndecodableAndForeignRows`, whose foreign-row fixture carries a DISTINCT `entry_id` on purpose: sharing one would let the last-wins collapse absorb it and the case would stay green with the artifact filter deleted.
+
+**Operator-only means TWO refusals, and the second is the point.** G2 mirrors `merge_run.go` and `vouch.go`. G3 goes beyond what the issue asked: the grooming report is AGENT-AUTHORED, so an agent that could also disposition it would convert an operator gate into a rubber stamp. It is keyed on `operatorrole.IsTokenSubject` — the same predicate `actor.go` already uses to classify a delegated writer as `actor_kind=agent` — so it reuses the existing notion of agent identity rather than inventing one, and if that prefix convention changes, actor classification and this refusal move together. G4 mirrors `merge_run.go`'s posture verbatim: `write:approvals` enforced with NO cookie-session bypass, because a disposition is an approval-class judgment.
+
+**The READ is not operator-only.** The issue states the requirement for CAPTURE, and the underlying `grooming_report` artifact is already agent-readable, so a refusal on the read would add a failure mode with no corresponding hazard. The `GET` is registered at `readAccess`.
+
+**Delegation is unchanged, structurally.** No file under `backend/internal/spec/` or `docs/spec/` is touched, so `ordering` / `dedup` / `scoping` remain refused at `mode: auto` by the two existing parse-time controls — re-asserted by `TestGroomingRegistry_DispositionCaptureDoesNotWidenDelegation`.
+
 ## Run lifecycle endpoints
 
 ### Run CRUD handlers (`runs.go`)

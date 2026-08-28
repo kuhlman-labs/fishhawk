@@ -693,3 +693,177 @@ func groomingDocWithHygiene(hygiene string) []byte {
 		`[{"id":"ordering:github/kuhlman-labs/fishhawk#2235","item_ref":`+gr2235Ref+`,"rank":1,"score":9.5,"rubric_citations":[{"rubric_id":"V1"}]}]`,
 		`[]`, hygiene, `[]`, `[]`, `[]`)
 }
+
+// --- GroomingEntryIDs / GroomingEntryClasses (E54.30 / #2843) ---------------
+//
+// The two exports are the capture surface's valid-entry-id authority. They read
+// the SAME collector the semantic check walks, so the ids a disposition capture
+// accepts cannot drift from the ids ValidateGroomingReport already proved the
+// report declares.
+//
+// The assertion is built from the PARSED report's DECLARED id strings — read
+// straight off gr.Ordering[i].ID and its siblings — NOT re-derived through
+// plan.GroomingEntryID. Re-deriving would compare the derivation to itself and
+// discriminate nothing; comparing to the declared strings is what proves the
+// export returns the ids the artifact actually carries.
+
+// allClassGroomingReport builds a report carrying at least one entry of EVERY
+// one of the nine classes: the six typed arrays plus the three milestone-scope
+// classes. It is marshalled and round-tripped through ParseGroomingReport, so
+// the fixture is schema- AND semantics-valid by the time the exports see it.
+func allClassGroomingReport(t *testing.T) *plan.GroomingReport {
+	t.Helper()
+	ref := func(id string) plan.ItemRef {
+		return plan.ItemRef{Type: "github_issue", ID: id, URL: "https://example.test/" + id}
+	}
+	gr := &plan.GroomingReport{
+		Kind:            plan.KindGroomingReport,
+		ReportVersion:   plan.GroomingReportVersion,
+		TicketReference: plan.TicketReference{Type: "github_issue", ID: "acme/app#2843", URL: "https://example.test/acme/app#2843"},
+		GeneratedBy:     plan.GeneratedBy{Agent: "claude-code", Model: "claude-opus-5", Timestamp: milestoneFixedTime},
+		Summary:         "one entry of every class",
+		Ordering: []plan.OrderingEntry{{
+			ID: plan.GroomingEntryID(plan.GroomingClassOrdering, "", ref("acme/app#1")),
+			// rank/score/citation are the schema's ordering requirements.
+			ItemRef: ref("acme/app#1"), Rank: 1, Score: 3.5,
+			RubricCitations: []plan.RubricCitation{{RubricID: "V1"}},
+		}},
+		Duplicates: []plan.DuplicateCandidate{{
+			ID:   plan.GroomingEntryID(plan.GroomingClassDuplicate, "", ref("acme/app#2"), ref("acme/app#3")),
+			Pair: []plan.ItemRef{ref("acme/app#2"), ref("acme/app#3")},
+			// A duplicate id sorts its two keys; the fixture supplies them
+			// already sorted so the declared string is unambiguous.
+			Basis: "same title and body", Confidence: "high",
+		}},
+		HygieneDefects: []plan.HygieneDefect{{
+			ID:      plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref("acme/app#4")),
+			ItemRef: ref("acme/app#4"), Defect: "missing_label_namespace",
+			Detail: "no area: label", Fix: &plan.HygieneFix{Labels: []string{"area:backend"}},
+		}},
+		DependencyEdges: []plan.DependencyEdge{{
+			ID:   plan.GroomingEntryID(plan.GroomingClassDependency, "", ref("acme/app#5"), ref("acme/app#6")),
+			From: ref("acme/app#5"), To: ref("acme/app#6"),
+			Basis: "#5 needs #6's endpoint", Kind: "depends_on",
+		}},
+		VisionDrift: []plan.VisionDriftFlag{{
+			ID:      plan.GroomingEntryID(plan.GroomingClassVisionDrift, "n2", ref("acme/app#7")),
+			ItemRef: ref("acme/app#7"), Basis: "non_goal",
+			CharterRefID: "N2", Detail: "advances a declared non-goal",
+		}},
+		DecompositionSuggestions: []plan.DecompositionSuggestion{{
+			ID:      plan.GroomingEntryID(plan.GroomingClassDecomposition, "", ref("acme/app#8")),
+			ItemRef: ref("acme/app#8"), Rationale: "three independent surfaces",
+			ProposedChildren: []plan.DecompositionChild{
+				{Title: "first surface", ScopeHint: "backend"},
+				{Title: "second surface", ScopeHint: "cli"},
+			},
+		}},
+		MilestoneScope: msScope(
+			[]plan.MilestoneInclusion{msInc("acme/app#1", 0, nil, nil)},
+			[]plan.MilestoneExclusion{msExc("acme/app#9")},
+			[]plan.MilestoneDeclinedCall{msDeclined("q1")},
+			[]string{msKey("acme/app#1")},
+		),
+	}
+	body, err := json.Marshal(gr)
+	if err != nil {
+		t.Fatalf("marshal all-class report: %v", err)
+	}
+	parsed, err := plan.ParseGroomingReport(body)
+	if err != nil {
+		t.Fatalf("ParseGroomingReport(all-class fixture): %v", err)
+	}
+	return parsed
+}
+
+// declaredGroomingIDs reads every id STRING the parsed report carries, walking
+// the typed arrays directly. This is the authority the exports are compared
+// against — no derivation is called.
+func declaredGroomingIDs(gr *plan.GroomingReport) []string {
+	var out []string
+	for _, e := range gr.Ordering {
+		out = append(out, e.ID)
+	}
+	for _, e := range gr.Duplicates {
+		out = append(out, e.ID)
+	}
+	for _, e := range gr.HygieneDefects {
+		out = append(out, e.ID)
+	}
+	for _, e := range gr.DependencyEdges {
+		out = append(out, e.ID)
+	}
+	for _, e := range gr.VisionDrift {
+		out = append(out, e.ID)
+	}
+	for _, e := range gr.DecompositionSuggestions {
+		out = append(out, e.ID)
+	}
+	if gr.MilestoneScope != nil {
+		for _, e := range gr.MilestoneScope.Included {
+			out = append(out, e.ID)
+		}
+		for _, e := range gr.MilestoneScope.Excluded {
+			out = append(out, e.ID)
+		}
+		for _, e := range gr.MilestoneScope.DeclinedCalls {
+			out = append(out, e.ID)
+		}
+	}
+	return out
+}
+
+func TestGroomingEntryIDs_EveryClassDeclaredID(t *testing.T) {
+	gr := allClassGroomingReport(t)
+	want := declaredGroomingIDs(gr)
+	if len(want) != 9 {
+		t.Fatalf("fixture declares %d ids, want 9 (one per class); the fixture is no longer all-class", len(want))
+	}
+	got := plan.GroomingEntryIDs(gr)
+	if len(got) != len(want) {
+		t.Fatalf("GroomingEntryIDs returned %d ids %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("GroomingEntryIDs()[%d] = %q, want the DECLARED id %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestGroomingEntryClasses_EveryClassMapped(t *testing.T) {
+	gr := allClassGroomingReport(t)
+	got := plan.GroomingEntryClasses(gr)
+	// The expected class for each declared id is read off the ARRAY the entry
+	// appeared in — the routing the class names — not re-derived from the id.
+	want := map[string]string{
+		gr.Ordering[0].ID:                     plan.GroomingClassOrdering,
+		gr.Duplicates[0].ID:                   plan.GroomingClassDuplicate,
+		gr.HygieneDefects[0].ID:               plan.GroomingClassHygiene,
+		gr.DependencyEdges[0].ID:              plan.GroomingClassDependency,
+		gr.VisionDrift[0].ID:                  plan.GroomingClassVisionDrift,
+		gr.DecompositionSuggestions[0].ID:     plan.GroomingClassDecomposition,
+		gr.MilestoneScope.Included[0].ID:      plan.GroomingClassMilestoneInclusion,
+		gr.MilestoneScope.Excluded[0].ID:      plan.GroomingClassMilestoneExclusion,
+		gr.MilestoneScope.DeclinedCalls[0].ID: plan.GroomingClassMilestoneDeclined,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("GroomingEntryClasses returned %d entries %v, want %d", len(got), got, len(want))
+	}
+	for id, wantClass := range want {
+		if got[id] != wantClass {
+			t.Errorf("GroomingEntryClasses()[%q] = %q, want %q", id, got[id], wantClass)
+		}
+	}
+}
+
+// TestGroomingEntryExports_NilReport pins the nil branch of both exports: a
+// caller that could not parse a report must get an EMPTY id set, not a panic
+// (collectGroomingEntries dereferences its argument).
+func TestGroomingEntryExports_NilReport(t *testing.T) {
+	if ids := plan.GroomingEntryIDs(nil); ids != nil {
+		t.Errorf("GroomingEntryIDs(nil) = %v, want nil", ids)
+	}
+	if classes := plan.GroomingEntryClasses(nil); classes != nil {
+		t.Errorf("GroomingEntryClasses(nil) = %v, want nil", classes)
+	}
+}
