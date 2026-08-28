@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/work-management-v0.schema.json",
+  "title": "Fishhawk work-management conventions v0",
+  "description": "Schema for a repo's work-management conventions config (#1005). This is a NEW canonical artifact, NOT a block inside .fishhawk/workflows.yaml (workflow-v0 is frozen at Day 21). It declares the work-management provider (GitHub Projects today; Jira deferred), its connection, and a map of work-item types (bug / feature / chore / adr / …) — each with a title format, body skeleton, default labels/fields, board placement, numbering rule, and epic-link policy. The conventions layer is the value: it turns one tool call into a conventions-complete work item. The shipped default (docs/spec/work-management-default.yaml) is a product artifact validated against this schema at backend package init. Breaking changes bump to work-management-v1 in a new schema file; old configs stay readable forever.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_version", "provider", "types", "required_fields"],
+
+  "properties": {
+    "spec_version": {
+      "type": "string",
+      "enum": ["work-management-v0"],
+      "description": "Config schema version. Single-value enum per the docs/spec versioning rules; a breaking change goes to work-management-v1 in a new schema file."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["github_projects", "jira", "gitlab"],
+      "description": "Work-management backend. github_projects, gitlab, and jira are concrete providers in v0 (gitlab per ADR-058, jira per #1094); gitlab and jira are registered only when their server-side connection env is configured, and any provider not registered/configured on the server must fail closed at filing time, never silently."
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "number"],
+      "description": "GitHub Projects connection. Required when provider is github_projects. The jira provider has its own connection block (`jira`).",
+      "properties": {
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Project owner login (user or organization)."
+        },
+        "owner_type": {
+          "type": "string",
+          "enum": ["user", "organization"],
+          "default": "user",
+          "description": "Whether the owner login is a user or an organization. GitHub's GraphQL owner query differs by kind (the Project #7 trap: kuhlman-labs is a user, not an org)."
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Project number (the integer in the project URL)."
+        }
+      }
+    },
+    "jira": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_key"],
+      "description": "Jira connection. Required when provider is jira (semantic check). This block selects ONLY the target project; the Jira instance base URL and credentials are server-side env (FISHHAWKD_JIRA_BASE_URL / FISHHAWKD_JIRA_EMAIL / FISHHAWKD_JIRA_API_TOKEN), NOT in this checked-in config — matching the FISHHAWKD_PROJECTS_TOKEN single-instance, secrets-never-in-repo precedent.",
+      "properties": {
+        "project_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Jira project key (e.g. FISH) that filed issues are created under."
+        },
+        "issue_types": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "description": "Optional map from canonical work-item type (bug, feature, chore, adr, …) to the Jira issue-type name (Bug, Story, Task, …). An absent entry falls back to a title-cased default in the provider."
+        },
+        "parent_field": {
+          "type": "string",
+          "minLength": 1,
+          "default": "parent",
+          "description": "Field used to link a created issue to its parent epic. Team-managed (next-gen) projects use the default `parent` reference ({\"parent\":{\"key\":\"EPIC-KEY\"}}); company-managed (classic) projects set the instance's epic-link custom field id (e.g. customfield_10014) to the bare epic key string. Optional; absent means the team-managed `parent` default."
+        }
+      }
+    },
+    "gitlab": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "GitLab connection (ADR-058 Phase 2). Required when provider is gitlab (semantic check); a gitlab block under any other provider is rejected (semantic check). This block carries ONLY an optional target-project override; the GitLab instance base URL and token are server-side env (FISHHAWKD_GITLAB_BASE_URL / FISHHAWKD_GITLAB_TOKEN), NOT in this checked-in config — matching the jira / FISHHAWKD_PROJECTS_TOKEN single-instance, secrets-never-in-repo precedent. GitLab boards are label-driven, so the canonical `states` map's values are GitLab label names and applying the state label at create time IS board placement; parent_epic links via the Free-tier issue-links API (relates_to), NOT Premium group epics.",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional namespaced GitLab project path (e.g. group/subgroup/project) that filed issues are created under. Absent means the filing repo's owner/name path is used as the project path."
+        }
+      }
+    },
+    "complexity_levels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["low", "medium", "high"],
+      "description": "The complexity prior: concrete file/coupling definitions for each level, so a filer picks one deterministically. Optional in a repo config but shipped in the default.",
+      "properties": {
+        "low": { "type": "string", "minLength": 1 },
+        "medium": { "type": "string", "minLength": 1 },
+        "high": { "type": "string", "minLength": 1 }
+      }
+    },
+    "required_fields": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Fields every filed item must carry. The mandatory trio is Summary, Done-means, complexity (semantic check enforces their presence); everything else is optional. Done-means must be testable — see field_hints."
+    },
+    "field_hints": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "description": "Per-field authoring hints, keyed by field name. The Done-means hint must state that the condition is testable."
+    },
+    "types": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Work-item types, keyed by snake_case type name (bug, feature, chore, adr, …). Each declares how an item of that type is materialized.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": { "$ref": "#/$defs/work_item_type" }
+      }
+    },
+    "states": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Canonical board-state map for run-lifecycle-driven transitions (#1012): each canonical state from the closed set (backlog/up_next/in_progress/in_review/blocked/done) maps to the provider's column/option string (e.g. the GitHub Projects single-select Status option \"In Progress\"). The small closed set is what keeps a future Jira provider tractable. Optional and additive: absent means no transitions are configured and the board-sync hook no-ops. Every transitions value must be a key present here (semantic check).",
+      "properties": {
+        "backlog": { "type": "string", "minLength": 1, "description": "Provider option for the canonical backlog state." },
+        "up_next": { "type": "string", "minLength": 1, "description": "Provider option for the canonical up_next state — the committed/not-started entry column a campaign start (#1816) sweeps its still-queued items onto." },
+        "in_progress": { "type": "string", "minLength": 1, "description": "Provider option for the canonical in_progress state." },
+        "in_review": { "type": "string", "minLength": 1, "description": "Provider option for the canonical in_review state." },
+        "blocked": { "type": "string", "minLength": 1, "description": "Provider option for the canonical blocked state." },
+        "done": { "type": "string", "minLength": 1, "description": "Provider option for the canonical done state." }
+      }
+    },
+    "transitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Run-lifecycle-event to canonical-state map (#1012): when a run reaches a lifecycle point, the board card moves to the mapped canonical state (resolved to a provider option via `states`). The closed event set is run_started/pr_opened/run_failed/run_merged, the campaign-scoped campaign_started (#1816), and the issue-lifecycle issue_closed/issue_reopened (#1817). Optional and additive: absent means no transitions are configured. Every value must be a key present in `states` (semantic check).",
+      "properties": {
+        "run_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when a run starts on the item (e.g. in_progress)." },
+        "pr_opened": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run opens a PR (e.g. in_review)." },
+        "run_failed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run fails (e.g. blocked)." },
+        "run_merged": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run's PR merges (e.g. done)." },
+        "campaign_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a campaign's still-queued item moves to when the campaign transitions pending -> running (e.g. up_next). Campaign-scoped, not run-scoped: campaign items have no run at start time (#1816)." },
+        "issue_closed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a hand-closed, never-run-driven issue (epic/ADR/throwaway) advances to when the issue is closed as completed (e.g. done). Issue-lifecycle-scoped, not run-scoped: driven by the issues.closed webhook, not a run (#1817). A not_planned/duplicate close leaves the card in place." },
+        "issue_reopened": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a reopened issue is pulled back to, from the issue_closed target only (a human-parked card elsewhere is untouched) (e.g. backlog). Issue-lifecycle-scoped, driven by the issues.reopened webhook (#1817)." }
+      }
+    },
+    "product_feedback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "description": "Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means egress is enabled (the default), so an existing config keeps working without edits. With enabled:false, POST /v0/runs/{id}/product-reports returns 403 product_feedback_disabled and files nothing. The object shape mirrors the backend workmgmt.ProductFeedback struct (a boolean enabled), decoded under DisallowUnknownFields.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether upstream product-feedback egress is allowed for this repo. enabled:false hard-disables the product-report endpoint."
+        }
+      }
+    },
+    "charter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "description": "Declares where the repo's checked-in charter document lives (E54.1 / #2233) — the prioritization anchor a backlog-grooming run reads so every ranking it proposes cites a rubric line by id. The document is human-authored: agents read it, agents never write it, and it is resolved from the run's BASE ref so a change cannot rewrite the charter constraining it. This block is SCHEMA-OPTIONAL but FEATURE-MANDATORY — its absence is not a fail-open: backlog_grooming fails closed when no charter resolves (there is no report-only-without-a-charter degradation anywhere in E54), and that enforcement lives in #2234/#2236, not in this schema. This slice ships DECLARATION ONLY: nothing here reads, injects, or renders the document. Path safety and resolution are owned by backend/internal/repodoc (#2796), whose validatePath rejects an absolute, traversal-bearing, backslash-carrying, control-character-carrying, or non-canonical path fail-closed at resolve time. See docs/spec/work-management-v0.md for the charter's content contract.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path of the charter document, relative to the filing repo's root (e.g. .fishhawk/charter.md, the conventional location declared by the shipped default). Must be non-empty. Declaration-time validation is structural only — the path-shape rule (no absolute, no .. segment, no backslash, canonical spelling) is enforced fail-closed by repodoc.validatePath at the single point where the declared path is used to fetch the document, so this schema deliberately does not carry a second copy of it."
+        }
+      }
+    },
+    "grooming": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Operator-declarable controls on what a backlog-grooming run PROPOSES (E54.8 / #2240) — the mitigation ADR-065 names for its own sharpest adoption risk, report churn training operators to rubber-stamp. Absent means every field resolves to the conservative package default; see docs/spec/work-management-v0.md § \"Grooming churn thresholds\".",
+      "properties": {
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The significance bar a computed difference must cross to be PROPOSED. Sub-threshold differences are still computed and reported as suppressed — they are withheld from the proposal set, never discarded silently.",
+          "properties": {
+            "min_rank_movement": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Minimum ABSOLUTE rank delta (in positions, against the last applied ordering) that makes an ordering entry worth proposing. 1 means propose every one-position swap, i.e. no suppression at all. The floor is 1 rather than 0 because a non-positive bar would disable the guard, and a control that can be declared into a no-op is not a control."
+            },
+            "min_score_delta": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 0.05,
+              "description": "Minimum ABSOLUTE score delta that makes an ordering entry worth proposing. Combined with min_rank_movement by OR: EITHER dimension crossing its bar surfaces the entry. OR rather than AND because over-proposing is the safe direction for a suppression control — a missed proposal is invisible, a surplus one is merely noise. Exclusive minimum 0 for the same reason min_rank_movement floors at 1."
+            },
+            "significant_hygiene_defects": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "description": "The hygiene defect classes this repo considers worth proposing. ABSENT means all six are significant (the conservative default). grooming-report-v1 carries NO per-defect severity field, so #2240's \"a hygiene defect at or above a severity\" dimension is expressed as this operator-declared significance SET keyed on the defect enum rather than as an ordering over severities that does not exist. A defect outside the declared set is suppressed on EVERY appearance, including its first: an operator who declares a defect class insignificant expects not to see it, not to see it once.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "missing_label_namespace",
+                  "absent_done_means",
+                  "unlinked_parent_epic",
+                  "unboarded",
+                  "missing_parent_epic_link",
+                  "missing_estimate"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "work_item_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["body_skeleton"],
+      "description": "Conventions for one work-item type.",
+      "properties": {
+        "title_format": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Title template with {placeholder} tokens (e.g. {summary}, {epic}, {n}, {number}). Rendering is the apply layer's concern; this schema only carries the template."
+        },
+        "body_skeleton": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Ordered list of body section headings. Dual-audience by design, e.g. Feature = Summary/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means."
+        },
+        "optional_sections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Section headings from body_skeleton that render only when the filing supplies content for them: an absent Sections key omits the heading entirely, while a present key — even one with an empty value — renders the heading in position exactly as a mandatory section does. Every entry MUST also appear in this type's body_skeleton (semantic check enforces, fail-closed). Sections not listed here render unconditionally. Additive-optional within v0."
+        },
+        "default_labels": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/label" },
+          "description": "Labels applied to every item of this type before caller-supplied labels are merged."
+        },
+        "label_defaults": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/label" },
+          "description": "Per-namespace default labels applied at filing time as a fail-open completeness pass (#1616). Each key is a label namespace (e.g. 'autonomy', 'area'); each value is the FULL default label string for that namespace (e.g. 'autonomy:medium'). When the merged label set has no label in a key's namespace (no label with the `<key>:` prefix), the default value is appended and reported in the filing response's defaulted_labels. A caller-supplied label already in the namespace suppresses the default. Semantic check (fail-closed): every value must begin with `<its key>:`. Additive-optional within v0."
+        },
+        "required_label_namespaces": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Label namespaces (e.g. 'area', 'autonomy') that a filed item of this type should carry after merge, derivation, and defaulting (#1616). A namespace still absent after the completeness pass is reported LOUDLY in the filing response's missing_label_namespaces — never a rejection (fail-open). Additive-optional within v0."
+        },
+        "default_fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Default board placement and classification fields.",
+          "properties": {
+            "status": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Single-select Status field value (e.g. Backlog). For GitHub Projects this is the status field set via updateProjectV2ItemFieldValue."
+            },
+            "board_column": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Board column, when distinct from status."
+            },
+            "complexity": {
+              "$ref": "#/$defs/complexity",
+              "description": "Default complexity prior for this type."
+            }
+          }
+        },
+        "numbering": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scheme"],
+          "description": "Numbering rule. Required when the type is `adr` (semantic check). ADRs number sequentially.",
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": ["sequential"],
+              "description": "Allocation scheme. v0 supports sequential (next integer after the highest existing)."
+            },
+            "prefix": {
+              "type": "string",
+              "description": "Number prefix rendered into the title (e.g. ADR-)."
+            },
+            "pad": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 12,
+              "description": "Zero-pad the rendered {number} to this minimum width (e.g. 3 -> 041). 0/absent means no padding. Bounded 0..12 so a runaway pad cannot allocate an oversized title string; 12 exceeds any realistic numbering width."
+            }
+          }
+        },
+        "epic_link": {
+          "type": "string",
+          "enum": ["required", "optional", "none"],
+          "default": "optional",
+          "description": "Whether items of this type link to a parent epic. required = a parent epic relation must be supplied; none = epic linking does not apply."
+        }
+      }
+    },
+    "complexity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "canonical_state": {
+      "type": "string",
+      "enum": ["backlog", "up_next", "in_progress", "in_review", "blocked", "done"],
+      "description": "A canonical board state from the closed set. The provider option string each maps to is declared in `states`."
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(:[a-z0-9][a-z0-9-]*)?$",
+      "description": "A repo label, either a bare token (epic, adr) or a namespaced token (area:backend, type:feature, autonomy:low, phase:p0)."
+    }
+  }
+}

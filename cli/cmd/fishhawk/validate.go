@@ -22,7 +22,7 @@ const defaultSpecPath = ".fishhawk/workflows.yaml"
 // rather than a re-typed copy. Printed as a second stdout line after `<path>:
 // OK`, whose bytes are kept unchanged so any consumer parsing the first line is
 // unaffected.
-const validateResidualLine = "checked locally: schema, reuse resolution, and stage-reference resolution (duplicate ids, needs, inputs.from_stage). The remaining stage-binding rules (type/executor/constraint, produces-artifact, plan schema, max_autonomy) are checked server-side at run creation."
+const validateResidualLine = "checked locally: schema, reuse resolution, stage-reference resolution (duplicate ids, needs, inputs.from_stage), and — for a workflow producing a grooming report — the mandatory-charter rule against the sibling .fishhawk/work-management.yaml (its absence means the shipped default, which declares a charter). The remaining stage-binding rules (type/executor/constraint, produces-artifact, plan schema, max_autonomy) are checked server-side at run creation, which remains the load-bearing charter enforcement point."
 
 // runValidate implements `fishhawk validate [path]`. Reads the
 // file (default `.fishhawk/workflows.yaml`), validates it against
@@ -41,6 +41,8 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "")
 		_, _ = fmt.Fprintln(stderr, "Validates a Fishhawk workflow spec against the version-routed JSON Schema (v0/v1/v2),")
 		_, _ = fmt.Fprintln(stderr, "then resolves stage references locally (duplicate ids, needs, inputs.from_stage).")
+		_, _ = fmt.Fprintln(stderr, "For a workflow producing a grooming report it also enforces the mandatory-charter rule")
+		_, _ = fmt.Fprintln(stderr, "against the sibling work-management.yaml (absent means the shipped default, which declares a charter).")
 		_, _ = fmt.Fprintln(stderr, "The remaining stage-binding rules are checked server-side at run creation.")
 		_, _ = fmt.Fprintln(stderr, "Defaults to .fishhawk/workflows.yaml when no path is supplied.")
 		_, _ = fmt.Fprintln(stderr, "")
@@ -87,6 +89,46 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 
+	// The static charter check (E54.11 / #2801) runs only AFTER ValidateBytes
+	// succeeds, so a schema-invalid spec reports its schema errors first and the
+	// charter check never runs on a document the validator already rejected.
+	requiring, cerr := spec.WorkflowsRequiringCharter(data)
+	if cerr != nil {
+		// Unreachable in practice — ValidateBytes already parsed the same bytes
+		// through the shared decodeAndResolve prefix — but surface rather than
+		// swallow.
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", path, cerr)
+		return exitFailure
+	}
+	if len(requiring) == 0 {
+		// AC3: a spec that declares no grooming workflow takes the OK path
+		// completely unchanged — the sibling conventions file is never read.
+		// STRUCTURAL early return: deleting it routes non-grooming specs through
+		// the charter check below, which the non-grooming test then reddens.
+		return printValidateOK(stdout, path)
+	}
+
+	// One or more workflows produce a grooming report: the mandatory-charter
+	// rule applies. Read the sibling conventions ONCE and decide via the shared
+	// reason core, then print one refusal line per requiring workflow.
+	declared, charterPath, loadErr := loadCharterDeclaration(path)
+	if reason := spec.CharterAdmissionReason(declared, charterPath, loadErr); reason != "" {
+		for _, workflowID := range requiring {
+			// The CLI has no repo identity, so the spec path is the message's
+			// location subject (see cli/README.md and the plan's risks).
+			_, _ = fmt.Fprintf(stderr, "%s: %s\n", path, spec.CharterRefusalMessage(path, workflowID, reason))
+		}
+		return exitFailure
+	}
+
+	return printValidateOK(stdout, path)
+}
+
+// printValidateOK prints the unchanged success output — the `<path>: OK` line
+// (whose bytes any consumer parsing the first line depends on) plus the
+// residual-scope note — and returns exitOK. Factored so the two success return
+// sites emit byte-identical output.
+func printValidateOK(stdout io.Writer, path string) int {
 	_, _ = fmt.Fprintf(stdout, "%s: OK\n", path)
 	_, _ = fmt.Fprintln(stdout, validateResidualLine)
 	return exitOK
