@@ -32,6 +32,13 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       ;;
     work-management-v*.schema.json)
       cp "$schema" "$REPO_ROOT/backend/internal/workmgmt/schemas/$base"
+      # The CLI is a second CONSUMER of the canonical work-management schema
+      # (E54.11 / #2801): `fishhawk validate` validates a repo's conventions
+      # file against it before the charter read, so the static charter check
+      # fails closed on a conventions file run admission would refuse. It is
+      # never a second AUTHOR of the rules — the semantic cross-field checks
+      # stay backend-owned in Go.
+      cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"
       ;;
     *)
       echo "sync-schemas: unrecognized schema file '$base' — skipping (add a case to route it)" >&2

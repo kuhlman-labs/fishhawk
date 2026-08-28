@@ -23,23 +23,30 @@ import (
 // resolved workflow produces a grooming report is REFUSED at admission when no
 // charter is declared.
 //
-// WHERE THIS RULE IS ENFORCED, AND WHERE IT IS NOT (approval condition G3).
-// Enforcement is at RUN ADMISSION — on EVERY seam that mints a run, which
-// today means POST /v0/runs and the campaign item-run start — and nowhere
-// else. It is
-// deliberately NOT enforced by static validation (`fishhawk validate`, the
-// CLI's spec check): the CLI does not parse work-management conventions
-// anywhere today, so teaching static validation about the charter would mean
-// giving the validator a conventions loader it has no other reason to have.
-// Run admission is the LOAD-BEARING half — it is what makes starting an
-// unanchored grooming run impossible — and it fails closed on a loader error
-// too. The static half is tracked as its own follow-up. Do not read this gate
-// as "a workflow declaring grooming_report will not validate": it will, and
-// then it will not START.
+// WHERE THIS RULE IS ENFORCED (approval condition G3; static half E54.11 / #2801).
+// RUN ADMISSION is the LOAD-BEARING enforcement point — on EVERY seam that mints
+// a run, which today means POST /v0/runs and the campaign item-run start. It is
+// what makes STARTING an unanchored grooming run impossible, it fails closed on a
+// loader error, and it is UNCHANGED by #2801 (AC5) apart from the message
+// single-ownership extraction below.
 //
-// workflowRequiresCharter is kept PURE and EXPORTED-shaped (no receiver, no
-// I/O) so wiring it into static validation later is a call rather than a
-// rewrite.
+// The rule is ALSO checked STATICALLY now, by `fishhawk validate` (#2801): the
+// CLI reruns WorkflowRequiresCharter's structural discriminator over the spec and
+// reads the repo's WORKING-TREE .fishhawk/work-management.yaml for a charter
+// declaration, rendering MsgFmtCharterRequired when a grooming workflow has none.
+// The two are an EARLIER WARNING plus the LOAD-BEARING gate, not equivalents:
+// the CLI decides the charter question from the LOCAL working tree, while run
+// admission decides it from the forge-fetched conventions at the run's ref, so
+// on a dirty or diverged checkout the two can legitimately disagree. The static
+// check can therefore be LESS strict than admission (a missed early warning),
+// never more (a false refusal of a spec the product accepts) — see cli/README.md.
+// The message template is shared through TestCharterMessageParityAcrossModules,
+// which holds MsgFmtCharterRequired and the three reason values byte-identical
+// across the two modules (they cannot share a package).
+//
+// WorkflowRequiresCharter is kept PURE (no receiver, no I/O); the CLI reruns an
+// independent structural twin over its raw yaml tree rather than importing it
+// (separate Go modules), held to this copy by the parity test.
 //
 // THE `haveStageDefs` GUARD IS A NARROWING, NOT THE SAFETY PROPERTY. The call
 // site in runs.go sits inside the existing `haveStageDefs` admission region,
@@ -137,14 +144,32 @@ func charterAdmissionReason(conv workmgmt.Conventions, err error) string {
 	return ""
 }
 
-// charterRefusalMessage renders the actionable refusal text both arms carry.
+// MsgFmtCharterRequired is the actionable refusal template BOTH the run-admission
+// gate and `fishhawk validate` render (E54.11 / #2801). Two %s verbs: the
+// workflow id, then the LOCATION subject — the repo at run admission, the spec
+// path at static validation (the CLI has no repo identity). Its CLI twin is
+// cli/internal/spec.MsgFmtCharterRequired, held byte-identical by
+// TestCharterMessageParityAcrossModules. Declared on a SINGLE line as an
+// interpreted string literal (its `charter:`/`path:` backticks forbid a raw
+// string) so that parity test can match it verbatim.
+const MsgFmtCharterRequired = "workflow %s in %s produces a grooming report, but no backlog charter is declared: a grooming run ranks the backlog against the charter's rubric, and there is no unanchored-grooming mode. Declare a `charter:` block with its `path:` key in .fishhawk/work-management.yaml pointing at the checked-in charter document (conventionally .fishhawk/charter.md), then start the run again."
+
+// MsgCharterConventionsUnreadableSuffix is appended to MsgFmtCharterRequired ONLY
+// for reasonConventionsUnavailable — the load itself failed, so the message says
+// the conventions could not be READ rather than that a charter is merely absent.
+// The leading space is intentional: it follows the base sentence. Single-line
+// const for the same parity reason; CLI twin
+// cli/internal/spec.MsgCharterConventionsUnreadableSuffix.
+const MsgCharterConventionsUnreadableSuffix = " The work-management conventions could not be read for this repo, and an unreadable conventions file is refused rather than assumed to declare a charter."
+
+// charterRefusalMessage renders the actionable refusal text both arms carry, from
+// the single-owner templates above. Its rendered output is pinned byte-for-byte
+// by TestCharterRefusalMessage_Golden, so the const extraction changed no shipped
+// byte.
 func charterRefusalMessage(repo, workflowID, reason string) string {
-	message := "workflow " + workflowID + " in " + repo + " produces a grooming report, but no backlog charter is declared: " +
-		"a grooming run ranks the backlog against the charter's rubric, and there is no unanchored-grooming mode. " +
-		"Declare a `charter:` block with its `path:` key in " + conventionsPathForMessage +
-		" pointing at the checked-in charter document (conventionally .fishhawk/charter.md), then start the run again."
+	message := fmt.Sprintf(MsgFmtCharterRequired, workflowID, repo)
 	if reason == reasonConventionsUnavailable {
-		message += " The work-management conventions could not be read for this repo, and an unreadable conventions file is refused rather than assumed to declare a charter."
+		message += MsgCharterConventionsUnreadableSuffix
 	}
 	return message
 }

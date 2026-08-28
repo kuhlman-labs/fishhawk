@@ -831,3 +831,37 @@ func TestCharterGate_EveryCreateRunForTriggerCallerIsGated(t *testing.T) {
 			"the walker is not reaching the source it is supposed to gate", found)
 	}
 }
+
+// TestCharterRefusalMessage_Golden pins charterRefusalMessage's rendered output
+// byte-for-byte for each of the three reasons (E54.11 / #2801, approval
+// condition step 2). The expected text is written out LITERALLY here, never
+// recomposed from MsgFmtCharterRequired / MsgCharterConventionsUnreadableSuffix
+// — a golden test recomposed from the consts it guards proves nothing. This
+// proves the step-1 const extraction changed no shipped byte, and that the
+// run-admission gate still produces the same message the CLI mirrors (AC5).
+//
+// COUNTERFACTUAL: change one character of MsgFmtCharterRequired and both the
+// charter_absent and charter_path_empty expectations go RED; change
+// MsgCharterConventionsUnreadableSuffix and the conventions_unavailable
+// expectation goes RED.
+func TestCharterRefusalMessage_Golden(t *testing.T) {
+	const base = "workflow tidy_the_backlog in octo/repo produces a grooming report, but no backlog charter is declared: a grooming run ranks the backlog against the charter's rubric, and there is no unanchored-grooming mode. Declare a `charter:` block with its `path:` key in .fishhawk/work-management.yaml pointing at the checked-in charter document (conventionally .fishhawk/charter.md), then start the run again."
+	const unavailableSuffix = " The work-management conventions could not be read for this repo, and an unreadable conventions file is refused rather than assumed to declare a charter."
+
+	cases := []struct {
+		reason string
+		want   string
+	}{
+		{reason: reasonCharterAbsent, want: base},
+		{reason: reasonCharterPathEmpty, want: base},
+		{reason: reasonConventionsUnavailable, want: base + unavailableSuffix},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			got := charterRefusalMessage("octo/repo", "tidy_the_backlog", tc.reason)
+			if got != tc.want {
+				t.Errorf("charterRefusalMessage(reason=%q) rendered:\n got: %q\nwant: %q", tc.reason, got, tc.want)
+			}
+		})
+	}
+}

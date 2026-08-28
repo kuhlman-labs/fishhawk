@@ -28,10 +28,21 @@
 // What stays backend-only is the BINDING class: the ADR-038
 // type<->executor<->constraint bindings, the plan `schema: standard_v1`
 // rule, the produces-artifact bindings (deployment / acceptance /
-// grooming_report and the E52.7 post-hoc-constraint<->pull_request rule),
-// and the `max_autonomy` no-op check that needs the autonomy resolver the
-// CLI deliberately does not carry. Those are checked server-side at run
-// creation; everything else `fishhawk validate` now reports locally.
+// grooming_report placement + schema, and the E52.7
+// post-hoc-constraint<->pull_request rule), and the `max_autonomy` no-op
+// check that needs the autonomy resolver the CLI deliberately does not
+// carry. Those are checked server-side at run creation.
+//
+// The one work-management rule now ALSO checked locally is the
+// MANDATORY-CHARTER rule (E54.11 / #2801, charter.go): a workflow producing
+// a grooming_report is refused when the repo's sibling
+// .fishhawk/work-management.yaml declares no charter. That is an EARLIER
+// WARNING against the local working tree, not the load-bearing gate — run
+// admission, deciding from the forge-fetched conventions, still owns
+// enforcement, and the CLI can be less strict than it but never more. The
+// grooming_report produces-artifact BINDING above (valid only on a plan
+// stage, must declare schema grooming_report_v1) remains backend-only;
+// everything else `fishhawk validate` now reports locally.
 package spec
 
 import (
