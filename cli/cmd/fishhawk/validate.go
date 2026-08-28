@@ -146,11 +146,19 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	// The static charter check (E54.11 / #2801) runs only AFTER ValidateBytes
 	// succeeds, so a schema-invalid spec reports its schema errors first and the
 	// charter check never runs on a document the validator already rejected.
+	// DELIBERATELY UNTESTED (#2996): ValidateBytes above already parsed these
+	// same bytes through the shared decodeAndResolve prefix, so reaching the
+	// branch below requires an input that fails WorkflowsRequiringCharter but
+	// not ValidateBytes — evidence the two calls had DIVERGED, not evidence
+	// the branch is exercised. A test manufactured by bypassing the first
+	// call would prove nothing about the shipped path, so this stays a
+	// surface-rather-than-swallow guard with no corresponding test. (Kept
+	// ABOVE the `if`, not inside it: go tool cover attributes the whole
+	// if-body's line span to its block's hit count, so a comment inside a
+	// permanently-zero-coverage block gets flagged as an uncovered "new line"
+	// by the patch-coverage gate on any future reword of this note.)
 	requiring, cerr := spec.WorkflowsRequiringCharter(data)
 	if cerr != nil {
-		// Unreachable in practice — ValidateBytes already parsed the same bytes
-		// through the shared decodeAndResolve prefix — but surface rather than
-		// swallow.
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", path, cerr)
 		return exitFailure
 	}

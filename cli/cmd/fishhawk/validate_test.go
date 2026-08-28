@@ -231,6 +231,48 @@ workflows:
           - artifact: pull_request
 `
 
+// twoGroomingSpecsForValidate is a schema-valid v2 spec declaring TWO workflows
+// that each produce a grooming_report, mirroring groomingSpecForValidate's
+// stage shape. The workflows are named so DECLARATION order (zz_ first, aa_
+// second) is the REVERSE of spec.WorkflowsRequiringCharter's SORTED order —
+// deliberately, so a fixture whose declaration order happened to match sorted
+// order could not pass this end-to-end assertion by accident (Go map
+// iteration over the decoded workflows is randomized; see
+// TestRunValidate_Charter_TwoGroomingWorkflows_RefusesEachInSortedOrder).
+const twoGroomingSpecsForValidate = `version: "2"
+workflows:
+  zz_sweep_the_backlog:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+  aa_tidy_the_backlog:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
 // nonGroomingSpecForValidate is an ordinary code-change spec — no grooming_report.
 const nonGroomingSpecForValidate = `version: "2"
 workflows:
@@ -274,6 +316,34 @@ func TestRunValidate_Charter_GroomingNoCharter_Refuses(t *testing.T) {
 		t.Fatalf("exit = %d, want exitFailure:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
 	}
 	want := path + ": " + spec.CharterRefusalMessage(path, "tidy_the_backlog", spec.ReasonCharterAbsent) + "\n"
+	if stderr.String() != want {
+		t.Errorf("stderr =\n%q\nwant\n%q", stderr.String(), want)
+	}
+	if stdout.String() != "" {
+		t.Errorf("stdout = %q, want empty on a refusal", stdout.String())
+	}
+}
+
+// TestRunValidate_Charter_TwoGroomingWorkflows_RefusesEachInSortedOrder is the
+// DONE-MEANS end-to-end case for the multi-workflow half of #2996: a spec
+// declaring TWO grooming workflows, with a sibling conventions file that
+// declares no charter, exits 1 with ONE stderr line per requiring workflow, in
+// spec.WorkflowsRequiringCharter's SORTED id order. twoGroomingSpecsForValidate
+// declares the workflows in the REVERSE of sorted order, so this pins
+// sortedness itself and not merely that two lines were printed. Counterfactual
+// A (the refusal loop printing only requiring[0]) and counterfactual B
+// (reversing the sort in WorkflowsRequiringCharter) are run empirically per the
+// approved plan; see the PR notes for the observed RED/GREEN transcript.
+func TestRunValidate_Charter_TwoGroomingWorkflows_RefusesEachInSortedOrder(t *testing.T) {
+	path := writeSpecAndConventions(t, twoGroomingSpecsForValidate, validConventions) // validConventions declares no charter
+	var stdout, stderr strings.Builder
+
+	got := runValidate([]string{path}, &stdout, &stderr)
+	if got != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
+	}
+	want := path + ": " + spec.CharterRefusalMessage(path, "aa_tidy_the_backlog", spec.ReasonCharterAbsent) + "\n" +
+		path + ": " + spec.CharterRefusalMessage(path, "zz_sweep_the_backlog", spec.ReasonCharterAbsent) + "\n"
 	if stderr.String() != want {
 		t.Errorf("stderr =\n%q\nwant\n%q", stderr.String(), want)
 	}
