@@ -168,6 +168,36 @@ identity_lines() {
   ' | sort -u
 }
 
+# all_labels <block> / all_label_lines <block> — the COMPLETE set of `key: value`
+# label pairs in a labels / selector block, NORMALIZED (single space after the
+# colon), SORTED, comma-joined (all_labels) or one-per-line (all_label_lines).
+# Unlike identity_labels this drops NOTHING. r17a's stated rule is "a pod
+# satisfies a Service iff EVERY selector key:value is present in the pod's labels"
+# — a property over the FULL selector, not just its identity subset. A Service
+# carrying an extra selector key absent from the purported matching pod would make
+# Kubernetes select ZERO pods, yet an identity-only comparison silently ignores
+# that key and passes r17a (high/test_vacuity, #2916). Label keys/values never
+# contain a comma, so the comma-join stays an exact element set for
+# selector_matches, exactly as the identity CSV does.
+all_labels() { all_label_lines "$1" | paste -sd, -; }
+all_label_lines() {
+  printf '%s' "$1" | awk '
+    {
+      line = $0; sub(/^[[:space:]]+/, "", line)
+      # A real label line only: a valid label KEY (alnum start, then the
+      # label-key charset [A-Za-z0-9._/-]) followed by `: value`. This excludes
+      # YAML comment lines (`# note: ...`) that ride inside the block and would
+      # otherwise be captured as a bogus label — the selector template carries
+      # exactly such an explanatory comment.
+      if (line ~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*:[[:space:]]/) {
+        sub(/:[[:space:]]+/, ": ", line); gsub(/"/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        print line
+      }
+    }
+  ' | sort -u
+}
+
 # selector_matches <selector-id-csv> <pod-id-csv> — return 0 iff the pod satisfies
 # the selector: EVERY selector key:value is present in the pod's identity set. The
 # CSV elements carry spaces and slashes but never a comma, so splitting on comma
@@ -1560,7 +1590,10 @@ fi
 #       ALL run in BOTH allInOne and split renders, over a pod universe that
 #       includes the two Job pod templates (they are part of the shipped defect:
 #       today they satisfy the bare svc/fishhawk selector):
-#         r17a — every rendered Service selects EXACTLY ONE workload pod set.
+#         r17a — every rendered Service selects EXACTLY ONE workload pod set,
+#                evaluated over the COMPLETE selector + pod-label sets (a pod
+#                satisfies the selector iff every selector key:value is in the pod
+#                labels), so a stray selector key absent from the pod reddens it.
 #         r17b — svc/fishhawk's selector is the FULL {name,instance,component} set
 #                (component=server allInOne, api split) — not just the component.
 #         r17c — for every Deployment, spec.selector.matchLabels' identity set
@@ -1581,9 +1614,11 @@ fi
 #         M2 drop component from the Deployment POD LABELS  a=R b=G c=R d=G
 #         M3 drop component from the SERVICE selector arm   a=R b=R c=G d=G (a: !=1,
 #                                                             observed count REPORTED)
-#         M4 role server->api in BOTH sel+pod, Service=server  a=R b=G c=G d=G
+#         M4 role server->api in BOTH sel+pod, Service=server  a=R b=G c=R d=G
+#                                                             (c: the full-expected-
+#                                                             set pin, condition 2)
 #       Every assertion is reddened by at least one mutation (a:M2/M3/M4, b:M3,
-#       c:M1/M2, d:M1); a cell disagreeing with this is a finding, not a fixup.
+#       c:M1/M2/M4, d:M1); a cell disagreeing with this is a finding, not a fixup.
 # ---------------------------------------------------------------------------
 r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <render-args...>
   local mode="$1" primary_dep="$2" svc_comp="$3"; shift 3
@@ -1593,15 +1628,17 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
   local manifest="$out"
   local expected_primary="app.kubernetes.io/component: $svc_comp,app.kubernetes.io/instance: fishhawk,app.kubernetes.io/name: fishhawk"
 
-  # Pod universe: every Deployment + Job pod template (name + identity set).
-  local pod_sets=() pod_names=() doc name block
+  # Pod universe: every Deployment + Job pod template (name + identity set + the
+  # COMPLETE label set). r17a matches over the full sets (a stray selector key must
+  # redden it); r17b/r17c/r17d stay identity-only.
+  local pod_sets=() pod_full_sets=() pod_names=() doc name block
   while IFS= read -r -d '' doc; do
     name=$(doc_name "$doc"); block=$(pod_labels_block "$doc")
-    pod_sets+=("$(identity_labels "$block")"); pod_names+=("$name")
+    pod_sets+=("$(identity_labels "$block")"); pod_full_sets+=("$(all_labels "$block")"); pod_names+=("$name")
   done < <(docs_of_kind "$manifest" Deployment)
   while IFS= read -r -d '' doc; do
     name=$(doc_name "$doc"); block=$(pod_labels_block "$doc")
-    pod_sets+=("$(identity_labels "$block")"); pod_names+=("$name")
+    pod_sets+=("$(identity_labels "$block")"); pod_full_sets+=("$(all_labels "$block")"); pod_names+=("$name")
   done < <(docs_of_kind "$manifest" Job)
 
   # Anti-vacuity: the parse must yield a non-trivial universe INCLUDING the primary
@@ -1622,22 +1659,28 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
     fail "r17 ($mode) no pod carries the expected primary set [$expected_primary]"
   fi
 
-  # r17a — every Service selects exactly one workload pod; r17b captured here.
-  local svc_doc svc_name sel_set count matched fh_sel_set=""
+  # r17a — every Service selects exactly one workload pod, evaluated over the
+  # COMPLETE selector and pod-label sets: a pod satisfies the selector iff EVERY
+  # selector key:value is present in the pod's labels, so a Service carrying an
+  # extra selector key absent from the pod (Kubernetes would select zero pods)
+  # reddens it (#2916). r17b's identity capture of svc/fishhawk rides along.
+  local svc_doc svc_name sel_block sel_set sel_full count matched fh_sel_set=""
   while IFS= read -r -d '' svc_doc; do
     svc_name=$(doc_name "$svc_doc")
-    sel_set=$(identity_labels "$(yaml_block "$svc_doc" "selector")")
+    sel_block=$(yaml_block "$svc_doc" "selector")
+    sel_set=$(identity_labels "$sel_block")
+    sel_full=$(all_labels "$sel_block")
     [ "$svc_name" = "fishhawk" ] && fh_sel_set="$sel_set"
     count=0; matched=""
-    for i in "${!pod_sets[@]}"; do
-      if selector_matches "$sel_set" "${pod_sets[$i]}"; then
+    for i in "${!pod_full_sets[@]}"; do
+      if selector_matches "$sel_full" "${pod_full_sets[$i]}"; then
         count=$((count+1)); matched="$matched ${pod_names[$i]}"
       fi
     done
     if [ "$count" -eq 1 ]; then
       pass "r17a ($mode) Service $svc_name selects exactly one workload (${matched# })"
     else
-      fail "r17a ($mode) Service $svc_name selects $count workloads (expected 1):${matched} [selector: $sel_set]"
+      fail "r17a ($mode) Service $svc_name selects $count workloads (expected 1):${matched} [selector: $sel_full]"
     fi
   done < <(docs_of_kind "$manifest" Service)
 
