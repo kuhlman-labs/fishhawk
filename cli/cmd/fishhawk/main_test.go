@@ -1802,15 +1802,19 @@ func TestCLIFlagsMatchExecutableSurface(t *testing.T) {
 	}
 }
 
-// TestZeroFlagCommandsInterceptHelp pins that the two commands whose
-// cmdinfo entry declares an EMPTY flag set — `token list` and `validate` —
-// nonetheless register a flag.FlagSet and Parse it BEFORE doing any work,
-// so the `-h` drive in harvestFlags (TestCLIFlagsMatchExecutableSurface) is
-// intercepted by the flag package (ErrHelp -> exitUsage, usage printed) and
-// never falls through to the command body. Without a FlagSet, `token list
-// -h` would execute the real credential-store listing during `go test` and
-// the empty harvest would be a vacuous fall-through, not a truthful reading
-// of an empty flag set.
+// TestZeroFlagCommandsInterceptHelp pins that the ONE command whose cmdinfo
+// entry declares an EMPTY flag set — `token list` — nonetheless registers a
+// flag.FlagSet and Parses it BEFORE doing any work, so the `-h` drive in
+// harvestFlags (TestCLIFlagsMatchExecutableSurface) is intercepted by the
+// flag package (ErrHelp -> exitUsage, usage printed) and never falls through
+// to the command body. Without a FlagSet, `token list -h` would execute the
+// real credential-store listing during `go test` and the empty harvest would
+// be a vacuous fall-through, not a truthful reading of an empty flag set.
+//
+// `validate` was the second such command until E52.22 / #2351 gave it
+// `--emit-resolved`; its `-h` interception is retained below as its own
+// regression subtest, because harvestFlags depends on that interception for
+// EVERY command, not only the zero-flag ones.
 func TestZeroFlagCommandsInterceptHelp(t *testing.T) {
 	t.Run("token list", func(t *testing.T) {
 		var stdout, stderr strings.Builder
@@ -1827,7 +1831,10 @@ func TestZeroFlagCommandsInterceptHelp(t *testing.T) {
 			t.Errorf("token list -h printed no flag usage to stderr: %q", stderr.String())
 		}
 	})
-	t.Run("validate", func(t *testing.T) {
+	// `validate` is no longer a zero-flag command (it registers
+	// --emit-resolved). This subtest is retained as the usage-banner
+	// regression pin for the `-h` interception harvestFlags relies on.
+	t.Run("validate -h prints the usage banner", func(t *testing.T) {
 		var stdout, stderr strings.Builder
 		got := run([]string{"validate", "-h"}, &stdout, &stderr)
 		if got != exitUsage {
@@ -1911,7 +1918,7 @@ func usageOverrideFuncs(t *testing.T) map[string]int {
 // reddens.
 func TestCustomUsageCommandsArePinned(t *testing.T) {
 	pinned := map[string][]string{
-		"validate":     {},
+		"validate":     {"emit-resolved"},
 		"migrate-spec": {"out", "in-place", "report-only"},
 		"token login":  commonPlus("provider", "client-id"),
 		"init":         commonPlus("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),

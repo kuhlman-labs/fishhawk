@@ -53,6 +53,17 @@ check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
 # (workflow-v2.md § "Where errors point"). A raw check-jsonschema run rejects
 # the unresolved source — a stage inheriting its executor reads as missing one.
 # Use `fishhawk validate` (which resolves reuse first) for a reuse-bearing spec.
+#
+# To keep check-jsonschema in the loop anyway, pipe it the RESOLVED document
+# (E52.22 / #2351). --emit-resolved writes the resolved YAML to stdout and
+# nothing else; --default-filetype yaml is required because check-jsonschema
+# assumes JSON on stdin. Emit RESOLVES without VALIDATING, so exit 0 from the
+# left half means 'resolvable', not 'valid' — the schema verdict is the right
+# half's. The emitted form drops comments, key order and anchors: never write
+# it back over the source.
+fishhawk validate --emit-resolved docs/spec/examples/workflow-v2-reuse.yaml \
+    | check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
+        --default-filetype yaml -
 
 check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \
     docs/spec/examples/plan-standard-v1-example.json

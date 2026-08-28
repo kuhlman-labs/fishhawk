@@ -166,6 +166,16 @@ The cost is the same tradeoff `needs:` expansion accepts: a reported error **pat
 
 Post-resolution enforcement has one operator-facing consequence: a **bare `check-jsonschema` run resolves no reuse**, so it rejects a valid reuse-bearing document — a stage that inherits its `executor` trips `$defs/stage`'s `required` list when the raw bytes are validated directly. Use `fishhawk validate` (or let the backend validate), which resolves first. This is the same asymmetry the action-class rules note the other way round (a raw run *accepts* a document the backend *rejects*): the bare schema is neither a superset nor a subset of what the product accepts, so it is not the authority for a reuse-bearing spec.
 
+To keep a bare `check-jsonschema` run in the loop anyway, pipe it the **resolved** document (E52.22 / #2351):
+
+```sh
+fishhawk validate --emit-resolved .fishhawk/workflows.yaml \
+    | check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
+        --default-filetype yaml -
+```
+
+`--emit-resolved` writes the resolved document to stdout and nothing else (the loss warning goes to stderr); `--default-filetype yaml` is required because `check-jsonschema` assumes JSON on stdin. It **resolves without validating** — a zero exit from the left half means *resolvable*, not *valid*, and it runs neither the mandatory-charter rule nor the stage-reference sweeps, so `fishhawk validate` without the flag remains the authority. Comments, key order and anchors are not preserved: the emitted form is machine-readable only and must never be written back over the source.
+
 The `defaults` and `extends` keys are stripped after validation, before the typed decode. No Go struct, database column, API field or consumer read site sees either key.
 
 ## Workflow members

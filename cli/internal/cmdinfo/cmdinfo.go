@@ -152,7 +152,7 @@ func Commands() []Command {
 		{Key: "init", Synopsis: "Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight).", Args: "",
 			Flags: withCommon("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo")},
 		{Key: "validate", Synopsis: "Validate a workflow spec file locally.", Args: "[path]",
-			Flags: []string{}},
+			Flags: []string{"emit-resolved"}},
 		{Key: "migrate-spec", Synopsis: "Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report.", Args: "[path]",
 			Flags: []string{"out", "in-place", "report-only"}},
 		{Key: "runner start", Synopsis: "Spawn the fishhawk-runner locally against an already-minted run.", Args: "",

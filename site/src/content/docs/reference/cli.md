@@ -183,7 +183,7 @@ Flags: `--backend-url`, `--token`, `--timeout`, `--preset`, `--working-dir`, `--
 
 #### `fishhawk validate`
 
-Flags: none.
+Flags: `--emit-resolved`
 
 #### `fishhawk migrate-spec`
 
