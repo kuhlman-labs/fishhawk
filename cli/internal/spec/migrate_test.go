@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"encoding/json"
 	"flag"
 	"os"
 	"path/filepath"
@@ -901,5 +902,172 @@ func TestSameMatrixIgnoresComments(t *testing.T) {
 	differentSeverity["fixup"] = actionEntry{Class: "fixup", Mode: "auto", When: "convergent_concerns", MinSeverity: "low"}
 	if sameMatrix(base(), differentSeverity) {
 		t.Error("sameMatrix must report matrices differing in MinSeverity as UNEQUAL")
+	}
+}
+
+// --- tier-expansion corpus (E52.18 / #2341) ---------------------------------
+
+// cliTierCorpusClass mirrors the corpus JSON shape for one action class.
+type cliTierCorpusClass struct {
+	Mode string `json:"mode"`
+	When string `json:"when,omitempty"`
+}
+
+// cliTierCorpusRow mirrors the corpus JSON shape for one tier.
+type cliTierCorpusRow struct {
+	Tier        string                        `json:"tier"`
+	Classes     map[string]cliTierCorpusClass `json:"classes"`
+	PageHumanOn []string                      `json:"page_human_on"`
+	Reason      string                        `json:"reason"`
+}
+
+type cliTierCorpusFile struct {
+	Comment string             `json:"$comment"`
+	Tiers   []cliTierCorpusRow `json:"tiers"`
+}
+
+// loadCLITierCorpus reads testdata/tier-expansion-fixtures.json and asserts
+// the corpus carries exactly {low, medium, high}, each with exactly the five
+// known action classes. Without this guard an emptied corpus iterates zero
+// rows and passes vacuously — guaranteeing nothing while looking green.
+func loadCLITierCorpus(t *testing.T) []cliTierCorpusRow {
+	t.Helper()
+	b, err := os.ReadFile("testdata/tier-expansion-fixtures.json")
+	if err != nil {
+		t.Fatalf("loadCLITierCorpus: read: %v", err)
+	}
+	var f cliTierCorpusFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatalf("loadCLITierCorpus: unmarshal: %v", err)
+	}
+
+	knownTiers := map[string]bool{"low": false, "medium": false, "high": false}
+	knownClasses := []string{"approve", "fixup", "waive", "retry", "merge"}
+	for _, row := range f.Tiers {
+		if _, ok := knownTiers[row.Tier]; !ok {
+			t.Fatalf("corpus carries unexpected tier %q; must carry exactly low, medium, high", row.Tier)
+		}
+		if knownTiers[row.Tier] {
+			t.Fatalf("corpus carries duplicate tier %q", row.Tier)
+		}
+		knownTiers[row.Tier] = true
+		if len(row.Classes) != len(knownClasses) {
+			t.Fatalf("tier %q: corpus carries %d classes, want 5 (approve, fixup, waive, retry, merge)", row.Tier, len(row.Classes))
+		}
+		for _, cls := range knownClasses {
+			if _, ok := row.Classes[cls]; !ok {
+				t.Fatalf("tier %q: corpus missing class %q", row.Tier, cls)
+			}
+		}
+	}
+	for tier, seen := range knownTiers {
+		if !seen {
+			t.Fatalf("corpus missing tier %q; must carry exactly low, medium, high", tier)
+		}
+	}
+	if len(f.Tiers) != 3 {
+		t.Fatalf("corpus has %d tier rows, want exactly 3 (low, medium, high)", len(f.Tiers))
+	}
+	return f.Tiers
+}
+
+// TestTierExpansionCorpus_CLIMatches asserts the CLI's tierExpansion function
+// against the shared docs/spec/tier-expansion-fixtures.json corpus and then
+// proves each corpus row round-trips through MigrateBytes by synthesizing a
+// v1 operator_agent block that should collapse to autonomy: <tier>.
+// tierExpansion and the migrateBlock paths are two independent surfaces — a
+// solo edit to either one reddens here independently.
+func TestTierExpansionCorpus_CLIMatches(t *testing.T) {
+	rows := loadCLITierCorpus(t)
+
+	// pageV1 reverses the v2 page event spelling back to the v1 token used in
+	// must_page_human (the only token that differs across versions).
+	pageV1 := func(v2Event string) string {
+		if v2Event == gatingReviewerRejectToken {
+			return legacyReviewerRejectToken
+		}
+		return v2Event
+	}
+
+	// classKnob maps action class name to its knobClass entry.
+	classKnob := map[string]knobClass{}
+	for _, kc := range knobClasses {
+		classKnob[kc.Class] = kc
+	}
+
+	for _, row := range rows {
+		t.Run(row.Tier, func(t *testing.T) {
+			// (a) Direct: tierExpansion returns a matrix and page list that
+			// agree with the corpus row on every class.
+			gotMatrix, gotPages := tierExpansion(row.Tier)
+
+			// Build the expected matrix from the corpus row.
+			wantMatrix := map[string]actionEntry{}
+			for cls, ce := range row.Classes {
+				wantMatrix[cls] = actionEntry{Class: cls, Mode: ce.Mode, When: ce.When}
+			}
+			if !sameMatrix(gotMatrix, wantMatrix) {
+				t.Errorf("tier %s: tierExpansion matrix differs from corpus\n  got:  %v\n  want: %v", row.Tier, gotMatrix, wantMatrix)
+			}
+
+			// Page list comparison. CLI low tier: tierExpansion returns nil pages;
+			// corpus has page_human_on: []. Compare nil/empty-tolerantly via
+			// len==0 short-circuit.
+			if len(row.PageHumanOn) == 0 {
+				if len(gotPages) != 0 {
+					t.Errorf("tier %s: pages = %v, want nil/empty", row.Tier, gotPages)
+				}
+			} else {
+				// tierExpansion returns v2 spellings (gating_reviewer_reject);
+				// the corpus also uses v2 spellings — compare directly.
+				if !sameSet(gotPages, row.PageHumanOn) {
+					t.Errorf("tier %s: pages = %v, want %v", row.Tier, gotPages, row.PageHumanOn)
+				}
+			}
+
+			// (b) End-to-end: synthesize a v1 operator_agent block from the
+			// corpus row and assert MigrateBytes collapses it correctly.
+			switch row.Tier {
+			case "low":
+				// A v1 absent operator_agent is NOT rounded to autonomy: low
+				// (a block with all knobs absent WOULD round to low via matchTier,
+				// but there is no schema-valid way to represent "all gated" in v1 as
+				// an explicit block). Use minimalV1 (no operator_agent) and assert
+				// neither autonomy: nor actions: appears in the output.
+				got := string(migrateOK(t, minimalV1).Migrated)
+				if strings.Contains(got, "autonomy:") {
+					t.Errorf("absent operator_agent must not emit autonomy: key:\n%s", got)
+				}
+				if strings.Contains(got, "actions:") {
+					t.Errorf("absent operator_agent must not emit actions: key:\n%s", got)
+				}
+			default:
+				// Synthesize a v1 operator_agent block in the same knob-per-line
+				// format TestMigrateBytes_TierRounding uses. Gated classes are
+				// OMITTED — v1 encodes "gated" by absence of the may_* knob, not by
+				// an explicit value.
+				block := "    operator_agent:\n"
+				for _, kc := range knobClasses {
+					ce := row.Classes[kc.Class]
+					if ce.Mode == "auto" {
+						block += "      " + kc.Knob + ": " + ce.When + "\n"
+					}
+				}
+				if len(row.PageHumanOn) > 0 {
+					block += "      must_page_human:\n"
+					for _, ev := range row.PageHumanOn {
+						block += "        - " + pageV1(ev) + "\n"
+					}
+				}
+				got := migrateBlock(t, block)
+				wantKey := "autonomy: " + row.Tier
+				if !strings.Contains(got, wantKey) {
+					t.Errorf("corpus-synthesized v1 block must collapse to %q:\n%s", wantKey, got)
+				}
+				if strings.Contains(got, "actions:") {
+					t.Errorf("corpus-synthesized v1 block (tier-exact) must not emit actions: key:\n%s", got)
+				}
+			}
+		})
 	}
 }

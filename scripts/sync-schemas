@@ -93,4 +93,18 @@ cp "$REPO_ROOT/docs/spec/acceptance-verdict-fixtures.json" \
 cp "$REPO_ROOT/docs/spec/acceptance-verdict-fixtures.json" \
   "$REPO_ROOT/runner/cmd/fishhawk-runner/testdata/acceptance-verdict-fixtures.json"
 
+# The shared tier-expansion fixture corpus (E52.18 / #2341) is the canonical
+# proof surface for the two hand-maintained tier expansion tables that CANNOT
+# import each other across the backend/cli module wall: expandTier in
+# backend/internal/spec/v2autonomy.go and tierExpansion in
+# cli/internal/spec/migrate.go. Mirroring it into both testdata dirs makes the
+# two suites run the SAME rows, so a twin divergence fails whichever side
+# drifted; CI's schema-sync gate red-lines a mirror that itself drifts. Same
+# *-fixtures.json naming idiom: NOT *.schema.json, so the loop above never
+# globs it.
+cp "$REPO_ROOT/docs/spec/tier-expansion-fixtures.json" \
+  "$REPO_ROOT/backend/internal/spec/testdata/tier-expansion-fixtures.json"
+cp "$REPO_ROOT/docs/spec/tier-expansion-fixtures.json" \
+  "$REPO_ROOT/cli/internal/spec/testdata/tier-expansion-fixtures.json"
+
 echo "schemas synced from docs/spec/"

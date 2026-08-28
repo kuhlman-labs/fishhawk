@@ -150,6 +150,8 @@ explicit `actions` matrix form when it carries a rationale comment on a `may_*` 
 the same delegation, so nothing widens or narrows. A comment on the `operator_agent:` key itself
 does not block; it rides onto the emitted `autonomy` key.
 
+**`tierExpansion` is a structural twin of `backend/internal/spec`'s `expandTier` (E52.18 / #2341).** Both encode the same three tiers, class entries and page list, but they cannot share a Go implementation across the module wall. The shared proof surface is `docs/spec/tier-expansion-fixtures.json`, mirrored into `cli/internal/spec/testdata/` by `scripts/sync-schemas`. `TestTierExpansionCorpus_CLIMatches` asserts `tierExpansion` against every corpus row AND synthesizes a v1 operator_agent block from each row and runs it through `MigrateBytes`, confirming the codemod collapses it to `autonomy: <tier>`.
+
 Exit codes: `0` migrated or already-v2 no-op, `1` refusal / output-validation failure / refused
 overwrite, `2` usage or I/O. Full contract, translation table and refusal taxonomy:
 `docs/spec/workflow-migration.md`.
