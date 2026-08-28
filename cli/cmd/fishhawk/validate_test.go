@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -742,14 +744,21 @@ workflows:
 			want: "roles",
 		},
 		{
+			// The want is the DECODE-phase fragment, not a bare ":" that every
+			// `<path>: <msg>` line satisfies: only a *spec.ParseError carries
+			// the yaml decoder's own text, so this row proves the refusal came
+			// from the decode phase rather than from any other path.
 			name: "malformed YAML",
 			doc:  "version: \"2\"\n\tworkflows: [",
-			want: ":",
+			want: "yaml: line 2:",
 		},
 		{
+			// Likewise: "empty document" is spec.ParseError's exact message for
+			// an empty input (spec.go's decodeAndResolve), not a generic line
+			// shape.
 			name: "empty document",
 			doc:  "",
-			want: ":",
+			want: "empty document",
 		},
 	}
 	for _, tc := range cases {
@@ -767,6 +776,92 @@ workflows:
 			}
 			if strings.Contains(stderr, emitResolvedLossWarning) {
 				t.Errorf("the loss warning was printed on a failure path: %q", stderr)
+			}
+		})
+	}
+}
+
+// errAfterN is an io.Writer that accepts at most n bytes in total and then
+// fails, modelling the two ways a real stdout write can go wrong: a consumer
+// that closed the pipe early (n == 0, an immediate error) and a redirect to a
+// full disk (n > 0, a short accepted prefix then an error). It records
+// everything it accepted so the test can assert the truncation it produced.
+type errAfterN struct {
+	n        int   // bytes still acceptable
+	err      error // returned once the budget is exhausted
+	shortNil bool  // return (n < len(p), nil) instead — a non-conforming writer
+	accepted strings.Builder
+}
+
+func (w *errAfterN) Write(p []byte) (int, error) {
+	take := len(p)
+	if take > w.n {
+		take = w.n
+	}
+	w.accepted.Write(p[:take])
+	w.n -= take
+	if take == len(p) {
+		return take, nil
+	}
+	if w.shortNil {
+		// Deliberately violates the io.Writer contract (a short write with a
+		// nil error). The CLI must still refuse rather than trust the count.
+		return take, nil
+	}
+	return take, w.err
+}
+
+// TestValidateEmitResolved_StdoutWriteFailureIsNotSuccess pins that a failed or
+// short stdout write is REPORTED, not swallowed: emit must exit non-zero and
+// name the failure on stderr rather than handing a consumer a truncated
+// document under exit 0. The rows cover an immediate failure (a closed pipe),
+// a partial-then-failing write (a redirect to a full disk), and the
+// contract-violating short write with a nil error.
+func TestValidateEmitResolved_StdoutWriteFailureIsNotSuccess(t *testing.T) {
+	// Sanity anchor: the same input on a healthy writer succeeds, so a RED row
+	// below is the writer's doing and not a broken fixture.
+	if code, _, stderr := emitResolved(t, emitFixtureRelPath); code != exitOK {
+		t.Fatalf("control: healthy-writer emit exit = %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	sentinel := errors.New("boom: downstream consumer went away")
+	cases := []struct {
+		name       string
+		w          *errAfterN
+		wantErrTxt string
+	}{
+		{
+			name:       "closed pipe (immediate failure)",
+			w:          &errAfterN{n: 0, err: sentinel},
+			wantErrTxt: sentinel.Error(),
+		},
+		{
+			name:       "disk full (partial write then failure)",
+			w:          &errAfterN{n: 16, err: sentinel},
+			wantErrTxt: sentinel.Error(),
+		},
+		{
+			name:       "short write with a nil error",
+			w:          &errAfterN{n: 16, shortNil: true},
+			wantErrTxt: io.ErrShortWrite.Error(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr strings.Builder
+			code := runValidate([]string{"--emit-resolved", emitFixtureRelPath}, tc.w, &stderr)
+			if code == exitOK {
+				t.Fatalf("exit = 0 on a failing stdout write; the consumer got %d truncated byte(s) under a success exit",
+					tc.w.accepted.Len())
+			}
+			if code != exitUsage {
+				t.Errorf("exit = %d, want %d (the I/O class the usage banner documents)", code, exitUsage)
+			}
+			if !strings.Contains(stderr.String(), "writing the resolved document to stdout") {
+				t.Errorf("stderr does not name the stdout write failure: %q", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantErrTxt) {
+				t.Errorf("stderr %q does not carry the underlying error %q", stderr.String(), tc.wantErrTxt)
 			}
 		})
 	}

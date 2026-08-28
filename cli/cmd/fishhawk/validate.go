@@ -43,7 +43,9 @@ const emitResolvedLossWarning = "fishhawk validate --emit-resolved: emitting the
 // into a bare `check-jsonschema --schemafile docs/spec/workflow-v2.schema.json -`
 // run (E52.22 / #2351). That mode deliberately runs NEITHER spec.ValidateBytes
 // NOR the E54.11 static charter check — the point is to hand the document to a
-// validator that judges validity itself.
+// validator that judges validity itself. A failed or short stdout write on that
+// path exits 2 (the I/O class) rather than reporting success, so a truncated
+// document is never emitted under exit 0.
 //
 // Exit code 0 on success, 1 on validation failure (per the issue
 // body — exit 2 is reserved for usage errors).
@@ -118,7 +120,21 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		// this path, so a failure can never leave a truncated half-document on
 		// the pipe.
 		_, _ = fmt.Fprintln(stderr, emitResolvedLossWarning)
-		_, _ = stdout.Write(resolved)
+		// A stdout write failure must NOT be reported as success: a partial
+		// write (a redirect to a full disk, a downstream consumer that closed
+		// early) would otherwise hand the consumer a truncated document under
+		// exit 0. Both halves are checked because `n < len(p)` with a nil error
+		// violates the io.Writer contract but costs one comparison to refuse.
+		if n, werr := stdout.Write(resolved); werr != nil || n != len(resolved) {
+			if werr == nil {
+				werr = io.ErrShortWrite
+			}
+			_, _ = fmt.Fprintf(stderr, "fishhawk validate: %s: writing the resolved document to stdout: %v\n", path, werr)
+			// exitUsage, not exitFailure: this is the I/O class the usage
+			// banner's exit-code table already assigns 2 (the same code the
+			// unreadable-input branch above returns), not a spec defect.
+			return exitUsage
+		}
 		return exitOK
 	}
 
