@@ -455,6 +455,163 @@ func TestGroomingDispositionsStageListErrorIs500(t *testing.T) {
 	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
 }
 
+// G7d. TestGroomingDispositionsArtifactListErrorIs500 pins the artifact-LIST
+// failure branch: a stage whose artifact list cannot be read is a 500, never
+// the 409 that says the run carries no report. An unreadable list is not an
+// absent report, and collapsing the two would hand an operator "there is
+// nothing to disposition" while the report sits unread (#2993).
+//
+// The injected error is a test-constructed sentinel, never obtained from the
+// resolver, so a RED lands on the behavioral assertion and not on setup.
+func TestGroomingDispositionsArtifactListErrorIs500(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	au := &auditFake{}
+	s := New(Config{
+		RunRepo: &gdRunRepo{stages: []*run.Stage{
+			{ID: stageID, RunID: runID, Type: run.StageTypePlan},
+		}},
+		ArtifactRepo: &gdArtifactRepo{listErr: errors.New("artifact list boom")},
+		AuditRepo:    au,
+	})
+
+	w := postGD(t, s, runID, gdBatch("ordering:github/acme/app#1", "approved"), gdOperator)
+	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(w.Body.String(), "grooming_report_absent") {
+		t.Error("an UNREADABLE artifact list was reported as an ABSENT report; the two states must stay distinct")
+	}
+	// Committed state, read after the call returns: a regression that fell
+	// through to the write path is caught here even if the error identity
+	// happened to match.
+	if rows := gdRows(au); len(rows) != 0 {
+		t.Errorf("appended %d disposition rows on an unreadable artifact list, want 0: %+v", len(rows), rows)
+	}
+
+	// BOTH verbs resolve through newestGroomingReportArtifact. The read-back is
+	// where a collapsed error would report the report as absent when it is
+	// merely unreadable, so it gets its own assertion.
+	g := getGD(t, s, runID)
+	requireGDError(t, g, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(g.Body.String(), "grooming_report_absent") {
+		t.Error("GET reported an UNREADABLE artifact list as an ABSENT report")
+	}
+}
+
+// gdTieBreakFixture builds two grooming_report artifacts with BYTE-EQUAL
+// CreatedAt and different ids. The artifact with the lexicographically GREATER
+// id string is the one newerGroomingArtifact selects, so it carries the report
+// that DROPS the Duplicates class — making WHICH report won observable through
+// the API rather than through internals.
+//
+// The ordering is COMPUTED from the two id strings, never assumed from
+// generation order: uuid.New() gives no ordering guarantee, and assuming one
+// makes the test pass and fail at random.
+type gdTieBreakFixture struct {
+	winner, loser *artifact.Artifact
+	winnerStage   uuid.UUID
+	loserStage    uuid.UUID
+	ids           groomingApplyEntryIDs
+	byStage       map[uuid.UUID][]*artifact.Artifact
+}
+
+func newGDTieBreakFixture(t *testing.T) *gdTieBreakFixture {
+	t.Helper()
+	// Equal to the byte: one shared time value, not two constructions of it.
+	created := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+
+	full, ids := groomingApplyFullReport()
+	fullBody := groomingApplyReportJSON(t, full)
+
+	trimmed, _ := groomingApplyFullReport()
+	trimmed.Duplicates = []plan.DuplicateCandidate{}
+	trimmedBody := groomingApplyReportJSON(t, trimmed)
+
+	stageA, stageB := uuid.New(), uuid.New()
+	idA, idB := uuid.New(), uuid.New()
+	for idA.String() == idB.String() {
+		idB = uuid.New()
+	}
+	// The GREATER id string wins (grooming_dispositions.go: the equal-CreatedAt
+	// branch is `candidate.ID.String() > incumbent.ID.String()`).
+	winnerID, winnerStage, loserID, loserStage := idA, stageA, idB, stageB
+	if idB.String() > idA.String() {
+		winnerID, winnerStage, loserID, loserStage = idB, stageB, idA, stageA
+	}
+
+	// The winner drops the Duplicates class; the loser keeps it. So the
+	// duplicate entry id exists ONLY on the LOSER.
+	winner := &artifact.Artifact{
+		ID: winnerID, StageID: winnerStage, Kind: artifact.KindGroomingReport,
+		Content: trimmedBody, ContentHash: sha256Hex(trimmedBody), CreatedAt: created,
+	}
+	loser := &artifact.Artifact{
+		ID: loserID, StageID: loserStage, Kind: artifact.KindGroomingReport,
+		Content: fullBody, ContentHash: sha256Hex(fullBody), CreatedAt: created,
+	}
+	return &gdTieBreakFixture{
+		winner: winner, loser: loser,
+		winnerStage: winnerStage, loserStage: loserStage, ids: ids,
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			winnerStage: {winner}, loserStage: {loser},
+		},
+	}
+}
+
+// TestGroomingDispositionsEqualCreatedAtTieBreakIsTotal pins the id-string
+// tiebreak in newerGroomingArtifact: two reports written in the same clock tick
+// must still order stably, and the SAME one must win regardless of the order
+// the repository returns the stages in (#2994).
+//
+// The reversed-stage-order arm is what makes this a totality test rather than
+// one lucky arrangement: a resolver whose selection depended on traversal order
+// passes one arm and fails the other.
+func TestGroomingDispositionsEqualCreatedAtTieBreakIsTotal(t *testing.T) {
+	f := newGDTieBreakFixture(t)
+
+	arms := []struct {
+		name   string
+		stages []uuid.UUID
+	}{
+		{"winner_first", []uuid.UUID{f.winnerStage, f.loserStage}},
+		{"winner_second", []uuid.UUID{f.loserStage, f.winnerStage}},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
+			runID := uuid.New()
+			s := New(Config{
+				RunRepo: &gdRunRepo{stages: []*run.Stage{
+					{ID: arm.stages[0], RunID: runID, Type: run.StageTypePlan},
+					{ID: arm.stages[1], RunID: runID, Type: run.StageTypePlan},
+				}},
+				ArtifactRepo: &gdArtifactRepo{byStage: f.byStage},
+				AuditRepo:    &auditFake{},
+			})
+
+			// The duplicate entry exists ONLY on the LOSING report, so a
+			// capture that attached to the loser would 200 here. It must 422.
+			w := postGD(t, s, runID, gdBatch(f.ids.duplicate, "approved"), gdOperator)
+			requireGDError(t, w, http.StatusUnprocessableEntity, "grooming_entry_unknown")
+
+			// An entry on the WINNING report is accepted and the response names
+			// the greater-id artifact.
+			w = postGD(t, s, runID, gdBatch(f.ids.ordering, "approved"), gdOperator)
+			out := decodeGDResponse(t, w)
+			if out.ArtifactID != f.winner.ID.String() {
+				t.Errorf("capture attached to artifact %s, want the GREATER-id %s (loser %s)",
+					out.ArtifactID, f.winner.ID, f.loser.ID)
+			}
+			if out.StageID != f.winnerStage.String() {
+				t.Errorf("capture stage = %s, want the winning report's stage %s", out.StageID, f.winnerStage)
+			}
+
+			// The read-back resolves through the same function and must agree.
+			got := decodeGDResponse(t, getGD(t, s, runID))
+			if got.ArtifactID != f.winner.ID.String() {
+				t.Errorf("read-back artifact = %s, want the GREATER-id %s", got.ArtifactID, f.winner.ID)
+			}
+		})
+	}
+}
+
 // G8. TestGroomingDispositionsUnknownEntryRejected. The unknown id is a freshly
 // generated random string — definitionally not a derived id — so the fixture
 // never consults the control it is testing.
