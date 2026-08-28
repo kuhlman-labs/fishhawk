@@ -1029,10 +1029,12 @@ workflows:
 }
 
 // TestParseV2_VersionGate_ReuseKeysRejectedBelowMajor2 is the version gate.
-// This repo's own .fishhawk/workflows.yaml and all three shipped presets are
-// v0.x / v1.x, so a resolver leaking below the major gate would touch every
-// spec that actually runs today. Both lower majors are asserted: the reuse
-// keys are rejected by their own schema and are NEVER resolved.
+// The gate matters because workflow-v0 and workflow-v1 are FROZEN majors the
+// version-routed validator still routes and still accepts: a resolver leaking
+// below the major gate would resolve `defaults` / `extends` in a document
+// whose OWN schema forbids them, quietly changing what an operator's v0/v1
+// spec means. Both lower majors are asserted: the reuse keys are rejected by
+// their own schema and are NEVER resolved.
 //
 // The document declares `extends: nope` — an UNKNOWN base — deliberately. A
 // document that merely carries well-formed reuse keys cannot distinguish "the

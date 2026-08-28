@@ -5271,19 +5271,25 @@ workflows:
 	}
 }
 
-// shippedBudgetDocs are the repo's own v0.x/v1.x specs that declare stage
-// budgets — the exact documents #2217's operator identified as at risk. All
-// declare max_tokens on their agent stages in the legacy integer-minutes
-// spelling.
+// shippedSpecRelPath reaches this repo's own governing workflow spec from
+// backend/internal/spec. It is a single named constant because more than one
+// test needs the repo-root spec, and two independent relative literals to the
+// same file would be a second thing to keep in sync (#2344).
+const shippedSpecRelPath = "../../../.fishhawk/workflows.yaml"
+
+// shippedBudgetDocs are the repo's own shipped specs that declare stage
+// budgets — the exact documents #2217's operator identified as at risk. The
+// live spec declares version "2" since the E52 operator migration; the budget
+// assertion below is spelling-agnostic on purpose.
 var shippedBudgetDocs = []struct {
 	name string
 	path string
 }{
-	{"workflows.yaml", "../../../.fishhawk/workflows.yaml"},
+	{"workflows.yaml", shippedSpecRelPath},
 }
 
 // TestParseBytes_ShippedSpecsAndPresetsStillParse pins that this repo's own
-// version-1.3 .fishhawk/workflows.yaml and the three embedded presets still
+// version-"2" .fishhawk/workflows.yaml and the three embedded presets still
 // parse with their stage budgets DECODED.
 //
 // The assertion is ABSENCE-TOLERANT by design (#2217 / E52.8): a v2 budget
@@ -5358,6 +5364,34 @@ func TestParseBytes_ShippedSpecsAndPresetsStillParse(t *testing.T) {
 			}
 			assertBudgetsDecoded(t, "preset "+string(p), raw)
 		})
+	}
+}
+
+// TestShippedSpecDeclaresWorkflowV2 anchors the prose that asserts which
+// workflow major this repo's own .fishhawk/workflows.yaml declares. Those
+// claims went stale silently once the E52 operator migration rewrote the
+// live spec from v1.3 to v2 (#2344), and a comment cannot be tested; this
+// pin makes the NEXT major migration red instead, and names every site that
+// must be corrected alongside it.
+func TestShippedSpecDeclaresWorkflowV2(t *testing.T) {
+	raw, err := os.ReadFile(shippedSpecRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", shippedSpecRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", shippedSpecRelPath, err)
+	}
+	const want = "2"
+	if s.Version != want {
+		t.Fatalf("%s declares version %q, want %q.\nIf this repo's spec was deliberately migrated to a new major, update this test AND the prose that names the declared major:\n"+
+			"  - backend/internal/spec/spec_test.go (shippedBudgetDocs and TestParseBytes_ShippedSpecsAndPresetsStillParse doc comments)\n"+
+			"  - backend/internal/spec/README.md (the reuse \"Version gate\" bullet)\n"+
+			"  - backend/internal/spec/v2reuse_test.go (TestParseV2_VersionGate_ReuseKeysRejectedBelowMajor2 doc comment)\n"+
+			"  - cli/internal/spec/v2reuse_test.go (TestValidateV2_VersionGate_ReuseKeysRejectedBelowMajor2 doc comment)\n"+
+			"  - docs/spec/README.md (the \"Validating locally\" check-jsonschema block — the spec must be listed under the command for the major it declares)\n"+
+			"  - docs/spec/workflow-migration.md (the operator-walk record)",
+			shippedSpecRelPath, s.Version, want)
 	}
 }
 
