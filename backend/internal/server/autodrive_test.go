@@ -2241,39 +2241,86 @@ func TestAutoDrive_ReportMode_RetrySiblingStageDoesNotAdvanceKey(t *testing.T) {
 	}
 }
 
-// TestAutoDrive_ReportMode_RetriedWhileFailedDoesNotDoubleEmit is the
-// ordering-regression guard (binding condition 1). In reality a stage_retried
-// row is written only AFTER run.RetryStage flips the stage out of `failed`
-// (retry.go:492), so a poll that reads count=1 also sees a stage that has left
-// `failed` and there is no retry gate to report — the count and the failed
-// state are coupled by that ordering. This test constructs the ordering-
-// IMPOSSIBLE state (a stage_retried row present WHILE the stage is still
-// failed) and asserts the flooding guard still holds: three polls of that
-// fixed (count, failed) occurrence emit EXACTLY ONE row, never a second. It
-// guards a future reordering (audit-before-state-flip) that would otherwise
-// silently reintroduce the flood.
-func TestAutoDrive_ReportMode_RetriedWhileFailedDoesNotDoubleEmit(t *testing.T) {
+// TestAutoDrive_ReportMode_RetryCountAdvancesOnlyAfterStageLeavesFailed is the
+// ordering-coupling guard (binding condition 1, as corrected by the routed
+// reason). It supersedes the earlier RetriedWhileFailedDoesNotDoubleEmit, whose
+// premise was wrong: that test seeded the retry receipt (count=1) BEFORE the
+// first poll, so every poll keyed on :retry:1 and it only re-tested ordinary
+// same-key dedup — it never drove the base -> :retry:1 transition. And the
+// "a stage_retried row present WHILE the stage is failed must not double-emit"
+// property it claimed is not true of the report code and must not be made true:
+// a genuine count advance is exactly what re-surfaces a distinct occurrence
+// (TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure).
+//
+// What IS true, and is what this pins, is the ORDERING that makes the count
+// advance safe. retryStageAs calls run.RetryStage FIRST (retry.go:491-492),
+// which flips the stage OUT of `failed`, and only THEN writes the stage_retried
+// receipt (retry.go:509-518 — "Audit first" is about ordering relative to the
+// orchestrator handoff, not the state flip). So the (failed, count>=1) state is
+// unreachable: any poll that reads count=1 also sees a stage that has left
+// `failed`, retryableFailedStage returns nil, and the retry gate is CLOSED. The
+// count reaching 1 is therefore never a within-occurrence event — it is the
+// signature of a SECOND failure (the stage came back to `failed`), which
+// re-surfaces correctly and is covered separately.
+//
+// This test drives that real ordering: the base-key row is emitted while the
+// stage is failed (count=0), a re-poll of that same occurrence adds nothing,
+// then the retry is applied in retry.go's ORDER — the stage leaves `failed`
+// FIRST, then the count-1 receipt lands — and the poll at that instant emits NO
+// second row because the gate is closed. It is load-bearing: were the report
+// path to surface a retry proposal without the liveness gate (or were retry.go
+// reordered to write the receipt before the state flip), the count=1 poll would
+// key on :retry:1 while the base occurrence is still open and emit a
+// within-occurrence second row — the flood this issue closes.
+func TestAutoDrive_ReportMode_RetryCountAdvancesOnlyAfterStageLeavesFailed(t *testing.T) {
 	s, repo, au, _ := newAutoDriveServer(t)
 	runID, impl := startRetryReportRun(t, s, repo)
-	// The ordering-impossible state: a retry receipt present while the stage is
-	// still failed (count=1, state=failed).
-	seedStageRetry(t, au, runID, impl.ID, CategoryStageRetried, 1)
 
-	reported := 0
-	for i := 0; i < 3; i++ {
-		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
-		if err != nil {
-			t.Fatalf("AutoDriveRunGate pass %d: %v", i+1, err)
-		}
-		if out.Reported {
-			reported++
-		}
+	// First failure occurrence, retry count 0 -> base key.
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
 	}
-	if reported != 1 {
-		t.Errorf("reported outcomes = %d over 3 polls of one occurrence, want 1", reported)
+	if !out.Reported || out.Action != delegation.ActionRetry {
+		t.Fatalf("pass 1 outcome = %+v, want reported retry at the base key", out)
 	}
 	if n := countReportRows(t, au); n != 1 {
-		t.Errorf("act:report rows = %d over 3 polls of the :retry:1 occurrence, want exactly 1 (acts = %v)", n, autoDrivenActs(t, au))
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// Re-poll the SAME failed occurrence (count still 0): the within-occurrence
+	// flooding guard holds.
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second row on the same occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// Apply the retry the way retry.go does: run.RetryStage flips the stage out
+	// of `failed` (to pending, retry.go:274) FIRST, and only THEN is the
+	// stage_retried receipt written. Reproduce exactly that order — the stage
+	// leaves `failed`, then the count-1 receipt lands.
+	impl.State = run.StageStatePending
+	seedStageRetry(t, au, runID, impl.ID, CategoryStageRetried, 1)
+
+	// At the instant count=1 exists, the stage is no longer `failed`: the retry
+	// gate is closed, so the advancing count produces NO within-occurrence
+	// second row. (A genuine SECOND failure — the stage returning to `failed`
+	// with count=1 — is a distinct occurrence and re-surfaces; see
+	// TestAutoDrive_ReportMode_RetryResurfacesOnSecondFailure.)
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate post-retry: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("post-retry outcome = %+v, want no report: the count advanced only after the stage left `failed`, closing the gate", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows after the retry transition = %d, want exactly 1 — the retry count advanced only after the gate closed (acts = %v)", n, autoDrivenActs(t, au))
 	}
 }
 
