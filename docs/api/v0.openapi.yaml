@@ -7555,7 +7555,16 @@ paths:
 
         **Batch-atomic.** The WHOLE batch is validated before ANY row is
         appended: a request naming one unknown `entry_id` records NOTHING, so a
-        partially-recorded capture is unreachable.
+        partially-recorded capture is unreachable. The one exception is an audit
+        append that fails PART WAY through a batch: the rows already appended are
+        durable, so the `500` reports `details.recorded` / `details.requested`
+        and a repeat POST is safe (capture is last-wins).
+
+        **One JSON document per request.** Trailing content after the
+        dispositions object — a second batch, or garbage — is
+        `400 validation_failed`. A decoder that stopped at the first value would
+        discard the rest and report success, which would silently record half of
+        what the caller sent. Trailing whitespace is accepted.
 
         **Supersession.** An `entry_id` may not repeat WITHIN one request
         (ambiguous intent, `400 validation_failed`), but a LATER request on the

@@ -237,8 +237,10 @@ func newerGroomingArtifact(candidate, incumbent *artifact.Artifact) bool {
 //	G4 403 insufficient_scope                — missing write:approvals, enforced
 //	                                           UNCONDITIONALLY (no cookie-session
 //	                                           bypass), the merge_run.go posture.
-//	G5 400 validation_failed                 — unparseable body, empty batch,
-//	                                           empty entry_id, intra-batch dup.
+//	G5 400 validation_failed                 — unparseable body, trailing
+//	                                           content after the object, empty
+//	                                           batch, empty entry_id,
+//	                                           intra-batch dup.
 //	G6 400 grooming_verdict_invalid          — verdict outside the closed set.
 //	G7 409 grooming_report_absent / 500      — no report vs unreadable report.
 //	G8 422 grooming_entry_unknown            — an id the report does not declare.
@@ -300,11 +302,37 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 	// G5: body shape.
 	var reqBody groomingDispositionRequest
 	if r.Body != nil {
-		if decErr := json.NewDecoder(r.Body).Decode(&reqBody); decErr != nil && !errors.Is(decErr, io.EOF) {
+		dec := json.NewDecoder(r.Body)
+		decErr := dec.Decode(&reqBody)
+		switch {
+		case decErr != nil && !errors.Is(decErr, io.EOF):
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				"request body must be valid JSON {dispositions:[{entry_id, verdict, close_target}]}",
 				map[string]any{"error": decErr.Error()})
 			return
+		case decErr == nil:
+			// G5': the body must be ONE JSON document and nothing else.
+			//
+			// json.Decoder stops after the first value, so without this a body
+			// of two concatenated batches decodes the first, DISCARDS the
+			// second, and returns 200 — a success response for a capture that
+			// recorded half of what the operator sent, which is precisely the
+			// silent-partial-capture failure this endpoint exists to prevent.
+			// The refusal sits inside G5, ahead of every write, so a rejected
+			// body still records nothing.
+			//
+			// Trailing WHITESPACE is accepted: a trailing newline is what every
+			// curl heredoc and most HTTP clients send. A second Decode returns
+			// io.EOF for whitespace-only remainder, a nil error for a second
+			// value, and a syntax error for garbage — so io.EOF is exactly the
+			// accept condition.
+			var trailing json.RawMessage
+			if tErr := dec.Decode(&trailing); !errors.Is(tErr, io.EOF) {
+				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+					"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success",
+					map[string]any{"field": "body"})
+				return
+			}
 		}
 	}
 	if len(reqBody.Dispositions) == 0 {
@@ -422,6 +450,15 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 			// The rows that DID land are durable, and a repeat POST is safe
 			// because capture is last-wins rather than additive-conflicting —
 			// so the count is reported rather than hidden.
+			//
+			// `recorded` / `requested` REACH THE CALLER only because both keys
+			// are members of errors.go's default-deny 5xx allow-list
+			// (redactableDetailKeys). They were not, and this comment claimed a
+			// count the shipped body never carried; the counts are the
+			// operator's only evidence of what survived, so
+			// TestGroomingDispositionsMidBatchAppendFailure asserts them off
+			// the RESPONSE BYTES — not off the map handed to writeError, which
+			// is the assertion that would keep a redacted count looking pinned.
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"recording the disposition batch failed part-way; the rows already appended are durable and a repeat POST is safe (capture is last-wins)",
 				map[string]any{"recorded": n, "requested": len(reqBody.Dispositions), "error": aerr.Error()})

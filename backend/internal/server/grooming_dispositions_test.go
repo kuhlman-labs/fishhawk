@@ -332,6 +332,63 @@ func TestGroomingDispositionsMalformedBodyRejected(t *testing.T) {
 	requireGDError(t, w, http.StatusBadRequest, "validation_failed")
 }
 
+// G5e. TestGroomingDispositionsTrailingContentRejected pins the
+// single-JSON-document rule.
+//
+// The case that matters is TWO CONCATENATED BATCHES: json.Decoder stops after
+// the first value, so before the G5' check that body decoded the first batch,
+// silently discarded the second, and returned 200 — a success response for a
+// capture that recorded half of what the operator sent.
+//
+// The assertion is on COMMITTED STATE as well as identity: each refusal is
+// followed by a read of the appended rows asserting ZERO, which is what proves
+// the refusal precedes the write rather than merely renaming the response.
+//
+// TRAILING WHITESPACE MUST STILL BE ACCEPTED — a trailing newline is what every
+// curl heredoc sends, and rejecting it would break every real caller to fix a
+// synthetic one. That row is the regression this table most needs.
+func TestGroomingDispositionsTrailingContentRejected(t *testing.T) {
+	f := newGDFixture(t, nil)
+	one := gdBatch(f.ids.ordering, "approved")
+	two := gdBatch(f.ids.hygiene, "rejected")
+
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantCode int
+	}{
+		// The silent-drop case: two valid batches, the second discarded.
+		{"second valid object", one + two, http.StatusBadRequest},
+		{"trailing garbage", one + " garbage-not-json", http.StatusBadRequest},
+		{"trailing array", one + `[1,2,3]`, http.StatusBadRequest},
+		// Accepted: whitespace only.
+		{"trailing newline", one + "\n", http.StatusOK},
+		{"trailing whitespace", one + " \t\r\n ", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(gdRows(f.au))
+			w := postGD(t, f.s, f.runID, tc.body, gdOperator)
+			if tc.wantCode != http.StatusOK {
+				requireGDError(t, w, tc.wantCode, "validation_failed")
+				// COMMITTED STATE: a refused body records nothing. The 400
+				// bytes alone would not distinguish "refused before the write"
+				// from "refused after one row leaked".
+				if n := len(gdRows(f.au)) - before; n != 0 {
+					t.Errorf("a refused body appended %d rows, want 0 — the refusal must precede the write", n)
+				}
+				return
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (trailing whitespace must be ACCEPTED); body: %s",
+					w.Code, w.Body.String())
+			}
+			if n := len(gdRows(f.au)) - before; n != 1 {
+				t.Errorf("an accepted body appended %d rows, want 1", n)
+			}
+		})
+	}
+}
+
 // G6. TestGroomingDispositionsInvalidVerdictRejected.
 func TestGroomingDispositionsInvalidVerdictRejected(t *testing.T) {
 	f := newGDFixture(t, nil)
@@ -612,6 +669,11 @@ type gdPGFixture struct {
 	artID     uuid.UUID
 	ids       groomingApplyEntryIDs
 	auditRepo audit.Repository
+	// runRepo / artRepo are exposed so a test can re-wire a SECOND server over
+	// the same Postgres state with a decorated audit repository (the mid-batch
+	// append-failure injection below).
+	runRepo run.Repository
+	artRepo artifact.Repository
 }
 
 // newGDPGFixture wires real repositories against a shared testcontainers
@@ -651,7 +713,10 @@ func newGDPGFixture(t *testing.T) *gdPGFixture {
 		t.Fatalf("create grooming_report artifact: %v", err)
 	}
 	s := New(Config{RunRepo: runRepo, ArtifactRepo: artRepo, AuditRepo: auditRepo})
-	return &gdPGFixture{s: s, runID: rn.ID, stageID: stage.ID, artID: art.ID, ids: ids, auditRepo: auditRepo}
+	return &gdPGFixture{
+		s: s, runID: rn.ID, stageID: stage.ID, artID: art.ID, ids: ids,
+		auditRepo: auditRepo, runRepo: runRepo, artRepo: artRepo,
+	}
 }
 
 // pgDispositionRows reads the persisted grooming_disposition_recorded rows.
@@ -788,6 +853,164 @@ func TestGroomingDispositionsUnknownEntryLeavesNoRows(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatalf("a refused batch left %d rows in the chain, want 0 — validation must complete for the WHOLE batch before ANY append", len(rows))
 	}
+}
+
+// gdFailingAudit fails the k-th grooming_disposition_recorded AppendChained and
+// PASSES EVERY OTHER CALL THROUGH to the real repository, so the rows before
+// the failure genuinely land in Postgres. That pass-through is the point: the
+// branch under test is the one place the change knowingly weakens its own
+// "a partially-recorded capture is unreachable" claim, and only durable rows
+// can prove the reported count against what actually persisted.
+type gdFailingAudit struct {
+	audit.Repository
+	failAt int // 1-based index among disposition appends; 0 never fails
+	calls  int
+}
+
+func (f *gdFailingAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryGroomingDispositionRecorded {
+		f.calls++
+		if f.calls == f.failAt {
+			return nil, fmt.Errorf("gdFailingAudit: injected append failure on disposition %d", f.calls)
+		}
+	}
+	return f.Repository.AppendChained(ctx, p)
+}
+
+// gdErrorDetails decodes the error envelope's details map.
+func gdErrorDetails(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body %s)", err, w.Body.String())
+	}
+	return env.Error.Details
+}
+
+// TestGroomingDispositionsMidBatchAppendFailure pins the ONE branch where the
+// batch-atomic guarantee is knowingly weakened: an AppendChained failure PART
+// WAY through the batch, after earlier rows have durably landed.
+//
+// Three things are asserted, and the third is the one that matters:
+//
+//  1. the response is 500 internal_error;
+//  2. details.recorded / details.requested carry the counts;
+//  3. details.recorded EQUALS the number of rows that actually persisted —
+//     a body claiming 2 while 3 landed is worse than the failure itself, and
+//     that count is the operator's only evidence of what survived.
+//
+// Then the DOCUMENTED RECOVERY is exercised: the same batch is re-POSTed
+// against a healthy server and the read-back resolves last-wins to the retried
+// verdicts, which is what makes the error message's "a repeat POST is safe"
+// claim true rather than aspirational.
+func TestGroomingDispositionsMidBatchAppendFailure(t *testing.T) {
+	f := newGDPGFixture(t)
+	// Fail the THIRD disposition: two rows land, one does not.
+	failing := &gdFailingAudit{Repository: f.auditRepo, failAt: 3}
+	sick := New(Config{RunRepo: f.runRepo, ArtifactRepo: f.artRepo, AuditRepo: failing})
+
+	body := fmt.Sprintf(`{"dispositions":[
+	  {"entry_id":%q,"verdict":"approved"},
+	  {"entry_id":%q,"verdict":"approved"},
+	  {"entry_id":%q,"verdict":"approved"}
+	]}`, f.ids.hygiene, f.ids.duplicate, f.ids.ordering)
+
+	w := postGD(t, sick, f.runID, body, gdOperator)
+	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
+
+	details := gdErrorDetails(t, w)
+	recorded, okR := details["recorded"].(float64)
+	requested, okQ := details["requested"].(float64)
+	if !okR || !okQ {
+		t.Fatalf("details missing recorded/requested counts: %v", details)
+	}
+	if int(requested) != 3 {
+		t.Errorf("details.requested = %v, want 3", requested)
+	}
+	if int(recorded) != 2 {
+		t.Errorf("details.recorded = %v, want 2 (the two appends that preceded the injected failure)", recorded)
+	}
+
+	// (3) The reported count must match DURABLE STATE, not the loop counter's
+	// intent. Read the rows back from Postgres.
+	rows := f.pgDispositionRows(t)
+	if len(rows) != int(recorded) {
+		t.Fatalf("details.recorded = %d but %d rows actually persisted; the reported count is the operator's only evidence of what survived",
+			int(recorded), len(rows))
+	}
+	landed := map[string]string{}
+	for _, row := range rows {
+		var got groomingDispositionPayload
+		if err := json.Unmarshal(row.Payload, &got); err != nil {
+			t.Fatalf("decode persisted payload: %v", err)
+		}
+		landed[got.EntryID] = got.Verdict
+	}
+	if _, ok := landed[f.ids.ordering]; ok {
+		t.Error("the disposition whose append FAILED persisted anyway")
+	}
+	for _, id := range []string{f.ids.hygiene, f.ids.duplicate} {
+		if landed[id] != "approved" {
+			t.Errorf("entry %q did not durably land before the failure (got %q)", id, landed[id])
+		}
+	}
+
+	// RECOVERY: re-POST the whole batch with CORRECTING verdicts against a
+	// healthy server. Capture is last-wins, so the retry resolves cleanly and
+	// the partial capture leaves no stuck state.
+	retry := fmt.Sprintf(`{"dispositions":[
+	  {"entry_id":%q,"verdict":"rejected"},
+	  {"entry_id":%q,"verdict":"rejected"},
+	  {"entry_id":%q,"verdict":"rejected"}
+	]}`, f.ids.hygiene, f.ids.duplicate, f.ids.ordering)
+	if w := postGD(t, f.s, f.runID, retry, gdOperator); w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if n := len(f.pgDispositionRows(t)); n != 5 {
+		t.Errorf("chain holds %d rows, want 5 (2 partial + 3 retried) — every capture stays auditable", n)
+	}
+	got := decodeGDResponse(t, getGD(t, f.s, f.runID))
+	if len(got.Dispositions) != 3 {
+		t.Fatalf("read-back returned %d dispositions, want 3: %+v", len(got.Dispositions), got.Dispositions)
+	}
+	for _, d := range got.Dispositions {
+		if d.Verdict != "rejected" {
+			t.Errorf("entry %q reads back as %q, want the RETRIED %q", d.EntryID, d.Verdict, "rejected")
+		}
+	}
+}
+
+// TestGroomingDispositionsReadBackListErrorIs500 pins the
+// ListForRunByCategory failure branch in respondGroomingDispositions — the
+// read that BOTH verbs share. The append succeeds; only the projection read
+// fails.
+func TestGroomingDispositionsReadBackListErrorIs500(t *testing.T) {
+	f := newGDFixture(t, nil)
+	f.au.listByCategoryErr = errors.New("chain read boom")
+	w := postGD(t, f.s, f.runID, gdBatch(f.ids.ordering, "approved"), gdOperator)
+	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
+	// The capture itself LANDED — the failure is on the read-back, and the
+	// distinction matters to an operator deciding whether to retry.
+	if n := len(gdRows(f.au)); n != 1 {
+		t.Errorf("appended %d rows, want 1 — the append precedes the failing read-back", n)
+	}
+	requireGDError(t, getGD(t, f.s, f.runID), http.StatusInternalServerError, "internal_error")
+}
+
+// TestGroomingDispositionsGetInvalidRunIDRejected pins the GET handler's
+// run_id parse. The POST's parse is covered by the ladder; this one had no
+// case at all.
+func TestGroomingDispositionsGetInvalidRunIDRejected(t *testing.T) {
+	f := newGDFixture(t, nil)
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/not-a-uuid/grooming-dispositions", nil)
+	req.SetPathValue("run_id", "not-a-uuid")
+	w := httptest.NewRecorder()
+	f.s.handleListGroomingDispositions(w, gdOperator(req))
+	requireGDError(t, w, http.StatusBadRequest, "validation_failed")
 }
 
 // --- route registration -----------------------------------------------------

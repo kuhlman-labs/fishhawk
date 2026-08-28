@@ -105,6 +105,16 @@ var redactableDetailKeys = map[string]struct{}{
 	"failed_ordinal":   {},
 	"filed":            {},
 	"stage":            {},
+	// recorded / requested: the durable-row count and batch size a partially
+	// applied batch reports (grooming_dispositions.go's mid-batch
+	// AppendChained failure, #2843). Product-owned integers the handler
+	// computes from the caller's OWN submitted batch — never derived from an
+	// error, a subprocess or a third-party response — so they satisfy the
+	// membership rule above, on the `failed_ordinal` precedent. Without them
+	// the 5xx body carries no count at all and the caller cannot tell how many
+	// of its rows survived.
+	"recorded":  {},
+	"requested": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of
