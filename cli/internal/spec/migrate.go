@@ -701,9 +701,11 @@ func readApprovals(node *yaml.Node) approvalPredicate {
 // tier match (Tier non-empty) or the explicit action matrix.
 type delegationBlock struct {
 	// Tier is non-empty ONLY on an exact match against a tier's full
-	// expansion — all five classes AND the page list. Any partial match
-	// emits the explicit matrix instead, because rounding to a tier would
-	// widen or narrow agent authority without the operator noticing.
+	// expansion — all five classes AND the page list — AND only when the
+	// block carries no knob-key or page-key rationale comment (see
+	// carriesRationaleComments). Any partial match emits the explicit
+	// matrix instead, because rounding to a tier would widen or narrow
+	// agent authority without the operator noticing.
 	Tier string
 	// Entries are the classes the source actually declared, in canonical
 	// order. An ABSENT knob is omitted entirely: absence already resolves
@@ -713,7 +715,11 @@ type delegationBlock struct {
 	// source declared none).
 	PageEvents []string
 	// PageKey{Head,Line,Foot} carry the comments on the source
-	// `must_page_human` KEY onto the emitted `page_human_on` key.
+	// `must_page_human` KEY onto the emitted `page_human_on` key. A block
+	// carrying any of them does NOT collapse to a tier shorthand — the
+	// shorthand has no `page_human_on` key to carry them onto, so the
+	// collapse would erase the operator's written rationale. See
+	// carriesRationaleComments.
 	PageKeyHead, PageKeyLine, PageKeyFoot string
 	// ModelPolicy is the source's model_policy node, carried verbatim.
 	ModelPolicy *yaml.Node
@@ -728,10 +734,18 @@ type actionEntry struct {
 	// Key{Head,Line,Foot} carry the comments on the source may_* KNOB key
 	// onto the emitted action-class key, so a rationale comment written on
 	// e.g. `may_approve:` survives the reconstruction into the actions
-	// matrix. (An operator_agent block that collapses to a tier shorthand
-	// has no per-class key to carry them onto — that loss is inherent to
-	// the collapse, not a bug this preserves against.)
+	// matrix. A block carrying any of them does NOT collapse to a tier
+	// shorthand: the shorthand has no per-class key to carry them onto, so
+	// collapsing would destroy the operator's written rationale for a
+	// delegation choice. See carriesRationaleComments.
 	KeyHead, KeyLine, KeyFoot string
+}
+
+// semantic returns the entry with its comment fields zeroed, so two
+// entries can be compared on delegation semantics alone. See sameMatrix.
+func (e actionEntry) semantic() actionEntry {
+	e.KeyHead, e.KeyLine, e.KeyFoot = "", "", ""
+	return e
 }
 
 // analyzeDelegation translates a level's operator_agent block, recording
@@ -798,6 +812,16 @@ func translateOperatorAgent(oa *yaml.Node, path string) (*delegationBlock, []Ref
 		if kn := mapKeyNode(oa, kc.Knob); kn != nil {
 			entry.KeyHead, entry.KeyLine, entry.KeyFoot = kn.HeadComment, kn.LineComment, kn.FootComment
 		}
+		if entry.KeyLine == "" {
+			// yaml.v3 attaches a TRAILING comment on a SCALAR-valued key
+			// (`may_approve: clean_dual_approval  # why`) to the VALUE
+			// node, not the key node — unlike `must_page_human:  # why`,
+			// whose block-sequence value starts on the next line, so the
+			// comment lands on the key. Reading only the key node would
+			// drop that rationale AND let the block collapse to a tier
+			// with it, which is the loss this whole gate exists to stop.
+			entry.KeyLine = knob.LineComment
+		}
 		block.Entries = append(block.Entries, entry)
 	}
 
@@ -859,9 +883,15 @@ func translatePageEvent(token string) (string, bool) {
 // so the explicit matrix is emitted instead: rounding a
 // may_approve-ONLY block up to `autonomy: medium` would silently hand the
 // operator agent fixup and retry authority the source never granted.
+//
+// The comment gate (carriesRationaleComments) is evaluated BEFORE that
+// class/page-list comparison, so a comment-bearing block never reaches it.
 func matchTier(block *delegationBlock) string {
 	if block.ModelPolicy != nil {
 		return "" // no tier expands to a model_policy
+	}
+	if carriesRationaleComments(block) {
+		return ""
 	}
 	resolved := map[string]actionEntry{}
 	for _, kc := range knobClasses {
@@ -881,6 +911,35 @@ func matchTier(block *delegationBlock) string {
 		return tier
 	}
 	return ""
+}
+
+// carriesRationaleComments reports whether the block carries an operator
+// rationale comment on a source `may_*` KNOB key or on the
+// `must_page_human` key. Such a block is deliberately KEPT in explicit
+// `actions` matrix form: only the matrix has a per-class key and a
+// `page_human_on` key to carry those comments onto, so collapsing to a
+// tier shorthand would destroy the operator's written rationale for a
+// delegation choice. The emitted matrix is semantically IDENTICAL
+// delegation — the tier shorthand and the matrix expand to the same
+// matrix — so nothing widens or narrows; only the output shape differs.
+//
+// A comment on the `operator_agent:` KEY itself does NOT reach this gate
+// and does NOT block the collapse: applyDelegation renames that key in
+// place, so renameKey carries the comment onto the emitted `autonomy` key
+// intact and nothing is lost.
+//
+// Presence is the whole test. A stray `#` line blocks the collapse
+// exactly as a paragraph of rationale does: a heuristic about which
+// comments are "substantive" would be the kind of guess the codemod's
+// refusal taxonomy exists to avoid, and the fail-safe direction is
+// preserving text rather than dropping it.
+func carriesRationaleComments(block *delegationBlock) bool {
+	for _, e := range block.Entries {
+		if e.KeyHead != "" || e.KeyLine != "" || e.KeyFoot != "" {
+			return true
+		}
+	}
+	return block.PageKeyHead != "" || block.PageKeyLine != "" || block.PageKeyFoot != ""
 }
 
 // tierExpansion is the CLI-side copy of workflow-v2 $defs/autonomy_tier's
@@ -917,12 +976,19 @@ func tierExpansion(tier string) (map[string]actionEntry, []string) {
 	return nil, nil
 }
 
+// sameMatrix compares two resolved matrices on their DELEGATION
+// SEMANTICS ONLY — Class, Mode, When and MinSeverity. The comment fields
+// are deliberately excluded: tierExpansion's entries never carry comments,
+// so including them would make the comparison decide the comment question
+// as a side effect of a struct equality. That decision belongs to
+// carriesRationaleComments, which matchTier evaluates before ever calling
+// this.
 func sameMatrix(a, b map[string]actionEntry) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for k, av := range a {
-		if bv, ok := b[k]; !ok || av != bv {
+		if bv, ok := b[k]; !ok || av.semantic() != bv.semantic() {
 			return false
 		}
 	}

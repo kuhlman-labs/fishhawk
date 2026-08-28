@@ -383,8 +383,11 @@ func TestMigrateBytes_AlreadyV2ValidatesBeforeNoOp(t *testing.T) {
 // TestMigrateBytes_ActionsMatrixPreservesKnobComments: a comment on a may_*
 // knob key (and on must_page_human) survives the reconstruction into the
 // explicit actions matrix. Comment preservation is a blocking codemod
-// behavior; a tier collapse has no per-class key to carry these onto, so
-// this exercises the may_approve-only block that does NOT collapse.
+// behavior; a tier collapse has no per-class key to carry these onto,
+// which is why such a comment BLOCKS the collapse
+// (TestMigrateBytes_CommentBearingBlockKeepsMatrix). This case reaches
+// the matrix by a second route as well — a may_approve-only block is not
+// tier-exact to begin with.
 func TestMigrateBytes_ActionsMatrixPreservesKnobComments(t *testing.T) {
 	block := "    operator_agent:\n" +
 		"      # approve only on a clean dual approval\n" +
@@ -725,5 +728,178 @@ func TestMigrate_GoldenFixturePathsExist(t *testing.T) {
 		if _, err := os.Stat(filepath.Clean(p)); err != nil {
 			t.Errorf("fixture %s is missing: %v", p, err)
 		}
+	}
+}
+
+// mediumPageItems is the seven-event must_page_human list the medium tier
+// expands to, spelled in the legacy vocabulary the source uses.
+const mediumPageItems = "        - reviewer_reject\n        - plan_rejection\n        - scope_amendment\n" +
+	"        - budget_override\n        - policy_override\n        - exception_request\n" +
+	"        - requirement_arbitration\n"
+
+// mediumOperatorAgent renders an operator_agent block that matches the
+// medium tier EXACTLY (approve/fixup/retry delegated, waive and merge
+// absent, the full seven-event page list, no route_fixup_min_severity and
+// no model_policy), optionally injecting one comment on `key` at `pos`
+// ("head", "line" or "foot"). An empty key injects nothing.
+func mediumOperatorAgent(t *testing.T, key, pos, text string) string {
+	t.Helper()
+	knobs := []struct{ name, seg string }{
+		{"may_approve", "      may_approve: clean_dual_approval\n"},
+		{"may_route_fixup", "      may_route_fixup: convergent_concerns\n"},
+		{"may_retry", "      may_retry: infra_flake\n"},
+		{"must_page_human", "      must_page_human:\n" + mediumPageItems},
+	}
+	out := "    operator_agent:\n"
+	for _, k := range knobs {
+		seg := k.seg
+		if k.name == key {
+			switch pos {
+			case "head":
+				seg = "      # " + text + "\n" + seg
+			case "line":
+				nl := strings.Index(seg, "\n")
+				seg = seg[:nl] + "  # " + text + seg[nl:]
+			case "foot":
+				seg += "      # " + text + "\n"
+			default:
+				t.Fatalf("unknown comment position %q", pos)
+			}
+		}
+		out += seg
+	}
+	return out
+}
+
+// migrateBlock splices an operator_agent block into minimalV1's
+// feature_change workflow and returns the migrated text.
+func migrateBlock(t *testing.T, block string) string {
+	t.Helper()
+	src := strings.Replace(minimalV1, "  feature_change:\n", "  feature_change:\n"+block, 1)
+	return string(migrateOK(t, src).Migrated)
+}
+
+// TestMigrateBytes_CommentBearingBlockKeepsMatrix pins the comment gate
+// (carriesRationaleComments): a tier-EXACT operator_agent block whose
+// author wrote a rationale comment on a may_* knob key or on
+// must_page_human is deliberately kept in explicit `actions` matrix form,
+// because only the matrix has a per-class key and a page_human_on key to
+// carry that comment onto. A comment on the `operator_agent:` KEY itself
+// does NOT block: the in-place rename carries it onto `autonomy`.
+//
+// Every comment cell asserts the comment TEXT survives, not merely the
+// branch shape — that is what turns a wrong assumption about which node
+// yaml.v3 attaches a comment to into a RED instead of a silently
+// wrong-branch pass.
+func TestMigrateBytes_CommentBearingBlockKeepsMatrix(t *testing.T) {
+	// (a) CONTROL: the same block with NO comment anywhere collapses. This
+	// proves the block is tier-exact by construction, so the non-collapse
+	// in (b) and (c) is attributable to the comment and nothing else.
+	t.Run("control/uncommented tier-exact block collapses", func(t *testing.T) {
+		got := migrateBlock(t, mediumOperatorAgent(t, "", "", ""))
+		if !strings.Contains(got, "autonomy: medium") {
+			t.Errorf("a tier-exact uncommented block must collapse to `autonomy: medium`:\n%s", got)
+		}
+		if strings.Contains(got, "actions:") {
+			t.Errorf("a tier-exact uncommented block must not emit the explicit matrix:\n%s", got)
+		}
+	})
+
+	// (b) and (c): every present knob key crossed with every comment
+	// position, plus the must_page_human key at the same three positions.
+	// The one cell that does NOT block is must_page_human/foot, and the
+	// reason is measured, not assumed — see the dedicated subtest below.
+	for _, key := range []string{"may_approve", "may_route_fixup", "may_retry", "must_page_human"} {
+		for _, pos := range []string{"head", "line", "foot"} {
+			if key == "must_page_human" && pos == "foot" {
+				continue
+			}
+			t.Run(key+"/"+pos+" comment keeps the matrix", func(t *testing.T) {
+				text := key + " " + pos + " rationale"
+				got := migrateBlock(t, mediumOperatorAgent(t, key, pos, text))
+				if !strings.Contains(got, "actions:") {
+					t.Errorf("a %s comment on %s must keep the explicit matrix:\n%s", pos, key, got)
+				}
+				if strings.Contains(got, "autonomy:") {
+					t.Errorf("a %s comment on %s must not collapse to a tier:\n%s", pos, key, got)
+				}
+				if !strings.Contains(got, "# "+text) {
+					t.Errorf("the %s comment on %s was discarded: missing %q\n%s", pos, key, "# "+text, got)
+				}
+			})
+		}
+	}
+
+	// (c') The measured exception. A comment written BELOW the last
+	// must_page_human list item is attached by yaml.v3 to that ITEM's
+	// FootComment — not to the `must_page_human` key and not to the
+	// sequence. It therefore does not reach the gate, and the block
+	// collapses. That is honest rather than a silent wrong branch: the
+	// matrix path rebuilds the page list as bare scalars, so an
+	// item-level comment is dropped in BOTH output shapes — blocking the
+	// collapse would preserve nothing. This subtest exists so the day
+	// item-level comments ARE carried, it goes red and the rule is
+	// revisited deliberately.
+	t.Run("must_page_human/foot comment lands on the last list ITEM and does not block", func(t *testing.T) {
+		const text = "must_page_human foot rationale"
+		got := migrateBlock(t, mediumOperatorAgent(t, "must_page_human", "foot", text))
+		if !strings.Contains(got, "autonomy: medium") {
+			t.Errorf("a comment attached to a page-list ITEM does not reach the gate, so the block must still collapse:\n%s", got)
+		}
+		if strings.Contains(got, "# "+text) {
+			t.Errorf("item-level page comments are not carried today; if this now survives, the gate must be extended to cover them:\n%s", got)
+		}
+	})
+
+	// (d) A comment on the `operator_agent:` KEY itself still collapses:
+	// renameKey carries it onto the emitted `autonomy` key intact.
+	t.Run("operator_agent key comment still collapses", func(t *testing.T) {
+		const text = "the medium autonomy preset per METHODOLOGY.md"
+		got := migrateBlock(t, "    # "+text+"\n"+mediumOperatorAgent(t, "", "", ""))
+		if !strings.Contains(got, "autonomy: medium") {
+			t.Errorf("a comment on the operator_agent key must not block the collapse:\n%s", got)
+		}
+		if strings.Contains(got, "actions:") {
+			t.Errorf("a comment on the operator_agent key must not force the matrix:\n%s", got)
+		}
+		if !strings.Contains(got, "# "+text) {
+			t.Errorf("the operator_agent key comment was discarded: missing %q\n%s", "# "+text, got)
+		}
+	})
+}
+
+// TestSameMatrixIgnoresComments pins the comment-blind half of the change
+// directly. With the explicit gate in place, reverting sameMatrix to plain
+// struct equality is invisible end to end, so this is the only test that
+// can observe it. The negative controls (Mode, MinSeverity) prove the
+// comment-stripping did not degenerate into comparing nothing.
+func TestSameMatrixIgnoresComments(t *testing.T) {
+	base := func() map[string]actionEntry {
+		return map[string]actionEntry{
+			"approve": {Class: "approve", Mode: "auto", When: "clean_dual_approval"},
+			"fixup":   {Class: "fixup", Mode: "auto", When: "convergent_concerns"},
+			"waive":   {Class: "waive", Mode: "gated"},
+		}
+	}
+
+	commented := base()
+	commented["approve"] = actionEntry{
+		Class: "approve", Mode: "auto", When: "clean_dual_approval",
+		KeyHead: "# head", KeyLine: "# line", KeyFoot: "# foot",
+	}
+	if !sameMatrix(base(), commented) {
+		t.Error("sameMatrix must compare delegation semantics only; comment fields made two identical matrices differ")
+	}
+
+	differentMode := base()
+	differentMode["approve"] = actionEntry{Class: "approve", Mode: "gated"}
+	if sameMatrix(base(), differentMode) {
+		t.Error("sameMatrix must report matrices differing in Mode as UNEQUAL")
+	}
+
+	differentSeverity := base()
+	differentSeverity["fixup"] = actionEntry{Class: "fixup", Mode: "auto", When: "convergent_concerns", MinSeverity: "low"}
+	if sameMatrix(base(), differentSeverity) {
+		t.Error("sameMatrix must report matrices differing in MinSeverity as UNEQUAL")
 	}
 }

@@ -144,6 +144,12 @@ Output matrix — stdout carries the report in every cell, never the migrated YA
 | `--in-place` | rewrite the source file |
 | `--out` with `--in-place`, or `--report-only` with either | usage error (exit 2) |
 
+A delegation block that would otherwise collapse to `autonomy: <tier>` is deliberately kept in
+explicit `actions` matrix form when it carries a rationale comment on a `may_*` knob key or on
+`must_page_human` — only the matrix has a key to carry that comment onto, and both forms expand to
+the same delegation, so nothing widens or narrows. A comment on the `operator_agent:` key itself
+does not block; it rides onto the emitted `autonomy` key.
+
 Exit codes: `0` migrated or already-v2 no-op, `1` refusal / output-validation failure / refused
 overwrite, `2` usage or I/O. Full contract, translation table and refusal taxonomy:
 `docs/spec/workflow-migration.md`.

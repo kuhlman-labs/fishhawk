@@ -52,11 +52,15 @@ Two singleton roles naming the same person are one human. Emitting `count: 2` ov
 
 ### Delegation: tier shorthand vs. explicit matrix
 
-The translated matrix is compared against the three `autonomy` tier expansions. `autonomy: <tier>` is emitted **only on an exact match** across all five action classes AND the page list (compared as a set). Any partial match emits the explicit `actions` matrix and no `autonomy` key: rounding a `may_approve`-only block up to `autonomy: medium` would hand the operator agent fixup and retry authority the source never granted.
+The translated matrix is compared against the three `autonomy` tier expansions. `autonomy: <tier>` is emitted **only on an exact match** across all five action classes AND the page list (compared as a set), and **only when the block carries no rationale comment on a `may_*` knob key or on `must_page_human`** — that comment gate is evaluated **before** the class/page-list comparison, so a comment-bearing block never reaches it. Any partial match emits the explicit `actions` matrix and no `autonomy` key: rounding a `may_approve`-only block up to `autonomy: medium` would hand the operator agent fixup and retry authority the source never granted.
 
 - An **absent knob** is omitted entirely — absence already resolves to the fail-closed `mode: gated`.
 - An **absent `operator_agent` block** emits **neither** key. It is deliberately not rounded to `autonomy: low`, which would additionally assert an empty `page_human_on` list the source never declared.
 - A `route_fixup_min_severity` or a `model_policy` blocks the tier collapse — no tier expands to either.
+- A **rationale comment on a `may_*` knob key or on `must_page_human`** blocks the tier collapse and deliberately KEEPS the block in explicit `actions` matrix form. Only the matrix has a per-class key and a `page_human_on` key to carry that comment onto; collapsing would silently erase the operator's written rationale for a delegation choice. The emitted matrix is the **same delegation** — the tier shorthand and the matrix expand to an identical matrix — so nothing widens or narrows, only the output shape differs. Presence is the whole test: a stray `#` line blocks the collapse exactly as a paragraph of rationale does, because a heuristic about which comments are "substantive" would be the kind of guess this refusal taxonomy exists to avoid.
+- A comment on the **`operator_agent:` key itself** does **not** block the collapse. The key is renamed in place, so the comment rides onto the emitted `autonomy` key with nothing lost.
+
+Two attachment details follow from yaml.v3 and are worth knowing when you read a migrated diff. A trailing comment on a scalar knob (`may_approve: clean_dual_approval  # why`) attaches to the *value* node, and the codemod reads it from there — unlike `must_page_human:  # why`, whose block-sequence value starts on the next line, so that comment lands on the key. But a comment written *below* the last `must_page_human` list item attaches to that **item**, reaching neither the key nor the gate: it does not block the collapse, and it is dropped in both output shapes, because the matrix path rebuilds the page list as bare scalars.
 
 ## What is never fabricated
 
