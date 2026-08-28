@@ -44,10 +44,15 @@ spec:
       protocol: TCP
   selector:
     {{- if eq .Values.deployment.mode "split" }}
-    # Split mode: route HTTP + webhook traffic only to the api pods (which dedup
-    # webhook deliveries via the Postgres store). The single -worker pod
-    # (component=worker) is deliberately excluded from the Service endpoints.
+    # Split mode: select ONLY the api pods (component=api), which dedup webhook
+    # deliveries via the Postgres store; the single -worker pod (component=worker)
+    # is deliberately excluded from the Service endpoints.
     {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 4 }}
     {{- else }}
-    {{- include "fishhawk.selectorLabels" . | nindent 4 }}
+    # allInOne mode: select ONLY the fishhawkd pod (component=server), deliberately
+    # excluding the postgres/minio/jaeger pods and both hook Jobs' pods, whose bare
+    # name+instance labels the bare selector would otherwise match (svc/fishhawk
+    # then routed to an arbitrary pod — the jaeger-logs symptom). Both arms select
+    # exactly one workload; the component discriminator is what makes that true.
+    {{- include "fishhawk.selectorLabels" (dict "root" . "role" "server") | nindent 4 }}
     {{- end }}

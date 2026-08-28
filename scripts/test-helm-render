@@ -141,6 +141,89 @@ envfrom_ref() {
   '
 }
 
+# identity_labels <block> — the app.kubernetes.io/{name,instance,component}
+# key:value pairs inside a labels / matchLabels / selector block, NORMALIZED
+# (single space after the colon), SORTED, and comma-joined. Every OTHER label is
+# dropped — helm.sh/chart, app.kubernetes.io/version, managed-by, and the API-
+# server-added pod-template-hash — because none of those may appear in a Service
+# selector and a sibling pod template carrying one (e.g. helm.sh/chart in its
+# metadata.labels) must not perturb the identity set (condition 5). The result is
+# the FULL identity set {name,instance,component}, so an equality check against it
+# pins all three, not just the component discriminator (condition 2).
+identity_labels() { identity_lines "$1" | paste -sd, -; }
+
+# identity_lines <block> — the same identity pairs, one per line, sorted. The
+# primitive identity_labels joins; kept separate so a selector's lines can be
+# checked for membership in a pod's set (the "pod satisfies selector" relation).
+identity_lines() {
+  printf '%s' "$1" | awk '
+    {
+      line = $0; sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^app\.kubernetes\.io\/(name|instance|component):[[:space:]]/) {
+        sub(/:[[:space:]]+/, ": ", line); gsub(/"/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        print line
+      }
+    }
+  ' | sort -u
+}
+
+# selector_matches <selector-id-csv> <pod-id-csv> — return 0 iff the pod satisfies
+# the selector: EVERY selector key:value is present in the pod's identity set. The
+# CSV elements carry spaces and slashes but never a comma, so splitting on comma
+# and substring-matching ",<line>," against the comma-fenced pod set is an exact
+# element test.
+selector_matches() {
+  local sel="$1" pod="$2" line
+  local IFS=,
+  for line in $sel; do
+    [ -n "$line" ] || continue
+    case ",$pod," in *",$line,"*) : ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# docs_of_kind <manifest> <kind> — each rendered document whose top-level `kind:`
+# equals <kind>, emitted NUL-separated so a caller can `while IFS= read -r -d ''`
+# over them and handle one workload at a time. Splitting the multi-document render
+# on a bare `---` line; the `# Source:` comment that follows each separator rides
+# along in the document harmlessly.
+docs_of_kind() {
+  printf '%s' "$1" | awk -v kind="$2" '
+    /^---[[:space:]]*$/ {
+      if (have && iskind) printf "%s%c", buf, 0
+      buf=""; have=0; iskind=0; next
+    }
+    {
+      buf = (buf=="" ? $0 : buf "\n" $0); have=1
+      if ($0 ~ "^kind:[[:space:]]*" kind "[[:space:]]*$") iskind=1
+    }
+    END { if (have && iskind) printf "%s%c", buf, 0 }
+  '
+}
+
+# doc_name <document> — the metadata.name value (indent-2 `name:` after the
+# top-level `metadata:` key), used to name which workload an assertion is about.
+doc_name() {
+  printf '%s' "$1" | awk '
+    /^metadata:/ { m=1; next }
+    m && match($0, /^  name:[[:space:]]*/) {
+      s=$0; sub(/^  name:[[:space:]]*/, "", s); gsub(/"/, "", s); print s; exit
+    }
+    m && /^[^[:space:]]/ { exit }
+  '
+}
+
+# pod_labels_block <workload-document> — the pod template's metadata.labels block
+# (spec.template.metadata.labels). yaml_block "template" scopes to everything
+# under `template:`, then the FIRST `labels:` inside it is the pod labels (the pod
+# spec has no other `labels:` key). Shared by Deployment and Job documents.
+pod_labels_block() {
+  local tmpl
+  tmpl=$(yaml_block "$1" "template")
+  yaml_block "$tmpl" "labels"
+}
+
 # r1–r14 are the render/lint suite. When re-invoked as the r15e degraded-network
 # SELF-TEST (FISHHAWK_HELM_RENDER_SELFTEST=1), skip them and re-enter only the r15
 # registry block below — the self-test exercises the r15b sentinel skip branch and
@@ -1468,6 +1551,156 @@ if grep -rqF "webhook dispatch and GitHub-side actions will be disabled" "$REPO_
 else
   fail "r16e App-absent warn text not found in backend/cmd/fishhawkd/"
 fi
+
+# ---------------------------------------------------------------------------
+# r17 — SELECTOR INTEGRITY (E69.5 / #2916). The allInOne fishhawkd Service +
+#       Deployment must select ONLY the fishhawkd pod, not the
+#       postgres/minio/jaeger pods or the migrate/minio-bucket hook Job pods whose
+#       bare name+instance labels a bare selector matched. Four named assertions,
+#       ALL run in BOTH allInOne and split renders, over a pod universe that
+#       includes the two Job pod templates (they are part of the shipped defect:
+#       today they satisfy the bare svc/fishhawk selector):
+#         r17a — every rendered Service selects EXACTLY ONE workload pod set.
+#         r17b — svc/fishhawk's selector is the FULL {name,instance,component} set
+#                (component=server allInOne, api split) — not just the component.
+#         r17c — for every Deployment, spec.selector.matchLabels' identity set
+#                EQUALS its pod-template identity set (equality, not subset: a
+#                subset check would pass a selector that DROPPED the component).
+#         r17d — no pod set satisfies two DISTINCT Deployment selectors.
+#       A Job's OWN selector is controller-generated from a controller-uid and is
+#       never rendered by the chart, so Jobs enter r17a/r17d as candidate PODS
+#       only, never as an overlapping selector.
+#
+#       THE COUNTERFACTUAL MATRIX (run as the mandated deletion walk during
+#       implementation; recorded in the PR body). Each mutation is applied to the
+#       chart, the harness re-run, verdicts observed, then restored. Every mutation
+#       names ONLY the assertions that can observe it; a GREEN is evidence about
+#       an assertion's scope, not a gap:
+#         M0 control (no mutation)                          a=G b=G c=G d=G
+#         M1 drop component from the Deployment SELECTOR    a=G b=G c=R d=R
+#         M2 drop component from the Deployment POD LABELS  a=R b=G c=R d=G
+#         M3 drop component from the SERVICE selector arm   a=R b=R c=G d=G (a: !=1,
+#                                                             observed count REPORTED)
+#         M4 role server->api in BOTH sel+pod, Service=server  a=R b=G c=G d=G
+#       Every assertion is reddened by at least one mutation (a:M2/M3/M4, b:M3,
+#       c:M1/M2, d:M1); a cell disagreeing with this is a finding, not a fixup.
+# ---------------------------------------------------------------------------
+r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <render-args...>
+  local mode="$1" primary_dep="$2" svc_comp="$3"; shift 3
+  render "$@"
+  assert_render_ok "r17 ($mode) chart renders for selector-integrity checks"
+  [ "$status" -eq 0 ] || return
+  local manifest="$out"
+  local expected_primary="app.kubernetes.io/component: $svc_comp,app.kubernetes.io/instance: fishhawk,app.kubernetes.io/name: fishhawk"
+
+  # Pod universe: every Deployment + Job pod template (name + identity set).
+  local pod_sets=() pod_names=() doc name block
+  while IFS= read -r -d '' doc; do
+    name=$(doc_name "$doc"); block=$(pod_labels_block "$doc")
+    pod_sets+=("$(identity_labels "$block")"); pod_names+=("$name")
+  done < <(docs_of_kind "$manifest" Deployment)
+  while IFS= read -r -d '' doc; do
+    name=$(doc_name "$doc"); block=$(pod_labels_block "$doc")
+    pod_sets+=("$(identity_labels "$block")"); pod_names+=("$name")
+  done < <(docs_of_kind "$manifest" Job)
+
+  # Anti-vacuity: the parse must yield a non-trivial universe INCLUDING the primary
+  # workload's expected pod set, or r17a/r17d could pass over an empty/truncated
+  # parse and prove nothing.
+  local usize=${#pod_sets[@]} i found_primary=0
+  if [ "$usize" -ge 4 ]; then
+    pass "r17 ($mode) pod universe has $usize labelled pods (parse non-vacuous)"
+  else
+    fail "r17 ($mode) pod universe has only $usize pods — parse likely truncated"
+  fi
+  for i in "${!pod_sets[@]}"; do
+    [ "${pod_sets[$i]}" = "$expected_primary" ] && found_primary=1
+  done
+  if [ "$found_primary" -eq 1 ]; then
+    pass "r17 ($mode) the primary workload pod carries the expected {name,instance,component=$svc_comp} set"
+  else
+    fail "r17 ($mode) no pod carries the expected primary set [$expected_primary]"
+  fi
+
+  # r17a — every Service selects exactly one workload pod; r17b captured here.
+  local svc_doc svc_name sel_set count matched fh_sel_set=""
+  while IFS= read -r -d '' svc_doc; do
+    svc_name=$(doc_name "$svc_doc")
+    sel_set=$(identity_labels "$(yaml_block "$svc_doc" "selector")")
+    [ "$svc_name" = "fishhawk" ] && fh_sel_set="$sel_set"
+    count=0; matched=""
+    for i in "${!pod_sets[@]}"; do
+      if selector_matches "$sel_set" "${pod_sets[$i]}"; then
+        count=$((count+1)); matched="$matched ${pod_names[$i]}"
+      fi
+    done
+    if [ "$count" -eq 1 ]; then
+      pass "r17a ($mode) Service $svc_name selects exactly one workload (${matched# })"
+    else
+      fail "r17a ($mode) Service $svc_name selects $count workloads (expected 1):${matched} [selector: $sel_set]"
+    fi
+  done < <(docs_of_kind "$manifest" Service)
+
+  # r17b — svc/fishhawk's selector is the FULL expected identity set (condition 2:
+  # a discriminator-only check proves the discriminator, not the selector).
+  assert_equals "r17b ($mode) svc/fishhawk selector is the full {name,instance,component=$svc_comp} set" \
+    "$fh_sel_set" "$expected_primary"
+
+  # r17c — each Deployment's selector identity set EQUALS its pod-template identity
+  # set; the primary Deployment additionally carries the full expected set.
+  while IFS= read -r -d '' doc; do
+    name=$(doc_name "$doc")
+    local dsel dpod
+    dsel=$(identity_labels "$(yaml_block "$doc" "matchLabels")")
+    dpod=$(identity_labels "$(pod_labels_block "$doc")")
+    assert_equals "r17c ($mode) Deployment $name selector identity set equals its pod-template set" "$dsel" "$dpod"
+    if [ "$name" = "$primary_dep" ]; then
+      assert_equals "r17c ($mode) Deployment $name carries the full expected {name,instance,component=$svc_comp} set" \
+        "$dsel" "$expected_primary"
+    fi
+  done < <(docs_of_kind "$manifest" Deployment)
+
+  # r17d — no pod set satisfies two DISTINCT Deployment selectors (condition 3:
+  # distinct pairs; self-pairs are excluded so M0 can pass).
+  local dep_sel=() dep_name=() j k overlap d17_ok=1
+  while IFS= read -r -d '' doc; do
+    dep_name+=("$(doc_name "$doc")")
+    dep_sel+=("$(identity_labels "$(yaml_block "$doc" "matchLabels")")")
+  done < <(docs_of_kind "$manifest" Deployment)
+  for i in "${!dep_sel[@]}"; do
+    for j in "${!dep_sel[@]}"; do
+      [ "$j" -gt "$i" ] || continue
+      overlap=""
+      for k in "${!pod_sets[@]}"; do
+        if selector_matches "${dep_sel[$i]}" "${pod_sets[$k]}" && selector_matches "${dep_sel[$j]}" "${pod_sets[$k]}"; then
+          overlap="$overlap ${pod_names[$k]}"
+        fi
+      done
+      if [ -n "$overlap" ]; then
+        fail "r17d ($mode) Deployment selectors ${dep_name[$i]} and ${dep_name[$j]} both match pod(s):${overlap}"
+        d17_ok=0
+      fi
+    done
+  done
+  if [ "$d17_ok" -eq 1 ]; then
+    pass "r17d ($mode) no pod set satisfies two distinct Deployment selectors"
+  fi
+
+  # Job pod components asserted BY RENDERED VALUE (plan step 7): neither equals
+  # server/api/worker, which is what makes r17a's "exactly one workload" a property
+  # over ALL shipped pods rather than Deployments only.
+  local comp
+  while IFS= read -r -d '' doc; do
+    name=$(doc_name "$doc")
+    comp=$(identity_lines "$(pod_labels_block "$doc")" | sed -n 's#^app.kubernetes.io/component: ##p')
+    case "$name" in
+      *-migrate)       assert_equals "r17 ($mode) migrate Job pod component is migrate" "$comp" "migrate" ;;
+      *-minio-bucket)  assert_equals "r17 ($mode) minio-bucket Job pod component is minio-bucket" "$comp" "minio-bucket" ;;
+    esac
+  done < <(docs_of_kind "$manifest" Job)
+}
+r17_assertions allInOne fishhawk server -f "$CHART/values-local.yaml"
+r17_assertions split fishhawk-api api -f "$CHART/values-local.yaml" --set deployment.mode=split
 
 fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)
 
