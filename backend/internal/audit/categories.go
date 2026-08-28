@@ -98,6 +98,14 @@ import "sort"
 // no_changes_proposed flag that IS #2240 AC1's visible "no changes proposed"
 // outcome — so an operator awaits this one category to learn what a grooming
 // run actually proposes, as distinct from what the agent emitted.
+// E54.30 / #2843 added grooming_disposition_recorded, written once per
+// DISPOSITION an operator records against an individual grooming-report entry
+// on POST /v0/runs/{run_id}/grooming-dispositions. It is a DIFFERENT FACT from
+// grooming_mutation_applied and the two must not be conflated: this row is what
+// the OPERATOR DECIDED (approved / rejected / amended, with an optional
+// close_target) about one entry id; a grooming_mutation_applied row is what was
+// APPLIED, and the second derives from the first. Capture is operator-only and,
+// as of #2843, is consumed by NOTHING — the apply half is #2991.
 // E54.6 / #2238 added campaign_grooming_source_resolved, written once per
 // campaign created from an approved grooming run's ratified order (the third
 // POST /v0/campaigns source): it carries the campaign id, the source
@@ -181,6 +189,7 @@ var KnownCategories = map[string]struct{}{
 	"fixup_pushed":                            {},
 	"grooming_apply_completed":                {},
 	"grooming_churn_filtered":                 {},
+	"grooming_disposition_recorded":           {},
 	"grooming_mutation_applied":               {},
 	"grooming_report_recorded":                {},
 	"implement_review_backstop_elapsed":       {},

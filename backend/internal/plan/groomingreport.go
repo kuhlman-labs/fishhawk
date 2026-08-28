@@ -593,3 +593,63 @@ func formatRanks(ordering []OrderingEntry) string {
 	}
 	return "[" + strings.Join(got, ", ") + "]"
 }
+
+// GroomingEntryIDs returns every entry id the report DECLARES, in report
+// order (ordering, duplicates, hygiene, dependency, vision drift,
+// decomposition, then the three milestone-scope classes).
+//
+// It is a thin export over collectGroomingEntries — the SAME collector
+// groomingSemanticCheck walks — so the id set a capture surface validates
+// against cannot drift from the set ValidateGroomingReport already proved the
+// report declares. Rule (c) of that check requires declaredID == derivedID, so
+// on a validated report the two are the same string; this returns the DERIVED
+// one, which is the contractual id.
+//
+// An entry whose derivation produced an EMPTY id is skipped. That is only
+// reachable for a malformed duplicate pair (a pair without exactly two
+// endpoints), which the schema and ParseGroomingReport already reject — so on
+// any report that reached this function the skip never fires, and if it ever
+// did, omitting the entry is the fail-safe direction: capture refuses an id it
+// cannot derive rather than accepting an ambiguous one.
+//
+// A nil report returns nil.
+func GroomingEntryIDs(gr *GroomingReport) []string {
+	if gr == nil {
+		return nil
+	}
+	entries := collectGroomingEntries(gr)
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.derivedID == "" {
+			continue
+		}
+		out = append(out, e.derivedID)
+	}
+	return out
+}
+
+// GroomingEntryClasses maps each declared entry id to its CLASS — the leading
+// segment of the derived id and the name of the typed array the entry appeared
+// in. Built from the same collector as GroomingEntryIDs, so the two agree by
+// construction.
+//
+// The class is what a disposition-capture surface records alongside the
+// verdict: an operator's decision on "duplicate:a+b" is a decision about a
+// close, and a reader of the audit row should not have to re-parse the id to
+// learn that.
+//
+// A nil report returns nil.
+func GroomingEntryClasses(gr *GroomingReport) map[string]string {
+	if gr == nil {
+		return nil
+	}
+	entries := collectGroomingEntries(gr)
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.derivedID == "" {
+			continue
+		}
+		out[e.derivedID] = e.class
+	}
+	return out
+}

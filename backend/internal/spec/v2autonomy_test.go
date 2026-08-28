@@ -1302,3 +1302,35 @@ func TestClampResolvedMatrix_LowCeilingClampsGroomingHygiene(t *testing.T) {
 		t.Error("scoping source = escalation, want it untouched by the clamp")
 	}
 }
+
+// TestGroomingRegistry_DispositionCaptureDoesNotWidenDelegation is the
+// DELEGATION-WIDENING PIN for E54.30 / #2843.
+//
+// #2843 ships a CAPTURE surface for per-entry grooming dispositions: an
+// operator records a verdict against an individual grooming-report entry and it
+// persists as an auditable fact. It edits no spec file and no autonomy-registry
+// file, and it must not — capture is not delegation. This assertion is what
+// makes that a machine-checked property rather than a claim in a PR body: the
+// three destructive classes stay non-delegable and still draw the exact
+// MsgNonDelegableGroomingClassAuto refusal at `mode: auto`.
+//
+// If a future change widens delegation to route a destructive class through the
+// disposition surface at `mode: auto`, this reddens on the shipped message.
+func TestGroomingRegistry_DispositionCaptureDoesNotWidenDelegation(t *testing.T) {
+	for _, class := range []string{ActionGroomOrdering, ActionGroomDedup, ActionGroomScoping} {
+		t.Run(class, func(t *testing.T) {
+			if _, nonDelegable := nonDelegableGroomingClasses[class]; !nonDelegable {
+				t.Fatalf("%q left nonDelegableGroomingClasses; #2843 captures an operator's verdict and must not widen what an agent may decide", class)
+			}
+			_, err := ParseBytes(groomingMatrixDoc(class,
+				"        mode: auto\n        when: objective_reversible\n"))
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError still refusing mode: auto on %q", err, class)
+			}
+			if want := MsgNonDelegableGroomingClassAuto(class); ve.Message != want {
+				t.Errorf("Message = %q,\nwant the unchanged non-delegable-class refusal %q", ve.Message, want)
+			}
+		})
+	}
+}

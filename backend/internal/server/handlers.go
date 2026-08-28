@@ -76,6 +76,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/vouch-commit", s.requireRunAccount(memberWrite, s.handleVouchCommit))
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", s.requireRunAccount(memberWrite, s.handleMergeRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
+	// Per-entry grooming disposition capture + read-back (E54.30 / #2843).
+	// CAPTURE is operator-only (the handler refuses a run-bound agent token AND
+	// a delegated operator-agent token); the READ-BACK needs read access only.
+	mux.HandleFunc("POST /v0/runs/{run_id}/grooming-dispositions", s.requireRunAccount(memberWrite, s.handleRecordGroomingDispositions))
+	mux.HandleFunc("GET /v0/runs/{run_id}/grooming-dispositions", s.requireRunAccount(readAccess, s.handleListGroomingDispositions))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
 	// On-demand orphaned-review recovery (#2712): the same per-run helper the

@@ -150,6 +150,7 @@ var exportBaseline = []string{
 	// #2712: the decoded /healthz slice the restart-strand probe reads
 	// (process_start + the sibling identity fields). Exported alongside the
 	// other apiClient result types.
+	"GroomingDispositionEntry",
 	"HealthInfo",
 	"HostDispatchResult",
 	"InitInput",
@@ -173,6 +174,7 @@ var exportBaseline = []string{
 	"LatencyGate",
 	"ListAuditInput",
 	"ListAuditOutput",
+	"ListGroomingDispositionsOutput",
 	"ListRunAuditFilter",
 	"ListRunsInput",
 	"ListRunsOutput",
@@ -224,6 +226,9 @@ var exportBaseline = []string{
 	"ReconciledReviewStage",
 	"RecordAutoDriveAct",
 	"RecordAutoDriveActResult",
+	"RecordGroomingDispositionsInput",
+	"RecordGroomingDispositionsOutput",
+	"RecordedGroomingDisposition",
 	"RecoverExemptPath",
 	"RecoverRunParams",
 	"RecoverScopePath",

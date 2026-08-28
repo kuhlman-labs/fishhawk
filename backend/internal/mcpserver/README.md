@@ -753,6 +753,36 @@ Returns the filed follow-up issue (`{type, title, number, url, provider, applied
 
 Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, caught locally before the HTTP hop), `cross_run_defer` (403), `concern_not_found` (404), `concern_defer_conflict` (422 — non-open concern or a post-filing race), `work_item_invalid` (422), `provider_unimplemented` (501), `work_item_filing_failed` (502 — the concern stays open), `concern_store_unconfigured` (503).
 
+## Per-entry grooming dispositions (`fishhawk_record_grooming_dispositions`, [E54.30 / #2843](https://github.com/kuhlman-labs/fishhawk/issues/2843))
+
+`fishhawk_record_grooming_dispositions` **captures** an operator's verdicts on individual entries of a backlog_grooming run's `grooming_report` — one `{entry_id, verdict, close_target?}` per decided entry — and persists each as a chained `grooming_disposition_recorded` audit row. It wraps `POST /v0/runs/{run_id}/grooming-dispositions`.
+
+**Nothing consumes these dispositions yet.** The verb is CAPTURE only: recording an approval applies nothing, closes no duplicate, and re-ranks no backlog. The consumption half — the apply stage and its concurrency protocol — is [#2991](https://github.com/kuhlman-labs/fishhawk/issues/2991). Until that lands a recorded disposition is inert, forward-compatible audit history. Do not call this expecting a tracker mutation. The tool description says so on the wire, so an agent reading the tool list learns it before calling rather than after.
+
+The audit category is **deliberately distinct** from `grooming_mutation_applied`: this row is what the OPERATOR DECIDED; that one is what was APPLIED, and the second derives from the first.
+
+**Operator-only, with TWO refusals.** The backend rejects a run-bound MCP token (subject `mcp:run:<uuid>`) outright with `run_token_forbidden`, **even for its own run**; and it rejects a DELEGATED operator-agent token (subject prefix `operator-agent/`) with `operator_agent_forbidden`. The second closes the subtler self-approval path: the grooming report is agent-authored, so an agent dispositioning it would convert an operator gate into a rubber stamp. `write:approvals` is required and enforced unconditionally — no cookie-session bypass. `TestRecordGroomingDispositions_SurfacesBackendRefusals` asserts the tool names each backend code rather than flattening it into a transport error, so the MCP path cannot MASK the HTTP refusal, and `TestRecordGroomingDispositionsFullPath_RunBoundTokenRefusedAtBothLayers` proves the run-bound refusal through the REAL server rather than a fake.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose NEWEST `grooming_report` the dispositions attach to. |
+| `dispositions[].entry_id` | **yes** | The entry's stable DERIVED id, as the report declares it. |
+| `dispositions[].verdict` | **yes** | One of `approved` / `rejected` / `amended` — the closed `workmgmt` verdict set. |
+| `dispositions[].close_target` | no | For an approved duplicate, which item the pair collapses onto. Recorded verbatim; interpreted by nothing in this slice. |
+
+Semantics worth knowing before calling:
+
+- **Which report.** The dispositions attach to the run's NEWEST `grooming_report` artifact, resolved server-side; the resolved `artifact_id` + `content_hash` come back in the response. The `GET` read-back uses the same resolver, so capture and read-back agree by construction.
+- **Batch-atomic.** One unknown `entry_id` records **NOTHING** — the whole batch is validated before any append, so a partial capture is unreachable.
+- **Last-wins supersession.** An `entry_id` may not repeat WITHIN one request (ambiguous intent → `validation_failed`), but a LATER request on the same entry **supersedes** the earlier one. Both rows stay on the chain, so the correction is itself auditable.
+- **The read-back rides along.** The capture's 200 carries the FULL current disposition set for the artifact, so no separate read call is needed. `ListGroomingDispositions` on the client exists for a standalone read.
+
+The tool pre-validates the run UUID, a non-empty batch, and non-empty `entry_id`s **before** the HTTP hop; it deliberately does NOT duplicate the verdict or entry-id checks, because a second copy of a closed set is a drift source and the backend's refusal is the one that matters.
+
+Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `entry_id` (caught locally), `validation_failed` (400), `grooming_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `grooming_report_absent` (409), `grooming_entry_unknown` (422), `grooming_dispositions_unconfigured` (503).
+
 ## Run-branch reset (`fishhawk_reset_run_branch`)
 
 `fishhawk_reset_run_branch` ([ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#867](https://github.com/kuhlman-labs/fishhawk/issues/867)) is the **destructive, operator-gated** remediation for a foreign commit pushed **ON TOP** of a run's own commits on the open PR branch. It force-rewinds the run/PR branch back to its **last run-authored HEAD** (the newest commit attributable to the run's reported-head ledger), dropping the on-top foreign commit, then re-parks the review gate so CI + the merge reconciler re-evaluate the rewound head. It wraps `POST /v0/runs/{run_id}/reset-branch`.
