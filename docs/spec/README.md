@@ -27,21 +27,26 @@ brew install check-jsonschema
 check-jsonschema --check-metaschema docs/spec/*.schema.json
 
 # validate examples. A workflow file is validated against the major it
-# DECLARES: this repo's own .fishhawk/workflows.yaml declares version "1.3", so
-# it belongs in the v1 command below and moves to the v2 command once the
-# operator migration to workflow-v2 lands (see workflow-migration.md).
+# DECLARES — routing is per-document, not per-repo. This repo's own
+# .fishhawk/workflows.yaml is listed under the v2 command below because the
+# operator migration to workflow-v2 has landed (see workflow-migration.md);
+# if it is ever migrated again, it moves to the command for the new major.
 check-jsonschema --schemafile docs/spec/workflow-v0.schema.json \
     docs/spec/examples/workflow-v0-feature-change.yaml \
     docs/spec/examples/workflow-v0-routine-change.yaml
 
 check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \
-    docs/spec/examples/workflow-v1-acceptance.yaml \
-    .fishhawk/workflows.yaml
+    docs/spec/examples/workflow-v1-acceptance.yaml
 
 # a v2 spec declares version: "2" — the dotted minor form is rejected.
+# .fishhawk/workflows.yaml belongs here ONLY because it declares no `defaults`
+# and no `extends`: a bare check-jsonschema run resolves no same-document
+# reuse (#2340, and see the reuse note below). Add a reuse block to it and
+# this invocation must become `fishhawk validate`.
 check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
     docs/spec/examples/workflow-v2-backlog-grooming.yaml \
-    docs/spec/examples/workflow-v2-milestone-scoping.yaml
+    docs/spec/examples/workflow-v2-milestone-scoping.yaml \
+    .fishhawk/workflows.yaml
 
 # NOT examples/workflow-v2-reuse.yaml: v2 `defaults` / `extends` are resolved
 # BEFORE schema validation, so the schema only ever sees the RESOLVED document
