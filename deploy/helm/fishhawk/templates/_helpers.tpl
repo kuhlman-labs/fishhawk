@@ -31,8 +31,10 @@ Chart name and version, as used by the chart label.
 {{/*
 Common labels. Accepts either the chart root context (`.`) — the back-compat
 call shape, byte-identical to the pre-split output — or a dict
-`(dict "root" $ "role" R)` so split-mode Deployments stamp an
+`(dict "root" $ "role" R)` so a Deployment stamps an
 `app.kubernetes.io/component` label (threaded through fishhawk.selectorLabels).
+Roles: `server` (allInOne fishhawkd), `api`/`worker` (split mode); see
+fishhawk.selectorLabels for the full component enumeration.
 */}}
 {{- define "fishhawk.labels" -}}
 {{- $root := . -}}
@@ -47,11 +49,30 @@ app.kubernetes.io/managed-by: {{ $root.Release.Service }}
 
 {{/*
 Selector labels. Accepts either the chart root context (`.`) — emitting the bare
-two-label set (byte-identical to the allInOne / pre-split call sites) — or a dict
-`(dict "root" $ "role" R)` where a non-empty role (api|worker) adds an
-`app.kubernetes.io/component: <role>` label. The component label lets the split-
-mode Service select only the api pods, excluding the worker pod from its
-endpoints.
+two-label set (byte-identical to the postgres/minio/jaeger dependency call sites,
+which append their own literal component line) — or a dict
+`(dict "root" $ "role" R)` where a non-empty role adds an
+`app.kubernetes.io/component: <role>` label.
+
+Component values the chart ships:
+  server            — the allInOne fishhawkd Deployment (threaded here so its
+                      Service + Deployment select ONLY the fishhawkd pod; the bare
+                      name+instance pair is a strict superset of every dependency
+                      and Job pod, so a bare selector matched all of them).
+  api, worker       — split-mode fishhawkd Deployments (the Service selects api,
+                      excluding worker from its endpoints).
+  postgres, minio,
+  jaeger            — the dev-dependency workloads (each appends its own literal
+                      component line next to a bare selectorLabels call).
+  migrate,
+  minio-bucket      — stamped literally on the two hook Jobs' pod templates.
+
+`server` is the RATIFIED allInOne value and is a DIFFERENT axis from the fishhawkd
+pod-spec role `all` (fishhawk.fishhawkdPodSpec), which selects which subprocesses
+run, not which component a pod is. Any value threaded into a Deployment's
+spec.selector.matchLabels lands in an IMMUTABLE field, so changing it later is a
+delete/recreate — which is why the allInOne value is settled here rather than left
+open.
 */}}
 {{- define "fishhawk.selectorLabels" -}}
 {{- $root := . -}}

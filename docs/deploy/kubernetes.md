@@ -63,6 +63,18 @@ On a stuck rollout or a `/healthz` timeout the command tails `kubectl get pods` 
 `kubectl logs deploy/fishhawk` to stderr, kills the port-forward, and exits
 non-zero (the same fail-loud contract as `scripts/dev up`).
 
+**Upgrading an existing dev release across chart 0.3.0.** Chart 0.3.0 adds
+`app.kubernetes.io/component: server` to the allInOne fishhawkd Deployment's
+`spec.selector.matchLabels`, and a Deployment's `spec.selector` is **immutable**
+in the Kubernetes API. So `scripts/dev k8s` against a release first installed on
+chart 0.2.x fails with a `field is immutable` error rather than reconciling — the
+`helm upgrade --install` is idempotent for VALUE changes, not for this selector
+change. The clean path is `scripts/dev k8s-down` (`helm uninstall`) then
+`scripts/dev k8s` (fresh install). The full remedy set (including the
+delete-Deployment-then-upgrade branch and the symmetric in-cluster rollback
+caveat) is in
+[the chart README's Upgrading section](../../deploy/helm/fishhawk/README.md).
+
 ## Reaching fishhawkd
 
 While the bring-up's port-forward is alive, fishhawkd is reachable at
@@ -75,6 +87,20 @@ kubectl port-forward svc/fishhawk 8080:8080
 Local uses port-forward (or a NodePort) rather than an Ingress;
 `values-local.yaml` sets `ingress.enabled: false` so `config.externalUrl` /
 `config.oauthCallbackUrl` are used verbatim.
+
+`kubectl port-forward svc/fishhawk 8080:8080` and `kubectl logs deploy/fishhawk`
+now resolve **deterministically** to the fishhawkd pod. The Service + Deployment
+carry an `app.kubernetes.io/component: server` discriminator
+([#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916)), so the selector
+no longer also matches the in-cluster postgres/minio/jaeger pods or the
+migrate/minio-bucket hook Job pods — before this, a selector-resolving command
+picked an arbitrary matching pod and could return jaeger's logs. Confirm exactly
+one pod backs the Service:
+
+```sh
+kubectl -n fishhawk get pods \
+  -l app.kubernetes.io/name=fishhawk,app.kubernetes.io/instance=fishhawk,app.kubernetes.io/component=server
+```
 
 ## Frontend (SPA)
 
@@ -222,7 +248,10 @@ against an unmigrated database, so its FAILURE path is the one worth knowing.
 `scripts/test-helm-render` drives the chart through `helm template` / `helm lint`
 and asserts on rendered output — the credential-contract failure modes, the
 migrate Job's timing and `restartPolicy`, the `envFrom` wiring, the derived
-ingress URLs, and a render + lint of every profile. It runs inside
+ingress URLs, the **selector-integrity** check (r17: every Service selects
+exactly one workload pod, and `svc/fishhawk` carries the full
+`{name,instance,component}` set — [#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916)),
+and a render + lint of every profile. It runs inside
 `scripts/test verify` and skips (exit 0, printed reason) when `helm` is absent.
 
 ## values-local vs values-prod

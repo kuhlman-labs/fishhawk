@@ -10,7 +10,7 @@ description: >-
   ship as values-prod / values-cell / values-single-tenant.
 type: application
 # Chart version: bump on chart-template changes.
-version: 0.2.0
+version: 0.3.0
 # appVersion tracks the fishhawkd image tag shipped by backend-release.yml.
 # Defaults to the `main` rolling tag (matches infra/terraform image_tag default);
 # override per-release via image.tag in values.yaml.

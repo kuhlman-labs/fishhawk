@@ -6,16 +6,27 @@ kind: Deployment
 metadata:
   name: {{ include "fishhawk.fullname" . }}
   labels:
-    {{- include "fishhawk.labels" . | nindent 4 }}
+    {{- include "fishhawk.labels" (dict "root" . "role" "server") | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # The allInOne fishhawkd workload carries an app.kubernetes.io/component: server
+  # discriminator so its Service + Deployment select ONLY the fishhawkd pod. The
+  # bare name+instance selector is a strict superset of the
+  # postgres/minio/jaeger/migrate/minio-bucket pod labels, so without the
+  # component the Service and Deployment matched all of them (svc/fishhawk picked
+  # an arbitrary pod — the jaeger-logs symptom). `server` is a DIFFERENT axis from
+  # the fishhawkd pod-spec role `all` below (which selects subprocesses), so both
+  # coexist. NOTE: spec.selector is IMMUTABLE after creation — changing this value
+  # later requires deleting/recreating the Deployment (see the UPGRADE note in
+  # deploy/helm/fishhawk/README.md). The two selectorLabels call sites below MUST
+  # stay byte-identical or the Deployment never matches its own pods.
   selector:
     matchLabels:
-      {{- include "fishhawk.selectorLabels" . | nindent 6 }}
+      {{- include "fishhawk.selectorLabels" (dict "root" . "role" "server") | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        {{- include "fishhawk.selectorLabels" (dict "root" . "role" "server") | nindent 8 }}
     spec:
       {{- include "fishhawk.fishhawkdPodSpec" (dict "root" . "role" "all") | nindent 6 }}
 {{- end -}}

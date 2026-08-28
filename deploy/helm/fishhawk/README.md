@@ -46,12 +46,71 @@ future split-mode guard must be wired into
   tag).
 - Liveness + readiness probes on `GET /healthz` against containerPort
   8080; a ClusterIP Service on 8080.
-- In `split` mode the Service selector carries
-  `app.kubernetes.io/component: api`, so HTTP + webhook traffic routes
-  only to the api pods — which dedup webhook deliveries via the
-  Postgres store whenever `FISHHAWKD_DATABASE_URL` is set (`serve.go`).
-  The `-worker` pod (`component: worker`) is excluded from the Service
-  endpoints; its probes hit the pod directly.
+- The Service selector carries an `app.kubernetes.io/component`
+  discriminator so it selects EXACTLY the fishhawkd pod, never the
+  in-cluster postgres/minio/jaeger pods or the migrate/minio-bucket
+  hook Job pods (all of which carry the same bare `name`+`instance`
+  labels). In `allInOne` mode the discriminator is
+  `component: server`; in `split` mode it is `component: api`, so HTTP
+  + webhook traffic routes only to the api pods — which dedup webhook
+  deliveries via the Postgres store whenever `FISHHAWKD_DATABASE_URL`
+  is set (`serve.go`). The `-worker` pod (`component: worker`) is
+  excluded from the Service endpoints; its probes hit the pod directly.
+  Without the discriminator the bare selector matched every workload
+  pod, and selector-resolving commands (`kubectl port-forward
+  svc/fishhawk`, `kubectl logs deploy/fishhawk`) picked an arbitrary
+  match — the jaeger-logs symptom of
+  [#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916). The
+  same `component` label lands in the Deployment's immutable
+  `spec.selector` — see **Upgrading** below.
+
+## Upgrading
+
+**Chart 0.3.0 changes the fishhawkd Deployment's `spec.selector.matchLabels`**
+(it adds `app.kubernetes.io/component: server` to the allInOne workload,
+[#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916)). A
+Deployment's `spec.selector` is **immutable** in the Kubernetes API — the
+API server rejects any update that changes it — so a plain `helm upgrade`
+from chart 0.2.x **FAILS** with a field-immutable error
+(`field is immutable`) rather than silently reconciling. This is expected;
+pick ONE of the two remedies, which are NOT interchangeable:
+
+1. **Delete the Deployment, then upgrade onto the still-installed release.**
+   Deleting only the Deployment leaves the Helm release intact, so you
+   `helm upgrade` (or `helm rollback`) onto it — do NOT `helm install`,
+   there is nothing to install onto:
+
+   ```sh
+   # default FOREGROUND cascade, so the old ReplicaSet + pods go too
+   # (do NOT use --cascade=orphan — that strands the old ReplicaSet, which
+   # still carries the old selector and would fight the new one):
+   kubectl -n <namespace> delete deploy <release>-fishhawk
+   helm upgrade <release> deploy/helm/fishhawk -n <namespace> [ -f <your-values> ]
+   ```
+
+2. **Uninstall the release, then install fresh.** No release remains, so a
+   fresh `helm install` is correct here (a `helm upgrade` would have nothing
+   to upgrade):
+
+   ```sh
+   helm uninstall <release> -n <namespace>
+   helm install <release> deploy/helm/fishhawk -n <namespace> [ -f <your-values> ]
+   ```
+
+Either path causes a brief API downtime while the fishhawkd pod is recreated.
+The in-cluster postgres/minio/jaeger workloads are untouched — they already
+carried a `component` label — and in **`split` mode the `-api` and `-worker`
+Deployments are unaffected**, because they already selected on
+`component: api`/`worker` before 0.3.0; only the allInOne Deployment's
+selector changed.
+
+> **In-cluster rollback is NOT free either.** Because `spec.selector` is
+> immutable, rolling a release that is already on 0.3.0 *back* to 0.2.x hits
+> the SAME immutable-field error as rolling forward, and needs the same
+> remedy — delete the Deployment (foreground cascade) then `helm rollback`,
+> or `helm uninstall` then `helm install` the 0.2.x chart. Reverting the PR
+> that shipped 0.3.0 is a code rollback with no data migration; the in-cluster
+> rollback of a *running* release is the part that costs the downtime above.
 
 ## Config
 
@@ -586,8 +645,21 @@ third-party image the chart RENDERS (r15 — extracted from
 `helm template` output, classified by an anonymous Docker Hub
 registry-v2 manifest HEAD into exists/missing/indeterminate, fail-closed
 only on a definite 404 and guarded by a known-bad **sentinel** so an
-unreachable registry can never green the case), and a render + lint of
-every profile. It **skips with a printed reason
+unreachable registry can never green the case), and a
+**selector-integrity check** ([r17](https://github.com/kuhlman-labs/fishhawk/issues/2916),
+run in BOTH allInOne and split renders): r17a asserts every rendered
+Service selects EXACTLY ONE workload pod, over a universe that includes
+the migrate and minio-bucket **Job** pod templates (they carry the same
+bare labels and are part of the shipped defect); r17b asserts
+`svc/fishhawk`'s selector is the FULL `{name,instance,component}` set
+(`server` allInOne, `api` split), not just the discriminator; r17c
+asserts each Deployment's `spec.selector.matchLabels` identity set
+EQUALS its pod-template set and that the primary Deployment carries the
+full expected set; r17d asserts no pod set satisfies two DISTINCT
+Deployment selectors. The complete mutation-to-verdict counterfactual
+matrix (M0–M4) is recorded in the r17 header comment in
+`scripts/test-helm-render`. A render + lint of
+every profile rounds out the suite. It **skips with a printed reason
 and exits 0** when `helm` is absent from PATH, so a helm-less host is
 not red-lined; the cost is honest — on such a host the chart is
 unguarded, the same residual the zsh guard already accepts for
@@ -738,6 +810,9 @@ helm template fishhawk deploy/helm/fishhawk --set migrate.activeDeadlineSeconds=
 helm template fishhawk deploy/helm/fishhawk --set migrate.activeDeadlineSeconds=210
 # split topology (two Deployments):
 helm template fishhawk deploy/helm/fishhawk --set deployment.mode=split --set workers.slaTimer=true
+# confirm svc/fishhawk carries the component discriminator (server allInOne, api split):
+helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-local.yaml \
+  --show-only templates/service.yaml | grep 'app.kubernetes.io/component'   # → server
 # confirm the allInOne topology guard fails:
 helm template fishhawk deploy/helm/fishhawk --set replicaCount=2 --set workers.slaTimer=true
 # Mode-1 profile + GHES/EMU endpoints: unset renders NO such key, set renders each.
