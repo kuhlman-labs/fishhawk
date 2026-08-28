@@ -495,10 +495,29 @@ assert_render_ok "r5 DB URL NOT required when postgres.enabled (in-cluster env o
 
 # The PEM's dotted secretKey is a Secret key and a projected FILE, never an env
 # key — envFrom skips it as an invalid identifier, so validating it as env would
-# be wrong.
-render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+# be wrong. Rendered against a SYNTHETIC App-ENABLED fixture, NOT values-local:
+# the local profile deliberately ships the GitHub App OFF since #2914 (see r16),
+# so reading values-local here would go green-for-the-wrong-reason today and red
+# once the placeholder is gone. This fixture keeps the dotted-key-is-a-file-not-
+# an-env-key contract pinned independently of the local profile's choice.
+cat > "$tmproot/r5pem.yaml" <<'YAML'
+profile: local
+config:
+  githubAppId: "123456"
+secrets:
+  mode: chartManaged
+  githubApp:
+    privateKeyFile:
+      enabled: true
+  values:
+    databaseUrl: "postgres://u:p@h:5432/d?sslmode=disable"
+    githubWebhookSecret: "w"
+    anthropicApiKey: "a"
+    githubAppPrivateKey: "synthetic-test-pem"
+YAML
+render -f "$tmproot/r5pem.yaml" --show-only templates/secret.yaml
 assert_contains "r5 PEM dotted key is a Secret key" "$out" '"github-app-private-key.pem":'
-render -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
+render -f "$tmproot/r5pem.yaml" --show-only templates/deployment.yaml
 assert_absent "r5 PEM dotted key is NOT emitted as an env key" "$out" "name: github-app-private-key.pem"
 assert_contains "r5 PEM dotted key backs the volume items: projection" "$out" 'key: "github-app-private-key.pem"'
 
@@ -1378,6 +1397,76 @@ if lint_out=$("$(command -v helm)" lint "$CHART" -f "$tmproot/r14b.yaml" 2>&1); 
   pass "r14o helm lint the complete-GitLab fixture"
 else
   fail "r14o helm lint complete-GitLab fixture: $(printf '%s' "$lint_out" | tail -3)"
+fi
+
+# ---------------------------------------------------------------------------
+# r16 — THE GITHUB APP OFF POSTURE (E69.3 / #2914). values-local ships the
+#       GitHub App OFF: a placeholder PEM cannot parse and fishhawkd parses it
+#       EAGERLY at boot (githubapp.NewSignerFromPEM), so a placeholder crashloops
+#       the pod. serve.go treats the App as all-or-nothing and tolerates it
+#       WHOLLY absent (a Warn, not an exit). The chart must emit NO App wiring for
+#       the local profile, and the documented re-enable recipe must actually turn
+#       the App back on. Every case asserts SHIPPED RENDERED OUTPUT; r16d is the
+#       POSITIVE anti-vacuity guard so r16a-c cannot be greened by a chart that
+#       lost the App path entirely.
+# ---------------------------------------------------------------------------
+# r16a values-local ConfigMap carries NEITHER the App id NOR the private-key file
+# path. assert_field_absent matches at YAML KEY position, so the template comments
+# that name those very keys cannot green it.
+render -f "$CHART/values-local.yaml" --show-only templates/configmap.yaml
+assert_render_ok "r16a GitHub-App-off ConfigMap renders"
+assert_field_absent "r16a values-local ConfigMap omits FISHHAWKD_GITHUB_APP_ID" "$out" "FISHHAWKD_GITHUB_APP_ID"
+assert_field_absent "r16a values-local ConfigMap omits FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE" "$out" "FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE"
+
+# r16b values-local Secret carries no dotted PEM key, and no PEM/placeholder body
+# appears ANYWHERE in the rendered release — the point of #2914 is that the
+# unparseable placeholder is GONE, not merely relocated.
+render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
+assert_render_ok "r16b GitHub-App-off Secret renders"
+assert_field_absent "r16b values-local Secret omits the dotted github-app-private-key.pem key" "$out" '"github-app-private-key.pem"'
+render -f "$CHART/values-local.yaml"
+assert_absent "r16b no BEGIN RSA PRIVATE KEY body in the rendered release" "$out" "BEGIN RSA PRIVATE KEY"
+assert_absent "r16b no DEV-PLACEHOLDER PEM body in the rendered release" "$out" "DEV-PLACEHOLDER-NOT-A-REAL-KEY"
+
+# r16c values-local Deployment has no PEM volume and no volumeMount at the PEM
+# mount path — the pod cannot mount a key it does not have.
+render -f "$CHART/values-local.yaml" --show-only templates/deployment.yaml
+assert_render_ok "r16c GitHub-App-off Deployment renders"
+assert_absent "r16c values-local Deployment has no github-app-private-key volume/mount" "$out" "github-app-private-key"
+assert_absent "r16c values-local Deployment mounts no PEM at the mount path" "$out" "/etc/fishhawk/github-app-private-key.pem"
+
+# r16d POSITIVE / anti-vacuity: values-local PLUS the README's documented enable
+# overrides renders BOTH env keys AND the volume + mount — so r16a-c cannot be
+# satisfied by a chart that dropped the App path outright. A single-line PEM-
+# shaped value is enough for the render (fishhawkd parses the PEM at boot; the
+# chart does not), which is the README's recipe with a throwaway key.
+r16d_over=(--set config.githubAppId=123456
+           --set secrets.githubApp.privateKeyFile.enabled=true
+           --set secrets.values.githubAppPrivateKey=SYNTHETIC-DEV-PEM)
+render -f "$CHART/values-local.yaml" "${r16d_over[@]}" --show-only templates/configmap.yaml
+assert_render_ok "r16d enable-recipe ConfigMap renders"
+assert_contains "r16d enable recipe emits FISHHAWKD_GITHUB_APP_ID" "$out" 'FISHHAWKD_GITHUB_APP_ID: "123456"'
+assert_contains "r16d enable recipe emits FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE" "$out" \
+  'FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE: "/etc/fishhawk/github-app-private-key.pem"'
+render -f "$CHART/values-local.yaml" "${r16d_over[@]}" --show-only templates/deployment.yaml
+assert_contains "r16d enable recipe renders the PEM volume/mount" "$out" "name: github-app-private-key"
+assert_contains "r16d enable recipe renders the PEM mount path" "$out" "/etc/fishhawk/github-app-private-key.pem"
+
+# r16e CROSS-BOUNDARY (the technique r1/r13 use). The chart-side OFF claim rests
+# on serve.go's contract: the App id + key file are JOINTLY required (either alone
+# is a misconfiguration exit), and with NEITHER set fishhawkd WARNS and disables
+# GitHub-side actions rather than refusing. Both literals are copied VERBATIM from
+# backend/cmd/fishhawkd/serve.go, so a serve.go change that makes the App
+# mandatory reddens this gate instead of silently reinstating the crashloop.
+if grep -rqF "both --github-app-id and --github-app-private-key-file required" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r16e fishhawkd jointly requires the App id and key file (either alone exits)"
+else
+  fail "r16e joint-requirement text not found in backend/cmd/fishhawkd/"
+fi
+if grep -rqF "webhook dispatch and GitHub-side actions will be disabled" "$REPO_ROOT/backend/cmd/fishhawkd/" 2>/dev/null; then
+  pass "r16e fishhawkd tolerates the App wholly absent (a Warn, not an exit) — the posture values-local ships"
+else
+  fail "r16e App-absent warn text not found in backend/cmd/fishhawkd/"
 fi
 
 fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)

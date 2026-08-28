@@ -46,7 +46,15 @@ config:
   oauthRedirectAfterLogin: "http://localhost:5173/"
   oidcAudience: "fishhawkd-local"
   oidcJwksUrl: ""
-  githubAppId: "123456"
+  # GitHub App OFF for the local profile (#2914). serve.go requires
+  # --github-app-id and --github-app-private-key-file TOGETHER and exits with
+  # "github app misconfigured: both --github-app-id and
+  # --github-app-private-key-file required" on either alone; a dev id without a
+  # parseable key is exactly the crashloop #2914 reports (fishhawkd parses the
+  # PEM eagerly at boot). Left empty (not deleted) so the OFF posture is visible
+  # and a reader does not re-add a lone id. To turn the App back on with a
+  # generated throwaway key, see deploy/helm/fishhawk/README.md.
+  githubAppId: ""
   planReviewModel: "claude-sonnet-4-6"
   budgetTimezone: "UTC"
 
@@ -81,6 +89,17 @@ jaeger:
 # supersedes it via fishhawk.secretName, so the chart owns `<fullname>-secrets`.
 secrets:
   mode: chartManaged
+  # GitHub App disabled for the local profile (#2914). enabled:false drops the
+  # PEM volume + readOnly mount from the pod spec, drops
+  # FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE from the ConfigMap, and makes the PEM
+  # record non-required in fishhawk.secretKeySpec so validateSecretContract does
+  # not demand it. Paired with config.githubAppId: "" above, this ships the App
+  # wholly OFF — the posture serve.go supports with a Warn ("FISHHAWKD_GITHUB_
+  # APP_ID not set; webhook dispatch and GitHub-side actions will be disabled"),
+  # not an exit. See README.md for the generate-a-key-and-enable recipe.
+  githubApp:
+    privateKeyFile:
+      enabled: false
   values:
     # Targets the in-cluster Postgres Service. Matches the Deployment's
     # postgres.enabled override, kept here so chartManaged renders a complete
@@ -93,9 +112,9 @@ secrets:
     # in-cluster MinIO bucket (trace storage).
     awsAccessKeyId: "fishhawk"
     awsSecretAccessKey: "fishhawk-dev-secret"
-    # Placeholder PEM so the private-key file volume renders + mounts. Not a
-    # usable key — replace for any real GitHub App integration.
-    githubAppPrivateKey: |
-      -----BEGIN RSA PRIVATE KEY-----
-      DEV-PLACEHOLDER-NOT-A-REAL-KEY
-      -----END RSA PRIVATE KEY-----
+    # No githubAppPrivateKey: the local profile runs with the GitHub App disabled
+    # (secrets.githubApp.privateKeyFile.enabled: false above), so the record is
+    # non-required and no PEM key is emitted. A placeholder PEM cannot parse and
+    # fishhawkd parses it eagerly at boot, which is the crashloop #2914 reports —
+    # so shipping one here is worse than shipping none. To enable the App with a
+    # generated throwaway key, see README.md.
