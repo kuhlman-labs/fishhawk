@@ -1,0 +1,57 @@
+{
+  "$comment": "Canonical tier-expansion corpus (E52.18 / #2341). The workflow-v2 autonomy tier expansion is encoded in TWO hand-maintained twins that cannot import each other across the backend/cli module wall: expandTier in backend/internal/spec/v2autonomy.go and tierExpansion in cli/internal/spec/migrate.go. This file is the shared proof surface: each module asserts its own implementation against the SAME rows. The claim is CORPUS AGREEMENT, not byte-carrying — the two expansion functions return different types (backend ActionMatrix keyed by class with typed Mode/DelegationCondition; CLI map[string]actionEntry with string fields), so each module projects the corpus through its own type rather than sharing a Go type. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it and never emits its unrecognized-file warning.",
+  "tiers": [
+    {
+      "tier": "low",
+      "classes": {
+        "approve": {"mode": "gated"},
+        "fixup":   {"mode": "gated"},
+        "waive":   {"mode": "gated"},
+        "retry":   {"mode": "gated"},
+        "merge":   {"mode": "gated"}
+      },
+      "page_human_on": [],
+      "reason": "Human-led: nothing delegated and no page list — with nothing delegated there is nothing to except."
+    },
+    {
+      "tier": "medium",
+      "classes": {
+        "approve": {"mode": "auto", "when": "clean_dual_approval"},
+        "fixup":   {"mode": "auto", "when": "convergent_concerns"},
+        "waive":   {"mode": "gated"},
+        "retry":   {"mode": "auto", "when": "infra_flake"},
+        "merge":   {"mode": "gated"}
+      },
+      "page_human_on": [
+        "gating_reviewer_reject",
+        "plan_rejection",
+        "scope_amendment",
+        "budget_override",
+        "policy_override",
+        "exception_request",
+        "requirement_arbitration"
+      ],
+      "reason": "Approve, fixup and retry delegated under their named conditions; waive and merge stay human-gated."
+    },
+    {
+      "tier": "high",
+      "classes": {
+        "approve": {"mode": "auto", "when": "clean_dual_approval"},
+        "fixup":   {"mode": "auto", "when": "convergent_concerns"},
+        "waive":   {"mode": "auto", "when": "solo_low"},
+        "retry":   {"mode": "auto", "when": "infra_flake"},
+        "merge":   {"mode": "auto", "when": "gates_resolved_ci_green"}
+      },
+      "page_human_on": [
+        "gating_reviewer_reject",
+        "plan_rejection",
+        "scope_amendment",
+        "budget_override",
+        "policy_override",
+        "exception_request",
+        "requirement_arbitration"
+      ],
+      "reason": "Medium plus waive and merge at auto, so a clean change can be carried through to merge."
+    }
+  ]
+}

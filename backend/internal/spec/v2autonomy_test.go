@@ -9,6 +9,163 @@ import (
 	"testing"
 )
 
+// --- tier-expansion corpus (E52.18 / #2341) ---------------------------------
+
+// tierCorpusClass is one class entry from the shared tier-expansion fixture.
+type tierCorpusClass struct {
+	Mode string `json:"mode"`
+	When string `json:"when,omitempty"`
+}
+
+// tierCorpusRow is one tier row from the shared fixture.
+type tierCorpusRow struct {
+	Tier        string                     `json:"tier"`
+	Classes     map[string]tierCorpusClass `json:"classes"`
+	PageHumanOn []string                   `json:"page_human_on"`
+	Reason      string                     `json:"reason"`
+}
+
+type tierCorpusFile struct {
+	Comment string          `json:"$comment"`
+	Tiers   []tierCorpusRow `json:"tiers"`
+}
+
+// loadTierExpansionFixtures reads testdata/tier-expansion-fixtures.json and
+// asserts the corpus carries exactly the three expected tiers (low, medium,
+// high), each with exactly the five known classes. A truncated, emptied or
+// mis-keyed corpus makes both corpus tests iterate zero rows and pass
+// vacuously — the corpus would then guarantee nothing while looking green,
+// which is the same blind-gate failure class this issue exists to close.
+func loadTierExpansionFixtures(t *testing.T) []tierCorpusRow {
+	t.Helper()
+	b, err := os.ReadFile("testdata/tier-expansion-fixtures.json")
+	if err != nil {
+		t.Fatalf("loadTierExpansionFixtures: read: %v", err)
+	}
+	var f tierCorpusFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatalf("loadTierExpansionFixtures: unmarshal: %v", err)
+	}
+
+	// Shape guard: corpus MUST carry exactly {low, medium, high}, each with
+	// exactly {approve, fixup, waive, retry, merge}. Without this a zero-row
+	// iteration produces a vacuous green — the corpus guarantees nothing.
+	knownTiers := map[string]bool{"low": false, "medium": false, "high": false}
+	knownClasses := []string{"approve", "fixup", "waive", "retry", "merge"}
+	for _, row := range f.Tiers {
+		if _, ok := knownTiers[row.Tier]; !ok {
+			t.Fatalf("corpus carries unexpected tier %q; corpus must carry exactly low, medium, high", row.Tier)
+		}
+		if knownTiers[row.Tier] {
+			t.Fatalf("corpus carries duplicate tier %q", row.Tier)
+		}
+		knownTiers[row.Tier] = true
+		if len(row.Classes) != len(knownClasses) {
+			t.Fatalf("tier %q: corpus carries %d classes, want 5 (approve, fixup, waive, retry, merge)", row.Tier, len(row.Classes))
+		}
+		for _, cls := range knownClasses {
+			if _, ok := row.Classes[cls]; !ok {
+				t.Fatalf("tier %q: corpus missing class %q", row.Tier, cls)
+			}
+		}
+	}
+	for tier, seen := range knownTiers {
+		if !seen {
+			t.Fatalf("corpus missing tier %q; corpus must carry exactly low, medium, high", tier)
+		}
+	}
+	if len(f.Tiers) != 3 {
+		t.Fatalf("corpus has %d tier rows, want exactly 3 (low, medium, high)", len(f.Tiers))
+	}
+	return f.Tiers
+}
+
+// TestTierExpansionCorpus_BackendMatches asserts both the SHIPPED behaviour
+// (ResolveAutonomy on a real parsed v2 document) and the internal table
+// (expandTier) against the shared docs/spec/tier-expansion-fixtures.json
+// corpus. The corpus, frozenTierBlocks, tierPageList and expandTier are four
+// independent surfaces: a solo edit to any one of them reddens at least one
+// assertion here or in TestExpandTier_MatchesFrozenTierTable.
+func TestTierExpansionCorpus_BackendMatches(t *testing.T) {
+	rows := loadTierExpansionFixtures(t)
+	for _, row := range rows {
+		t.Run(row.Tier, func(t *testing.T) {
+			tier := AutonomyTier(row.Tier)
+
+			// (a) Shipped behaviour: parse a real v2 document with autonomy: <tier>
+			// and assert the resolved matrix.
+			wf := Workflow{Autonomy: tier}
+			rm := ResolveAutonomy(&wf, nil)
+			if rm == nil {
+				t.Fatalf("ResolveAutonomy returned nil for tier %q", row.Tier)
+			}
+			for _, cls := range []string{ActionApprove, ActionFixup, ActionWaive, ActionRetry, ActionMerge} {
+				wantEntry := row.Classes[cls]
+				got := resolvedFor(t, rm, cls)
+				if got.Mode != ActionMode(wantEntry.Mode) {
+					t.Errorf("class %s: mode = %q, want %q", cls, got.Mode, wantEntry.Mode)
+				}
+				if got.Condition != DelegationCondition(wantEntry.When) {
+					t.Errorf("class %s: condition = %q, want %q", cls, got.Condition, wantEntry.When)
+				}
+			}
+
+			// Page list comparison. Backend convention: expandTier(TierLow) sets
+			// PageHumanOn to nil (no field assigned), so resolveBlock carries nil
+			// for low — compare nil/empty-tolerantly via len==0 short-circuit so a
+			// []string{} vs nil mismatch cannot masquerade as corpus drift.
+			if len(row.PageHumanOn) == 0 {
+				if len(rm.PageHumanOn) != 0 {
+					t.Errorf("tier %s: PageHumanOn = %v, want nil/empty (nothing to page on)", row.Tier, rm.PageHumanOn)
+				}
+			} else {
+				if !reflect.DeepEqual(rm.PageHumanOn, row.PageHumanOn) {
+					t.Errorf("tier %s: PageHumanOn = %v, want %v", row.Tier, rm.PageHumanOn, row.PageHumanOn)
+				}
+			}
+
+			// (b) Internal table: expandTier agrees with the corpus row.
+			expanded := expandTier(tier)
+			for cls, wantEntry := range row.Classes {
+				gotEntry, ok := expanded.Classes[cls]
+				if !ok {
+					t.Errorf("tier %s: expandTier has no class %q", row.Tier, cls)
+					continue
+				}
+				if string(gotEntry.Mode) != wantEntry.Mode {
+					t.Errorf("tier %s class %s: expandTier mode = %q, want %q", row.Tier, cls, gotEntry.Mode, wantEntry.Mode)
+				}
+				if string(gotEntry.When) != wantEntry.When {
+					t.Errorf("tier %s class %s: expandTier when = %q, want %q", row.Tier, cls, gotEntry.When, wantEntry.When)
+				}
+			}
+
+			// Anchor: corpus page list == tierPageList for medium and high.
+			// A solo edit to tierPageList without updating the corpus (or vice
+			// versa) reddens here before TestExpandTier_MatchesFrozenTierTable
+			// can catch it.
+			if row.Tier != "low" {
+				if !reflect.DeepEqual(row.PageHumanOn, tierPageList) {
+					t.Errorf("tier %s: corpus page list %v != tierPageList %v — corpus or frozen literal drifted", row.Tier, row.PageHumanOn, tierPageList)
+				}
+			}
+
+			// Anchor: derived operator_agent block == frozenTierBlocks[tier].
+			// This cross-checks the corpus against the pre-existing frozen literal,
+			// so a corpus row authored wrong immediately reddens against frozenTierBlocks
+			// rather than silently becoming the new truth.
+			wantBlock := frozenTierBlocks[tier]
+			if wantBlock == nil {
+				t.Fatalf("no frozen block for tier %s", row.Tier)
+			}
+			gotBlock := DerivedOperatorAgent(rm)
+			if !reflect.DeepEqual(gotBlock, wantBlock) {
+				t.Errorf("tier %s: DerivedOperatorAgent = %+v, want the frozen block %+v", row.Tier, gotBlock, wantBlock)
+			}
+		})
+	}
+}
+
 // --- workflow-v2 unified autonomy grammar (ADR-066 / E52.10 / #2222) --------
 //
 // These tests assert SHIPPED behaviour rather than the presence of an edit:

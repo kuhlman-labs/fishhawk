@@ -1035,6 +1035,8 @@ Two independent controls refuse `<non-delegable>: auto`: the explicit branch abo
 
 The medium/high page list is `gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`. A tier emits `gating_reviewer_reject`, never a bare `reviewer_reject` — a tier must not expand to a value undeclarable under the grammar it belongs to.
 
+**What is and is not machine-checked:** the corpus at `docs/spec/tier-expansion-fixtures.json` links the two hand-maintained implementations (`expandTier` in `backend/internal/spec` and `tierExpansion` in `cli/internal/spec`) — a drift between them fails CI. The prose table and the `$defs/autonomy_tier` description in the JSON Schema are transcribed by hand only and are not machine-checked against the corpus.
+
 An explicit `actions` entry **overrides the tier for that class only**; unlisted classes keep the tier's value, and a class no tier names resolves to `gated`.
 
 ### `page_human_on` — the events that always page
