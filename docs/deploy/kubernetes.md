@@ -37,7 +37,10 @@ scripts/dev k8s        # or: make k8s-up
 This:
 
 1. Builds the fishhawkd image into the host Docker daemon as
-   `ghcr.io/kuhlman-labs/fishhawkd:dev-local`.
+   `ghcr.io/kuhlman-labs/fishhawkd:dev-local`, for the host architecture —
+   BuildKit's `TARGETARCH` automatic platform ARG defaults to the host
+   platform, so on an Apple Silicon host the image is arm64 and runs
+   natively on the Docker-Desktop node rather than under emulation.
 2. Runs `helm upgrade --install fishhawk deploy/helm/fishhawk -f
    deploy/helm/fishhawk/values-local.yaml --set image.tag=dev-local --set
    image.pullPolicy=IfNotPresent`. The `--set` overrides point the chart at the

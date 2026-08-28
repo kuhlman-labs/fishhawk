@@ -353,6 +353,49 @@ else
   fail "cmd_k8s_up should pass --build-arg GIT_SHA"
 fi
 
+# 4e. backend/Dockerfile's GOARCH must derive from BuildKit's TARGETARCH
+# automatic platform ARG rather than a hardcoded literal (#2912) — a hardcoded
+# GOARCH=amd64 is invisible on an amd64 CI runner and only surfaces as
+# emulated execution on an arm64 host/node. These read the SHIPPED Dockerfile
+# via orig_repo_root, not REPO_ROOT, which later fixtures re-point at
+# throwaway git repos.
+dockerfile_path="${orig_repo_root}/backend/Dockerfile"
+dockerfile_no_comments="$(grep -vE '^[[:space:]]*#' "$dockerfile_path")"
+
+builder_line="$(grep -nE '^FROM .* AS builder' "$dockerfile_path" | head -1 | cut -d: -f1)"
+targetarch_line="$(grep -nE '^ARG[[:space:]]+TARGETARCH\b' "$dockerfile_path" | head -1 | cut -d: -f1)"
+buildrun_line="$(grep -Fn -- 'go build \' "$dockerfile_path" | head -1 | cut -d: -f1)"
+
+# Assertion A: ARG TARGETARCH is declared inside the builder stage —
+# positionally after "AS builder" and before the fishhawkd go build RUN
+# line — so a global-scope declaration (which BuildKit does not propagate
+# into a stage) is caught rather than silently ignored.
+if [[ -n "$builder_line" && -n "$targetarch_line" && -n "$buildrun_line" \
+      && "$targetarch_line" -gt "$builder_line" && "$targetarch_line" -lt "$buildrun_line" ]]; then
+  pass "backend/Dockerfile declares ARG TARGETARCH inside the builder stage"
+else
+  fail "backend/Dockerfile should declare ARG TARGETARCH after 'AS builder' and before the go build RUN line"
+fi
+
+# Assertion B: the fishhawkd go build RUN line derives GOARCH from that ARG.
+if [[ -n "$buildrun_line" ]] && sed -n "${buildrun_line}p" "$dockerfile_path" | grep -q 'GOARCH=${TARGETARCH}'; then
+  pass "backend/Dockerfile's go build RUN line sets GOARCH=\${TARGETARCH}"
+else
+  fail "backend/Dockerfile's go build RUN line should set GOARCH=\${TARGETARCH}"
+fi
+
+# Assertion C: no hardcoded architecture literal remains anywhere in the
+# file (comment lines stripped first, so a comment documenting the old
+# behavior does not trip this) — matched regardless of quoting or spacing,
+# and including a shell-style ${VAR:-amd64} default expression.
+if print -r -- "$dockerfile_no_comments" | grep -qE \
+     -e 'GOARCH[[:space:]]*=[[:space:]]*"?(amd64|arm64|386|arm|ppc64le|s390x|riscv64)"?\b' \
+     -e '\$\{[A-Za-z_][A-Za-z0-9_]*:-[[:space:]]*"?(amd64|arm64|386|arm|ppc64le|s390x|riscv64)"?[[:space:]]*\}'; then
+  fail "backend/Dockerfile should not hardcode a GOARCH architecture literal"
+else
+  pass "backend/Dockerfile has no hardcoded GOARCH architecture literal"
+fi
+
 # 5. _decide_mcp_signal: all three branches plus the reflog-unavailable fallback.
 # Args: <mcp_rebuilt> <force_all> <reflog_ok> <merge_diff_text>
 if [[ "$(_decide_mcp_signal 0 1 1 'backend/cmd/fishhawk-mcp/main.go')" == 0 ]]; then
