@@ -220,6 +220,7 @@ Error messages: precise about what failed and how to fix. No generic apologies.
 ## Traps
 
 - **macOS bash is 3.2** — no associative arrays. Use zsh, gawk, or awk lookups for scripts that need them.
+- **A container image build must derive `GOARCH` from BuildKit's `TARGETARCH` automatic platform ARG (declared inside the stage that uses it), never a literal** — a hardcoded `GOARCH=amd64` is invisible on an amd64 CI runner and only surfaces as emulated execution on an arm64 host/node (#2912); `scripts/test-dev` pins the shipped directive.
 - **`go.work` is committed**; `go.work.sum` is not. `go.sum` will appear on first external import.
 - **Project #7 Status field** has 6 options (Backlog/Up Next/In Progress/In Review/Blocked/Done) set via GraphQL `updateProjectV2Field` with `singleSelectOptions` (undocumented input field). Repeat the same workaround if creating new projects.
 - **Project #7 owner is `kuhlman-labs` as a `user`, not an `organization`** — the GraphQL queries that take an owner login must use `user(login:"kuhlman-labs")`, not `organization(...)`, or you get a NOT_FOUND. The repo lives under what looks like an org namespace but it's a user-owned account.

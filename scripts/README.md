@@ -436,6 +436,23 @@ split: `docs/deploy/kubernetes.md`. The true end-to-end path (image
 build → chart install → `/healthz` green) is an operator smoke test
 against a Docker-Desktop cluster, not run in CI.
 
+`scripts/test-dev` also asserts that the SHIPPED `backend/Dockerfile`
+derives its `go build` `GOARCH` from BuildKit's `TARGETARCH` automatic
+platform ARG rather than a hardcoded literal (#2912 — a hardcoded
+`GOARCH=amd64` builds an amd64 image that only runs under emulation on
+an arm64 Docker-Desktop node): (A) `ARG TARGETARCH` is declared inside
+the builder stage — after `FROM ... AS builder`, before the fishhawkd
+`go build` RUN line — since an automatic platform ARG declared only in
+the global scope does not propagate into a stage; (B) that RUN line
+sets `GOARCH=${TARGETARCH}`; (C) no hardcoded architecture literal
+(`amd64`, `arm64`, etc., in any quoting/spacing, including inside a
+`${VAR:-amd64}`-style default) remains anywhere in the file, with
+comment lines stripped first so a comment documenting the prior
+behavior doesn't trip it. This pins the shipped build directive so a
+no-op or comment-only touch fails the gate — it does NOT prove the
+built image's `.Architecture` actually matches the host/node; that
+remains the operator smoke test above, not run in CI.
+
 ## Opt-in local TLS front end (E66.28 / [#2453](https://github.com/kuhlman-labs/fishhawk/issues/2453))
 
 An **opt-in, default-off** loopback-only reverse proxy (caddy) that

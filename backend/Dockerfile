@@ -61,10 +61,19 @@ ARG VERSION=dev
 # release workflow) are byte-identical to the pre-arg behavior. scripts/dev
 # k8s passes the short HEAD SHA (with -dirty on a dirty tree).
 ARG GIT_SHA=unknown
+# TARGETARCH is a BuildKit automatic platform ARG, populated from
+# --platform and defaulting to the host platform when unset. It must be
+# redeclared here (inside the builder stage) to be in scope — a declaration
+# only in the global scope before the first FROM does not propagate into a
+# stage. This makes local arm64 (Apple Silicon Docker-Desktop) builds target
+# the host natively instead of running under amd64 emulation (#2912); CI and
+# release builds run on amd64 runners so TARGETARCH resolves to amd64 there,
+# unchanged from the prior literal.
+ARG TARGETARCH
 
 # CGO_ENABLED=0 produces a fully static binary — required by the
 # distroless/static base image (no libc).
-RUN cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
         -trimpath \
         -ldflags="-s -w -X github.com/kuhlman-labs/fishhawk/backend/internal/version.Version=${VERSION} -X github.com/kuhlman-labs/fishhawk/backend/internal/version.GitSHA=${GIT_SHA}" \
         -o /out/fishhawkd \
