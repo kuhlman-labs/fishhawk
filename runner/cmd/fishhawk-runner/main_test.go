@@ -23506,7 +23506,10 @@ func TestAgentEnvNotNarrowerThanGateEnv(t *testing.T) {
 // so the #2894 BaseEnv assignment must ride along. The fake invoker captures
 // the Invocation actually handed to invoker.Invoke and the assertion reads
 // BaseEnv off THAT value, so a path that reconstructed a fresh Invocation
-// would fail here.
+// would fail here. The assertion compares the captured BaseEnv for EQUALITY
+// with the seeded slice rather than merely non-nil, so a re-invoke path that
+// substituted an env of its own composing — a fresh agentenv.Env(), an
+// os.Environ() passthrough — fails too, not just one that left it nil.
 func TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -23524,7 +23527,8 @@ func TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv(t *testing.T) {
 		scopeFiles:          []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
 	}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
-	baseInv := agent.Invocation{BaseEnv: []string{"PATH=/bin"}}
+	wantBaseEnv := []string{"PATH=/bin"}
+	baseInv := agent.Invocation{BaseEnv: wantBaseEnv}
 	res := agent.Result{OK: true}
 	_, _, _ = runVerifyFixLoop(context.Background(), cfg, invoker, baseInv, &res, io.Discard)
 
@@ -23534,8 +23538,9 @@ func TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv(t *testing.T) {
 	if invoker.gotInv == nil {
 		t.Fatal("invocation not captured")
 	}
-	if invoker.gotInv.BaseEnv == nil {
-		t.Error("fix-up re-invoke Invocation.BaseEnv is nil; the derived invocation must inherit the #2894 default-deny env, or the fix-up agent spawns with the runner's full environment")
+	if !reflect.DeepEqual(invoker.gotInv.BaseEnv, wantBaseEnv) {
+		t.Errorf("fix-up re-invoke Invocation.BaseEnv = %q, want %q; the derived invocation must inherit the #2894 default-deny env VERBATIM, or the fix-up agent spawns with the runner's full environment (or with an env the caller never composed)",
+			invoker.gotInv.BaseEnv, wantBaseEnv)
 	}
 }
 
@@ -23552,7 +23557,8 @@ func TestReinvokeOnBaseRebaseConflict_DerivedInvocationCarriesBaseEnv(t *testing
 		workingDir: t.TempDir(),
 	}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
-	baseInv := agent.Invocation{BaseEnv: []string{"PATH=/bin"}}
+	wantBaseEnv := []string{"PATH=/bin"}
+	baseInv := agent.Invocation{BaseEnv: wantBaseEnv}
 	res := agent.Result{}
 	if err := reinvokeOnBaseRebaseConflict(context.Background(), cfg, invoker, baseInv,
 		&res, gitops.ErrBaseRebaseConflict, io.Discard); err != nil {
@@ -23564,8 +23570,9 @@ func TestReinvokeOnBaseRebaseConflict_DerivedInvocationCarriesBaseEnv(t *testing
 	if invoker.gotInv == nil {
 		t.Fatal("invocation not captured")
 	}
-	if invoker.gotInv.BaseEnv == nil {
-		t.Error("base-rebase re-invoke Invocation.BaseEnv is nil; the derived invocation must inherit the #2894 default-deny env")
+	if !reflect.DeepEqual(invoker.gotInv.BaseEnv, wantBaseEnv) {
+		t.Errorf("base-rebase re-invoke Invocation.BaseEnv = %q, want %q; the derived invocation must inherit the #2894 default-deny env VERBATIM",
+			invoker.gotInv.BaseEnv, wantBaseEnv)
 	}
 }
 
