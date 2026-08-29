@@ -502,7 +502,7 @@ func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
 // forgeGuardMustBlock / forgeGuardMustNotBlock are the shipped-behavior
 // table: which repository paths the implement stage may not write, and
 // — the over-broad-pattern failure mode — which it must stay free to.
-// The MUST-BLOCK rows now cover THREE of the four rationale families
+// The MUST-BLOCK rows now cover all three rationale families
 // (docs/spec/workflow-preset.md): self-execution (the .github / .gitlab-ci
 // / .gitlab/ci / .gitlab/agents rows), self-governance (.fishhawk) and
 // legal (LICENSE / NOTICE).

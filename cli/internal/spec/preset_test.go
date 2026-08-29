@@ -872,7 +872,7 @@ func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
 // forgeGuardMustBlock / forgeGuardMustNotBlock are the shipped-behavior
 // table, identical to the backend mirror's — a contract enforced on one
 // side only is how a mirror survives having diverged. The MUST-BLOCK rows
-// now cover THREE of the four rationale families
+// now cover all three rationale families
 // (docs/spec/workflow-preset.md): self-execution (the .github / .gitlab-ci
 // / .gitlab/ci / .gitlab/agents rows), self-governance (.fishhawk) and
 // legal (LICENSE / NOTICE).
