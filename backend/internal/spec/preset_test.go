@@ -478,6 +478,7 @@ func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
 		{"github entry point", ".github/workflows/**"},
 		{"gitlab entry point", ".gitlab-ci.yml"},
 		{"gitlab include fragments", ".gitlab/ci/**"},
+		{"gitlab agent ci_access config", ".gitlab/agents/**"},
 		{"additive: governance survived", ".fishhawk/**"},
 		{"additive: LICENSE survived", "LICENSE"},
 		{"additive: NOTICE survived", "NOTICE"},
@@ -501,22 +502,37 @@ func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
 // forgeGuardMustBlock / forgeGuardMustNotBlock are the shipped-behavior
 // table: which repository paths the implement stage may not write, and
 // — the over-broad-pattern failure mode — which it must stay free to.
+// The MUST-BLOCK rows now cover THREE of the four rationale families
+// (docs/spec/workflow-preset.md): self-execution (the .github / .gitlab-ci
+// / .gitlab/ci / .gitlab/agents rows), self-governance (.fishhawk) and
+// legal (LICENSE / NOTICE).
+//
+// The two .gitlab/agents rows are the E45.34 (#2962) addition: GitLab reads
+// the agent-for-Kubernetes config from .gitlab/agents/<name>/config.yaml,
+// whose `ci_access` block grants the stage's own pipeline jobs cluster
+// access, so it is a capability-granting file on the agent's execution
+// surface. .gitlab/agents/deploy/config.yaml pins the exact documented path
+// shape; .gitlab/agents/nested/deep/config.yaml pins that the `**` suffix
+// reaches arbitrary depth (mirroring the .gitlab/ci/nested row).
 //
 // The two .gitlab/ template rows and the nested sub/project row are
-// load-bearing, not decorative. The templates pin the ratified
-// `.gitlab/ci/**`-not-`.gitlab/**` breadth decision, so a later widening
-// fails here and must be re-decided explicitly rather than drifting in.
-// The nested row pins the root-anchoring claim the guard's residual
-// analysis rests on: a bare-filename pattern must NOT match a nested
-// path of the same name, because GitLab reads the pipeline definition
-// from the repository root and a nested file of that name executes
-// nothing.
+// load-bearing, not decorative, and stay load-bearing AFTER the .gitlab/agents
+// addition. The templates pin the ratified `.gitlab/ci/**`-not-`.gitlab/**`
+// breadth decision — the agent rows added a NARROW second .gitlab/ prefix,
+// not a widening to .gitlab/**, so the template rows must still stay
+// UNBLOCKED or a future widening to .gitlab/** would slip in silently. The
+// nested row pins the root-anchoring claim the guard's residual analysis
+// rests on: a bare-filename pattern must NOT match a nested path of the same
+// name, because GitLab reads the pipeline definition from the repository root
+// and a nested file of that name executes nothing.
 var (
 	forgeGuardMustBlock = []string{
 		".github/workflows/fishhawk.yml",
 		".gitlab-ci.yml",
 		".gitlab/ci/build.yml",
 		".gitlab/ci/nested/fragment.yml",
+		".gitlab/agents/deploy/config.yaml",
+		".gitlab/agents/nested/deep/config.yaml",
 		".fishhawk/workflows.yaml",
 		"LICENSE",
 		"NOTICE",
