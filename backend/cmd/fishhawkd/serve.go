@@ -1509,7 +1509,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"enterprise slug / org login / GitLab group path of the ONE implicit account a self-hosted deployment admits through (ADR-057 Mode 1). Empty = hosted multi-tenant (no bootstrap); setting it bootstraps that account at startup so every member of it auto-joins at sign-in.")
 	singleTenantGranularity := fs.String("single-tenant-granularity",
 		envOr("FISHHAWKD_SINGLE_TENANT_GRANULARITY", ""),
-		"tier the single-tenant account key names: enterprise | organization | group. Empty defaults to enterprise ONCE --single-tenant-account-key is set; setting it alone is a startup error.")
+		"tier the single-tenant account key names: enterprise | organization | group | user. Empty defaults to enterprise ONCE --single-tenant-account-key is set; setting it alone is a startup error. Use 'user' for a personal-namespace install (account key = your forge login, admitted with no forge membership read).")
 	singleTenantAutoJoinRole := fs.String("single-tenant-auto-join-role",
 		envOr("FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE", ""),
 		"role granted to members auto-joining the single-tenant account. Empty defaults to member ONCE --single-tenant-account-key is set; an account with no auto-join role admits nobody.")

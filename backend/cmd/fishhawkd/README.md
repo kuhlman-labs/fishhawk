@@ -14,7 +14,7 @@ SQL (`docs/deploy/gitlab.md`, `docs/deploy/self-hosted.md`).
 
 | Command | Flags | Effect |
 |---|---|---|
-| `account create` | `--db`, `--provider` (**required**, `github`\|`gitlab`), `--account-key` (**required**), `--display-name`, `--granularity` | Upsert one `accounts` row (idempotent on `provider,account_key`). `--granularity` defaults per provider — `organization` for github, `group` for gitlab — and must be one of `enterprise\|organization\|group`. |
+| `account create` | `--db`, `--provider` (**required**, `github`\|`gitlab`), `--account-key` (**required**), `--display-name`, `--granularity` | Upsert one `accounts` row (idempotent on `provider,account_key`). `--granularity` defaults per provider — `organization` for github, `group` for gitlab — and must be one of `enterprise\|organization\|group\|user`. `user` is the personal-namespace tier: `account_key` is the owner's forge login and the login gate admits it with no forge membership read (E44.35 / #2925). |
 | `account list` | `--db`, `--provider` (filter) | Render the registered accounts. |
 | `installation register` | `--db`, `--provider` (**required**), `--account-key` (**required**), `--installation-ref` (**required**), `--forge-base-url`, `--oauth-base-url` | Upsert one `installations` row under the named account (idempotent on `provider,installation_ref`). **FAILS CLOSED** naming the `account create` remedy when the account does not exist — it never materializes it. |
 | `installation list` | `--db`, `--provider` (filter) | Render each installation with its owning `account_key` (the impact-inventory read the auth-change checklist asks for). |
@@ -274,8 +274,8 @@ multi-tenant posture (no bootstrap, no write).
 
 | Env var | Flag | Effect | Empty means |
 |---|---|---|---|
-| `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | `--single-tenant-account-key` | enterprise slug / org login / GitLab group path — **and the sole enablement signal** | hosted multi-tenant; bootstrap skipped |
-| `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `--single-tenant-granularity` | `enterprise` \| `organization` \| `group` | `enterprise`, once the key is set |
+| `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | `--single-tenant-account-key` | enterprise slug / org login / GitLab group path / **owner login** (for `user` granularity) — **and the sole enablement signal**. For `user` granularity it must match the authenticated login EXACTLY, including case (the comparison is byte-exact; no normalization) | hosted multi-tenant; bootstrap skipped |
+| `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `--single-tenant-granularity` | `enterprise` \| `organization` \| `group` \| `user` | `enterprise`, once the key is set |
 | `FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE` | `--single-tenant-auto-join-role` | role minted on auto-joining members | `member`, once the key is set |
 | `FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME` | `--single-tenant-display-name` | cosmetic | NULL |
 | `FISHHAWKD_SINGLE_TENANT_PROVIDER` | `--single-tenant-provider` | `github` \| `gitlab` | `github`, once the key is set |

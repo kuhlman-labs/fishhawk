@@ -44,8 +44,11 @@ an org member of "acme" into an `enterprise`-granularity account keyed "acme"
 (and a derived enterprise short code into an `organization` account of the same
 key) — unauthorized admission in the login gate. The caller
 (`auth.MembershipResolver`) derives each key already bound to the granularity it
-came from (`organization` / `enterprise` / `group`); see
-`backend/internal/auth/README.md`.
+came from (`organization` / `enterprise` / `group` / `user`); see
+`backend/internal/auth/README.md`. The `user` tier (E44.35 / #2925) is the
+personal-namespace pair `{login, "user"}` — bound to the login itself, so an
+`organization` account keyed by that same login is NOT admitted by it, and a
+`user` account is NOT admitted by an org key of the same name.
 
 ## account_id threading
 
@@ -197,7 +200,7 @@ fails closed instead.
 | Branch | Result |
 |---|---|
 | Partial configuration (above) | `ErrSingleTenantMissingAccountKey` |
-| Granularity outside `enterprise` / `organization` / `group` | error naming the flag + accepted set (mirrors `accounts_granularity_check`, so the operator sees a message instead of SQLSTATE 23514) |
+| Granularity outside `enterprise` / `organization` / `group` / `user` | error naming the flag + accepted set (mirrors `accounts_granularity_check`, so the operator sees a message instead of SQLSTATE 23514) |
 | Provider outside `github` / `gitlab` | error naming the flag (mirrors `accounts_provider_check`) |
 | Empty `AutoJoinRole` on a directly-constructed config | error — `ListAutoJoinAccountsByKeys` selects only `auto_join_role IS NOT NULL`, so a NULL role is invisible to the login gate and the account would admit nobody. Unreachable through the flag path, where `resolveDefaults` fills `member`; `Validate` is the guard for direct construction |
 | Configured profile, nil query surface (no `FISHHAWKD_DATABASE_URL`) | error — never a silent skip |

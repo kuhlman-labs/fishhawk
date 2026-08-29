@@ -59,6 +59,13 @@ func TestSingleTenantConfig_Validate(t *testing.T) {
 			wantErr: "--single-tenant-granularity",
 		},
 		{
+			// The rejection must enumerate every accepted tier so an operator
+			// sees 'user' as an option — the new tier (E44.35 / #2925).
+			name:    "rejection enumerates the user tier",
+			cfg:     SingleTenantConfig{Provider: "github", AccountKey: "acme", Granularity: "team", AutoJoinRole: "member"},
+			wantErr: "user",
+		},
+		{
 			name:    "provider outside the CHECK constraint",
 			cfg:     SingleTenantConfig{Provider: "bitbucket", AccountKey: "acme", Granularity: "enterprise", AutoJoinRole: "member"},
 			wantErr: "--single-tenant-provider",
@@ -93,6 +100,13 @@ func TestSingleTenantConfig_Validate(t *testing.T) {
 	valid := SingleTenantConfig{Provider: "gitlab", AccountKey: "acme/platform", Granularity: "group", AutoJoinRole: "member"}
 	if err := valid.Validate(); err != nil {
 		t.Errorf("Validate() on a valid profile = %v, want nil", err)
+	}
+
+	// The personal-namespace tier (E44.35 / #2925): account_key = the
+	// owner's login, granularity = user.
+	validUser := SingleTenantConfig{Provider: "github", AccountKey: "octocat", Granularity: "user", AutoJoinRole: "member"}
+	if err := validUser.Validate(); err != nil {
+		t.Errorf("Validate() on a valid user-granularity profile = %v, want nil", err)
 	}
 }
 

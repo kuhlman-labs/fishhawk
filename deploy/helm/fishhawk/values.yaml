@@ -220,7 +220,9 @@ config:
 singleTenant:
   # Enterprise slug, org login, or GitLab group path.
   accountKey: ""
-  # enterprise | organization | group. Empty → enterprise.
+  # enterprise | organization | group | user. Empty → enterprise.
+  # Use "user" for a personal-namespace install: accountKey is the owner's
+  # forge login and the login gate admits it with no forge membership read.
   granularity: ""
   # Role granted to auto-joining members. Empty → member.
   autoJoinRole: ""

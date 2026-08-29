@@ -42,7 +42,7 @@ func runAccountCreate(args []string, logSink io.Writer) int {
 	provider := fs.String("provider", "", "forge discriminator (github|gitlab) — required")
 	accountKey := fs.String("account-key", "", "forge-neutral natural key (enterprise slug / org login / GitLab group path) — required")
 	displayName := fs.String("display-name", "", "cosmetic display name (optional)")
-	granularity := fs.String("granularity", "", "enterprise|organization|group (optional; defaults per provider)")
+	granularity := fs.String("granularity", "", "enterprise|organization|group|user (optional; defaults per provider)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}

@@ -127,6 +127,36 @@ func TestRunAccountCreate_WritesRowAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestRunAccountCreate_UserGranularityWritesRow is the CLI-level done-means for
+// the widened accounts_granularity_check (0077 / E44.35 #2925): an explicit
+// --granularity user writes an accounts row with granularity='user'. Without
+// the migration's CHECK widening this fails with SQLSTATE 23514; without 'user'
+// in account.accountGranularities it fails validation before the write.
+func TestRunAccountCreate_UserGranularityWritesRow(t *testing.T) {
+	url := pgtest.NewURL(t)
+
+	var out bytes.Buffer
+	if got := runAccount([]string{"create", "--db", url, "--provider", "github", "--account-key", "octocat", "--granularity", "user"}, &out); got != exitOK {
+		t.Fatalf("create --granularity user exit = %d, want %d; log:\n%s", got, exitOK, out.String())
+	}
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	var granularity string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT granularity FROM accounts WHERE provider = $1 AND account_key = $2`,
+		"github", "octocat").Scan(&granularity); err != nil {
+		t.Fatalf("read back account: %v", err)
+	}
+	if granularity != "user" {
+		t.Errorf("granularity = %q, want user", granularity)
+	}
+}
+
 // TestRunAccountList_FiltersAndRendersAccountKey asserts the list surface: it
 // renders the joined columns and honors the --provider filter. Covers binding
 // condition 1 (real integration coverage for the list verb).

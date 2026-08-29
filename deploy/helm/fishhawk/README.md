@@ -131,7 +131,7 @@ Empty keys are omitted to match fishhawkd's ignore-if-unset semantics.
 | `config.oauthUserUrl` | `FISHHAWKD_OAUTH_USER_URL` | GHES/EMU user-profile URL |
 | `config.oauthOrgsUrl` | `FISHHAWKD_OAUTH_ORGS_URL` | GHES/EMU user-orgs URL (the login gate's org lister) |
 | `singleTenant.accountKey` | `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | **the enablement signal** — set it and fishhawkd bootstraps ONE implicit account at startup |
-| `singleTenant.granularity` | `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `enterprise` \| `organization` \| `group`; empty → `enterprise` |
+| `singleTenant.granularity` | `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `enterprise` \| `organization` \| `group` \| `user`; empty → `enterprise`. `user` is the personal-namespace tier (`accountKey` = owner login, admitted with no forge read) |
 | `singleTenant.autoJoinRole` | `FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE` | empty → `member`; an account with no auto-join role admits nobody |
 | `singleTenant.displayName` | `FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME` | cosmetic; empty stores NULL |
 | `singleTenant.provider` | `FISHHAWKD_SINGLE_TENANT_PROVIDER` | `github` \| `gitlab`; empty → `github` |

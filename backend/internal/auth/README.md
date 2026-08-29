@@ -35,8 +35,11 @@ The OAuth callback consults `Config.AuthMembership` (a `MembershipResolver`) AFT
 | `organization` | github | `GitHubOAuth.ListUserOrgKeys` — GET `/user/orgs` with the USER's OAuth token, never an App token | yes |
 | `enterprise` | github, **EMU posture only** | the enterprise short code split off the EMU login itself (`emu.go`) | **no** |
 | `group` | gitlab | `GitLabMembershipLister.ListUserOrgKeys` — GET `/api/v4/groups` with the USER's OAuth token, never `FISHHAWKD_GITLAB_TOKEN`; **paginated** to exhaustion (Link `rel="next"`, else a full page implies another) under a 50-page cap, each page body read under a 4 MiB byte cap | yes |
+| `user` | any | the authenticated login itself — the single pair `{login, "user"}` (`selfPairs`, E44.35 / #2925). The personal-namespace tier: `account_key == authenticated login`, byte-exact | **no** |
 
 A match with no existing grant upserts an audited `origin='auto_join'` row (role = the policy's `auto_join_role`, `member_ref` = the forge login) and admits.
+
+**The `user` tier is forge-INDEPENDENT (E44.35 / #2925).** Its predicate `authenticated login == account_key` derives no authority from the forge beyond the profile fetch that already happened, so `evalAutoJoin` runs it over `selfPairs(login)` **BEFORE** the lister lookup — the same placement, and for the same reason, as the invited-grant check. This is what makes a personal-namespace self-host admit its owner when the forge is unreachable or unregistered. The forge call **still happens** whenever a healthy lister is registered — its result is needed for the org/group/EMU granularities — and the two admitted sets (forge-independent user pair, forge-derived pairs) are **unioned**, so a login owning a `user` account AND belonging to auto-join orgs is admitted to both. Two fail-closed edges MOVED as a result: an unregistered lister and a forge-read error now deny only when NO user-granularity account admits (below).
 
 **Keys stay bound to their granularity.** The derived membership set is a list of `(key, granularity)` PAIRS, and `ListAutoJoinAccountsByKeys` matches them **pair-wise** (two positionally-paired arrays `unnest`ed together) — never `account_key = ANY(keys) AND granularity = ANY(granularities)`, whose cartesian product would admit a mere org member of "acme" into an ENTERPRISE account keyed "acme", and a derived enterprise short code into an ORGANIZATION account of the same key. The identical pairing governs re-verification of an existing `auto_join` grant: it re-admits only when its account's own `(account_key, granularity)` is a derived pair.
 
@@ -51,11 +54,12 @@ A match with no existing grant upserts an audited `origin='auto_join'` row (role
 | Mode | Behavior |
 |---|---|
 | `Config.AuthMembership == nil` | deny ALL sign-ins: 302 to the access-denied redirect, no session, no cookie |
-| Forge error during auto-join eval, no invited grant | resolver error → callback 502 `membership_resolution_failed`, no session |
+| Forge error during auto-join eval, neither an invited grant NOR a user-granularity account admits | resolver error → callback 502 `membership_resolution_failed`, no session |
 | Forge error during auto-join eval, invited grant present | invited admission stands (DB-only); auto-join eval degrades closed |
+| Forge error during auto-join eval, a user-granularity account admits | **admits** the user account (its predicate never needed the forge); the forge-derived org/group set is simply dropped for this sign-in (E44.35 / #2925) |
 | No admitting account | 302 to `Config.AuthAccessDeniedRedirect` (default `/access-denied`, validated by `isSafeRelativeRedirect`), no session, no cookie |
-| Provider with NO registered lister (gitlab with `FISHHAWKD_GITLAB_BASE_URL` unset), no invited grant | deny — no auto-join eval is possible without a live membership read |
-| Provider with NO registered lister, invited grant present | **admits** — invited grants are DB-only and forge-independent, so they cannot be gated on forge configuration |
+| Provider with NO registered lister (gitlab with `FISHHAWKD_GITLAB_BASE_URL` unset), neither an invited grant NOR a user-granularity account admits | deny — no forge-derived auto-join eval is possible without a live membership read |
+| Provider with NO registered lister, invited grant OR user-granularity account present | **admits** — invited grants are DB-only and forge-independent; the user tier is likewise forge-independent, so neither can be gated on forge configuration |
 | Underscore-bearing login on github.com posture | no enterprise key derived at all → no enterprise admission (spoofing guard) |
 | EMU posture, login with no underscore / empty half (`alice_`, `_acme`) | no enterprise key contributed; org auto-join unaffected |
 | GitLab group listing errors, non-200, undecodable, exceeds the 50-page cap, or returns a page body over the 4 MiB read cap | error → auto-join eval fails closed (whole sign-in, absent an invited grant). The forge body is semi-trusted input on an auth path, so an oversized page is rejected outright rather than truncated-and-parsed — a truncated listing is a partial membership set, and admitting on one is what this contract forbids |

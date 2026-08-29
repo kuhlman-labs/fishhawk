@@ -50,7 +50,11 @@ const (
 	// default (migration 0052).
 	DefaultSingleTenantProvider = "github"
 	// DefaultSingleTenantGranularity is the GitHub Enterprise posture a
-	// self-hosted (GHES / EMU) install almost always wants.
+	// self-hosted (GHES / EMU) install almost always wants. A
+	// personal-namespace install with no enterprise/org/group to auto-join
+	// through instead sets granularity='user' and account_key=<owner
+	// login>, whose admission needs no forge membership read (E44.35 /
+	// #2925). The default is unchanged.
 	DefaultSingleTenantGranularity = "enterprise"
 	// DefaultSingleTenantAutoJoinRole is the least-privileged role the
 	// login gate can mint a grant with.
@@ -71,7 +75,7 @@ var ErrSingleTenantMissingAccountKey = errors.New(
 // the single-tenant bootstrap (below) and the operator registry surface
 // (registry.go), so the constraint literals live in exactly one place.
 var (
-	accountGranularities = []string{"enterprise", "organization", "group"}
+	accountGranularities = []string{"enterprise", "organization", "group", "user"}
 	accountProviders     = []string{"github", "gitlab"}
 )
 
@@ -86,7 +90,9 @@ type SingleTenantConfig struct {
 	// DisplayName is cosmetic; empty stores NULL.
 	DisplayName string
 	// Granularity is the tier the account_key names ("enterprise" |
-	// "organization" | "group").
+	// "organization" | "group" | "user"). The "user" tier is the
+	// personal-namespace posture (E44.35 / #2925): account_key is the
+	// owner's forge login and admission needs no live-forge read.
 	Granularity string
 	// AutoJoinRole is the role auto-joined members are granted. It must be
 	// non-empty: ListAutoJoinAccountsByKeys selects only accounts whose

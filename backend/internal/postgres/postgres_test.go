@@ -868,6 +868,25 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 	); err != nil {
 		t.Errorf("insert (gitlab, acme-corp) account failed, want success (account_key is provider-scoped): %v", err)
 	}
+	// 0077 (#2925, E44.35) widened accounts_granularity_check to admit 'user' —
+	// the personal-namespace tier. This is a behavioral done-means assertion (a
+	// comment-only touch cannot pass): an accounts row with granularity='user'
+	// now INSERTs where it previously violated the CHECK (SQLSTATE 23514), while
+	// an out-of-set granularity is still rejected by the fail-closed CHECK.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'github', 'octocat', 'user')`,
+		uuid.New(),
+	); err != nil {
+		t.Errorf("insert granularity='user' account after MigrateUp failed (widened CHECK?): %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'github', 'bogus-key', 'team')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("insert account with granularity='team' succeeded, want accounts_granularity_check rejection")
+	}
 	// Forge-neutral-naming mode (Amendment A1 relocation, 0055): the endpoint-
 	// config columns forge_base_url/oauth_base_url now live on INSTALLATIONS,
 	// not accounts — a forge-agnostic workspace spanning a github.com install and
@@ -3084,6 +3103,129 @@ func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
 	}
 	if runsTable != 1 {
 		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0076 is an ALTER + CREATE INDEX)", runsTable)
+	}
+}
+
+// accountsGranularityCheckDefSQL reads the accounts granularity CHECK
+// expression, whose admitted-value set 0077 (#2925) widens with 'user'.
+const accountsGranularityCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+	  WHERE conname = 'accounts_granularity_check'`
+
+// TestMigrateDown_AccountsGranularityUserReversal pins 0077 (#2925, E44.35) in
+// BOTH directions: after MigrateUp the accounts granularity CHECK ADMITS a
+// 'user' row, and after reverting 0077 it REFUSES one while still accepting the
+// three original tiers — proving the constraint was RESTORED, not merely
+// dropped off the 'user' value. A re-MigrateUp re-widens it.
+//
+// Per approval condition 6, the seeded 'user' row is DELETED before the
+// rollback so the test exercises the INTENDED operator path (re-key/delete the
+// user-granularity accounts first) rather than the down migration's documented
+// SQLSTATE-23514 refusal. The 'nonsense' row is rejected in BOTH states — the
+// assertion that distinguishes RELAXED from DROPPED, and the counterfactual
+// target for the up migration's re-ADD.
+func TestMigrateDown_AccountsGranularityUserReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	// An ABSENT constraint reads as the empty string rather than a fatal, so a
+	// migration that DROPped without re-ADDing fails on the BEHAVIOURAL
+	// assertions below (a 'user'/'team' insert is no longer governed) — the
+	// property that distinguishes relaxed from dropped — not on a query error.
+	constraintDef := func() string {
+		var def string
+		switch err := pool.QueryRow(ctx, accountsGranularityCheckDefSQL).Scan(&def); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ""
+		case err != nil:
+			t.Fatalf("query accounts_granularity_check constraint def: %v", err)
+		}
+		return def
+	}
+	// A real accounts row is what the CHECK governs, so every assertion INSERTs
+	// one rather than grepping the rendered constraint text.
+	insertAccount := func(key, granularity string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO accounts (id, provider, account_key, granularity) VALUES ($1, 'github', $2, $3)`,
+			uuid.New(), key, granularity)
+		return err
+	}
+	rejectedBy := func(err error) *pgconn.PgError {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("insert SUCCEEDED, want a CHECK-constraint rejection — the constraint was dropped rather than relaxed/restored")
+		}
+		var checkErr *pgconn.PgError
+		if !errors.As(err, &checkErr) {
+			t.Fatalf("insert returned %v, want a *pgconn.PgError from the CHECK constraint", err)
+		}
+		return checkErr
+	}
+
+	// ---- state 1: 0077 applied ----
+	if def := constraintDef(); !strings.Contains(def, "user") {
+		t.Errorf("accounts_granularity_check after MigrateUp does not admit 'user': %s", def)
+	}
+	if err := insertAccount("octocat", "user"); err != nil {
+		t.Fatalf("insert granularity='user' after MigrateUp: %v — 0077 must make the row insertable", err)
+	}
+	// RELAXED, NOT DROPPED: an unrecognized granularity is still refused.
+	if e := rejectedBy(insertAccount("bogus", "team")); e.Code != "23514" || e.ConstraintName != "accounts_granularity_check" {
+		t.Errorf("insert granularity='team' after MigrateUp: SQLSTATE %s constraint %q, want 23514 accounts_granularity_check — 0077 must RELAX the CHECK, not drop it",
+			e.Code, e.ConstraintName)
+	}
+	// The three original tiers are undisturbed.
+	for _, g := range []string{"enterprise", "organization", "group"} {
+		if err := insertAccount("k-"+g, g); err != nil {
+			t.Errorf("insert granularity=%q after MigrateUp: %v — 0077 must disturb no pre-existing tier", g, err)
+		}
+	}
+
+	// ---- the operator action the down migration requires (condition 6) ----
+	// 0077's down re-adds a CHECK the 'user' row would violate; its header names
+	// the remedy (re-key or delete the user-granularity accounts first). Model
+	// that decision explicitly so the rollback exercises the intended path, not
+	// the documented refusal.
+	if _, err := pool.Exec(ctx, `DELETE FROM accounts WHERE granularity = 'user'`); err != nil {
+		t.Fatalf("clear user-granularity accounts before rollback: %v", err)
+	}
+
+	// ---- state 2: 0077 reverted ----
+	// downThrough names 0077 (rather than a bare MigrateDown at the tip) so this
+	// stays a one-line target when a migration lands above it.
+	downThrough(t, url, "0077")
+
+	if def := constraintDef(); strings.Contains(def, "user") {
+		t.Errorf("accounts_granularity_check after rollback still admits 'user': %s", def)
+	}
+	if e := rejectedBy(insertAccount("octocat", "user")); e.Code != "23514" || e.ConstraintName != "accounts_granularity_check" {
+		t.Errorf("insert granularity='user' after rollback: SQLSTATE %s constraint %q, want 23514 accounts_granularity_check",
+			e.Code, e.ConstraintName)
+	}
+	// RESTORED, not merely dropped-off-'user': 'organization' still inserts and
+	// 'team' is still refused.
+	if err := insertAccount("acme-corp", "organization"); err != nil {
+		t.Errorf("insert granularity='organization' after rollback: %v — the rollback must restore the three-value set, not drop the constraint", err)
+	}
+	if e := rejectedBy(insertAccount("bogus2", "team")); e.Code != "23514" || e.ConstraintName != "accounts_granularity_check" {
+		t.Errorf("insert granularity='team' after rollback: SQLSTATE %s constraint %q, want 23514 accounts_granularity_check",
+			e.Code, e.ConstraintName)
+	}
+
+	// ---- re-widened after MigrateUp ----
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("re-MigrateUp: %v", err)
+	}
+	if err := insertAccount("octocat", "user"); err != nil {
+		t.Errorf("insert granularity='user' after re-MigrateUp: %v — 0077 must re-widen the CHECK", err)
 	}
 }
 

@@ -5447,13 +5447,16 @@ paths:
         Verifies the state, exchanges the code for a GitHub access token,
         fetches the GitHub profile, then runs the workspace-membership gate
         (E44.3 / ADR-057 Amendment A2) BEFORE any session exists: an
-        `invited` `account_members` row admits DB-only; otherwise the user's
-        live org list is intersected with org-granularity accounts whose
-        `auto_join_role` policy is set (minting an audited `auto_join` row on
-        first match). Only an admitted user gets a `fishhawk_session` cookie,
-        bound to the resolved account. A user no account admits is redirected
-        to the access-denied page with NO session cookie; a forge error
-        during auto-join evaluation (with no invited row) fails closed.
+        `invited` `account_members` row admits DB-only; a `user`-granularity
+        account whose `account_key` equals the authenticated login admits with
+        NO forge read (E44.35 / #2925); otherwise the user's live org list is
+        intersected with org-granularity accounts whose `auto_join_role` policy
+        is set (minting an audited `auto_join` row on first match). Only an
+        admitted user gets a `fishhawk_session` cookie, bound to the resolved
+        account. A user no account admits is redirected to the access-denied
+        page with NO session cookie; a forge error during auto-join evaluation
+        fails closed only when neither an invited grant NOR a user-granularity
+        account admits.
       security: []
       tags: [auth]
       parameters:
@@ -5476,7 +5479,8 @@ paths:
         '502':
           description: |
             Membership resolution failed closed — the forge membership API
-            errored during auto-join evaluation and no invited grant admits
+            errored during auto-join evaluation and neither an invited grant
+            NOR a user-granularity account admits
             (`membership_resolution_failed`). No session is created.
           content:
             application/json:
@@ -5518,15 +5522,18 @@ paths:
         Verifies the state, exchanges the code for a GitLab access token,
         fetches the GitLab profile, then runs the workspace-membership gate
         (E44.3 / ADR-057 Amendment A2) with `provider=gitlab` BEFORE any
-        session exists: an `invited` `account_members` row admits DB-only;
-        otherwise the user's live GitLab group list (`GET /api/v4/groups`
-        with the signing-in user's OAuth token) is intersected with
-        group-granularity accounts whose `auto_join_role` policy is set
-        (minting an audited `auto_join` row on first match). Only an admitted
-        user gets a `fishhawk_session` cookie, bound to the resolved account.
-        A user no account admits is redirected to the access-denied page with
-        NO session cookie; a forge error during auto-join evaluation (with no
-        invited row) fails closed. The user identity is scoped by provider so
+        session exists: an `invited` `account_members` row admits DB-only; a
+        `user`-granularity account whose `account_key` equals the authenticated
+        login admits with NO forge read (E44.35 / #2925); otherwise the user's
+        live GitLab group list (`GET /api/v4/groups` with the signing-in
+        user's OAuth token) is intersected with group-granularity accounts
+        whose `auto_join_role` policy is set (minting an audited `auto_join`
+        row on first match). Only an admitted user gets a `fishhawk_session`
+        cookie, bound to the resolved account. A user no account admits is
+        redirected to the access-denied page with NO session cookie; a forge
+        error during auto-join evaluation fails closed only when neither an
+        invited grant NOR a user-granularity account admits. The user identity
+        is scoped by provider so
         a GitLab numeric id never collides with a GitHub user of the same id.
       security: []
       tags: [auth]
@@ -5550,7 +5557,8 @@ paths:
         '502':
           description: |
             Membership resolution failed closed — the GitLab membership API
-            errored during auto-join evaluation and no invited grant admits
+            errored during auto-join evaluation and neither an invited grant
+            NOR a user-granularity account admits
             (`membership_resolution_failed`). No session is created.
           content:
             application/json:
