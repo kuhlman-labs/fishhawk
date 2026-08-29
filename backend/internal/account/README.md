@@ -282,3 +282,53 @@ committed-state, idempotence, and cross-boundary tests
 through to the shipped `gitLabProjectRegistry`) live in
 `backend/cmd/fishhawkd/{account,installation}_test.go`. Operator guide:
 `docs/deploy/gitlab.md`.
+
+## Operator membership surface (`members.go`, E44.34 / #2924)
+
+`members.go` is the membership half of the operator registry: it admits the first
+human on a fresh self-hosted install by writing an `account_members` row with
+`origin='invited'`, which the login-gate admission walk (`backend/internal/auth/membership.go`)
+already honors **DB-only** — an invited grant is checked BEFORE the sole live-forge
+auto-join read (ADR-057 Amendment A2), so it admits with no forge round-trip at all.
+`InviteMember` / `ListMembers` back the `fishhawkd member invite|list` subcommands,
+composing with the shipped `account create` verb: the operator creates the account,
+then invites the member into it. This replaces the hand-written SQL
+`docs/deploy/self-hosted.md` used to point operators at.
+
+### The verb pins `origin='invited'` rather than parameterizing it
+
+`UpsertInvitedAccountMember` writes the literal `'invited'` — there is no `--origin`
+flag. An operator verb that could mint `origin='auto_join'` would assert a
+forge-derived provenance no forge ever reported, and the login gate re-verifies
+`auto_join` grants against the live forge on each subsequent login, so such a row
+would be silently revoked later. Consequence, asserted as committed state in
+`members_test.go`: an existing `auto_join` grant re-invited by an operator is
+**upgraded** to `invited` (forge-independent) — the `ON CONFLICT … DO UPDATE SET
+origin = EXCLUDED.origin` is deliberate, not incidental.
+
+### The role allow-list exists because there is no DB `CHECK`
+
+`account_members.role` is nullable `TEXT` with **no** database `CHECK` (migration
+`0055`), and `Store.MemberRole` (`roles.go`) resolves every non-`admin` value —
+including a typo like `admn` — to member-tier (least privilege). So a mis-typed
+`--role` would be accepted by the database and silently produce a member-tier grant
+with no error at any layer. `InviteMemberRequest.Validate` is the ONLY guard: it
+rejects any role outside `{admin, member}` (`memberRoles`) with `ErrValidation`
+naming the value and the accepted set. `member_ref` is the forge **login** the
+resolver matches on (`ListMemberGrants(ctx, provider, profile.Login)`), not a numeric
+id or email.
+
+### Fail-closed branches
+
+| Branch | Result |
+|---|---|
+| Empty `--member-ref` / provider not in `accountProviders` / role not in `memberRoles` | error wrapping `ErrValidation`, naming the offending value |
+| Named account does not exist | error wrapping `ErrAccountNotFound`, naming the `account create` remedy; membership write never reached |
+| Any other DB fault from `GetAccountByKey` | propagated verbatim (neither validation nor not-found), so the CLI maps it to a failure exit |
+
+`ErrValidation` / `ErrAccountNotFound` are reused from `registry.go` so the CLI's
+usage-vs-failure exit-code split is by error KIND. `members_test.go` pins one case
+per branch plus committed-state / idempotence / auto_join-upgrade reads; the
+cross-boundary seam test (CLI → domain → sqlc → Postgres → the resolver with an
+**empty lister registry**, proving DB-only admission) lives in
+`backend/cmd/fishhawkd/member_test.go`. Operator guide: `docs/deploy/self-hosted.md`.

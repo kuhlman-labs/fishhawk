@@ -7,6 +7,7 @@
 //	fishhawkd migrate down          roll back the most recent migration (dev only)
 //	fishhawkd account create|list   register / inventory tenancy accounts (GitLab authz gate)
 //	fishhawkd installation register|list  register / inventory installations (GitLab authz gate)
+//	fishhawkd member invite|list    invite / inventory account membership grants (first-user bootstrap)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -48,6 +49,8 @@ func run(args []string, logSink io.Writer) int {
 		return runAccount(rest, logSink)
 	case "installation":
 		return runInstallation(rest, logSink)
+	case "member":
+		return runMember(rest, logSink)
 	case "-h", "--help", "help":
 		printUsage(logSink)
 		return exitOK
@@ -73,7 +76,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -86,6 +89,8 @@ func printUsage(w io.Writer) {
 		"  account list           Inventory registered tenancy accounts.",
 		"  installation register  Register an installation under an account (the GitLab authorization gate).",
 		"  installation list      Inventory registered installations with their owning account_key.",
+		"  member invite          Invite a forge member into an account (the first-user bootstrap; writes an origin='invited' grant).",
+		"  member list            Inventory membership grants with their origin and owning account.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}
