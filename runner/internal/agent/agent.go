@@ -56,12 +56,25 @@ type Invocation struct {
 	// keeps working. A NIL BaseEnv preserves today's
 	// inherit-parent-env behavior byte-for-byte; a non-nil EMPTY
 	// slice means "start from an empty env" — the default-deny
-	// posture. Used by the acceptance stage (ADR-050 / #1535) to
-	// hand the agent the minimized runner/internal/acceptenv set
-	// instead of the full runner env. It applies only at the seed
-	// point: a Cmd builder that pre-sets a non-nil cmd.Env (the
-	// test seam) keeps its env, exactly as with the os.Environ()
-	// seed today. Adapters must not mutate the slice.
+	// posture.
+	//
+	// As a SEAM contract the nil case above remains exactly as
+	// specified. What changed is who sets the field: the runner now
+	// seeds BaseEnv on EVERY stage — runner/internal/acceptenv for
+	// the acceptance stage (ADR-050 / #1535) and
+	// runner/internal/agentenv for every other stage (#2894) — so a
+	// spawn that inherits the runner's full environment is no longer
+	// a path the runner takes. #2894 closed that asymmetry: the
+	// implement/plan/review agent was the one subprocess class with
+	// no env allow-list, and it therefore saw the ambient operator
+	// bearer FISHHAWK_API_TOKEN. A nil BaseEnv now means only "this
+	// caller composed no env", which in-tree is the local replay /
+	// test path.
+	//
+	// It applies only at the seed point: a Cmd builder that pre-sets
+	// a non-nil cmd.Env (the test seam) keeps its env, exactly as
+	// with the os.Environ() seed today. Adapters must not mutate the
+	// slice.
 	BaseEnv []string
 
 	// Env carries additional environment variables to layer onto
