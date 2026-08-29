@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupattempt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -2869,6 +2870,52 @@ type fixupReportingObligationDetail struct {
 	Untrusted bool `json:"untrusted,omitempty"`
 }
 
+// fixupConcernUnattemptedCategory is the audit-log category for the advisory
+// pre-review signal (#2896) emitted when a fix-up pass leaves the files a routed
+// concern's instruction text NAMED entirely untouched. It is an internal
+// advisory audit kind written by the trace handler before the reviewer verdict —
+// NOT an issue-comment surface (nothing in issuecomment emits it). EVIDENCE
+// ONLY: it never fails, re-opens, or re-budgets the pass.
+const fixupConcernUnattemptedCategory = "fixup_concern_unattempted"
+
+// fixupConcernUnattemptedPayload is the audit payload for a
+// fixup_concern_unattempted entry (#2896).
+//
+// It is emitted whenever the pass routed at least one concern AND the check
+// found something to say — an unattempted concern, an untouched file the routed
+// instructions named, or a NON-ZERO undeterminable count. That last disjunct is
+// binding condition 3 on #2896: a pass whose every routed concern was
+// undeterminable is a total COVERAGE GAP, and emitting nothing there would let
+// the operator read silence as "checked and clean". With it, silence from this
+// surface means exactly one thing — the pass routed concerns, every one was
+// decidable, and every one was attempted.
+type fixupConcernUnattemptedPayload struct {
+	RoutedCount         int                             `json:"routed_count"`
+	UnattemptedCount    int                             `json:"unattempted_count"`
+	UndeterminableCount int                             `json:"undeterminable_count"`
+	Concerns            []fixupConcernUnattemptedDetail `json:"concerns"`
+	// UnattributedUntouchedFiles are candidate paths the routed instruction text
+	// as a WHOLE named (the operator's fix-up reason / operator_concern) and the
+	// pass never touched, with no claim about WHICH routed concern they belong
+	// to — see resolveRoutedFixupConcerns for why they are not attributed.
+	UnattributedUntouchedFiles []string `json:"unattributed_untouched_files,omitempty"`
+}
+
+// fixupConcernUnattemptedDetail is one unattempted routed concern on the audit
+// payload: its durable concern id when the trigger recorded one, its 1-based
+// ROUTING position (populated always — it is what identifies an id-less
+// positionally-routed concern in the operator-facing record, binding condition
+// 5a), the server-derived severity/category, and the files its routed text named
+// that the pass left untouched. The concern NOTE is deliberately absent: it is
+// already carried, with its own trust framing, by the routed-concern surfaces.
+type fixupConcernUnattemptedDetail struct {
+	ID              string   `json:"id,omitempty"`
+	Position        int      `json:"position"`
+	Severity        string   `json:"severity"`
+	Category        string   `json:"category"`
+	ImplicatedFiles []string `json:"implicated_files"`
+}
+
 // concernRelitigationSuppressedCategory is the audit-log category for the
 // deterministic re-litigation guard (#1913): a reviewer concern whose
 // settled_ref resolves to a same-run/same-stage WAIVED or DEFERRED concern and
@@ -3716,6 +3763,119 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 						slog.String("stage_id", stageID.String()),
 						slog.String("error", aerr.Error()),
 					)
+				}
+			}
+		}
+	}
+
+	// Routed-concern NOT-ATTEMPTED pre-review signal (#2896). A fix-up pass
+	// reports `succeeded` with no mechanical check that each routed concern was
+	// even attempted — the verify gate certifies only the tree and this review is
+	// diff-only — so a silently dropped concern is indistinguishable from an
+	// addressed one (run 925addab / PR #2895: two concerns routed, only the low's
+	// file touched, the medium's file never opened, stage clean). This is the
+	// cheapest mechanically-checkable signal: this is the one place holding BOTH
+	// the routed concern set (the stage_fixup_triggered payload) and the FIX-UP
+	// DELTA diff, so derive each routed concern's implicated files from its
+	// routed text, intersect with the committed path set, and surface every
+	// concern whose implicated files are ENTIRELY untouched.
+	//
+	// EVIDENCE ONLY, byte-for-byte the #1407/#2737 posture: an advisory audit
+	// entry plus a prompt field. It NEVER touches the review outcome, res, the
+	// stage result, or the fix-up budget — pinned by
+	// TestRunImplementReviews_UnattemptedConcern_SignalDoesNotAlterOutcome.
+	// Untouched implicated files are evidence the concern was NOT ATTEMPTED, and
+	// deliberately NOT proof it was not addressed: a concern can be legitimately
+	// resolved by editing a different file, or legitimately declined.
+	if routed, sharedText, haveTrigger := s.resolveRoutedFixupConcerns(ctx, runID, stageID); haveTrigger && len(routed) > 0 {
+		// committedPathSet folds rename SOURCES into the touched set so a fix
+		// realized as a rename is never a false untouched signal (#2398); a diff
+		// whose R rows carry no source path is rename-INDETERMINATE and the
+		// untouched label is not determinable at all, so the signal is suppressed.
+		committed, _, renameIndeterminate := committedPathSet(diff)
+		candidates := fixupAttemptCandidates(approvedPlan, committed)
+		if !renameIndeterminate && len(candidates) > 0 {
+			classified := make([]fixupattempt.Concern, 0, len(routed))
+			for _, rc := range routed {
+				classified = append(classified, fixupattempt.Concern{
+					ID:       rc.ID,
+					Position: rc.Position,
+					Severity: rc.Severity,
+					Category: rc.Category,
+					// Position rides through from routing time; Implicated is the
+					// only thing derived here.
+					Implicated: fixupattempt.Implicated(rc.Note, candidates),
+				})
+			}
+			findings, undeterminable := fixupattempt.Unattempted(classified, committed)
+			// The routed instruction text as a WHOLE (the operator's reason and
+			// operator_concern) routinely names the files a concern's own prose
+			// only alludes to — in the #2896 incident NEITHER concern note named
+			// a path while the reason named both. Those paths cannot be
+			// attributed to one concern without guessing, so untouched ones are
+			// reported as FILES the routed instructions named and the pass never
+			// touched, with no claim about which concern they belong to.
+			unattributed := fixupattempt.Untouched(fixupattempt.Implicated(sharedText, candidates), committed)
+			if len(findings) > 0 || len(unattributed) > 0 || undeterminable > 0 {
+				details := make([]fixupConcernUnattemptedDetail, 0, len(findings))
+				var gateConcerns []prompt.GateFixupUnattemptedConcern
+				for _, f := range findings {
+					details = append(details, fixupConcernUnattemptedDetail{
+						ID:              f.ID,
+						Position:        f.Position,
+						Severity:        f.Severity,
+						Category:        f.Category,
+						ImplicatedFiles: f.ImplicatedFiles,
+					})
+					gateConcerns = append(gateConcerns, prompt.GateFixupUnattemptedConcern{
+						ID:              f.ID,
+						Position:        f.Position,
+						Severity:        f.Severity,
+						Category:        f.Category,
+						ImplicatedFiles: f.ImplicatedFiles,
+					})
+				}
+				// Only an ACTIONABLE result reaches the reviewer prompt: a
+				// pure coverage-gap record (findings and unattributed both
+				// empty, undeterminable non-zero) is operator-facing audit
+				// only, so a review whose check found nothing to say stays
+				// byte-identical.
+				if len(gateConcerns) > 0 || len(unattributed) > 0 {
+					if gateEvidence == nil {
+						gateEvidence = &prompt.GateEvidence{}
+						trig.GateEvidence = gateEvidence
+					}
+					gateEvidence.FixupUnattemptedConcerns = gateConcerns
+					gateEvidence.FixupUnattemptedFiles = unattributed
+					gateEvidence.FixupUnattemptedUndeterminable = undeterminable
+					gateEvidence.FixupRoutedConcernCount = len(routed)
+				}
+				// Best-effort advisory append with a WARN on failure. The
+				// resolver already returned no trigger under a nil AuditRepo, so
+				// this guard is belt-and-braces rather than the sole defense.
+				if s.cfg.AuditRepo != nil {
+					payload, _ := json.Marshal(fixupConcernUnattemptedPayload{
+						RoutedCount:                len(routed),
+						UnattemptedCount:           len(findings),
+						UndeterminableCount:        undeterminable,
+						Concerns:                   details,
+						UnattributedUntouchedFiles: unattributed,
+					})
+					systemKind := audit.ActorKind("system")
+					if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+						RunID:     runID,
+						StageID:   &stageID,
+						Timestamp: time.Now().UTC(),
+						Category:  fixupConcernUnattemptedCategory,
+						ActorKind: &systemKind,
+						Payload:   payload,
+					}); aerr != nil {
+						s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append fixup_concern_unattempted audit entry failed",
+							slog.String("run_id", runID.String()),
+							slog.String("stage_id", stageID.String()),
+							slog.String("error", aerr.Error()),
+						)
+					}
 				}
 			}
 		}
@@ -5733,6 +5893,143 @@ func operatorScopeUndelivered(operatorAdded []string, diff policy.Diff) (undeliv
 		out = append(out, p)
 	}
 	return out, indeterminate
+}
+
+// routedFixupConcern is one concern routed back to a fix-up pass, read from the
+// stage_fixup_triggered audit payload with its 1-based ROUTING POSITION captured
+// at read time (#2896 binding condition 1). Position is captured here, before
+// any classification or filtering, and copied verbatim through
+// fixupattempt.Unattempted — it is never re-derived from a filtered slice, which
+// is what would let the surviving finding of two id-less routed concerns be
+// labelled "concern 1" when the concern actually dropped was the second.
+type routedFixupConcern struct {
+	ID       string
+	Position int
+	Severity string
+	Category string
+	Note     string
+}
+
+// resolveRoutedFixupConcerns returns the concerns routed back to this stage's
+// most recent fix-up pass, plus the SHARED routed instruction text (the
+// operator's fix-up `reason` and free-text `operator_concern`).
+//
+// Entry selection is the SAME predicate resolveFixupConcerns uses at prompt-serve
+// time — newest-first, the first entry bound to this stage with a non-empty
+// concern set — so the review classifies the concerns the served fix-up prompt
+// actually rendered. It deliberately does NOT reuse the #2737 block's
+// anchor-pinned resolution (binding condition 5b: this is a SEPARATE
+// ListForRunByCategory call, not a hoist of that one): the
+// fixup_report_obligations_declared anchor is written only when the served
+// prompt detected a REPORTING obligation, so keying off it would make this
+// signal inert on the ordinary fix-up pass — exactly the "ships as coverage,
+// checks nothing" failure this change exists to avoid. The #2737 block and its
+// tests are untouched by that choice.
+//
+// concern_ids[i] is paired with concerns[i] ONLY when the two arrays are the
+// same length; writeFixupAudit writes both from the same selection-order slices
+// and the deprecated positional path leaves concern_ids EMPTY rather than
+// misaligned, so a future divergence degrades to an id-less, position-labelled
+// concern instead of attributing a finding to the WRONG concern id.
+//
+// Returns ok=false when the AuditRepo is unconfigured, the list errors, or the
+// stage carries no fix-up trigger (the common, non-fix-up case) — each a
+// no-signal degrade, the fail-safe direction for an evidence-only surface.
+func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (concerns []routedFixupConcern, sharedText string, ok bool) {
+	if s.cfg.AuditRepo == nil {
+		return nil, "", false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list stage_fixup_triggered audit for attempt check failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, "", false
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Concerns        []planreview.Concern `json:"concerns"`
+			ConcernIDs      []string             `json:"concern_ids"`
+			Reason          string               `json:"reason"`
+			OperatorConcern string               `json:"operator_concern"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			// Same tolerance as resolveFixupConcerns: skip a malformed entry.
+			continue
+		}
+		if len(payload.Concerns) == 0 {
+			continue
+		}
+		idsAligned := len(payload.ConcernIDs) == len(payload.Concerns)
+		out := make([]routedFixupConcern, 0, len(payload.Concerns))
+		for idx, c := range payload.Concerns {
+			rc := routedFixupConcern{
+				Position: idx + 1,
+				Severity: string(c.Severity),
+				Category: string(c.Category),
+				Note:     c.Note,
+			}
+			if idsAligned {
+				rc.ID = payload.ConcernIDs[idx]
+			}
+			out = append(out, rc)
+		}
+		shared := payload.Reason
+		if payload.OperatorConcern != "" {
+			shared += "\n" + payload.OperatorConcern
+		}
+		return out, shared, true
+	}
+	return nil, "", false
+}
+
+// fixupAttemptCandidates returns the repo-relative paths a routed concern's
+// instruction text may be resolved against: the approved plan's declared
+// scope.files UNION the paths the fix-up commit actually touched.
+//
+// Binding condition 4 on #2896 resolves the plan's internal conflict between
+// "scope.files UNION committed paths" and the "nil plan / empty scope.files ->
+// no signal" fail-safe in favour of the UNION, with ONE rule stated here: the
+// candidate set is the union, and the SIGNAL is suppressed only when that union
+// is EMPTY. So a nil approvedPlan or an empty scope.files does NOT by itself
+// suppress the check — if the pass committed a diff, those committed paths are
+// candidates and an entry IS emitted when the routed text names one and leaves
+// it untouched. The union is what lets a concern naming a file the pass
+// legitimately CREATED still resolve, and the empty-union guard is what stops
+// the classifier running with nothing to anchor on (every concern would be
+// undeterminable, so it could only ever emit a coverage-gap record about a pass
+// it had no way to check).
+func fixupAttemptCandidates(approvedPlan *plan.Plan, committed map[string]struct{}) []string {
+	seen := make(map[string]struct{}, len(committed)+8)
+	var out []string
+	add := func(p string) {
+		if p == "" || strings.HasSuffix(p, "/") || !isRepoRelativePath(p) {
+			return
+		}
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if approvedPlan != nil {
+		for _, f := range approvedPlan.Scope.Files {
+			add(f.Path)
+		}
+	}
+	for p := range committed {
+		add(p)
+	}
+	// Committed paths arrive in map order; sort the whole set so the candidate
+	// order (and therefore every rendered/audited file list) is deterministic.
+	sort.Strings(out)
+	return out
 }
 
 // gateEvidenceForReview maps the bundle's gate_evidence wire struct into

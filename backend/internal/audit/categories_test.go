@@ -242,6 +242,19 @@ func TestKnownCategories_PlanCommentOnlyOverrideAcknowledged(t *testing.T) {
 // reading the PR" half of the acceptance criterion untrue — and
 // categories_completeness_test.go's AST sweep fails the build on a category
 // backend code emits but the registry omits.
+// TestKnownCategories_FixupConcernUnattempted pins the #2896 advisory
+// pre-review signal's category: the implement review appends
+// fixup_concern_unattempted when a fix-up pass left the files a routed
+// concern's instruction text named entirely untouched. Unregistered it would be
+// unwaitable via fishhawk_await_audit and unfilterable via
+// GET /v0/runs/{run_id}/audit?category=, which is the operator-facing half of
+// the signal.
+func TestKnownCategories_FixupConcernUnattempted(t *testing.T) {
+	if !IsKnownCategory("fixup_concern_unattempted") {
+		t.Fatal("fixup_concern_unattempted is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 func TestKnownCategories_FixupReportingObligationUndelivered(t *testing.T) {
 	if !IsKnownCategory("fixup_reporting_obligation_undelivered") {
 		t.Fatal("fixup_reporting_obligation_undelivered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")

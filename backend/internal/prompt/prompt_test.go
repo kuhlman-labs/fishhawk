@@ -10942,3 +10942,112 @@ func TestBuild_MultiLineIssueTitle_CanOpenColumn0DelimiterLine(t *testing.T) {
 			"body envelope's own framing changed.\n---\n%s", untrustedIssueTextEnd, n, got)
 	}
 }
+
+// TestBuild_ImplementReview_GateEvidence_RendersFixupUnattemptedConcerns pins
+// the #2896 reviewer-facing half: a DISTINCT high-priority block naming each
+// unattempted routed concern (by id where there is one, by routing POSITION
+// where there is not), its severity/category and its untouched files, framed as
+// NOT ATTEMPTED rather than NOT ADDRESSED.
+func TestBuild_ImplementReview_GateEvidence_RendersFixupUnattemptedConcerns(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 1},
+			FixupUnattemptedConcerns: []GateFixupUnattemptedConcern{
+				{ID: "f5c464c6", Position: 2, Severity: "medium", Category: "security",
+					ImplicatedFiles: []string{"docs/onboarding.md"}},
+				{Position: 3, Severity: "low", Category: "verification",
+					ImplicatedFiles: []string{"backend/internal/server/README.md"}},
+			},
+			FixupUnattemptedFiles:          []string{"docs/spec/workflow-v2.md"},
+			FixupUnattemptedUndeterminable: 1,
+			FixupRoutedConcernCount:        4,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Routed concern NOT ATTEMPTED (deterministic, high priority)",
+		"This is NOT a \"cannot be verified from the diff\" observation",
+		"concern `f5c464c6` (routed position 2) [medium/security] — named but untouched: docs/onboarding.md",
+		// An id-less concern is labelled by its ROUTING position, never dropped.
+		"routed concern 3 [low/verification] — named but untouched: backend/internal/server/README.md",
+		"not attributable to one concern",
+		"docs/spec/workflow-v2.md",
+		// The framing that keeps the signal honest.
+		"evidence the concern was NOT ATTEMPTED",
+		"does NOT establish that the concern was not ADDRESSED",
+		"names a file precisely to say do NOT touch",
+		// The coverage caveat, so the block cannot read as an exhaustive audit.
+		"Coverage caveat: 1 of the 4 routed concern(s) could NOT be checked",
+		"ADVISORY — it did NOT fail, re-open, or re-budget the pass",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("not-attempted gate-evidence render missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_NoFixupUnattemptedSection is the
+// byte-identity pin (prompt-hash replay stability): a review with nothing
+// unattempted renders exactly as it did before this signal existed, INCLUDING a
+// pure coverage-gap carrier (undeterminable count set, no findings and no
+// files), which is operator-facing audit only.
+func TestBuild_ImplementReview_GateEvidence_NoFixupUnattemptedSection(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{ScopeFacts: &GateScopeFacts{DeclaredFiles: 1}},
+	}
+	plain, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(plain, "### Routed concern NOT ATTEMPTED") {
+		t.Errorf("the block must be absent when nothing is unattempted:\n%s", plain)
+	}
+
+	gapOnly := base
+	gapOnly.GateEvidence = &GateEvidence{
+		ScopeFacts:                     &GateScopeFacts{DeclaredFiles: 1},
+		FixupUnattemptedUndeterminable: 2,
+		FixupRoutedConcernCount:        2,
+	}
+	gotGap, err := Build("implement_review", gapOnly)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if gotGap != plain {
+		t.Errorf("a coverage-gap-only carrier changed the reviewer prompt:\n%s", gotGap)
+	}
+}
+
+// TestWriteTrustedFixupConcerns_StatesTheNotAttemptedObligation pins the up-front
+// half of #2896: the fix-up prompt tells the agent BEFORE it works that a routed
+// concern whose named files it leaves untouched is surfaced to the re-review, so
+// a different-file fix or a decline must be stated rather than left silent.
+func TestWriteTrustedFixupConcerns_StatesTheNotAttemptedObligation(t *testing.T) {
+	var b strings.Builder
+	writeTrustedFixupConcerns(&b, []FixupConcern{{Text: "[medium/security] qualify the lead sentence"}})
+	got := b.String()
+	for _, w := range []string{
+		"surfaced to the re-review as NOT ATTEMPTED",
+		"editing a DIFFERENT file than it names, or you decline it, say so explicitly",
+		"fix-up commit message body",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up concern render missing %q:\n%s", w, got)
+		}
+	}
+
+	// An empty concern set still renders nothing at all.
+	var empty strings.Builder
+	writeTrustedFixupConcerns(&empty, nil)
+	if empty.String() != "" {
+		t.Errorf("empty concern set rendered %q", empty.String())
+	}
+}

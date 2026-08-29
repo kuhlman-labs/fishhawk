@@ -7918,3 +7918,597 @@ func TestApplyConcernResolutions_ReopenedReasonUntouched(t *testing.T) {
 		t.Errorf("reopened state_reason must NOT carry the head sha suffix, got %q", row.StateReason)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2896 — routed-concern NOT-ATTEMPTED advisory signal.
+// ---------------------------------------------------------------------------
+
+// unattemptedScopeA and unattemptedScopeB are the two declared scope files the
+// #2896 tests route concerns against. Both are in the plan scope, so both are
+// candidates regardless of what the fix-up commit touched.
+const (
+	unattemptedScopeA = "backend/internal/foo/foo.go"
+	unattemptedScopeB = "docs/onboarding.md"
+)
+
+// newUnattemptedReviewServer mirrors newImplementReviewServerWithSet but seeds a
+// plan whose scope carries the given files, so a routed concern can name a
+// declared-but-untouched path. The stock helper's single-file scope cannot
+// express "named file the pass never touched".
+func newUnattemptedReviewServer(t *testing.T, reviewer PlanReviewer, scopeFiles ...string) (
+	*Server, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
+) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementGatingReviewers
+	runRow.Repo = "kuhlman-labs/example"
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	files := make([]plan.ScopeFile, 0, len(scopeFiles))
+	for _, p := range scopeFiles {
+		files = append(files, plan.ScopeFile{Path: p, Operation: plan.FileOpModify})
+	}
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Add foo helper",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope:                      plan.Scope{Files: files},
+	})
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   newSigningFake(),
+		TraceStore:    newTraceStoreFake(),
+		AuditRepo:     au,
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		PlanReviewers: singleReviewerSet{reviewer},
+	})
+	return s, au, rr, runRow, implStage
+}
+
+// seedFixupTriggerConcerns seeds a stage_fixup_triggered entry routing the given
+// concerns, with `reason` as the operator's shared routed text. withIDs controls
+// whether the payload carries a concern_ids array: false reproduces the
+// DEPRECATED positional routing path, where a finding is identifiable only by
+// its 1-based routing position.
+func seedFixupTriggerConcerns(t *testing.T, au *auditFake, runID, stageID uuid.UUID,
+	concerns []planreview.Concern, reason string, withIDs bool) []string {
+	t.Helper()
+	payload := map[string]any{
+		"stage_id": stageID.String(),
+		"concerns": concerns,
+		"reason":   reason,
+	}
+	var ids []string
+	if withIDs {
+		for range concerns {
+			ids = append(ids, uuid.NewString())
+		}
+		payload["concern_ids"] = ids
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal fixup trigger payload: %v", err)
+	}
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: int64(len(au.seeded) + 1), RunID: &runID, StageID: &stageID,
+		Category: CategoryStageFixupTriggered, Payload: raw,
+	})
+	return ids
+}
+
+// unattemptedPayloads returns the decoded payloads of every
+// fixup_concern_unattempted entry appended for the run.
+func unattemptedPayloads(t *testing.T, au *auditFake) []fixupConcernUnattemptedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []fixupConcernUnattemptedPayload
+	for i := range au.appended {
+		if au.appended[i].Category != fixupConcernUnattemptedCategory {
+			continue
+		}
+		var p fixupConcernUnattemptedPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			t.Fatalf("unmarshal fixup_concern_unattempted payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// twoRoutedConcerns is the routed pair both mandated-negative tests use: the
+// first names scope file A, the second names scope file B.
+func twoRoutedConcerns() []planreview.Concern {
+	return []planreview.Concern{
+		{Severity: "low", Category: "verification", Note: "the first concern is about " + unattemptedScopeA},
+		{Severity: "medium", Category: "security", Note: "the second concern is about " + unattemptedScopeB},
+	}
+}
+
+// touchedOnlyA is the fix-up DELTA of a pass that addressed only the first
+// routed concern — the shape of the #2896 incident.
+func touchedOnlyA() policy.Diff {
+	return policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: unattemptedScopeA, Status: policy.StatusModified},
+	}}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_SurfacesDroppedConcern is the
+// MANDATED NEGATIVE (#2896) and the counterfactual vehicle for the whole
+// control: TWO concerns are routed naming two different declared files, the
+// fix-up delta touches only the FIRST, and the pass must surface the SECOND.
+//
+// A both-addressed test would pass against today's behavior and prove nothing,
+// which is exactly the trap the issue names. The bad state is seeded BY
+// CONSTRUCTION — the second concern's file is simply absent from the diff — so
+// the RED lands on the committed-audit-state assertion, not on fixture setup.
+//
+// COUNTERFACTUAL (observed, not reasoned): deleting the review-time check block
+// from runImplementReviews makes this go RED with
+// "fixup_concern_unattempted entries = 0, want exactly 1".
+func TestRunImplementReviews_UnattemptedConcern_SurfacesDroppedConcern(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, rr, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	ids := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+		"address both routed concerns", true)
+
+	gated := s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("fixup_concern_unattempted entries = %d, want exactly 1", len(payloads))
+	}
+	p := payloads[0]
+	if p.RoutedCount != 2 || p.UnattemptedCount != 1 || p.UndeterminableCount != 0 {
+		t.Errorf("counts = routed %d / unattempted %d / undeterminable %d, want 2/1/0",
+			p.RoutedCount, p.UnattemptedCount, p.UndeterminableCount)
+	}
+	if len(p.Concerns) != 1 {
+		t.Fatalf("payload concerns = %+v, want exactly the dropped one", p.Concerns)
+	}
+	got := p.Concerns[0]
+	if got.ID != ids[1] {
+		t.Errorf("payload names concern %q, want the SECOND routed concern %q", got.ID, ids[1])
+	}
+	if got.ID == ids[0] {
+		t.Errorf("payload names the FIRST concern, which WAS attempted")
+	}
+	if got.Position != 2 {
+		t.Errorf("Position = %d, want 2", got.Position)
+	}
+	if got.Severity != "medium" || got.Category != "security" {
+		t.Errorf("severity/category = %q/%q, want medium/security", got.Severity, got.Category)
+	}
+	if !reflect.DeepEqual(got.ImplicatedFiles, []string{unattemptedScopeB}) {
+		t.Errorf("implicated files = %v, want [%s]", got.ImplicatedFiles, unattemptedScopeB)
+	}
+
+	// The reviewer prompt carries the signal, and the outcome is untouched.
+	if gated {
+		t.Error("a gating approve must not gate — the advisory signal changed the review outcome")
+	}
+	st, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if st.State != implStage.State {
+		t.Errorf("stage state = %q, want it unchanged (%q)", st.State, implStage.State)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) == 0 || !strings.Contains(reviewer.calls[0], "Routed concern NOT ATTEMPTED") {
+		t.Errorf("reviewer prompt does not carry the not-attempted block:\n%s", reviewer.calls[0])
+	}
+	if !strings.Contains(reviewer.calls[0], unattemptedScopeB) {
+		t.Errorf("reviewer prompt does not name the untouched file %s", unattemptedScopeB)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_IDLessRoutingReportsOriginalPosition
+// is BINDING CONDITION 1's discriminating case. TWO ID-LESS concerns are routed
+// (the deprecated positional path, which writes no concern_ids), the pass
+// attempts ONLY THE FIRST, and the surviving finding must report position 2.
+//
+// Deriving Position after the routed slice is filtered would label it 1 and send
+// an operator to inspect the concern that WAS attempted. Dropping the FIRST
+// concern instead would report position 1 either way and prove nothing.
+func TestRunImplementReviews_UnattemptedConcern_IDLessRoutingReportsOriginalPosition(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	ids := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+		"address both routed concerns", false)
+	if ids != nil {
+		t.Fatalf("the id-less arm must seed no concern_ids, got %v", ids)
+	}
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 || len(payloads[0].Concerns) != 1 {
+		t.Fatalf("payloads = %+v, want one entry naming one concern", payloads)
+	}
+	got := payloads[0].Concerns[0]
+	if got.ID != "" {
+		t.Errorf("ID = %q, want empty on the positional routing path", got.ID)
+	}
+	if got.Position != 2 {
+		t.Fatalf("Position = %d, want 2 — the record mislabels WHICH id-less concern was dropped, "+
+			"sending an operator to a concern that WAS attempted", got.Position)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if !strings.Contains(reviewer.calls[0], "routed concern 2") {
+		t.Errorf("reviewer prompt does not label the id-less concern by its routing position:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes drives the REAL
+// routed text from #2896's own reproduction (run 925addab, concerns f5c464c6 and
+// 9955251a) end to end through the review, with that pass's actual delta — only
+// backend/internal/server/README.md committed.
+//
+// BINDING CONDITION 2's reality check. Neither real concern NOTE names a path
+// (both land in the undeterminable bucket, which the payload states), but the
+// operator's routed REASON names docs/onboarding.md, so the file the incident
+// silently dropped IS surfaced. Had this returned nothing, the feature would
+// have shipped inert — the #2884/PR #3021 failure mode this condition exists to
+// prevent.
+func TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes(t *testing.T) {
+	const (
+		realDoc    = "docs/onboarding.md"
+		realREADME = "backend/internal/server/README.md"
+		realImpl   = "backend/internal/server/onboarding.go"
+		realTest   = "backend/internal/server/onboarding_test.go"
+	)
+	// Verbatim from run 925addab's stage_fixup_triggered payload (pass 1).
+	realMediumNote := "The repository\u2019s long-form security documentation initially overstates the " +
+		"authorization gate as applying to every caller without forge read."
+	realLowNote := "TestOnboardingReadiness_AnonymousBeforeVisibility is a weak ordering pin by the test's " +
+		"own admission (CONDITION 2 disclosure): repoFilterFor also short-circuits anonymous callers."
+	realReason := "CONCERN 1 (sol, medium) — docs/onboarding.md, the opening sentence of the \"Repo " +
+		"read-visibility gate (#1512)\" section.\n\nCONCERN 2 (fable, low) — backend/internal/server/README.md, " +
+		"the claim that `_AnonymousBeforeVisibility` \"pins\" ordering.\n\nDo not touch onboarding.go or " +
+		"either test file's logic."
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, realDoc, realREADME, realImpl, realTest)
+	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+		{Severity: "medium", Category: "security", Note: realMediumNote},
+		{Severity: "low", Category: "verification", Note: realLowNote},
+	}, realReason, true)
+
+	// The incident's actual fix-up delta: only the README was committed.
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: realREADME, Status: policy.StatusModified},
+	}}
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("the #2896 incident produced %d entries, want 1 — the feature would have shipped inert",
+			len(payloads))
+	}
+	p := payloads[0]
+	// The honest split for the two REAL notes: neither names a path.
+	if p.UndeterminableCount != 2 {
+		t.Errorf("undeterminable = %d, want 2 (neither real note names a path)", p.UndeterminableCount)
+	}
+	if len(p.Concerns) != 0 {
+		t.Errorf("per-concern findings = %+v, want none — the real NOTES name no path", p.Concerns)
+	}
+	found := false
+	for _, f := range p.UnattributedUntouchedFiles {
+		if f == realDoc {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unattributed untouched files = %v, want them to include %s — the incident's dropped file",
+			p.UnattributedUntouchedFiles, realDoc)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if !strings.Contains(reviewer.calls[0], realDoc) {
+		t.Errorf("reviewer prompt does not name %s:\n%s", realDoc, reviewer.calls[0])
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_AllAttempted_NoSignal is the
+// no-false-positive control (fail-safe vii): every routed concern's named file
+// is in the delta, so no entry is appended and the reviewer prompt carries no
+// block. It exists ONLY as the control — it passes against today's behavior and
+// is not the counterfactual vehicle.
+func TestRunImplementReviews_UnattemptedConcern_AllAttempted_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(), "address both", true)
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: unattemptedScopeA, Status: policy.StatusModified},
+		{Path: unattemptedScopeB, Status: policy.StatusModified},
+	}}
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+
+	if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+		t.Fatalf("entries = %d, want 0 — every routed concern's file was touched", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "Routed concern NOT ATTEMPTED") {
+		t.Error("the reviewer prompt carries the block on an all-attempted pass")
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_UndeterminableOnly_EmitsCoverageGap
+// is BINDING CONDITION 3: a pass whose EVERY routed concern is undeterminable is
+// a total coverage gap. It must still emit the record, with the counts, so
+// silence from this surface means "checked and clean" and never "could not
+// check". The reviewer prompt stays byte-identical — there is nothing actionable
+// to tell the reviewer, and the gap is operator-facing.
+func TestRunImplementReviews_UnattemptedConcern_UndeterminableOnly_EmitsCoverageGap(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA)
+	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+		{Severity: "medium", Category: "process", Note: "the prose is overbroad and should be qualified"},
+	}, "please tighten the wording", true)
+
+	// The delta touches the one scope file, so nothing is untouched either.
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("entries = %d, want 1 — a total coverage gap must not read as silence", len(payloads))
+	}
+	p := payloads[0]
+	if p.RoutedCount != 1 || p.UnattemptedCount != 0 || p.UndeterminableCount != 1 {
+		t.Errorf("counts = routed %d / unattempted %d / undeterminable %d, want 1/0/1",
+			p.RoutedCount, p.UnattemptedCount, p.UndeterminableCount)
+	}
+	if len(p.Concerns) != 0 || len(p.UnattributedUntouchedFiles) != 0 {
+		t.Errorf("payload carries findings %+v / files %v, want none", p.Concerns, p.UnattributedUntouchedFiles)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "Routed concern NOT ATTEMPTED") {
+		t.Error("a pure coverage-gap record must not reach the reviewer prompt")
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_NoFixupTrigger_NoSignal is
+// fail-safe (iii): an ordinary (non-fix-up) implement review resolves no routed
+// concerns, so it emits nothing and its prompt is byte-identical to a build with
+// the signal absent.
+func TestRunImplementReviews_UnattemptedConcern_NoFixupTrigger_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+		t.Fatalf("entries = %d, want 0 on a non-fix-up review", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "Routed concern NOT ATTEMPTED") {
+		t.Error("a non-fix-up implement review must be byte-identical — it carries the block")
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_MalformedTriggerPayload_NoSignal is
+// fail-safe (iv): an undecodable stage_fixup_triggered payload is skipped, so
+// the check degrades to no signal rather than to a guess.
+func TestRunImplementReviews_UnattemptedConcern_MalformedTriggerPayload_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: 1, RunID: &runRow.ID, StageID: &implStage.ID,
+		Category: CategoryStageFixupTriggered, Payload: []byte(`{"concerns": "not-an-array"}`),
+	})
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+		t.Fatalf("entries = %d, want 0 on a malformed trigger payload", n)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_ListError_NoSignal is fail-safe
+// (ii): the resolver's OWN ListForRunByCategory call failing degrades to no
+// signal with a WARN. Binding condition 5b: this check re-queries rather than
+// hoisting the #2737 block's result, so this error test targets that call.
+func TestRunImplementReviews_UnattemptedConcern_ListError_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(), "address both", true)
+	au.listByCategoryErr = errors.New("audit list boom")
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+
+	if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+		t.Fatalf("entries = %d, want 0 when the audit list read fails", n)
+	}
+}
+
+// TestResolveRoutedFixupConcerns_NilAuditRepo is fail-safe (i): with no
+// AuditRepo the resolver reports no trigger at all, so the review-time block is
+// never entered.
+func TestResolveRoutedFixupConcerns_NilAuditRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	concerns, shared, ok := s.resolveRoutedFixupConcerns(t.Context(), uuid.New(), uuid.New())
+	if ok || concerns != nil || shared != "" {
+		t.Fatalf("resolveRoutedFixupConcerns with a nil AuditRepo = (%v, %q, %v), want (nil, \"\", false)",
+			concerns, shared, ok)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_RenameIndeterminate_NoSignal is
+// fail-safe (vi): a committed diff carrying a RENAME row with no source path
+// (the legacy/consolidated #2398 shape) makes untouched labels non-determinable,
+// so the signal is suppressed entirely rather than asserting a drop it cannot
+// substantiate.
+func TestRunImplementReviews_UnattemptedConcern_RenameIndeterminate_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+	seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(), "address both", true)
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: unattemptedScopeA, Status: policy.StatusModified},
+		// An R row with NO OldPath — rename-indeterminate.
+		{Path: "backend/internal/foo/moved.go", Status: policy.StatusRenamed},
+	}}
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+
+	if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+		t.Fatalf("entries = %d, want 0 on a rename-indeterminate diff", n)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_EmptyPlanScope is fail-safe (v)
+// under the rule BINDING CONDITION 4 required be picked and stated: the
+// candidate set is scope.files UNION the committed paths, and only an EMPTY
+// UNION suppresses the check.
+//
+// So the two halves of (v) are asserted SEPARATELY and explicitly:
+//
+//   - empty scope.files WITH a committed diff — the committed paths are still
+//     candidates, so the check RUNS and an entry IS emitted (here a coverage-gap
+//     record, per condition 3). Note the honest consequence of the rule: with an
+//     empty scope every candidate is by definition a committed (touched) path,
+//     so an unattempted FINDING is unreachable in this arm — what the arm proves
+//     is that the check is not SUPPRESSED, which is the semantics chosen.
+//   - empty scope.files AND an empty diff — the union is empty, nothing can be
+//     anchored, and NO entry is emitted.
+func TestRunImplementReviews_UnattemptedConcern_EmptyPlanScope(t *testing.T) {
+	newArm := func(t *testing.T) (*Server, *auditFake, *run.Run, *run.Stage) {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-7",
+		}
+		s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer)
+		seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+			{Severity: "medium", Category: "process", Note: "the wording is overbroad"},
+		}, "see the note", true)
+		return s, au, runRow, implStage
+	}
+
+	t.Run("empty scope with a committed diff still checks", func(t *testing.T) {
+		s, au, runRow, implStage := newArm(t)
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, "", nil)
+		payloads := unattemptedPayloads(t, au)
+		if len(payloads) != 1 {
+			t.Fatalf("entries = %d, want 1 — committed paths are candidates even with an empty scope",
+				len(payloads))
+		}
+		if payloads[0].RoutedCount != 1 || payloads[0].UndeterminableCount != 1 {
+			t.Errorf("counts = routed %d / undeterminable %d, want 1/1 — the check ran and could not decide",
+				payloads[0].RoutedCount, payloads[0].UndeterminableCount)
+		}
+	})
+
+	t.Run("empty scope and empty diff emits nothing", func(t *testing.T) {
+		s, au, runRow, implStage := newArm(t)
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, policy.Diff{}, nil, "", nil)
+		if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+			t.Fatalf("entries = %d, want 0 — the candidate union is empty, so nothing can be checked", n)
+		}
+	})
+}
+
+// TestRunImplementReviews_UnattemptedConcern_SignalDoesNotAlterOutcome is the
+// evidence-only pin, modelled on the #2737 sibling: when the signal FIRES, the
+// review dispatch result, the stage status and the remaining fix-up budget must
+// be identical to the arm where it does not. Only the delta differs between the
+// arms, so the signal is the sole variable.
+func TestRunImplementReviews_UnattemptedConcern_SignalDoesNotAlterOutcome(t *testing.T) {
+	type outcome struct {
+		gated       bool
+		stageState  run.StageState
+		fixupPasses int
+		signalFired int
+	}
+	arm := func(t *testing.T, diff policy.Diff) outcome {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-7",
+		}
+		s, au, rr, runRow, implStage := newUnattemptedReviewServer(t, reviewer, unattemptedScopeA, unattemptedScopeB)
+		seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(), "address both", true)
+		gated := s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+		passes, err := s.countFixupPasses(t.Context(), runRow.ID, implStage.ID)
+		if err != nil {
+			t.Fatalf("countFixupPasses: %v", err)
+		}
+		st, err := rr.GetStage(t.Context(), implStage.ID)
+		if err != nil {
+			t.Fatalf("GetStage: %v", err)
+		}
+		return outcome{
+			gated: gated, stageState: st.State, fixupPasses: passes,
+			signalFired: countAppendedByCategory(au, fixupConcernUnattemptedCategory),
+		}
+	}
+
+	fired := arm(t, touchedOnlyA())
+	baseline := arm(t, policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: unattemptedScopeA, Status: policy.StatusModified},
+		{Path: unattemptedScopeB, Status: policy.StatusModified},
+	}})
+
+	if fired.signalFired != 1 {
+		t.Fatalf("the firing arm emitted %d entries, want 1 — the test is not discriminating", fired.signalFired)
+	}
+	if baseline.signalFired != 0 {
+		t.Fatalf("the baseline arm emitted %d entries, want 0 — the test is not discriminating", baseline.signalFired)
+	}
+	if fired.gated != baseline.gated {
+		t.Errorf("review dispatch result changed when the signal fired: %v vs baseline %v", fired.gated, baseline.gated)
+	}
+	if fired.stageState != baseline.stageState {
+		t.Errorf("stage status changed when the signal fired: %q vs baseline %q", fired.stageState, baseline.stageState)
+	}
+	if fired.fixupPasses != baseline.fixupPasses {
+		t.Errorf("fix-up budget input changed when the signal fired: %d vs baseline %d",
+			fired.fixupPasses, baseline.fixupPasses)
+	}
+}

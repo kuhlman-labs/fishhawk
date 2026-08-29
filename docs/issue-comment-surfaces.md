@@ -601,6 +601,31 @@ Notes:
   pre-review surface for the partial / operator-added case. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The routed-concern not-attempted audit kind — `fixup_concern_unattempted`
+  (#2896), written by the implement-review assembly path
+  (`trace.go::runImplementReviews`) before any reviewer verdict — is an
+  **internal, advisory audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread. It fires on a fix-up pass whose
+  routed instruction text NAMES repository files the pass left entirely
+  untouched: the backend resolves each routed concern's implicated paths against
+  the approved plan's `scope.files` UNION the committed paths, and reports every
+  concern whose implicated set is disjoint from the committed set. Payload
+  `{routed_count, unattempted_count, undeterminable_count, concerns:[{id,
+  position, severity, category, implicated_files}], unattributed_untouched_files}`
+  — `position` is the concern's 1-based ROUTING position, captured at routing
+  time so an id-less positionally-routed concern is still identifiable, and
+  `unattributed_untouched_files` are paths named in the operator's shared routed
+  text (`reason` / `operator_concern`) that cannot be attributed to one concern
+  without guessing. The entry is written whenever the pass routed concerns AND
+  there is a finding, an untouched named file, or a NON-ZERO
+  `undeterminable_count` — that last disjunct so a pass the check could not
+  decide at all cannot read as silence. Advisory + best-effort: untouched files
+  are evidence a concern was NOT ATTEMPTED and never proof it was not addressed
+  (a concern can be resolved by editing a different file, or declined), so it
+  never fails, re-opens, or re-budgets the pass; a nil `AuditRepo`, a list error,
+  a malformed trigger payload, a rename-indeterminate diff, or an empty candidate
+  union each emit nothing. Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The routed-reporting-obligation audit kind —
   `fixup_reporting_obligation_undelivered` (#2737), written by the
   implement-review assembly path (`trace.go::runImplementReviews`) before any
