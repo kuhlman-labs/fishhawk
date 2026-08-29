@@ -194,7 +194,7 @@ func (s *Server) handleForgeCallback(w http.ResponseWriter, r *http.Request, pro
 	if s.cfg.AuthMembership == nil {
 		s.cfg.Logger.Warn("oauth sign-in denied: no membership resolver configured",
 			"provider", provider, "login", profile.Login)
-		http.Redirect(w, r, s.accessDeniedRedirect(accessDeniedNoResolver, provider, profile.Login), http.StatusFound)
+		http.Redirect(w, r, s.accessDeniedRedirect(accessDeniedNoResolver), http.StatusFound)
 		return
 	}
 	accountIDs, err := s.cfg.AuthMembership.ResolveAccounts(r.Context(), provider, accessToken, *profile)
@@ -207,7 +207,7 @@ func (s *Server) handleForgeCallback(w http.ResponseWriter, r *http.Request, pro
 	if len(accountIDs) == 0 {
 		s.cfg.Logger.Info("oauth sign-in denied: no admitting account",
 			"provider", provider, "login", profile.Login)
-		http.Redirect(w, r, s.accessDeniedRedirect(accessDeniedNoAccount, provider, profile.Login), http.StatusFound)
+		http.Redirect(w, r, s.accessDeniedRedirect(accessDeniedNoAccount), http.StatusFound)
 		return
 	}
 	// Deterministic-first: the resolver returns a sorted set; a
@@ -401,20 +401,24 @@ func toUserResponse(u *auth.User, accountID string) userResponse {
 // empty or unsafe configured value (same defense-in-depth as the
 // post-login redirect).
 //
-// E44.31 / #2467: the target now carries the denial branch code, the
-// provider, and the authenticated login, so the page it resolves to can
-// explain WHICH branch fired instead of rendering an unqualified "access
-// denied". The parameters are merged into the resolved target's EXISTING
-// query via net/url — never appended with a naive "?" — so an
-// operator-configured target that already carries a query string keeps it.
-// url.Values.Set (not Add) is deliberate: Add yields duplicate keys and
+// E44.31 / #2467: the target now carries the denial branch code, so the page
+// it resolves to can explain WHICH branch fired instead of rendering an
+// unqualified "access denied". The parameter is merged into the resolved
+// target's EXISTING query via net/url — never appended with a naive "?" —
+// so an operator-configured target that already carries a query string keeps
+// it. url.Values.Set (not Add) is deliberate: Add yields duplicate keys and
 // Query().Get returns the FIRST, so an operator-set reason would shadow the
 // branch code and the page would name the wrong denial — precisely the
 // failure this change exists to fix.
 //
-// login is attached only when sanitizeForgeLogin accepts it; a rejected
-// value is omitted entirely rather than truncated.
-func (s *Server) accessDeniedRedirect(reason accessDeniedReason, provider, login string) string {
+// The reason code is the ONLY parameter carried. The provider and the
+// authenticated login are deliberately NOT attached: /access-denied is a
+// separate, unauthenticated request, so neither the backend page nor the SPA
+// can verify an identity read off this URL, and neither renders one (see the
+// file comment in accessdenied.go). Carrying a login here would put it in
+// browser history, proxy logs and Referer headers to no end. The denial is
+// logged server-side with both values by the caller.
+func (s *Server) accessDeniedRedirect(reason accessDeniedReason) string {
 	target := s.cfg.AuthAccessDeniedRedirect
 	if target == "" || !isSafeRelativeRedirect(target) {
 		target = "/access-denied"
@@ -428,12 +432,6 @@ func (s *Server) accessDeniedRedirect(reason accessDeniedReason, provider, login
 	}
 	q := parsed.Query()
 	q.Set("reason", string(reason))
-	if _, ok := parseAccessDeniedProvider(provider); ok {
-		q.Set("provider", provider)
-	}
-	if safe, ok := sanitizeForgeLogin(login); ok {
-		q.Set("login", safe)
-	}
 	parsed.RawQuery = q.Encode()
 	return parsed.String()
 }

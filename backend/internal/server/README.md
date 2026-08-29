@@ -3172,43 +3172,42 @@ renders the generic branch for an unrecognized value either way — and the
 control would have no attainable counterfactual. The log line also makes the
 generic page's "recorded in the fishhawkd log" advice true.
 
-### Who is authoritative for the login — and which topology shows it
+### No identity is claimed — by either page, in any topology
 
-The identity line ("You signed in to GitHub as `octocat`") renders **only on
-the backend page**, and only when BOTH a recognized `provider` and a login
-passing `sanitizeForgeLogin` are present. Naming a login with no forge reads as
-a bare string; naming a forge with no login says nothing.
+The page names the DEPLOYMENT'S decision, never the user's action. There is no
+"You signed in to GitHub as `octocat`" line, no `provider`/`login` on the deny
+redirect, and no identity parameter read by either renderer.
+
+That is a correction, not the original design (implement-review high/security
+on this PR). The first cut rendered an identity line on the backend page under
+an approval condition asserting that the backend "knows the authenticated login
+from the callback it just processed". It does not. The callback authenticates
+and then issues a **302**; `GET /access-denied` is a SEPARATE, unauthenticated
+request with no session and no cookie, whose parameters are whatever the URL
+carries. Its authority is exactly the SPA's: none. Anyone could have crafted
+`/access-denied?provider=github&login=<valid-name>` and obtained a
+Fishhawk-branded page asserting that login had signed in. A charset bound stops
+markup but establishes nothing about authenticity, so the CLAIM was removed
+rather than the input hardened further — no amount of validation turns an
+unsigned query parameter into an authenticated fact.
 
 | Topology | Serves `/access-denied` | Shows the login? |
 |---|---|---|
-| Split-origin (Vite dev, self-host with the SPA on its own origin) | fishhawkd's `handleAccessDenied` | **Yes** |
+| Split-origin (Vite dev, self-host with the SPA on its own origin) | fishhawkd's `handleAccessDenied` | **No** |
 | Same-origin reverse proxy routing non-`/v0` to the SPA | `frontend/src/routes/access-denied.tsx` | **No** |
 | Client-side `RequireAuth` navigation (no query at all) | the SPA page | **No** |
 
-The SPA deliberately does not render the parameter. It cannot verify who signed
-in, so stating "you signed in as X" would let a crafted URL show a misleading
-login on the deployment's own denial page — `html/template` and React both
-escape, so this is not XSS; the residual is a modest phishing surface. Both
-pages read the same `reason` enum, so either routing renders a correct
-branch-specific explanation; only the identity line differs.
+Both pages read the same `reason` enum, so either routing renders the same
+branch-specific explanation — the two now differ in nothing that matters. The
+page closes by disclosing its own limits ("This page names no account: it is
+served without a session…") and pointing at the fishhawkd log, which records
+the provider and login the attempt was made with. That is where an operator
+correlates identity, and the only place that can do it honestly.
 
-Read the backend's authority honestly: `/access-denied` is a **separate
-request** from the callback, so the handler learns the login from the redirect
-query, not from the session it just refused to create. Its authority is
-therefore exactly the strength of the redirect chain — high in the real flow,
-absent under a hand-crafted URL. Binding it harder (a short-lived HttpOnly
-cookie set by the callback) is a possible upgrade, not something this change
-does.
-
-### `sanitizeForgeLogin` fails closed by OMISSION
-
-Accepts `^[A-Za-z0-9._-]{1,64}$` — GitHub logins are alphanumeric + hyphen (max
-39), GitLab usernames additionally allow dots and underscores. Anything else
-(empty, whitespace, markup, control characters, over-length) renders **no login
-at all**, never a truncated or partially-scrubbed value: a scrubbed prefix of
-hostile text is still attacker-chosen text. The same bound is applied at
-redirect-construction time, so a hostile login never reaches the query string
-either.
+Binding an identity properly — a short-lived HttpOnly cookie or one-time token
+set by the callback — is a real design with its own surface, and out of
+proportion to a page whose job is explaining a denial. It is deliberately NOT
+done here.
 
 ### 200, not 403
 
@@ -3218,15 +3217,15 @@ invite an intermediary proxy to substitute its own error body — the exact clas
 of failure this issue fixes. The denial itself is still recorded honestly: the
 callback creates no session and no cookie, and logs the reason server-side.
 
-The page sets `Cache-Control: no-store` (it can carry a login) and
-`Referrer-Policy: no-referrer` (the login rides in this page's own URL, so the
-Referer is suppressed on any outbound navigation).
+The page sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer` —
+ordinary hygiene for a public error page reached mid-OAuth, whose URL would
+otherwise ride the Referer to whatever the operator navigates to next.
 
 ### Parameter merge
 
 `accessDeniedRedirect` resolves the base target exactly as before —
 `Config.AuthAccessDeniedRedirect` when `isSafeRelativeRedirect` accepts it,
-`/access-denied` otherwise — then merges `reason`/`provider`/`login` into the
+`/access-denied` otherwise — then merges `reason`, and nothing else, into the
 resolved target's **existing** query via `net/url`, never a naive `"?"` append,
 so an operator-configured target keeps its own parameters. `url.Values.Set`
 (not `Add`) is load-bearing: `Add` yields duplicate keys and `Query().Get`

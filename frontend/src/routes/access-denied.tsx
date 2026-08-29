@@ -18,14 +18,15 @@ import { useAuth } from '@/auth/use-auth';
  * which is what the client-side RequireAuth navigation (it passes no query)
  * has always shown.
  *
- * This page deliberately does NOT render the redirect's `login` parameter.
- * It reaches this route in the same-origin reverse-proxy topology and via
- * client-side navigation, and in neither case can it verify who signed in —
- * the value would be a query parameter on an unauthenticated page, so
- * stating "you signed in as X" would let a crafted URL show a misleading
- * login on the deployment's own denial page. The split-origin topology,
- * where the browser lands on fishhawkd's own GET /access-denied, is where
- * the login is named; see backend/internal/server/README.md.
+ * NO topology names the login. This page cannot verify who signed in — the
+ * value would be a query parameter on an unauthenticated page, so stating
+ * "you signed in as X" would let a crafted URL show a misleading login on
+ * the deployment's own denial page. fishhawkd's own GET /access-denied (the
+ * split-origin topology) is a separate unauthenticated request from the
+ * callback and has exactly the same non-authority, so it renders no identity
+ * either and the deny redirect no longer carries `provider` or `login` at
+ * all; see backend/internal/server/README.md. The test below keeps this
+ * pinned against a crafted query.
  */
 
 const DENIAL_REASONS = ['no_membership_resolver', 'no_admitting_account'] as const;

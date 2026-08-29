@@ -36,7 +36,7 @@ func accessDeniedPage(t *testing.T, rawQuery string) (*httptest.ResponseRecorder
 // presence-only scope gate would not catch.
 const (
 	noResolverText = "no membership resolver wired on this deployment"
-	noAccountText  = "No workspace account on this deployment admits this login"
+	noAccountText  = "No workspace account on this deployment admits the login"
 	genericText    = "The specific reason was not carried to this page"
 	singleTenantK  = "FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY"
 	inviteRemedy   = "ask an existing workspace admin to invite it"
@@ -66,15 +66,15 @@ func TestAccessDenied_NoMembershipResolver(t *testing.T) {
 }
 
 // M2: reason=no_admitting_account renders the no-workspace-admits
-// explanation, the sanitized login, the single-tenant key, and the
-// admin-invite remedy.
+// explanation, the single-tenant key, and the admin-invite remedy. The
+// provider and login on the query are ignored — see M4.
 func TestAccessDenied_NoAdmittingAccount(t *testing.T) {
 	w, _ := accessDeniedPage(t, "reason=no_admitting_account&provider=github&login=octocat")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{noAccountText, "octocat", "GitHub", singleTenantK, inviteRemedy} {
+	for _, want := range []string{noAccountText, singleTenantK, inviteRemedy} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q:\n%s", want, body)
 		}
@@ -85,8 +85,8 @@ func TestAccessDenied_NoAdmittingAccount(t *testing.T) {
 }
 
 // The denial page sets the three headers the plan names. Cache-Control keeps
-// the login-bearing page out of shared caches; Referrer-Policy keeps the
-// login off any outbound navigation from the page.
+// this reason-bearing page out of shared caches; Referrer-Policy keeps its
+// URL off any outbound navigation from the page.
 func TestAccessDenied_Headers(t *testing.T) {
 	w, _ := accessDeniedPage(t, "reason=no_admitting_account&provider=github&login=octocat")
 	for header, want := range map[string]string{
@@ -154,83 +154,95 @@ func TestAccessDenied_ReasonUnrecognized_GenericAndRecorded(t *testing.T) {
 	}
 }
 
-// M4: a login failing the charset/length check is OMITTED, not truncated.
-// Every hostile value is seeded BY CONSTRUCTION as a literal here — never
-// produced by calling sanitizeForgeLogin inside the test's own setup — so
-// the RED under a deleted control lands on the body assertion below rather
-// than on fixture setup.
-func TestAccessDenied_HostileLogin_Omitted(t *testing.T) {
-	for name, bad := range map[string]string{
-		"markup":       `<script>alert(1)</script>`,
-		"phish-text":   "Call support at 555-0100 to restore access",
-		"control-char": "octo\x00cat",
-		"newline":      "octocat\nSend your token to evil@example.com",
-		"over-length":  strings.Repeat("a", 65),
-		"empty":        "",
-		"whitespace":   "   ",
-		"slash":        "octocat/../admin",
+// M4: the page NEVER renders an identity, whatever the query carries.
+//
+// This is the control the fix-up pass installed in place of the earlier
+// sanitize-then-render one (implement-review high/security): /access-denied
+// is a separate, unauthenticated request, so a provider+login on its query
+// establishes nothing — a crafted URL could otherwise produce a
+// Fishhawk-branded page asserting that a named login signed in. The table
+// therefore pairs hostile values with a PERFECTLY VALID one ("octocat",
+// "provider-only"): a control that merely sanitized would keep the valid row
+// GREEN while still rendering the claim, so the valid row is what makes the
+// deletion counterfactual real. Re-adding any {{.Login}}/{{.Provider}}
+// interpolation reddens the octocat row first.
+//
+// Every value is seeded BY CONSTRUCTION as a literal here — never produced by
+// calling a sanitizer inside the test's own setup — so the RED lands on the
+// body assertions below rather than on fixture setup. Each row additionally
+// asserts that "octocat" specifically does not survive, which the earlier
+// whitespace-fragment loop could not catch on the single-token rows
+// (implement-review low/untested-path).
+func TestAccessDenied_NeverRendersAnIdentity(t *testing.T) {
+	for name, login := range map[string]string{
+		"valid login":   "octocat",
+		"markup":        `<script>alert(1)</script>`,
+		"phish-text":    "Call support at 555-0100 to restore access",
+		"control-char":  "octo\x00cat",
+		"newline":       "octocat\nSend your token to evil@example.com",
+		"over-length":   strings.Repeat("a", 65),
+		"empty":         "",
+		"whitespace":    "   ",
+		"slash":         "octocat/../admin",
+		"provider-only": "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			q := url.Values{}
 			q.Set("reason", "no_admitting_account")
 			q.Set("provider", "github")
-			q.Set("login", bad)
+			q.Set("login", login)
 			w, _ := accessDeniedPage(t, q.Encode())
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 			}
 			body := w.Body.String()
-			// Omission, not truncation: no fragment of the hostile value
-			// survives, and the page falls back to the identity-free
-			// sentence.
-			for _, frag := range strings.Fields(bad) {
+			// Nothing of the supplied login reaches the page — not the whole
+			// value, not a whitespace-delimited fragment, and not the
+			// "octocat" prefix a truncating implementation would leave on the
+			// single-token control-char and slash rows.
+			if login != "" && strings.Contains(body, login) {
+				t.Errorf("body carried the supplied login %q:\n%s", login, body)
+			}
+			for _, frag := range strings.Fields(login) {
 				if len(frag) >= 4 && strings.Contains(body, frag) {
-					t.Errorf("body carried a fragment %q of the rejected login:\n%s", frag, body)
+					t.Errorf("body carried a fragment %q of the supplied login:\n%s", frag, body)
 				}
 			}
-			if !strings.Contains(body, "This Fishhawk deployment did not admit the sign-in.") {
-				t.Errorf("body missing the identity-free sentence:\n%s", body)
+			if strings.Contains(body, "octocat") {
+				t.Errorf("body carried a truncated login prefix \"octocat\":\n%s", body)
 			}
-			if strings.Contains(body, "You signed in to") {
-				t.Errorf("body claimed an identity it could not verify:\n%s", body)
+			if strings.Contains(body, "You signed in") {
+				t.Errorf("body claimed an identity it cannot verify:\n%s", body)
+			}
+			// The provider is not rendered either: "you signed in to GitHub"
+			// is the same unverified claim with the login left out.
+			if strings.Contains(body, "GitHub") || strings.Contains(body, "github") {
+				t.Errorf("body named the forge the request claimed:\n%s", body)
+			}
+			// The branch explanation is unaffected by any of this.
+			if !strings.Contains(body, noAccountText) {
+				t.Errorf("branch explanation lost:\n%s", body)
 			}
 		})
 	}
 }
 
-// M5: an absent login renders the identity-free sentence with no
-// empty-name artifact.
-func TestAccessDenied_LoginAbsent(t *testing.T) {
+// M5: with no identity parameters at all, the page states plainly that it
+// names no account and points at the log that does.
+func TestAccessDenied_NoIdentityParameters(t *testing.T) {
 	w, _ := accessDeniedPage(t, "reason=no_admitting_account")
 	body := w.Body.String()
 	if !strings.Contains(body, "This Fishhawk deployment did not admit the sign-in.") {
-		t.Errorf("body missing the identity-free sentence:\n%s", body)
+		t.Errorf("body missing the deployment-did sentence:\n%s", body)
 	}
-	if strings.Contains(body, "You signed in to") {
-		t.Errorf("body rendered an identity line with no login:\n%s", body)
+	if !strings.Contains(body, "This page names no account") {
+		t.Errorf("body missing the no-identity disclosure:\n%s", body)
+	}
+	if strings.Contains(body, "You signed in") {
+		t.Errorf("body claimed an identity:\n%s", body)
 	}
 	if !strings.Contains(body, noAccountText) {
-		t.Errorf("branch explanation lost when the login is absent:\n%s", body)
-	}
-}
-
-// A recognized login with an ABSENT or UNRECOGNIZED provider still omits the
-// identity line: naming a login with no forge reads as a bare string.
-func TestAccessDenied_ProviderGuard(t *testing.T) {
-	for name, q := range map[string]string{
-		"provider absent":       "reason=no_admitting_account&login=octocat",
-		"provider unrecognized": "reason=no_admitting_account&provider=bitbucket&login=octocat",
-	} {
-		t.Run(name, func(t *testing.T) {
-			w, _ := accessDeniedPage(t, q)
-			body := w.Body.String()
-			if strings.Contains(body, "You signed in to") {
-				t.Errorf("identity line rendered with no recognized provider:\n%s", body)
-			}
-			if strings.Contains(body, "bitbucket") {
-				t.Errorf("body echoed the unrecognized provider:\n%s", body)
-			}
-		})
+		t.Errorf("branch explanation lost:\n%s", body)
 	}
 }
 
@@ -241,71 +253,62 @@ func TestAccessDenied_ProviderGuard(t *testing.T) {
 // operator's value would come first and Query().Get would return it — the
 // page would name the wrong denial, which is exactly the failure this issue
 // exists to fix.
+//
+// The absentKeys rows pin the fix-up pass's other half: the redirect carries
+// the reason and NOTHING else. Neither landing page can verify an identity
+// read off this URL, so putting the provider and login on it would only leak
+// them into browser history, proxy logs and Referer headers.
 func TestAccessDeniedRedirect_Table(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		configured string
 		reason     accessDeniedReason
-		provider   string
-		login      string
 		wantPath   string
 		wantQuery  map[string]string
 		absentKeys []string
 	}{
 		{
-			name:   "empty config falls back to the default target",
-			reason: accessDeniedNoAccount, provider: "github", login: "octocat",
-			wantPath:  "/access-denied",
-			wantQuery: map[string]string{"reason": "no_admitting_account", "provider": "github", "login": "octocat"},
+			name:       "empty config falls back to the default target",
+			reason:     accessDeniedNoAccount,
+			wantPath:   "/access-denied",
+			wantQuery:  map[string]string{"reason": "no_admitting_account"},
+			absentKeys: []string{"provider", "login"},
 		},
 		{
 			name:       "scheme-relative config is refused by isSafeRelativeRedirect",
-			configured: "//evil.example.com/", reason: accessDeniedNoResolver, provider: "gitlab", login: "gluser",
+			configured: "//evil.example.com/", reason: accessDeniedNoResolver,
 			wantPath:  "/access-denied",
-			wantQuery: map[string]string{"reason": "no_membership_resolver", "provider": "gitlab", "login": "gluser"},
+			wantQuery: map[string]string{"reason": "no_membership_resolver"},
 		},
 		{
 			name:       "absolute config is refused by isSafeRelativeRedirect",
-			configured: "https://evil.example.com/access-denied", reason: accessDeniedNoAccount, provider: "github", login: "octocat",
+			configured: "https://evil.example.com/access-denied", reason: accessDeniedNoAccount,
 			wantPath:  "/access-denied",
 			wantQuery: map[string]string{"reason": "no_admitting_account"},
 		},
 		{
 			name:       "plain configured path is honored",
-			configured: "/no-entry", reason: accessDeniedNoAccount, provider: "github", login: "octocat",
-			wantPath:  "/no-entry",
-			wantQuery: map[string]string{"reason": "no_admitting_account", "provider": "github", "login": "octocat"},
+			configured: "/no-entry", reason: accessDeniedNoAccount,
+			wantPath:   "/no-entry",
+			wantQuery:  map[string]string{"reason": "no_admitting_account"},
+			absentKeys: []string{"provider", "login"},
 		},
 		{
 			name:       "a configured path's pre-existing query survives the merge",
-			configured: "/no-entry?theme=dark", reason: accessDeniedNoAccount, provider: "github", login: "octocat",
+			configured: "/no-entry?theme=dark", reason: accessDeniedNoAccount,
 			wantPath:  "/no-entry",
-			wantQuery: map[string]string{"theme": "dark", "reason": "no_admitting_account", "provider": "github", "login": "octocat"},
+			wantQuery: map[string]string{"theme": "dark", "reason": "no_admitting_account"},
 		},
 		{
 			name:       "an operator-set reason key is REPLACED, not duplicated (Set, not Add)",
-			configured: "/no-entry?reason=operator-chose-this", reason: accessDeniedNoAccount, provider: "github", login: "octocat",
+			configured: "/no-entry?reason=operator-chose-this", reason: accessDeniedNoAccount,
 			wantPath:  "/no-entry",
 			wantQuery: map[string]string{"reason": "no_admitting_account"},
-		},
-		{
-			name:   "a login failing the charset check is omitted from the redirect",
-			reason: accessDeniedNoAccount, provider: "github", login: "<script>alert(1)</script>",
-			wantPath:   "/access-denied",
-			wantQuery:  map[string]string{"reason": "no_admitting_account", "provider": "github"},
-			absentKeys: []string{"login"},
-		},
-		{
-			name:   "an unrecognized provider is omitted from the redirect",
-			reason: accessDeniedNoAccount, provider: "bitbucket", login: "octocat",
-			wantPath:   "/access-denied",
-			wantQuery:  map[string]string{"reason": "no_admitting_account", "login": "octocat"},
-			absentKeys: []string{"provider"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New(Config{Addr: "127.0.0.1:0", AuthAccessDeniedRedirect: tc.configured})
-			got := s.accessDeniedRedirect(tc.reason, tc.provider, tc.login)
+			got := s.accessDeniedRedirect(tc.reason)
 			u, err := url.Parse(got)
 			if err != nil {
 				t.Fatalf("parse %q: %v", got, err)
@@ -328,17 +331,5 @@ func TestAccessDeniedRedirect_Table(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// sanitizeForgeLogin's accept side: the charset the two forges actually
-// produce must pass, or the control would omit every legitimate login and
-// the page would silently lose its identity line for everyone.
-func TestSanitizeForgeLogin_Accepts(t *testing.T) {
-	for _, login := range []string{"octocat", "alice-acme", "alice_acme", "a.b_c-d", "x", strings.Repeat("a", 64)} {
-		got, ok := sanitizeForgeLogin(login)
-		if !ok || got != login {
-			t.Errorf("sanitizeForgeLogin(%q) = %q,%v; want %q,true", login, got, ok, login)
-		}
 	}
 }

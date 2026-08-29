@@ -5476,9 +5476,10 @@ paths:
             no membership resolver configured): redirect to the access-denied
             page (default `/access-denied`) with NO session cookie. The deny
             redirect carries `reason` (`no_admitting_account` or
-            `no_membership_resolver`), `provider`, and `login`, so the page it
-            resolves to names WHICH branch fired (E44.31 / #2467). A login
-            failing the charset/length bound is omitted rather than truncated.
+            `no_membership_resolver`) and NOTHING else, so the page it
+            resolves to names WHICH branch fired without claiming an identity
+            it cannot verify (E44.31 / #2467). The provider and login are
+            logged server-side, not put on the URL.
         '400': { $ref: '#/components/responses/BadRequest' }
         '502':
           description: |
@@ -5558,9 +5559,10 @@ paths:
             no membership resolver configured): redirect to the access-denied
             page (default `/access-denied`) with NO session cookie. The deny
             redirect carries `reason` (`no_admitting_account` or
-            `no_membership_resolver`), `provider`, and `login`, so the page it
-            resolves to names WHICH branch fired (E44.31 / #2467). A login
-            failing the charset/length bound is omitted rather than truncated.
+            `no_membership_resolver`) and NOTHING else, so the page it
+            resolves to names WHICH branch fired without claiming an identity
+            it cannot verify (E44.31 / #2467). The provider and login are
+            logged server-side, not put on the URL.
         '400': { $ref: '#/components/responses/BadRequest' }
         '502':
           description: |
@@ -5596,12 +5598,19 @@ paths:
         explanation, and would invite an intermediary proxy to substitute its
         own error body, which is the failure this page exists to fix.
 
-        `reason`, `provider` and `login` are each matched against a closed
-        allow-list (or, for `login`, a charset/length bound) before rendering;
-        an unrecognized value is OMITTED and the generic body is served, never
-        echoed. In a same-origin reverse-proxy deployment that routes non-/v0
-        paths to the SPA, `/access-denied` reaches the React page instead;
-        both render the same `reason` enum.
+        **Claims no identity.** This is a separate request from the callback,
+        with no session and no cookie, so a `provider`/`login` on its query
+        would be unverifiable — a crafted URL could otherwise produce a
+        Fishhawk-branded page asserting that a named login signed in. The
+        redirect therefore carries neither, and the page renders neither; the
+        fishhawkd log records the provider and login of the denied attempt.
+        `reason` is matched against a closed allow-list and only SELECTS one
+        of three fixed bodies; an unrecognized value renders the generic body,
+        is never echoed, and is logged.
+
+        In a same-origin reverse-proxy deployment that routes non-/v0 paths to
+        the SPA, `/access-denied` reaches the React page instead; both render
+        the same `reason` enum and neither names a login.
       security: []
       tags: [auth]
       parameters:
@@ -5614,32 +5623,17 @@ paths:
             deployment-configuration fault). `no_admitting_account` — the
             resolver ran and no workspace account admits the login. Any other
             value renders the generic body and is recorded in the fishhawkd
-            log.
+            log. This is the only parameter the page reads.
           schema:
             type: string
             enum: [no_membership_resolver, no_admitting_account]
-        - name: provider
-          in: query
-          required: false
-          description: Forge the sign-in was attempted against.
-          schema:
-            type: string
-            enum: [github, gitlab]
-        - name: login
-          in: query
-          required: false
-          description: |
-            Authenticated forge login. Rendered only alongside a recognized
-            `provider`, and only when it matches `^[A-Za-z0-9._-]{1,64}$`.
-          schema:
-            type: string
       responses:
         '200':
           description: |
             The denial explanation. `Cache-Control: no-store` and
-            `Referrer-Policy: no-referrer` are set — the login rides in this
-            page's own URL, so the Referer is suppressed on any outbound
-            navigation.
+            `Referrer-Policy: no-referrer` are set — ordinary hygiene for a
+            public error page reached mid-OAuth, whose URL would otherwise
+            ride the Referer to whatever is navigated to next.
           content:
             text/html:
               schema: { type: string }

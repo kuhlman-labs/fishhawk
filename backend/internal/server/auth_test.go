@@ -722,9 +722,8 @@ func TestGitHubCallback_NoAdmittingAccount_RedirectsAccessDenied(t *testing.T) {
 
 // The configured deny target is honored when safe and replaced by the
 // default when it is an open-redirect vector. Since E44.31 / #2467 the
-// Location also carries the branch code, the provider and the login, so the
-// assertion parses the URL and checks path + parameters rather than
-// comparing a byte-exact string.
+// Location also carries the branch code, so the assertion parses the URL and
+// checks path + reason rather than comparing a byte-exact string.
 func TestGitHubCallback_AccessDeniedRedirectConfig(t *testing.T) {
 	for _, tc := range []struct{ configured, want string }{
 		{"/no-entry", "/no-entry"},
@@ -753,9 +752,6 @@ func TestGitHubCallback_AccessDeniedRedirectConfig(t *testing.T) {
 			if got := u.Query().Get("reason"); got != string(accessDeniedNoAccount) {
 				t.Errorf("Location reason = %q, want %q (from %q)", got, accessDeniedNoAccount, loc)
 			}
-			if got := u.Query().Get("login"); got != "octocat" {
-				t.Errorf("Location login = %q, want octocat (from %q)", got, loc)
-			}
 		})
 	}
 }
@@ -777,6 +773,16 @@ func assertAccessDeniedLocation(t *testing.T, w *httptest.ResponseRecorder, want
 	}
 	if got := u.Query().Get("reason"); got != string(want) {
 		t.Errorf("Location reason = %q, want %q (from %q)", got, want, loc)
+	}
+	// The denial URL carries the branch code and NOTHING identifying: the
+	// page it lands on is unauthenticated and cannot verify a login read off
+	// a query string, so carrying one would only leak it into browser
+	// history, proxy logs and Referer headers (fix-up, implement-review
+	// high/security).
+	for _, k := range []string{"provider", "login"} {
+		if _, ok := u.Query()[k]; ok {
+			t.Errorf("Location carries %s, want absent (from %q)", k, loc)
+		}
 	}
 }
 
@@ -801,7 +807,7 @@ func TestAccessDeniedRedirectTargetResolves(t *testing.T) {
 			// AuthMembership deliberately nil.
 		})
 		replayDenialLocation(t, s, callbackRequest(t, s),
-			"no membership resolver wired on this deployment", "octocat", "GitHub")
+			"no membership resolver wired on this deployment", "octocat")
 	})
 
 	// Provider parity: both callbacks funnel through the one shared
@@ -810,18 +816,20 @@ func TestAccessDeniedRedirectTargetResolves(t *testing.T) {
 	t.Run("no_admitting_account github", func(t *testing.T) {
 		s, _, _ := newAuthServerWithResolver(t, &fakeMembershipResolver{})
 		replayDenialLocation(t, s, callbackRequest(t, s),
-			"No workspace account on this deployment admits this login", "octocat", "GitHub")
+			"No workspace account on this deployment admits the login", "octocat")
 	})
 	t.Run("no_admitting_account gitlab", func(t *testing.T) {
 		s, _ := newGitLabAuthServerWithResolver(t, &fakeMembershipResolver{})
 		replayDenialLocation(t, s, gitlabCallbackRequest(t, s),
-			"No workspace account on this deployment admits this login", "gluser", "GitLab")
+			"No workspace account on this deployment admits the login", "gluser")
 	})
 }
 
 // replayDenialLocation takes the 302's Location VERBATIM and issues it as a
-// second request against the same handler.
-func replayDenialLocation(t *testing.T, s *Server, w *httptest.ResponseRecorder, wantText, wantLogin, wantProvider string) {
+// second request against the same handler. deniedLogin is the login the
+// callback authenticated: the replayed page must NOT name it — end to end
+// through the real flow, the denial page claims no identity.
+func replayDenialLocation(t *testing.T, s *Server, w *httptest.ResponseRecorder, wantText, deniedLogin string) {
 	t.Helper()
 	if w.Code != http.StatusFound {
 		t.Fatalf("callback status = %d, want 302:\n%s", w.Code, w.Body.String())
@@ -842,8 +850,11 @@ func replayDenialLocation(t *testing.T, s *Server, w *httptest.ResponseRecorder,
 	if !strings.Contains(body, wantText) {
 		t.Errorf("replayed page missing the branch explanation %q:\n%s", wantText, body)
 	}
-	if !strings.Contains(body, wantLogin) || !strings.Contains(body, wantProvider) {
-		t.Errorf("replayed page missing the identity (%s / %s):\n%s", wantProvider, wantLogin, body)
+	if strings.Contains(body, deniedLogin) {
+		t.Errorf("replayed page named the login %q it cannot verify:\n%s", deniedLogin, body)
+	}
+	if strings.Contains(body, "You signed in") {
+		t.Errorf("replayed page claimed an identity:\n%s", body)
 	}
 }
 

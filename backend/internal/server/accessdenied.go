@@ -3,7 +3,6 @@ package server
 import (
 	"html/template"
 	"net/http"
-	"regexp"
 )
 
 // The membership-gate denial page (E44.31 / #2467).
@@ -16,11 +15,23 @@ import (
 // landed on a bare ServeMux 404 with no explanation of why sign-in failed.
 //
 // This file makes that target resolve AND explain itself: the callback
-// classifies its denial into a stable reason code and carries it (plus the
-// provider and the authenticated login) on the redirect query, and
-// handleAccessDenied renders a self-contained html/template page naming the
-// branch and its remedy — the same shape manifest.go and oauthauthorize.go
-// already use for their server-rendered pages.
+// classifies its denial into a stable reason code and carries it on the
+// redirect, and handleAccessDenied renders a self-contained html/template
+// page naming the branch and its remedy — the same shape manifest.go and
+// oauthauthorize.go already use for their server-rendered pages.
+//
+// NO IDENTITY IS RENDERED HERE, and none is carried on the redirect.
+// /access-denied is a SEPARATE, unauthenticated request from the callback:
+// the callback authenticates and then 302s, so this handler has no session,
+// no cookie and no authenticated state to read — a provider/login on the
+// query would have exactly the authority the SPA page has, which is none.
+// Anyone could craft /access-denied?provider=github&login=<valid-name> and
+// obtain a Fishhawk-branded page asserting that login signed in. A charset
+// bound stops markup but establishes nothing about authenticity, so the
+// claim is removed rather than hardened: the page states only what the
+// DEPLOYMENT did (it refused the sign-in) and what the operator can do
+// about it, never what the user did. The reason code — a closed enum, not
+// free text — is the whole payload, and it is what makes the page useful.
 //
 // STATUS 200, NOT 403, deliberately. The request to /access-denied SUCCEEDS
 // and returns the explanation; a 403 would claim the operator is forbidden
@@ -28,7 +39,7 @@ import (
 // intermediary proxy to replace the body with its own error page — which is
 // precisely the class of failure this issue exists to fix. The denial itself
 // is still recorded honestly: the callback creates no session and no cookie,
-// and logs the reason server-side.
+// and logs the provider and login server-side.
 
 // accessDeniedReason is the closed set of denial branch codes the callback
 // carries on its redirect. The zero value is the unknown fallback: an
@@ -51,7 +62,7 @@ const (
 
 // parseAccessDeniedReason is a closed allow-list, NOT a passthrough. The
 // reason value arrives on the query string of a PUBLIC, UNAUTHENTICATED
-// route and reaches the rendered page, so it must never be attacker-chosen
+// route and selects the rendered body, so it must never be attacker-chosen
 // free text. Any value that is not one of the two branch codes — including
 // the empty string — yields accessDeniedUnknown and the generic body.
 //
@@ -76,62 +87,12 @@ func parseAccessDeniedReason(raw string) (accessDeniedReason, bool) {
 	}
 }
 
-// accessDeniedProviders is the closed set of forge providers the callback
-// carries. Same reasoning as parseAccessDeniedReason: the value is rendered
-// on a public page, so it is matched against a fixed set rather than echoed.
-func parseAccessDeniedProvider(raw string) (string, bool) {
-	switch raw {
-	case "github":
-		return "GitHub", true
-	case "gitlab":
-		return "GitLab", true
-	default:
-		return "", false
-	}
-}
-
-// forgeLoginPattern bounds the echoed login. GitHub logins are
-// alphanumeric + hyphen (max 39); GitLab usernames additionally allow dots
-// and underscores. 64 is a generous ceiling over both.
-var forgeLoginPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
-
-// sanitizeForgeLogin is the control bounding the login rendered on the
-// denial page. The login arrives on the query string of a PUBLIC,
-// UNAUTHENTICATED route, so it is untrusted regardless of the fact that our
-// own redirect is what normally sets it.
-//
-// html/template auto-escaping already prevents script injection; this
-// control exists for the residual — an unauthenticated third party crafting
-// a Fishhawk-branded page carrying arbitrary attacker text (a phishing
-// remediation instruction). It therefore fails closed by OMISSION: a
-// rejected value renders NO login at all, never a truncated or
-// partially-scrubbed one, because a scrubbed prefix of hostile text is
-// still attacker-chosen text.
-func sanitizeForgeLogin(login string) (string, bool) {
-	if !forgeLoginPattern.MatchString(login) {
-		return "", false
-	}
-	return login, true
-}
-
-// accessDeniedView is the denial page's template model. Every field is
-// derived from a closed allow-list or the charset/length bound above; no
-// raw query value reaches the template.
+// accessDeniedView is the denial page's template model. The ONLY field is
+// the allow-listed branch code: no query value reaches the template, and
+// nothing on the page names who attempted the sign-in.
 type accessDeniedView struct {
 	// Reason is one of the two branch codes, or empty for the generic body.
 	Reason accessDeniedReason
-	// Provider is the display name ("GitHub"/"GitLab"), empty when absent
-	// or unrecognized.
-	Provider string
-	// Login is the sanitized forge login, empty when absent or rejected.
-	Login string
-}
-
-// ShowIdentity reports whether the page can name who signed in. Both halves
-// are required: naming a login with no provider reads as a bare string, and
-// naming a provider with no login says nothing useful.
-func (v accessDeniedView) ShowIdentity() bool {
-	return v.Provider != "" && v.Login != ""
 }
 
 // NoResolver / NoAccount keep the branch predicates in Go rather than
@@ -143,7 +104,8 @@ func (v accessDeniedView) NoAccount() bool  { return v.Reason == accessDeniedNoA
 // manifestStartTmpl, consentTmpl and forgeChoiceTmpl: a self-contained
 // document, no external CSS and no external assets, with every dynamic
 // value crossing the boundary through html/template rather than string
-// concatenation.
+// concatenation. Here the only dynamic input is the branch selection —
+// every rendered word is a literal in this template.
 var accessDeniedTmpl = template.Must(template.New("access-denied").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Access denied</title>
@@ -151,27 +113,28 @@ var accessDeniedTmpl = template.Must(template.New("access-denied").Parse(`<!DOCT
 </head>
 <body>
 <h1>Access denied</h1>
-{{if .ShowIdentity}}<p>You signed in to {{.Provider}} as <code>{{.Login}}</code>, but this Fishhawk deployment did not admit the sign-in.</p>
-{{else}}<p>This Fishhawk deployment did not admit the sign-in.</p>
-{{end}}
+<p>This Fishhawk deployment did not admit the sign-in.</p>
 {{if .NoResolver}}<h2>Why</h2>
-<p>The login gate has no membership resolver wired on this deployment, so every sign-in is denied. This is a deployment-configuration fault, not a problem with your account.</p>
+<p>The login gate has no membership resolver wired on this deployment, so every sign-in is denied. This is a deployment-configuration fault, not a problem with the account you used.</p>
 <h2>Remedy</h2>
 <p>An operator must configure the database and the workspace profile. For a single-tenant self-host, set <code>FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY</code> to the forge login or organization that owns the deployment. See the self-hosted deployment guide.</p>
 {{else if .NoAccount}}<h2>Why</h2>
-<p>No workspace account on this deployment admits this login: there is no invited membership for it, and no auto-join policy matched.</p>
+<p>No workspace account on this deployment admits the login the sign-in was made with: there is no invited membership for it, and no auto-join policy matched.</p>
 <h2>Remedy</h2>
-<p>Either set <code>FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY</code> to this login (single-tenant self-host), or ask an existing workspace admin to invite it.</p>
+<p>Either set <code>FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY</code> to that login (single-tenant self-host), or ask an existing workspace admin to invite it.</p>
 {{else}}<h2>Why</h2>
-<p>This deployment denied the sign-in. The specific reason was not carried to this page; it is recorded in the fishhawkd log.</p>
+<p>This deployment denied the sign-in. The specific reason was not carried to this page.</p>
 <h2>Remedy</h2>
-<p>Either set <code>FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY</code> to this login (single-tenant self-host), or ask an existing workspace admin to invite it. If every sign-in on this deployment is denied, the login gate has no membership resolver configured and an operator must wire the database.</p>
+<p>Either set <code>FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY</code> to the login the sign-in was made with (single-tenant self-host), or ask an existing workspace admin to invite it. If every sign-in on this deployment is denied, the login gate has no membership resolver configured and an operator must wire the database.</p>
 {{end}}
+<p>This page names no account: it is served without a session, so it cannot verify who attempted the sign-in. The fishhawkd log records the attempt, naming the forge and the login it was made with.</p>
 </body>
 </html>`))
 
 // handleAccessDenied implements GET /access-denied — the backend-origin
-// landing page for the callback's membership-gate denial.
+// landing page for the callback's membership-gate denial. It reads exactly
+// one query parameter, and that parameter only SELECTS one of three fixed
+// bodies; see the file comment for why no identity is read or rendered.
 func (s *Server) handleAccessDenied(w http.ResponseWriter, r *http.Request) {
 	rawReason := r.URL.Query().Get("reason")
 	reason, recognized := parseAccessDeniedReason(rawReason)
@@ -182,20 +145,15 @@ func (s *Server) handleAccessDenied(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Warn("access-denied page: unrecognized reason code; rendering the generic body",
 			"reason", rawReason)
 	}
-	provider, _ := parseAccessDeniedProvider(r.URL.Query().Get("provider"))
-	login, _ := sanitizeForgeLogin(r.URL.Query().Get("login"))
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	// The login rides in this page's own URL, so suppressing the Referer
-	// keeps it off any outbound navigation from this page.
+	// Ordinary hygiene for a public error page reached mid-OAuth: the
+	// Referer would otherwise carry this URL (and, on the hop that got
+	// here, the forge's) to anything the operator navigates to next.
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(http.StatusOK)
-	if err := accessDeniedTmpl.Execute(w, accessDeniedView{
-		Reason:   reason,
-		Provider: provider,
-		Login:    login,
-	}); err != nil {
+	if err := accessDeniedTmpl.Execute(w, accessDeniedView{Reason: reason}); err != nil {
 		s.cfg.Logger.Error("render access-denied page", "error", err.Error())
 	}
 }
