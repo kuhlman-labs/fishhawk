@@ -290,7 +290,7 @@ exemptions, keyed `(stage_id, Origin, HeadSHA)`).
 **Audit categories**: `implement_review_started` (#600, count-gates the current round incl. fix-up re-review
 rounds), `implement_reviewed` (+ `Origin`/`HeadSHA` provenance on supplemental passes), `implement_review_failed`
 (#664, `Timeout` discriminator #747), `implement_review_skipped`, `implement_review_backstop_elapsed` (ADR-036),
-`consolidated_review_diff_truncated` (#1060). `review_action_hint` (#777) is a display-only MCP-layer nudge
+`consolidated_review_diff_truncated` (#1060), `implement_review_diff_truncated` (#2875, the diff a review round saw was cut — runner 256 KiB cap or forge compare cap; distilled onto gate-view `review_diff_truncated`). `review_action_hint` (#777) is a display-only MCP-layer nudge
 computed from these entries. Payload shapes in `backend/internal/planreview/README.md`.
 
 ### 4.3 Campaign lifecycle (ADR-047)

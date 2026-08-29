@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -1103,5 +1104,126 @@ func TestGateView_BlankNoteConcernRendersPointer(t *testing.T) {
 	// chokepoint cannot be satisfied by decorating every note.
 	if byID[authored.ID] != "the helper shadows the package-level logger" {
 		t.Errorf("authored note = %q, want it rendered verbatim", byID[authored.ID])
+	}
+}
+
+// --- diff-truncation surface (#2875) ------------------------------------
+
+// seedReviewDiffTruncatedMarker appends an implement_review_diff_truncated audit
+// entry (or a raw payload when rawPayload != nil, for the undecodable case).
+func seedReviewDiffTruncatedMarker(au *auditFake, runID uuid.UUID, p reviewDiffTruncatedPayload, rawPayload []byte) {
+	payload := rawPayload
+	if payload == nil {
+		payload, _ = json.Marshal(p)
+	}
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: reviewDiffTruncatedCategory, Payload: payload, Timestamp: time.Now().UTC(),
+	})
+}
+
+// TestBuildGateView_ReviewDiffTruncated_Present: an emitted entry surfaces as
+// review_diff_truncated with reason + the COMPLETE omitted list, and the NEWEST
+// entry wins across two rounds. COUNTERFACTUAL: delete the reviewDiffTruncatedForRun
+// call from buildGateView → the field is nil and this goes RED.
+func TestBuildGateView_ReviewDiffTruncated_Present(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	// Round 1 (older), then round 2 (newer) wins.
+	seedReviewDiffTruncatedMarker(au, runID, reviewDiffTruncatedPayload{
+		Reason: "runner_patch_cap", ChangedFileCount: 3, OmittedFileCount: 1,
+		OmittedFiles: []string{"old.go (no hunks shown)"},
+	}, nil)
+	seedReviewDiffTruncatedMarker(au, runID, reviewDiffTruncatedPayload{
+		Reason: "GitHub capped compare", ChangedFileCount: 9, OmittedFileCount: 2,
+		OmittedFiles:         []string{"a.go (no hunks shown)", "b.go (may be cut — its tail may be missing)"},
+		OmittedFilesResidual: 5, DeltaReReview: true, BestEffort: true,
+	}, nil)
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	rdt := resp.ReviewDiffTruncated
+	if rdt == nil {
+		t.Fatal("review_diff_truncated = nil, want the newest entry")
+	}
+	if rdt.Reason != "GitHub capped compare" || rdt.ChangedFileCount != 9 || rdt.OmittedFileCount != 2 {
+		t.Errorf("review_diff_truncated = %+v, want the newest (round 2) entry", rdt)
+	}
+	if len(rdt.OmittedFiles) != 2 || !rdt.BestEffort || !rdt.DeltaReReview || rdt.OmittedFilesResidual != 5 {
+		t.Errorf("review_diff_truncated fields = %+v, want the complete list + residual 5 + best-effort + delta", rdt)
+	}
+}
+
+// TestBuildGateView_ReviewDiffTruncated_Degrades: each degrade yields nil, never
+// a partially-populated field and never a failed gate view.
+func TestBuildGateView_ReviewDiffTruncated_Degrades(t *testing.T) {
+	t.Run("nil AuditRepo", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		if got := s.reviewDiffTruncatedForRun(context.Background(), uuid.New()); got != nil {
+			t.Errorf("nil AuditRepo must yield nil; got %+v", got)
+		}
+	})
+	t.Run("list error", func(t *testing.T) {
+		s, repo, base, _ := gateViewServer(t)
+		s.cfg.AuditRepo = &oneCategoryErrAudit{auditFake: base, failCategory: reviewDiffTruncatedCategory}
+		runID := seedGateRun(t, repo)
+		if got := s.reviewDiffTruncatedForRun(context.Background(), runID); got != nil {
+			t.Errorf("list error must yield nil; got %+v", got)
+		}
+	})
+	t.Run("no entry", func(t *testing.T) {
+		s, repo, _, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		if got := s.reviewDiffTruncatedForRun(context.Background(), runID); got != nil {
+			t.Errorf("no entry must yield nil; got %+v", got)
+		}
+	})
+	t.Run("undecodable payload", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		seedReviewDiffTruncatedMarker(au, runID, reviewDiffTruncatedPayload{}, []byte("{not json"))
+		if got := s.reviewDiffTruncatedForRun(context.Background(), runID); got != nil {
+			t.Errorf("undecodable payload must yield nil; got %+v", got)
+		}
+	})
+}
+
+// TestHandleGetRunGateView_ReviewDiffTruncated_EndToEnd crosses handler -> wire:
+// a seeded implement_review_diff_truncated entry is served through the real
+// GET /v0/runs/{run_id}/gate-view handler and the decoded response body asserts
+// review_diff_truncated.omitted_files AND the residual round-trip intact.
+func TestHandleGetRunGateView_ReviewDiffTruncated_EndToEnd(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedReviewDiffTruncatedMarker(au, runID, reviewDiffTruncatedPayload{
+		Reason: "runner_patch_cap", ChangedFileCount: 210, OmittedFileCount: 205,
+		OmittedFiles:         []string{"pkg/one.go (no hunks shown)", "pkg/two.go (may be cut — its tail may be missing)"},
+		OmittedFilesResidual: 5,
+	}, nil)
+
+	w := getGateView(t, s, runID, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	// Decode the raw HTTP body (not a re-marshal) so a json-tag drift is caught.
+	var body struct {
+		ReviewDiffTruncated *struct {
+			Reason               string   `json:"reason"`
+			OmittedFiles         []string `json:"omitted_files"`
+			OmittedFilesResidual int      `json:"omitted_files_residual"`
+		} `json:"review_diff_truncated"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.ReviewDiffTruncated == nil {
+		t.Fatal("review_diff_truncated absent from the wire body")
+	}
+	if len(body.ReviewDiffTruncated.OmittedFiles) != 2 ||
+		body.ReviewDiffTruncated.OmittedFiles[0] != "pkg/one.go (no hunks shown)" {
+		t.Errorf("omitted_files did not round-trip: %+v", body.ReviewDiffTruncated.OmittedFiles)
+	}
+	if body.ReviewDiffTruncated.OmittedFilesResidual != 5 {
+		t.Errorf("omitted_files_residual = %d, want 5 (residual must round-trip end to end)",
+			body.ReviewDiffTruncated.OmittedFilesResidual)
 	}
 }

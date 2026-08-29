@@ -4674,6 +4674,184 @@ func TestBuild_ImplementReview_DeltaReReviewFraming(t *testing.T) {
 	}
 }
 
+// --- diff-truncation notice (#2875) ------------------------------------
+
+const (
+	truncNoticeHeader  = "THE DIFF BELOW IS TRUNCATED — IT IS NOT THE WHOLE CHANGE."
+	truncNoticeBinding = "you MUST NOT report a control"
+	truncNoticeUnknown = "The set of omitted files could not be determined"
+)
+
+// truncatedReviewTrigger builds a base implement-review Trigger with the diff
+// truncated and two omitted files rendered as the server would.
+func truncatedReviewTrigger() Trigger {
+	return Trigger{
+		Repo:                      "kuhlman-labs/example",
+		ApprovedPlan:              fixturePlan(),
+		Diff:                      "- M backend/internal/auth/gitlab.go\n- M backend/internal/auth/github.go\n",
+		DiffPatch:                 "diff --git a/backend/internal/auth/gitlab.go b/backend/internal/auth/gitlab.go\n@@ -1 +1 @@\n-x\n+y\n",
+		DiffPatchTruncated:        true,
+		DiffPatchTruncationReason: "runner_patch_cap",
+		DiffPatchOmittedFiles: []string{
+			"backend/internal/auth/github.go (no hunks shown)",
+			"backend/internal/auth/gitlab.go (may be cut — its tail may be missing)",
+		},
+	}
+}
+
+// TestBuild_ImplementReview_DiffTruncated_RendersUnmissableNotice is the
+// done-means test: the truncation notice renders with the bold header, both
+// omitted file paths + why-markers, and the binding UNVERIFIED instruction, and
+// the header appears BEFORE the ```diff fence.
+func TestBuild_ImplementReview_DiffTruncated_RendersUnmissableNotice(t *testing.T) {
+	got, err := Build("implement_review", truncatedReviewTrigger())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		truncNoticeHeader,
+		"PREFIX",
+		"Truncation reason: `runner_patch_cap`.",
+		"backend/internal/auth/github.go (no hunks shown)",
+		"backend/internal/auth/gitlab.go (may be cut — its tail may be missing)",
+		truncNoticeBinding,
+		"UNVERIFIED",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("truncated implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+	headerIdx := strings.Index(got, truncNoticeHeader)
+	fenceIdx := strings.Index(got, "```diff")
+	if headerIdx < 0 || fenceIdx < 0 || headerIdx >= fenceIdx {
+		t.Errorf("truncation header must precede the ```diff fence (header=%d fence=%d)", headerIdx, fenceIdx)
+	}
+}
+
+// TestBuild_ImplementReview_DiffTruncated_NamesOmittedFiles asserts the file
+// NAMES specifically — proving the omitted-file list rendering is independently
+// load-bearing, not covered by the header assertion.
+func TestBuild_ImplementReview_DiffTruncated_NamesOmittedFiles(t *testing.T) {
+	got, err := Build("implement_review", truncatedReviewTrigger())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Assert the full notice ENTRIES (path + why-marker), which only the omitted
+	// list renders — the bare paths also appear in the changed-files index above,
+	// so asserting the marker-bearing entry keeps this a clean counterfactual for
+	// the list rendering specifically.
+	for _, entry := range []string{
+		"backend/internal/auth/github.go (no hunks shown)",
+		"backend/internal/auth/gitlab.go (may be cut — its tail may be missing)",
+	} {
+		if !strings.Contains(got, entry) {
+			t.Errorf("truncated prompt must render omitted-file entry %q:\n%s", entry, got)
+		}
+	}
+}
+
+// TestBuild_ImplementReview_DiffTruncated_ResidualAndUnknownBranches covers the
+// "+N more" residual line and the explicit could-not-determine line for an empty
+// omitted list.
+func TestBuild_ImplementReview_DiffTruncated_ResidualAndUnknownBranches(t *testing.T) {
+	t.Run("residual line", func(t *testing.T) {
+		trig := truncatedReviewTrigger()
+		trig.DiffPatchOmittedFilesResidual = 3
+		got, err := Build("implement_review", trig)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if !strings.Contains(got, "+3 more") {
+			t.Errorf("residual prompt missing '+3 more' line:\n%s", got)
+		}
+	})
+	t.Run("empty omitted list renders could-not-determine", func(t *testing.T) {
+		trig := truncatedReviewTrigger()
+		trig.DiffPatchOmittedFiles = nil
+		got, err := Build("implement_review", trig)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if !strings.Contains(got, truncNoticeUnknown) {
+			t.Errorf("empty-list prompt must render the could-not-determine line:\n%s", got)
+		}
+		// Header still renders (not a bare-header omission).
+		if !strings.Contains(got, truncNoticeHeader) {
+			t.Errorf("empty-list prompt must still render the header:\n%s", got)
+		}
+	})
+	t.Run("forge best-effort label", func(t *testing.T) {
+		trig := truncatedReviewTrigger()
+		trig.DiffPatchTruncationBestEffort = true
+		trig.DiffPatchTruncationReason = "compare truncated by GitHub"
+		got, err := Build("implement_review", trig)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if !strings.Contains(got, "BEST-EFFORT") || !strings.Contains(got, "may itself be incomplete") {
+			t.Errorf("forge-truncation prompt must label the list best-effort:\n%s", got)
+		}
+	})
+}
+
+// TestBuild_ImplementReview_DiffTruncated_FallbackPath asserts the notice renders
+// on the changed-files-only branch too (DiffPatch empty, flag set) — a patch
+// dropped for size is the same epistemic situation.
+func TestBuild_ImplementReview_DiffTruncated_FallbackPath(t *testing.T) {
+	trig := truncatedReviewTrigger()
+	trig.DiffPatch = ""
+	got, err := Build("implement_review", trig)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, truncNoticeHeader) || !strings.Contains(got, truncNoticeBinding) {
+		t.Errorf("fallback-path (no DiffPatch) prompt must still render the truncation notice:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_NotTruncated_ByteIdentical pins that a non-truncated
+// build is byte-identical to one built without any of the #2875 fields, and that
+// the notice text appears nowhere (prompt-hash replay stability).
+func TestBuild_ImplementReview_NotTruncated_ByteIdentical(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		DiffPatch:    "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n@@ -1 +1 @@\n-a\n+b\n",
+	}
+	gotBare, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build bare: %v", err)
+	}
+	withFalse := base
+	withFalse.DiffPatchTruncated = false
+	gotFalse, err := Build("implement_review", withFalse)
+	if err != nil {
+		t.Fatalf("Build false: %v", err)
+	}
+	if gotBare != gotFalse {
+		t.Errorf("explicit DiffPatchTruncated=false must be byte-identical to omitting the #2875 fields")
+	}
+	if strings.Contains(gotBare, truncNoticeHeader) {
+		t.Errorf("non-truncated prompt must not contain the truncation notice:\n%s", gotBare)
+	}
+}
+
+// TestBuild_ImplementReview_TruncationNotice_AfterSplitMarker pins that the
+// notice rides the per-round variable payload (below ImplementReviewSplitMarker)
+// and cannot invalidate the cacheable stable prefix.
+func TestBuild_ImplementReview_TruncationNotice_AfterSplitMarker(t *testing.T) {
+	got, err := Build("implement_review", truncatedReviewTrigger())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	markerIdx := strings.Index(got, ImplementReviewSplitMarker)
+	noticeIdx := strings.Index(got, truncNoticeHeader)
+	if markerIdx < 0 || noticeIdx < 0 || noticeIdx <= markerIdx {
+		t.Errorf("truncation notice must sit AFTER the split marker (marker=%d notice=%d)", markerIdx, noticeIdx)
+	}
+}
+
 // TestBuild_ImplementReview_DeltaVerificationSectionGuardedByPriorConcerns pins
 // that the concern_resolutions verdict-schema member and the "### Prior concerns
 // (delta verification)" section render iff PriorConcerns is non-empty — the #984

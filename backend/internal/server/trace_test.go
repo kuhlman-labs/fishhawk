@@ -8780,3 +8780,503 @@ func TestRunImplementReviews_UnattemptedConcern_SignalDoesNotAlterOutcome(t *tes
 			fired.fixupPasses, baseline.fixupPasses)
 	}
 }
+
+// --- diff-truncation classifier + wiring (#2875) -----------------------
+
+// gitHeader renders a plain (non-quoted) diff --git header line for path.
+func gitHeader(path string) string {
+	return "diff --git a/" + path + " b/" + path + "\n"
+}
+
+// TestTruncatedPatchOmittedFiles_NamesAbsentAndCutFiles: files with no surviving
+// header are "(no hunks shown)" and the LAST surviving header's file is "(may be
+// cut)". COUNTERFACTUAL is the last-header rule: if the classifier treated the
+// last header as fully visible, fileB would drop out of the list.
+func TestTruncatedPatchOmittedFiles_NamesAbsentAndCutFiles(t *testing.T) {
+	patch := gitHeader("a.go") + "@@ -1 +1 @@\n-x\n+y\n" +
+		gitHeader("b.go") + "@@ -1 +1 @@\n-x\n+y" // b.go is the last header, cut mid-hunk
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "a.go", Status: policy.StatusModified},
+			{Path: "b.go", Status: policy.StatusModified},
+			{Path: "c.go", Status: policy.StatusModified},
+		},
+	}
+	got := truncatedPatchOmittedFiles(diff)
+	// a.go is visible (header present, not last) → not reported.
+	for _, g := range got {
+		if strings.HasPrefix(g, "a.go ") {
+			t.Errorf("a.go should be visible (not reported), got entry %q", g)
+		}
+	}
+	if !containsString(got, "b.go (may be cut — its tail may be missing)") {
+		t.Errorf("b.go (last header) should be reported as may-be-cut; got %v", got)
+	}
+	if !containsString(got, "c.go (no hunks shown)") {
+		t.Errorf("c.go (no header) should be reported as no-hunks; got %v", got)
+	}
+}
+
+// TestTruncatedPatchOmittedFiles_CutInsideHeader (condition 6): the cap lands
+// inside the LAST file's header line, so that header does not fully match. The
+// file with the incomplete header is "(no hunks shown)" and the previous COMPLETE
+// header becomes the conservative "(may be cut)" default.
+func TestTruncatedPatchOmittedFiles_CutInsideHeader(t *testing.T) {
+	patch := gitHeader("a.go") + "@@ -1 +1 @@\n-x\n+y\n" +
+		"diff --git a/b.go b/b." // header cut mid-path
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "a.go", Status: policy.StatusModified},
+			{Path: "b.go", Status: policy.StatusModified},
+		},
+	}
+	got := truncatedPatchOmittedFiles(diff)
+	if !containsString(got, "b.go (no hunks shown)") {
+		t.Errorf("b.go (cut-inside-header) should be no-hunks; got %v", got)
+	}
+	if !containsString(got, "a.go (may be cut — its tail may be missing)") {
+		t.Errorf("a.go (last COMPLETE header) should be may-be-cut; got %v", got)
+	}
+}
+
+// TestTruncatedPatchOmittedFiles_UnidentifiablePathFailsClosed (fail-closed): a
+// path git C-quotes in its header (quote + backslash) cannot be matched raw, so
+// it is reported OMITTED, never silently dropped. COUNTERFACTUAL: default the
+// unidentified path to visible → it disappears from the list.
+func TestTruncatedPatchOmittedFiles_UnidentifiablePathFailsClosed(t *testing.T) {
+	quoted := `pa"th\x.go`
+	// Git writes the header C-quoted; the raw path never matches it.
+	patch := gitHeader("plain.go") + "@@ -1 +1 @@\n-x\n+y\n" +
+		"diff --git \"a/pa\\\"th\\\\x.go\" \"b/pa\\\"th\\\\x.go\"\n@@ -1 +1 @@\n-x\n+y\n"
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "plain.go", Status: policy.StatusModified},
+			{Path: quoted, Status: policy.StatusModified},
+		},
+	}
+	got := truncatedPatchOmittedFiles(diff)
+	if !containsString(got, quoted+" (no hunks shown)") {
+		t.Errorf("C-quoted path must fail closed to OMITTED; got %v", got)
+	}
+}
+
+// TestTruncatedPatchOmittedFiles_PrefixSuffixCollision (condition 5, the
+// under-report direction): foo.go is genuinely omitted while bar/foo.go IS
+// present. The anchored match must NOT mark foo.go visible off bar/foo.go's
+// header. COUNTERFACTUAL: a bare substring match marks foo.go visible → RED.
+func TestTruncatedPatchOmittedFiles_PrefixSuffixCollision(t *testing.T) {
+	// Only bar/foo.go has a header; foo.go and foo.go.bak have none.
+	patch := gitHeader("bar/foo.go") + "@@ -1 +1 @@\n-x\n+y\n"
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "foo.go", Status: policy.StatusModified},
+			{Path: "foo.go.bak", Status: policy.StatusModified},
+			{Path: "bar/foo.go", Status: policy.StatusModified},
+		},
+	}
+	got := truncatedPatchOmittedFiles(diff)
+	if !containsString(got, "foo.go (no hunks shown)") {
+		t.Errorf("foo.go (prefix collision with bar/foo.go) must be reported omitted; got %v", got)
+	}
+	if !containsString(got, "foo.go.bak (no hunks shown)") {
+		t.Errorf("foo.go.bak (suffix collision) must be reported omitted; got %v", got)
+	}
+	// bar/foo.go is the only/last header → may-be-cut, but must be present.
+	if !containsString(got, "bar/foo.go (may be cut — its tail may be missing)") {
+		t.Errorf("bar/foo.go should be the surviving (last) header; got %v", got)
+	}
+}
+
+func TestTruncatedPatchOmittedFiles_NotTruncated_ReturnsNil(t *testing.T) {
+	diff := policy.Diff{
+		PatchTruncated: false,
+		Patch:          gitHeader("a.go"),
+		ChangedFiles:   []policy.ChangedFile{{Path: "a.go", Status: policy.StatusModified}},
+	}
+	if got := truncatedPatchOmittedFiles(diff); got != nil {
+		t.Errorf("non-truncated diff must return nil; got %v", got)
+	}
+}
+
+func TestTruncatedPatchOmittedFiles_EmptyChangedFiles_ReturnsNil(t *testing.T) {
+	diff := policy.Diff{PatchTruncated: true, Patch: "x"}
+	if got := truncatedPatchOmittedFiles(diff); got != nil {
+		t.Errorf("empty ChangedFiles must return nil; got %v", got)
+	}
+}
+
+// TestTruncatedPatchOmittedFiles_ReturnsCompleteList: the DERIVATION returns the
+// COMPLETE list (condition 3 — the cap lives at the prompt consumer, not here).
+// >200 omitted files all come back so the audit/gate view carry the full set.
+func TestTruncatedPatchOmittedFiles_ReturnsCompleteList(t *testing.T) {
+	files := make([]policy.ChangedFile, 0, 250)
+	for i := 0; i < 250; i++ {
+		files = append(files, policy.ChangedFile{Path: fmt.Sprintf("f%03d.go", i), Status: policy.StatusModified})
+	}
+	// Empty patch → every file has no header → all omitted.
+	diff := policy.Diff{PatchTruncated: true, Patch: "", ChangedFiles: files}
+	got := truncatedPatchOmittedFiles(diff)
+	if len(got) != 250 {
+		t.Errorf("derivation must return the COMPLETE list; got %d, want 250", len(got))
+	}
+}
+
+// TestDeriveReviewDiffTruncation_ReasonFailClosed pins condition 1: a truncated
+// diff with NO forge reason derives runner_patch_cap (never empty), and a forge
+// reason rides through verbatim and marks best-effort.
+func TestDeriveReviewDiffTruncation_ReasonFailClosed(t *testing.T) {
+	// Runner path: empty reason → runner_patch_cap, not best-effort.
+	runner := policy.Diff{PatchTruncated: true, ChangedFiles: []policy.ChangedFile{{Path: "a.go"}}}
+	tr, ok := deriveReviewDiffTruncation(runner)
+	if !ok || tr.Reason != "runner_patch_cap" || tr.BestEffort {
+		t.Errorf("runner path = %+v ok=%v, want reason runner_patch_cap best-effort false", tr, ok)
+	}
+	// Forge path: reason verbatim, best-effort true.
+	forge := policy.Diff{PatchTruncated: true, PatchTruncationReason: "GitHub capped compare",
+		ChangedFiles: []policy.ChangedFile{{Path: "a.go"}}}
+	tf, ok := deriveReviewDiffTruncation(forge)
+	if !ok || tf.Reason != "GitHub capped compare" || !tf.BestEffort {
+		t.Errorf("forge path = %+v ok=%v, want reason verbatim best-effort true", tf, ok)
+	}
+	// Not truncated → ok=false.
+	if _, ok := deriveReviewDiffTruncation(policy.Diff{}); ok {
+		t.Errorf("non-truncated diff must return ok=false")
+	}
+}
+
+// reviewDiffTruncatedAuditPayload returns the single implement_review_diff_-
+// truncated payload the run appended, or the zero value + false when none.
+func reviewDiffTruncatedAuditPayload(t *testing.T, au *auditFake) (reviewDiffTruncatedPayload, bool) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out reviewDiffTruncatedPayload
+	found := false
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].Category != reviewDiffTruncatedCategory {
+			continue
+		}
+		n++
+		if err := json.Unmarshal(au.appended[i].Payload, &out); err != nil {
+			t.Fatalf("unmarshal implement_review_diff_truncated payload: %v", err)
+		}
+		found = true
+	}
+	if n > 1 {
+		t.Fatalf("implement_review_diff_truncated emitted %d times, want at most 1", n)
+	}
+	return out, found
+}
+
+// TestRunImplementReviews_TruncatedDiff_EmitsAuditAndFlagsPrompt: a truncated
+// full diff both emits the audit entry (with the omitted paths + runner_patch_cap
+// reason) AND renders the prompt notice. COUNTERFACTUAL for the emit: delete the
+// emitReviewDiffTruncated call → the audit entry vanishes.
+func TestRunImplementReviews_TruncatedDiff_EmitsAuditAndFlagsPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	patch := gitHeader("backend/internal/foo/foo.go") + "@@ -1 +1 @@\n-x\n+y" // last header cut
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: "backend/internal/foo/missing.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	p, ok := reviewDiffTruncatedAuditPayload(t, au)
+	if !ok {
+		t.Fatal("no implement_review_diff_truncated audit entry appended")
+	}
+	if p.Reason != "runner_patch_cap" {
+		t.Errorf("audit reason = %q, want runner_patch_cap", p.Reason)
+	}
+	if !containsString(p.OmittedFiles, "backend/internal/foo/missing.go (no hunks shown)") {
+		t.Errorf("audit omitted_files missing the absent file; got %v", p.OmittedFiles)
+	}
+	if p.ChangedFileCount != 2 {
+		t.Errorf("audit changed_file_count = %d, want 2", p.ChangedFileCount)
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	for _, w := range []string{
+		"THE DIFF BELOW IS TRUNCATED",
+		"Truncation reason: `runner_patch_cap`.",
+		"backend/internal/foo/missing.go (no hunks shown)",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q from truncation notice:\n%s", w, got)
+		}
+	}
+}
+
+// TestRunImplementReviews_TruncatedDiff_PromptCapAuditComplete drives
+// runImplementReviews with >200 omitted files and asserts condition 3's split at
+// the WIRING level: the PROMPT lists exactly reviewDiffPromptOmittedCap (200)
+// paths plus a "+50 more" residual line, while the AUDIT payload carries the
+// COMPLETE 250-file list with omitted_files_residual=50. This is the one place
+// the prompt-bounded/audit-complete split is actually decided (trace.go's
+// promptList cap branch). COUNTERFACTUAL: remove that cap branch → the prompt
+// renders all 250 with no "+50 more" and residual=0, and this goes RED.
+func TestRunImplementReviews_TruncatedDiff_PromptCapAuditComplete(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	files := make([]policy.ChangedFile, 0, 250)
+	for i := 0; i < 250; i++ {
+		files = append(files, policy.ChangedFile{Path: fmt.Sprintf("f%03d.go", i), Status: policy.StatusModified})
+	}
+	// Empty patch → every changed file has no surviving header → all 250 omitted.
+	diff := policy.Diff{PatchTruncated: true, Patch: "", ChangedFiles: files}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	// Audit surface: COMPLETE list + residual.
+	p, ok := reviewDiffTruncatedAuditPayload(t, au)
+	if !ok {
+		t.Fatal("no implement_review_diff_truncated audit entry appended")
+	}
+	if len(p.OmittedFiles) != 250 {
+		t.Errorf("audit omitted_files len = %d, want the complete 250", len(p.OmittedFiles))
+	}
+	if p.OmittedFilesResidual != 50 {
+		t.Errorf("audit omitted_files_residual = %d, want 50", p.OmittedFilesResidual)
+	}
+	if !containsString(p.OmittedFiles, "f249.go (no hunks shown)") {
+		t.Errorf("audit omitted_files must carry the last (past-cap) file; got %d entries", len(p.OmittedFiles))
+	}
+
+	// Prompt surface: BOUNDED to 200 + a "+50 more" residual line.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	if n := strings.Count(got, " (no hunks shown)\n"); n != reviewDiffPromptOmittedCap {
+		t.Errorf("prompt listed %d omitted files, want the cap of %d", n, reviewDiffPromptOmittedCap)
+	}
+	if !strings.Contains(got, "- +50 more (list capped for the prompt") {
+		t.Errorf("prompt missing the '+50 more' residual line:\n%s", got)
+	}
+	if !strings.Contains(got, "f199.go (no hunks shown)") {
+		t.Errorf("prompt must list the 200th omitted file (f199.go):\n%s", got)
+	}
+	if strings.Contains(got, "f200.go (no hunks shown)") || strings.Contains(got, "f249.go (no hunks shown)") {
+		t.Errorf("prompt must NOT list past-cap omitted files (f200.go/f249.go):\n%s", got)
+	}
+}
+
+// TestRunImplementReviews_TruncatedDiff_SurfacesOnGateView drives a runner-
+// truncated diff through runImplementReviews and then reads the SAME server's
+// gate view — no hand-seeded payload — closing the emit -> reviewDiffTruncatedForRun
+// seam end to end (condition 1's gate-view leg). COUNTERFACTUAL: delete the
+// emitReviewDiffTruncated call in runImplementReviews → the gate view's
+// review_diff_truncated block is nil and this goes RED.
+func TestRunImplementReviews_TruncatedDiff_SurfacesOnGateView(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	patch := gitHeader("backend/internal/foo/foo.go") + "@@ -1 +1 @@\n-x\n+y" // last header cut
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: "backend/internal/foo/missing.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	gv := s.buildGateView(t.Context(), runRow.ID, "implement", nil)
+	rdt := gv.ReviewDiffTruncated
+	if rdt == nil {
+		t.Fatal("gate view review_diff_truncated = nil; the emit -> read seam is broken")
+	}
+	if rdt.Reason != "runner_patch_cap" {
+		t.Errorf("gate view reason = %q, want runner_patch_cap", rdt.Reason)
+	}
+	if !containsString(rdt.OmittedFiles, "backend/internal/foo/missing.go (no hunks shown)") {
+		t.Errorf("gate view omitted_files missing the absent file; got %v", rdt.OmittedFiles)
+	}
+}
+
+// TestRunImplementReviews_NotTruncated_EmitsNoAudit is the byte-identical
+// control: no truncation → no audit entry, no prompt notice.
+func TestRunImplementReviews_NotTruncated_EmitsNoAudit(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	diff := policy.Diff{
+		Patch:        gitHeader("backend/internal/foo/foo.go") + "@@ -1 +1 @@\n-x\n+y\n",
+		ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	if n := countAuditCategory(au, reviewDiffTruncatedCategory); n != 0 {
+		t.Errorf("implement_review_diff_truncated entries = %d, want 0 when not truncated", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "THE DIFF BELOW IS TRUNCATED") {
+		t.Errorf("non-truncated prompt must not render the truncation notice:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestConsolidatedReviewDiff_CarriesForgeTruncation: cmp.Truncated /
+// TruncationReason map onto PatchTruncated / PatchTruncationReason.
+// COUNTERFACTUAL: drop the mapping → the fields go zero.
+func TestConsolidatedReviewDiff_CarriesForgeTruncation(t *testing.T) {
+	cmp := &githubclient.ComparePatchResult{
+		Patch:            "diff --git a/x b/x\n",
+		Truncated:        true,
+		TruncationReason: "oversized compare",
+		Files:            []githubclient.ComparePatchFile{{Path: "x", Status: "modified"}},
+	}
+	diff := consolidatedReviewDiff(cmp)
+	if !diff.PatchTruncated || diff.PatchTruncationReason != "oversized compare" {
+		t.Errorf("consolidatedReviewDiff = {truncated:%v reason:%q}, want {true, oversized compare}",
+			diff.PatchTruncated, diff.PatchTruncationReason)
+	}
+}
+
+// truncatedDeltaCompareBody is a ComparePatch response whose second file carries
+// changes>0 but NO patch body — GitHub's oversized-diff omission — so
+// ComparePatch marks the result Truncated with a forge reason. shown.go's header
+// survives; omitted.go's does not.
+const truncatedDeltaCompareBody = `{
+	"total_commits": 1,
+	"commits": [{"sha":"currenthead"}],
+	"files": [
+		{"filename":"delta/shown.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+DELTA_MARKER"},
+		{"filename":"delta/omitted.go","status":"modified","changes":5}
+	]
+}`
+
+// TestRunImplementReviews_DeltaReReview_RecomputesTruncation pins condition 2 in
+// BOTH directions: the audit + prompt derive from the diff the round ACTUALLY
+// reviewed (the delta), never the full diff.
+func TestRunImplementReviews_DeltaReReview_RecomputesTruncation(t *testing.T) {
+	// Direction A: truncated FULL diff, CLEAN delta → NO record, NO notice.
+	t.Run("truncated full + clean delta emits nothing", func(t *testing.T) {
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+		s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		seedReReview(t, s, au, runRow, implStage.ID, "priorhead")
+		s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody) // clean delta
+
+		full := fullReReviewBundleDiff()
+		full.PatchTruncated = true // the full diff WAS truncated, but the delta is what's reviewed
+		if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, full, nil, "currenthead", nil) {
+			t.Fatal("gating approve must not gate")
+		}
+		if n := countAuditCategory(au, reviewDiffTruncatedCategory); n != 0 {
+			t.Errorf("truncated-full + clean-delta must emit NO record; got %d", n)
+		}
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		if strings.Contains(reviewer.calls[0], "THE DIFF BELOW IS TRUNCATED") {
+			t.Errorf("clean delta must render NO truncation notice:\n%s", reviewer.calls[0])
+		}
+	})
+
+	// Direction B: CLEAN full diff, TRUNCATED delta → record AND notice.
+	t.Run("clean full + truncated delta emits record and notice", func(t *testing.T) {
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+		s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		seedReReview(t, s, au, runRow, implStage.ID, "priorhead")
+		s.cfg.GitHub = cannedComparePatchClient(t, truncatedDeltaCompareBody)
+
+		full := fullReReviewBundleDiff() // NOT truncated
+		if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, full, nil, "currenthead", nil) {
+			t.Fatal("gating approve must not gate")
+		}
+		p, ok := reviewDiffTruncatedAuditPayload(t, au)
+		if !ok {
+			t.Fatal("truncated delta must emit an implement_review_diff_truncated record")
+		}
+		if !p.DeltaReReview {
+			t.Errorf("record must mark delta_re_review=true; got %+v", p)
+		}
+		if !p.BestEffort || p.Reason == "runner_patch_cap" {
+			t.Errorf("forge-truncated delta must be best-effort with the forge reason; got %+v", p)
+		}
+		if !containsString(p.OmittedFiles, "delta/omitted.go (no hunks shown)") {
+			t.Errorf("record must name the delta's omitted file; got %v", p.OmittedFiles)
+		}
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		got := reviewer.calls[0]
+		if !strings.Contains(got, "THE DIFF BELOW IS TRUNCATED") || !strings.Contains(got, "delta/omitted.go (no hunks shown)") {
+			t.Errorf("truncated-delta prompt must render the notice naming the delta's omitted file:\n%s", got)
+		}
+		if !strings.Contains(got, "BEST-EFFORT") {
+			t.Errorf("forge-truncated delta prompt must label the list best-effort:\n%s", got)
+		}
+	})
+}
+
+// TestRunImplementReviews_TruncatedDiff_AuditAppendFails_ReviewStillRuns: the
+// best-effort posture — an AppendChained error on the truncation category leaves
+// the review dispatched and the prompt notice intact.
+func TestRunImplementReviews_TruncatedDiff_AuditAppendFails_ReviewStillRuns(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.appendErrCategory = reviewDiffTruncatedCategory // only this category's append fails
+
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          gitHeader("a.go") + "@@ -1 +1 @@\n-x\n+y",
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "a.go", Status: policy.StatusModified},
+			{Path: "b.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1 (append failure must not block dispatch)", len(reviewer.calls))
+	}
+	if !strings.Contains(reviewer.calls[0], "THE DIFF BELOW IS TRUNCATED") {
+		t.Errorf("prompt notice must survive an audit append failure:\n%s", reviewer.calls[0])
+	}
+}
+
+// TestEmitReviewDiffTruncated_NilAuditRepo_NoPanic: the nil-AuditRepo guard.
+func TestEmitReviewDiffTruncated_NilAuditRepo_NoPanic(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"}) // no AuditRepo
+	s.emitReviewDiffTruncated(context.Background(), uuid.New(), uuid.New(),
+		reviewDiffTruncation{Reason: "runner_patch_cap", OmittedFiles: []string{"a.go (no hunks shown)"}}, 0, false)
+	// Reaching here without a panic is the assertion.
+}

@@ -906,6 +906,41 @@ func TestConstraints_DiffCoverageRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDiff_PatchTruncationReason_Additive pins that the #2875 PatchTruncationReason
+// field is carried on a Diff and that a zero-value Diff leaves it empty, and that
+// nothing in the policy engine reads it (a truncated diff with a reason evaluates
+// byte-identically to one without). It is a pure data carrier for the server-side
+// prompt/audit surfaces.
+func TestDiff_PatchTruncationReason_Additive(t *testing.T) {
+	// Carried through.
+	d := Diff{
+		ChangedFiles:          []ChangedFile{{Path: "a.go", Status: StatusModified}},
+		PatchTruncated:        true,
+		PatchTruncationReason: "some forge reason",
+	}
+	if d.PatchTruncationReason != "some forge reason" {
+		t.Fatalf("PatchTruncationReason = %q, want carried", d.PatchTruncationReason)
+	}
+	// Zero value is empty.
+	var zero Diff
+	if zero.PatchTruncationReason != "" {
+		t.Errorf("zero-value Diff.PatchTruncationReason = %q, want empty", zero.PatchTruncationReason)
+	}
+	// The evaluator ignores it: a truncated diff carrying a reason evaluates
+	// identically to the same diff with no reason (only ChangedFiles drive the
+	// closed constraint set; DetectCommentOnlyGo branches on PatchTruncated alone).
+	c := Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}}
+	withReason := Evaluate(d, c)
+	d.PatchTruncationReason = ""
+	withoutReason := Evaluate(d, c)
+	// DeepEqual, not a length compare: a bare len() would pass even if the
+	// reason leaked into the violation set (different identities, same count),
+	// so it does not actually prove the evaluator ignores the field.
+	if !reflect.DeepEqual(withReason, withoutReason) {
+		t.Errorf("Evaluate differs with/without reason:\n with:    %+v\n without: %+v", withReason, withoutReason)
+	}
+}
+
 // --- comment-only Go exemption (#2660) ---------------------------------
 
 // commentOnlyGoDiff is a modified .go file whose only changed lines are a

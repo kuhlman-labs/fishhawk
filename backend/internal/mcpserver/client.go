@@ -372,6 +372,35 @@ type GateView struct {
 	// requires_live_validation criterion or against an older backend. Same wire
 	// contract as Run.LiveValidation — the json tag MUST byte-match the backend.
 	LiveValidation *RunLiveValidation `json:"live_validation,omitempty"`
+	// ReviewDiffTruncated surfaces that an implement review ran on a TRUNCATED
+	// diff (#2875) — the runner cut the patch at 256 KiB or the forge capped a
+	// compare, so the reviewer saw only a prefix. Omitted (nil) when the run
+	// carried no such entry or against an older backend. The json tag MUST
+	// byte-match the backend's gateViewResponse or the field silently decodes to
+	// nil — the mixed-version degrade.
+	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+}
+
+// gateViewReviewDiffTruncated mirrors the backend's gateViewReviewDiffTruncated
+// (#2875): the distilled newest implement_review_diff_truncated audit entry. The
+// json tags MUST byte-match the backend or each field silently decodes to its
+// zero value (the #371-class hand-maintained-wire-mirror trap). OmittedFiles is
+// the COMPLETE list (unlike the reviewer prompt, which is capped);
+// OmittedFilesResidual reports how many the prompt dropped. BestEffort marks a
+// forge truncation whose inventory is itself capped.
+//
+// Deliberately UNEXPORTED — same rationale as gateViewDispute: the MCP jsonschema
+// reflection walks it through the exported ReviewDiffTruncated field either way,
+// and this package's exported surface (exportBaseline, export_surface_test.go) is
+// not widened for a nested payload shape.
+type gateViewReviewDiffTruncated struct {
+	Reason               string   `json:"reason" jsonschema:"machine-readable origin of the cut: 'runner_patch_cap' (the runner's 256 KiB patch cap) or the forge's truncation reason"`
+	ChangedFileCount     int      `json:"changed_file_count" jsonschema:"count of files the stage changed (from the uncapped name-status inventory)"`
+	OmittedFileCount     int      `json:"omitted_file_count" jsonschema:"count of changed files not fully visible in the truncated hunks"`
+	OmittedFiles         []string `json:"omitted_files,omitempty" jsonschema:"the complete list of not-fully-visible files, each '<path> (<why>)'"`
+	OmittedFilesResidual int      `json:"omitted_files_residual,omitempty" jsonschema:"how many omitted files the reviewer's capped PROMPT list dropped past the cap"`
+	DeltaReReview        bool     `json:"delta_re_review,omitempty" jsonschema:"true when the truncated diff was a post-fix-up delta re-review rather than the full diff"`
+	BestEffort           bool     `json:"best_effort,omitempty" jsonschema:"true for a forge truncation whose file inventory is itself capped, so the omitted set may itself be incomplete"`
 }
 
 // GateViewConcern is one OPEN concern with full decision context. Note carries

@@ -51,6 +51,29 @@ type gateViewResponse struct {
 	// the newest live_validation walk marker; omitted (nil) when the run carried
 	// no marked criterion. Same best-effort read as the run-status surface.
 	LiveValidation *runLiveValidationPayload `json:"live_validation,omitempty"`
+	// ReviewDiffTruncated surfaces, adjacent to the verdict, that an implement
+	// review ran on a TRUNCATED diff (#2875): the runner cut the patch at 256 KiB
+	// or the forge capped a compare, so the reviewer saw only a prefix. Distilled
+	// from the newest implement_review_diff_truncated audit entry; omitted (nil)
+	// when the run carried none. Carries the COMPLETE omitted-file list (unlike the
+	// prompt, which is capped). Same best-effort read as LiveValidation.
+	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+}
+
+// gateViewReviewDiffTruncated is the gate-view distillation of the newest
+// implement_review_diff_truncated audit entry (#2875). It mirrors the audit
+// payload's field set; OmittedFiles is the COMPLETE list (the operator surface
+// the issue asks to make complete) while OmittedFilesResidual reports how many
+// the reviewer's capped PROMPT list dropped. BestEffort marks a forge truncation
+// whose file inventory is itself capped, so the list may itself be incomplete.
+type gateViewReviewDiffTruncated struct {
+	Reason               string   `json:"reason"`
+	ChangedFileCount     int      `json:"changed_file_count"`
+	OmittedFileCount     int      `json:"omitted_file_count"`
+	OmittedFiles         []string `json:"omitted_files,omitempty"`
+	OmittedFilesResidual int      `json:"omitted_files_residual,omitempty"`
+	DeltaReReview        bool     `json:"delta_re_review,omitempty"`
+	BestEffort           bool     `json:"best_effort,omitempty"`
 }
 
 // gateViewConcern is one OPEN concern with its full decision context.
@@ -358,7 +381,49 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// still pending at this gate" in the one call. Omitted (nil) when the run
 	// carried no marked criterion or the read fails.
 	resp.LiveValidation = s.liveValidationForRun(ctx, runID)
+	// Diff-truncation surface (#2875): the same best-effort single-read as
+	// LiveValidation, so the gate view answers "did a review run on a partial
+	// diff" in the one call. Omitted (nil) when the run carried no truncation
+	// entry or the read fails.
+	resp.ReviewDiffTruncated = s.reviewDiffTruncatedForRun(ctx, runID)
 	return resp
+}
+
+// reviewDiffTruncatedForRun distills the newest implement_review_diff_truncated
+// audit entry for the run into the gate-view surface (#2875), mirroring
+// liveValidationForRun's best-effort posture exactly: nil AuditRepo -> nil, list
+// error -> WARN + nil, no entry -> nil, undecodable payload -> WARN + nil. It
+// never fails the gate view.
+func (s *Server) reviewDiffTruncatedForRun(ctx context.Context, runID uuid.UUID) *gateViewReviewDiffTruncated {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, reviewDiffTruncatedCategory)
+	if err != nil {
+		s.cfg.Logger.Warn("gate-view: list implement_review_diff_truncated failed; omitting review_diff_truncated block",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Newest wins: ListForRunByCategory is sequence-ascending.
+	newest := entries[len(entries)-1]
+	var p reviewDiffTruncatedPayload
+	if uerr := json.Unmarshal(newest.Payload, &p); uerr != nil {
+		s.cfg.Logger.Warn("gate-view: decode implement_review_diff_truncated payload failed; omitting review_diff_truncated block",
+			"run_id", runID.String(), "error", uerr.Error())
+		return nil
+	}
+	return &gateViewReviewDiffTruncated{
+		Reason:               p.Reason,
+		ChangedFileCount:     p.ChangedFileCount,
+		OmittedFileCount:     p.OmittedFileCount,
+		OmittedFiles:         p.OmittedFiles,
+		OmittedFilesResidual: p.OmittedFilesResidual,
+		DeltaReReview:        p.DeltaReReview,
+		BestEffort:           p.BestEffort,
+	}
 }
 
 // gateViewHistory holds the sorted, decoded audit joins the concern loop reads.

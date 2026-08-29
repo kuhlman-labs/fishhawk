@@ -87,6 +87,21 @@ type Diff struct {
 	// which combined with an absent Patch is already the patch_absent
 	// refusal.
 	PatchTruncated bool
+
+	// PatchTruncationReason is the machine-readable ORIGIN of the cut when
+	// PatchTruncated is true (#2875) — carried alongside the flag so the
+	// implement-review truncation notice and the operator-facing audit entry
+	// can name WHY the diff below the reviewer is only a prefix. On the
+	// forge-compare path it holds the forge's ComparePatchResult.TruncationReason
+	// (GitHub capped an oversized compare). On the runner path the runner wire
+	// format carries only the boolean, so this stays EMPTY here and the server
+	// derives "runner_patch_cap" — a non-empty reason therefore always means a
+	// FORGE truncation, whose file inventory is itself capped and best-effort.
+	//
+	// Purely additive data: no evaluator reads it (DetectCommentOnlyGo still
+	// branches on PatchTruncated alone), so a zero-value Diff and every older
+	// bundle leave it empty and evaluate byte-identically.
+	PatchTruncationReason string
 }
 
 // Constraints is the parsed shape of the workflow-spec stage's

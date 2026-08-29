@@ -635,6 +635,41 @@ type Trigger struct {
 	// keeping the "### Diff under review" section byte-identical to today's
 	// first-review rendering.
 	DeltaReReview bool
+	// DiffPatchTruncated marks the reviewed diff as a PREFIX of the real change
+	// (#2875): the runner cut the unified patch at its 256 KiB cap, or the forge
+	// capped an oversized compare. When true, buildImplementReview emits an
+	// unmissable notice — immediately under "### Diff under review", AHEAD of the
+	// hunks — that the diff is truncated, names the files not fully visible, and
+	// BINDS the reviewer not to report a control ABSENT on the strength of its not
+	// appearing below. Empty/false for every non-implement-review build and for a
+	// non-truncated diff, so the prompt stays byte-identical to today when nothing
+	// was cut (prompt-hash replay stability, the same contract the diff section's
+	// #2398 note states).
+	DiffPatchTruncated bool
+	// DiffPatchTruncationReason is the machine-readable origin of the cut named in
+	// the notice (#2875): "runner_patch_cap" for the runner's 256 KiB cap, or the
+	// forge's TruncationReason prose for a GitHub-capped compare. Empty unless
+	// DiffPatchTruncated is true.
+	DiffPatchTruncationReason string
+	// DiffPatchTruncationBestEffort marks a FORGE truncation (#2875): the omitted
+	// file list is derived against the compare API's own file inventory, which is
+	// itself subject to GitHub's 300-file cap, so a file missing from BOTH the
+	// truncated patch and the capped inventory can be neither named nor counted.
+	// When true the notice labels the list best-effort and says the omitted set
+	// may itself be incomplete. False for the runner path, whose --name-status
+	// inventory is uncapped and complete.
+	DiffPatchTruncationBestEffort bool
+	// DiffPatchOmittedFiles are the changed files NOT fully visible in the
+	// truncated hunks, each already rendered by the server as "<path> (<why>)"
+	// (why = "no hunks shown" or "may be cut — its tail may be missing"). This is
+	// the PROMPT-facing list, capped by the server (the audit payload and gate
+	// view carry the complete list). Empty when DiffPatchTruncated is false or the
+	// omitted set could not be determined.
+	DiffPatchOmittedFiles []string
+	// DiffPatchOmittedFilesResidual is the count of omitted files BEYOND the
+	// prompt cap — rendered as a "+N more" line so a pathological diff cannot blow
+	// the prompt. Zero when the whole omitted set fit under the cap.
+	DiffPatchOmittedFilesResidual int
 	// ScopeDrift is the runner-reported list of paths that the implement
 	// stage created/modified but that were EXCLUDED from the scope-bounded
 	// diff above — paths the operator may stage into the final commit
@@ -4039,6 +4074,60 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 	}
 }
 
+// writeReviewDiffTruncationNotice renders the diff-truncation notice (#2875)
+// when the reviewed diff is a PREFIX of the real change. It is a no-op when
+// DiffPatchTruncated is false, so a non-truncated review is byte-identical to
+// the pre-#2875 prompt. The notice: (a) opens with a bold header stating the
+// hunks are a prefix, not the whole change; (b) names the truncation reason;
+// (c) lists every not-fully-visible file with its why-marker, plus a "+N more"
+// residual line, or an explicit could-not-determine line when the list is
+// empty; (d) for a FORGE truncation labels the list best-effort because the
+// forge's own file inventory is capped; (e) closes with the BINDING rule that
+// the reviewer must not report a control ABSENT on the strength of its not
+// appearing below — for a listed file it must READ the file or state the
+// property UNVERIFIED, and an "X is missing" finding about a listed file is a
+// defect in the review, not the change.
+func writeReviewDiffTruncationNotice(b *strings.Builder, t Trigger) {
+	if !t.DiffPatchTruncated {
+		return
+	}
+	b.WriteString("**THE DIFF BELOW IS TRUNCATED — IT IS NOT THE WHOLE CHANGE.** The hunks below are only a " +
+		"PREFIX of the real change; the implement stage changed more than is shown here.\n\n")
+	reason := t.DiffPatchTruncationReason
+	if reason == "" {
+		reason = "unknown"
+	}
+	fmt.Fprintf(b, "Truncation reason: `%s`.\n\n", reason)
+	if t.DiffPatchTruncationBestEffort {
+		b.WriteString("This truncation came from the forge's compare API, whose changed-file inventory is " +
+			"ITSELF capped, so the omitted list below is BEST-EFFORT — the omitted set may itself be incomplete, " +
+			"and a file changed by this stage may appear in NEITHER the hunks below NOR this list.\n\n")
+	}
+	switch {
+	case len(t.DiffPatchOmittedFiles) > 0:
+		b.WriteString("Files changed by this stage that are NOT fully visible in the hunks below " +
+			"(read each from the repository before judging it):\n\n")
+		for _, f := range t.DiffPatchOmittedFiles {
+			b.WriteString("- ")
+			b.WriteString(f)
+			b.WriteString("\n")
+		}
+		if t.DiffPatchOmittedFilesResidual > 0 {
+			fmt.Fprintf(b, "- +%d more (list capped for the prompt; the full set is on the run's gate view)\n",
+				t.DiffPatchOmittedFilesResidual)
+		}
+		b.WriteString("\n")
+	default:
+		b.WriteString("The set of omitted files could not be determined from the surviving patch — treat ANY " +
+			"file as potentially not fully visible.\n\n")
+	}
+	b.WriteString("BINDING: you MUST NOT report a control, test, guard, or any other code as ABSENT or MISSING " +
+		"because it does not appear in the hunks below. For any file named above — or, when the omitted set is " +
+		"undetermined, any file — either READ it from the repository and judge what you actually read, or state " +
+		"the property UNVERIFIED for this round. An \"X is missing\" finding about a not-fully-visible file is a " +
+		"defect in the review, not in the change.\n\n")
+}
+
 // buildImplementReview constructs the constrained prompt for an
 // implement-review agent (ADR-027 impl 2/2). The agent reviews the diff
 // produced by the implement stage against the approved plan and emits a
@@ -4318,6 +4407,13 @@ func buildImplementReview(t Trigger) string {
 	// adapters key on: everything above is the stable, cacheable prefix; this
 	// section and everything below it is the per-round-variable payload.
 	b.WriteString("### Diff under review\n\n")
+	// Truncation notice (#2875). Rendered AFTER ImplementReviewSplitMarker so it
+	// rides the per-round variable payload and never invalidates the cacheable
+	// stable prefix, and AHEAD of the hunks (both the ```diff fence and the
+	// file-list fallback) because a patch dropped for size is the same epistemic
+	// situation as a capped one. No-op when the diff was not truncated, keeping the
+	// section byte-identical to today.
+	writeReviewDiffTruncationNotice(&b, t)
 	if t.DeltaReReview {
 		// Delta re-review framing (#1725). On the post-fix-up delta path the diff
 		// below is ONLY the fix-up changes since the previous review's head — not

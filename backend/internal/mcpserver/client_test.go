@@ -1567,6 +1567,57 @@ func TestRunLiveValidation_WireShape(t *testing.T) {
 	})
 }
 
+// TestGateViewReviewDiffTruncated_WireShape pins the hand-maintained MCP wire
+// mirror for the gate-view review_diff_truncated block (#2875): the backend tags
+// MUST byte-match GateView.ReviewDiffTruncated / gateViewReviewDiffTruncated or
+// the pointer (and each field) silently decodes to its zero value (the #371-class
+// trap), exactly like the sibling LiveValidation convention this file carries. A
+// populated block decodes as sent (including the residual round-trip), and an
+// old-backend body that omits the field decodes to nil (the mixed-version
+// degrade).
+func TestGateViewReviewDiffTruncated_WireShape(t *testing.T) {
+	runID := uuid.New()
+	serveGV := func(t *testing.T, rdt string) *GateView {
+		t.Helper()
+		body := `{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]`
+		if rdt != "" {
+			body += `,"review_diff_truncated":` + rdt
+		}
+		body += `}`
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		gv, err := c.GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		return gv
+	}
+
+	t.Run("populated block decodes including residual", func(t *testing.T) {
+		gv := serveGV(t, `{"reason":"runner_patch_cap","changed_file_count":210,"omitted_file_count":205,`+
+			`"omitted_files":["a.go (no hunks shown)"],"omitted_files_residual":5,"delta_re_review":true,"best_effort":true}`)
+		rdt := gv.ReviewDiffTruncated
+		if rdt == nil {
+			t.Fatal("ReviewDiffTruncated is nil; the review_diff_truncated json tag does not byte-match the backend")
+		}
+		if rdt.Reason != "runner_patch_cap" || rdt.ChangedFileCount != 210 || rdt.OmittedFileCount != 205 ||
+			len(rdt.OmittedFiles) != 1 || rdt.OmittedFilesResidual != 5 || !rdt.DeltaReReview || !rdt.BestEffort {
+			t.Errorf("ReviewDiffTruncated = %+v, want every field decoded (a mistyped tag zeroes one silently)", *rdt)
+		}
+	})
+
+	t.Run("old-backend body omits the field -> nil", func(t *testing.T) {
+		gv := serveGV(t, "")
+		if gv.ReviewDiffTruncated != nil {
+			t.Errorf("ReviewDiffTruncated = %+v, want nil when the backend omits review_diff_truncated (the mixed-version degrade)", gv.ReviewDiffTruncated)
+		}
+	})
+}
+
 // --- W1: the WHOLE MCP wire, gh subprocess → request body (#2226) ---
 //
 // The gap the operator named: issue_fetch_test.go ends at the decode and the
