@@ -82,7 +82,7 @@ In practice a TERMed runner exits gracefully and its deferred release removes th
 - No MCP token (`acceptance_no_mcp_token` event — ADR-050 #2).
 - `inv.WorkingDir` → a fresh empty `os.MkdirTemp` dir. This is diff-withholding per ADR-049 #4 plus accidental-write hygiene ONLY, not an authority boundary — the boundary is credential-free env + no commit/push/PR path.
 - `egressproxy.Start(BuildAllowlist(...))` — a start error fails category-C BEFORE any agent spawn.
-- `acceptenv.Env` → `Invocation.BaseEnv` (the `runner/internal/agent` seam): a non-nil BaseEnv REPLACES the `os.Environ()` seed in both the claudecode and codex adapters, with the API-key + `Env` overlays still applied on top; nil preserves the inherit-parent-env behavior byte-for-byte, so every non-acceptance spawn is unchanged. Refused passthroughs → `acceptance_env_refused`.
+- `acceptenv.Env` → `Invocation.BaseEnv` (the `runner/internal/agent` seam): a non-nil BaseEnv REPLACES the `os.Environ()` seed in both the claudecode and codex adapters, with the API-key + `Env` overlays still applied on top; nil preserves the inherit-parent-env behavior byte-for-byte. Since #2894 the non-acceptance spawn is ALSO given a non-nil BaseEnv (`agentenv.Env`, below), so the nil case is no longer a path the runner takes; this acceptance branch's assignment runs later and overwrites it, leaving the acceptance posture byte-for-byte unchanged. Refused passthroughs → `acceptance_env_refused`.
 - `inv.JSONSchema = acceptanceVerdictJSONSchema` (claudecode structured output; other backends use the file fallback).
 
 **Verdict file path (#1780):** the buildAcceptance output contract NAMES the run/stage-keyed `/tmp/fishhawk-acceptance-<run>-<stage>.json` path (`prompt.AcceptanceVerdictPath(runID, stageID)`, threaded via `Trigger.AcceptanceRunID`/`AcceptanceStageID`). The runner's `acceptanceVerdictPath` reads that FIRST, falling back to the legacy fixed `/tmp/fishhawk-acceptance.json` (`legacyAcceptanceVerdictPath` ↔ `prompt.LegacyAcceptanceVerdictPath`) when a trigger threads no ids. The keyed and legacy format strings are byte-identical across the two modules.
@@ -431,6 +431,110 @@ drives a fetched prompt carrying the config through `run()` to a
 `diff_coverage` event in the uploaded bundle, and
 `TestRun_NoDiffCoverage_EmitsNoEvent` pins the other half: a stage with no
 declared constraint runs no command and emits no event.
+
+### Agent-env allow-list
+
+`runner/internal/agentenv::Env` builds the child env for the NON-acceptance
+agent spawn (plan / implement / review), assigned to `Invocation.BaseEnv` at
+main.go's single `agent.Invocation` construction site. It is the third and last
+member of the family: `gateenv.go` covers gate subprocesses, `acceptenv` covers
+the acceptance agent, `agentenv` covers everything else. Before #2894 the
+implement agent was the ONE subprocess class with no allow-list — a nil
+`BaseEnv` is inherit-parent-env in both adapters, so the agent saw the runner's
+whole `os.Environ()`, including the ambient operator bearer
+`FISHHAWK_API_TOKEN`.
+
+The posture is the same **default-deny allow-list**, with the rungs keyed to
+what the implement agent actually drives (the repo's Go toolchain, git,
+Docker-backed testcontainers, a Node-based agent CLI):
+
+- `allowExact` — PATH/HOME/locale/temp/CC/CXX, `CI` (scripts/test's timescale
+  auto-5x keys off it), the proxy vars in both cases, and the Docker **client**
+  vars by exact name (`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`,
+  `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `DOCKER_API_VERSION` — exact rather
+  than a `DOCKER_` prefix, which would also admit `DOCKER_AUTH_CONFIG` and
+  `DOCKER_PASSWORD`).
+- `allowGo` — the explicit Go toolchain/runtime NAME set, not a bare `GO`
+  prefix (#2504). It is DUPLICATED from `gateEnvAllowGo` because this package
+  cannot import package main and hoisting the set would break the
+  source-reading `TestGateEnvListsMatchCLICopy` lockstep with the CLI copy;
+  `TestAgentEnvNotNarrowerThanGateEnv` pins the duplication in Go, so drift
+  fails a test rather than silently narrowing the agent's toolchain env.
+- `allowPrefix` — `LC_`, `CGO_`, `XDG_`, `NODE_`, `NPM_CONFIG_`/`npm_config_`,
+  `TESTCONTAINERS_`, `SSL_CERT_`, and the model/agent-CLI configuration family
+  `ANTHROPIC_`/`OPENAI_`/`CLAUDE_` (gateway base URLs, alternate auth tokens,
+  CLI knobs) — the one class deliberately re-admitted, exactly as `acceptenv`
+  re-admits the model keys.
+
+Layered on top, applied BEFORE the allow-list: `denyExact`
+(`FISHHAWK_API_TOKEN`, `FISHHAWK_GITHUB_TOKEN`, `FISHHAWK_GITLAB_TOKEN`,
+`GITHUB_TOKEN`, `GH_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `NPM_TOKEN`,
+`DOCKER_AUTH_CONFIG`, `SSH_AUTH_SOCK`) and `denyPrefix` (`FISHHAWK_`, `GOOGLE_`,
+`AWS_`, `AZURE_`).
+
+**The two credentials that still reach the child are OVERLAYS, not
+inheritance.** The run-bound MCP token arrives via `Invocation.Env`
+(`FISHHAWK_API_TOKEN` = the freshly minted `fhm_` bearer, plus
+`FISHHAWK_BACKEND_URL`) — the SAME variable name the denylist strips from the
+base, so the name is present in the child carrying the run-bound value, never
+the ambient operator bearer. The model API key arrives via the adapter's
+API-key append: `apiKeyForAgent` reads the runner's OWN ambient process env
+(`os.Getenv`), which this filter never mutates — it filters a snapshot — so
+denying `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` from the base makes the adapter
+the SINGLE injection point for the model credential rather than withholding it.
+Both routes go through `agent.AppendEnvOverride`, which strips any same-named
+entry before appending, so each appears exactly once.
+
+**Operator passthrough.** `FISHHAWK_AGENT_ENV_<NAME>=<value>` on the runner env
+becomes `<NAME>=<value>` on the agent env — a per-variable escape hatch needing
+no code change. It is checked BEFORE the `FISHHAWK_` deny prefix, so the
+channel works while every other `FISHHAWK_*` var (including the
+`FISHHAWK_TEST_*` / `FISHHAWK_SKIP_PATCH_COVERAGE` gate knobs) stays out. A
+stripped name that collides with the denylist is **refused, never honored**,
+and reported on a single-line `agent_env_refused` log event — the passthrough
+branch is the one place the denylist is load-bearing rather than
+belt-and-suspenders, since default-deny already drops those names from the base.
+
+**Honest residuals.** The passthrough is NOT a universal escape hatch, and the
+two residuals below are exactly where it stops. `Denied` consults BOTH
+`denyExact` and `denyPrefix`, and the passthrough branch applies it to the
+STRIPPED name, so `FISHHAWK_AGENT_ENV_SSH_AUTH_SOCK` and
+`FISHHAWK_AGENT_ENV_AWS_BEARER_TOKEN_BEDROCK` are refused and logged, not
+honored (`TestEnv_PassthroughDeniedCollisionRefused` names both). Re-admitting
+a denied variable takes a code change to the deny rules — deliberately, since
+the refusal is the one place the denylist is load-bearing.
+
+- `SSH_AUTH_SOCK` is dropped (and denied): it is an authority handle to the
+  operator's SSH agent, and the runner — not the agent — performs the
+  run-branch push. An agent-driven `go mod download` of a private module over
+  an ssh-rewritten URL would fail; this repo has no private module
+  dependencies, and the passthrough will NOT restore it.
+- `AWS_*` / `GOOGLE_*` / `AZURE_*` are denied by prefix, so a deployment
+  routing the agent through Bedrock or Vertex loses its cloud model credential
+  and cannot re-admit it through the passthrough either. Bedrock/Vertex
+  routing is therefore unsupported under this policy until those deny rules
+  are narrowed in code. The first-party route is unaffected: `apiKeyForAgent`
+  reads the runner's ambient `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` and the
+  adapter appends it as an overlay, which is why denying the raw keys from the
+  base withholds nothing.
+
+**A second model-vendor credential DOES reach the agent.** The
+`ANTHROPIC_`/`OPENAI_`/`CLAUDE_` allow rungs re-admit those whole
+configuration families, while `denyExact` names only the two raw keys
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` — so any OTHER credential-bearing
+name in those families exported ambiently on the runner (`ANTHROPIC_AUTH_TOKEN`,
+`OPENAI_ADMIN_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) WILL be inherited by the
+implement agent. That is a deliberate, documented residual, not an oversight:
+the families carry the gateway base URLs and alternate auth tokens the agent
+needs, exactly as `acceptenv` re-admits the model keys. An operator who does
+not want a particular one reaching the agent must not export it into the
+runner's environment.
+
+Pinned by `runner/internal/agentenv/agentenv_test.go` (one behavioral case per
+named branch), `TestAgentEnvNotNarrowerThanGateEnv` (the gate-env lockstep),
+and `TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials` (the
+cross-boundary end-to-end: main.go wiring → `BaseEnv` → the claudecode adapter's
+seed → a REAL child process that echoes its own environment).
 
 ## PR-open checkpoint resume (E48.46 / #2169)
 

@@ -40,6 +40,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agentenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/diffcov"
@@ -870,6 +871,36 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// signed trace bundle. Reverting this one line fully disables
 		// emission.
 		ProgressSink: logSink,
+	}
+
+	// Default-deny the agent's inherited environment (#2894). Until this
+	// assignment the non-acceptance agent was the ONE subprocess class with no
+	// env allow-list: a nil Invocation.BaseEnv is inherit-parent-env in both
+	// adapters, so the implement/plan/review agent saw the runner's whole
+	// os.Environ() — the ambient operator bearer FISHHAWK_API_TOKEN, the GitHub
+	// App installation token, and anything else the runner carried. agentenv
+	// composes the same default-deny allow-list posture gateenv.go gives gate
+	// subprocesses and acceptenv gives the acceptance agent.
+	//
+	// It is assigned to the shared `inv` and therefore covers every derived
+	// invocation by value — the fix-up dispatch, the verify-fix re-invoke
+	// (fixInv := baseInv) and the base-rebase re-invoke (reinvokeInv := baseInv)
+	// — the same seam inv.Model above rides.
+	//
+	// Placed BEFORE the `if stageType == "acceptance"` block, whose acceptenv
+	// assignment overwrites BaseEnv, so the acceptance posture is unchanged by
+	// construction and no stage-type condition is needed here. The two
+	// credentials the agent legitimately needs are OVERLAYS applied on top by
+	// the adapter, not inheritance: the run-bound MCP token (inv.Env below) and
+	// the model API key (apiKeyForAgent reads the runner's OWN process env,
+	// which this snapshot filter never mutates).
+	agentBaseEnv, agentEnvRefused := agentenv.Env(os.Environ())
+	inv.BaseEnv = agentBaseEnv
+	if len(agentEnvRefused) > 0 {
+		refusedJSON, _ := json.Marshal(agentEnvRefused)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"agent_env_refused","run_id":%q,"names":%s}`+"\n",
+			cfg.runID, refusedJSON)
 	}
 
 	// Pin the backend-resolved implement model onto the spawn (#1013). The

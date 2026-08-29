@@ -32,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agentenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
@@ -23464,4 +23465,386 @@ func TestFixupObligationsBranch_NeverTouchesStageOutcome(t *testing.T) {
 // printNode renders an AST node back to source for the comparison above.
 func printNode(w io.Writer, fset *token.FileSet, node ast.Node) error {
 	return format.Node(w, fset, node)
+}
+
+// ---------------------------------------------------------------------------
+// Agent-env allow-list (#2894)
+// ---------------------------------------------------------------------------
+
+// TestAgentEnvNotNarrowerThanGateEnv pins the DUPLICATED Go toolchain name set
+// (and the system essentials) in runner/internal/agentenv against silent drift
+// from gateenv.go. The agent drives the SAME Go toolchain the gates do — it
+// runs `go test` itself — so the agent env must never be NARROWER than the gate
+// env for those names, and never weaker on the known-secret denylist.
+//
+// This is a plain in-Go comparison rather than a source grep: package main can
+// import agentenv and read gateenv.go's vars directly. (The gate-env <-> CLI
+// pin, TestGateEnvListsMatchCLICopy, must stay a source read because the CLI
+// copy lives in a different module.)
+func TestAgentEnvNotNarrowerThanGateEnv(t *testing.T) {
+	for key := range gateEnvAllowExact {
+		if !agentenv.Allowed(key) {
+			t.Errorf("agentenv.Allowed(%q) = false; the agent env must not be narrower than the gate env (gateEnvAllowExact)", key)
+		}
+	}
+	for key := range gateEnvAllowGo {
+		if !agentenv.Allowed(key) {
+			t.Errorf("agentenv.Allowed(%q) = false; the agent runs the same Go toolchain the gates do (gateEnvAllowGo)", key)
+		}
+	}
+	for key := range gateEnvDeny {
+		if !agentenv.Denied(key) {
+			t.Errorf("agentenv.Denied(%q) = false; a secret denied to gate subprocesses must also be denied to the agent (gateEnvDeny)", key)
+		}
+	}
+}
+
+// TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv and its base-rebase twin
+// answer binding approval condition 3 EMPIRICALLY rather than by reading
+// main.go: both re-invoke paths derive their Invocation from the one
+// agent.Invocation literal by value (fixInv := baseInv, reinvokeInv := baseInv),
+// so the #2894 BaseEnv assignment must ride along. The fake invoker captures
+// the Invocation actually handed to invoker.Invoke and the assertion reads
+// BaseEnv off THAT value, so a path that reconstructed a fresh Invocation
+// would fail here. The assertion compares the captured BaseEnv for EQUALITY
+// with the seeded slice rather than merely non-nil, so a re-invoke path that
+// substituted an env of its own composing — a fresh agentenv.Env(), an
+// os.Environ() passthrough — fails too, not just one that left it nil.
+func TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "a.txt"), "hello\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "initial")
+	mustWrite(t, filepath.Join(repo, "a.txt"), "changed\n")
+
+	cfg := config{
+		workingDir:          repo,
+		verifyCmd:           "false", // always fails, so the fix re-invoke runs
+		verifyMaxIterations: 1,
+		scopeFiles:          []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
+	}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	wantBaseEnv := []string{"PATH=/bin"}
+	baseInv := agent.Invocation{BaseEnv: wantBaseEnv}
+	res := agent.Result{OK: true}
+	_, _, _ = runVerifyFixLoop(context.Background(), cfg, invoker, baseInv, &res, io.Discard)
+
+	if invoker.callIdx == 0 {
+		t.Fatal("the verify-fix loop never re-invoked the agent; the assertion below would be vacuous")
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	if !reflect.DeepEqual(invoker.gotInv.BaseEnv, wantBaseEnv) {
+		t.Errorf("fix-up re-invoke Invocation.BaseEnv = %q, want %q; the derived invocation must inherit the #2894 default-deny env VERBATIM, or the fix-up agent spawns with the runner's full environment (or with an env the caller never composed)",
+			invoker.gotInv.BaseEnv, wantBaseEnv)
+	}
+}
+
+// TestReinvokeOnBaseRebaseConflict_DerivedInvocationCarriesBaseEnv is the
+// base-rebase half of condition 3 (see the doc comment above).
+func TestReinvokeOnBaseRebaseConflict_DerivedInvocationCarriesBaseEnv(t *testing.T) {
+	orig := checkoutRunBranch
+	checkoutRunBranch = func(_ context.Context, _, _ string) error { return nil }
+	t.Cleanup(func() { checkoutRunBranch = orig })
+
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		workingDir: t.TempDir(),
+	}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	wantBaseEnv := []string{"PATH=/bin"}
+	baseInv := agent.Invocation{BaseEnv: wantBaseEnv}
+	res := agent.Result{}
+	if err := reinvokeOnBaseRebaseConflict(context.Background(), cfg, invoker, baseInv,
+		&res, gitops.ErrBaseRebaseConflict, io.Discard); err != nil {
+		t.Fatalf("reinvokeOnBaseRebaseConflict: %v", err)
+	}
+	if invoker.callIdx == 0 {
+		t.Fatal("the base-rebase path never re-invoked the agent; the assertion below would be vacuous")
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	if !reflect.DeepEqual(invoker.gotInv.BaseEnv, wantBaseEnv) {
+		t.Errorf("base-rebase re-invoke Invocation.BaseEnv = %q, want %q; the derived invocation must inherit the #2894 default-deny env VERBATIM",
+			invoker.gotInv.BaseEnv, wantBaseEnv)
+	}
+}
+
+// agentEnvHelperMarker activates TestHelperProcessAgentEnvDump. It is passed
+// as an ARGV token, deliberately NOT an env var: the whole point of the test
+// below is that the child's environment is composed by agentenv, so an
+// env-gated helper would fail to activate for reasons unrelated to the
+// assertion under test — and a counterfactual that deletes the BaseEnv
+// assignment would then go red on helper activation instead of on the
+// credential comparison.
+const agentEnvHelperMarker = "fishhawk-agentenv-helper"
+
+// TestHelperProcessAgentEnvDump pretends to be the `claude` binary for the
+// cross-boundary test below: it dumps its OWN os.Environ() as a single
+// stream-json event, then a clean terminal result. It is a no-op under a
+// normal test run (the marker is absent from os.Args).
+func TestHelperProcessAgentEnvDump(t *testing.T) {
+	found := false
+	for _, a := range os.Args {
+		if a == agentEnvHelperMarker {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	defer os.Exit(0)
+	entries, err := json.Marshal(os.Environ())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "marshal environ:", err)
+		return
+	}
+	fmt.Printf(`{"type":"agent_env","entries":%s}`+"\n", entries)
+	fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
+}
+
+// capturingInvoker wraps a REAL adapter so a run() test can read back both the
+// Invocation the runner composed and the Result the real child produced.
+type capturingInvoker struct {
+	inner  agent.Invoker
+	gotInv *agent.Invocation
+	res    *agent.Result
+}
+
+func (c *capturingInvoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Result, error) {
+	i := inv
+	c.gotInv = &i
+	r, err := c.inner.Invoke(ctx, inv)
+	c.res = &r
+	return r, err
+}
+
+// childEnvFromResult extracts the child's real os.Environ() from the
+// agent_env event the helper process emitted. It returns the RAW entry slice
+// (not a map) so duplicate-name assertions stay possible.
+func childEnvFromResult(t *testing.T, res *agent.Result) []string {
+	t.Helper()
+	if res == nil {
+		t.Fatal("no agent Result captured")
+	}
+	for _, ev := range res.Events {
+		if ev.Kind != "agent_env" {
+			continue
+		}
+		var payload struct {
+			Entries []string `json:"entries"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+			t.Fatalf("agent_env payload not JSON: %v: %s", err, ev.Payload)
+		}
+		return payload.Entries
+	}
+	t.Fatalf("no agent_env event in the child's output; the helper process never ran (events: %d)", len(res.Events))
+	return nil
+}
+
+// childEnvValues returns every value the child env carries for key, in order.
+// A length other than 1 is what makes "present exactly once" assertable.
+func childEnvValues(env []string, key string) []string {
+	prefix := key + "="
+	var out []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			out = append(out, strings.TrimPrefix(kv, prefix))
+		}
+	}
+	return out
+}
+
+// TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials is the
+// cross-boundary end-to-end assertion for #2894. It spans main.go's wiring ->
+// agent.Invocation.BaseEnv -> the claudecode adapter's seed logic -> a REAL
+// child process, which is the seam no per-layer unit can cover. It is also the
+// DONE-MEANS test: the change is an allow-list/default-value shape whose
+// correctness the compiler does not enforce, so a comment-only or no-op touch
+// of main.go would satisfy the scope-completeness gate while this test goes
+// red.
+//
+// The fixture SETS every ambient credential to a distinct sentinel first — an
+// env-filtering test whose fixture never exported the variable is vacuous.
+//
+// FISHHAWK_API_TOKEN is asserted by IDENTITY, not by absence (binding approval
+// condition 2): main.go injects the RUN-BOUND MCP token under that SAME NAME
+// via Invocation.Env, so the name IS present in the child. What must be true is
+// that its value is the run-bound token and NOT the ambient operator bearer the
+// denylist stripped from the base.
+func TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials(t *testing.T) {
+	const (
+		ambientBearer   = "fhm_ambient_operator_bearer_sentinel"
+		runBoundBearer  = "fhm_stubmcptokenforuse" // what the fake uploader mints
+		ghAppSentinel   = "ghs_app_token_sentinel"
+		ghTokenSentinel = "ghp_github_token_sentinel"
+		ghCLISentinel   = "gho_gh_token_sentinel"
+		modelSentinel   = "anthropic-model-key-sentinel"
+	)
+	if ambientBearer == runBoundBearer {
+		t.Fatal("the ambient and run-bound sentinels must differ or the identity assertion is vacuous")
+	}
+
+	// Ambient credentials the agent must not inherit.
+	t.Setenv("FISHHAWK_API_TOKEN", ambientBearer)
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", ghAppSentinel)
+	t.Setenv("GITHUB_TOKEN", ghTokenSentinel)
+	t.Setenv("GH_TOKEN", ghCLISentinel)
+	t.Setenv("ANTHROPIC_API_KEY", modelSentinel)
+	// A non-allow-listed ambient var: the default-deny case.
+	t.Setenv("SOME_UNLISTED_VENDOR_SECRET", "unlisted-sentinel")
+	// Toolchain names the agent must KEEP.
+	t.Setenv("GOPRIVATE", "example.com/private")
+	// The operator escape hatch.
+	t.Setenv("FISHHAWK_AGENT_ENV_TARGET_THING", "target-thing-value")
+
+	// The real claudecode adapter, with only the child binary faked. The Cmd
+	// builder leaves cmd.Env NIL on purpose: the adapter re-seeds cmd.Env from
+	// BaseEnv only when it is nil, so pre-setting it would bypass the very seam
+	// under test.
+	capture := &capturingInvoker{}
+	origNewInvoker := newInvoker
+	newInvoker = func(apiKey, _ string) agent.Invoker {
+		cc := claudecode.New(apiKey)
+		cc.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, os.Args[0],
+				"-test.run=TestHelperProcessAgentEnvDump", "--", agentEnvHelperMarker)
+		}
+		capture.inner = cc
+		return capture
+	}
+	t.Cleanup(func() { newInvoker = origNewInvoker })
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Do the thing.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if capture.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	// t.Error, not t.Fatal: a nil BaseEnv means the child inherited the whole
+	// runner env, and the credential assertions below are exactly what should
+	// then report WHICH secrets leaked. Short-circuiting here would hide that.
+	if capture.gotInv.BaseEnv == nil {
+		t.Error("Invocation.BaseEnv is nil on a non-acceptance stage; a nil BaseEnv is inherit-parent-env — the #2894 default-deny assignment did not run")
+	}
+	childEnv := childEnvFromResult(t, capture.res)
+
+	// (a) The run-bound MCP token pair, asserted by IDENTITY. The name IS
+	// present (the Invocation.Env overlay puts it there); its value must be the
+	// run-bound token, never the ambient operator bearer.
+	if vals := childEnvValues(childEnv, "FISHHAWK_API_TOKEN"); len(vals) != 1 {
+		t.Errorf("FISHHAWK_API_TOKEN present %d times, want exactly 1: %v", len(vals), vals)
+	} else if vals[0] != runBoundBearer {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want the run-bound token %q (and never the ambient bearer %q)",
+			vals[0], runBoundBearer, ambientBearer)
+	}
+	if vals := childEnvValues(childEnv, "FISHHAWK_BACKEND_URL"); len(vals) != 1 || vals[0] != "https://api.fishhawk.test" {
+		t.Errorf("FISHHAWK_BACKEND_URL = %v, want exactly one https://api.fishhawk.test — the agent cannot reach the MCP surface without it", vals)
+	}
+
+	// (b) Credentials with NO overlay must genuinely disappear, by name.
+	for _, key := range []string{"FISHHAWK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "SOME_UNLISTED_VENDOR_SECRET"} {
+		if vals := childEnvValues(childEnv, key); len(vals) != 0 {
+			t.Errorf("%s present in the child env (%v), want absent", key, vals)
+		}
+	}
+	// ...and none of their VALUES appears anywhere in the child env under any
+	// other name.
+	joined := strings.Join(childEnv, "\n")
+	for _, sentinel := range []string{ambientBearer, ghAppSentinel, ghTokenSentinel, ghCLISentinel, "unlisted-sentinel"} {
+		if strings.Contains(joined, sentinel) {
+			t.Errorf("sentinel %q leaked into the child env", sentinel)
+		}
+	}
+
+	// (c) The model key is the ONE deliberately re-admitted class, and it
+	// arrives via the ADAPTER OVERLAY (apiKeyForAgent reads the runner's own
+	// ambient env), not by inheritance — so exactly once, with the sentinel.
+	if vals := childEnvValues(childEnv, "ANTHROPIC_API_KEY"); len(vals) != 1 {
+		t.Errorf("ANTHROPIC_API_KEY present %d times, want exactly 1: %v", len(vals), vals)
+	} else if vals[0] != modelSentinel {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want %q", vals[0], modelSentinel)
+	}
+
+	// (d) The toolchain still functions: PATH/HOME and a representative
+	// allowGo name survive.
+	for _, key := range []string{"PATH", "HOME", "GOPRIVATE"} {
+		if vals := childEnvValues(childEnv, key); len(vals) == 0 {
+			t.Errorf("%s absent from the child env; the allow-list is too narrow for the agent's toolchain", key)
+		}
+	}
+
+	// (e) The operator passthrough arrives with the prefix stripped.
+	if vals := childEnvValues(childEnv, "TARGET_THING"); len(vals) != 1 || vals[0] != "target-thing-value" {
+		t.Errorf("TARGET_THING = %v, want exactly one target-thing-value (FISHHAWK_AGENT_ENV_ passthrough)", vals)
+	}
+	if vals := childEnvValues(childEnv, "FISHHAWK_AGENT_ENV_TARGET_THING"); len(vals) != 0 {
+		t.Errorf("the prefixed passthrough key also reached the child: %v", vals)
+	}
+}
+
+// TestRun_ImplementStage_RefusedPassthroughLogged covers the refusal branch's
+// observable behavior at the run() layer: a FISHHAWK_AGENT_ENV_<NAME> whose
+// stripped name collides with the denylist is neither honored nor silent — it
+// is absent from BaseEnv AND named on the agent_env_refused log line.
+func TestRun_ImplementStage_RefusedPassthroughLogged(t *testing.T) {
+	t.Setenv("FISHHAWK_AGENT_ENV_GITHUB_TOKEN", "smuggled-token")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Do the thing.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `{"event":"agent_env_refused","run_id":"11111111-2222-3333-4444-555555555555","names":["GITHUB_TOKEN"]}`) {
+		t.Errorf("missing agent_env_refused log line for the denied passthrough:\n%s", stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	for _, kv := range invoker.gotInv.BaseEnv {
+		if strings.HasPrefix(kv, "GITHUB_TOKEN=") {
+			t.Errorf("the refused passthrough was honored anyway: %q", kv)
+		}
+	}
 }
