@@ -472,3 +472,79 @@ func TestGetGateView_NoDisputes_RendersFalse(t *testing.T) {
 		t.Errorf("disputed = %v disputes = %+v, want a clean undisputed render", got.Disputed, got.Disputes)
 	}
 }
+
+// TestGetGateView_ReviewDiffTruncated_PassesThrough is the json-tag byte-match
+// guard for the #2875 review_diff_truncated field: the backend body is RAW
+// server-shaped JSON (the server's exact key spelling), so a tag typo on
+// GateView.ReviewDiffTruncated or any gateViewReviewDiffTruncated field decodes
+// to a zero value and reddens this test — the client returns it unmodified.
+func TestGetGateView_ReviewDiffTruncated_PassesThrough(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{
+      "run_id": "` + runID.String() + `",
+      "open": [],
+      "settled": [],
+      "suppressed_relitigations": [],
+      "history_incomplete": false,
+      "review_diff_truncated": {
+        "reason": "runner_patch_cap",
+        "changed_file_count": 210,
+        "omitted_file_count": 205,
+        "omitted_files": ["pkg/one.go (no hunks shown)", "pkg/two.go (may be cut — its tail may be missing)"],
+        "omitted_files_residual": 5,
+        "delta_re_review": true,
+        "best_effort": true
+      }
+    }`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	rdt := decoded.GateView.ReviewDiffTruncated
+	if rdt == nil {
+		t.Fatal("review_diff_truncated did not decode through the seam (json tag mismatch?)")
+	}
+	if rdt.Reason != "runner_patch_cap" || rdt.ChangedFileCount != 210 || rdt.OmittedFileCount != 205 {
+		t.Errorf("review_diff_truncated scalars = %+v, want reason/counts intact", rdt)
+	}
+	if len(rdt.OmittedFiles) != 2 || rdt.OmittedFiles[0] != "pkg/one.go (no hunks shown)" {
+		t.Errorf("omitted_files did not pass through: %+v", rdt.OmittedFiles)
+	}
+	if rdt.OmittedFilesResidual != 5 || !rdt.DeltaReReview || !rdt.BestEffort {
+		t.Errorf("residual/delta/best_effort did not pass through: %+v", rdt)
+	}
+}
+
+// TestGetGateView_ReviewDiffTruncated_OmittedLeavesMirrorNil: a backend body that
+// omits the block leaves the client mirror nil (the mixed-version degrade).
+func TestGetGateView_ReviewDiffTruncated_OmittedLeavesMirrorNil(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{
+      "run_id": "` + runID.String() + `",
+      "open": [],
+      "settled": [],
+      "suppressed_relitigations": [],
+      "history_incomplete": false
+    }`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	if decoded.GateView.ReviewDiffTruncated != nil {
+		t.Errorf("review_diff_truncated = %+v, want nil when the backend omits it", decoded.GateView.ReviewDiffTruncated)
+	}
+}

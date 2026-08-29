@@ -193,6 +193,7 @@ var KnownCategories = map[string]struct{}{
 	"grooming_mutation_applied":               {},
 	"grooming_report_recorded":                {},
 	"implement_review_backstop_elapsed":       {},
+	"implement_review_diff_truncated":         {},
 	"implement_review_failed":                 {},
 	"implement_review_skipped":                {},
 	"implement_review_started":                {},

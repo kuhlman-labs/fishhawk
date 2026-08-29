@@ -601,6 +601,25 @@ Notes:
   pre-review surface for the partial / operator-added case. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The implement-review diff-truncation audit kind — `implement_review_diff_truncated`
+  (#2875), written by the implement-review assembly path
+  (`trace.go::runImplementReviews`) at review dispatch — is an **internal,
+  advisory audit kind, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it to the issue thread. It fires once per review round when the diff the
+  round ACTUALLY reviewed (the fix-up delta on a delta re-review, else the full
+  diff) was TRUNCATED before the reviewer saw it: the runner cut the unified patch
+  at its 256 KiB cap (`runner_patch_cap`, derived server-side because the runner
+  wire carries only the boolean) or the forge capped an oversized compare (the
+  forge's `TruncationReason`, `best_effort=true`). Payload `{reason,
+  changed_file_count, omitted_file_count, omitted_files (the COMPLETE list, each
+  "<path> (<why>)"), omitted_files_residual (how many the capped PROMPT list
+  dropped), delta_re_review, best_effort}`. Advisory + best-effort — a nil
+  `AuditRepo` or an append error contributes nothing and never blocks the review.
+  It is distilled onto `GET /v0/runs/{run_id}/gate-view` as `review_diff_truncated`
+  (newest entry wins) so an operator sees, adjacent to the verdict, that a review
+  ran on a partial diff — the false-reject class (a reviewer reports a control it
+  could not see as ABSENT). Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The routed-concern not-attempted audit kind — `fixup_concern_unattempted`
   (#2896), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an

@@ -1666,6 +1666,58 @@ components:
           description: The audit categories that failed to read, when `history_incomplete` is true.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
+        review_diff_truncated:
+          $ref: '#/components/schemas/GateViewReviewDiffTruncated'
+
+    GateViewReviewDiffTruncated:
+      type: object
+      description: |
+        Present when an implement review ran on a TRUNCATED diff (#2875): the
+        runner cut the unified patch at its 256 KiB cap, or the forge capped an
+        oversized compare, so the reviewer saw only a PREFIX of the change.
+        Distilled from the newest `implement_review_diff_truncated` audit entry;
+        omitted when the run carried none. Unlike the reviewer prompt (whose
+        omitted-file list is capped), this carries the COMPLETE `omitted_files`
+        list — the operator surface for seeing which files were cut.
+      required: [reason, changed_file_count, omitted_file_count]
+      properties:
+        reason:
+          type: string
+          description: |
+            Machine-readable origin of the cut: `runner_patch_cap` (the runner's
+            256 KiB patch cap) or the forge's truncation reason prose (a
+            GitHub-capped compare).
+        changed_file_count:
+          type: integer
+          description: Count of files the stage changed, from the uncapped name-status inventory.
+        omitted_file_count:
+          type: integer
+          description: Count of changed files not fully visible in the truncated hunks.
+        omitted_files:
+          type: array
+          items: { type: string }
+          description: |
+            The COMPLETE list of not-fully-visible files, each rendered
+            `<path> (<why>)` where why is `no hunks shown` or `may be cut — its
+            tail may be missing`. Omitted when the set is empty or could not be
+            determined.
+        omitted_files_residual:
+          type: integer
+          description: |
+            How many omitted files the reviewer's capped PROMPT list dropped past
+            its cap. Zero when the whole set fit inline. The gate-view list above
+            is always complete; this reports the prompt-surface truncation.
+        delta_re_review:
+          type: boolean
+          description: True when the truncated diff was a post-fix-up delta re-review rather than the full diff.
+        best_effort:
+          type: boolean
+          description: |
+            True for a FORGE truncation, whose changed-file inventory is itself
+            subject to GitHub's file cap — so the omitted set may itself be
+            incomplete and a changed file may appear in neither the hunks nor this
+            list. False for the runner path, whose name-status inventory is
+            complete.
 
     GateViewConcern:
       type: object

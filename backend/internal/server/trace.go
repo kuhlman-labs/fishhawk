@@ -2812,6 +2812,50 @@ func (s *Server) familyRuns(ctx context.Context, runRow *run.Run) []*run.Run {
 // under-reviewing.
 const consolidatedReviewTruncatedCategory = "consolidated_review_diff_truncated"
 
+// reviewDiffTruncatedCategory records that the diff an implement-review round
+// actually reviewed was TRUNCATED before the reviewer saw it (#2875): the
+// runner cut the unified patch at its 256 KiB cap, or the forge capped an
+// oversized compare. Internal advisory audit kind (system actor), NOT an
+// issue-comment surface — it surfaces the condition to the operator next to the
+// verdict (distilled onto the gate view as review_diff_truncated) so a review
+// that ran on a partial diff is visible without hunting through one low-severity
+// concern among twenty. Emitted once per review round, best-effort.
+const reviewDiffTruncatedCategory = "implement_review_diff_truncated"
+
+// runnerPatchCapTruncationReason is the SERVER-DERIVED origin for a truncation
+// with no forge reason (#2875 condition 1): the runner wire format carries only
+// the PatchTruncated boolean, so an ordinary 256 KiB cut arrives with an empty
+// PatchTruncationReason and the server fills this rather than leaving a blank
+// reason — which on an operator surface reads as "no reason given" rather than
+// the true "the runner's patch cap cut it". A non-empty PatchTruncationReason
+// therefore always denotes a FORGE truncation (best-effort inventory).
+const runnerPatchCapTruncationReason = "runner_patch_cap"
+
+// reviewDiffPromptOmittedCap bounds the omitted-file list rendered INTO THE
+// PROMPT (#2875 condition 3): prompt bloat is a real cost and a reviewer does
+// not need hundreds of paths inline, so the prompt keeps the cap and a "+N more"
+// residual. The AUDIT payload and the GATE VIEW carry the COMPLETE list — those
+// are JSON records an operator reads deliberately and are exactly the surface
+// the issue asks to make complete.
+const reviewDiffPromptOmittedCap = 200
+
+// reviewDiffTruncatedPayload is the audit payload for an
+// implement_review_diff_truncated entry (#2875). OmittedFiles is the COMPLETE
+// list (each "<path> (<why>)"); OmittedFilesResidual counts how many of them the
+// PROMPT list dropped past reviewDiffPromptOmittedCap (so the audit record and
+// the reviewer prompt describe the same cap), which is why the audit list is
+// authoritative while the residual is a prompt-surface fact. BestEffort marks a
+// forge truncation whose inventory is itself capped.
+type reviewDiffTruncatedPayload struct {
+	Reason               string   `json:"reason"`
+	ChangedFileCount     int      `json:"changed_file_count"`
+	OmittedFileCount     int      `json:"omitted_file_count"`
+	OmittedFiles         []string `json:"omitted_files"`
+	OmittedFilesResidual int      `json:"omitted_files_residual,omitempty"`
+	DeltaReReview        bool     `json:"delta_re_review,omitempty"`
+	BestEffort           bool     `json:"best_effort,omitempty"`
+}
+
 // operatorScopeUndeliveredCategory is the audit-log category for the advisory
 // pre-review signal (#1407) emitted when an implement commit leaves an
 // operator-DELIBERATELY-added scope path (an add_scope_files path folded at
@@ -3313,7 +3357,16 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 // word-form status becomes a policy.Status letter, and the reconstructed
 // unified diff rides on Patch for the reviewer's content-level lens.
 func consolidatedReviewDiff(cmp *githubclient.ComparePatchResult) policy.Diff {
-	diff := policy.Diff{Patch: cmp.Patch}
+	// Carry the forge truncation through to the review (#2875): a GitHub-capped
+	// compare (fix-up delta or consolidated fan-out diff) reaches the reviewer as
+	// a PREFIX, and mapping Truncated/TruncationReason here is what fires the
+	// truncation notice + operator audit on those paths. Before #2875 both were
+	// discarded and the reviewer got no signal at all.
+	diff := policy.Diff{
+		Patch:                 cmp.Patch,
+		PatchTruncated:        cmp.Truncated,
+		PatchTruncationReason: cmp.TruncationReason,
+	}
 	diff.ChangedFiles = make([]policy.ChangedFile, 0, len(cmp.Files))
 	for _, f := range cmp.Files {
 		diff.ChangedFiles = append(diff.ChangedFiles, policy.ChangedFile{
@@ -3589,11 +3642,18 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// collapsing to a delta with delta framing. The routed concerns and the
 	// reviewer's concern_resolutions delta-verification mechanism are preserved
 	// either way — they ride on trig.PriorConcerns, which is already set above.
+	// reviewedDiff is the diff the round ACTUALLY reviews: the fix-up delta on a
+	// delta re-review, else the full diff. The truncation notice + audit derive
+	// from it (not from `diff`) so a truncated full diff with a complete delta
+	// writes no false record and a complete full diff with a truncated delta
+	// writes the true one (#2875 condition 2).
+	reviewedDiff := diff
 	if hasFixupRoutedConcern(trig.PriorConcerns) {
 		if delta, ok := s.resolveFixupDeltaDiff(ctx, runRow, runID, stageID, headSHA); ok {
 			trig.Diff = renderDiffForReview(delta)
 			trig.DiffPatch = delta.Patch
 			trig.DeltaReReview = true
+			reviewedDiff = delta
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement review: re-review diff mode",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
@@ -3606,6 +3666,30 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				slog.String("mode", "full"),
 			)
 		}
+	}
+
+	// Diff-truncation notice + operator-facing audit (#2875). The reviewer sees a
+	// PREFIX of the change when the runner cut the patch at 256 KiB or the forge
+	// capped a compare; today that reaches the prompt with NO signal, so a reviewer
+	// that misses the buried marker reports controls it could not see as ABSENT
+	// (run bff9a242's two false HIGH findings). Thread the derived fields into the
+	// prompt (capped for prompt bloat) and emit one operator-facing audit entry
+	// carrying the COMPLETE list. Derived from reviewedDiff so prompt and audit
+	// agree; a non-truncated diff leaves every field zero-valued and the prompt
+	// byte-identical to today.
+	if trunc, ok := deriveReviewDiffTruncation(reviewedDiff); ok {
+		trig.DiffPatchTruncated = true
+		trig.DiffPatchTruncationReason = trunc.Reason
+		trig.DiffPatchTruncationBestEffort = trunc.BestEffort
+		promptList := trunc.OmittedFiles
+		residual := 0
+		if len(promptList) > reviewDiffPromptOmittedCap {
+			residual = len(promptList) - reviewDiffPromptOmittedCap
+			promptList = promptList[:reviewDiffPromptOmittedCap]
+		}
+		trig.DiffPatchOmittedFiles = promptList
+		trig.DiffPatchOmittedFilesResidual = residual
+		s.emitReviewDiffTruncated(ctx, runID, stageID, trunc, residual, trig.DeltaReReview)
 	}
 
 	// Operator-scope-undelivered pre-review signal (#1407): the operator may
@@ -5789,6 +5873,171 @@ func renderDiffForReview(diff policy.Diff) string {
 		}
 	}
 	return b.String()
+}
+
+// reviewDiffTruncation is the derived truncation summary for the diff an
+// implement-review round reviewed (#2875), shared by the prompt notice, the
+// operator audit entry, and the gate-view distillation so those surfaces can
+// never disagree. OmittedFiles is the COMPLETE, uncapped list (each rendered
+// "<path> (<why>)"); consumers cap it themselves for the prompt.
+type reviewDiffTruncation struct {
+	Reason           string
+	BestEffort       bool // forge-capped inventory; the omitted set may itself be incomplete
+	ChangedFileCount int
+	OmittedFiles     []string
+}
+
+// deriveReviewDiffTruncation summarizes a reviewed diff's truncation, returning
+// ok=false when the diff was not truncated (the byte-identical no-op path). The
+// reason is fail-closed and never blank (#2875 condition 1): a forge
+// TruncationReason rides through verbatim and marks the summary best-effort; an
+// EMPTY reason on a truncated diff is the runner path, filled with
+// runnerPatchCapTruncationReason. It is derived from the SAME diff the round
+// reviewed (the fix-up delta on a delta re-review, else the full diff), so the
+// prompt and the audit can never describe a different diff (condition 2).
+func deriveReviewDiffTruncation(diff policy.Diff) (reviewDiffTruncation, bool) {
+	if !diff.PatchTruncated {
+		return reviewDiffTruncation{}, false
+	}
+	reason := diff.PatchTruncationReason
+	bestEffort := false
+	if reason == "" {
+		reason = runnerPatchCapTruncationReason
+	} else {
+		// A forge TruncationReason means the changed-file inventory came from the
+		// compare API and is itself subject to GitHub's file cap, so the derived
+		// list cannot be presented as authoritative (condition 4).
+		bestEffort = true
+	}
+	return reviewDiffTruncation{
+		Reason:           reason,
+		BestEffort:       bestEffort,
+		ChangedFileCount: len(diff.ChangedFiles),
+		OmittedFiles:     truncatedPatchOmittedFiles(diff),
+	}, true
+}
+
+// truncatedPatchOmittedFiles derives WHICH changed files the truncation hid,
+// classifying each ChangedFiles path against the surviving patch text (#2875).
+// ChangedFiles is the complete `git diff --name-status` inventory — NEVER
+// truncated, only the hunk text is (runner/internal/gitdiff runs --name-status
+// and the patch as two separate git invocations) — so it is the authority for
+// what changed.
+//
+// A path is VISIBLE only when the patch carries a `diff --git ... b/<path>`
+// header line for it AND that header is not the LAST surviving header (the last
+// file is where the cap landed, so its tail may be missing). Every other path —
+// no header found, or the final cut header — is reported OMITTED. Two why-shapes
+// are distinguished: "no hunks shown" (no header) and "may be cut — its tail may
+// be missing" (the final header; said conservatively per condition 6, because a
+// cap landing exactly on a file boundary leaves that file complete).
+//
+// Identification is deliberately FAIL-CLOSED and OVER-REPORTING (conditions 5,
+// 6): the match is ANCHORED on the full `diff --git ` line ending in ` b/<path>`
+// so one changed path being a prefix/suffix of another (foo.go vs bar/foo.go,
+// foo.go vs foo.go.bak) can never mark an omitted file visible — the under-report
+// direction that recreates the false-HIGH bug this exists to prevent. Git
+// C-quotes a header path containing a quote, backslash, control byte or
+// non-ASCII byte, so such a path's exact line never appears and it is classified
+// OMITTED rather than assumed visible (an over-reported file costs one file read;
+// an under-reported one is the bug). The returned list is COMPLETE (uncapped);
+// callers cap it for the prompt.
+func truncatedPatchOmittedFiles(diff policy.Diff) []string {
+	if !diff.PatchTruncated || len(diff.ChangedFiles) == 0 {
+		return nil
+	}
+	patch := diff.Patch
+	idxByFile := make([]int, len(diff.ChangedFiles))
+	lastIdx := -1
+	for i, f := range diff.ChangedFiles {
+		idx := gitDiffHeaderIndex(patch, f.Path)
+		idxByFile[i] = idx
+		if idx > lastIdx {
+			lastIdx = idx
+		}
+	}
+	var out []string
+	for i, f := range diff.ChangedFiles {
+		switch {
+		case idxByFile[i] < 0:
+			out = append(out, f.Path+" (no hunks shown)")
+		case idxByFile[i] == lastIdx:
+			out = append(out, f.Path+" (may be cut — its tail may be missing)")
+		default:
+			// Header present and not the last one — fully visible; not reported.
+		}
+	}
+	return out
+}
+
+// gitDiffHeaderIndex returns the byte offset of the `diff --git ` header line
+// for path in patch, or -1 when no such line is present (#2875). The match is a
+// FULL LINE beginning with `diff --git ` and ending with ` b/<path>` — the
+// destination-side token git always emits (for a rename the a/ side differs, so
+// anchoring on ` b/<dest>` still identifies it). Anchoring on the whole
+// ` b/<path>` line-suffix (never a bare substring) is what makes foo.go vs
+// bar/foo.go non-colliding: bar/foo.go's line ends ` b/bar/foo.go`, which does
+// not end with ` b/foo.go`. A git-C-quoted path (quote/backslash/control/
+// non-ASCII byte) is written `"b/…"` with surrounding quotes and escapes, so its
+// exact suffix never matches and the caller fails it closed to OMITTED.
+func gitDiffHeaderIndex(patch, path string) int {
+	if path == "" {
+		return -1
+	}
+	const prefix = "diff --git "
+	suffix := " b/" + path
+	off := 0
+	for off < len(patch) {
+		lineStart := off
+		var line string
+		if nl := strings.IndexByte(patch[off:], '\n'); nl < 0 {
+			line = patch[off:]
+			off = len(patch)
+		} else {
+			line = patch[off : off+nl]
+			off += nl + 1
+		}
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, suffix) {
+			return lineStart
+		}
+	}
+	return -1
+}
+
+// emitReviewDiffTruncated writes the operator-facing implement_review_diff_-
+// truncated audit entry (#2875) once per review round, system actor, stage-
+// anchored. The payload carries the COMPLETE omitted list (condition 3) with the
+// prompt-cap residual, plus the reason, counts, delta flag, and the best-effort
+// marker. Best-effort with a WARN on append failure and a nil-AuditRepo skip,
+// exactly like emitConsolidatedReviewTruncated and the #1407 neighbour — it must
+// never block or fail the review.
+func (s *Server) emitReviewDiffTruncated(ctx context.Context, runID, stageID uuid.UUID, trunc reviewDiffTruncation, promptResidual int, deltaReReview bool) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(reviewDiffTruncatedPayload{
+		Reason:               trunc.Reason,
+		ChangedFileCount:     trunc.ChangedFileCount,
+		OmittedFileCount:     len(trunc.OmittedFiles),
+		OmittedFiles:         trunc.OmittedFiles,
+		OmittedFilesResidual: promptResidual,
+		DeltaReReview:        deltaReReview,
+		BestEffort:           trunc.BestEffort,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  reviewDiffTruncatedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append implement_review_diff_truncated audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // subtractPaths returns a new slice of `paths` with every element present in

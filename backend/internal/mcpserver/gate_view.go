@@ -57,6 +57,15 @@ Response (gate_view):
   - history_incomplete + history_gaps[] — set when an audit-derived join could
     not be built (the concerns stay intact; only cross-references may be
     missing). Degradation is visible, never silent.
+  - review_diff_truncated — present when an implement review ran on a TRUNCATED
+    diff (the runner cut the patch at 256 KiB, or the forge capped a compare, so
+    the reviewer saw only a prefix). Carries reason, changed_file_count,
+    omitted_file_count, the COMPLETE omitted_files list (unlike the reviewer
+    prompt, which is capped — omitted_files_residual counts what the prompt
+    dropped), delta_re_review, and best_effort (true for a forge truncation whose
+    file inventory is itself capped, so the omitted set may itself be
+    incomplete). Omitted when no review ran on a truncated diff. A HIGH finding
+    that a control is "missing" against a truncated review deserves scrutiny.
 `),
 	}, resolver.getGateView)
 }
