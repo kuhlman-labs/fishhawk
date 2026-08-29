@@ -4926,6 +4926,57 @@ func TestRemoteBranchTip_EmptyBranchRejected(t *testing.T) {
 	}
 }
 
+// TestRemoteBranchTipURL_ExistingBranch pins the happy path (#2884): the
+// URL-addressed sibling resolves an existing remote branch to its exact 40-hex
+// tip SHA, probing the bare repo by PATH (as a URL) rather than a remote name.
+func TestRemoteBranchTipURL_ExistingBranch(t *testing.T) {
+	repo, branch, want := remoteBranchTipRepo(t)
+	bare := mustGitOut(t, repo, "remote", "get-url", "origin")
+	got, err := RemoteBranchTipURL(context.Background(), repo, bare, branch, "")
+	if err != nil {
+		t.Fatalf("RemoteBranchTipURL: %v", err)
+	}
+	if got != want {
+		t.Errorf("RemoteBranchTipURL = %q, want the branch tip %q", got, want)
+	}
+	if len(got) != 40 {
+		t.Errorf("tip %q is not a 40-hex SHA", got)
+	}
+}
+
+// TestRemoteBranchTipURL_AbsentBranchReturnsEmptyNoError pins the load-bearing
+// contract distinction (#2884): `git ls-remote` exits 0 with EMPTY stdout for a
+// no-match, so an ABSENT branch must be ("", nil) — NOT an error. The fix-up
+// landing check reads the empty tip as "push did not land" (category B), a
+// different verdict from "the probe failed" (category C).
+func TestRemoteBranchTipURL_AbsentBranchReturnsEmptyNoError(t *testing.T) {
+	repo, _, _ := remoteBranchTipRepo(t)
+	bare := mustGitOut(t, repo, "remote", "get-url", "origin")
+	got, err := RemoteBranchTipURL(context.Background(), repo, bare, "fishhawk/never-created", "")
+	if err != nil {
+		t.Fatalf("an absent branch must NOT error (ls-remote exits 0 with empty stdout), got: %v", err)
+	}
+	if got != "" {
+		t.Errorf("an absent branch must return an empty tip, got %q", got)
+	}
+}
+
+// TestRemoteBranchTipURL_UnreadableRemoteReturnsError pins the other side of
+// that contract: an ls-remote FAILURE (here a URL that is not a repository)
+// returns a non-nil error and an empty SHA, so the caller fails infra
+// (category C) instead of mistaking an unreadable remote for a moved branch.
+func TestRemoteBranchTipURL_UnreadableRemoteReturnsError(t *testing.T) {
+	repo, branch, _ := remoteBranchTipRepo(t)
+	missing := filepath.Join(t.TempDir(), "does-not-exist.git")
+	got, err := RemoteBranchTipURL(context.Background(), repo, missing, branch, "")
+	if err == nil {
+		t.Fatal("an unreadable remote URL must return an error")
+	}
+	if got != "" {
+		t.Errorf("an errored probe must return an empty tip, got %q", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // #2548 — build-required scope drift, the THIRD scope-completeness park class
 // (decomposed children only).

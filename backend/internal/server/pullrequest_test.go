@@ -2999,3 +2999,156 @@ func TestPullRequestFailed_CheckpointPRTextGatedWhenAbsent(t *testing.T) {
 		}
 	}
 }
+
+// newFixupSeamServer wires a server that supports BOTH a raw trace upload (with
+// advisory reviewers + a seeded plan) AND the fixup_pushed /pull-request report
+// path (with GitHub stubbed for the lineage guard and the #1932/#2884 re-review
+// backstop's ComparePatch). This is the #2884 cross-boundary seam harness.
+func newFixupSeamServer(t *testing.T, pushedHead, baseSHA string) (
+	*Server, ed25519.PrivateKey, *auditFake, uuid.UUID, uuid.UUID,
+) {
+	t.Helper()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	ts := newTraceStoreFake()
+	rr := newOrchestratorRepo()
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {pushedHead}, baseSHA: {pushedHead}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementAdvisoryReviewers
+	runRow.Repo = "kuhlman-labs/example"
+	runRow.InstallationID = instID(99)
+	prURL := "https://github.com/kuhlman-labs/example/pull/42"
+	runRow.PullRequestURL = &prURL
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Add foo helper",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify}},
+		},
+	})
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   sf,
+		TraceStore:    ts,
+		AuditRepo:     au,
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		PlanReviewers: singleReviewerSet{reviewer},
+		GitHub:        gh,
+		Orchestrator:  &orchestrator.Orchestrator{Runs: rr},
+	})
+	priv, _ := sf.issue(t, runRow.ID)
+	return s, priv, au, runRow.ID, implStage.ID
+}
+
+// implementReviewStartedHeads returns the head_sha of every
+// implement_review_started audit entry, in append order.
+func implementReviewStartedHeads(au *auditFake) []string {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var heads []string
+	for _, e := range au.appended {
+		if e.Category == "implement_review_started" {
+			var p map[string]any
+			_ = json.Unmarshal(e.Payload, &p)
+			heads = append(heads, fmt.Sprint(p["head_sha"]))
+		}
+	}
+	return heads
+}
+
+// TestShipTrace_FixupReReview_AnchoredToPushedHead_NotOrphan is M10 — the
+// #2884 cross-boundary seam test. A raw push_fixup trace carrying the throwaway
+// verify head "orphan-wip-sha" followed by a fixup_pushed report carrying the
+// real pushed head must produce EXACTLY ONE implement_review_started, anchored
+// to the PUSHED head — never the orphan. This drives the real trace handler →
+// review-dispatch suppression → /pull-request report → backstop re-review →
+// concern-store seam end to end. Counterfactual (c): delete the manifest.PushFixup
+// skip in advanceStageAfterTrace → this goes RED with head_sha "orphan-wip-sha",
+// the #2884 signature itself.
+func TestShipTrace_FixupReReview_AnchoredToPushedHead_NotOrphan(t *testing.T) {
+	const pushedHead = "pushed-head-sha"
+	const baseSHA = "base-sha-xyz"
+	s, priv, au, runID, stageID := newFixupSeamServer(t, pushedHead, baseSHA)
+
+	traceBundle := implementFixupBundleWithHeadSHA(t, 1, "orphan-wip-sha")
+	if w := shipRequest(t, s, runID, stageID, "raw", priv, traceBundle, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run/stage",
+		"head_sha":            pushedHead,
+		"base_sha":            baseSHA,
+		"files_changed_count": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("pr status = %d:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	heads := implementReviewStartedHeads(au)
+	if len(heads) != 1 {
+		t.Fatalf("implement_review_started count = %d (%v), want exactly 1", len(heads), heads)
+	}
+	if heads[0] == "orphan-wip-sha" {
+		t.Fatalf("review anchored to the orphan verify sha — the #2884 regression: head_sha = %q", heads[0])
+	}
+	if heads[0] != pushedHead {
+		t.Errorf("implement_review_started head_sha = %q, want the PUSHED head %q", heads[0], pushedHead)
+	}
+}
+
+// TestShipPullRequest_FixupNoChanges_NoReviewDispatched is M11 — the sibling:
+// a raw push_fixup trace followed by a fixup_no_changes report dispatches ZERO
+// implement reviews. Nothing landed, so nothing is certified.
+func TestShipPullRequest_FixupNoChanges_NoReviewDispatched(t *testing.T) {
+	s, priv, au, runID, stageID := newFixupSeamServer(t, "pushed-head-sha", "base-sha-xyz")
+
+	traceBundle := implementFixupBundleWithHeadSHA(t, 1, "orphan-wip-sha")
+	if w := shipRequest(t, s, runID, stageID, "raw", priv, traceBundle, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_no_changes",
+		"branch":              "fishhawk/run/stage",
+		"base_sha":            "base-sha-xyz",
+		"files_changed_count": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("pr status = %d:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	if heads := implementReviewStartedHeads(au); len(heads) != 0 {
+		t.Errorf("implement_review_started = %v, want none (a fix-up that changed nothing certifies nothing)", heads)
+	}
+}

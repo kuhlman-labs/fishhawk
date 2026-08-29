@@ -290,6 +290,47 @@ func implementFixupBundleWithHeadSHA(t *testing.T, fileCount int, headSHA string
 	return gz.Bytes()
 }
 
+// implementPushGatedBundleWithHeadSHA is the #2884 sibling of
+// implementFixupBundleWithHeadSHA: identical shape and the same (stage_id,
+// head_sha) #797 dedup key, but a PushToSharedBranch manifest (a decomposed
+// child) instead of PushFixup. It forward-gates IDENTICALLY — childPushGated
+// keeps the stage in `running` across uploads — WITHOUT being a push_fixup, so
+// it still dispatches the trace-time implement review that control 2 now
+// suppresses for push_fixup. The two #797/#788 dedup tests borrow it for the
+// forward gate so they keep asserting exactly what they assert.
+func implementPushGatedBundleWithHeadSHA(t *testing.T, fileCount int, headSHA string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(bundle.Manifest{BundleSchema: "v1", PushToSharedBranch: true})
+	manifestLine, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(manifestLine)
+	raw.WriteByte('\n')
+
+	files := make([]map[string]string, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		files = append(files, map[string]string{"path": fmt.Sprintf("file%d.go", i), "status": "modified"})
+	}
+	diffPayload, _ := json.Marshal(map[string]any{
+		"kind": "name_status", "base_ref": "origin/main", "files": files, "num_files": fileCount,
+	})
+	diffLine, _ := json.Marshal(map[string]any{"seq": 2, "kind": "git_diff", "data": json.RawMessage(diffPayload)})
+	raw.Write(diffLine)
+	raw.WriteByte('\n')
+
+	verifyPayload, _ := json.Marshal(map[string]any{
+		"command": "go build ./...", "head_sha": headSHA, "exit_code": 0, "output": "", "outcome": "passed",
+	})
+	verifyLine, _ := json.Marshal(map[string]any{"seq": 3, "kind": "verify_run", "data": json.RawMessage(verifyPayload)})
+	raw.Write(verifyLine)
+	raw.WriteByte('\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
 // implementDiffBundleWithGateEvidence builds a trace bundle carrying BOTH a
 // git_diff event and a runner-shaped gate_evidence event (#963) whose
 // verify_run digest FAILED with a [build failed] tail. Used by the
@@ -1012,11 +1053,15 @@ func TestShipTrace_ImplementReview_GatingApprove_Advances(t *testing.T) {
 
 // TestShipTrace_ImplementReview_FixupForwardGated_StillReviews is CONDITION 3
 // of #794: the advisory implement RE-REVIEW must still fire at trace time for a
-// forward-gated fix-up stage. The fix-up bundle stamps push_fixup AND carries a
-// non-empty diff, so the trace handler defers the TERMINAL transition (the stage
-// stays `running` until the /pull-request fixup_pushed report) — but the
-// re-review runs on the bundle diff while the stage stays running. A regression
-// that silently stopped the fix-up re-review from firing must fail here.
+// forward-gated stage. Since #2884 the forward gate is exercised with a
+// PushToSharedBranch manifest, NOT push_fixup: control 2 deliberately suppresses
+// the trace-time review for push_fixup (that is asserted by
+// TestShipTrace_ImplementReview_PushFixupManifest_NoTraceTimeDispatch), because
+// its only available head there is the throwaway verify sha. This test borrows
+// the push-gated child manifest purely for its identical forward gate —
+// childPushGated keeps the stage in `running` until the /pull-request report —
+// while still dispatching the trace-time review, so a regression that silently
+// stopped a forward-gated stage's re-review from firing must fail here.
 func TestShipTrace_ImplementReview_FixupForwardGated_StillReviews(t *testing.T) {
 	reviewer := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
@@ -1025,9 +1070,7 @@ func TestShipTrace_ImplementReview_FixupForwardGated_StillReviews(t *testing.T) 
 	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
 	priv, _ := sf.issue(t, runRow.ID)
 
-	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-	t1 := t0.Add(5 * time.Minute)
-	bundleBytes := makeFixupPushBundle(t, true, 2, t0, t1)
+	bundleBytes := implementPushGatedBundleWithHeadSHA(t, 2, "fwd-gated-sha")
 	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
@@ -1054,13 +1097,15 @@ func TestShipTrace_ImplementReview_FixupForwardGated_StillReviews(t *testing.T) 
 
 // TestShipTrace_ImplementReview_DoubleVariantUpload_DispatchesOnce is the
 // #793 regression: the runner POSTs BOTH the raw and the redacted variant of
-// the same bundle, and a forward-gated implement stage (push_fixup here) stays
-// in `running` across both uploads, so advanceStageAfterTrace re-enters the
-// implement-review block on the redacted upload too. Before the variant gate
-// this dispatched a SECOND review (2x cost, divergent verdicts). With the
-// raw-variant gate (mirroring the recordCost #678 gate) the redacted upload is
-// a no-op: exactly one implement_review_started and one implement_reviewed for
-// the bundle. Fails on main with two of each.
+// the same bundle, and a forward-gated implement stage stays in `running`
+// across both uploads, so advanceStageAfterTrace re-enters the implement-review
+// block on the redacted upload too. Before the variant gate this dispatched a
+// SECOND review (2x cost, divergent verdicts). With the raw-variant gate
+// (mirroring the recordCost #678 gate) the redacted upload is a no-op: exactly
+// one implement_review_started and one implement_reviewed for the bundle. Fails
+// on main with two of each. Since #2884 the forward gate is a PushToSharedBranch
+// manifest, borrowed purely for its identical forward gate: push_fixup no longer
+// dispatches a trace-time review, so it cannot vehicle a raw-variant dedup test.
 func TestShipTrace_ImplementReview_DoubleVariantUpload_DispatchesOnce(t *testing.T) {
 	reviewer := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
@@ -1069,11 +1114,9 @@ func TestShipTrace_ImplementReview_DoubleVariantUpload_DispatchesOnce(t *testing
 	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
 	priv, _ := sf.issue(t, runRow.ID)
 
-	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-	t1 := t0.Add(5 * time.Minute)
 	// One bundle, two variants. The runner uploads raw first, then redacted,
 	// as two separate signed requests over the same stage_id.
-	bundleBytes := makeFixupPushBundle(t, true, 2, t0, t1)
+	bundleBytes := implementPushGatedBundleWithHeadSHA(t, 2, "double-variant-sha")
 	for _, variant := range []string{"raw", "redacted"} {
 		w := shipRequest(t, s, runRow.ID, implStage.ID, variant, priv, bundleBytes, "")
 		if w.Code != http.StatusAccepted {
@@ -1114,7 +1157,11 @@ func TestShipTrace_ImplementReview_FixupRedispatch_StillReviews(t *testing.T) {
 	// (stage_id, head_sha) key discriminates by SHA — not merely by the
 	// empty-head_sha bypass.
 	for i, headSHA := range []string{"fixupsha-cycle-1", "fixupsha-cycle-2"} {
-		bundleBytes := implementFixupBundleWithHeadSHA(t, 2+i, headSHA)
+		// #2884: migrated onto the PushToSharedBranch forward-gate builder. It
+		// gates identically but still dispatches the trace-time review (control 2
+		// suppresses that only for push_fixup), preserving this test's #797
+		// (stage_id, head_sha) dedup assertion.
+		bundleBytes := implementPushGatedBundleWithHeadSHA(t, 2+i, headSHA)
 		w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
 		if w.Code != http.StatusAccepted {
 			t.Fatalf("fix-up cycle (head_sha %s) status = %d, want 202:\n%s", headSHA, w.Code, w.Body.String())
@@ -1153,7 +1200,10 @@ func TestShipTrace_ImplementReview_RetriedRawUpload_DedupsBySHA(t *testing.T) {
 
 	// One pack with a fixed verify_run head_sha, POSTed raw TWICE — a
 	// transient-5xx retry re-uploads the identical raw bundle.
-	bundleBytes := implementFixupBundleWithHeadSHA(t, 2, "retried-raw-sha")
+	// #2884: migrated onto the PushToSharedBranch forward-gate builder (gates
+	// identically, still dispatches the trace-time review) so the #797 retry
+	// dedup assertion is unchanged.
+	bundleBytes := implementPushGatedBundleWithHeadSHA(t, 2, "retried-raw-sha")
 	for i := 0; i < 2; i++ {
 		w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
 		if w.Code != http.StatusAccepted {
@@ -1168,6 +1218,61 @@ func TestShipTrace_ImplementReview_RetriedRawUpload_DedupsBySHA(t *testing.T) {
 	}
 	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
 		t.Errorf("implement_reviewed entries = %d, want 1 (retried raw upload must dedup on head_sha)", n)
+	}
+}
+
+// TestShipTrace_ImplementReview_PushFixupManifest_NoTraceTimeDispatch is
+// control 2 of #2884 (M8): a raw push_fixup trace must dispatch ZERO trace-time
+// implement reviews. The fix-up's trace ships BEFORE the push, so the only head
+// here is the throwaway verify sha — an orphan. The re-review is deferred to the
+// fixup_pushed report against the pushed head. Counterfactual (c): delete the
+// manifest.PushFixup skip in advanceStageAfterTrace → this goes RED.
+func TestShipTrace_ImplementReview_PushFixupManifest_NoTraceTimeDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementFixupBundleWithHeadSHA(t, 2, "orphan-wip-sha")
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_review_started"); n != 0 {
+		t.Errorf("implement_review_started entries = %d, want 0 (push_fixup must not dispatch a trace-time review)", n)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Errorf("implement_reviewed entries = %d, want 0", n)
+	}
+}
+
+// TestShipTrace_ImplementReview_NonFixupManifest_StillDispatches is the M9
+// control proving the skip is keyed on the push_fixup flag, not a blanket break:
+// an ordinary (non-fix-up) implement raw trace still dispatches exactly one
+// trace-time review.
+func TestShipTrace_ImplementReview_NonFixupManifest_StillDispatches(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started entries = %d, want 1 (a non-fix-up implement trace still reviews)", n)
 	}
 }
 
@@ -2193,6 +2298,47 @@ func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
 	}
 	if len(au.entriesByCategory("implement_reviewed")) != 1 {
 		t.Error("the implement_reviewed entry must still have appended")
+	}
+}
+
+// TestImplementReviewLoop_AdvisoryReject_LeavesConcernOpenForMergeGate is
+// CONDITION 2(b) of #2884. Control 2 removes the trace-time gating-reject
+// dispatch for fix-ups; in this repo's advisory-reviewer deployment (every
+// shipped spec/preset declares implement reviewers with human>0, so they never
+// gate) the protection that actually holds is that a rejecting re-review still
+// leaves its concerns OPEN, so they surface at the operator's merge gate rather
+// than being silently dropped. A rejecting ADVISORY review that raises a NEW
+// concern must persist it in an open state — ListOpenByRun (the merge gate's
+// source) returns it — while the loop reports the rejection WITHOUT the caller
+// failing the stage (advisory authority).
+func TestImplementReviewLoop_AdvisoryReject_LeavesConcernOpenForMergeGate(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictReject,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "unhandled nil deref on the fixed path"}},
+		},
+		model: "claude-opus-4-8",
+	}
+	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "pushed-head-sha")
+
+	if !hasRejection {
+		t.Error("hasRejection = false, want true (an advisory reject is still a rejection the caller may act on)")
+	}
+	open, err := cr.ListOpenByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open concerns = %d, want 1 (a rejecting re-review's concern must stay open for the merge gate)", len(open))
+	}
+	if !open[0].State.IsOpen() {
+		t.Errorf("concern state = %q, want an open state so the merge gate surfaces it", open[0].State)
 	}
 }
 
@@ -3958,7 +4104,7 @@ func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *test
 				{ID: id.String(), Resolution: "reopened", Note: "still not fixed"},
 			},
 			reviewSequence: 7,
-		}})
+		}}, "")
 		if got := operatorConcernRows(cr)[0].State; got != concern.StateReopened {
 			t.Errorf("state = %q, want reopened", got)
 		}
@@ -3978,7 +4124,7 @@ func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *test
 				{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
 			},
 			reviewSequence: 7,
-		}})
+		}}, "")
 		if got := operatorConcernRows(cr)[0].State; got != concern.StateAddressed {
 			t.Errorf("state = %q, want addressed", got)
 		}

@@ -276,6 +276,28 @@ Span shape (one trace per run, stitched under the deterministic `otelemit.TraceI
 
 To view traces locally, start the opt-in Jaeger all-in-one (`docker compose --profile otel up -d`), set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, and open the Jaeger UI at http://localhost:16686. **Caveat**: the collector must be reachable from where the runner actually executes — under the standard dogfood loop the runner runs on a GitHub-hosted CI runner where `localhost:4318` is the CI host's loopback, so end-to-end local viewing requires invoking `fishhawk-runner` locally (see "Local invocation" above). Full span-attribute reference, the k8s Jaeger story (#895), and the GHA-export deferral are in `internal/otelemit/README.md`.
 
+### Fix-up landing controls (E68.1 / #2884)
+
+A fix-up pass must prove its work reached the PR branch before the stage reports success. Run 8ae65577 (PR #2883) reported `fixup_no_changes` with its work stranded in dangling `fishhawk verify wip` commits and a stash, and the re-review then certified fixes against a sha that is not on the PR. Two controls in `fixupland.go` close it; both run on the isFixup path only, and both snapshot state BEFORE `CommitAndPush` (and thus before the committed-tree verify gate's throwaway commit + `gitResetSoftHEAD1` unwind).
+
+**Snapshots (captured before the push).** `fixupStashList` (`git stash list`) and `fixupReflogCommits` (`git reflog`) record the pre-pass stash stack and HEAD reflog. A snapshot READ failure sets `fixupSnapshotErr`, which makes the stranded-work check below fail CLOSED (category C, retryable) rather than silently skip — with no baseline the runner cannot prove the work landed, the exact condition #2884 exploited.
+
+**Control 1a — the no-changes branch (`strandedFixupWork`).** Before reporting `fixup_no_changes`, three probes run, each fail-closed:
+
+- a NET-NEW stash entry (present now, absent from the pre-pass snapshot) — a stash is never a valid terminal fix-up artifact; the snapshot comparison keeps a pre-existing operator stash from false-firing;
+- a local HEAD that advanced past the base tip in unpushed commits;
+- a DANGLING commit created during the pass, reachable from neither the base tip nor the branch (`reflogStrandedCommits`, a reflog walk bounded by the pre-pass snapshot). This is the residue a `fishhawk verify wip` commit leaves after `gitResetSoftHEAD1` returns HEAD to the base tip — which the stash and HEAD probes both MISS (no stash, HEAD back at the base tip), so only a provenance walk surfaces it.
+
+Any reason → `ErrFixupWorkStranded` (category B), the failure path reports `{failed, B}`, and #788 recovery restores the pre-fix-up review gate. A probe error or an unavailable snapshot → `ErrVerifyInfraFailure` (category C). A clean check falls through to the byte-identical `fixup_no_changes` report.
+
+**Control 1b — the push branch (`verifyFixupPushLanded`).** Before reporting `fixup_pushed`, re-read the remote branch tip via `git ls-remote` (`gitops.RemoteBranchTipURL`, using the SAME `https://github.com/<owner>/<repo>` URL and run token `CommitAndPush` pushed with) and require it to reflect the pushed head. `ls-remote` exits 0 with empty stdout for an absent branch, so an absent tip is `("", nil)` (category B, "push did not land") while an ls-remote FAILURE is `("", err)` (category C) — the two are never conflated.
+
+**Semantics decision (condition 3): EXACT equality, not descendant tolerance.** A concurrent push landing on top of ours between our push and this re-read — a vouch commit, a bot formatter, another runner — therefore produces a category-B "push did not land" FALSE POSITIVE. The trade is deliberate: a descendant check needs a network fetch of the remote commit plus its own failure surface on the success path, while the race window here is milliseconds and its failure mode is SAFE (category B → the operator retries; no bad merge ships). If that false positive is ever observed in practice, revisit with a fetch-based `merge-base --is-ancestor <pushedHead> <fetchedTip>` descendant check.
+
+**Deliberately narrow (condition, risks).** Control 1 fires only on the no-changes branch, where #2884 landed. A fix-up that DID commit and push while also leaving a stash behind is not failed by control 1 — control 1b proves that pass's own commit reached the branch, but a second stashed edit would still be silently lost. Making a leftover stash fatal on the push path too would fail passes where the pre-agent tree was already dirty; the narrower rule is the deliberate choice.
+
+The unit contract for the helpers is pinned in `cmd/fishhawk-runner/fixupland_test.go` (one case per probe mode + error identity) and `internal/gitops/commit_test.go` (`RemoteBranchTipURL`'s absent-vs-failure discrimination); the end-to-end run() contract in `cmd/fishhawk-runner/main_test.go` (M1–M7, one per named failure mode, each with a deletion counterfactual).
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:

@@ -4031,7 +4031,9 @@ func pushFailureCategory(err error) string {
 		errors.Is(err, gitops.ErrCommitOutOfScope) ||
 		errors.Is(err, gitops.ErrScopeFilesMissing) ||
 		errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) ||
-		errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		errors.Is(err, gitops.ErrPushedTreeNotVerified) ||
+		errors.Is(err, gitops.ErrFixupWorkStranded) ||
+		errors.Is(err, gitops.ErrFixupPushNotLanded) {
 		return "B"
 	}
 	return "C"
@@ -7044,6 +7046,18 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
 	// below on the isFixup path.
 	commitMessage := implementCommitMessage(cfg, title, body, logSink)
+	// #2884 fix-up landing snapshots. Captured on the isFixup path BEFORE
+	// CommitAndPush (and thus before the committed-tree verify gate's throwaway
+	// `fishhawk verify wip` commit + gitResetSoftHEAD1 unwind), so the post-pass
+	// stranded-work check can tell the pass's OWN residue (a net-new stash, an
+	// advanced HEAD, a dangling commit) from pre-existing state. Left zero-valued
+	// off the isFixup path.
+	var (
+		fixupBaseTipSHA  string
+		fixupPreStash    []stashEntry
+		fixupPreReflog   []stashEntry
+		fixupSnapshotErr error
+	)
 	if isFixup {
 		// Per-pass fix-up commit message (#1572): a fix-up gets its own commit
 		// subject/body from the run/stage-keyed sidecar the fix-up agent wrote
@@ -7059,7 +7073,26 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				`{"event":"fixup_base_tip_unresolved","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, rpErr.Error())
 		}
+		fixupBaseTipSHA = baseTipSHA
 		commitMessage = fixupCommitMessage(cfg, baseTipSHA, logSink)
+
+		// #2884: snapshot the stash stack and HEAD reflog before CommitAndPush.
+		// A snapshot read failure makes the later stranded-work check fail CLOSED
+		// (category C) rather than silently skip — with no baseline the runner
+		// cannot prove the work landed, which is the condition the incident
+		// exploited. Fold a reflog read failure into the same signal.
+		var stashErr, reflogErr error
+		fixupPreStash, stashErr = fixupStashList(ctx, repoDir)
+		fixupPreReflog, reflogErr = fixupReflogCommits(ctx, repoDir)
+		fixupSnapshotErr = stashErr
+		if fixupSnapshotErr == nil {
+			fixupSnapshotErr = reflogErr
+		}
+		if fixupSnapshotErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_stash_snapshot_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, fixupSnapshotErr.Error())
+		}
 	}
 
 	// Compile-gate the scope-only committed tree before push (#728), on every
@@ -7650,6 +7683,29 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// report error is category-C (network) and is surfaced so the failure
 		// path reports it.
 		if isFixup {
+			// #2884 control 1a: a fix-up that reports no changes must not have
+			// left its work stranded. Fail CLOSED (category C, retryable) when
+			// the pre-push snapshot was unavailable — without a baseline the
+			// runner cannot prove the work landed.
+			if fixupSnapshotErr != nil {
+				return fmt.Errorf("%w: fix-up pre-push snapshot unavailable, cannot prove work landed: %v",
+					gitops.ErrVerifyInfraFailure, fixupSnapshotErr)
+			}
+			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, fixupPreReflog)
+			if sErr != nil {
+				// A probe failure is infrastructure (category C): re-run in place
+				// rather than silently reporting success over unproven work.
+				return fmt.Errorf("%w: fix-up stranded-work probe failed: %v",
+					gitops.ErrVerifyInfraFailure, sErr)
+			}
+			if len(reasons) > 0 {
+				localHead, _ := fixupLocalHead(ctx, repoDir)
+				reasonsJSON, _ := json.Marshal(reasons)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_work_stranded","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q,"reasons":%s}`+"\n",
+					cfg.runID, cfg.stageID, branch, fixupBaseTipSHA, localHead, reasonsJSON)
+				return fmt.Errorf("%w: %s", gitops.ErrFixupWorkStranded, strings.Join(reasons, "; "))
+			}
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"implement_fixup_no_changes","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
 				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
@@ -7722,6 +7778,23 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// A report error is category-C (network) and is surfaced so the failure
 	// path reports it.
 	if isFixup {
+		// #2884 control 1b: prove the push landed on the branch before reporting
+		// fixup_pushed. Reuse the SAME remote URL expression CommitAndPush pushed
+		// to (the RemoteURL arg above) so no new forge assumption is introduced.
+		// A mismatch is category B (ErrFixupPushNotLanded); an unreadable tip is
+		// category C (ErrVerifyInfraFailure). Either way, no fixup_pushed report
+		// is sent, so the re-review is never certified against a head that is not
+		// on the branch.
+		fixupRemoteURL := fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
+		if err := verifyFixupPushLanded(ctx, repoDir, fixupRemoteURL, branch, token, cap.HeadSHA); err != nil {
+			if errors.Is(err, gitops.ErrFixupPushNotLanded) {
+				tip, _ := fixupRemoteBranchTip(ctx, repoDir, fixupRemoteURL, branch, token)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_push_not_landed","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q}`+"\n",
+					cfg.runID, cfg.stageID, branch, cap.HeadSHA, tip)
+			}
+			return err
+		}
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"implement_fixup_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA, verifiedTreeSHA, cap.TreeSHA,
