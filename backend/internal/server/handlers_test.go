@@ -233,6 +233,30 @@ func TestReleaseNotesPreviewRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestAccessDeniedRouteRegistered guards the route table: GET
+// /access-denied (E44.31 / #2467) must reach handleAccessDenied. The route is
+// PUBLIC and unauthenticated by design — the operator arriving here has no
+// session, because the membership gate refused to create one — so the proof
+// is a 200 text/html body carrying the page's own heading. An UNregistered
+// route would instead 404 with the mux's default not-found body, which is
+// exactly the bug #2467 reports.
+func TestAccessDeniedRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/access-denied", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (route reaches handleAccessDenied):\n%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "<h1>Access denied</h1>") {
+		t.Errorf("body = %s, want the access-denied page (handleAccessDenied reached)", rec.Body.String())
+	}
+}
+
 // TestReleaseNotesPersistRouteRegistered guards the route table: POST
 // /v0/releases/notes (#1587) must reach handleReleaseNotesPersist. The
 // anonymous request reaches the handler's auth ladder and returns 401 — an

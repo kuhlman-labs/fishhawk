@@ -3139,3 +3139,97 @@ and provider-ROUTING the mirror is follow-on work; and `ApproverSubject` is a
 dedup JOIN key, so on a deployment that already had GitLab sign-in live a
 user's pre-change `github:` vote and post-change `gitlab:` vote occupy two
 approver slots.
+
+## Membership-gate denial page (`accessdenied.go`, E44.31 / [#2467](https://github.com/kuhlman-labs/fishhawk/issues/2467))
+
+`handleForgeCallback` denies a sign-in on two named branches and 302s the
+browser at a **relative** target. That target resolves against the callback's
+**own origin** — fishhawkd — so in the standard split-origin layout (Vite on
+`:5173` proxying only `/v0` to fishhawkd on `:8080`) it never reaches the SPA
+page added by #1827. fishhawkd registered no such route, so the operator landed
+on a bare `ServeMux` 404 with no explanation. (The companion `GET /favicon.ico
+404` in the issue's log is the tell that the Go mux, not Vite, answered.)
+
+`GET /access-denied` makes that target resolve and explain itself.
+
+### The two reason codes
+
+| `reason` | Branch | What the page says |
+|---|---|---|
+| `no_membership_resolver` | `Config.AuthMembership == nil` | The login gate has no membership resolver wired, so EVERY sign-in is denied. A **deployment-configuration** fault, not a per-user one; the remedy is wiring the database and the workspace profile. |
+| `no_admitting_account` | `len(accountIDs) == 0` | No workspace account admits this login — no invited membership, no auto-join match. Remedies: `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY`, or an admin invite. |
+
+Absent or unrecognized → the generic body naming both remedies. `reason` is
+matched by `parseAccessDeniedReason`, a **closed allow-list, not a
+passthrough**: the value arrives on the query string of a public,
+unauthenticated route and reaches the rendered page, so it must never be
+attacker-chosen free text.
+
+That allow-list's effect is made **observable**: a non-empty unrecognized value
+is logged (`access-denied page: unrecognized reason code`). Without that,
+deleting the allow-list would change nothing a test could assert — the template
+renders the generic branch for an unrecognized value either way — and the
+control would have no attainable counterfactual. The log line also makes the
+generic page's "recorded in the fishhawkd log" advice true.
+
+### Who is authoritative for the login — and which topology shows it
+
+The identity line ("You signed in to GitHub as `octocat`") renders **only on
+the backend page**, and only when BOTH a recognized `provider` and a login
+passing `sanitizeForgeLogin` are present. Naming a login with no forge reads as
+a bare string; naming a forge with no login says nothing.
+
+| Topology | Serves `/access-denied` | Shows the login? |
+|---|---|---|
+| Split-origin (Vite dev, self-host with the SPA on its own origin) | fishhawkd's `handleAccessDenied` | **Yes** |
+| Same-origin reverse proxy routing non-`/v0` to the SPA | `frontend/src/routes/access-denied.tsx` | **No** |
+| Client-side `RequireAuth` navigation (no query at all) | the SPA page | **No** |
+
+The SPA deliberately does not render the parameter. It cannot verify who signed
+in, so stating "you signed in as X" would let a crafted URL show a misleading
+login on the deployment's own denial page — `html/template` and React both
+escape, so this is not XSS; the residual is a modest phishing surface. Both
+pages read the same `reason` enum, so either routing renders a correct
+branch-specific explanation; only the identity line differs.
+
+Read the backend's authority honestly: `/access-denied` is a **separate
+request** from the callback, so the handler learns the login from the redirect
+query, not from the session it just refused to create. Its authority is
+therefore exactly the strength of the redirect chain — high in the real flow,
+absent under a hand-crafted URL. Binding it harder (a short-lived HttpOnly
+cookie set by the callback) is a possible upgrade, not something this change
+does.
+
+### `sanitizeForgeLogin` fails closed by OMISSION
+
+Accepts `^[A-Za-z0-9._-]{1,64}$` — GitHub logins are alphanumeric + hyphen (max
+39), GitLab usernames additionally allow dots and underscores. Anything else
+(empty, whitespace, markup, control characters, over-length) renders **no login
+at all**, never a truncated or partially-scrubbed value: a scrubbed prefix of
+hostile text is still attacker-chosen text. The same bound is applied at
+redirect-construction time, so a hostile login never reaches the query string
+either.
+
+### 200, not 403
+
+The request to `/access-denied` **succeeds** and returns the explanation. A 403
+would claim the operator is forbidden from READING the explanation, and would
+invite an intermediary proxy to substitute its own error body — the exact class
+of failure this issue fixes. The denial itself is still recorded honestly: the
+callback creates no session and no cookie, and logs the reason server-side.
+
+The page sets `Cache-Control: no-store` (it can carry a login) and
+`Referrer-Policy: no-referrer` (the login rides in this page's own URL, so the
+Referer is suppressed on any outbound navigation).
+
+### Parameter merge
+
+`accessDeniedRedirect` resolves the base target exactly as before —
+`Config.AuthAccessDeniedRedirect` when `isSafeRelativeRedirect` accepts it,
+`/access-denied` otherwise — then merges `reason`/`provider`/`login` into the
+resolved target's **existing** query via `net/url`, never a naive `"?"` append,
+so an operator-configured target keeps its own parameters. `url.Values.Set`
+(not `Add`) is load-bearing: `Add` yields duplicate keys and `Query().Get`
+returns the FIRST, so an operator-set `reason` would shadow the branch code and
+the page would name the wrong denial — precisely the failure this change exists
+to fix.

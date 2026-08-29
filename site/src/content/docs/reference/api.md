@@ -25,7 +25,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **113 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **114 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -43,6 +43,7 @@ The v0 REST API exposes **113 operations** across the paths below, generated fro
 | `GET` | `/v0/auth/github/callback` | GitHub OAuth callback |
 | `GET` | `/v0/auth/gitlab/login` | Begin GitLab OAuth sign-in |
 | `GET` | `/v0/auth/gitlab/callback` | GitLab OAuth callback |
+| `GET` | `/access-denied` | Membership-gate denial page |
 | `GET` | `/v0/auth/github/manifest-flow-start` | Begin GitHub App manifest registration |
 | `GET` | `/v0/auth/github/manifest-callback` | Receive GitHub App manifest-flow callback |
 | `GET` | `/v0/auth/me` | Current user |

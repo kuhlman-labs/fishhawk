@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -676,9 +677,7 @@ func TestGitHubCallback_NilResolver_DeniesFailClosed(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
 	}
-	if loc := w.Header().Get("Location"); loc != "/access-denied" {
-		t.Errorf("Location = %q, want /access-denied", loc)
-	}
+	assertAccessDeniedLocation(t, w, accessDeniedNoResolver)
 	assertNoAuthCookies(t, w)
 	if len(repo.users) != 0 {
 		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
@@ -714,9 +713,7 @@ func TestGitHubCallback_NoAdmittingAccount_RedirectsAccessDenied(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
 	}
-	if loc := w.Header().Get("Location"); loc != "/access-denied" {
-		t.Errorf("Location = %q, want /access-denied", loc)
-	}
+	assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
 	assertNoAuthCookies(t, w)
 	if len(repo.users) != 0 {
 		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
@@ -724,7 +721,10 @@ func TestGitHubCallback_NoAdmittingAccount_RedirectsAccessDenied(t *testing.T) {
 }
 
 // The configured deny target is honored when safe and replaced by the
-// default when it is an open-redirect vector.
+// default when it is an open-redirect vector. Since E44.31 / #2467 the
+// Location also carries the branch code, the provider and the login, so the
+// assertion parses the URL and checks path + parameters rather than
+// comparing a byte-exact string.
 func TestGitHubCallback_AccessDeniedRedirectConfig(t *testing.T) {
 	for _, tc := range []struct{ configured, want string }{
 		{"/no-entry", "/no-entry"},
@@ -742,10 +742,108 @@ func TestGitHubCallback_AccessDeniedRedirectConfig(t *testing.T) {
 				AuthAccessDeniedRedirect: tc.configured,
 			})
 			w := callbackRequest(t, s)
-			if loc := w.Header().Get("Location"); loc != tc.want {
-				t.Errorf("Location = %q, want %q", loc, tc.want)
+			loc := w.Header().Get("Location")
+			u, err := url.Parse(loc)
+			if err != nil {
+				t.Fatalf("parse Location %q: %v", loc, err)
+			}
+			if u.Path != tc.want {
+				t.Errorf("Location path = %q, want %q (from %q)", u.Path, tc.want, loc)
+			}
+			if got := u.Query().Get("reason"); got != string(accessDeniedNoAccount) {
+				t.Errorf("Location reason = %q, want %q (from %q)", got, accessDeniedNoAccount, loc)
+			}
+			if got := u.Query().Get("login"); got != "octocat" {
+				t.Errorf("Location login = %q, want octocat (from %q)", got, loc)
 			}
 		})
+	}
+}
+
+// assertAccessDeniedLocation parses the denial 302's Location and asserts the
+// path plus the branch code it must carry (E44.31 / #2467). Parsing rather
+// than comparing byte-exact keeps the assertion on the two things that
+// matter — where the browser lands and which branch the page will explain —
+// instead of on parameter ordering.
+func assertAccessDeniedLocation(t *testing.T, w *httptest.ResponseRecorder, want accessDeniedReason) {
+	t.Helper()
+	loc := w.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse Location %q: %v", loc, err)
+	}
+	if u.Path != "/access-denied" {
+		t.Errorf("Location path = %q, want /access-denied (from %q)", u.Path, loc)
+	}
+	if got := u.Query().Get("reason"); got != string(want) {
+		t.Errorf("Location reason = %q, want %q (from %q)", got, want, loc)
+	}
+}
+
+// TestAccessDeniedRedirectTargetResolves is the cross-boundary seam test —
+// the one that would have caught #2467. The scope spans four layers (the
+// OAuth callback, the redirect target, route registration on the mux, and
+// the rendered page) whose per-layer units each passed today while the seam
+// between them 404'd: the callback's RELATIVE target resolves against
+// fishhawkd's own origin, and fishhawkd registered no such route.
+//
+// So this drives a denial through the full handler, takes the Location
+// header VERBATIM, and replays that exact URL against the SAME handler,
+// asserting 200 + text/html + the branch's own explanation. Deleting the
+// `GET /access-denied` registration in handlers.go turns this RED with a
+// 404 — the reported bug, reproduced as a test.
+func TestAccessDeniedRedirectTargetResolves(t *testing.T) {
+	t.Run("no_membership_resolver", func(t *testing.T) {
+		repo := newFakeAuthRepo()
+		_, gh := stubGitHubOAuthServer(t)
+		s := New(Config{
+			Addr: "127.0.0.1:0", AuthRepo: repo, GitHubOAuth: gh,
+			// AuthMembership deliberately nil.
+		})
+		replayDenialLocation(t, s, callbackRequest(t, s),
+			"no membership resolver wired on this deployment", "octocat", "GitHub")
+	})
+
+	// Provider parity: both callbacks funnel through the one shared
+	// handleForgeCallback, so the GitLab denial must produce the same
+	// reason-bearing redirect and land on the same explained page.
+	t.Run("no_admitting_account github", func(t *testing.T) {
+		s, _, _ := newAuthServerWithResolver(t, &fakeMembershipResolver{})
+		replayDenialLocation(t, s, callbackRequest(t, s),
+			"No workspace account on this deployment admits this login", "octocat", "GitHub")
+	})
+	t.Run("no_admitting_account gitlab", func(t *testing.T) {
+		s, _ := newGitLabAuthServerWithResolver(t, &fakeMembershipResolver{})
+		replayDenialLocation(t, s, gitlabCallbackRequest(t, s),
+			"No workspace account on this deployment admits this login", "gluser", "GitLab")
+	})
+}
+
+// replayDenialLocation takes the 302's Location VERBATIM and issues it as a
+// second request against the same handler.
+func replayDenialLocation(t *testing.T, s *Server, w *httptest.ResponseRecorder, wantText, wantLogin, wantProvider string) {
+	t.Helper()
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	req := httptest.NewRequest(http.MethodGet, loc, nil)
+	page := httptest.NewRecorder()
+	s.Handler().ServeHTTP(page, req)
+
+	if page.Code != http.StatusOK {
+		t.Fatalf("replaying Location %q: status = %d, want 200 (a 404 here is #2467 itself):\n%s",
+			loc, page.Code, page.Body.String())
+	}
+	if ct := page.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := page.Body.String()
+	if !strings.Contains(body, wantText) {
+		t.Errorf("replayed page missing the branch explanation %q:\n%s", wantText, body)
+	}
+	if !strings.Contains(body, wantLogin) || !strings.Contains(body, wantProvider) {
+		t.Errorf("replayed page missing the identity (%s / %s):\n%s", wantProvider, wantLogin, body)
 	}
 }
 
@@ -934,9 +1032,7 @@ func TestGitHubCallback_MembershipGate_PostgresE2E(t *testing.T) {
 		seedAccountAt(t, pool, "acme", "enterprise", &role)
 
 		w := callbackRequest(t, s)
-		if loc := w.Header().Get("Location"); loc != "/access-denied" {
-			t.Errorf("Location = %q, want /access-denied", loc)
-		}
+		assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
 		assertNoAuthCookies(t, w)
 		var sessions int
 		if err := pool.QueryRow(context.Background(),
@@ -1028,9 +1124,7 @@ func TestGitHubCallback_MembershipGate_PostgresE2E(t *testing.T) {
 		if w.Code != http.StatusFound {
 			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
 		}
-		if loc := w.Header().Get("Location"); loc != "/access-denied" {
-			t.Errorf("Location = %q, want /access-denied", loc)
-		}
+		assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
 		assertNoAuthCookies(t, w)
 		var sessions int
 		if err := pool.QueryRow(context.Background(),
@@ -1471,9 +1565,7 @@ func TestGitLabCallback_EmptyAccounts_AccessDenied(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
 	}
-	if loc := w.Header().Get("Location"); loc != "/access-denied" {
-		t.Errorf("Location = %q, want /access-denied", loc)
-	}
+	assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
 	assertNoAuthCookies(t, w)
 	if len(repo.users) != 0 {
 		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
