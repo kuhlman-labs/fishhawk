@@ -730,41 +730,59 @@ func TestMembership_MultiAccount_DeterministicOrder(t *testing.T) {
 // and M3 (lister errors ⇒ its result cannot have been used).
 // ---------------------------------------------------------------------
 
-// M1 [real pgtest]: a user-granularity account keyed 'octocat' with an
-// auto_join_role admits login 'octocat' through a HEALTHY lister and
-// mints exactly one origin='auto_join' row. The lister is called (its
-// result feeds the org/group granularities); admission does not turn on
-// that call, which is what M2/M3 prove.
+// M1 [real pgtest]: a user-granularity account keyed 'octocat' AND an
+// organization account keyed 'acme-corp' with a live org membership BOTH
+// admit through a HEALTHY lister — the UNION of the forge-INDEPENDENT user
+// admission and the forge-DERIVED org admission (approval condition 1).
+// Seeding the org account is load-bearing: it discriminates a resolver
+// that short-circuits after the user account admits and drops the
+// forge-derived set (the literal no-call remedy condition 1 FORBADE). A
+// test that admitted only the user account would still pass under that
+// broken short circuit; asserting the org account too catches it. Each
+// account mints exactly one origin='auto_join' row and a second resolve
+// leaves both at 1 — the shared-haveGrant no-remint guarantee across the
+// two evalAutoJoin calls and across resolves. Admission does NOT turn on
+// the lister call itself; that no-call independence is what M2/M3 prove,
+// so M1 asserts no zero call-count.
 func TestMembership_UserGranularityAutoJoin_Admits(t *testing.T) {
 	pool, lister, r := newMembershipFixture(t)
 	role := "member"
-	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
-	lister.keys = []string{"some-org"} // a healthy forge; irrelevant to the user tier
+	userID := seedGitHubAccount(t, pool, "octocat", "user", &role)
+	orgID := seedGitHubAccount(t, pool, "acme-corp", "organization", &role)
+	lister.keys = []string{"acme-corp"} // healthy forge: octocat is an org member
 
-	got, err := resolve(t, r, "github")
-	if err != nil {
-		t.Fatalf("ResolveAccounts: %v", err)
+	for i := 1; i <= 2; i++ {
+		got, err := resolve(t, r, "github")
+		if err != nil {
+			t.Fatalf("ResolveAccounts (resolve #%d): %v", i, err)
+		}
+		if len(got) != 2 || !admits(got, userID) || !admits(got, orgID) {
+			t.Fatalf("resolve #%d admitted = %v, want BOTH the user account %s and the forge-derived org account %s (a short circuit after the user admit would drop the org account)",
+				i, got, userID, orgID)
+		}
 	}
-	if len(got) != 1 || got[0] != accountID {
-		t.Fatalf("admitted = %v, want [%s]", got, accountID)
-	}
+
+	// The user account minted an audited auto_join row bound to the login
+	// with the policy role.
 	var origin, memberRef string
 	var gotRole *string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT origin, member_ref, role FROM account_members WHERE account_id = $1`,
-		accountID).Scan(&origin, &memberRef, &gotRole); err != nil {
-		t.Fatalf("read minted grant: %v", err)
+		userID).Scan(&origin, &memberRef, &gotRole); err != nil {
+		t.Fatalf("read minted user grant: %v", err)
 	}
 	if origin != auth.MemberOriginAutoJoin {
-		t.Errorf("origin = %q, want auto_join", origin)
+		t.Errorf("user grant origin = %q, want auto_join", origin)
 	}
 	if memberRef != "octocat" {
-		t.Errorf("member_ref = %q, want octocat", memberRef)
+		t.Errorf("user grant member_ref = %q, want octocat", memberRef)
 	}
 	if gotRole == nil || *gotRole != "member" {
-		t.Errorf("role = %v, want policy role 'member'", gotRole)
+		t.Errorf("user grant role = %v, want policy role 'member'", gotRole)
 	}
-	assertMemberRowCount(t, pool, accountID, 1)
+	// Neither account re-minted across the two resolves.
+	assertMemberRowCount(t, pool, userID, 1)
+	assertMemberRowCount(t, pool, orgID, 1)
 }
 
 // M2 [real pgtest]: the SAME admission with the provider ABSENT from the
@@ -938,24 +956,45 @@ func TestMembership_UserGranularity_MintGrantError_FailsClosed(t *testing.T) {
 }
 
 // M9 [real pgtest]: idempotence. A second resolve for an already-granted
-// user account admits WITHOUT minting a duplicate row. Read against the
-// REAL store — a duplicate mint is committed state, invisible to the fake
-// (condition 3). The account_id/provider/member_ref upsert conflict makes
-// this an end-to-end idempotence guarantee.
+// user account admits WITHOUT re-minting the grant. Read against the REAL
+// store — a re-mint is committed state, invisible to the fake (condition
+// 3). The row COUNT alone is TAUTOLOGICAL here: UpsertAutoJoinGrant's ON
+// CONFLICT (account_id, provider, member_ref) DO UPDATE keeps the count at
+// 1 even if the resolver re-upserts, so a count assertion cannot
+// distinguish one upsert from two (the test_vacuity concern). The system
+// transaction id xmin CAN: a second upsert fires DO UPDATE and writes a
+// NEW row version with a fresh xmin, whereas the haveGrant bootstrap guard
+// (which skips the mint when the persisted grant already exists) leaves
+// xmin untouched. So the load-bearing assertion is xmin unchanged across
+// the two resolves; the count stays as a belt-and-suspenders check.
 func TestMembership_UserGranularity_SecondResolve_NoDuplicateRow(t *testing.T) {
 	pool, lister, r := newMembershipFixture(t)
 	role := "member"
 	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
 	lister.keys = nil
 
-	for i := 1; i <= 2; i++ {
-		got, err := resolve(t, r, "github")
-		if err != nil {
-			t.Fatalf("ResolveAccounts (resolve #%d): %v", i, err)
-		}
-		if len(got) != 1 || got[0] != accountID {
-			t.Fatalf("resolve #%d admitted = %v, want [%s]", i, got, accountID)
-		}
+	// First resolve mints the grant.
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts (resolve #1): %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("resolve #1 admitted = %v, want [%s]", got, accountID)
+	}
+	xmin1 := memberRowXmin(t, pool, accountID)
+
+	// Second resolve re-verifies the existing grant and must NOT re-upsert.
+	got, err = resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts (resolve #2): %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("resolve #2 admitted = %v, want [%s]", got, accountID)
+	}
+	xmin2 := memberRowXmin(t, pool, accountID)
+
+	if xmin2 != xmin1 {
+		t.Errorf("account_members row xmin changed %q -> %q: the second resolve re-upserted the grant (haveGrant bootstrap guard bypassed)", xmin1, xmin2)
 	}
 	assertMemberRowCount(t, pool, accountID, 1) // no duplicate minted row
 }
@@ -1009,6 +1048,31 @@ func TestMembershipResolver_AdmitsViaSingleTenantBootstrap_UserGranularity(t *te
 	if mrole == nil || *mrole != "member" {
 		t.Errorf("role = %v, want the profile's auto-join role 'member'", mrole)
 	}
+}
+
+// admits reports whether id is in the admitted set (order-independent).
+func admits(got []uuid.UUID, id uuid.UUID) bool {
+	for _, g := range got {
+		if g == id {
+			return true
+		}
+	}
+	return false
+}
+
+// memberRowXmin reads the single account_members row's system transaction
+// id (xmin), which Postgres rewrites on every UPDATE — including an ON
+// CONFLICT DO UPDATE that leaves the row's values unchanged. A stable xmin
+// across two resolves proves the second resolve performed no second upsert.
+func memberRowXmin(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID) string {
+	t.Helper()
+	var xmin string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT xmin::text FROM account_members WHERE account_id = $1`, accountID,
+	).Scan(&xmin); err != nil {
+		t.Fatalf("read row xmin: %v", err)
+	}
+	return xmin
 }
 
 func assertMemberRowCount(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, want int) {
