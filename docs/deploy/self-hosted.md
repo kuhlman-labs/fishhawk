@@ -244,6 +244,36 @@ account does not exist — it never materializes it. `--role` defaults to `membe
 admission forge-independent. Full flag / exit-code contract:
 [`backend/cmd/fishhawkd/README.md`](../../backend/cmd/fishhawkd/README.md).
 
+## If sign-in shows "Access denied"
+
+The membership gate refuses a sign-in on two named branches. Since E44.31 /
+[#2467](https://github.com/kuhlman-labs/fishhawk/issues/2467) the deny redirect
+carries a `reason` code and the landing page names which one fired, so you no
+longer have to correlate against the log to learn WHY. The redirect carries
+nothing else.
+
+| `reason` | What happened | Remedy |
+|---|---|---|
+| `no_membership_resolver` | The login gate has no membership resolver wired at all — most often no database configured — so **every** sign-in is denied. A deployment-configuration fault, not a per-user one. | Configure `FISHHAWKD_DATABASE_URL`, then the single-tenant profile (`FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY`, above). |
+| `no_admitting_account` | The resolver ran and no workspace account admits this login: no `invited` `account_members` row, and no auto-join policy matched. | Set `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` to this login or its org (watch the byte-exact casing rule above), **or** have an existing workspace admin run `fishhawkd member invite`. |
+
+**Neither page names the login, in any topology.** In the split-origin layout
+(the SPA served on its own origin — Vite dev, or a self-host that does not
+proxy the SPA), the deny redirect is relative and resolves against
+**fishhawkd**, so fishhawkd's own `GET /access-denied` renders it. Behind a
+same-origin reverse proxy that routes non-`/v0` paths to the SPA, the React
+page renders instead. Both show the same branch-specific explanation, and
+neither states who signed in: `/access-denied` is a separate, unauthenticated
+request in both topologies, so a login on its URL is an unverifiable parameter
+— claiming an identity from one would let a crafted URL show a misleading login
+on your own denial page.
+
+To learn WHO was denied, read the fishhawkd log: the callback logs
+`oauth sign-in denied` with the provider and the login before it redirects.
+
+If the page shows the generic body instead of a branch, the deployment recorded
+the reason but did not carry it — check the same log line.
+
 ## What stays untenanted
 
 CLI / bearer-token runs are not bound to an account: the account-scoped authz

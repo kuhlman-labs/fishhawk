@@ -167,6 +167,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/auth/gitlab/login", s.handleGitLabLogin)
 	mux.HandleFunc("GET /v0/auth/gitlab/callback", s.handleGitLabCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
+	// The backend-origin landing page for the callback's membership-gate
+	// denial (E44.31 / #2467). The callback's 302 target is RELATIVE, so it
+	// resolves against fishhawkd — this route is what makes it resolve. In a
+	// same-origin reverse-proxy deployment that routes non-/v0 paths to the
+	// SPA, /access-denied reaches the React page instead; both render the
+	// same reason enum, so either routing is correct.
+	mux.HandleFunc("GET /access-denied", s.handleAccessDenied)
 	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
 	// The one directory-routed surface (ADR-062 A2.1, E44.7 / #1831). The
 	// handoff-verifying middleware is mounted on the routed path ITSELF, and

@@ -53,11 +53,11 @@ A match with no existing grant upserts an audited `origin='auto_join'` row (role
 
 | Mode | Behavior |
 |---|---|
-| `Config.AuthMembership == nil` | deny ALL sign-ins: 302 to the access-denied redirect, no session, no cookie |
+| `Config.AuthMembership == nil` | deny ALL sign-ins: 302 to the access-denied redirect carrying `reason=no_membership_resolver` (the ONLY parameter — the page is unauthenticated and names no login), no session, no cookie. The page names this a deployment-configuration fault, not a per-user one (E44.31 / #2467) |
 | Forge error during auto-join eval, neither an invited grant NOR a user-granularity account admits | resolver error → callback 502 `membership_resolution_failed`, no session |
 | Forge error during auto-join eval, invited grant present | invited admission stands (DB-only); auto-join eval degrades closed |
 | Forge error during auto-join eval, a user-granularity account admits | **admits** the user account (its predicate never needed the forge); the forge-derived org/group set is simply dropped for this sign-in (E44.35 / #2925) |
-| No admitting account | 302 to `Config.AuthAccessDeniedRedirect` (default `/access-denied`, validated by `isSafeRelativeRedirect`), no session, no cookie |
+| No admitting account | 302 to `Config.AuthAccessDeniedRedirect` (default `/access-denied`, validated by `isSafeRelativeRedirect`) carrying `reason=no_admitting_account` (the ONLY parameter — the page is unauthenticated and names no login), no session, no cookie. The page names the single-tenant-key and admin-invite remedies (E44.31 / #2467) |
 | Provider with NO registered lister (gitlab with `FISHHAWKD_GITLAB_BASE_URL` unset), neither an invited grant NOR a user-granularity account admits | deny — no forge-derived auto-join eval is possible without a live membership read |
 | Provider with NO registered lister, invited grant OR user-granularity account present | **admits** — invited grants are DB-only and forge-independent; the user tier is likewise forge-independent, so neither can be gated on forge configuration |
 | Underscore-bearing login on github.com posture | no enterprise key derived at all → no enterprise admission (spoofing guard) |

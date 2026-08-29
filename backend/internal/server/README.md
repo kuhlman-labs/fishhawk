@@ -3139,3 +3139,96 @@ and provider-ROUTING the mirror is follow-on work; and `ApproverSubject` is a
 dedup JOIN key, so on a deployment that already had GitLab sign-in live a
 user's pre-change `github:` vote and post-change `gitlab:` vote occupy two
 approver slots.
+
+## Membership-gate denial page (`accessdenied.go`, E44.31 / [#2467](https://github.com/kuhlman-labs/fishhawk/issues/2467))
+
+`handleForgeCallback` denies a sign-in on two named branches and 302s the
+browser at a **relative** target. That target resolves against the callback's
+**own origin** — fishhawkd — so in the standard split-origin layout (Vite on
+`:5173` proxying only `/v0` to fishhawkd on `:8080`) it never reaches the SPA
+page added by #1827. fishhawkd registered no such route, so the operator landed
+on a bare `ServeMux` 404 with no explanation. (The companion `GET /favicon.ico
+404` in the issue's log is the tell that the Go mux, not Vite, answered.)
+
+`GET /access-denied` makes that target resolve and explain itself.
+
+### The two reason codes
+
+| `reason` | Branch | What the page says |
+|---|---|---|
+| `no_membership_resolver` | `Config.AuthMembership == nil` | The login gate has no membership resolver wired, so EVERY sign-in is denied. A **deployment-configuration** fault, not a per-user one; the remedy is wiring the database and the workspace profile. |
+| `no_admitting_account` | `len(accountIDs) == 0` | No workspace account admits this login — no invited membership, no auto-join match. Remedies: `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY`, or an admin invite. |
+
+Absent or unrecognized → the generic body naming both remedies. `reason` is
+matched by `parseAccessDeniedReason`, a **closed allow-list, not a
+passthrough**: the value arrives on the query string of a public,
+unauthenticated route and reaches the rendered page, so it must never be
+attacker-chosen free text.
+
+That allow-list's effect is made **observable**: a non-empty unrecognized value
+is logged (`access-denied page: unrecognized reason code`). Without that,
+deleting the allow-list would change nothing a test could assert — the template
+renders the generic branch for an unrecognized value either way — and the
+control would have no attainable counterfactual. The log line also makes the
+generic page's "recorded in the fishhawkd log" advice true.
+
+### No identity is claimed — by either page, in any topology
+
+The page names the DEPLOYMENT'S decision, never the user's action. There is no
+"You signed in to GitHub as `octocat`" line, no `provider`/`login` on the deny
+redirect, and no identity parameter read by either renderer.
+
+That is a correction, not the original design (implement-review high/security
+on this PR). The first cut rendered an identity line on the backend page under
+an approval condition asserting that the backend "knows the authenticated login
+from the callback it just processed". It does not. The callback authenticates
+and then issues a **302**; `GET /access-denied` is a SEPARATE, unauthenticated
+request with no session and no cookie, whose parameters are whatever the URL
+carries. Its authority is exactly the SPA's: none. Anyone could have crafted
+`/access-denied?provider=github&login=<valid-name>` and obtained a
+Fishhawk-branded page asserting that login had signed in. A charset bound stops
+markup but establishes nothing about authenticity, so the CLAIM was removed
+rather than the input hardened further — no amount of validation turns an
+unsigned query parameter into an authenticated fact.
+
+| Topology | Serves `/access-denied` | Shows the login? |
+|---|---|---|
+| Split-origin (Vite dev, self-host with the SPA on its own origin) | fishhawkd's `handleAccessDenied` | **No** |
+| Same-origin reverse proxy routing non-`/v0` to the SPA | `frontend/src/routes/access-denied.tsx` | **No** |
+| Client-side `RequireAuth` navigation (no query at all) | the SPA page | **No** |
+
+Both pages read the same `reason` enum, so either routing renders the same
+branch-specific explanation — the two now differ in nothing that matters. The
+page closes by disclosing its own limits ("This page names no account: it is
+served without a session…") and pointing at the fishhawkd log, which records
+the provider and login the attempt was made with. That is where an operator
+correlates identity, and the only place that can do it honestly.
+
+Binding an identity properly — a short-lived HttpOnly cookie or one-time token
+set by the callback — is a real design with its own surface, and out of
+proportion to a page whose job is explaining a denial. It is deliberately NOT
+done here.
+
+### 200, not 403
+
+The request to `/access-denied` **succeeds** and returns the explanation. A 403
+would claim the operator is forbidden from READING the explanation, and would
+invite an intermediary proxy to substitute its own error body — the exact class
+of failure this issue fixes. The denial itself is still recorded honestly: the
+callback creates no session and no cookie, and logs the reason server-side.
+
+The page sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer` —
+ordinary hygiene for a public error page reached mid-OAuth, whose URL would
+otherwise ride the Referer to whatever the operator navigates to next.
+
+### Parameter merge
+
+`accessDeniedRedirect` resolves the base target exactly as before —
+`Config.AuthAccessDeniedRedirect` when `isSafeRelativeRedirect` accepts it,
+`/access-denied` otherwise — then merges `reason`, and nothing else, into the
+resolved target's **existing** query via `net/url`, never a naive `"?"` append,
+so an operator-configured target keeps its own parameters. `url.Values.Set`
+(not `Add`) is load-bearing: `Add` yields duplicate keys and `Query().Get`
+returns the FIRST, so an operator-set `reason` would shadow the branch code and
+the page would name the wrong denial — precisely the failure this change exists
+to fix.
