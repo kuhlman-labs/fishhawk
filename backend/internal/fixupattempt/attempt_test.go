@@ -91,6 +91,42 @@ func TestImplicated(t *testing.T) {
 		{"non-candidate path yields nothing (anti-phantom)", "edit backend/internal/server/trace.go", nil},
 		{"bare prose word", "The README did not get the same treatment", nil},
 		{"empty note", "", nil},
+
+		// Negative-instruction suppression (#2896 fix-up, item A). Routed text
+		// names files to FORBID them as often as to require them; reporting such
+		// a path as untouched accuses the agent of dropping work precisely when
+		// it obeyed.
+		{"do-not-touch mention is suppressed", "Do not touch docs/onboarding.md.", nil},
+		{"lowercase don't is suppressed", "don't edit docs/onboarding.md", nil},
+		{"need-no-change mention is suppressed",
+			"The tests need NO change \u2014 docs/onboarding.md is already right.", nil},
+		{"never mention is suppressed", "never open docs/onboarding.md", nil},
+		// Only text BEFORE the mention, within its clause, suppresses. This is
+		// what keeps a conjunction honest in BOTH directions: scanning the whole
+		// clause would suppress the obligation too and MASK the very drop this
+		// package exists to detect.
+		{"obligation before a prohibition in one sentence keeps the obligation",
+			"Fix docs/onboarding.md but do not touch backend/internal/server/onboarding.go.",
+			[]string{"docs/onboarding.md"}},
+		// A '.' is a path byte, so the clause boundary requires trailing
+		// whitespace. Without that rule the dot inside the first filename would
+		// cut the clause and lose the "do not" for the second path.
+		{"prohibition survives a preceding filename's dot",
+			"Do not touch docs/onboarding.md or backend/internal/server/onboarding.go.", nil},
+		{"a prohibition in an earlier sentence does not suppress a later obligation",
+			"Do not touch site/README.md. Now fix docs/onboarding.md.",
+			[]string{"docs/onboarding.md"}},
+		{"one non-prohibited mention is enough",
+			"Fix docs/onboarding.md. Do not touch docs/onboarding.md frontmatter.",
+			[]string{"docs/onboarding.md"}},
+		// THE RESIDUAL, pinned deliberately: a CITATION mention carries no
+		// negative marker and is not separable from an obligation by any lexical
+		// rule, so it still resolves. That is exactly why the caller's shared-text
+		// surface claims only "mentioned and untouched", never "evidence of an
+		// unattempted concern".
+		{"a bare citation mention is NOT suppressed (known residual)",
+			"The RED landed at docs/onboarding.md:41 during my own re-run.",
+			[]string{"docs/onboarding.md"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -148,43 +184,53 @@ func TestImplicated_RealIncidentNotes(t *testing.T) {
 		t.Fatalf("real low note resolved %v; want nil", got)
 	}
 
-	// The routed reason for the two-concern pass names both files.
+	// The routed reason for the two-concern pass names all four files, but two of
+	// them ONLY under negative instructions — "Do not touch onboarding.go or
+	// either test file's logic" and "The implementation and tests are correct and
+	// need NO change ... at onboarding_test.go:564". Those must NOT resolve: the
+	// agent's leaving them untouched is OBEDIENCE, and reporting them would put a
+	// false accusation into a durable operator-facing record (#2896 fix-up,
+	// item A).
 	gotPass1 := Implicated(realReasonPass1, realCandidates)
 	wantPass1 := []string{
 		"backend/internal/server/README.md",
-		"backend/internal/server/onboarding.go",
-		"backend/internal/server/onboarding_test.go",
 		"docs/onboarding.md",
 	}
 	if !reflect.DeepEqual(gotPass1, wantPass1) {
-		t.Fatalf("real pass-1 reason resolved %v, want %v", gotPass1, wantPass1)
+		t.Fatalf("real pass-1 reason resolved %v, want %v \u2014 a forbidden path in this list is "+
+			"the false-accusation defect, a missing obligation path is the inert-signal defect",
+			gotPass1, wantPass1)
 	}
 
 	// THE INCIDENT: pass 1 committed only backend/internal/server/README.md.
-	// docs/onboarding.md — the medium's file — must surface as untouched.
+	// The FULL untouched list is pinned, not merely checked for the true
+	// positive: a test that asserts only that docs/onboarding.md appears cannot
+	// detect the resolver growing new false positives (#2896 fix-up, the low).
 	untouched := Untouched(gotPass1, touchedSet("backend/internal/server/README.md"))
-	found := false
-	for _, p := range untouched {
-		if p == "docs/onboarding.md" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("the #2896 incident would NOT have been detected: untouched = %v, "+
-			"want it to include docs/onboarding.md", untouched)
+	wantUntouched := []string{"docs/onboarding.md"}
+	if !reflect.DeepEqual(untouched, wantUntouched) {
+		t.Fatalf("the reference incident reports untouched = %v, want exactly %v", untouched, wantUntouched)
 	}
 
 	// Pass 2's single-concern reason names the same file, so a single-concern
-	// pass attributes it directly to the routed concern.
+	// pass attributes it directly to the routed concern. Pinned in full for the
+	// same reason as pass 1, and it is where the RESIDUAL is visible and
+	// deliberate: onboarding.go is suppressed ("Do not touch onboarding.go,
+	// either test file, or any other doc"), but onboarding_test.go survives
+	// because pass 2 cites it as evidence ("RED ... at onboarding_test.go:564")
+	// with no negative marker in front of it. A citation is not separable from an
+	// obligation by any lexical rule. The record stays honest not by pretending
+	// otherwise but by CLAIMING less: the caller reports this half as paths the
+	// routed text MENTIONED and the diff did not touch, never as evidence of an
+	// unattempted concern.
 	gotPass2 := Implicated(realReasonPass2, realCandidates)
-	hasDoc := false
-	for _, p := range gotPass2 {
-		if p == "docs/onboarding.md" {
-			hasDoc = true
-		}
+	wantPass2 := []string{
+		"backend/internal/server/README.md",
+		"backend/internal/server/onboarding_test.go",
+		"docs/onboarding.md",
 	}
-	if !hasDoc {
-		t.Fatalf("real pass-2 reason resolved %v, want it to include docs/onboarding.md", gotPass2)
+	if !reflect.DeepEqual(gotPass2, wantPass2) {
+		t.Fatalf("real pass-2 reason resolved %v, want %v", gotPass2, wantPass2)
 	}
 }
 

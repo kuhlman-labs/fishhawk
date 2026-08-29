@@ -611,21 +611,28 @@ Notes:
   the approved plan's `scope.files` UNION the committed paths, and reports every
   concern whose implicated set is disjoint from the committed set. Payload
   `{routed_count, unattempted_count, undeterminable_count, concerns:[{id,
-  position, severity, category, implicated_files}], unattributed_untouched_files}`
+  position, severity, category, implicated_files}], mentioned_untouched_files}`
   — `position` is the concern's 1-based ROUTING position, captured at routing
   time so an id-less positionally-routed concern is still identifiable, and
-  `unattributed_untouched_files` are paths named in the operator's shared routed
-  text (`reason` / `operator_concern`) that cannot be attributed to one concern
-  without guessing. The entry is written whenever the pass routed concerns AND
+  `mentioned_untouched_files` are paths the operator's shared routed text
+  (`reason` / `operator_concern`) MENTIONED that cannot be attributed to one
+  concern without guessing — a MENTION, not an established obligation: a path
+  named only under an explicit negative instruction ("do not touch X") is
+  filtered out, but a bare citation is not lexically separable from a
+  requirement, so the field name claims only what it can prove. The routing round
+  is PINNED to the reviewed delta (the `fixup_pushed` entry for its head SHA), not
+  newest-wins, so a multi-pass stage cannot draw a warning naming the wrong round;
+  an unpinnable delta across two or more rounds emits nothing. The entry is
+  written whenever the pass routed concerns AND
   there is a finding, an untouched named file, or a NON-ZERO
   `undeterminable_count` — that last disjunct so a pass the check could not
   decide at all cannot read as silence. Advisory + best-effort: untouched files
   are evidence a concern was NOT ATTEMPTED and never proof it was not addressed
   (a concern can be resolved by editing a different file, or declined), so it
   never fails, re-opens, or re-budgets the pass; a nil `AuditRepo`, a list error,
-  a malformed trigger payload, a rename-indeterminate diff, or an empty candidate
-  union each emit nothing. Listed here only so a future reader grepping the audit
-  categories doesn't mistake it for a comment surface.
+  a malformed trigger payload, a rename-indeterminate diff, an empty candidate
+  union, or an unpinnable delta each emit nothing. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The routed-reporting-obligation audit kind —
   `fixup_reporting_obligation_undelivered` (#2737), written by the
   implement-review assembly path (`trace.go::runImplementReviews`) before any

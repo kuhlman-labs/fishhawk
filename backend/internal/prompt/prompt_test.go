@@ -10961,7 +10961,7 @@ func TestBuild_ImplementReview_GateEvidence_RendersFixupUnattemptedConcerns(t *t
 				{Position: 3, Severity: "low", Category: "verification",
 					ImplicatedFiles: []string{"backend/internal/server/README.md"}},
 			},
-			FixupUnattemptedFiles:          []string{"docs/spec/workflow-v2.md"},
+			FixupMentionedUntouchedFiles:   []string{"docs/spec/workflow-v2.md"},
 			FixupUnattemptedUndeterminable: 1,
 			FixupRoutedConcernCount:        4,
 		},
@@ -10975,12 +10975,18 @@ func TestBuild_ImplementReview_GateEvidence_RendersFixupUnattemptedConcerns(t *t
 		"concern `f5c464c6` (routed position 2) [medium/security] — named but untouched: docs/onboarding.md",
 		// An id-less concern is labelled by its ROUTING position, never dropped.
 		"routed concern 3 [low/verification] — named but untouched: backend/internal/server/README.md",
-		"not attributable to one concern",
-		"docs/spec/workflow-v2.md",
+		// The shared-text half claims a MENTION, never evidence of a drop: routed
+		// text names files to forbid or cite them as often as to require them,
+		// and the durable record must not read as an accusation (#2896 fix-up).
+		"MENTIONED in the routed instructions as a whole (not attributable to one " +
+			"concern, and a mention is not an established obligation) and NOT touched: " +
+			"docs/spec/workflow-v2.md",
 		// The framing that keeps the signal honest.
-		"evidence the concern was NOT ATTEMPTED",
+		"For a PER-CONCERN line that is evidence the concern was NOT ATTEMPTED",
 		"does NOT establish that the concern was not ADDRESSED",
-		"names a file precisely to say do NOT touch",
+		"The MENTIONED line is weaker still and claims only what it says",
+		"filtered out backend-side",
+		"do not read that line as an accusation",
 		// The coverage caveat, so the block cannot read as an exhaustive audit.
 		"Coverage caveat: 1 of the 4 routed concern(s) could NOT be checked",
 		"ADVISORY — it did NOT fail, re-open, or re-budget the pass",

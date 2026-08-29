@@ -7929,6 +7929,9 @@ func TestApplyConcernResolutions_ReopenedReasonUntouched(t *testing.T) {
 const (
 	unattemptedScopeA = "backend/internal/foo/foo.go"
 	unattemptedScopeB = "docs/onboarding.md"
+	// unattemptedScopeC is named ONLY by the LATER routing round, so a finding
+	// naming it proves the reviewed delta was classified against the wrong pass.
+	unattemptedScopeC = "backend/internal/baz/baz.go"
 )
 
 // newUnattemptedReviewServer mirrors newImplementReviewServerWithSet but seeds a
@@ -8006,6 +8009,24 @@ func seedFixupTriggerConcerns(t *testing.T, au *auditFake, runID, stageID uuid.U
 		Category: CategoryStageFixupTriggered, Payload: raw,
 	})
 	return ids
+}
+
+// seedFixupPushed seeds the fixup_pushed entry that records a fix-up pass's
+// delta arriving on the branch. It is what pins a reviewed head SHA to its
+// ROUTING ROUND: the pass that produced this delta is the newest
+// stage_fixup_triggered entry recorded BEFORE this entry's sequence.
+func seedFixupPushed(t *testing.T, au *auditFake, runID, stageID uuid.UUID, headSHA string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"run_id": runID.String(), "stage_id": stageID.String(), "head_sha": headSHA,
+	})
+	if err != nil {
+		t.Fatalf("marshal fixup_pushed payload: %v", err)
+	}
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: int64(len(au.seeded) + 1), RunID: &runID, StageID: &stageID,
+		Category: "fixup_pushed", Payload: raw,
+	})
 }
 
 // unattemptedPayloads returns the decoded payloads of every
@@ -8160,6 +8181,115 @@ func TestRunImplementReviews_UnattemptedConcern_IDLessRoutingReportsOriginalPosi
 	}
 }
 
+// TestRunImplementReviews_UnattemptedConcern_EarlierDeltaUsesEarlierRound is
+// ITEM B's discriminating case (#2896 fix-up). TWO routing rounds exist on ONE
+// implement stage — the normal shape, since re-routing a dropped concern in a
+// further pass is this campaign's standard workaround — and the review being
+// assembled is for the EARLIER pass's delta, which was pushed BEFORE the second
+// round was triggered.
+//
+// Selecting the newest stage-bound trigger would classify pass 1's diff against
+// pass 2's concerns and write a durable warning naming the wrong routing round.
+// The ordering is seeded BY CONSTRUCTION (trigger 1, push 1, trigger 2, in
+// sequence order) so the RED lands on the attribution assertions below, not on
+// fixture setup.
+//
+// COUNTERFACTUAL (observed, not reasoned): reverting resolveRoutedFixupConcerns
+// to newest-wins — deleting the `pinned && e.Sequence >= pinSeq` skip — makes
+// this go RED with "routed_count = 1, want 2 — the reviewed delta was
+// classified against the WRONG routing round".
+func TestRunImplementReviews_UnattemptedConcern_EarlierDeltaUsesEarlierRound(t *testing.T) {
+	const pass1Head = "1111111111112222"
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer,
+		unattemptedScopeA, unattemptedScopeB, unattemptedScopeC)
+
+	// Round 1: two concerns, naming A and B.
+	round1 := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+		"address both routed concerns", true)
+	// Round 1's delta lands on the branch.
+	seedFixupPushed(t, au, runRow.ID, implStage.ID, pass1Head)
+	// Round 2 is triggered before round 1's review assembly runs — the race.
+	round2 := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+		{Severity: "high", Category: "correctness", Note: "the later round is about " + unattemptedScopeC},
+	}, "address the later concern", true)
+
+	// Review round 1's delta: it touched only A, so round 1's SECOND concern
+	// (naming B) is the genuine finding. Round 2's file C is also untouched, so a
+	// newest-wins resolver would confidently report the wrong concern.
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, pass1Head, nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("fixup_concern_unattempted entries = %d, want exactly 1", len(payloads))
+	}
+	p := payloads[0]
+	if p.RoutedCount != 2 {
+		t.Fatalf("routed_count = %d, want 2 — the reviewed delta was classified against the WRONG "+
+			"routing round (round 2 routed 1 concern, round 1 routed 2)", p.RoutedCount)
+	}
+	if len(p.Concerns) != 1 {
+		t.Fatalf("payload concerns = %+v, want exactly one finding", p.Concerns)
+	}
+	got := p.Concerns[0]
+	if got.ID != round1[1] {
+		t.Errorf("finding names concern %q, want round 1's SECOND concern %q", got.ID, round1[1])
+	}
+	if got.ID == round2[0] {
+		t.Errorf("finding names the LATER round's concern %q — a durable warning about a routing "+
+			"round this delta was never written against", round2[0])
+	}
+	if !reflect.DeepEqual(got.ImplicatedFiles, []string{unattemptedScopeB}) {
+		t.Errorf("implicated files = %v, want [%s] (round 1's dropped file), not round 2's %s",
+			got.ImplicatedFiles, unattemptedScopeB, unattemptedScopeC)
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_UnpinnableAcrossRounds_NoSignal is
+// ITEM B's fail-safe (#2896 fix-up). When the reviewed delta cannot be tied to a
+// push — an empty head SHA, or a head no fixup_pushed entry records — the
+// fallback is decided by AMBIGUITY, not recency: with two routing rounds on the
+// stage there is no way to know which one this delta answers, so the signal is
+// SUPPRESSED rather than guessed. A wrong routing round is worse than none, the
+// same refusal-to-guess the ambiguous-suffix rule makes.
+//
+// The single-round case is the complement and is covered by every other test in
+// this group: they pass headSHA "" with ONE trigger and still fire.
+func TestRunImplementReviews_UnattemptedConcern_UnpinnableAcrossRounds_NoSignal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headSHA string
+	}{
+		{"empty head sha", ""},
+		{"head sha no push recorded", "deadbeefdeadbeef"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-opus-4-7",
+			}
+			s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer,
+				unattemptedScopeA, unattemptedScopeB, unattemptedScopeC)
+			seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+				"address both routed concerns", true)
+			seedFixupPushed(t, au, runRow.ID, implStage.ID, "1111111111112222")
+			seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+				{Severity: "high", Category: "correctness", Note: "the later round is about " + unattemptedScopeC},
+			}, "address the later concern", true)
+
+			s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, tc.headSHA, nil)
+
+			if n := countAppendedByCategory(au, fixupConcernUnattemptedCategory); n != 0 {
+				t.Fatalf("fixup_concern_unattempted entries = %d, want 0 — an unpinnable delta across "+
+					"two routing rounds must not be attributed to either", n)
+			}
+		})
+	}
+}
+
 // TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes drives the REAL
 // routed text from #2896's own reproduction (run 925addab, concerns f5c464c6 and
 // 9955251a) end to end through the review, with that pass's actual delta — only
@@ -8217,20 +8347,32 @@ func TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes(t *testing.T) 
 	if len(p.Concerns) != 0 {
 		t.Errorf("per-concern findings = %+v, want none — the real NOTES name no path", p.Concerns)
 	}
-	found := false
-	for _, f := range p.UnattributedUntouchedFiles {
-		if f == realDoc {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("unattributed untouched files = %v, want them to include %s — the incident's dropped file",
-			p.UnattributedUntouchedFiles, realDoc)
+	// The FULL list is pinned, not merely searched for the true positive. The
+	// real reason says "Do not touch onboarding.go or either test file's logic",
+	// so realImpl must be ABSENT: the agent left it untouched because it obeyed,
+	// and naming it in this durable record would accuse the agent of a drop
+	// exactly when it followed instructions (#2896 fix-up, item A). A test that
+	// only checks the true positive cannot detect the signal growing new false
+	// positives (#2896 fix-up, the low).
+	want := []string{realDoc}
+	if !reflect.DeepEqual(p.MentionedUntouchedFiles, want) {
+		t.Fatalf("mentioned untouched files = %v, want exactly %v — realImpl (%s) is named ONLY under "+
+			"\"Do not touch\" and must not be reported", p.MentionedUntouchedFiles, want, realImpl)
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
 	if !strings.Contains(reviewer.calls[0], realDoc) {
 		t.Errorf("reviewer prompt does not name %s:\n%s", realDoc, reviewer.calls[0])
+	}
+	// Scoped to the not-attempted BLOCK: realImpl is a declared scope file, so it
+	// legitimately appears elsewhere in the prompt. What must not happen is its
+	// appearing in THIS block, where it would read as evidence of a drop.
+	block := reviewer.calls[0][strings.Index(reviewer.calls[0], "### Routed concern NOT ATTEMPTED"):]
+	if end := strings.Index(block, "\n### "); end > 0 {
+		block = block[:end]
+	}
+	if strings.Contains(block, realImpl) {
+		t.Errorf("the not-attempted block names the \"do not touch\" file %s:\n%s", realImpl, block)
 	}
 }
 
@@ -8291,8 +8433,8 @@ func TestRunImplementReviews_UnattemptedConcern_UndeterminableOnly_EmitsCoverage
 		t.Errorf("counts = routed %d / unattempted %d / undeterminable %d, want 1/0/1",
 			p.RoutedCount, p.UnattemptedCount, p.UndeterminableCount)
 	}
-	if len(p.Concerns) != 0 || len(p.UnattributedUntouchedFiles) != 0 {
-		t.Errorf("payload carries findings %+v / files %v, want none", p.Concerns, p.UnattributedUntouchedFiles)
+	if len(p.Concerns) != 0 || len(p.MentionedUntouchedFiles) != 0 {
+		t.Errorf("payload carries findings %+v / files %v, want none", p.Concerns, p.MentionedUntouchedFiles)
 	}
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
@@ -8370,7 +8512,7 @@ func TestRunImplementReviews_UnattemptedConcern_ListError_NoSignal(t *testing.T)
 // never entered.
 func TestResolveRoutedFixupConcerns_NilAuditRepo(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
-	concerns, shared, ok := s.resolveRoutedFixupConcerns(t.Context(), uuid.New(), uuid.New())
+	concerns, shared, ok := s.resolveRoutedFixupConcerns(t.Context(), uuid.New(), uuid.New(), "")
 	if ok || concerns != nil || shared != "" {
 		t.Fatalf("resolveRoutedFixupConcerns with a nil AuditRepo = (%v, %q, %v), want (nil, \"\", false)",
 			concerns, shared, ok)

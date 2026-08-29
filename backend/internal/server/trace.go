@@ -2894,11 +2894,18 @@ type fixupConcernUnattemptedPayload struct {
 	UnattemptedCount    int                             `json:"unattempted_count"`
 	UndeterminableCount int                             `json:"undeterminable_count"`
 	Concerns            []fixupConcernUnattemptedDetail `json:"concerns"`
-	// UnattributedUntouchedFiles are candidate paths the routed instruction text
-	// as a WHOLE named (the operator's fix-up reason / operator_concern) and the
-	// pass never touched, with no claim about WHICH routed concern they belong
-	// to — see resolveRoutedFixupConcerns for why they are not attributed.
-	UnattributedUntouchedFiles []string `json:"unattributed_untouched_files,omitempty"`
+	// MentionedUntouchedFiles are candidate paths the routed instruction text as
+	// a WHOLE MENTIONED (the operator's fix-up reason / operator_concern) and
+	// the pass never touched. The field NAME is the contract: it claims a
+	// mention, not an obligation, and never that these paths are evidence of an
+	// unattempted concern. Two things are unknowable here and both are withheld
+	// rather than guessed — WHICH routed concern a shared-text path belongs to
+	// (see resolveRoutedFixupConcerns), and whether the routed text NAMED the
+	// path to require it or merely to cite it. An explicit negative instruction
+	// ("do not touch X") is filtered out by fixupattempt.Implicated, but a bare
+	// citation is not separable from an obligation by any lexical rule, so the
+	// durable record claims only what it can prove (#2896 fix-up, item A).
+	MentionedUntouchedFiles []string `json:"mentioned_untouched_files,omitempty"`
 }
 
 // fixupConcernUnattemptedDetail is one unattempted routed concern on the audit
@@ -3787,7 +3794,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// Untouched implicated files are evidence the concern was NOT ATTEMPTED, and
 	// deliberately NOT proof it was not addressed: a concern can be legitimately
 	// resolved by editing a different file, or legitimately declined.
-	if routed, sharedText, haveTrigger := s.resolveRoutedFixupConcerns(ctx, runID, stageID); haveTrigger && len(routed) > 0 {
+	if routed, sharedText, haveTrigger := s.resolveRoutedFixupConcerns(ctx, runID, stageID, headSHA); haveTrigger && len(routed) > 0 {
 		// committedPathSet folds rename SOURCES into the touched set so a fix
 		// realized as a rename is never a false untouched signal (#2398); a diff
 		// whose R rows carry no source path is rename-INDETERMINATE and the
@@ -3813,10 +3820,13 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 			// only alludes to — in the #2896 incident NEITHER concern note named
 			// a path while the reason named both. Those paths cannot be
 			// attributed to one concern without guessing, so untouched ones are
-			// reported as FILES the routed instructions named and the pass never
-			// touched, with no claim about which concern they belong to.
-			unattributed := fixupattempt.Untouched(fixupattempt.Implicated(sharedText, candidates), committed)
-			if len(findings) > 0 || len(unattributed) > 0 || undeterminable > 0 {
+			// reported as paths the routed instructions MENTIONED and the pass
+			// never touched — no claim about which concern they belong to, and no
+			// claim that a mention was an obligation (Implicated drops a path
+			// under an explicit "do not touch", but a bare citation is not
+			// separable from a requirement lexically).
+			mentioned := fixupattempt.Untouched(fixupattempt.Implicated(sharedText, candidates), committed)
+			if len(findings) > 0 || len(mentioned) > 0 || undeterminable > 0 {
 				details := make([]fixupConcernUnattemptedDetail, 0, len(findings))
 				var gateConcerns []prompt.GateFixupUnattemptedConcern
 				for _, f := range findings {
@@ -3836,17 +3846,17 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 					})
 				}
 				// Only an ACTIONABLE result reaches the reviewer prompt: a
-				// pure coverage-gap record (findings and unattributed both
+				// pure coverage-gap record (findings and mentioned both
 				// empty, undeterminable non-zero) is operator-facing audit
 				// only, so a review whose check found nothing to say stays
 				// byte-identical.
-				if len(gateConcerns) > 0 || len(unattributed) > 0 {
+				if len(gateConcerns) > 0 || len(mentioned) > 0 {
 					if gateEvidence == nil {
 						gateEvidence = &prompt.GateEvidence{}
 						trig.GateEvidence = gateEvidence
 					}
 					gateEvidence.FixupUnattemptedConcerns = gateConcerns
-					gateEvidence.FixupUnattemptedFiles = unattributed
+					gateEvidence.FixupMentionedUntouchedFiles = mentioned
 					gateEvidence.FixupUnattemptedUndeterminable = undeterminable
 					gateEvidence.FixupRoutedConcernCount = len(routed)
 				}
@@ -3855,11 +3865,11 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				// this guard is belt-and-braces rather than the sole defense.
 				if s.cfg.AuditRepo != nil {
 					payload, _ := json.Marshal(fixupConcernUnattemptedPayload{
-						RoutedCount:                len(routed),
-						UnattemptedCount:           len(findings),
-						UndeterminableCount:        undeterminable,
-						Concerns:                   details,
-						UnattributedUntouchedFiles: unattributed,
+						RoutedCount:             len(routed),
+						UnattemptedCount:        len(findings),
+						UndeterminableCount:     undeterminable,
+						Concerns:                details,
+						MentionedUntouchedFiles: mentioned,
 					})
 					systemKind := audit.ActorKind("system")
 					if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -5910,21 +5920,40 @@ type routedFixupConcern struct {
 	Note     string
 }
 
-// resolveRoutedFixupConcerns returns the concerns routed back to this stage's
-// most recent fix-up pass, plus the SHARED routed instruction text (the
-// operator's fix-up `reason` and free-text `operator_concern`).
+// resolveRoutedFixupConcerns returns the concerns routed back to the fix-up pass
+// that produced THE DELTA UNDER REVIEW, plus the SHARED routed instruction text
+// (the operator's fix-up `reason` and free-text `operator_concern`).
 //
-// Entry selection is the SAME predicate resolveFixupConcerns uses at prompt-serve
-// time — newest-first, the first entry bound to this stage with a non-empty
-// concern set — so the review classifies the concerns the served fix-up prompt
-// actually rendered. It deliberately does NOT reuse the #2737 block's
-// anchor-pinned resolution (binding condition 5b: this is a SEPARATE
-// ListForRunByCategory call, not a hoist of that one): the
-// fixup_report_obligations_declared anchor is written only when the served
-// prompt detected a REPORTING obligation, so keying off it would make this
-// signal inert on the ordinary fix-up pass — exactly the "ships as coverage,
-// checks nothing" failure this change exists to avoid. The #2737 block and its
-// tests are untouched by that choice.
+// ENTRY SELECTION IS PINNED TO headSHA, not newest-wins (#2896 fix-up, item B).
+// A stage routinely carries SEVERAL stage_fixup_triggered entries — re-routing a
+// dropped concern in a further pass is this campaign's own standard workaround —
+// and the review of pass N's delta can be assembled after pass N+1 has already
+// been triggered. Selecting the newest entry would then classify pass N's diff
+// against pass N+1's concerns and write a durable warning naming the WRONG
+// routing round: a signal confidently pointing at the wrong concern, the same
+// class of defect binding condition 1 forbids for positions.
+//
+// The association is anchored on the audit log's own ordering. The reviewed
+// delta IS its head SHA; the fixup_pushed entry for (stage, headSHA) is where
+// that delta entered the ledger; and the pass that produced it is the NEWEST
+// stage_fixup_triggered entry recorded BEFORE that push. So the pin is
+// `newest trigger with Sequence < fixupPushedSequence(stage, headSHA)`.
+//
+// When the delta cannot be pinned — an empty headSHA (the trace-time hook keys
+// on the throwaway WIP verify sha, and unit callers pass ""), no fixup_pushed
+// entry for that head, or a list error — the fallback is decided by AMBIGUITY,
+// not by recency: with exactly ONE candidate trigger entry on the stage there is
+// nothing to get wrong, so it is used; with TWO OR MORE the signal is SUPPRESSED
+// (WARN). A wrong routing round is worse than no signal, for the same reason
+// Implicated discards an ambiguous suffix rather than guessing.
+//
+// It deliberately does NOT reuse the #2737 block's anchor-pinned resolution
+// (binding condition 5b: this is a SEPARATE ListForRunByCategory call, not a
+// hoist of that one): the fixup_report_obligations_declared anchor is written
+// only when the served prompt detected a REPORTING obligation, so keying off it
+// would make this signal inert on the ordinary fix-up pass — exactly the "ships
+// as coverage, checks nothing" failure this change exists to avoid. The #2737
+// block and its tests are untouched by that choice.
 //
 // concern_ids[i] is paired with concerns[i] ONLY when the two arrays are the
 // same length; writeFixupAudit writes both from the same selection-order slices
@@ -5932,10 +5961,11 @@ type routedFixupConcern struct {
 // misaligned, so a future divergence degrades to an id-less, position-labelled
 // concern instead of attributing a finding to the WRONG concern id.
 //
-// Returns ok=false when the AuditRepo is unconfigured, the list errors, or the
-// stage carries no fix-up trigger (the common, non-fix-up case) — each a
-// no-signal degrade, the fail-safe direction for an evidence-only surface.
-func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (concerns []routedFixupConcern, sharedText string, ok bool) {
+// Returns ok=false when the AuditRepo is unconfigured, the list errors, the
+// stage carries no fix-up trigger (the common, non-fix-up case), or the delta is
+// unpinnable across multiple triggers — each a no-signal degrade, the fail-safe
+// direction for an evidence-only surface.
+func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID uuid.UUID, headSHA string) (concerns []routedFixupConcern, sharedText string, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return nil, "", false
 	}
@@ -5948,9 +5978,27 @@ func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID 
 		)
 		return nil, "", false
 	}
+	// Pin the trigger to the delta under review. pinSeq > 0 means "consider only
+	// entries recorded before this sequence"; pinned=false means the delta could
+	// not be tied to a push, and the ambiguity guard below decides.
+	pinSeq, pinned := s.fixupPushedSequenceForHead(ctx, runID, stageID, headSHA)
+	if !pinned && countStageFixupTriggers(entries, stageID) > 1 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: fix-up delta not pinnable to a routing round across multiple triggers — skipping attempt check",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("head_sha", headSHA),
+		)
+		return nil, "", false
+	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
 		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		if pinned && e.Sequence >= pinSeq {
+			// Recorded at or after the push under review: a LATER routing round,
+			// whose concerns this delta could not have been written against.
 			continue
 		}
 		var payload struct {
@@ -5987,6 +6035,72 @@ func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID 
 		return out, shared, true
 	}
 	return nil, "", false
+}
+
+// countStageFixupTriggers counts the stage-bound stage_fixup_triggered entries
+// carrying at least one concern — the number of ROUTING ROUNDS the attempt check
+// could confuse for one another. One (or zero) means the newest-wins selection
+// cannot pick the wrong round; two or more means an unpinnable delta must be
+// refused rather than guessed.
+func countStageFixupTriggers(entries []*audit.Entry, stageID uuid.UUID) int {
+	n := 0
+	for _, e := range entries {
+		if e == nil || e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Concerns []planreview.Concern `json:"concerns"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || len(payload.Concerns) == 0 {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// fixupPushedSequenceForHead returns the audit sequence of the fixup_pushed
+// entry that recorded headSHA for this stage — the ledger position of the delta
+// under review — and whether one was found.
+//
+// An empty headSHA is unpinnable by construction and never scans: the trace-time
+// review hook keys on the throwaway WIP verify sha (documented on
+// bundle.ExtractHeadSHA), which never appears on a fixup_pushed entry, so a blind
+// match would be a guess. A list error is likewise unpinnable rather than an
+// error the caller must handle — the caller's ambiguity guard turns both into
+// either a safe single-round selection or a suppressed signal.
+func (s *Server) fixupPushedSequenceForHead(ctx context.Context, runID, stageID uuid.UUID, headSHA string) (int64, bool) {
+	if headSHA == "" || s.cfg.AuditRepo == nil {
+		return 0, false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "fixup_pushed")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: list fixup_pushed audit for attempt-check pinning failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return 0, false
+	}
+	// Newest-first: a head re-pushed under the same sha resolves to its latest
+	// ledger position, which is the round whose concerns it was written against.
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e == nil || e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.HeadSHA == headSHA {
+			return e.Sequence, true
+		}
+	}
+	return 0, false
 }
 
 // fixupAttemptCandidates returns the repo-relative paths a routed concern's

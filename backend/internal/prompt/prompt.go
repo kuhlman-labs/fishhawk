@@ -913,13 +913,19 @@ type GateEvidence struct {
 	// files are evidence the concern was NOT ATTEMPTED, never proof it was not
 	// addressed.
 	FixupUnattemptedConcerns []GateFixupUnattemptedConcern
-	// FixupUnattemptedFiles are candidate paths the routed instruction text as a
-	// WHOLE named (the operator's fix-up reason / operator_concern) and the pass
-	// never touched. They are reported UNATTRIBUTED — with no claim about which
-	// routed concern they belong to — because attributing a path from shared
-	// text to one of several concerns would be a guess, and a wrongly-labelled
-	// concern is worse than an unlabelled file.
-	FixupUnattemptedFiles []string
+	// FixupMentionedUntouchedFiles are candidate paths the routed instruction
+	// text as a WHOLE MENTIONED (the operator's fix-up reason /
+	// operator_concern) and the pass never touched. Two claims are deliberately
+	// withheld. They are UNATTRIBUTED — no claim about which routed concern they
+	// belong to — because attributing a path from shared text to one of several
+	// concerns would be a guess. And they are a MENTION, not an established
+	// obligation: routed text names files to forbid or to cite them as often as
+	// to require them, and while an explicit negative instruction ("do not touch
+	// X") is filtered out backend-side, a bare citation is not separable from an
+	// obligation by any lexical rule (#2896 fix-up, item A). The rendering below
+	// therefore says "mentioned ... and NOT touched" and never calls this half
+	// evidence that a concern was not attempted.
+	FixupMentionedUntouchedFiles []string
 	// FixupUnattemptedUndeterminable is how many routed concerns the check could
 	// not decide (their routed text named no candidate path). Rendered as an
 	// explicit coverage caveat so the block cannot read as an exhaustive audit.
@@ -5023,7 +5029,7 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		writeUntrustedObligationExcerpts(b, untrusted, binding)
 	}
 
-	if len(ev.FixupUnattemptedConcerns) > 0 || len(ev.FixupUnattemptedFiles) > 0 {
+	if len(ev.FixupUnattemptedConcerns) > 0 || len(ev.FixupMentionedUntouchedFiles) > 0 {
 		b.WriteString("### Routed concern NOT ATTEMPTED (deterministic, high priority)\n\n")
 		b.WriteString("This is NOT a \"cannot be verified from the diff\" observation — it is a deterministic " +
 			"backend fact about the fix-up commit's file set. The operator routed concern(s) back to this " +
@@ -5038,18 +5044,23 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			fmt.Fprintf(b, "- %s [%s/%s] — named but untouched: %s\n",
 				label, c.Severity, c.Category, strings.Join(c.ImplicatedFiles, ", "))
 		}
-		if len(ev.FixupUnattemptedFiles) > 0 {
-			fmt.Fprintf(b, "- named in the routed instructions as a whole (not attributable to one concern) "+
-				"and untouched: %s\n", strings.Join(ev.FixupUnattemptedFiles, ", "))
+		if len(ev.FixupMentionedUntouchedFiles) > 0 {
+			fmt.Fprintf(b, "- MENTIONED in the routed instructions as a whole (not attributable to one "+
+				"concern, and a mention is not an established obligation) and NOT touched: %s\n",
+				strings.Join(ev.FixupMentionedUntouchedFiles, ", "))
 		}
 		b.WriteString("\n")
 		b.WriteString("Read what this does and does NOT establish. It establishes that the pass left those " +
-			"files untouched — evidence the concern was NOT ATTEMPTED. It does NOT establish that the concern " +
-			"was not ADDRESSED: a concern can be legitimately resolved by editing a DIFFERENT file than the " +
-			"instruction named, and a routed instruction sometimes names a file precisely to say do NOT touch " +
-			"it. Your task is to ask which happened: look for the fix elsewhere in the diff, and if you cannot " +
-			"find it and the agent did not state that it declined or fixed it elsewhere, name it as a routed " +
-			"concern left unaddressed rather than as a diff-only-unverifiable finding.\n\n")
+			"files untouched. For a PER-CONCERN line that is evidence the concern was NOT ATTEMPTED. It does " +
+			"NOT establish that the concern was not ADDRESSED: a concern can be legitimately resolved by " +
+			"editing a DIFFERENT file than the instruction named, or legitimately declined. The MENTIONED line " +
+			"is weaker still and claims only what it says — the routed text named those paths and the diff " +
+			"does not contain them. Paths under an explicit negative instruction (\"do not touch X\") are " +
+			"filtered out backend-side, but a path the instructions merely CITE as context is not separable " +
+			"from one they require, so do not read that line as an accusation. Your task is to ask which " +
+			"happened: look for the fix elsewhere in the diff, and if you cannot find it and the agent did " +
+			"not state that it declined or fixed it elsewhere, name it as a routed concern left unaddressed " +
+			"rather than as a diff-only-unverifiable finding.\n\n")
 		if ev.FixupUnattemptedUndeterminable > 0 {
 			fmt.Fprintf(b, "Coverage caveat: %d of the %d routed concern(s) could NOT be checked this way — "+
 				"their routed text named no repository path, so this block says nothing about them either "+

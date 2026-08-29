@@ -47,17 +47,41 @@ naming `board.go` must NOT implicate `site/dashboard.go` — a **spurious match
 marks an untouched file as touched and MASKS a genuine drop**, which is the exact
 failure this package exists to detect.
 
+A resolved candidate is then kept only if it has at least one mention **not
+introduced by an explicit negative instruction**. Routed text names files to
+FORBID them as often as to require them — the reference incident's own routed
+reason says *"Do not touch onboarding.go or either test file's logic"* — and
+reporting such a path as untouched accuses the agent of dropping work precisely
+when it obeyed. `prohibitiveMarkers` is a small imperative set (`do not`, `don't`,
+`must not`, `should not`, `never`, `avoid`, `no need to`, `refrain from`,
+`no change`, `leave unchanged`, …) matched against the clause text **preceding**
+the mention. Two details are load-bearing:
+
+- **Before-only, within the clause.** `Fix docs/onboarding.md but do not touch
+  onboarding.go` must keep the first path and drop the second. Scanning the whole
+  clause would suppress both and mask the very drop this package detects.
+- **A clause boundary is a newline, a `;`, or `.`/`!`/`?` FOLLOWED BY
+  WHITESPACE.** A bare `.` is a path byte, so an unconditional dot boundary would
+  cut the clause at the dot inside a preceding filename and lose the `do not` for
+  the path after it.
+
+Over-matching is the safe direction here: a wrongly suppressed mention only
+weakens an advisory signal, while a wrongly surfaced one puts a correctly-untouched
+file into a durable operator-facing record.
+
 `Unattempted(routed, touched)` returns a `Finding` for each routed concern whose
 implicated set is NON-EMPTY and DISJOINT from the touched set, plus a count of
 the concerns it could not decide. A **partially** touched implicated set counts
 as ATTEMPTED — the pass demonstrably opened one of the named files, which is all
 this signal claims to detect.
 
-`Untouched(paths, touched)` backs the UNATTRIBUTED half: paths named in the
-routed instruction text as a whole (the operator's `reason` /
-`operator_concern`) rather than inside one concern's own note.
+`Untouched(paths, touched)` backs the SHARED-TEXT half: paths the routed
+instruction text as a whole (the operator's `reason` / `operator_concern`)
+MENTIONED, rather than paths named inside one concern's own note. The caller
+reports these as `mentioned_untouched_files` — a name chosen to claim exactly
+what is provable and nothing more (see the fourth trade below).
 
-## Three deliberate trades
+## Four deliberate trades
 
 **Untouched means NOT ATTEMPTED, never NOT ADDRESSED.** A concern can be
 legitimately resolved by editing a different file than the reviewer named, or
@@ -80,6 +104,18 @@ second — sending an operator to inspect a concern that WAS attempted, which
 spends their trust worse than no signal would. The same refusal-to-guess governs
 the ambiguous-suffix rule.
 
+**The shared-text half claims a MENTION, not an obligation.** Suppressing
+explicit prohibitions is tractable; separating a CITATION from a requirement is
+not. `"the RED landed at onboarding_test.go:564"` carries no negative marker and
+no lexical rule distinguishes it from `"fix onboarding_test.go"`. Rather than
+pretend to a precision it does not have, the surface CLAIMS LESS: the payload
+member is `mentioned_untouched_files` and the reviewer prompt says *"MENTIONED in
+the routed instructions as a whole … and NOT touched"*, never *"evidence of an
+unattempted concern"*. The durable audit record an operator reads later, without
+the prompt's framing, therefore states only what is true. `TestImplicated`'s
+`a bare citation mention is NOT suppressed (known residual)` case pins that
+residual so it stays visible rather than drifting.
+
 ## What the incident's real text proves
 
 The reality check is pinned by `TestImplicated_RealIncidentNotes` against the
@@ -93,6 +129,18 @@ verbatim routed text of run `925addab` (concerns `f5c464c6` and `9955251a`):
   `docs/onboarding.md` resolves and, with only
   `backend/internal/server/README.md` committed, surfaces as untouched. The
   incident IS detected.
+- **Two of the four candidates the reason mentions are suppressed.** Pass 1's
+  reason says *"Do not touch onboarding.go or either test file's logic"* and
+  *"The implementation and tests are correct and need NO change … at
+  onboarding_test.go:564"*, so the pass-1 resolution is exactly
+  `[backend/internal/server/README.md, docs/onboarding.md]` and the reported
+  untouched list is exactly `[docs/onboarding.md]`. Both lists are pinned in
+  FULL, not searched for the true positive: a test that checks only the true
+  positive cannot detect the signal growing new false positives.
+- **The residual is visible in pass 2.** That reason suppresses `onboarding.go`
+  the same way but keeps `onboarding_test.go`, which it cites as evidence with no
+  negative marker in front of it. `TestImplicated_RealIncidentNotes` pins that
+  list in full too.
 
 That is why the caller resolves the shared routed text as well as each note, and
 why a path from shared text is reported **unattributed** when several concerns

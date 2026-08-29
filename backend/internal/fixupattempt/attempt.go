@@ -80,9 +80,20 @@ func pathByte(b byte) bool {
 	return false
 }
 
-// tokenize splits note into maximal runs of path bytes.
-func tokenize(note string) []string {
-	var out []string
+// mention is one path-shaped token together with its BYTE OFFSET in the note.
+// The offset is what lets a mention be classified against the prose that
+// introduces it (see prohibited): the same path can be named once as an
+// obligation and once under "do not touch", and only the offset tells the two
+// apart.
+type mention struct {
+	text  string
+	start int
+}
+
+// tokenize splits note into maximal runs of path bytes, keeping each run's
+// offset.
+func tokenize(note string) []mention {
+	var out []mention
 	start := -1
 	for i := 0; i < len(note); i++ {
 		if pathByte(note[i]) {
@@ -92,14 +103,92 @@ func tokenize(note string) []string {
 			continue
 		}
 		if start >= 0 {
-			out = append(out, note[start:i])
+			out = append(out, mention{text: note[start:i], start: start})
 			start = -1
 		}
 	}
 	if start >= 0 {
-		out = append(out, note[start:])
+		out = append(out, mention{text: note[start:], start: start})
 	}
 	return out
+}
+
+// prohibitiveMarkers are the explicit NEGATIVE-INSTRUCTION lead-ins that make a
+// path mention a prohibition rather than an obligation. Lowercased; matched as
+// substrings of the clause text PRECEDING the mention.
+//
+// The set is deliberately small and imperative. It is not an attempt to parse
+// English: it covers the shapes an operator actually writes when forbidding a
+// file ("Do not touch X", "the tests need NO change", "never edit X"), and
+// nothing else. Over-matching is the SAFE direction — a wrongly suppressed
+// mention only weakens an advisory signal, while a wrongly surfaced one puts a
+// correctly-untouched file into a durable operator-facing record as apparent
+// evidence of a dropped concern (#2896 fix-up, item A).
+var prohibitiveMarkers = []string{
+	"do not",
+	"don't",
+	"must not",
+	"mustn't",
+	"should not",
+	"shouldn't",
+	"never",
+	"avoid",
+	"no need to",
+	"refrain from",
+	"no change",
+	"no changes",
+	"leave alone",
+	"leave unchanged",
+}
+
+// clauseStart returns the offset of the start of the clause containing pos.
+//
+// A clause ends at a newline, a ';', or sentence-terminating punctuation
+// FOLLOWED BY WHITESPACE. The whitespace requirement is load-bearing: a bare '.'
+// is a path byte, so treating every '.' as a boundary would cut the clause at
+// the dot inside a preceding filename ("Do not touch docs/a.md or docs/b.md"
+// would lose its "do not" for the second path).
+func clauseStart(note string, pos int) int {
+	for i := pos - 1; i >= 0; i-- {
+		switch note[i] {
+		case '\n', ';':
+			return i + 1
+		case '.', '!', '?':
+			if i+1 < len(note) && isSpaceByte(note[i+1]) {
+				return i + 1
+			}
+		}
+	}
+	return 0
+}
+
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// prohibited reports whether the mention at pos is introduced by an explicit
+// negative instruction.
+//
+// Only text BEFORE the mention, within its own clause, is consulted. That is
+// what makes "Fix docs/onboarding.md but do not touch onboarding.go" resolve
+// correctly in BOTH directions — the first path keeps its obligation, the second
+// is suppressed — where scanning the whole clause would suppress both and mask
+// the very drop this package exists to detect.
+//
+// The residual is stated plainly rather than papered over: a mention that is
+// neither an obligation nor an explicit prohibition (a CITATION — "the RED
+// landed at onboarding_test.go:564") is NOT distinguishable from an obligation
+// by any lexical rule, and still resolves. That is why the shared-text half of
+// the signal claims only that the routed text MENTIONED a path the diff did not
+// touch, and never that the path is evidence of an unattempted concern.
+func prohibited(note string, pos int) bool {
+	clause := strings.ToLower(note[clauseStart(note, pos):pos])
+	for _, m := range prohibitiveMarkers {
+		if strings.Contains(clause, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeToken strips the decorations a reviewer's prose puts around a path:
@@ -134,29 +223,47 @@ func normalizeToken(tok string) string {
 // `xdocs/onboarding.md` does NOT implicate `docs/onboarding.md`. That matters:
 // a spurious match would mark an untouched file as touched and MASK a genuine
 // drop.
+//
+// A resolved candidate is then kept only if it has at least ONE mention that is
+// not introduced by an explicit negative instruction (see prohibited). Routed
+// text names files to FORBID them as often as to require them — the #2896
+// reference incident's own routed reason says "Do not touch onboarding.go or
+// either test file's logic" — and reporting such a path as untouched accuses the
+// agent of dropping work precisely when it obeyed. That check is lexical and
+// therefore bounded: a CITATION mention (a path named only as context) is not
+// separable from an obligation by any rule of this kind and still resolves,
+// which is why the caller's shared-text surface claims only that the routed text
+// MENTIONED an untouched path.
 func Implicated(note string, candidates []string) []string {
 	if note == "" || len(candidates) == 0 {
 		return nil
 	}
-	hit := make(map[string]struct{}, len(candidates))
-	for _, tok := range tokenize(note) {
-		tok = normalizeToken(tok)
+	hit := make(map[string]bool, len(candidates))
+	for _, m := range tokenize(note) {
+		tok := normalizeToken(m.text)
 		if tok == "" {
 			continue
 		}
-		if resolved, ok := resolveToken(tok, candidates); ok {
-			hit[resolved] = struct{}{}
+		resolved, ok := resolveToken(tok, candidates)
+		if !ok {
+			continue
 		}
-	}
-	if len(hit) == 0 {
-		return nil
+		// A path is implicated by its FIRST non-prohibited mention and by
+		// nothing else: a candidate every one of whose mentions sits under an
+		// explicit negative instruction is dropped, never merely down-weighted.
+		if !hit[resolved] {
+			hit[resolved] = !prohibited(note, m.start)
+		}
 	}
 	out := make([]string, 0, len(hit))
 	for _, c := range candidates {
-		if _, ok := hit[c]; ok {
+		if hit[c] {
 			delete(hit, c)
 			out = append(out, c)
 		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
