@@ -7835,3 +7835,86 @@ func TestImplementReview_AcceptanceDerivedObligation_TextQuarantined(t *testing.
 		t.Errorf("the undelivered obligation must still be named by id and status:\n%s", prompt)
 	}
 }
+
+// TestApplyConcernResolutions_AddressedStampsReviewedHeadSHA is M12 of #2884:
+// a `confirmed` resolution (StateAddressed) stamps the reviewed head sha into
+// the state_reason so a future PR-head divergence is visible in the ledger.
+// Counterfactual (d): delete the head-sha suffix in applyConcernResolutions →
+// this goes RED.
+func TestApplyConcernResolutions_AddressedStampsReviewedHeadSHA(t *testing.T) {
+	ctx := context.Background()
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer to confirm", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	id := operatorConcernRows(cr)[0].ID
+	s.applyRoundConcernResolutions(ctx, stage.RunID, stage.ID, []roundReviewVerdict{{
+		model:   "claude-opus-4-8",
+		verdict: planreview.VerdictApprove,
+		resolutions: []planreview.ConcernResolution{
+			{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
+		},
+		reviewSequence: 7,
+	}}, "reviewedheadsha1234")
+	row := operatorConcernRows(cr)[0]
+	if row.State != concern.StateAddressed {
+		t.Fatalf("state = %q, want addressed", row.State)
+	}
+	if !strings.Contains(row.StateReason, "[verified at reviewedheadsha1234]") {
+		t.Errorf("addressed state_reason = %q, want it to carry the reviewed head sha", row.StateReason)
+	}
+}
+
+// TestApplyConcernResolutions_EmptyHeadSHALeavesReasonByteIdentical is M12b:
+// when the reviewed head sha is empty the state_reason is passed through
+// byte-identical, so no legacy path changes.
+func TestApplyConcernResolutions_EmptyHeadSHALeavesReasonByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer to confirm", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	id := operatorConcernRows(cr)[0].ID
+	s.applyRoundConcernResolutions(ctx, stage.RunID, stage.ID, []roundReviewVerdict{{
+		model:   "claude-opus-4-8",
+		verdict: planreview.VerdictApprove,
+		resolutions: []planreview.ConcernResolution{
+			{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
+		},
+		reviewSequence: 7,
+	}}, "")
+	row := operatorConcernRows(cr)[0]
+	if row.StateReason != "diff resolves it" {
+		t.Errorf("empty head sha must leave the reason byte-identical, got %q", row.StateReason)
+	}
+}
+
+// TestApplyConcernResolutions_ReopenedReasonUntouched is M12c: reopened (and
+// superseded) resolutions never receive the head-sha suffix — only a
+// `confirmed` (StateAddressed) does.
+func TestApplyConcernResolutions_ReopenedReasonUntouched(t *testing.T) {
+	ctx := context.Background()
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer to reopen", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	id := operatorConcernRows(cr)[0].ID
+	s.applyRoundConcernResolutions(ctx, stage.RunID, stage.ID, []roundReviewVerdict{{
+		model:   "claude-opus-4-8",
+		verdict: planreview.VerdictReject,
+		resolutions: []planreview.ConcernResolution{
+			{ID: id.String(), Resolution: "reopened", Note: "still not fixed"},
+		},
+		reviewSequence: 7,
+	}}, "reviewedheadsha1234")
+	row := operatorConcernRows(cr)[0]
+	if row.State != concern.StateReopened {
+		t.Fatalf("state = %q, want reopened", row.State)
+	}
+	if strings.Contains(row.StateReason, "[verified at") {
+		t.Errorf("reopened state_reason must NOT carry the head sha suffix, got %q", row.StateReason)
+	}
+}

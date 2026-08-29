@@ -3607,6 +3607,33 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	fixupVerifyGate = func(_ context.Context, _ config, _ io.Writer) ([]agent.Event, string, error) {
 		return nil, "", nil
 	}
+	// Stub the #2884 fix-up landing seams to a clean-and-landed default so a
+	// fake-pusher run() test never probes the runner's own source repo (".") or
+	// a live remote: no stash, an empty reflog, no dangling commits, and a
+	// remote tip that MATCHES the pushed head (so verifyFixupPushLanded lands).
+	// fixupLocalHead returns "" so the advanced-HEAD probe (guarded on head!="")
+	// never false-fires against the base tip captured from the real ".". Tests
+	// exercising a stranding or a not-landed push swap in recording fakes AFTER
+	// this via withFakeFixup* helpers.
+	origFixStash, origFixHead, origFixStranded := fixupStashList, fixupLocalHead, fixupStrandedReflog
+	origFixReflog, origFixRemoteTip := fixupReflogCommits, fixupRemoteBranchTip
+	fixupStashList = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
+	fixupReflogCommits = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
+	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) { return nil, nil }
+	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return "", nil }
+	fixupRemoteBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) {
+		if fp.result != nil && fp.result.HeadSHA != "" {
+			return fp.result.HeadSHA, nil
+		}
+		return "head-sha-abc", nil
+	}
+	t.Cleanup(func() {
+		fixupStashList = origFixStash
+		fixupLocalHead = origFixHead
+		fixupStrandedReflog = origFixStranded
+		fixupReflogCommits = origFixReflog
+		fixupRemoteBranchTip = origFixRemoteTip
+	})
 	t.Cleanup(func() {
 		newPusher = origP
 		newPROpener = origO
@@ -5137,6 +5164,73 @@ func TestRun_FetchPrompt_ServerTimeout_Applied(t *testing.T) {
 		t.Errorf("Budget.Timeout = %v, want 30m (from server AgentTimeoutSeconds=1800)",
 			invoker.gotInv.Budget.Timeout)
 	}
+}
+
+// withFakeFixupStashList swaps the #2884 fix-up stash-probe seam. The fake
+// returns entries on the CURRENT-snapshot read strandedFixupWork makes; the
+// run() pre-snapshot read (fixupStashList before CommitAndPush) returns the
+// default withFakeGitOps stub (empty), so a returned entry reads as NET-NEW.
+func withFakeFixupStashList(t *testing.T, entries []stashEntry, err error) {
+	t.Helper()
+	orig := fixupStashList
+	var calls int
+	fixupStashList = func(_ context.Context, _ string) ([]stashEntry, error) {
+		calls++
+		// Call 1 is the run() pre-snapshot; keep it empty so the current
+		// snapshot's entries are net-new. Call 2+ is strandedFixupWork's read.
+		if calls == 1 {
+			if err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		return entries, err
+	}
+	t.Cleanup(func() { fixupStashList = orig })
+}
+
+// withFakeFixupStashSnapshotError makes ONLY the run() pre-snapshot read fail
+// and every later read succeed — condition 4's fail-closed case.
+func withFakeFixupStashSnapshotError(t *testing.T, err error) {
+	t.Helper()
+	orig := fixupStashList
+	var calls int
+	fixupStashList = func(_ context.Context, _ string) ([]stashEntry, error) {
+		calls++
+		if calls == 1 {
+			return nil, err
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() { fixupStashList = orig })
+}
+
+// withFakeFixupLocalHead swaps the fix-up local-HEAD probe seam.
+func withFakeFixupLocalHead(t *testing.T, head string, err error) {
+	t.Helper()
+	orig := fixupLocalHead
+	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return head, err }
+	t.Cleanup(func() { fixupLocalHead = orig })
+}
+
+// withFakeFixupStrandedReflog swaps the dangling-commit provenance seam.
+func withFakeFixupStrandedReflog(t *testing.T, dangling []stashEntry, err error) {
+	t.Helper()
+	orig := fixupStrandedReflog
+	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) {
+		return dangling, err
+	}
+	t.Cleanup(func() { fixupStrandedReflog = orig })
+}
+
+// withFakeFixupRemoteBranchTip swaps the fix-up remote-tip probe seam so a
+// run() test can drive verifyFixupPushLanded's match / mismatch / read-error
+// branches without a live remote.
+func withFakeFixupRemoteBranchTip(t *testing.T, tip string, err error) {
+	t.Helper()
+	orig := fixupRemoteBranchTip
+	fixupRemoteBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) { return tip, err }
+	t.Cleanup(func() { fixupRemoteBranchTip = orig })
 }
 
 // withFakeRemoteBranchExists swaps the remoteBranchExists seam for the
@@ -8223,6 +8317,215 @@ func TestRun_ImplementStage_Fixup_NoChanges_ReportsFixupNoChanges(t *testing.T) 
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes_reported"`) {
 		t.Errorf("missing implement_fixup_no_changes_reported log line:\n%s", stderr.String())
+	}
+}
+
+// fixupLandingPrompt is the shared fix-up prompt for the #2884 landing tests.
+func fixupLandingPrompt() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+}
+
+// runFixupLanding drives run() through the fix-up implement path.
+func runFixupLanding(t *testing.T, stderr *strings.Builder) int {
+	t.Helper()
+	return run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, stderr)
+}
+
+// M1 (#2884): a no-changes fix-up that left a NET-NEW STASH behind fails
+// category-B and does NOT report fixup_no_changes. Counterfactual (a): delete
+// the strandedFixupWork call on the no-changes branch → this goes RED.
+func TestRun_Fixup_NoChanges_NetNewStash_FailsCategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupStashList(t, []stashEntry{{SHA: "ff5b54fddeadbeef00000000000000000000cafe", Subject: "WIP on fishhawk/run"}}, nil)
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Error("must NOT report fixup_no_changes when work is stranded")
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) || !strings.Contains(stderr.String(), "ff5b54fd") {
+		t.Errorf("fixup_work_stranded log must name the stash sha:\n%s", stderr.String())
+	}
+}
+
+// M2 (#2884): a no-changes fix-up whose local HEAD advanced past the base tip
+// fails category-B naming both heads. Counterfactual (a) reddens this too.
+func TestRun_Fixup_NoChanges_UnpushedLocalHead_FailsCategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupLocalHead(t, "advancedlocalhead0000000000000000000000", nil)
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if !strings.Contains(stderr.String(), "advancedlocalhead") || !strings.Contains(stderr.String(), `"expected_head_sha"`) {
+		t.Errorf("stranded log must name expected and actual heads:\n%s", stderr.String())
+	}
+}
+
+// M2b (#2884, condition 1 — the incident shape BY CONSTRUCTION): a no-changes
+// fix-up that COMMITTED then reset back to the base tip with NO stash, leaving a
+// DANGLING commit. The stash probe and the HEAD probe both read clean; only the
+// reflog provenance probe surfaces it. This goes RED against the plan's original
+// two-probe design.
+func TestRun_Fixup_NoChanges_DanglingCommit_FailsCategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	// Clean stash and clean HEAD; only the provenance walk finds the orphan.
+	withFakeFixupStrandedReflog(t, []stashEntry{{SHA: "0421daebb24df3d9338d5b28e52d164c7bf49bc1", Subject: "fishhawk verify wip"}}, nil)
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Error("must NOT report fixup_no_changes when a dangling commit is stranded")
+	}
+	if !strings.Contains(stderr.String(), "0421daeb") {
+		t.Errorf("stranded log must name the dangling sha (the #2884 orphan):\n%s", stderr.String())
+	}
+}
+
+// M4 (#2884, condition 4): the stash pre-snapshot itself errors → fail CLOSED
+// category-C, never a fall-through to a success report.
+func TestRun_Fixup_NoChanges_StashProbeError_FailsClosedCategoryC(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupStashSnapshotError(t, errors.New("stash list: fatal: not a git repository"))
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "C" {
+		t.Fatalf("report = %+v, want {failed, C}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Error("must NOT report fixup_no_changes when the snapshot was unavailable")
+	}
+}
+
+// M5 (#2884): a fix-up that pushed a head whose REMOTE TIP differs fails
+// category-B naming both heads and does NOT report fixup_pushed. Counterfactual
+// (b): delete the verifyFixupPushLanded call → this goes RED.
+func TestRun_Fixup_RemoteTipMismatch_FailsCategoryB(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{} // default: pushes head "head-sha-abc", NoChanges false
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupRemoteBranchTip(t, "a518571b9a6a8579f8b4baea134a411831fbbd04", nil) // the stale original PR head
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
+		t.Error("must NOT report fixup_pushed when the push did not land")
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_push_not_landed"`) ||
+		!strings.Contains(stderr.String(), "head-sha-abc") ||
+		!strings.Contains(stderr.String(), "a518571b") {
+		t.Errorf("fixup_push_not_landed log must name both heads:\n%s", stderr.String())
+	}
+}
+
+// M6 (#2884): an unreadable remote tip on the push path fails CLOSED category-C.
+func TestRun_Fixup_RemoteTipUnreadable_CategoryC(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupRemoteBranchTip(t, "", errors.New("ls-remote: connection refused"))
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "C" {
+		t.Fatalf("report = %+v, want {failed, C}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
+		t.Error("must NOT report fixup_pushed when the remote tip is unreadable")
+	}
+}
+
+// M7 (#2884): the happy control — a matching remote tip reports fixup_pushed and
+// exits OK. This is what passes against today's code, which is why M1/M2/M2b/M5
+// are the load-bearing cases.
+func TestRun_Fixup_RemoteTipMatches_ReportsFixupPushed(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupLandingPrompt()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+	withFakeFixupRemoteBranchTip(t, "head-sha-abc", nil)
+
+	var stderr strings.Builder
+	if got := runFixupLanding(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Fatalf("report = %+v, want fixup_pushed", fu.gotPRArgs)
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
+		t.Errorf("missing implement_fixup_pushed log:\n%s", stderr.String())
 	}
 }
 

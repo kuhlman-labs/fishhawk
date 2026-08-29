@@ -229,6 +229,29 @@ func (*BuildRequiredDriftError) Unwrap() error { return ErrCommittedTestsFailed 
 // ErrCommitWouldNotCompile / ErrCommittedTestsFailed.
 var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified by the committed-tree gates")
 
+// ErrFixupWorkStranded is the category-B sentinel for a fix-up pass that
+// reported no changes while leaving its work behind rather than on the branch
+// (#2884, run 8ae65577). The stranding shapes are a net-new stash entry (a
+// stash is never a valid terminal artifact), a local HEAD that advanced past
+// the fix-up base tip in unpushed commits, or a commit created during the pass
+// that is dangling — reachable from neither the base tip nor the branch, the
+// exact residue a `fishhawk verify wip` commit leaves after gitResetSoftHEAD1
+// unwinds it (the orphan 0421daeb/b6925a64 shape). Returned before any success
+// report so the runner fails the stage category-B (re-scope/re-plan) and #788
+// recovery restores the pre-fix-up review gate instead of certifying work that
+// is not on the pull request.
+var ErrFixupWorkStranded = errors.New("gitops: fix-up work is stranded in local commits or a stash")
+
+// ErrFixupPushNotLanded is the category-B sentinel for a fix-up pass that
+// committed and pushed a head, but whose remote branch tip does not reflect
+// that head afterward — the push did not land on the branch (#2884). Returned
+// naming the expected pushed head and the actual remote tip (or "absent"), it
+// fails the stage category-B rather than reporting fixup_pushed for a head the
+// PR would not merge. A read failure of the remote tip is NOT this sentinel: an
+// ls-remote fault is category-C infra, wrapped in ErrVerifyInfraFailure so it
+// stays retryable in place and is never mistaken for a moved branch.
+var ErrFixupPushNotLanded = errors.New("gitops: fix-up push did not land on the branch")
+
 // ErrVerifyInfraFailure is the infrastructure-failure sentinel for a verify
 // command that did not COMPLETE for a reason outside the diff (#2645): a
 // tool's global lock held by a concurrent process (golangci-lint's
@@ -1633,6 +1656,49 @@ func RemoteBranchTip(ctx context.Context, repoDir, remote, branch, pushToken str
 	out, err := (&Pusher{}).runOutEnv(ctx, repoDir, authEnv, "ls-remote", "--heads", remote, "refs/heads/"+branch)
 	if err != nil {
 		return "", fmt.Errorf("gitops: ls-remote %s %s: %w", remote, branch, err)
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil
+	}
+	// Format: "<sha>\trefs/heads/<branch>". Take the leading SHA field.
+	if fields := strings.Fields(line); len(fields) > 0 {
+		return fields[0], nil
+	}
+	return "", nil
+}
+
+// RemoteBranchTipURL is the URL-addressed sibling of RemoteBranchTip: it
+// returns the commit SHA at refs/heads/<branch> on the remote reachable at
+// remoteURL, or "" when the branch does not exist there. Where RemoteBranchTip
+// resolves a configured remote NAME (and derives its auth from that remote),
+// this probes a remote URL directly — the same `git ls-remote <url>
+// refs/heads/<branch>` observeRemoteHead runs — so it works on a checkout whose
+// named `origin` is an unusable SSH URL (#772) and on a FreshFetchBase worktree
+// with no tracking ref. It authenticates with authConfigEnv(remoteURL,
+// pushToken), the identical process-scoped credential the push used (#1933), so
+// an https remote resolves under the same fresh run token that pushed.
+//
+// CONTRACT, identical to RemoteBranchTip and load-bearing for the #2884 fix-up-
+// push-landed check: `git ls-remote` exits 0 with EMPTY stdout for a no-match,
+// so an ABSENT branch is ("", nil) while an ls-remote FAILURE is ("", err). The
+// caller must never conflate a transient network/auth fault with evidence that
+// the branch moved — the fix-up landing check maps the two to different failure
+// categories (B for a genuine mismatch, C for an unreadable tip).
+func RemoteBranchTipURL(ctx context.Context, repoDir, remoteURL, branch, pushToken string) (string, error) {
+	if branch == "" {
+		return "", errors.New("gitops: branch required")
+	}
+	if remoteURL == "" {
+		return "", errors.New("gitops: remote URL required")
+	}
+	authEnv, err := authConfigEnv(remoteURL, pushToken)
+	if err != nil {
+		return "", fmt.Errorf("gitops: build auth env: %w", err)
+	}
+	out, err := (&Pusher{}).runOutEnv(ctx, repoDir, authEnv, "ls-remote", remoteURL, "refs/heads/"+branch)
+	if err != nil {
+		return "", fmt.Errorf("gitops: ls-remote %s %s: %w", remoteURL, branch, err)
 	}
 	line := strings.TrimSpace(out)
 	if line == "" {

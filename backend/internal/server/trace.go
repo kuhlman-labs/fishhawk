@@ -482,11 +482,27 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// path where this hook already dispatched for the head, the backstop detects
 	// the existing implement_review_started entry and is a no-op.
 	if stage.Type == run.StageTypeImplement && variant == tracestore.VariantRaw {
-		// Diff source is the trace bundle, regardless of whether a PR was
-		// opened (local --no-pr runs still carry the git_diff event). An
-		// extraction error skips review and proceeds to the terminal
-		// transition rather than failing the stage.
-		if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
+		// Control 2 (#2884): SKIP the trace-time implement re-review for a
+		// fix-up re-dispatch. A fix-up ships its trace BEFORE the push (the #794
+		// forward gate), so the only head available here is the throwaway
+		// `fishhawk verify wip` verify sha (bundle.ExtractHeadSHA) — a sha that
+		// may never reach the branch. Dispatching from it certified fixes
+		// against an orphan on run 8ae65577. Fix-up re-reviews are consolidated
+		// onto the fixup_pushed /pull-request report (maybeBackstopFixupReReview),
+		// which sources its diff from ComparePatch(base, pushedHead) — the commit
+		// the PR will merge. A manifest read error leaves today's behavior
+		// unchanged: an older bundle without the flag is indistinguishable from a
+		// non-fix-up one, and over-reviewing is the safe direction. This skip
+		// falls through to the fixupPushGated deferral below, which keeps the
+		// stage in `running` for the push report to drive terminally.
+		manifest, merr := bundle.ExtractManifest(bundleBytes)
+		if merr == nil && manifest.PushFixup {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+				"trace upload: fix-up implement re-review deferred to the push report (#2884)",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+		} else if diff, derr := bundle.ExtractDiff(bundleBytes); derr == nil {
 			// Surface runner-reported scope_drift to the reviewer so an
 			// operator-staged required file in a drifted path is not
 			// false-rejected as missing (#695). Best-effort: an extraction
@@ -3055,18 +3071,26 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 	}()
 }
 
-// maybeBackstopFixupReReview dispatches a post-fix-up implement re-review when
-// the fix-up's trace-time review hook (#793) never fired for the pushed head
-// (#1932). The trace-time hook lives in advanceStageAfterTrace and dispatches
-// the re-review from the RAW trace variant; when that raw trace is routed to
-// failStageCategoryB by a backend policy re-evaluation (a stale-base bundle diff
-// that exceeds max_files_changed is the observed case, run 98020210) the handler
-// never reaches the review hook, #788 fix-up recovery then restores the implement
-// stage to succeeded, and the subsequent fixup_pushed report records the new head
-// with nothing re-arming the re-review — implement_review_status stays 'pending'
-// forever and the audit-complete merge gate wedges. Called from
-// succeedFixupPushStage after the fixup_pushed audit entry lands, this backstop
-// re-arms the re-review for ANY trace-time miss.
+// maybeBackstopFixupReReview dispatches the post-fix-up implement re-review
+// against the PUSHED head. Since #2884 this is the PRIMARY path for a fix-up
+// re-review, not a backstop: advanceStageAfterTrace now SKIPS the trace-time
+// review hook (#793) for any push_fixup manifest, precisely because that hook
+// keyed on the throwaway `fishhawk verify wip` verify sha (bundle.ExtractHeadSHA)
+// — a sha that may never reach the branch, which certified fixes against an
+// orphan on run 8ae65577. Called from succeedFixupPushStage after the
+// fixup_pushed audit entry lands, it sources the review diff from
+// ComparePatch(base, pushedHead) — the commit the PR will merge.
+//
+// The guards below are retained unchanged. On the normal path the #1957
+// same-pass guard (a) simply never fires, because no trace-time started entry
+// precedes this call now that the trace-time dispatch is suppressed; it stays as
+// the defence against an OLDER-runner bundle whose manifest omits push_fixup, so
+// the trace-time hook still dispatched (that older bundle is indistinguishable
+// from a non-fix-up one at the hook, the safe over-review direction). The
+// original #1932 miss it was written for — a raw trace routed to
+// failStageCategoryB before the review hook, so no started entry after the
+// trigger — is still handled: implement_review_status would otherwise stay
+// 'pending' forever and wedge the audit-complete merge gate.
 //
 // Guards, in order — each fails closed to no-second-review, because a double
 // dispatch is the worse failure (2x review cost, divergent verdicts, and #777's
@@ -4377,7 +4401,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// BEFORE recomputeAndPublishAuditComplete so the republished check still
 	// reflects post-resolution concern state, exactly as it did when the
 	// resolutions were applied inline.
-	s.applyRoundConcernResolutions(ctx, runID, stageID, round)
+	s.applyRoundConcernResolutions(ctx, runID, stageID, round, headSHA)
 
 	// The implement review has now written its terminal entries
 	// (implement_reviewed / implement_review_failed). Re-derive and
@@ -4986,14 +5010,16 @@ type concernResolutionVetoedPayload struct {
 // buffered verdicts IN LOOP ORDER through applyConcernResolutions — so the
 // REOPEN-WINS ordering semantics the state machine encodes are unchanged and
 // the only behavioural difference from the previous inline application is that
-// a `confirmed` can now be refused by the veto.
-func (s *Server) applyRoundConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict) {
+// a `confirmed` can now be refused by the veto. reviewedHeadSHA is the head the
+// round's reviewers read (#2884): it is stamped onto a `confirmed` resolution's
+// state_reason so a future PR-head divergence is visible in the ledger.
+func (s *Server) applyRoundConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict, reviewedHeadSHA string) {
 	if s.cfg.ConcernRepo == nil || len(round) == 0 {
 		return
 	}
 	vc := s.buildResolutionVetoContext(ctx, runID, stageID, round)
 	for _, rv := range round {
-		s.applyConcernResolutions(ctx, runID, stageID, rv, vc)
+		s.applyConcernResolutions(ctx, runID, stageID, rv, vc, reviewedHeadSHA)
 	}
 }
 
@@ -5182,7 +5208,7 @@ func (s *Server) appendConcernResolutionVetoed(ctx context.Context, runID, stage
 // contradicts leaves the concern in its current OPEN state with its
 // state_reason intact and records a concern_resolution_vetoed entry instead.
 // `reopened` and `superseded` are never vetoed.
-func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, rv roundReviewVerdict, vc resolutionVetoContext) {
+func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, rv roundReviewVerdict, vc resolutionVetoContext, reviewedHeadSHA string) {
 	resolutions := rv.resolutions
 	if s.cfg.ConcernRepo == nil || len(resolutions) == 0 {
 		return
@@ -5247,7 +5273,17 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 				continue
 			}
 		}
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, res.Note); aerr != nil {
+		// Ledger provenance (#2884): for a `confirmed` resolution — the one
+		// that writes StateAddressed — stamp the reviewed head sha into the
+		// state_reason so a future divergence between what the confirming review
+		// read and the PR head is visible in the ledger instead of requiring a
+		// hand diff. Passed through byte-identical when the head is empty, and
+		// never applied to `reopened`/`superseded`.
+		note := res.Note
+		if to == concern.StateAddressed && reviewedHeadSHA != "" {
+			note += " [verified at " + reviewedHeadSHA + "]"
+		}
+		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, note); aerr != nil {
 			// InvalidTransitionError lands here — including the
 			// confirm-after-reopen case across heterogeneous reviewers,
 			// satisfying concern.go's never-silently-swallow contract.
