@@ -8290,6 +8290,132 @@ func TestRunImplementReviews_UnattemptedConcern_UnpinnableAcrossRounds_NoSignal(
 	}
 }
 
+// seedMalformedFixupTrigger seeds a stage-bound stage_fixup_triggered entry
+// whose payload cannot be decoded into the routed-concern shape. `concerns` is a
+// string where an array is expected, so json.Unmarshal fails — the same
+// undecodable shape fail-safe (iv) uses.
+func seedMalformedFixupTrigger(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+	t.Helper()
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: int64(len(au.seeded) + 1), RunID: &runID, StageID: &stageID,
+		Category: CategoryStageFixupTriggered, Payload: []byte(`{"concerns": "not-an-array"}`),
+	})
+}
+
+// TestRunImplementReviews_UnattemptedConcern_MalformedGoverningTrigger_NoSignal
+// is the ITEM B RESIDUAL case (#2896 fix-up). Delta-pinning fixed the ordinary
+// multi-round race, but a malformed entry INSIDE the pinned window was still
+// skipped and the backwards scan continued — falling through to an OLDER valid
+// round and attributing the reviewed delta to it. That is the same wrong-round
+// attribution the pin exists to prevent, reached by another path.
+//
+// Seeded BY CONSTRUCTION on one stage, in sequence order: trigger 1 (valid,
+// routing A and B) -> push 1 -> trigger 2 (MALFORMED) -> push 2. The review is
+// for push 2's head, so the pinned window is everything before push 2, whose
+// newest entry is the malformed trigger 2.
+//
+// COUNTERFACTUAL (observed, not reasoned): restoring the malformed branch to
+// `continue` makes this go RED on "entries = 1, want 0" — the fall-through
+// emits round 1's dropped file docs/onboarding.md and round 1's second concern
+// id, a routing round this delta was never written against.
+func TestRunImplementReviews_UnattemptedConcern_MalformedGoverningTrigger_NoSignal(t *testing.T) {
+	const (
+		pass1Head = "1111111111112222"
+		pass2Head = "3333333333334444"
+	)
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer,
+		unattemptedScopeA, unattemptedScopeB, unattemptedScopeC)
+
+	round1 := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+		"address both routed concerns", true)
+	seedFixupPushed(t, au, runRow.ID, implStage.ID, pass1Head)
+	// The round that GOVERNS the delta under review — and it is unreadable.
+	seedMalformedFixupTrigger(t, au, runRow.ID, implStage.ID)
+	seedFixupPushed(t, au, runRow.ID, implStage.ID, pass2Head)
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, pass2Head, nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 0 {
+		t.Fatalf("fixup_concern_unattempted entries = %d, want 0 — an unreadable governing trigger "+
+			"must yield NO signal, not an attribution derived from an older round: %+v",
+			len(payloads), payloads)
+	}
+	// "Fell through to the older round" is exactly what a weaker assertion would
+	// let pass, so pin round 1's identifiers out of the durable record.
+	au.mu.Lock()
+	for i := range au.appended {
+		body := string(au.appended[i].Payload)
+		if strings.Contains(body, round1[1]) {
+			au.mu.Unlock()
+			t.Fatalf("audit payload %q names round 1's second concern %q", au.appended[i].Category, round1[1])
+		}
+		if au.appended[i].Category == fixupConcernUnattemptedCategory && strings.Contains(body, unattemptedScopeB) {
+			au.mu.Unlock()
+			t.Fatalf("audit payload names round 1's dropped file %s", unattemptedScopeB)
+		}
+	}
+	au.mu.Unlock()
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "Routed concern NOT ATTEMPTED") {
+		t.Errorf("the reviewer prompt carries the not-attempted block:\n%s", reviewer.calls[0])
+	}
+	if strings.Contains(reviewer.calls[0], round1[1]) {
+		t.Errorf("the reviewer prompt names round 1's second concern %q", round1[1])
+	}
+}
+
+// TestRunImplementReviews_UnattemptedConcern_ValidGoverningTrigger_StillSignals
+// is the sibling control for the case above: the SAME two-round, two-push shape
+// with a WELL-FORMED newest trigger still emits the signal, and names the
+// GOVERNING round's concern. Without it, a guard that suppressed everything
+// would pass the malformed case.
+func TestRunImplementReviews_UnattemptedConcern_ValidGoverningTrigger_StillSignals(t *testing.T) {
+	const (
+		pass1Head = "1111111111112222"
+		pass2Head = "3333333333334444"
+	)
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, au, _, runRow, implStage := newUnattemptedReviewServer(t, reviewer,
+		unattemptedScopeA, unattemptedScopeB, unattemptedScopeC)
+
+	round1 := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, twoRoutedConcerns(),
+		"address both routed concerns", true)
+	seedFixupPushed(t, au, runRow.ID, implStage.ID, pass1Head)
+	round2 := seedFixupTriggerConcerns(t, au, runRow.ID, implStage.ID, []planreview.Concern{
+		{Severity: "high", Category: "correctness", Note: "the later round is about " + unattemptedScopeC},
+	}, "address the later concern", true)
+	seedFixupPushed(t, au, runRow.ID, implStage.ID, pass2Head)
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, touchedOnlyA(), nil, pass2Head, nil)
+
+	payloads := unattemptedPayloads(t, au)
+	if len(payloads) != 1 {
+		t.Fatalf("fixup_concern_unattempted entries = %d, want 1 — a valid governing trigger still signals",
+			len(payloads))
+	}
+	p := payloads[0]
+	if p.RoutedCount != 1 || len(p.Concerns) != 1 {
+		t.Fatalf("routed_count = %d, concerns = %+v, want the governing round's single concern",
+			p.RoutedCount, p.Concerns)
+	}
+	if got := p.Concerns[0].ID; got != round2[0] {
+		t.Errorf("finding names concern %q, want the governing round's %q (round 1's were %v)",
+			got, round2[0], round1)
+	}
+	if !reflect.DeepEqual(p.Concerns[0].ImplicatedFiles, []string{unattemptedScopeC}) {
+		t.Errorf("implicated files = %v, want [%s]", p.Concerns[0].ImplicatedFiles, unattemptedScopeC)
+	}
+}
+
 // TestRunImplementReviews_UnattemptedConcern_RealIncidentNotes drives the REAL
 // routed text from #2896's own reproduction (run 925addab, concerns f5c464c6 and
 // 9955251a) end to end through the review, with that pass's actual delta — only

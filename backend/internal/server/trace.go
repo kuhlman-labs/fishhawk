@@ -5962,9 +5962,13 @@ type routedFixupConcern struct {
 // concern instead of attributing a finding to the WRONG concern id.
 //
 // Returns ok=false when the AuditRepo is unconfigured, the list errors, the
-// stage carries no fix-up trigger (the common, non-fix-up case), or the delta is
-// unpinnable across multiple triggers — each a no-signal degrade, the fail-safe
-// direction for an evidence-only surface.
+// stage carries no fix-up trigger (the common, non-fix-up case), the delta is
+// unpinnable across multiple triggers, or the governing trigger entry is
+// UNDECODABLE — each a no-signal degrade, the fail-safe direction for an
+// evidence-only surface. The last two are ONE rule, not two accidents: when the
+// round that governs this delta cannot be identified (ambiguity) or cannot be
+// read (malformed), the concerns it routed are unknowable, and falling back on
+// a DIFFERENT round would emit a durable warning naming the wrong concern.
 func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID uuid.UUID, headSHA string) (concerns []routedFixupConcern, sharedText string, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return nil, "", false
@@ -6008,10 +6012,28 @@ func (s *Server) resolveRoutedFixupConcerns(ctx context.Context, runID, stageID 
 			OperatorConcern string               `json:"operator_concern"`
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
-			// Same tolerance as resolveFixupConcerns: skip a malformed entry.
-			continue
+			// A MALFORMED trigger inside the pinned window is NOT skipped
+			// (#2896 fix-up, item B residual). This is the newest routing round
+			// this delta could have been written against; if it cannot be
+			// parsed, the concerns it routed are unknowable, and continuing the
+			// backwards scan would attribute the delta to an OLDER round — the
+			// exact wrong-round attribution the pinning exists to prevent,
+			// reached by a different path. Same fail-safe as the unpinnable
+			// multi-round case: no signal beats a confident wrong answer.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"implement review: governing stage_fixup_triggered entry is undecodable — skipping attempt check",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("head_sha", headSHA),
+				slog.String("error", err.Error()),
+			)
+			return nil, "", false
 		}
 		if len(payload.Concerns) == 0 {
+			// Decodable but routed nothing: not a routing round at all, the same
+			// reading countStageFixupTriggers uses. Unlike the undecodable case
+			// above, what this entry routed IS known — nothing — so the scan may
+			// safely continue to the round that did route concerns.
 			continue
 		}
 		idsAligned := len(payload.ConcernIDs) == len(payload.Concerns)
