@@ -19,8 +19,11 @@ account to match.
 `auth.MembershipResolver` admits a sign-in only against an EXISTING `accounts`
 row and denies when none matches. Nothing else in the product creates that first
 row, so without the profile a fresh install has **no admitting account**: every
-sign-in is denied, and hand-written SQL is the only way out. The single-tenant
-profile is the supported way to create it.
+sign-in is denied. The single-tenant profile is the supported way to create it,
+and the `fishhawkd account` / `fishhawkd member` verbs (see
+[Bootstrapping without the auto-join profile](#bootstrapping-without-the-auto-join-profile))
+are the supported way to admit a specific human — neither requires hand-written
+SQL, which used to be the only way out.
 
 ## Enablement: the account key, and only the account key
 
@@ -168,6 +171,37 @@ enterprise/org/group then mints an `origin='auto_join'` `account_members` row.
 Auto-join grants are re-verified against their predicate at every subsequent
 login: a user who leaves the org stops being admitted, and the row is kept for
 audit rather than deleted.
+
+## Bootstrapping without the auto-join profile
+
+The auto-join profile covers the common case: every member of the customer's
+enterprise / org / group signs in and auto-joins. It does **not** cover an
+outside collaborator or contractor whose membership the forge would not report,
+nor a posture where the enterprise short code is not derivable (a github.com-style
+deployment configured at `enterprise` granularity). For those, admit the human
+directly with the supported CLI verbs instead of hand-written SQL — they write
+the same `origin='invited'` grant step 2 of the admission walk above admits
+**DB-only**:
+
+```sh
+# Create the admitting account (skip if the single-tenant profile already did).
+fishhawkd account create --db "$FISHHAWKD_DATABASE_URL" \
+  --provider github --account-key acme-corp
+
+# Invite the member — --member-ref is their forge LOGIN, not a numeric id/email.
+fishhawkd member invite --db "$FISHHAWKD_DATABASE_URL" \
+  --provider github --account-key acme-corp --member-ref outside-collaborator --role member
+
+# Confirm the roster (origin distinguishes invited from auto_join).
+fishhawkd member list --db "$FISHHAWKD_DATABASE_URL"
+```
+
+`member invite` **fails closed** naming the `account create` remedy when the
+account does not exist — it never materializes it. `--role` defaults to `member`
+(least privilege) and must be `admin` or `member`. Re-inviting an existing
+`auto_join` member upgrades that grant to `invited`, making the member's
+admission forge-independent. Full flag / exit-code contract:
+[`backend/cmd/fishhawkd/README.md`](../../backend/cmd/fishhawkd/README.md).
 
 ## What stays untenanted
 

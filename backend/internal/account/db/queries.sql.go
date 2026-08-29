@@ -235,6 +235,60 @@ func (q *Queries) ListAccountMembers(ctx context.Context, accountID uuid.UUID) (
 	return items, nil
 }
 
+const listAccountMembersWithAccountKey = `-- name: ListAccountMembersWithAccountKey :many
+SELECT m.id, m.account_id, m.provider, m.member_ref, m.role, m.origin, m.created_at, a.account_key
+  FROM account_members m
+  JOIN accounts a ON a.id = m.account_id
+ ORDER BY a.provider ASC, a.account_key ASC, m.created_at ASC, m.id ASC
+`
+
+type ListAccountMembersWithAccountKeyRow struct {
+	ID         uuid.UUID          `json:"id"`
+	AccountID  uuid.UUID          `json:"account_id"`
+	Provider   string             `json:"provider"`
+	MemberRef  string             `json:"member_ref"`
+	Role       *string            `json:"role"`
+	Origin     string             `json:"origin"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	AccountKey string             `json:"account_key"`
+}
+
+// The operator inventory read behind ` + "`fishhawkd member list`" + ` (E44.34 / #2924):
+// every membership grant JOINed with its owning account's account_key, so the
+// operator's real question — who is admitted to which account, and via which
+// origin — is answered in one row. EXPLICIT column list (not m.*) so the joined
+// account_key is carried and the scan order is pinned; origin is surfaced so an
+// invited grant (admits DB-only) is distinguishable from a login-minted
+// auto_join one.
+func (q *Queries) ListAccountMembersWithAccountKey(ctx context.Context) ([]ListAccountMembersWithAccountKeyRow, error) {
+	rows, err := q.db.Query(ctx, listAccountMembersWithAccountKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAccountMembersWithAccountKeyRow
+	for rows.Next() {
+		var i ListAccountMembersWithAccountKeyRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Provider,
+			&i.MemberRef,
+			&i.Role,
+			&i.Origin,
+			&i.CreatedAt,
+			&i.AccountKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAccountsByAccountKey = `-- name: ListAccountsByAccountKey :many
 SELECT id, provider, account_key, display_name, granularity, home_region, created_at, updated_at FROM accounts
  WHERE account_key = $1
@@ -605,6 +659,62 @@ func (q *Queries) UpsertAccountMemberWithOrigin(ctx context.Context, arg UpsertA
 		arg.Origin,
 	)
 	return err
+}
+
+const upsertInvitedAccountMember = `-- name: UpsertInvitedAccountMember :one
+INSERT INTO account_members (id, account_id, provider, member_ref, role, origin)
+VALUES ($1, $2, $3, $4, $5, 'invited')
+ON CONFLICT (account_id, provider, member_ref) DO UPDATE
+   SET role   = EXCLUDED.role,
+       origin = EXCLUDED.origin
+RETURNING id, account_id, provider, member_ref, role, origin, created_at, updated_at
+`
+
+type UpsertInvitedAccountMemberParams struct {
+	ID        uuid.UUID `json:"id"`
+	AccountID uuid.UUID `json:"account_id"`
+	Provider  string    `json:"provider"`
+	MemberRef string    `json:"member_ref"`
+	Role      *string   `json:"role"`
+}
+
+type UpsertInvitedAccountMemberRow struct {
+	ID        uuid.UUID          `json:"id"`
+	AccountID uuid.UUID          `json:"account_id"`
+	Provider  string             `json:"provider"`
+	MemberRef string             `json:"member_ref"`
+	Role      *string            `json:"role"`
+	Origin    string             `json:"origin"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// The operator invite write behind ` + "`fishhawkd member invite`" + ` (E44.34 / #2924).
+// Idempotent create-or-update keyed on (account_id, provider, member_ref).
+// Distinct from UpsertAccountMember (no origin) and UpsertAccountMemberWithOrigin
+// (:exec, no RETURNING): the CLI must PRINT the row it wrote AND pins origin to
+// the literal 'invited'. The origin in the DO UPDATE is deliberate: an operator
+// invite OVERWRITES a prior auto_join grant, upgrading to DB-only admission.
+func (q *Queries) UpsertInvitedAccountMember(ctx context.Context, arg UpsertInvitedAccountMemberParams) (UpsertInvitedAccountMemberRow, error) {
+	row := q.db.QueryRow(ctx, upsertInvitedAccountMember,
+		arg.ID,
+		arg.AccountID,
+		arg.Provider,
+		arg.MemberRef,
+		arg.Role,
+	)
+	var i UpsertInvitedAccountMemberRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.Provider,
+		&i.MemberRef,
+		&i.Role,
+		&i.Origin,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const upsertInstallation = `-- name: UpsertInstallation :one

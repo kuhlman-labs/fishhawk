@@ -125,6 +125,31 @@ ON CONFLICT (account_id, provider, member_ref) DO UPDATE
    SET role = EXCLUDED.role
 RETURNING *;
 
+-- name: UpsertInvitedAccountMember :one
+-- The operator invite write behind `fishhawkd member invite` (E44.34 / #2924).
+-- Idempotent create-or-update keyed on (account_id, provider, member_ref), the
+-- unnamed UNIQUE constraint on account_members (migration 0055) — inferred here
+-- by its column list.
+--
+-- Distinct from UpsertAccountMember (no origin, pre-0056 shape) and from
+-- UpsertAccountMemberWithOrigin (:exec, no RETURNING, owned by the login gate's
+-- auto_join write): the CLI must PRINT the row it wrote (hence :one + explicit
+-- RETURNING) AND must pin origin to the literal 'invited' rather than accept it
+-- as a parameter — an operator verb that could mint an auto_join grant would
+-- fabricate a forge-derived provenance no forge ever asserted, and the login
+-- gate re-verifies auto_join grants against the live forge, silently revoking
+-- such a row later.
+--
+-- The origin in the DO UPDATE is DELIBERATE: an explicit operator invite
+-- OVERWRITES a prior auto_join grant, upgrading that member to DB-only,
+-- forge-independent admission.
+INSERT INTO account_members (id, account_id, provider, member_ref, role, origin)
+VALUES ($1, $2, $3, $4, $5, 'invited')
+ON CONFLICT (account_id, provider, member_ref) DO UPDATE
+   SET role   = EXCLUDED.role,
+       origin = EXCLUDED.origin
+RETURNING id, account_id, provider, member_ref, role, origin, created_at, updated_at;
+
 -- name: GetAccountMemberRole :one
 -- The handler-authz role lookup (E44.5 / #1829): the caller's role in an
 -- account, keyed on the forge-neutral (account_id, provider, member_ref).
@@ -142,6 +167,21 @@ SELECT role FROM account_members
 SELECT * FROM account_members
  WHERE account_id = $1
  ORDER BY created_at ASC, id ASC;
+
+-- name: ListAccountMembersWithAccountKey :many
+-- The operator inventory read behind `fishhawkd member list` (E44.34 / #2924):
+-- every membership grant JOINed with its owning account's account_key, so the
+-- operator's real question — who is admitted to which account, and via which
+-- origin — is answered in one row. EXPLICIT column list (not m.*) so the joined
+-- account_key is carried and the scan order is pinned; origin is surfaced so an
+-- invited grant (admits DB-only) is distinguishable from a login-minted
+-- auto_join one. No filter — the CLI filters by --provider / --account-key in Go
+-- so one query serves the unfiltered and scoped forms, exactly as
+-- `installation list` does.
+SELECT m.id, m.account_id, m.provider, m.member_ref, m.role, m.origin, m.created_at, a.account_key
+  FROM account_members m
+  JOIN accounts a ON a.id = m.account_id
+ ORDER BY a.provider ASC, a.account_key ASC, m.created_at ASC, m.id ASC;
 
 -- name: ListMemberGrantsByRef :many
 -- The login-gate admission read (E44.3 / ADR-057 Amendment A2): every grant for

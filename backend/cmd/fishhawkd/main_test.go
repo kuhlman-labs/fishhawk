@@ -40,7 +40,7 @@ func TestRun_UnknownSubcommand(t *testing.T) {
 // dispatched to their own usage path (not the top-level `unknown subcommand`
 // error): a bare `account` / `installation` reaches its own usage banner.
 func TestRun_AccountInstallationDispatch(t *testing.T) {
-	for _, cmd := range []string{"account", "installation"} {
+	for _, cmd := range []string{"account", "installation", "member"} {
 		t.Run(cmd, func(t *testing.T) {
 			var out strings.Builder
 			got := run([]string{cmd}, &out)
@@ -62,7 +62,7 @@ func TestRun_AccountInstallationDispatch(t *testing.T) {
 func TestPrintUsage_NamesNewSubcommands(t *testing.T) {
 	var out strings.Builder
 	printUsage(&out)
-	for _, want := range []string{"account create", "account list", "installation register", "installation list"} {
+	for _, want := range []string{"account create", "account list", "installation register", "installation list", "member invite", "member list"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("printUsage output missing %q:\n%s", want, out.String())
 		}
