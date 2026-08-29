@@ -172,8 +172,21 @@ func TestEnv_PassthroughEmptyNameDropped(t *testing.T) {
 // already drops these names from the BASE, so the passthrough branch is the
 // only place a deny rung changes the outcome. An attempt to smuggle a denied
 // name back in must be absent from the env AND reported in refused.
+//
+// SSH_AUTH_SOCK (denyExact) and AWS_BEARER_TOKEN_BEDROCK (denyPrefix) are the
+// two names the README's "Honest residuals" paragraph cites: they are the
+// cases where an operator might reasonably EXPECT the passthrough to be a
+// recovery path, and it is not. Pinning them here keeps that paragraph
+// consistent with the enforced refusal instead of merely asserting it.
 func TestEnv_PassthroughDeniedCollisionRefused(t *testing.T) {
-	for _, name := range []string{"GITHUB_TOKEN", "FISHHAWK_API_TOKEN", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"} {
+	for _, name := range []string{
+		"GITHUB_TOKEN",
+		"FISHHAWK_API_TOKEN",
+		"ANTHROPIC_API_KEY",
+		"AWS_SECRET_ACCESS_KEY",
+		"SSH_AUTH_SOCK",
+		"AWS_BEARER_TOKEN_BEDROCK",
+	} {
 		t.Run(name, func(t *testing.T) {
 			env, refused := Env([]string{PassthroughPrefix + name + "=smuggled"})
 			if got := envMap(t, env); got[name] != "" {

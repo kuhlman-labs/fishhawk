@@ -495,14 +495,40 @@ and reported on a single-line `agent_env_refused` log event — the passthrough
 branch is the one place the denylist is load-bearing rather than
 belt-and-suspenders, since default-deny already drops those names from the base.
 
-**Honest residuals.** `SSH_AUTH_SOCK` is dropped (and denied): it is an
-authority handle to the operator's SSH agent, and the runner — not the agent —
-performs the run-branch push. An agent-driven `go mod download` of a private
-module over an ssh-rewritten URL would fail; this repo has no private module
-dependencies. `AWS_*` / `GOOGLE_*` / `AZURE_*` are denied by prefix, so a
-deployment routing the agent through Bedrock or Vertex would lose its model
-credential. Both are discharged by the passthrough: the operator re-admits
-exactly that one variable explicitly.
+**Honest residuals.** The passthrough is NOT a universal escape hatch, and the
+two residuals below are exactly where it stops. `Denied` consults BOTH
+`denyExact` and `denyPrefix`, and the passthrough branch applies it to the
+STRIPPED name, so `FISHHAWK_AGENT_ENV_SSH_AUTH_SOCK` and
+`FISHHAWK_AGENT_ENV_AWS_BEARER_TOKEN_BEDROCK` are refused and logged, not
+honored (`TestEnv_PassthroughDeniedCollisionRefused` names both). Re-admitting
+a denied variable takes a code change to the deny rules — deliberately, since
+the refusal is the one place the denylist is load-bearing.
+
+- `SSH_AUTH_SOCK` is dropped (and denied): it is an authority handle to the
+  operator's SSH agent, and the runner — not the agent — performs the
+  run-branch push. An agent-driven `go mod download` of a private module over
+  an ssh-rewritten URL would fail; this repo has no private module
+  dependencies, and the passthrough will NOT restore it.
+- `AWS_*` / `GOOGLE_*` / `AZURE_*` are denied by prefix, so a deployment
+  routing the agent through Bedrock or Vertex loses its cloud model credential
+  and cannot re-admit it through the passthrough either. Bedrock/Vertex
+  routing is therefore unsupported under this policy until those deny rules
+  are narrowed in code. The first-party route is unaffected: `apiKeyForAgent`
+  reads the runner's ambient `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` and the
+  adapter appends it as an overlay, which is why denying the raw keys from the
+  base withholds nothing.
+
+**A second model-vendor credential DOES reach the agent.** The
+`ANTHROPIC_`/`OPENAI_`/`CLAUDE_` allow rungs re-admit those whole
+configuration families, while `denyExact` names only the two raw keys
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` — so any OTHER credential-bearing
+name in those families exported ambiently on the runner (`ANTHROPIC_AUTH_TOKEN`,
+`OPENAI_ADMIN_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) WILL be inherited by the
+implement agent. That is a deliberate, documented residual, not an oversight:
+the families carry the gateway base URLs and alternate auth tokens the agent
+needs, exactly as `acceptenv` re-admits the model keys. An operator who does
+not want a particular one reaching the agent must not export it into the
+runner's environment.
 
 Pinned by `runner/internal/agentenv/agentenv_test.go` (one behavioral case per
 named branch), `TestAgentEnvNotNarrowerThanGateEnv` (the gate-env lockstep),
