@@ -9029,6 +9029,103 @@ func TestRunImplementReviews_TruncatedDiff_EmitsAuditAndFlagsPrompt(t *testing.T
 	}
 }
 
+// TestRunImplementReviews_TruncatedDiff_PromptCapAuditComplete drives
+// runImplementReviews with >200 omitted files and asserts condition 3's split at
+// the WIRING level: the PROMPT lists exactly reviewDiffPromptOmittedCap (200)
+// paths plus a "+50 more" residual line, while the AUDIT payload carries the
+// COMPLETE 250-file list with omitted_files_residual=50. This is the one place
+// the prompt-bounded/audit-complete split is actually decided (trace.go's
+// promptList cap branch). COUNTERFACTUAL: remove that cap branch → the prompt
+// renders all 250 with no "+50 more" and residual=0, and this goes RED.
+func TestRunImplementReviews_TruncatedDiff_PromptCapAuditComplete(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	files := make([]policy.ChangedFile, 0, 250)
+	for i := 0; i < 250; i++ {
+		files = append(files, policy.ChangedFile{Path: fmt.Sprintf("f%03d.go", i), Status: policy.StatusModified})
+	}
+	// Empty patch → every changed file has no surviving header → all 250 omitted.
+	diff := policy.Diff{PatchTruncated: true, Patch: "", ChangedFiles: files}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	// Audit surface: COMPLETE list + residual.
+	p, ok := reviewDiffTruncatedAuditPayload(t, au)
+	if !ok {
+		t.Fatal("no implement_review_diff_truncated audit entry appended")
+	}
+	if len(p.OmittedFiles) != 250 {
+		t.Errorf("audit omitted_files len = %d, want the complete 250", len(p.OmittedFiles))
+	}
+	if p.OmittedFilesResidual != 50 {
+		t.Errorf("audit omitted_files_residual = %d, want 50", p.OmittedFilesResidual)
+	}
+	if !containsString(p.OmittedFiles, "f249.go (no hunks shown)") {
+		t.Errorf("audit omitted_files must carry the last (past-cap) file; got %d entries", len(p.OmittedFiles))
+	}
+
+	// Prompt surface: BOUNDED to 200 + a "+50 more" residual line.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	if n := strings.Count(got, " (no hunks shown)\n"); n != reviewDiffPromptOmittedCap {
+		t.Errorf("prompt listed %d omitted files, want the cap of %d", n, reviewDiffPromptOmittedCap)
+	}
+	if !strings.Contains(got, "- +50 more (list capped for the prompt") {
+		t.Errorf("prompt missing the '+50 more' residual line:\n%s", got)
+	}
+	if !strings.Contains(got, "f199.go (no hunks shown)") {
+		t.Errorf("prompt must list the 200th omitted file (f199.go):\n%s", got)
+	}
+	if strings.Contains(got, "f200.go (no hunks shown)") || strings.Contains(got, "f249.go (no hunks shown)") {
+		t.Errorf("prompt must NOT list past-cap omitted files (f200.go/f249.go):\n%s", got)
+	}
+}
+
+// TestRunImplementReviews_TruncatedDiff_SurfacesOnGateView drives a runner-
+// truncated diff through runImplementReviews and then reads the SAME server's
+// gate view — no hand-seeded payload — closing the emit -> reviewDiffTruncatedForRun
+// seam end to end (condition 1's gate-view leg). COUNTERFACTUAL: delete the
+// emitReviewDiffTruncated call in runImplementReviews → the gate view's
+// review_diff_truncated block is nil and this goes RED.
+func TestRunImplementReviews_TruncatedDiff_SurfacesOnGateView(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	patch := gitHeader("backend/internal/foo/foo.go") + "@@ -1 +1 @@\n-x\n+y" // last header cut
+	diff := policy.Diff{
+		PatchTruncated: true,
+		Patch:          patch,
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: "backend/internal/foo/missing.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	gv := s.buildGateView(t.Context(), runRow.ID, "implement", nil)
+	rdt := gv.ReviewDiffTruncated
+	if rdt == nil {
+		t.Fatal("gate view review_diff_truncated = nil; the emit -> read seam is broken")
+	}
+	if rdt.Reason != "runner_patch_cap" {
+		t.Errorf("gate view reason = %q, want runner_patch_cap", rdt.Reason)
+	}
+	if !containsString(rdt.OmittedFiles, "backend/internal/foo/missing.go (no hunks shown)") {
+		t.Errorf("gate view omitted_files missing the absent file; got %v", rdt.OmittedFiles)
+	}
+}
+
 // TestRunImplementReviews_NotTruncated_EmitsNoAudit is the byte-identical
 // control: no truncation → no audit entry, no prompt notice.
 func TestRunImplementReviews_NotTruncated_EmitsNoAudit(t *testing.T) {

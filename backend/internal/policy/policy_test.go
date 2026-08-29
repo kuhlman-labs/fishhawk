@@ -933,8 +933,11 @@ func TestDiff_PatchTruncationReason_Additive(t *testing.T) {
 	withReason := Evaluate(d, c)
 	d.PatchTruncationReason = ""
 	withoutReason := Evaluate(d, c)
-	if len(withReason) != len(withoutReason) {
-		t.Errorf("Evaluate differs with/without reason: %d vs %d violations", len(withReason), len(withoutReason))
+	// DeepEqual, not a length compare: a bare len() would pass even if the
+	// reason leaked into the violation set (different identities, same count),
+	// so it does not actually prove the evaluator ignores the field.
+	if !reflect.DeepEqual(withReason, withoutReason) {
+		t.Errorf("Evaluate differs with/without reason:\n with:    %+v\n without: %+v", withReason, withoutReason)
 	}
 }
 
