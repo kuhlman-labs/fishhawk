@@ -51,7 +51,8 @@ second account, and it never writes `home_region` — the regional pin
 | Configuration | Behavior |
 |---|---|
 | Any `SINGLE_TENANT_*` field set with an empty account key | startup error naming `--single-tenant-account-key` |
-| Granularity outside `enterprise` / `organization` / `group` | startup error naming `--single-tenant-granularity` and the accepted set (rather than a raw SQLSTATE 23514 from `accounts_granularity_check`) |
+| Granularity outside `enterprise` / `organization` / `group` / `user` | startup error naming `--single-tenant-granularity` and the accepted set (rather than a raw SQLSTATE 23514 from `accounts_granularity_check`) |
+| `user`-granularity account key whose casing differs from the authenticated login | **sign-in denied** at the login gate — the `login == account_key` comparison is byte-exact, with NO case normalization. Set the account key to the login EXACTLY, including case (see the personal-namespace section below) |
 | Provider outside `github` / `gitlab` | startup error naming `--single-tenant-provider` |
 | Empty auto-join role (direct construction only; the flag path defaults to `member`) | startup error — `ListAutoJoinAccountsByKeys` selects only accounts whose `auto_join_role IS NOT NULL`, so a NULL role is invisible to the login gate and the account would admit nobody |
 | Account key set, `FISHHAWKD_DATABASE_URL` unset | startup error — a configured profile with no database is never a silent skip |
@@ -62,13 +63,18 @@ second account, and it never writes `home_region` — the regional pin
 | Env var | Flag | Empty means |
 |---|---|---|
 | `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | `--single-tenant-account-key` | hosted multi-tenant (no bootstrap) |
-| `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `--single-tenant-granularity` | `enterprise`, once the key is set |
+| `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `--single-tenant-granularity` | `enterprise`, once the key is set. Accepted: `enterprise` / `organization` / `group` / `user` |
 | `FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE` | `--single-tenant-auto-join-role` | `member`, once the key is set |
 | `FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME` | `--single-tenant-display-name` | NULL |
 | `FISHHAWKD_SINGLE_TENANT_PROVIDER` | `--single-tenant-provider` | `github`, once the key is set |
 
-The account key is the forge-neutral natural key: a GitHub enterprise slug, a
-GitHub org login, or a GitLab group full path — matching the granularity.
+The account key is the forge-neutral natural key, matching the granularity: a
+GitHub enterprise slug (`enterprise`), a GitHub org login (`organization`), a
+GitLab group full path (`group`), or — for the `user` tier — the **owner's
+forge login** itself. For `user` granularity the key must equal the
+authenticated login EXACTLY, including case: the login-gate comparison is
+byte-exact and performs no normalization, so a casing mismatch denies the very
+first sign-in of a fresh install (see [Personal-namespace install](#personal-namespace-install)).
 
 ## GHES / EMU endpoints
 
@@ -171,6 +177,41 @@ enterprise/org/group then mints an `origin='auto_join'` `account_members` row.
 Auto-join grants are re-verified against their predicate at every subsequent
 login: a user who leaves the org stops being admitted, and the row is kept for
 audit rather than deleted.
+
+## Personal-namespace install
+
+A self-host whose owner has **no** enterprise, organization, or group to
+auto-join through — a single-developer or personal-account deployment — sets the
+`user` granularity instead (E44.35 / #2925):
+
+```sh
+helm upgrade --install fishhawk deploy/helm/fishhawk \
+  -f deploy/helm/fishhawk/values-single-tenant.yaml \
+  --set ingress.host=fishhawk.example \
+  --set singleTenant.granularity=user \
+  --set singleTenant.accountKey=octocat   # your forge login, EXACT case
+```
+
+The `user` tier's membership predicate is `authenticated login == account_key`.
+Unlike the enterprise/EMU caveat in step 4 of the admission walk above — where
+the enterprise short code must be *derivable* from an EMU login and a
+github.com-style posture cannot supply one — the `user` tier needs **no live
+forge membership read at all**: the login is already authenticated by the OAuth
+handshake, so the owner is admitted even when the forge's org/group listing API
+is unreachable, rate-limited, or (for a bare personal account) simply empty.
+
+Two consequences to plan for:
+
+- **The account key must match the login EXACTLY, including case.** The
+  comparison is byte-exact with no normalization. GitHub returns the canonically
+  cased login from its profile API, so set `singleTenant.accountKey` to that
+  exact string. A casing mismatch denies the owner on the very first sign-in of
+  a fresh install, with `no admitting account` and nothing else to point at —
+  this is the first-boot foot-gun to check before anything else.
+- **Admission does not depend on the forge, but a healthy forge is still read**
+  for a login that *also* belongs to auto-join orgs/groups: the user-tier
+  admission and the forge-derived admissions are unioned, so configuring `user`
+  granularity never *narrows* what the owner can reach.
 
 ## Bootstrapping without the auto-join profile
 

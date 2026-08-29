@@ -717,6 +717,300 @@ func TestMembership_MultiAccount_DeterministicOrder(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------
+// E44.35 (#2925): the forge-INDEPENDENT user-granularity tier.
+//
+// The load-bearing property is that a user-granularity account's
+// ADMISSION DOES NOT DEPEND ON the forge listing call — NOT that the
+// process never dials the forge (it still does whenever a healthy lister
+// is registered, because the OTHER granularities need it, condition 1).
+// So M1 (healthy lister) asserts admission + the minted row and does NOT
+// assert a zero call-count; the no-call evidence lives in M2 (provider
+// absent from the lister map ⇒ no call possible, fake call-count == 0)
+// and M3 (lister errors ⇒ its result cannot have been used).
+// ---------------------------------------------------------------------
+
+// M1 [real pgtest]: a user-granularity account keyed 'octocat' with an
+// auto_join_role admits login 'octocat' through a HEALTHY lister and
+// mints exactly one origin='auto_join' row. The lister is called (its
+// result feeds the org/group granularities); admission does not turn on
+// that call, which is what M2/M3 prove.
+func TestMembership_UserGranularityAutoJoin_Admits(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
+	lister.keys = []string{"some-org"} // a healthy forge; irrelevant to the user tier
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s]", got, accountID)
+	}
+	var origin, memberRef string
+	var gotRole *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT origin, member_ref, role FROM account_members WHERE account_id = $1`,
+		accountID).Scan(&origin, &memberRef, &gotRole); err != nil {
+		t.Fatalf("read minted grant: %v", err)
+	}
+	if origin != auth.MemberOriginAutoJoin {
+		t.Errorf("origin = %q, want auto_join", origin)
+	}
+	if memberRef != "octocat" {
+		t.Errorf("member_ref = %q, want octocat", memberRef)
+	}
+	if gotRole == nil || *gotRole != "member" {
+		t.Errorf("role = %v, want policy role 'member'", gotRole)
+	}
+	assertMemberRowCount(t, pool, accountID, 1)
+}
+
+// M2 [real pgtest]: the SAME admission with the provider ABSENT from the
+// lister map — no forge call is possible, and the user-granularity
+// account still admits. The fake lister (registered under a DIFFERENT
+// provider) records ZERO calls, the executable no-call evidence for
+// `user-granularity-admission-does-not-depend-on-the-listing-call`.
+func TestMembership_UserGranularity_UnregisteredLister_StillAdmits(t *testing.T) {
+	pool := newMembershipPool(t)
+	// A fake lister registered under 'gitlab' only; resolving 'github'
+	// finds no lister, so no forge call is even reachable for github.
+	lister := &fakeOrgLister{keys: []string{"some-org"}}
+	r := auth.NewMembershipResolver(
+		auth.NewAccountMembershipStore(accountdb.New(pool)),
+		map[string]auth.ForgeMembershipLister{"gitlab": lister})
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s] (a user-granularity account admits with no forge configured)", got, accountID)
+	}
+	if lister.calls != 0 {
+		t.Errorf("forge lister called %d times admitting a user-granularity account with the provider unregistered, want 0", lister.calls)
+	}
+	assertMemberRowCount(t, pool, accountID, 1)
+}
+
+// M3 [real pgtest]: the SAME admission with the lister returning an
+// ERROR. The forge failure cannot deny a predicate that never needed the
+// forge — the moved fail-closed edge (condition 1). Its result cannot
+// have been used, so admission proves independence.
+func TestMembership_UserGranularity_ListerError_StillAdmits(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
+	lister.err = errors.New("github is down")
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v — a forge error must not deny a user-granularity account", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s]", got, accountID)
+	}
+	assertMemberRowCount(t, pool, accountID, 1)
+}
+
+// M4 [real pgtest]: the regression pin for the edge that must NOT be
+// loosened. A forge error with NO user-granularity account (and no
+// invited grant) still fails CLOSED — an organization account whose
+// admission genuinely needed the forge is denied when the forge errors.
+func TestMembership_ForgeError_NoUserGranularityAccount_FailsClosed(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	seedGitHubAccount(t, pool, "acme-corp", "organization", &role)
+	lister.err = errors.New("github is down")
+
+	got, err := resolve(t, r, "github")
+	if err == nil {
+		t.Fatalf("ResolveAccounts = %v, want fail-closed error (no user-granularity account admits)", got)
+	}
+}
+
+// M5 [real pgtest]: a user account keyed 'someone-else' DENIES login
+// 'octocat' — the byte-exact `login == account_key` predicate. (Case
+// sensitivity is deliberately not normalized: an operator whose account
+// key casing differs from the canonical login is denied here too;
+// docs/deploy/self-hosted.md states the key must match EXACTLY.)
+func TestMembership_UserGranularity_LoginMismatch_Denies(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	seedGitHubAccount(t, pool, "someone-else", "user", &role)
+	lister.keys = nil
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny (user account keyed 'someone-else' must not admit octocat)", got)
+	}
+}
+
+// M6 [real pgtest]: the (key, granularity) pairing must not cross
+// granularities, BOTH directions.
+func TestMembership_UserGranularityPairing_NoCrossGranularityAdmission(t *testing.T) {
+	// (a) An ORGANIZATION account keyed 'octocat' is NOT admitted by the
+	// login-derived user pair {octocat, user}: the org account needs a
+	// live org membership, which the user tier never supplies.
+	t.Run("user pair does not admit an organization account of the login name", func(t *testing.T) {
+		pool, lister, r := newMembershipFixture(t)
+		role := "member"
+		seedGitHubAccount(t, pool, "octocat", "organization", &role)
+		lister.keys = nil // NOT an org member of 'octocat'
+
+		got, err := resolve(t, r, "github")
+		if err != nil {
+			t.Fatalf("ResolveAccounts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("admitted = %v, want deny (the user pair must not admit an organization account)", got)
+		}
+	})
+	// (b) A USER account keyed 'acme-corp' is NOT admitted by the org key
+	// 'acme-corp' the lister returns: the user tier binds to the login,
+	// not to an org membership of the same name.
+	t.Run("org key does not admit a user account of the same key", func(t *testing.T) {
+		pool, lister, r := newMembershipFixture(t)
+		role := "member"
+		seedGitHubAccount(t, pool, "acme-corp", "user", &role)
+		lister.keys = []string{"acme-corp"} // an org membership of the same name
+
+		got, err := resolve(t, r, "github")
+		if err != nil {
+			t.Fatalf("ResolveAccounts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("admitted = %v, want deny (an org key must not admit a user account of the same key)", got)
+		}
+	})
+}
+
+// M7 [real pgtest]: re-verification stays login-bound. An existing
+// origin='auto_join' grant on a user account whose account_key no longer
+// equals the login stops admitting, and the row survives for audit.
+func TestMembership_UserGranularityReverify_KeyChanged_Denies(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	// The account was re-keyed to 'someone-else' after the grant was minted.
+	accountID := seedGitHubAccount(t, pool, "someone-else", "user", &role)
+	seedMember(t, pool, accountID, "octocat", auth.MemberOriginAutoJoin)
+	lister.keys = nil
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny (user account_key no longer equals the login)", got)
+	}
+	assertMemberRowCount(t, pool, accountID, 1) // kept for audit
+}
+
+// M8 [fake store]: a mint failure on the user path fails CLOSED. The fake
+// store's upsertErr is the only way to force the write to fail on demand;
+// the minted row IS the audit record, so a failed write must abort the
+// admission. (M9 covers the no-duplicate-row property, which is only
+// observable against the REAL store.)
+func TestMembership_UserGranularity_MintGrantError_FailsClosed(t *testing.T) {
+	lister := &fakeOrgLister{keys: []string{"some-org"}}
+	role := "member"
+	accountID := uuid.New()
+	store := &fakeMembershipStore{
+		policies: []auth.AutoJoinAccount{{
+			AccountID: accountID, AccountKey: "octocat",
+			Granularity: "user", AutoJoinRole: role,
+		}},
+		upsertErr: errors.New("write failed"),
+	}
+	r := auth.NewMembershipResolver(store,
+		map[string]auth.ForgeMembershipLister{"github": lister})
+
+	got, err := resolve(t, r, "github")
+	if err == nil {
+		t.Fatalf("ResolveAccounts = %v, want fail-closed error on user-path mint failure", got)
+	}
+}
+
+// M9 [real pgtest]: idempotence. A second resolve for an already-granted
+// user account admits WITHOUT minting a duplicate row. Read against the
+// REAL store — a duplicate mint is committed state, invisible to the fake
+// (condition 3). The account_id/provider/member_ref upsert conflict makes
+// this an end-to-end idempotence guarantee.
+func TestMembership_UserGranularity_SecondResolve_NoDuplicateRow(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "octocat", "user", &role)
+	lister.keys = nil
+
+	for i := 1; i <= 2; i++ {
+		got, err := resolve(t, r, "github")
+		if err != nil {
+			t.Fatalf("ResolveAccounts (resolve #%d): %v", i, err)
+		}
+		if len(got) != 1 || got[0] != accountID {
+			t.Fatalf("resolve #%d admitted = %v, want [%s]", i, got, accountID)
+		}
+	}
+	assertMemberRowCount(t, pool, accountID, 1) // no duplicate minted row
+}
+
+// CROSS-BOUNDARY (condition 2), user tier: single-tenant CONFIG →
+// bootstrap CREATE → resolver ADMISSION. The bootstrap writes the one
+// implicit account at granularity=user, and the REAL resolver then
+// admits its owner login with NO forge membership read — the exact
+// personal-namespace path #2925 stands up. Seeding a row by hand would
+// pass even if the bootstrap wrote a granularity/account_key the
+// resolver's pair binding does not match; driving the real bootstrap
+// catches that wiring failure.
+func TestMembershipResolver_AdmitsViaSingleTenantBootstrap_UserGranularity(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	accountID, bootstrapped, err := account.EnsureSingleTenantAccount(context.Background(),
+		accountdb.New(pool), account.SingleTenantConfig{
+			AccountKey:   "octocat",
+			Granularity:  "user",
+			AutoJoinRole: "member",
+		}, logger)
+	if err != nil {
+		t.Fatalf("EnsureSingleTenantAccount: %v", err)
+	}
+	if !bootstrapped {
+		t.Fatal("bootstrapped = false, want true")
+	}
+
+	// The forge is UNREACHABLE — the personal-namespace admission must
+	// not need it.
+	lister.err = errors.New("forge unreachable")
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want the bootstrapped user account [%s]", got, accountID)
+	}
+	var origin string
+	var mrole *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT origin, role FROM account_members WHERE account_id = $1`, accountID,
+	).Scan(&origin, &mrole); err != nil {
+		t.Fatalf("read minted grant: %v", err)
+	}
+	if origin != auth.MemberOriginAutoJoin {
+		t.Errorf("origin = %q, want auto_join", origin)
+	}
+	if mrole == nil || *mrole != "member" {
+		t.Errorf("role = %v, want the profile's auto-join role 'member'", mrole)
+	}
+}
+
 func assertMemberRowCount(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, want int) {
 	t.Helper()
 	var n int

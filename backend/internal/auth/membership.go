@@ -25,14 +25,17 @@ import (
 //     subsequent login; a row whose predicate no longer holds stops
 //     admitting but is kept for audit.
 //
-// The live forge read is reached ONLY on the auto_join path — when no
-// invited grant admits. It is intersected with accounts whose
+// The live forge read is reached ONLY on the forge-DERIVED auto_join
+// path — after the invited check AND the forge-INDEPENDENT user-pair
+// eval (E44.35, below). It is intersected with accounts whose
 // auto_join_role policy is set; a match with no existing grant mints an
 // origin='auto_join' row and admits. A forge error there fails the
-// auto_join eval CLOSED (and, with no invited grant, the whole sign-in).
-// A provider with NO registered lister denies the AUTO_JOIN path only —
-// the lister lookup happens AFTER the invited check, so an invited grant
-// still admits for a provider whose forge is unconfigured.
+// forge-derived eval CLOSED — and, when neither an invited grant NOR a
+// user-granularity account admits, the whole sign-in. A provider with
+// NO registered lister denies the FORGE-DERIVED path only — the lister
+// lookup happens AFTER the invited check and the user-pair eval, so an
+// invited grant OR a user-granularity account still admits for a
+// provider whose forge is unconfigured.
 //
 // E44.8 (#1832) generalizes the auto_join sources from one to three,
 // all behind this same seam:
@@ -45,12 +48,31 @@ import (
 //     flow exists yet, so provider="gitlab" is not reachable in
 //     production until that flow lands (operator-filed follow-up).
 //
+// E44.35 (#2925) adds a FOURTH auto_join source, forge-INDEPENDENT:
+//
+//   - user (any provider) — the single pair {profile.Login, "user"},
+//     derived from the already-authenticated login itself. Its predicate
+//     is `authenticated login == account_key`, which needs NO live-forge
+//     read, exactly as an invited grant needs none (Amendment A2). It is
+//     evaluated BEFORE the lister lookup, so a personal-namespace install
+//     admits its owner even when the forge lister is unregistered (no
+//     provider entry) or its read errors. The forge call STILL happens
+//     whenever a healthy lister is registered — its result is needed for
+//     the org/group/EMU-enterprise granularities — and the two admitted
+//     sets are UNIONED. Two fail-closed edges therefore MOVED: an
+//     unregistered lister and a forge-read error now deny only when NO
+//     user-granularity account admits; with none, the forge error still
+//     fails the whole sign-in closed exactly as before.
+//
 // Every derived membership key stays BOUND to the granularity it was
 // derived from — the admission set is a list of (key, granularity)
 // PAIRS, never a cartesian product of a key set and a granularity set.
 // An org key "acme" must not admit an enterprise account keyed "acme",
-// and a derived enterprise short code must not admit an organization
-// account of the same key.
+// a derived enterprise short code must not admit an organization
+// account of the same key, and the user pair {login, "user"} must not
+// admit an organization account keyed by that same login. Invited-first
+// ordering, the (key, granularity) pair binding, and the
+// mint-failure-denies rule are unchanged.
 
 // Member-grant origins (account_members.origin, migration 0056).
 const (
@@ -75,6 +97,12 @@ const (
 	granularityEnterprise = "enterprise"
 	// granularityGroup: GitLab group membership (full_path).
 	granularityGroup = "group"
+	// granularityUser: the personal-namespace tier (E44.35 / #2925). Its
+	// membership predicate is `authenticated login == account_key` and
+	// needs NO forge read — the login is already authenticated by the
+	// OAuth handshake, so no live membership listing is consulted to
+	// admit it. Any provider.
+	granularityUser = "user"
 )
 
 // MembershipKey is one derived membership fact: a forge key BOUND to
@@ -205,25 +233,83 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider,
 		return sortedAccountIDs(invited), nil
 	}
 
-	// No invited grant: the auto_join path, the ONLY live-forge read —
-	// and the ONLY path that needs a registered lister. The lookup is
-	// deliberately AFTER the invited check: an invited grant is a
-	// DB-only, forge-INDEPENDENT admission, so an unregistered provider
-	// must not deny it. A provider with no lister can only mean "no
-	// auto_join can be evaluated", which denies on its own.
+	// haveGrant is the set of accounts the user already has ANY grant
+	// for. It is built ONCE here and MUTATED as evalAutoJoin mints, so
+	// the forge-derived call below can never re-mint an account the
+	// forge-INDEPENDENT call already admitted.
+	haveGrant := make(map[uuid.UUID]bool, len(grants))
+	for _, g := range grants {
+		haveGrant[g.AccountID] = true
+	}
+
+	// (1) The forge-INDEPENDENT auto_join eval, over the single user
+	// pair {login, "user"}. Placed BEFORE the lister lookup for the same
+	// reason the invited check is: its predicate (`login == account_key`)
+	// derives no authority from the forge, so an unregistered or erroring
+	// forge must not deny it. A STORE error still fails closed.
+	admitted, err := r.evalAutoJoin(ctx, provider, profile.Login, grants, haveGrant, selfPairs(profile.Login))
+	if err != nil {
+		return nil, err
+	}
+
+	// (2) The forge-derived auto_join path — the ONLY live-forge read,
+	// and the ONLY path that needs a registered lister. Its lookup is
+	// deliberately AFTER the user eval: a user-granularity admission is
+	// forge-INDEPENDENT, so an unregistered provider must not deny it. A
+	// provider with no lister can only mean "no forge-derived auto_join
+	// can be evaluated"; it still admits any user-granularity account.
 	lister := r.listers[provider]
 	if lister == nil {
-		return nil, nil
+		return sortedAccountIDs(admitted), nil
 	}
 
-	// An error here fails the auto_join eval — and, since no invited
-	// grant admits, the whole sign-in — CLOSED.
+	// The forge call HAPPENS whenever a lister is registered and healthy
+	// (condition 1): its result is needed for the org/group/EMU
+	// granularities even when a user-granularity account already admits.
+	// On ERROR it fails the forge-derived eval CLOSED — but only denies
+	// the whole sign-in when NO user-granularity account admits.
 	liveKeys, forgeErr := lister.ListUserOrgKeys(ctx, accessToken)
 	if forgeErr != nil {
-		return nil, fmt.Errorf("auth: forge membership list failed and no invited grant admits: %w", forgeErr)
+		if len(admitted) > 0 {
+			return sortedAccountIDs(admitted), nil
+		}
+		return nil, fmt.Errorf("auth: forge membership list failed and neither an invited grant nor a user-granularity account admits: %w", forgeErr)
 	}
 
-	pairs := r.derivePairs(provider, profile.Login, liveKeys)
+	// derivePairs is UNCHANGED — the user pair is deliberately kept out
+	// of it so the org/group/EMU derivation and its cartesian-product
+	// guard stay exactly as tested.
+	forgeAdmitted, err := r.evalAutoJoin(ctx, provider, profile.Login, grants, haveGrant, r.derivePairs(provider, profile.Login, liveKeys))
+	if err != nil {
+		return nil, err
+	}
+
+	// Union the forge-independent and forge-derived admitted sets.
+	for id := range forgeAdmitted {
+		admitted[id] = true
+	}
+	return sortedAccountIDs(admitted), nil
+}
+
+// selfPairs returns the forge-INDEPENDENT membership pairs derived from
+// the login alone — the single {login, "user"} pair. The empty-login
+// case is already rejected at the top of ResolveAccounts, so this never
+// yields an empty-keyed pair.
+func selfPairs(login string) []MembershipKey {
+	return []MembershipKey{{Key: login, Granularity: granularityUser}}
+}
+
+// evalAutoJoin runs the auto_join admission walk over one set of derived
+// membership pairs: it re-verifies existing origin='auto_join' grants
+// against the pairs, then bootstrap-mints an audited grant for any
+// matching policy account with no existing grant. It is called twice by
+// ResolveAccounts — once with the forge-INDEPENDENT user pair, once with
+// the forge-derived pairs — with a SHARED haveGrant map (built once by
+// the caller and mutated here as grants are minted) so a second call
+// never re-mints an account the first already admitted. Every predicate,
+// the ListAutoJoinAccounts call, and the mint-failure-is-fail-closed
+// branch are byte-for-byte the pre-#2925 behavior.
+func (r *forgeMembershipResolver) evalAutoJoin(ctx context.Context, provider, login string, grants []MemberGrant, haveGrant map[uuid.UUID]bool, pairs []MembershipKey) (map[uuid.UUID]bool, error) {
 	pairSet := make(map[MembershipKey]bool, len(pairs))
 	for _, p := range pairs {
 		pairSet[p] = true
@@ -236,9 +322,7 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider,
 	// granularity) PAIR must still be one the user's memberships derive
 	// — never a cross-granularity key match. A failed predicate stops
 	// admitting; the row is kept for audit (suspended, not deleted).
-	haveGrant := make(map[uuid.UUID]bool, len(grants))
 	for _, g := range grants {
-		haveGrant[g.AccountID] = true
 		if g.Origin == MemberOriginAutoJoin &&
 			g.AutoJoinRole != nil &&
 			pairSet[MembershipKey{Key: g.AccountKey, Granularity: g.Granularity}] {
@@ -257,16 +341,17 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider,
 			if haveGrant[p.AccountID] {
 				continue
 			}
-			if err := r.store.UpsertAutoJoinGrant(ctx, r.newID(), p.AccountID, provider, profile.Login, p.AutoJoinRole); err != nil {
+			if err := r.store.UpsertAutoJoinGrant(ctx, r.newID(), p.AccountID, provider, login, p.AutoJoinRole); err != nil {
 				// The minted row IS the audit record of the admission;
 				// if it can't be written the admission doesn't happen.
 				return nil, fmt.Errorf("auth: mint auto-join grant: %w", err)
 			}
+			haveGrant[p.AccountID] = true
 			admitted[p.AccountID] = true
 		}
 	}
 
-	return sortedAccountIDs(admitted), nil
+	return admitted, nil
 }
 
 // derivePairs turns a provider's live membership listing (plus, for

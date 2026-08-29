@@ -74,6 +74,9 @@ func TestCreateAccountRequestValidate(t *testing.T) {
 		{"empty account key", CreateAccountRequest{Provider: "github", Granularity: "organization"}, "account key must be non-empty"},
 		{"unknown provider", CreateAccountRequest{Provider: "bitbucket", AccountKey: "acme", Granularity: "organization"}, `"bitbucket"`},
 		{"granularity org", CreateAccountRequest{Provider: "gitlab", AccountKey: "acme", Granularity: "org"}, `"org"`},
+		// The rejection must enumerate 'user' so an operator sees the new tier
+		// (E44.35 / #2925) as an accepted value.
+		{"rejection enumerates user tier", CreateAccountRequest{Provider: "gitlab", AccountKey: "acme", Granularity: "org"}, "user"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,6 +91,17 @@ func TestCreateAccountRequestValidate(t *testing.T) {
 				t.Errorf("error %q does not name %q", err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestCreateAccountRequestValidate_AcceptsUserGranularity pins that the
+// personal-namespace tier (E44.35 / #2925) validates clean — the positive
+// twin of the enumeration case above. A registry surface that dropped 'user'
+// from accountGranularities would reject this.
+func TestCreateAccountRequestValidate_AcceptsUserGranularity(t *testing.T) {
+	req := CreateAccountRequest{Provider: "github", AccountKey: "octocat", Granularity: "user"}
+	if err := req.resolveDefaults().Validate(); err != nil {
+		t.Errorf("Validate() on a user-granularity request = %v, want nil", err)
 	}
 }
 
