@@ -192,17 +192,22 @@ workflows:
           # may not rewrite. Both forges' CI entry points (the GitHub
           # Actions workflow directory, and the GitLab pipeline file plus
           # its conventional local-include fragment directory) are what
-          # EXECUTE the agent; the Fishhawk spec directory is what
-          # GOVERNS it; the legal files are neither but are likewise not
-          # the agent's to edit. Residual, stated rather than implied: a
-          # GitLab `include:` may name ANY path in the repository, so an
-          # operator whose pipeline delegates to a fragment outside
-          # `.gitlab/ci/` must extend this list. This is a starting
-          # policy, not a finished one.
+          # EXECUTE the agent, and the GitLab agent-for-Kubernetes config
+          # (.gitlab/agents/<name>/config.yaml) is part of that same
+          # execution surface: its `ci_access` block grants the stage's
+          # OWN pipeline jobs cluster access — a capability grant on the
+          # agent's execution environment, not a second CI entry point.
+          # The Fishhawk spec directory is what GOVERNS it; the legal
+          # files are neither but are likewise not the agent's to edit.
+          # Residual, stated rather than implied: a GitLab `include:` may
+          # name ANY path in the repository, so an operator whose pipeline
+          # delegates to a fragment outside `.gitlab/ci/` must extend this
+          # list. This is a starting policy, not a finished one.
           forbidden_paths:
             - ".github/workflows/**"
             - ".gitlab-ci.yml"
             - ".gitlab/ci/**"
+            - ".gitlab/agents/**"
             - ".fishhawk/**"
             - "LICENSE"
             - "NOTICE"

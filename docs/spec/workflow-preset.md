@@ -132,49 +132,106 @@ mirror: it keeps `@kuhlman-labs` and `scripts/test verify`.
 
 ### The forge-neutral self-modification guard
 
-The implement stage ships this `forbidden_paths` list (E45.31 / #2921;
-parent epic #1852):
+The implement stage ships this `forbidden_paths` list (E45.31 / #2921 and
+E45.34 / #2962; parent epic #1852):
 
 ```yaml
 forbidden_paths:
   - ".github/workflows/**"
   - ".gitlab-ci.yml"
   - ".gitlab/ci/**"
+  - ".gitlab/agents/**"
   - ".fishhawk/**"
   - "LICENSE"
   - "NOTICE"
 ```
 
-Two of those six guard the agent's own **execution**, and they are
-forge-neutral on purpose. `.github/workflows/**` covers the App-onboarded
-GitHub Actions workflow; `.gitlab-ci.yml` (plus `.gitlab/ci/**`) covers
-the GitLab pipeline the backend triggers. The onboarding templates
-document the two as each other's analogues —
-`backend/internal/onboarding/templates/fishhawk.yml` (installed as
-`.github/workflows/fishhawk.yml`) and
-`backend/internal/onboarding/templates/.gitlab-ci.yml` — so a GitLab
-repo scaffolded from a preset gets the same control surface a GitHub repo
-does at the same declared autonomy tier. Before #2921 it did not: only
-the GitHub entry point was listed, so a GitLab implement stage could
-rewrite the file that executes it.
+#### What the list encodes: three families, each with its own admission test
 
-`.fishhawk/**` is the matching guard one level up: it protects the
-agent's own **governance** (the workflow spec that decides what the
-stage may do) as these two protect its own **execution**. `LICENSE` and
-`NOTICE` are neither, but are likewise not the agent's to edit.
+The list is **decided, not accreted**. Every entry belongs to exactly one
+of three families, and each family carries its OWN admission test — so the
+next candidate is decidable rather than argued case by case. A single test
+("does the path execute the pipeline or grant it a capability?") is
+deliberately NOT used, because it cannot account for `LICENSE` and `NOTICE`
+— a third of the list — which do neither; a principle that fails to explain
+its own contents cannot make the next addition decidable.
 
-**Breadth: `.gitlab/ci/**`, not `.gitlab/**`.** GitLab's `include:`
-documentation uses `.gitlab/ci/*.yml` as the conventional location for
-local pipeline fragments, but `.gitlab/` as a whole also holds
+- **Self-execution** — the path configures WHAT RUNS the stage, *or* grants
+  a capability to the jobs the stage's pipeline runs. `.github/workflows/**`
+  covers the App-onboarded GitHub Actions workflow; `.gitlab-ci.yml` (plus
+  its conventional local-include fragment directory `.gitlab/ci/**`) covers
+  the GitLab pipeline the backend triggers; `.gitlab/agents/**` enters under
+  the capability-granting clause (see the decision below). The onboarding
+  templates document the two pipeline entry points as each other's
+  analogues — `backend/internal/onboarding/templates/fishhawk.yml`
+  (installed as `.github/workflows/fishhawk.yml`) and
+  `backend/internal/onboarding/templates/.gitlab-ci.yml` — so a GitLab repo
+  scaffolded from a preset gets the same control surface a GitHub repo does
+  at the same declared autonomy tier. Before #2921 only the GitHub entry
+  point was listed, so a GitLab implement stage could rewrite the file that
+  executes it.
+- **Self-governance** — the path configures the CONSTRAINTS the stage runs
+  under. `.fishhawk/**` is the workflow spec that decides what the stage may
+  do: the guard one level up from execution.
+- **Legal** — the path carries LICENSING OR ATTRIBUTION the project must not
+  silently alter. `LICENSE` and `NOTICE` execute nothing and govern nothing;
+  they are on the list under their own admission test — not the agent's to
+  edit — rather than as a stretch of the execution test.
+
+#### The decision on `.gitlab/agents/**`: self-execution, capability-granting clause
+
+`.gitlab/agents/**` is admitted, and it belongs to **self-execution under
+the capability-granting clause** — *not* to a new "security-sensitive
+config" family. GitLab's agent for Kubernetes reads its configuration from
+`.gitlab/agents/<agent-name>/config.yaml`
+([docs](https://docs.gitlab.com/ee/user/clusters/agent/)), and the
+`ci_access` block in that file is what authorizes CI/CD jobs to use the
+agent's cluster connection
+([`ci_access` docs](https://docs.gitlab.com/ee/user/clusters/agent/ci_cd_workflow/)).
+Editing it therefore grants the stage's own pipeline jobs a capability —
+cluster reach — they would not otherwise hold. That is a privilege grant on
+the agent's execution environment, which is why it sits in self-execution
+rather than being called a second CI entry point.
+
+The three arguments for including it: (1) it is privilege-granting
+configuration on the agent's own execution environment; (2) the cost is
+near zero, since editing a cluster-agent config is not ordinary feature
+work; (3) an operator who genuinely needs to edit it narrows the list in
+their own `.fishhawk/workflows.yaml`. The argument against — that
+"security-sensitive config" has no natural boundary and would eventually
+swallow deploy keys and protected-branch settings — is answered not by
+declining the entry but by the taxonomy above: the family is bounded by a
+stated admission test (execute-or-grant-a-capability, over a repository
+*file*), not by an open-ended notion of sensitivity.
+
+**Boundary claim — why the list ends where it does.** GitLab deploy keys
+([docs](https://docs.gitlab.com/ee/user/project/deploy_keys/)),
+protected-branch configuration
+([docs](https://docs.gitlab.com/ee/user/project/repository/branches/protected/))
+and CI/CD environment scoping are project **settings** configured through
+the UI/API — they are NOT files tracked in the repository. `forbidden_paths`
+is a path matcher over a repo tree, so it structurally cannot cover them and
+must not pretend to: there is simply nothing for a glob to match. That is
+the line that stops accretion — their absence from this list is a structural
+fact, not an omission — and it is the reason the list ends where it does.
+
+**Breadth: `.gitlab/ci/**` and `.gitlab/agents/**`, not `.gitlab/**`.**
+GitLab's `include:` documentation uses `.gitlab/ci/*.yml` as the
+conventional location for local pipeline fragments, and the agent config
+lives under `.gitlab/agents/`, but `.gitlab/` as a whole also holds
 non-executing configuration — `.gitlab/issue_templates/`,
-`.gitlab/merge_request_templates/` — that an agent has legitimate reason
-to edit and that cannot execute it. Blocking those would make a
-scaffolded repo need an operator to *loosen* the preset for ordinary
+`.gitlab/merge_request_templates/` — that an agent has legitimate reason to
+edit and that neither executes it nor grants it a capability. A description
+template passes the "is a repository file" condition but fails the
+"executes or grants a capability" one: it does neither. Blocking those would
+make a scaffolded repo need an operator to *loosen* the preset for ordinary
 work, and a loosened preset is a blunter control than a precise one, for
 zero security gain. The decision is pinned, not merely commented: both
 template paths are MUST-NOT-BLOCK rows in
-`TestPresetForbiddenPathsBlockBothForgeEntryPoints` on both embed sides,
-so widening to `.gitlab/**` fails that test and has to be re-decided
+`TestPresetForbiddenPathsBlockBothForgeEntryPoints` on both embed sides, so
+this change adding a NARROW second `.gitlab/` prefix (`.gitlab/agents/**`)
+rather than widening to `.gitlab/**` is exactly what those rows keep honest:
+a future widening to `.gitlab/**` fails that test and has to be re-decided
 explicitly rather than drifting in.
 
 **Root anchoring.** `.gitlab-ci.yml` is a bare-filename pattern, and
@@ -191,16 +248,18 @@ row alongside the template paths.
 **Residual, stated rather than papered over.** No glob is complete here.
 A GitLab `include: local:` may reference ANY path in the repository, so a
 pipeline that delegates to a fragment outside `.gitlab/ci/` remains
-writable by the implement stage. The shipped scaffold shape is fully
+writable by the implement stage; the same incompleteness applies to the
+agent config — an operator whose agent configs live outside
+`.gitlab/agents/` must extend the list. The shipped scaffold shape is fully
 covered — `backend/internal/onboarding/templates/.gitlab-ci.yml` uses no
-`include:` at all — so this applies only to an operator who later adds
-one, and such an operator must extend the list. A preset is a starting
-document, not a finished policy.
+`include:` at all, and no agent config is scaffolded — so this applies only
+to an operator who later adds one, and such an operator must extend the
+list. A preset is a starting document, not a finished policy.
 
 Note what this change does *not* touch: presets are copied into
 `.fishhawk/workflows.yaml` at `fishhawk init` / onboarding time, so
 already-scaffolded repositories keep whatever list they were seeded with.
-Only newly scaffolded repos pick up the two additional entries.
+Only newly scaffolded repos pick up the `.gitlab/agents/**` entry.
 
 ### Commented control-surface starters
 
