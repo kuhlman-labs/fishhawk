@@ -219,7 +219,12 @@ var denyExact = map[string]struct{}{
 //
 // GOOGLE_ mirrors gateEnvDenyPrefix (#2504); AWS_ and AZURE_ are the sibling
 // cloud-credential families. A deployment routing the agent through Bedrock or
-// Vertex re-admits its credential through the passthrough.
+// Vertex CANNOT recover its cloud credential through the passthrough: Env
+// applies Denied to the STRIPPED passthrough name, which lands right back on
+// these deny rules, so FISHHAWK_AGENT_ENV_AWS_BEARER_TOKEN_BEDROCK is refused
+// and logged rather than honored (TestEnv_PassthroughDeniedCollisionRefused).
+// Bedrock/Vertex routing is therefore unsupported under this policy until these
+// deny rules are narrowed here in code.
 var denyPrefix = []string{"FISHHAWK_", "GOOGLE_", "AWS_", "AZURE_"}
 
 // Env composes the agent invocation environment from base (the runner's
