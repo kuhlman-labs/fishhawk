@@ -3230,9 +3230,17 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 // (#797) as the second line against a double dispatch, and its gating-reject
 // return is intentionally ignored: the stage is already terminal/restored at
 // push-report time, so there is no in-flight transition to fail (the
-// consolidated-review call-site rationale, trace.go ~2687). gateEvidence is nil
-// (the PR-report path has no bundle in hand), the documented byte-identical omit
-// case in prompt.Build.
+// consolidated-review call-site rationale, trace.go ~2687).
+//
+// Gate evidence (#3042). This path has no bundle in hand at the call site, but
+// the fix-up stage ALREADY uploaded one carrying its committed-tree
+// gate_evidence (the #794 forward gate ships the trace BEFORE the push), so the
+// dispatch LOADS it via resolveStageGateEvidence rather than passing nil. When
+// it cannot be loaded the reviewer is handed a GateEvidence carrying only the
+// named machine reason, so the round always renders a gate-evidence section —
+// populated or explicitly reason-named — and never the silently omitted section
+// that let reviewers re-raise the same unresolvable "no evidence attached"
+// concern against every new head.
 func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID, stage *run.Stage, headSHA, baseSHA string) {
 	if s.cfg.AuditRepo == nil {
 		return
@@ -3348,7 +3356,18 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 		// transition to fail to category-B (the consolidated-review rationale
 		// above). The started/reviewed round and any concerns attach to the
 		// implement stage regardless of authority, re-arming the merge gate.
-		s.runImplementReviews(reviewCtx, runID, stageID, diff, nil, headSHA, nil)
+		//
+		// Gate evidence (#3042): load the fix-up stage's OWN uploaded bundle so
+		// the re-review carries the committed-tree verify tail. On a degrade,
+		// allocate a GateEvidence carrying only the named reason (the
+		// established allocate-if-needed pattern OperatorScopeUndelivered uses)
+		// so the section renders as an EXPLICIT named absence instead of being
+		// omitted.
+		gateEvidence, reason := s.resolveStageGateEvidence(reviewCtx, runID, stageID)
+		if gateEvidence == nil && reason != "" {
+			gateEvidence = &prompt.GateEvidence{VerifyEvidenceUnavailableReason: reason}
+		}
+		s.runImplementReviews(reviewCtx, runID, stageID, diff, nil, headSHA, gateEvidence)
 	}()
 }
 
@@ -6524,6 +6543,17 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 		out.FixupObligationReports = append(out.FixupObligationReports, prompt.GateFixupObligationReport{
 			ID:     r.ID,
 			Status: r.Status,
+		})
+	}
+	// Fix-up counterfactual self-reports (#3042). Rendered under explicitly
+	// AGENT-CLAIM authority — the runner never witnessed the mutation — as
+	// distinct from the runner-OBSERVED verify tail above. The wire shape
+	// carries no agent-authored free text, by design.
+	for _, cf := range ev.FixupCounterfactuals {
+		out.FixupCounterfactuals = append(out.FixupCounterfactuals, prompt.GateFixupCounterfactual{
+			ControlPath: cf.ControlPath,
+			Observed:    cf.Observed,
+			Restored:    cf.Restored,
 		})
 	}
 	return out

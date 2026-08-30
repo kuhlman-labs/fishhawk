@@ -324,6 +324,21 @@ type GateEvidence struct {
 	// silently DISABLES the signal, which is why the pair is pinned from BOTH
 	// modules against one shared literal JSON fixture.
 	FixupReportingObligations []FixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
+	// FixupCounterfactuals carries the agent's VALIDATED counterfactual
+	// self-report for a fix-up pass (#3042): one
+	// {control_path, observed, restored} triple per control the pass added or
+	// tightened and then counterfactually tested, each already fail-closed
+	// validated by the runner (control_path a member of the declared scope.files
+	// set, observed one of red|green|not_run, restored PRESENT in the sidecar,
+	// and a required `record` narrative that is checked on the runner and NOT
+	// transmitted). The implement re-review renders these under explicitly
+	// AGENT-CLAIM authority, distinct from the runner-OBSERVED verify tail.
+	// Absent (the byte-identical default) when there was no fix-up pass, the
+	// agent reported none, or no entry survived validation. The json tag MUST
+	// stay identical to the runner's composer — a one-sided edit silently
+	// DISABLES the signal, which is why the pair is pinned from BOTH modules
+	// against one shared literal JSON fixture.
+	FixupCounterfactuals []FixupCounterfactualEvidence `json:"fixup_counterfactuals,omitempty"`
 	// DiffCoverage carries the workflow-v1.6 `diff_coverage` measurement
 	// (ADR-059 / #1888): the customer coverage command, its exit code, and
 	// how much of the stage's added-line set the report showed as
@@ -376,6 +391,24 @@ type FixupSelfReportDivergenceEvidence struct {
 type FixupReportingObligationEvidence struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+}
+
+// FixupCounterfactualEvidence is one validated counterfactual self-report
+// (#3042): the declared-scope control path the agent counterfactually tested,
+// the outcome literal it CLAIMS it observed (`red` | `green` | `not_run`), and
+// whether it restored the control afterwards.
+//
+// There is deliberately NO free-text field — the agent's `record` narrative is
+// required on the runner and never transmitted, because a fix-up agent running
+// arbitrary repository commands controls every byte of that text and it would
+// otherwise reach the reviewer's prompt without ever appearing in the committed
+// diff. Everything here is an agent CLAIM the runner never witnessed. Mirrors
+// the runner's fixupCounterfactualEvidence — the json tags MUST stay identical
+// to the composer, same lockstep wire contract as the parent payload.
+type FixupCounterfactualEvidence struct {
+	ControlPath string `json:"control_path"`
+	Observed    string `json:"observed"`
+	Restored    bool   `json:"restored"`
 }
 
 // ScopeExemptionEvidence is one validated scope self-exemption (#1153): a

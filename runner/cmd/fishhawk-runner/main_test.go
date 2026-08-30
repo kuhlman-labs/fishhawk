@@ -17399,7 +17399,7 @@ func TestLoadFixupSelfReport_AbsentSidecar(t *testing.T) {
 	t.Cleanup(func() { fixupSelfReportDir = orig })
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
 		t.Errorf("absent sidecar must yield the zero result, got %+v", got)
 	}
 	if logSink.Len() != 0 {
@@ -17414,7 +17414,7 @@ func TestLoadFixupSelfReport_MalformedJSON(t *testing.T) {
 	path := writeFixupReportSidecar(t, cfg, "{not json")
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
 		t.Errorf("malformed sidecar must FAIL CLOSED, got %+v", got)
 	}
 	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_invalid"`) {
@@ -17433,7 +17433,7 @@ func TestLoadFixupSelfReport_StaleID(t *testing.T) {
 		`{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed"}`)
 
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
 		t.Errorf("stale-id sidecar must FAIL CLOSED, got %+v", got)
 	}
 	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_stale"`) {
@@ -17454,7 +17454,7 @@ func TestLoadFixupSelfReport_StatusIgnored(t *testing.T) {
 	} {
 		path := writeFixupReportSidecar(t, cfg, raw)
 		var logSink strings.Builder
-		if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != "" {
+		if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" {
 			t.Errorf("unrecognized status must FAIL CLOSED, got %+v for %s", got, raw)
 		}
 		if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_status_ignored"`) {
@@ -17474,7 +17474,7 @@ func TestLoadFixupSelfReport_Valid(t *testing.T) {
 		path := writeFixupReportSidecar(t, cfg,
 			fmt.Sprintf(`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":%q}`, status))
 		var logSink strings.Builder
-		if got := loadFixupSelfReport(cfg, &logSink); got.verifyStatus != status {
+		if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != status {
 			t.Fatalf("valid sidecar must yield %q, got %+v", status, got)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -17502,7 +17502,7 @@ func TestLoadFixupSelfReport_ObligationsHappyPath(t *testing.T) {
 			`{"id":"ob-2","status":"declined","reason":"sandbox refused the deletion"}]`))
 
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if got.verifyStatus != "passed" {
 		t.Errorf("verifyStatus = %q, want passed (obligations must not disturb the claim)", got.verifyStatus)
 	}
@@ -17536,7 +17536,7 @@ func TestLoadFixupSelfReport_MetWithEmptyRecordDropped(t *testing.T) {
 		writeFixupReportSidecar(t, cfg, obligationsSidecar(
 			`[{"id":"ob-1","status":"met","record":`+record+`}]`))
 		var logSink strings.Builder
-		got := loadFixupSelfReport(cfg, &logSink)
+		got := loadFixupSelfReport(cfg, nil, &logSink)
 		if len(got.obligations) != 0 {
 			t.Errorf("met with record %s survived validation: %+v", record, got.obligations)
 		}
@@ -17554,7 +17554,7 @@ func TestLoadFixupSelfReport_DeclinedWithEmptyReasonDropped(t *testing.T) {
 		writeFixupReportSidecar(t, cfg, obligationsSidecar(
 			`[{"id":"ob-1","status":"declined","reason":`+reason+`}]`))
 		var logSink strings.Builder
-		got := loadFixupSelfReport(cfg, &logSink)
+		got := loadFixupSelfReport(cfg, nil, &logSink)
 		if len(got.obligations) != 0 {
 			t.Errorf("declined with reason %s survived validation: %+v", reason, got.obligations)
 		}
@@ -17576,7 +17576,7 @@ func TestLoadFixupSelfReport_UnknownObligationStatusDropped(t *testing.T) {
 	} {
 		writeFixupReportSidecar(t, cfg, obligationsSidecar(`[`+entry+`]`))
 		var logSink strings.Builder
-		got := loadFixupSelfReport(cfg, &logSink)
+		got := loadFixupSelfReport(cfg, nil, &logSink)
 		if len(got.obligations) != 0 {
 			t.Errorf("entry %s survived validation: %+v", entry, got.obligations)
 		}
@@ -17611,7 +17611,7 @@ func TestLoadFixupSelfReport_InvalidObligationIDDropped(t *testing.T) {
 		writeFixupReportSidecar(t, cfg, obligationsSidecar(
 			`[{"id":`+id+`,"status":"met","record":"orphan"}]`))
 		var logSink strings.Builder
-		got := loadFixupSelfReport(cfg, &logSink)
+		got := loadFixupSelfReport(cfg, nil, &logSink)
 		if len(got.obligations) != 0 {
 			t.Errorf("id %s survived validation: %+v", id, got.obligations)
 		}
@@ -17626,7 +17626,7 @@ func TestLoadFixupSelfReport_InvalidObligationIDDropped(t *testing.T) {
 	// discriminates rather than rejecting everything.
 	writeFixupReportSidecar(t, cfg, obligationsSidecar(`[{"id":"ob-12","status":"met","record":"ok"}]`))
 	var logSink strings.Builder
-	if got := loadFixupSelfReport(cfg, &logSink); len(got.obligations) != 1 {
+	if got := loadFixupSelfReport(cfg, nil, &logSink); len(got.obligations) != 1 {
 		t.Errorf("a well-formed ob-12 must survive, got %+v", got.obligations)
 	}
 }
@@ -17641,7 +17641,7 @@ func TestLoadFixupSelfReport_StaleIdsDropObligations(t *testing.T) {
 		`{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed",`+
 			`"obligations":[{"id":"ob-1","status":"met","record":"a foreign run said so"}]}`)
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if len(got.obligations) != 0 {
 		t.Errorf("a stale sidecar's obligation reports survived: %+v", got.obligations)
 	}
@@ -17660,7 +17660,7 @@ func TestLoadFixupSelfReport_MalformedJSONDropsObligations(t *testing.T) {
 	writeFixupReportSidecar(t, cfg,
 		`{"run_id":"run-cccc","obligations":[{"id":"ob-1","status":"met","record":"x"}] not json`)
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if len(got.obligations) != 0 || got.verifyStatus != "" {
 		t.Errorf("malformed sidecar yielded %+v, want the zero result", got)
 	}
@@ -17678,7 +17678,7 @@ func TestLoadFixupSelfReport_UnknownVerifyStatusStillParsesObligations(t *testin
 		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"skipped",`+
 			`"obligations":[{"id":"ob-1","status":"met","record":"table in Notes"}]}`)
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if got.verifyStatus != "" {
 		t.Errorf("verifyStatus = %q, want \"\" for an unrecognized literal", got.verifyStatus)
 	}
@@ -17696,7 +17696,7 @@ func TestLoadFixupSelfReport_AbsentObligationsArray(t *testing.T) {
 	cfg := fixupReportCfg()
 	writeFixupReportSidecar(t, cfg, `{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"failed"}`)
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if got.verifyStatus != "failed" || len(got.obligations) != 0 {
 		t.Errorf("got %+v, want the claim alone", got)
 	}
@@ -17730,7 +17730,7 @@ func TestLoadFixupSelfReport_ObligationTextNeverLeavesTheRunner(t *testing.T) {
 			`{"id":"ob-2","status":"met","record":`+injected+`}]`))
 
 	var logSink strings.Builder
-	got := loadFixupSelfReport(cfg, &logSink)
+	got := loadFixupSelfReport(cfg, nil, &logSink)
 	if len(got.obligations) != 2 {
 		t.Fatalf("obligations = %+v, want 2 surviving entries (the text is required, just not retained)", got.obligations)
 	}
@@ -18360,7 +18360,7 @@ func TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome(t *testing.T) 
 		cfg := fixupReportCfg()
 		writeFixupReportSidecar(t, cfg,
 			fmt.Sprintf(`{"run_id":%q,"stage_id":%q,"verify_status":%q}`, cfg.runID, cfg.stageID, lit))
-		if got := loadFixupSelfReport(cfg, io.Discard); got.verifyStatus != lit {
+		if got := loadFixupSelfReport(cfg, nil, io.Discard); got.verifyStatus != lit {
 			t.Fatalf("loadFixupSelfReport rejected production verify literal %q (got %+v)", lit, got)
 		}
 	}
@@ -24149,5 +24149,241 @@ func TestRun_ImplementStage_RefusedPassthroughLogged(t *testing.T) {
 		if strings.HasPrefix(kv, "GITHUB_TOKEN=") {
 			t.Errorf("the refused passthrough was honored anyway: %q", kv)
 		}
+	}
+}
+
+// --- #3042 fix-up counterfactual self-report ------------------------------
+
+// cfScope is the declared scope.files set the counterfactual validator checks
+// control_path membership against. Two real repo paths so an out-of-scope case
+// is a freshly invented path definitionally absent from the set (bad state seeded
+// BY CONSTRUCTION, not by calling the control inside the fixture).
+func cfScope() []string {
+	return []string{"runner/cmd/fishhawk-runner/main.go", "backend/internal/prompt/prompt.go"}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// TestValidateFixupCounterfactuals_DropRules is the per-drop-rule table: one
+// case per named fail-closed reason, each asserting BOTH the drop-log reason
+// literal AND that no entry was retained. The last case is the control proving a
+// well-formed entry survives, so a validator that dropped everything would fail
+// too.
+func TestValidateFixupCounterfactuals_DropRules(t *testing.T) {
+	cfg := fixupReportCfg()
+	cases := []struct {
+		name    string
+		in      fixupCounterfactualReport
+		reason  string
+		wantOut bool
+	}{
+		{
+			name: "path_not_in_scope",
+			in: fixupCounterfactualReport{
+				ControlPath: "some/other/never-declared.go", Observed: "red",
+				Restored: boolPtr(true), Record: "deleted the guard, test went red",
+			},
+			reason: "path_not_in_scope",
+		},
+		{
+			name: "unknown_observed",
+			in: fixupCounterfactualReport{
+				ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "RED",
+				Restored: boolPtr(true), Record: "deleted the guard, test went red",
+			},
+			reason: "unknown_observed",
+		},
+		{
+			name: "missing_restored",
+			in: fixupCounterfactualReport{
+				ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+				Restored: nil, Record: "deleted the guard, test went red",
+			},
+			reason: "missing_restored",
+		},
+		{
+			name: "missing_record",
+			in: fixupCounterfactualReport{
+				ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+				Restored: boolPtr(true), Record: "   \t\n ",
+			},
+			reason: "missing_record",
+		},
+		{
+			name: "well-formed entry survives (control)",
+			in: fixupCounterfactualReport{
+				ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+				Restored: boolPtr(true), Record: "deleted the guard, test went red",
+			},
+			wantOut: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logSink strings.Builder
+			got := validateFixupCounterfactuals(cfg, []fixupCounterfactualReport{tc.in}, cfScope(), &logSink)
+			if tc.wantOut {
+				if len(got) != 1 {
+					t.Fatalf("retained = %+v, want the well-formed entry retained", got)
+				}
+				if logSink.Len() != 0 {
+					t.Errorf("a well-formed entry must not log a drop, got %q", logSink.String())
+				}
+				return
+			}
+			if len(got) != 0 {
+				t.Errorf("retained = %+v, want NO entry retained for %s", got, tc.reason)
+			}
+			if !strings.Contains(logSink.String(), `"reason":"`+tc.reason+`"`) {
+				t.Errorf("expected drop reason %q, got %q", tc.reason, logSink.String())
+			}
+			if !strings.Contains(logSink.String(), `"event":"fixup_counterfactual_dropped"`) {
+				t.Errorf("expected fixup_counterfactual_dropped, got %q", logSink.String())
+			}
+		})
+	}
+}
+
+// TestValidateFixupCounterfactuals_RestoredAbsentVsFalse is binding condition 1:
+// the two cases must be DISTINGUISHABLE. An entry whose `restored` key is ABSENT
+// is dropped as missing_restored; an entry carrying an explicit `"restored":
+// false` is RETAINED and renders. A plain-bool decode collapses both into
+// restored=false + retained, which is the whole defect.
+func TestValidateFixupCounterfactuals_RestoredAbsentVsFalse(t *testing.T) {
+	cfg := fixupReportCfg()
+
+	// Absent: decoded from real JSON with no `restored` member, so the pointer
+	// distinction is exercised through the decoder, not hand-set to nil.
+	var absent []fixupCounterfactualReport
+	if err := json.Unmarshal([]byte(
+		`[{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","record":"mutated and saw red"}]`,
+	), &absent); err != nil {
+		t.Fatal(err)
+	}
+	var absentLog strings.Builder
+	if got := validateFixupCounterfactuals(cfg, absent, cfScope(), &absentLog); len(got) != 0 {
+		t.Errorf("an entry with `restored` ABSENT must be DROPPED, got %+v", got)
+	}
+	if !strings.Contains(absentLog.String(), `"reason":"missing_restored"`) {
+		t.Errorf("expected missing_restored, got %q", absentLog.String())
+	}
+
+	// Present-but-false: an honest "I did not restore it" claim, RETAINED.
+	var present []fixupCounterfactualReport
+	if err := json.Unmarshal([]byte(
+		`[{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":false,"record":"mutated and saw red"}]`,
+	), &present); err != nil {
+		t.Fatal(err)
+	}
+	var presentLog strings.Builder
+	got := validateFixupCounterfactuals(cfg, present, cfScope(), &presentLog)
+	if len(got) != 1 {
+		t.Fatalf("an entry with an explicit `restored:false` must be RETAINED, got %+v (log %q)", got, presentLog.String())
+	}
+	if got[0].Restored {
+		t.Errorf("Restored = true, want false — the honest no-restore claim must survive verbatim")
+	}
+}
+
+// TestValidateFixupCounterfactuals_RecordDiscarded is the record-discard
+// control (binding condition 5): the record text carries a distinctive sentinel
+// and those EXACT BYTES must appear nowhere in the emitted event payload — not
+// under `record`, not under any other key, not folded into gate_evidence. A
+// field-is-unset assertion would pass against a copy under a different key.
+func TestValidateFixupCounterfactuals_RecordDiscarded(t *testing.T) {
+	const sentinel = "ZZQX-COUNTERFACTUAL-RECORD-SENTINEL-7f31"
+	cfg := fixupReportCfg()
+	var logSink strings.Builder
+	entries := validateFixupCounterfactuals(cfg, []fixupCounterfactualReport{{
+		ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+		Restored: boolPtr(true), Record: "deleted the guard; " + sentinel + "; restored it",
+	}}, cfScope(), &logSink)
+	if len(entries) != 1 {
+		t.Fatalf("retained = %+v, want the well-formed entry retained", entries)
+	}
+	ev := fixupCounterfactualsEvent(cfg, entries)
+	if bytes.Contains(ev.Payload, []byte(sentinel)) {
+		t.Errorf("the fixup_counterfactuals payload carries the record sentinel — agent-authored text must "+
+			"NOT cross the upload boundary:\n%s", ev.Payload)
+	}
+	gate := composeGateEvidence([]agent.Event{ev}, 0)
+	if gate == nil {
+		t.Fatal("composeGateEvidence returned nil for a fixup_counterfactuals event")
+	}
+	if bytes.Contains(gate.Payload, []byte(sentinel)) {
+		t.Errorf("the gate_evidence payload carries the record sentinel:\n%s", gate.Payload)
+	}
+	if strings.Contains(logSink.String(), sentinel) {
+		t.Errorf("the drop log carries the record sentinel: %q", logSink.String())
+	}
+}
+
+// TestValidateFixupCounterfactuals_Cap: entries past maxFixupCounterfactuals are
+// dropped with the named over_cap reason, so a pathological sidecar cannot grow
+// the reviewer prompt without bound.
+func TestValidateFixupCounterfactuals_Cap(t *testing.T) {
+	cfg := fixupReportCfg()
+	in := make([]fixupCounterfactualReport, 0, maxFixupCounterfactuals+3)
+	for i := 0; i < maxFixupCounterfactuals+3; i++ {
+		in = append(in, fixupCounterfactualReport{
+			ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+			Restored: boolPtr(true), Record: "mutated and saw red",
+		})
+	}
+	var logSink strings.Builder
+	got := validateFixupCounterfactuals(cfg, in, cfScope(), &logSink)
+	if len(got) != maxFixupCounterfactuals {
+		t.Errorf("retained = %d entries, want the cap of %d", len(got), maxFixupCounterfactuals)
+	}
+	if !strings.Contains(logSink.String(), `"reason":"over_cap"`) {
+		t.Errorf("expected over_cap drop reason, got %q", logSink.String())
+	}
+}
+
+// TestValidateFixupCounterfactuals_DropLogNeverEchoesAgentText: the drop log for
+// an out-of-scope path and an unknown observed literal carries the SANITIZED
+// values, never the agent's raw strings — the same reason safeFixupObligationID
+// exists.
+func TestValidateFixupCounterfactuals_DropLogNeverEchoesAgentText(t *testing.T) {
+	cfg := fixupReportCfg()
+	var logSink strings.Builder
+	validateFixupCounterfactuals(cfg, []fixupCounterfactualReport{{
+		ControlPath: "etc/PATH-SENTINEL-shadow", Observed: "OBSERVED-SENTINEL",
+		Restored: boolPtr(true), Record: "x",
+	}}, cfScope(), &logSink)
+	out := logSink.String()
+	for _, s := range []string{"PATH-SENTINEL-shadow", "OBSERVED-SENTINEL"} {
+		if strings.Contains(out, s) {
+			t.Errorf("drop log echoes agent-authored text %q: %s", s, out)
+		}
+	}
+	if !strings.Contains(out, `"control_path":"<not-in-scope>"`) || !strings.Contains(out, `"observed":"<invalid>"`) {
+		t.Errorf("drop log missing the sanitized placeholders: %s", out)
+	}
+}
+
+// TestLoadFixupSelfReport_WholeSidecarRulesStillDiscardCounterfactuals: the
+// pre-existing whole-sidecar rules are UNCHANGED and still dominate — malformed
+// JSON and a stale run/stage id discard the ENTIRE sidecar including its
+// counterfactuals, so a foreign run's claims can never reach this stage's
+// reviewer.
+func TestLoadFixupSelfReport_WholeSidecarRulesStillDiscardCounterfactuals(t *testing.T) {
+	cfg := fixupReportCfg()
+	const cfArr = `"counterfactuals":[{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"r"}]`
+	for _, tc := range []struct{ name, raw, event string }{
+		{"malformed", `{"run_id":"run-cccc",` + cfArr, "fixup_selfreport_invalid"},
+		{"stale", `{"run_id":"OTHER","stage_id":"OTHER","verify_status":"passed",` + cfArr + `}`, "fixup_selfreport_stale"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixupReportSidecar(t, cfg, tc.raw)
+			var logSink strings.Builder
+			got := loadFixupSelfReport(cfg, cfScope(), &logSink)
+			if len(got.counterfactuals) != 0 {
+				t.Errorf("counterfactuals = %+v, want the whole sidecar discarded", got.counterfactuals)
+			}
+			if !strings.Contains(logSink.String(), `"event":"`+tc.event+`"`) {
+				t.Errorf("expected %s, got %q", tc.event, logSink.String())
+			}
+		})
 	}
 }

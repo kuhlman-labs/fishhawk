@@ -411,6 +411,49 @@ preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,
 never fails, re-opens, or re-budgets the pass. Long-form contract:
 `backend/internal/fixupobligation/README.md`.
 
+## Fix-up re-review evidence: two blocks, two authorities (E68.20 / #3042)
+
+Since #2884 every fix-up re-review is dispatched from the `fixup_pushed` push
+report (`maybeBackstopFixupReReview`), whose call site had no bundle in hand and
+passed `gateEvidence = nil` — so the implement reviewers received NO "Gate
+evidence" verify section at all and correctly, but unresolvably, re-raised the
+same unverifiable-evidence concern against each new head. `writeGateEvidence`
+now carries two blocks for that path, and they are deliberately framed under
+DIFFERENT authority:
+
+**Half A — runner OBSERVATION.** The backend loads the fix-up stage's own
+uploaded redacted bundle (`Server.resolveStageGateEvidence`) and renders the
+committed-tree verify runs + summary exactly as the trace-time path does. When it
+cannot be loaded, `GateEvidence.VerifyEvidenceUnavailableReason` carries a
+BACKEND-side machine literal (never agent text) — `trace_store_not_wired`,
+`trace_list_failed`, `no_redacted_trace_for_stage`, `trace_fetch_failed`,
+`trace_read_failed`, `no_gate_evidence_in_trace`, `gate_evidence_parse_failed` —
+and the render states the absence EXPLICITLY: the tree is UNVERIFIED for this
+head, AND the absence is a backend/runner-side transport gap that the reviewer
+MUST NOT raise as an agent defect. That second line is the point: a silently
+omitted section is what let the concern re-raise every round. The block renders
+ONLY when there is no verify evidence at all AND a reason is set, so every
+populated path stays byte-identical (prompt-hash replay stability), pinned by a
+byte-identity control in `prompt_test.go`.
+
+**Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
+`{control_path, observed, restored}` triples the runner validated out of the
+fix-up self-report sidecar (`runner/README.md` for the fail-closed drop rules).
+The render says plainly that the verify runs above are what the RUNNER MEASURED
+while this block is only what the AGENT SAYS IT DID: the runner never witnessed
+the mutation and cannot tell a real counterfactual from a no-op one, so
+`observed: red` does NOT establish that the control discriminates. There is
+deliberately no test name and no narrative on the wire — the agent's `record`
+text is validated on the runner and discarded before the upload boundary (#2737's
+rationale), so the block carries nothing the operator's declared scope does not
+already name. `green`, `not_run` and `restored: NO` are each named as defect
+signals for the reviewer to weigh against the diff. ADVISORY: it never failed,
+re-opened or re-budgeted the pass.
+
+`writeFixupSelfReport` gains the matching agent-facing `counterfactuals` rules
+bullet, including that an absent `restored` is NOT the same claim as `false` and
+that the `record` text is discarded on the runner.
+
 ## Injected repo-authored documents (E55.1 / #2242)
 
 `Trigger.InjectedDocuments` carries repo-authored governance documents the

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/google/uuid"
@@ -12093,5 +12094,169 @@ func TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible(t *t
 	// one that will be asked to report it.
 	if got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0); len(got) != 1 {
 		t.Errorf("resolveFixupReportObligations = %+v, want the one obligation", got)
+	}
+}
+
+// --- #3042 resolveStageGateEvidence --------------------------------------
+
+// errReadTraceStore is a tracestore.Storage whose Get succeeds but whose body
+// fails on Read — the trace_read_failed branch, which a Get error cannot reach.
+type errReadTraceStore struct{}
+
+func (errReadTraceStore) Put(context.Context, tracestore.BundleRef, io.Reader) error { return nil }
+func (errReadTraceStore) Get(context.Context, tracestore.BundleRef) (io.ReadCloser, error) {
+	return io.NopCloser(iotest.ErrReader(errors.New("read blew up"))), nil
+}
+func (errReadTraceStore) Stat(context.Context, tracestore.BundleRef) (tracestore.Stat, error) {
+	return tracestore.Stat{}, errors.New("errReadTraceStore: Stat not used")
+}
+func (errReadTraceStore) List(context.Context, uuid.UUID) ([]tracestore.BundleRef, error) {
+	return nil, errors.New("errReadTraceStore: List not used")
+}
+
+// makeRedactedGateEvidenceBundle builds a gzipped JSONL trace bundle whose
+// gate_evidence event carries the given raw JSON payload. gateJSON == "" omits
+// the event entirely (the ErrNoGateEvidence case).
+func makeRedactedGateEvidenceBundle(t *testing.T, gateJSON string) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata}}
+	if gateJSON != "" {
+		lines = append(lines, line{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: json.RawMessage(gateJSON)})
+	}
+	lines = append(lines, line{Seq: len(lines) + 1, Kind: "trailer", Data: json.RawMessage(`{}`)})
+
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return gz.Bytes()
+}
+
+// TestResolveStageGateEvidence_DegradeReasons is the per-failure-mode table:
+// ONE case per named degrade literal, each asserting a nil evidence AND the
+// exact reason string. A branch that returned the wrong literal — or an empty
+// one, which would silently omit the reviewer's named-absence block — fails here.
+func TestResolveStageGateEvidence_DegradeReasons(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("b", 64)
+	trace := func() *feedbackAuditRepo {
+		return &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}}
+	}
+
+	cases := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "trace_store_not_wired (no TraceStore)",
+			cfg:  Config{Addr: "127.0.0.1:0", AuditRepo: trace()},
+			want: "trace_store_not_wired",
+		},
+		{
+			name: "trace_store_not_wired (no AuditRepo)",
+			cfg:  Config{Addr: "127.0.0.1:0", TraceStore: &priorDiffTraceStore{}},
+			want: "trace_store_not_wired",
+		},
+		{
+			name: "trace_list_failed",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  &feedbackAuditRepo{listErr: errors.New("audit down")},
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")}},
+			want: "trace_list_failed",
+		},
+		{
+			name: "no_redacted_trace_for_stage",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  &feedbackAuditRepo{},
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")}},
+			want: "no_redacted_trace_for_stage",
+		},
+		{
+			name: "trace_fetch_failed",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  trace(),
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("storage down")}},
+			want: "trace_fetch_failed",
+		},
+		{
+			name: "trace_read_failed",
+			cfg:  Config{Addr: "127.0.0.1:0", AuditRepo: trace(), TraceStore: errReadTraceStore{}},
+			want: "trace_read_failed",
+		},
+		{
+			name: "no_gate_evidence_in_trace",
+			cfg: Config{Addr: "127.0.0.1:0", AuditRepo: trace(),
+				TraceStore: &priorDiffTraceStore{body: makeRedactedGateEvidenceBundle(t, "")}},
+			want: "no_gate_evidence_in_trace",
+		},
+		{
+			name: "gate_evidence_parse_failed",
+			cfg: Config{Addr: "127.0.0.1:0", AuditRepo: trace(),
+				TraceStore: &priorDiffTraceStore{body: []byte("not a gzip bundle at all")}},
+			want: "gate_evidence_parse_failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+			if ev != nil {
+				t.Errorf("evidence = %+v, want nil on the %s degrade", ev, tc.want)
+			}
+			if reason != tc.want {
+				t.Errorf("reason = %q, want %q", reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveStageGateEvidence_Success: a stored redacted bundle carrying
+// gate_evidence resolves to a mapped prompt.GateEvidence with an EMPTY reason,
+// so the caller renders the populated section rather than a named absence.
+func TestResolveStageGateEvidence_Success(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("c", 64)
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}},
+		TraceStore: &priorDiffTraceStore{body: makeRedactedGateEvidenceBundle(t,
+			`{"scope_facts":{"declared_files":2},"verify_runs":[{"command":"scripts/test verify","exit_code":0,`+
+				`"outcome":"passed","output_tail":"RESOLVER_TAIL_SENTINEL"}]}`)},
+	})
+	ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+	if reason != "" {
+		t.Fatalf("reason = %q, want empty on the success path", reason)
+	}
+	if ev == nil || len(ev.VerifyRuns) != 1 || ev.VerifyRuns[0].OutputTail != "RESOLVER_TAIL_SENTINEL" {
+		t.Fatalf("evidence = %+v, want the bundle's verify run", ev)
 	}
 }
