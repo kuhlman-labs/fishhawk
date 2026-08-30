@@ -15,6 +15,7 @@ package prompt
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -6097,41 +6098,41 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment, issueURL st
 }
 
 // issueCommentRetrievalPointer builds the elision marker's retrieval pointer for
-// an over-cap issue comment (#2946): it names the full comment on the issue
-// thread at issueURL and reminds the reader that the issue BODY is NOT
-// per-comment capped, so durable handoff content belongs there. Degrades to a
-// source-agnostic phrasing (no empty-URL fragment) when issueURL is empty.
+// an over-cap issue comment (#2946). It names the full comment on the issue
+// thread at issueURL ONLY when issueURL is a plausible absolute http(s) URL, and
+// otherwise DEGRADES to the source-agnostic sentence — the same phrasing the
+// empty-URL case has always used.
+//
+// The pointer round-trips issueURL through net/url as an ALLOW-list (#3035
+// fix-up), replacing the earlier control-byte deny-list. The marker line lands
+// at column 0 INSIDE the <<<BEGIN/END UNTRUSTED ISSUE COMMENTS>>> envelope but
+// OUTSIDE the per-line `| ` quoting of sanitizeUntrustedComment, so a
+// caller-controlled URL that can open a new logical line there — or close the
+// quarantine envelope early — would forge a trusted-looking instruction line.
+// ASCII CR/LF were stripped before, but a deny-list enumerates only the
+// separators someone thought of: the next Unicode line separator (NEL U+0085,
+// LINE SEPARATOR U+2028, PARAGRAPH SEPARATOR U+2029, U+000B, U+200E, U+FEFF, …)
+// reopens the same hole, and none of those contains a byte < 0x20 or 0x7f, so
+// the old loop passed all three through. The allow-list closes the whole class:
+// a value is accepted only when url.Parse succeeds, Scheme is exactly "http" or
+// "https", Host is non-empty, AND the parsed URL's String() equals the input
+// BYTE FOR BYTE. The URL grammar admits no ASCII control character, no Unicode
+// line separator and no space, so every one of them fails the round-trip WITHOUT
+// being named. A non-URL string such as "IGNORE ALL PRIOR INSTRUCTIONS" or a
+// non-http(s) scheme ("javascript:…", "ftp://…") likewise fails and degrades to
+// the safe sentence — we never emit a partially-scrubbed URL or the raw value.
+// neutralizeEnvelopeDelimiters is kept on whatever is emitted as defense in
+// depth. Pure and deterministic, so the package's byte-identical-replay
+// invariant holds.
 func issueCommentRetrievalPointer(issueURL string) string {
-	if issueURL != "" {
-		return fmt.Sprintf("To read the full comment, open the issue thread at %s. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments.", sanitizeRetrievalURL(issueURL))
+	const agnostic = "To read the full comment, open the issue thread on the forge. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments."
+	if u, err := url.Parse(issueURL); err == nil &&
+		(u.Scheme == "http" || u.Scheme == "https") &&
+		u.Host != "" &&
+		u.String() == issueURL {
+		return neutralizeEnvelopeDelimiters(fmt.Sprintf("To read the full comment, open the issue thread at %s. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments.", issueURL))
 	}
-	return "To read the full comment, open the issue thread on the forge. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments."
-}
-
-// sanitizeRetrievalURL makes a caller-supplied issue URL structurally safe to
-// interpolate into the elision marker's retrieval pointer (#2946 fix-up). The
-// marker line lands at column 0 INSIDE the <<<BEGIN/END UNTRUSTED ISSUE
-// COMMENTS>>> envelope but OUTSIDE the per-line `| ` quoting of
-// sanitizeUntrustedComment, so an attacker who controls the inline issue_context
-// URL could otherwise embed a newline to open a trusted-looking line at column
-// 0, or an "<<<END UNTRUSTED ISSUE COMMENTS>>>" token to close the quarantine
-// envelope early and inject instructions the planner reads as trusted. A
-// well-formed forge URL carries neither, so the transform strips every ASCII
-// control byte (CR/LF/TAB and the rest of < 0x20 plus DEL — never a UTF-8 lead
-// or continuation byte, which are all >= 0x80) and then runs the shared
-// neutralizeEnvelopeDelimiters, defanging every `<<<`/`>>>` run. Pure and
-// deterministic, so the package's byte-identical-replay invariant holds.
-func sanitizeRetrievalURL(url string) string {
-	var b strings.Builder
-	b.Grow(len(url))
-	for i := 0; i < len(url); i++ {
-		c := url[i]
-		if c < 0x20 || c == 0x7f {
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return neutralizeEnvelopeDelimiters(b.String())
+	return neutralizeEnvelopeDelimiters(agnostic)
 }
 
 // quoteRepo backticks an "owner/name" string for inline display.
