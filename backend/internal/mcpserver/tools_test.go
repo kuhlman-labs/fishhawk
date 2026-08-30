@@ -7778,6 +7778,182 @@ func TestStartRun_GhMissing_DoesNotFail(t *testing.T) {
 	}
 }
 
+// TestStartRun_OverCapCommentWarning drives the #2946 over-cap comment scan on
+// the RESOLVED issue_context. The scan runs on both the inline-context path and
+// the gh-fetch path; each case seeds bodies by construction (strings.Repeat of a
+// known length) so the over/under-cap state is definitional, not derived from
+// the control under test. The gh-missing warning is asserted to still surface so
+// the new entries are ADDITIVE.
+func TestStartRun_OverCapCommentWarning(t *testing.T) {
+	over := func(n int) string { return strings.Repeat("z", prompt.MaxIssueCommentBytes+n) }
+	under := strings.Repeat("z", prompt.MaxIssueCommentBytes) // exactly at cap → NOT over
+
+	t.Run("inline_no_comments_no_warning", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext:  &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1},
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		if strings.Contains(rejectResultText(t, meta), "exceed the") {
+			t.Errorf("no over-cap warning expected with no comments:\n%s", rejectResultText(t, meta))
+		}
+	})
+
+	t.Run("inline_all_under_cap_including_exactly_at_cap_no_warning", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext: &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
+				Comments: []IssueComment{
+					{Author: "a", Body: "small", CreatedAt: "2026-05-01T00:00:00Z"},
+					{Author: "b", Body: under, CreatedAt: "2026-05-02T00:00:00Z"}, // boundary: == cap, NOT over
+				}},
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		if strings.Contains(rejectResultText(t, meta), "exceed the") {
+			t.Errorf("exactly-at-cap comment must NOT warn (> not >=):\n%s", rejectResultText(t, meta))
+		}
+	})
+
+	t.Run("inline_one_over_cap_one_warning_names_author_and_bytes", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext: &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
+				Comments: []IssueComment{
+					{Author: "alice", Body: over(500), CreatedAt: "2026-05-01T00:00:00Z"},
+				}},
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		text := rejectResultText(t, meta)
+		if !strings.Contains(text, "1 issue comment(s) exceed the") {
+			t.Errorf("expected a single over-cap warning:\n%s", text)
+		}
+		if !strings.Contains(text, "@alice") || !strings.Contains(text, strconv.Itoa(prompt.MaxIssueCommentBytes+500)) {
+			t.Errorf("warning must name the author and the byte count:\n%s", text)
+		}
+	})
+
+	t.Run("inline_many_over_cap_bounded_detail_plus_summary", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		var comments []IssueComment
+		total := maxOverCapDetailLines + 3 // 8 over-cap comments
+		for i := 0; i < total; i++ {
+			comments = append(comments, IssueComment{
+				Author: "u" + strconv.Itoa(i), Body: over(i + 1),
+				CreatedAt: "2026-05-01T00:00:00Z",
+			})
+		}
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext:  &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1, Comments: comments},
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		text := rejectResultText(t, meta)
+		if !strings.Contains(text, strconv.Itoa(total)+" issue comment(s) exceed the") {
+			t.Errorf("header must state the TRUE total %d:\n%s", total, text)
+		}
+		// Exactly maxOverCapDetailLines detail lines are named individually.
+		detailLines := strings.Count(text, " over cap")
+		if detailLines != maxOverCapDetailLines {
+			t.Errorf("expected %d named detail lines, got %d:\n%s", maxOverCapDetailLines, detailLines, text)
+		}
+		if !strings.Contains(text, strconv.Itoa(total-maxOverCapDetailLines)+" more over-cap comment(s) not listed") {
+			t.Errorf("remainder must be summarised as a count:\n%s", text)
+		}
+	})
+
+	t.Run("gh_fetch_path_over_cap_warns_and_gh_present", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		body := over(10)
+		// gh JSON with one over-cap comment (author.login + createdAt shape).
+		jsonBody := `{"title":"T","body":"B","url":"https://github.com/x/y/issues/9","number":9,"comments":[{"author":{"login":"bob"},"body":"` + body + `","createdAt":"2026-05-01T00:00:00Z"}]}`
+		withFakeGh(t, jsonBody)
+		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, Issue: "9",
+		})
+		if err != nil {
+			t.Fatalf("startRun: %v", err)
+		}
+		text := rejectResultText(t, meta)
+		if !strings.Contains(text, "1 issue comment(s) exceed the") || !strings.Contains(text, "@bob") {
+			t.Errorf("gh-fetched over-cap comment must warn naming the author:\n%s", text)
+		}
+	})
+
+	t.Run("gh_missing_warning_fires_and_overcap_is_additive", func(t *testing.T) {
+		// The prior version installed withFakeGhMissing but supplied inline
+		// IssueContext, so gh was NEVER consulted (startRun only fetches when
+		// issueNumber > 0 && issueContext == nil) — the gh-missing warning never
+		// fired and the case would have stayed green with that warning deleted.
+		//
+		// In startRun the gh-missing warning (needs a fetch attempt: an issue
+		// number and NO inline context) and the over-cap warning (needs a
+		// non-nil issue context) arise from MUTUALLY EXCLUSIVE branches: a
+		// successful fetch yields context but no gh warning, a failed fetch
+		// yields a gh warning but nil context. They cannot ride one result, so
+		// each branch is exercised where it actually fires.
+
+		// Branch 1 — fetch attempted with gh absent: the gh-missing warning
+		// must surface. This is the assertion the prior case lacked; it reddens
+		// if the "gh CLI not on PATH" warning is removed.
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		withFakeGhMissing(t)
+		meta1, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, Issue: "5",
+		})
+		if err != nil {
+			t.Fatalf("startRun (fetch path): %v", err)
+		}
+		text1 := rejectResultText(t, meta1)
+		if !strings.Contains(text1, "gh CLI not on PATH") {
+			t.Errorf("gh-missing fetch path must surface the gh-missing warning:\n%s", text1)
+		}
+		if strings.Contains(text1, "issue comment(s) exceed the") {
+			t.Errorf("no over-cap warning expected when the failed fetch produced no context:\n%s", text1)
+		}
+
+		// Branch 2 — inline over-cap context (gh irrelevant): the over-cap
+		// warning is APPENDED to the warning slice (overCapCommentWarnings is
+		// additive), so it surfaces on the inline path.
+		_, srv2 := newFakeBackend(t)
+		r2 := newResolver(srv2, nil)
+		withFakeGhMissing(t)
+		meta2, _, err := r2.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+			TriggerSource: string(runpkg.TriggerOnDemand),
+			IssueContext: &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
+				Comments: []IssueComment{{Author: "alice", Body: over(5), CreatedAt: "2026-05-01T00:00:00Z"}}},
+		})
+		if err != nil {
+			t.Fatalf("startRun (inline path): %v", err)
+		}
+		text2 := rejectResultText(t, meta2)
+		if !strings.Contains(text2, "1 issue comment(s) exceed the") {
+			t.Errorf("over-cap warning must surface on the inline path:\n%s", text2)
+		}
+	})
+}
+
 // TestStartRun_TriggerRefIssue_AutoDerivesNumber: when the agent
 // passes trigger_ref=issue:7 without issue, the MCP server still
 // fetches via gh.

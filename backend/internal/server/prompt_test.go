@@ -1038,6 +1038,118 @@ func TestGetStagePrompt_CachedIssueComments_MappedIntoTrigger(t *testing.T) {
 	}
 }
 
+// TestFillIssueContext_OverCapCommentWarn pins the #2946 server-side WARN: on
+// BOTH the cached-context branch (branch 1, also the campaign-hydration landing
+// spot) and the webhook-fetch branch (branch 2), fillIssueContext emits exactly
+// ONE greppable WARN when any resolved comment exceeds the per-comment cap, and
+// NONE when every comment is under cap. Bodies are seeded by construction so the
+// over/under-cap state is definitional. The WARN is read out of a capturing slog
+// handler (filtered to the specific message so the request-logging middleware's
+// own lines don't pollute the count).
+func TestFillIssueContext_OverCapCommentWarn(t *testing.T) {
+	const warnMsg = "issue comment over per-comment cap"
+	over := strings.Repeat("z", prompt.MaxIssueCommentBytes+50)
+	atCap := strings.Repeat("z", prompt.MaxIssueCommentBytes) // == cap, NOT over
+
+	countWarns := func(buf *bytes.Buffer) int {
+		return strings.Count(buf.String(), warnMsg)
+	}
+	newCapturing := func(t *testing.T) (*Server, *promptRunRepo, *signingFake, *stubIssueGetter, *bytes.Buffer) {
+		s, rr, sf, gh := newPromptServer(t)
+		var buf bytes.Buffer
+		s.cfg.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		return s, rr, sf, gh, &buf
+	}
+
+	t.Run("branch1_cached_two_over_cap_one_warn", func(t *testing.T) {
+		s, rr, sf, gh, buf := newCapturing(t)
+		runID, stageID := uuid.New(), uuid.New()
+		priv, _ := sf.issue(t, runID)
+		triggerRef := "issue:42"
+		rr.runRow = &run.Run{
+			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			IssueContext: &run.IssueContext{
+				Number: 42, Title: "T", Body: "B", URL: "https://github.com/kuhlman-labs/example/issues/42",
+				Comments: []run.IssueComment{
+					{Author: "alice", Body: over, CreatedAt: "2026-05-01T00:00:00Z"},
+					{Author: "bob", Body: over, CreatedAt: "2026-05-02T00:00:00Z"},
+				},
+			},
+		}
+		rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+		if w := promptRequest(t, s, runID, stageID, priv, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if gh.called {
+			t.Error("branch 1 must not call GitHub")
+		}
+		if n := countWarns(buf); n != 1 {
+			t.Errorf("want exactly ONE over-cap WARN, got %d:\n%s", n, buf.String())
+		}
+		if !strings.Contains(buf.String(), "\"over_cap_comments\":2") {
+			t.Errorf("WARN must report over_cap_comments=2:\n%s", buf.String())
+		}
+	})
+
+	t.Run("branch1_cached_all_under_cap_no_warn", func(t *testing.T) {
+		s, rr, sf, _, buf := newCapturing(t)
+		runID, stageID := uuid.New(), uuid.New()
+		priv, _ := sf.issue(t, runID)
+		triggerRef := "issue:42"
+		rr.runRow = &run.Run{
+			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			IssueContext: &run.IssueContext{
+				Number: 42, Title: "T", Body: "B", URL: "https://github.com/kuhlman-labs/example/issues/42",
+				Comments: []run.IssueComment{
+					{Author: "alice", Body: "small", CreatedAt: "2026-05-01T00:00:00Z"},
+					{Author: "bob", Body: atCap, CreatedAt: "2026-05-02T00:00:00Z"}, // boundary
+				},
+			},
+		}
+		rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+		if w := promptRequest(t, s, runID, stageID, priv, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := countWarns(buf); n != 0 {
+			t.Errorf("all-under-cap (incl exactly-at-cap) must not WARN, got %d:\n%s", n, buf.String())
+		}
+	})
+
+	t.Run("branch2_webhook_fetch_over_cap_one_warn", func(t *testing.T) {
+		s, rr, sf, gh, buf := newCapturing(t)
+		runID, stageID := uuid.New(), uuid.New()
+		priv, _ := sf.issue(t, runID)
+		installation := int64(99)
+		triggerRef := "issue:42"
+		rr.runRow = &run.Run{
+			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			InstallationID: &installation,
+			// No cached IssueContext → branch 2 fetches.
+		}
+		rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+		gh.issue = &githubclient.Issue{Number: 42, Title: "T", Body: "B", State: "open"}
+		gh.comments = []githubclient.FetchedIssueComment{
+			{Author: "carol", Body: over, CreatedAt: "2026-05-01T00:00:00Z"},
+			{Author: "dave", Body: "small", CreatedAt: "2026-05-02T00:00:00Z"},
+		}
+		if w := promptRequest(t, s, runID, stageID, priv, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if !gh.commentsCalled {
+			t.Error("branch 2 must fetch comments")
+		}
+		if n := countWarns(buf); n != 1 {
+			t.Errorf("want exactly ONE over-cap WARN on the webhook path, got %d:\n%s", n, buf.String())
+		}
+		if !strings.Contains(buf.String(), "\"over_cap_comments\":1") {
+			t.Errorf("WARN must report over_cap_comments=1:\n%s", buf.String())
+		}
+	})
+}
+
 // TestGetStagePrompt_CachedIssueContext_NoComments guards the
 // regression case: a cached IssueContext with no comments still
 // renders the body-only plan prompt unchanged — no comments section.

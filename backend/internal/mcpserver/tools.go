@@ -2678,6 +2678,59 @@ Returns the canonical Run row + an Idempotent flag.
 //     wasn't already passed inline).
 //  7. validate the trigger_source / issue_context pairing.
 //  8. hand off to apiClient.StartRun.
+//
+// maxOverCapDetailLines bounds how many over-cap comments overCapCommentWarnings
+// names individually before summarising the rest as a count, so a pathological
+// thread of many over-cap comments cannot dominate the tool result (#2946).
+const maxOverCapDetailLines = 5
+
+// overCapCommentWarnings scans a resolved issue context for comments past
+// prompt.MaxIssueCommentBytes and returns a best-effort warning block naming the
+// first maxOverCapDetailLines of them (author, created_at, byte count, overflow)
+// with the remainder summarised as a count. Returns nil — adding no warning —
+// when the context is absent or every comment is under cap. The contract is
+// deliberately "name the first five, summarise the rest" (not "name each"): an
+// operator staring at a truncated result learns nothing extra from the 200th
+// line, and the summary count still tells them the true total.
+func overCapCommentWarnings(ic *IssueContext) []string {
+	if ic == nil {
+		return nil
+	}
+	type overCap struct {
+		author, createdAt string
+		bytes             int
+	}
+	var over []overCap
+	for _, c := range ic.Comments {
+		if len(c.Body) > prompt.MaxIssueCommentBytes {
+			author := c.Author
+			if author == "" {
+				author = "unknown"
+			}
+			over = append(over, overCap{author: author, createdAt: c.CreatedAt, bytes: len(c.Body)})
+		}
+	}
+	if len(over) == 0 {
+		return nil
+	}
+	out := []string{fmt.Sprintf(
+		"%d issue comment(s) exceed the %d-byte per-comment cap and will be truncated in the plan prompt with an elision marker (the withheld tail is dropped from the prompt). Fix while it is cheap: split the comment into several, or move the durable content into the issue BODY, which is not per-comment capped.",
+		len(over), prompt.MaxIssueCommentBytes)}
+	shown := len(over)
+	if shown > maxOverCapDetailLines {
+		shown = maxOverCapDetailLines
+	}
+	for i := 0; i < shown; i++ {
+		o := over[i]
+		out = append(out, fmt.Sprintf("  - @%s (%s): %d bytes, %d over cap",
+			o.author, o.createdAt, o.bytes, o.bytes-prompt.MaxIssueCommentBytes))
+	}
+	if len(over) > shown {
+		out = append(out, fmt.Sprintf("  - ...and %d more over-cap comment(s) not listed individually", len(over)-shown))
+	}
+	return out
+}
+
 func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
 	if in.Repo == "" {
 		return nil, StartRunOutput{}, errors.New("repo is required (owner/name)")
@@ -2818,6 +2871,15 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 				fmt.Sprintf("issue fetch warning: %v — proceeding without inline issue context", ferr))
 		}
 	}
+
+	// Over-cap comment warning (#2946): scan the RESOLVED issue_context —
+	// whether fetched via gh above or supplied inline by the caller — and warn
+	// naming each comment past prompt.MaxIssueCommentBytes, so the operator sees
+	// the per-comment truncation at the one moment it is still cheap to fix
+	// (split the comment, or move the content into the issue BODY, which is not
+	// per-comment capped). This is the MCP-path visibility surface; runs with no
+	// tool result (webhook / campaign) get the server-side WARN in fillIssueContext.
+	warnings = append(warnings, overCapCommentWarnings(issueContext)...)
 
 	// (7) Validate the trigger_source / issue_context pairing.
 	// Mirrors the backend handler's check — better to fail here
