@@ -5512,9 +5512,11 @@ func TestBuild_ImplementReview_AmendedScope_RendersSection(t *testing.T) {
 		"backend/cmd/fishhawk-mcp/README.md",
 		"docs/extra.md",
 		"Do NOT record a scope-drift concern for any",
-		// Criterion 4 must reference the amended list.
-		"Scope amended at approval' section below (when present) ARE in-scope",
-		"in NEITHER scope.files NOR the amended-scope list are drift",
+		// Criterion 4 must reference the amended list. Its wording CHANGED in
+		// #2874 to name all three operator-authorized lists, so this pin is the
+		// post-change text.
+		"'Scope amended at approval', 'Scope amended mid-stage', and 'Scope authorized by child slice amendments' sections below (when present) ARE in-scope",
+		"in NONE of scope.files, the approval-amended list, the mid-stage-amended list, or the child-slice-amended list are drift",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("amended-scope prompt missing %q:\n%s", w, got)
@@ -6752,6 +6754,191 @@ func TestBuild_ImplementReview_ChildAmendedScope_EmptyByteIdentical(t *testing.T
 	if reduced := strings.Replace(with, section, "", 1); reduced != without {
 		t.Errorf("populated render differs from nil render by more than the new section:\n--- reduced ---\n%s\n--- without ---\n%s",
 			reduced, without)
+	}
+}
+
+// TestBuild_ImplementReview_MidStageAmendedScope_Rendered pins that a non-empty
+// MidStageAmendedScopeFiles renders the #2874 "Scope amended mid-stage" section
+// with every field — path, authorizing amendment id, the operator's decision
+// reason — plus the NOT-drift instruction and the merits-level-disagreement
+// clause the issue explicitly asked for.
+func TestBuild_ImplementReview_MidStageAmendedScope_Rendered(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		MidStageAmendedScopeFiles: []MidStageAmendedScopePath{
+			{
+				Path:           "backend/internal/audit/categories.go",
+				AmendmentID:    "6c8a2006",
+				DecisionReason: "the category table is the coupled registration",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Scope amended mid-stage (operator-approved — in-scope, NOT drift)",
+		"- backend/internal/audit/categories.go (approved amendment 6c8a2006: the category table is the coupled registration)",
+		"the operator APPROVED it",
+		"Do NOT record a scope-drift concern for any of them",
+		"do NOT write a resolution asking for an amendment that already exists",
+		"raise that as a NON-scope concern naming the amendment id",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_ImplementReview_MidStageAmendedScope_EmptyReason renders the
+// empty-DecisionReason branch: the decision endpoint does not require a reason,
+// so the bullet degrades to path + amendment id rather than emitting an empty
+// parenthetical clause.
+func TestBuild_ImplementReview_MidStageAmendedScope_EmptyReason(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		MidStageAmendedScopeFiles: []MidStageAmendedScopePath{
+			{Path: "backend/internal/audit/categories.go", AmendmentID: "6c8a2006"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- backend/internal/audit/categories.go (approved amendment 6c8a2006)\n") {
+		t.Errorf("empty-reason branch not rendered:\n%s", got)
+	}
+	if strings.Contains(got, "(approved amendment 6c8a2006: )") {
+		t.Errorf("empty reason must not render an empty parenthetical clause:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_MidStageAmendedScope_EmptyRendersNoSection is the
+// SECTION-ABSENCE pin (#2874, approval condition 1). It is deliberately a
+// POST-change-with-field vs POST-change-WITHOUT-field differential, NOT a
+// comparison against any pre-change snapshot: #2874 also rewrites standing
+// criterion 4, which renders UNCONDITIONALLY, so whole-prompt hash stability
+// against a pre-change build is structurally unavailable and is NOT claimed.
+// What IS guaranteed and asserted here: an empty field renders no heading, and
+// the populated render differs from the empty one by EXACTLY the new section —
+// so deleting the len()>0 guard (emitting a stray section for an empty field)
+// turns this RED.
+func TestBuild_ImplementReview_MidStageAmendedScope_EmptyRendersNoSection(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	without, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build (empty): %v", err)
+	}
+	if strings.Contains(without, "### Scope amended mid-stage") {
+		t.Fatalf("empty MidStageAmendedScopeFiles must render NO mid-stage-amendment section:\n%s", without)
+	}
+	explicitNil := base
+	explicitNil.MidStageAmendedScopeFiles = nil
+	gotNil, err := Build("implement_review", explicitNil)
+	if err != nil {
+		t.Fatalf("Build (nil): %v", err)
+	}
+	if gotNil != without {
+		t.Errorf("explicit-nil MidStageAmendedScopeFiles must be byte-identical to omitting it")
+	}
+
+	populated := base
+	populated.MidStageAmendedScopeFiles = []MidStageAmendedScopePath{
+		{Path: "backend/internal/audit/categories.go", AmendmentID: "6c8a2006", DecisionReason: "coupled registration"},
+	}
+	with, err := Build("implement_review", populated)
+	if err != nil {
+		t.Fatalf("Build (populated): %v", err)
+	}
+	section := "### Scope amended mid-stage (operator-approved — in-scope, NOT drift)\n\n" +
+		"While this stage was RUNNING the agent stopped and filed a scope-amendment request for the " +
+		"paths below, and the operator APPROVED it — the runner folded each path into the stage's ENFORCED " +
+		"scope, so touching it was authorized. They ARE in-scope. Do NOT record a scope-drift concern for any " +
+		"of them, and do NOT write a resolution asking for an amendment that already exists:\n\n" +
+		"- backend/internal/audit/categories.go (approved amendment 6c8a2006: coupled registration)\n" +
+		"\nThe operator's decision reason is shown so you can judge the amendment on its merits: if " +
+		"you disagree with the justification for a path, raise that as a NON-scope concern naming the " +
+		"amendment id. Disagreeing with an amendment is useful signal; mislabelling an approved path as " +
+		"drift is not.\n\n"
+	if !strings.Contains(with, section) {
+		t.Fatalf("populated render missing the exact section block:\n%s", with)
+	}
+	if reduced := strings.Replace(with, section, "", 1); reduced != without {
+		t.Errorf("populated render differs from the empty render by more than the new section:\n--- reduced ---\n%s\n--- without ---\n%s",
+			reduced, without)
+	}
+}
+
+// TestBuild_ImplementReview_Criterion4NamesAllThreeAmendedLists pins the #2874
+// criterion-4 rewrite: the drift definition the reviewer is bound by must name
+// the mid-stage-amended list alongside the approval-time and child-slice lists.
+// Both reviewers on run bff9a242 quoted the OLD sentence back verbatim while
+// flagging an approved amended path, so leaving criterion 4 unchanged would have
+// left the wrong rule binding even with the section present. The text is
+// UNCONDITIONAL — it renders on every implement review, amendment or not.
+func TestBuild_ImplementReview_Criterion4NamesAllThreeAmendedLists(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"'Scope amended at approval', 'Scope amended mid-stage', and 'Scope authorized by child slice amendments' sections below (when present) ARE in-scope",
+		"in NONE of scope.files, the approval-amended list, the mid-stage-amended list, or the child-slice-amended list are drift",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("criterion 4 missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "in NEITHER scope.files NOR the amended-scope list are drift") {
+		t.Errorf("criterion 4 still carries the pre-#2874 two-list drift definition:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_AllThreeAmendedSections_FixedOrder renders a Trigger
+// carrying approval-time, mid-stage AND child-slice amendments together and pins
+// the fixed approval → mid-stage → child order, so the three provenance channels
+// cannot be conflated by a reader.
+func TestBuild_ImplementReview_AllThreeAmendedSections_FixedOrder(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:              "kuhlman-labs/example",
+		ApprovedPlan:      fixturePlan(),
+		Diff:              "- M pkg/bar/bar.go\n",
+		AmendedScopeFiles: []string{"docs/extra.md"},
+		MidStageAmendedScopeFiles: []MidStageAmendedScopePath{
+			{Path: "backend/internal/audit/categories.go", AmendmentID: "amend-mid", DecisionReason: "coupled registration"},
+		},
+		ChildAmendedScopeFiles: []ChildAmendedScopePath{
+			{Path: "pkg/bar/childonly.go", AmendmentID: "amend-child", ChildRunID: "child-run-9", SliceIndex: childScopeIdx(2)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	approvalIdx := strings.Index(got, "### Scope amended at approval (")
+	midIdx := strings.Index(got, "### Scope amended mid-stage (")
+	childIdx := strings.Index(got, "### Scope authorized by child slice amendments (")
+	if approvalIdx < 0 || midIdx < 0 || childIdx < 0 {
+		t.Fatalf("all three sections must render (approval=%d mid=%d child=%d):\n%s", approvalIdx, midIdx, childIdx, got)
+	}
+	if approvalIdx >= midIdx || midIdx >= childIdx {
+		t.Errorf("sections out of order: approval=%d mid=%d child=%d", approvalIdx, midIdx, childIdx)
+	}
+	// Each path must live under ITS OWN section, never conflated into another.
+	if !strings.Contains(got[midIdx:childIdx], "- backend/internal/audit/categories.go (approved amendment amend-mid: coupled registration)") {
+		t.Errorf("mid-stage path not rendered inside the mid-stage section:\n%s", got[midIdx:childIdx])
+	}
+	if strings.Contains(got[midIdx:childIdx], "docs/extra.md") {
+		t.Errorf("approval-time path leaked into the mid-stage section:\n%s", got[midIdx:childIdx])
 	}
 }
 
