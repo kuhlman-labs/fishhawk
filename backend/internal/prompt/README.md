@@ -428,8 +428,8 @@ cannot be loaded, `GateEvidence.VerifyEvidenceUnavailableReason` carries a
 BACKEND-side machine literal (never agent text) — `trace_store_not_wired`,
 `trace_list_failed`, `no_redacted_trace_for_stage`, `trace_fetch_failed`,
 `trace_read_failed`, `no_gate_evidence_in_trace`, `gate_evidence_parse_failed`,
-`no_verify_runs_in_gate_evidence` — and the render states the absence
-EXPLICITLY: the tree is UNVERIFIED for this
+`no_verify_runs_in_gate_evidence`, `no_verify_run_tail_in_gate_evidence` — and
+the render states the absence EXPLICITLY: the tree is UNVERIFIED for this
 head, AND the absence is a backend/runner-side transport gap that the reviewer
 MUST NOT raise as an agent defect. That second line is the point: a silently
 omitted section is what let the concern re-raise every round. The block renders
@@ -450,6 +450,29 @@ the literal stamped onto it. Read the pair as: a non-empty reason with a
 **nil** evidence is a LOAD degrade (the caller allocates a reason-only
 `GateEvidence`); a non-empty reason with a **non-nil** evidence is the partial
 case, already stamped, nothing for the caller to allocate.
+
+THREE verify states, not two. The partial case splits, and the split is
+load-bearing rather than cosmetic:
+
+| state | literal | render |
+|---|---|---|
+| verify runs present | (empty) | the runs + summary, unchanged |
+| no run, no summary | `no_verify_runs_in_gate_evidence` | `Verify runs … NOT ATTACHED`, tree **UNVERIFIED** |
+| no run, summary PRESENT | `no_verify_run_tail_in_gate_evidence` | the summary, plus `Verify run output tail … NOT ATTACHED` — the summary **STANDS** |
+
+The third row is NOT folded into the second on purpose. The UNVERIFIED block
+asserts that compile/test state is unknown for this head; with a verify summary
+present that statement is FALSE — a summary is real committed-tree evidence,
+weaker than a per-command tail but not nothing — and asserting UNVERIFIED over a
+passing summary would teach the reviewer to distrust a true signal. That
+over-correction would be a worse defect than the silent omission being fixed. So
+the summary-without-tail state carries its own literal and its own narrower
+note, which names only the missing per-command output and says the summary
+stands. The two render blocks are mutually exclusive on `VerifySummary`'s
+nil-ness, so exactly one of the three states renders;
+`TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail` asserts BOTH halves
+— the tail note present AND the UNVERIFIED wording absent — because the negative
+half is the whole reason the state exists separately.
 
 ORDERING is an accepted, named failure mode rather than something the resolver
 verifies. On the normal path the fix-up stage ships its trace BEFORE the push

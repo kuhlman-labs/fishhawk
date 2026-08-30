@@ -12134,6 +12134,55 @@ func TestWriteGateEvidence_UnavailableReason_RendersNamedAbsence(t *testing.T) {
 	}
 }
 
+// TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail pins the THIRD
+// verify state (#3042 fix-up pass 2): a round carrying a verify SUMMARY but no
+// per-command run tail.
+//
+// The discrimination this test exists for is the NEGATIVE half. Folding this
+// state into the NOT-ATTACHED block would render "Compile/test state is
+// UNVERIFIED for this head" over a real passing summary — a FALSE statement
+// that teaches the reviewer to distrust genuine evidence, which is a worse
+// defect than the silent omission being fixed. So the summary must render, the
+// note must name only the missing TAIL under its own distinct machine literal,
+// and the UNVERIFIED wording must be ABSENT.
+func TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifySummary:                   &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+		VerifyEvidenceUnavailableReason: "no_verify_run_tail_in_gate_evidence",
+	})
+	for _, w := range []string{
+		"Verify summary: outcome=passed (iterations 1/3)",
+		"Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Machine reason: `no_verify_run_tail_in_gate_evidence`.",
+		"IS committed-tree evidence and STANDS",
+		"BACKEND/RUNNER-side transport gap, NOT an agent omission",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q:\n%s", w, got)
+		}
+	}
+	for _, w := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Compile/test state is UNVERIFIED for this head",
+	} {
+		if strings.Contains(got, w) {
+			t.Errorf("prompt asserts %q over a real verify summary — the two absences must stay apart:\n%s", w, got)
+		}
+	}
+}
+
+// TestWriteGateEvidence_UnavailableReason_SummaryOnlyWithoutReasonStaysSilent is
+// the companion control: with a summary and NO reason set, neither absence block
+// renders, so the new block cannot perturb an existing summary-only prompt
+// (prompt-hash replay stability).
+func TestWriteGateEvidence_UnavailableReason_SummaryOnlyWithoutReasonStaysSilent(t *testing.T) {
+	base := GateEvidence{VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3}}
+	got := implementReviewWithGateEvidence(t, &base)
+	if strings.Contains(got, "NOT ATTACHED TO THIS ROUND") {
+		t.Errorf("an absence block rendered with no reason set:\n%s", got)
+	}
+}
+
 // TestWriteGateEvidence_UnavailableReason_SuppressedWhenPopulated is the
 // byte-identity control: a populated verify path renders EXACTLY the same bytes
 // whether or not a reason is also set, so the new block cannot perturb any

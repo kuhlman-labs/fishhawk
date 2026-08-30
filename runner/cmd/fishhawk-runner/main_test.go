@@ -24318,45 +24318,75 @@ func TestValidateFixupCounterfactuals_RecordDiscarded(t *testing.T) {
 	}
 }
 
+// cfScopeN returns n DISTINCT declared-scope paths. The cap test needs identity
+// per entry, and the wire enums cannot supply it: {observed, restored} has only
+// six combinations, so a marker built from them alone repeats every six entries
+// and a retained window shifted by a multiple of six is byte-identical to the
+// first. control_path is the one per-entry field with an open (scope-bounded)
+// value space, so identity comes from the PATH and the enums only ride along.
+func cfScopeN(n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("runner/cmd/fishhawk-runner/cf_%02d.go", i))
+	}
+	return out
+}
+
 // TestValidateFixupCounterfactuals_Cap: entries past maxFixupCounterfactuals are
 // dropped with the named over_cap reason, so a pathological sidecar cannot grow
 // the reviewer prompt without bound.
 //
 // It asserts three things, not one. A cap that merely truncated to the right
-// LENGTH is not enough: a validator that retained an ARBITRARY twenty would pass
-// a len-only check. So each input entry carries a DISTINGUISHABLE pattern drawn
-// from the closed enums the wire shape allows — its {observed, restored} pair
-// cycles over the six combinations of the three observed literals and the two
-// restored values — and the retained set must be the FIRST twenty in SIDECAR
-// ORDER, position by position. And the over_cap drops are counted EXACTLY
-// (len(in)-cap, i.e. maxFixupCounterfactuals+3-maxFixupCounterfactuals = 3)
-// rather than merely looked for, so a validator that logged over_cap once and
-// dropped the rest silently — or logged it for an entry it actually retained —
-// fails here too.
+// LENGTH is not enough: a validator that retained an ARBITRARY twenty — the LAST
+// twenty, a shifted window, any permutation — would pass a len-only check. So
+// every input entry carries a UNIQUE control_path (cfScopeN), which makes the
+// retained sequence uniquely determined position by position; the {observed,
+// restored} enums still cycle alongside, but identity does NOT rest on them,
+// because six combinations cannot distinguish twenty-three positions and a
+// window shifted by six would reproduce them exactly. And the over_cap drops are
+// counted EXACTLY (len(in)-cap, i.e. maxFixupCounterfactuals+3-maxFixupCounterfactuals
+// = 3) rather than merely looked for, so a validator that logged over_cap once
+// and dropped the rest silently — or logged it for an entry it actually retained
+// — fails here too.
 func TestValidateFixupCounterfactuals_Cap(t *testing.T) {
 	cfg := fixupReportCfg()
 	const overBy = 3
+	total := maxFixupCounterfactuals + overBy
+	scope := cfScopeN(total)
 	observed := []string{"red", "green", "not_run"}
-	in := make([]fixupCounterfactualReport, 0, maxFixupCounterfactuals+overBy)
-	for i := 0; i < maxFixupCounterfactuals+overBy; i++ {
+	in := make([]fixupCounterfactualReport, 0, total)
+	for i := 0; i < total; i++ {
 		in = append(in, fixupCounterfactualReport{
-			ControlPath: "runner/cmd/fishhawk-runner/main.go",
+			ControlPath: scope[i],
 			Observed:    observed[i%len(observed)],
 			Restored:    boolPtr(i%2 == 0),
 			Record:      "mutated and saw a result",
 		})
 	}
 	var logSink strings.Builder
-	got := validateFixupCounterfactuals(cfg, in, cfScope(), &logSink)
+	got := validateFixupCounterfactuals(cfg, in, scope, &logSink)
 	if len(got) != maxFixupCounterfactuals {
 		t.Fatalf("retained = %d entries, want the cap of %d", len(got), maxFixupCounterfactuals)
 	}
-	// The retained set must be the FIRST cap entries, in order.
+	// The retained set must be the FIRST cap entries, in order — pinned by the
+	// unique path, so ANY permutation or shift is caught, not only some.
 	for i, e := range got {
-		if e.Observed != in[i].Observed || e.Restored != *in[i].Restored {
-			t.Errorf("retained[%d] = {observed:%q restored:%v}, want the sidecar's entry %d "+
-				"{observed:%q restored:%v} — the cap must keep the FIRST %d in order",
-				i, e.Observed, e.Restored, i, in[i].Observed, *in[i].Restored, maxFixupCounterfactuals)
+		if e.ControlPath != in[i].ControlPath || e.Observed != in[i].Observed || e.Restored != *in[i].Restored {
+			t.Errorf("retained[%d] = {path:%q observed:%q restored:%v}, want the sidecar's entry %d "+
+				"{path:%q observed:%q restored:%v} — the cap must keep the FIRST %d in order",
+				i, e.ControlPath, e.Observed, e.Restored,
+				i, in[i].ControlPath, in[i].Observed, *in[i].Restored, maxFixupCounterfactuals)
+		}
+	}
+	// Belt and braces on the same property from the other side: no past-cap
+	// path may appear in the retained set at all.
+	retained := make(map[string]struct{}, len(got))
+	for _, e := range got {
+		retained[e.ControlPath] = struct{}{}
+	}
+	for i := maxFixupCounterfactuals; i < total; i++ {
+		if _, ok := retained[scope[i]]; ok {
+			t.Errorf("past-cap entry %d (%s) was retained", i, scope[i])
 		}
 	}
 	if n := strings.Count(logSink.String(), `"reason":"over_cap"`); n != overBy {

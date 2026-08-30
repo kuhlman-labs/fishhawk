@@ -3493,14 +3493,32 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 // VerifyEvidenceUnavailableReason empty, so writeGateEvidence's named-absence
 // block (gated on a non-empty reason) would NOT render and the round would be
 // back to the silently-omitted verify section this change exists to end. So
-// when the mapped evidence has neither a verify run nor a verify summary this
-// returns (evidence, "no_verify_runs_in_gate_evidence") AND stamps that literal
-// onto the returned evidence's VerifyEvidenceUnavailableReason — the evidence is
-// still handed over (its counterfactuals / scope facts are real and must
-// render), but the missing verify tail is NAMED rather than absent. The second
-// return value is therefore "the reason the verify tail is unavailable", not
-// "the load failed": a non-empty reason with a NON-nil evidence is the partial
-// case, with a nil evidence the load-degrade case.
+// when the mapped evidence has no verify RUN this returns a named reason AND
+// stamps that literal onto the returned evidence's
+// VerifyEvidenceUnavailableReason — the evidence is still handed over (its
+// counterfactuals / scope facts are real and must render), but the missing
+// verify tail is NAMED rather than absent. The second return value is therefore
+// "the reason the verify tail is unavailable", not "the load failed": a
+// non-empty reason with a NON-nil evidence is a partial case, with a nil
+// evidence the load-degrade case.
+//
+// The partial case is itself TWO states, kept apart on purpose (#3042 fix-up
+// pass 2) — three verify states in total, not two:
+//
+//   - no run AND no summary -> no_verify_runs_in_gate_evidence. There is no
+//     committed-tree verify evidence of any kind, so writeGateEvidence renders
+//     the NOT-ATTACHED block, which states that compile/test state is
+//     UNVERIFIED for this head.
+//   - no run but a summary IS present -> no_verify_run_tail_in_gate_evidence.
+//     Only the per-command output tail is missing; the summary is REAL
+//     committed-tree evidence (weaker than a tail, but not nothing). Rendering
+//     the UNVERIFIED block over it would assert something FALSE and would teach
+//     the reviewer to distrust a passing summary — a worse defect than the one
+//     being fixed. So this literal is DISTINCT and draws its own short note
+//     that narrows what is missing without impeaching the summary.
+//
+// Both render blocks in writeGateEvidence are mutually exclusive on
+// VerifySummary's nil-ness, so exactly one of the three states renders.
 func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uuid.UUID) (*prompt.GateEvidence, string) {
 	if s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
 		return nil, "trace_store_not_wired"
@@ -3576,16 +3594,27 @@ func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uu
 		folded = nil
 	}
 	out := gateEvidenceForReview(ev, folded)
-	// Partial-bundle path: parsed fine, but there is no verify tail to attach.
-	// Name it on the evidence itself so writeGateEvidence renders the required
-	// named absence instead of omitting the section (see the doc comment).
-	if len(out.VerifyRuns) == 0 && out.VerifySummary == nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries no verify runs",
+	// Partial-bundle paths: the payload parsed fine, but the verify tail is
+	// wholly or partly absent. Name it on the evidence itself so
+	// writeGateEvidence renders the required named absence instead of omitting
+	// the section (see the doc comment). The two partial states are kept APART
+	// deliberately — collapsing them onto one literal would assert
+	// compile/test-state-UNVERIFIED over a real passing summary.
+	if len(out.VerifyRuns) == 0 {
+		if out.VerifySummary == nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries no verify runs",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+			out.VerifyEvidenceUnavailableReason = "no_verify_runs_in_gate_evidence"
+			return out, "no_verify_runs_in_gate_evidence"
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries a verify summary but no run tail",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 		)
-		out.VerifyEvidenceUnavailableReason = "no_verify_runs_in_gate_evidence"
-		return out, "no_verify_runs_in_gate_evidence"
+		out.VerifyEvidenceUnavailableReason = "no_verify_run_tail_in_gate_evidence"
+		return out, "no_verify_run_tail_in_gate_evidence"
 	}
 	return out, ""
 }

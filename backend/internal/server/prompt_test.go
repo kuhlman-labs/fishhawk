@@ -12291,30 +12291,85 @@ func resolverStageGateEvidenceServer(t *testing.T, runID, stageID uuid.UUID, bod
 }
 
 // TestResolveStageGateEvidence_ParsedButNoVerifyRuns is the partial-bundle
-// path: a gate_evidence payload that parses CLEANLY but carries no verify tail
-// at all (a counterfactual-only / scope-facts-only bundle, exactly what a stage
-// whose verify never ran emits).
+// path: a gate_evidence payload that parses CLEANLY but carries no verify RUN
+// tail.
 //
-// Returning ("") there is the defect — writeGateEvidence's named-absence block
-// is gated on a NON-EMPTY VerifyEvidenceUnavailableReason, so an empty reason
+// Returning ("") there is the defect — writeGateEvidence's named-absence blocks
+// are gated on a NON-EMPTY VerifyEvidenceUnavailableReason, so an empty reason
 // renders NO verify section whatsoever and the round is back to the silent
-// omission this change exists to end. So the resolver must name it: the
-// evidence is still returned (its counterfactuals are real and must render) but
-// carries no_verify_runs_in_gate_evidence, and the END-TO-END assertion is that
-// the reviewer prompt actually shows the named absence.
+// omission this change exists to end.
+//
+// THREE verify states, asserted as three, because collapsing them is itself a
+// defect (#3042 fix-up pass 2):
+//
+//   - no run AND no summary -> no_verify_runs_in_gate_evidence, and the
+//     NOT-ATTACHED block that declares compile/test state UNVERIFIED;
+//   - no run but a summary IS present -> no_verify_run_tail_in_gate_evidence,
+//     the summary RENDERED, a narrower tail-only note, and specifically NOT the
+//     UNVERIFIED wording — asserting UNVERIFIED over a real passing summary
+//     would be false and would teach the reviewer to distrust it;
+//   - a populated run tail -> the empty reason and neither block (covered by
+//     TestResolveStageGateEvidence_FoldedExtractFailureStillReturnsEvidence).
+//
+// The counterfactual-only case additionally asserts the counterfactual ROW
+// still renders. That is the whole point of returning `out` rather than nil on
+// this branch: the non-verify evidence is real and must reach the reviewer. A
+// future change that returned nil here would keep every other assertion in this
+// test green while silently discarding the payload.
 func TestResolveStageGateEvidence_ParsedButNoVerifyRuns(t *testing.T) {
+	const unverifiedBlock = "Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND"
+	const tailOnlyNote = "Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND"
 	for _, tc := range []struct {
-		name     string
-		gateJSON string
+		name       string
+		gateJSON   string
+		wantReason string
+		wantIn     []string
+		wantNotIn  []string
 	}{
 		{
 			name: "counterfactual-only",
 			gateJSON: `{"fixup_counterfactuals":[{"control_path":"backend/internal/server/prompt.go",` +
 				`"observed":"red","restored":true}]}`,
+			wantReason: "no_verify_runs_in_gate_evidence",
+			wantIn: []string{
+				unverifiedBlock,
+				"`no_verify_runs_in_gate_evidence`",
+				// The non-verify half of the payload MUST survive the branch.
+				"- backend/internal/server/prompt.go — observed: red, restored: yes",
+			},
+			wantNotIn: []string{tailOnlyNote},
 		},
 		{
-			name:     "scope-facts-only",
-			gateJSON: `{"scope_facts":{"declared_files":2}}`,
+			name:       "scope-facts-only",
+			gateJSON:   `{"scope_facts":{"declared_files":2}}`,
+			wantReason: "no_verify_runs_in_gate_evidence",
+			wantIn: []string{
+				unverifiedBlock,
+				"`no_verify_runs_in_gate_evidence`",
+				"- declared scope.files: 2",
+			},
+			wantNotIn: []string{tailOnlyNote},
+		},
+		{
+			// The state gpt named: a summary but no per-run tail. It must NOT
+			// take the UNVERIFIED block — the summary is real evidence.
+			name: "summary-only",
+			gateJSON: `{"verify_summary":{"outcome":"passed","iterations":1,"max_iterations":3,` +
+				`"detail":"SUMMARY_ONLY_DETAIL_SENTINEL"}}`,
+			wantReason: "no_verify_run_tail_in_gate_evidence",
+			wantIn: []string{
+				tailOnlyNote,
+				"`no_verify_run_tail_in_gate_evidence`",
+				// The summary itself still renders, verbatim.
+				"Verify summary: outcome=passed (iterations 1/3) — detail: SUMMARY_ONLY_DETAIL_SENTINEL",
+				"IS committed-tree evidence and STANDS",
+			},
+			wantNotIn: []string{
+				// The UNVERIFIED claim must never be asserted over a summary.
+				unverifiedBlock,
+				"Compile/test state is UNVERIFIED for this head",
+				"`no_verify_runs_in_gate_evidence`",
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -12324,24 +12379,28 @@ func TestResolveStageGateEvidence_ParsedButNoVerifyRuns(t *testing.T) {
 			if ev == nil {
 				t.Fatal("evidence = nil, want the parsed evidence still returned (its non-verify content is real)")
 			}
-			if reason != "no_verify_runs_in_gate_evidence" {
-				t.Errorf("reason = %q, want no_verify_runs_in_gate_evidence", reason)
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
 			}
-			if ev.VerifyEvidenceUnavailableReason != "no_verify_runs_in_gate_evidence" {
-				t.Errorf("VerifyEvidenceUnavailableReason = %q, want it STAMPED on the returned evidence — "+
+			if ev.VerifyEvidenceUnavailableReason != tc.wantReason {
+				t.Errorf("VerifyEvidenceUnavailableReason = %q, want it STAMPED on the returned evidence as %q — "+
 					"the caller only allocates a reason-carrying evidence when this one is nil",
-					ev.VerifyEvidenceUnavailableReason)
+					ev.VerifyEvidenceUnavailableReason, tc.wantReason)
 			}
 			// The point of the reason is what the reviewer SEES: render it.
 			out, berr := prompt.Build("implement_review", prompt.Trigger{GateEvidence: ev})
 			if berr != nil {
 				t.Fatal(berr)
 			}
-			if !strings.Contains(out, "Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND") {
-				t.Errorf("rendered prompt is missing the named-absence block:\n%s", out)
+			for _, want := range tc.wantIn {
+				if !strings.Contains(out, want) {
+					t.Errorf("rendered prompt is missing %q:\n%s", want, out)
+				}
 			}
-			if !strings.Contains(out, "`no_verify_runs_in_gate_evidence`") {
-				t.Errorf("rendered prompt does not name the machine reason:\n%s", out)
+			for _, notWant := range tc.wantNotIn {
+				if strings.Contains(out, notWant) {
+					t.Errorf("rendered prompt carries %q, which this state must NOT claim:\n%s", notWant, out)
+				}
 			}
 		})
 	}

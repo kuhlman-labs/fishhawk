@@ -1021,6 +1021,16 @@ type GateEvidence struct {
 	// instead of silently omitting the section: an omitted section is what let
 	// reviewers re-raise "the agent attached no evidence" against every new
 	// head. Empty (the byte-identical default) on every populated path.
+	//
+	// It names TWO distinct absences, discriminated by VerifySummary (#3042
+	// fix-up pass 2). With a nil VerifySummary it means there is no
+	// committed-tree verify evidence AT ALL and the NOT-ATTACHED block states
+	// compile/test state is UNVERIFIED. With a NON-nil VerifySummary only the
+	// per-command run TAIL is missing: the summary is real evidence and stands,
+	// so a separate, narrower note renders instead — asserting UNVERIFIED over a
+	// passing summary would be false and would teach the reviewer to distrust
+	// it. The literals are correspondingly distinct
+	// (no_verify_runs_in_gate_evidence vs no_verify_run_tail_in_gate_evidence).
 	VerifyEvidenceUnavailableReason string
 	// ScopeProvenance decomposes the declared scope.files count into its
 	// provenance (#1914) so the implement reviewer can machine-classify a
@@ -5121,6 +5131,30 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			fmt.Fprintf(b, " — detail: %s", ev.VerifySummary.Detail)
 		}
 		b.WriteString("\n\n")
+	}
+
+	// Named verify-RUN-TAIL absence (#3042 fix-up pass 2). The THIRD verify
+	// state, between "full evidence" and "nothing at all": the round carries a
+	// verify SUMMARY (rendered directly above) but no per-command run tail.
+	//
+	// This is deliberately NOT folded into the NOT-ATTACHED block above. That
+	// block states compile/test state is UNVERIFIED for this head — a statement
+	// that is FALSE when a summary is present, because the summary IS real
+	// committed-tree evidence, weaker than a tail but not nothing. Asserting
+	// UNVERIFIED over a passing summary would teach the reviewer to distrust it,
+	// turning a true signal into noise. So this note narrows what is missing
+	// (the per-command output) WITHOUT impeaching the summary, and carries its
+	// own distinct machine literal. The two blocks are mutually exclusive on
+	// VerifySummary's nil-ness, so exactly one of the three states renders.
+	if ev.VerifyEvidenceUnavailableReason != "" && len(ev.VerifyRuns) == 0 && ev.VerifySummary != nil {
+		fmt.Fprintf(b, "Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND. "+
+			"Machine reason: `%s`.\n\n", ev.VerifyEvidenceUnavailableReason)
+		b.WriteString("- The verify SUMMARY immediately above IS committed-tree evidence and STANDS. This note " +
+			"narrows what is missing — the per-command output tail — and does NOT put the summary's outcome in " +
+			"doubt. Do NOT report compile/test state as unverified on the strength of this note.\n")
+		b.WriteString("- This absence is a BACKEND/RUNNER-side transport gap, NOT an agent omission. You MUST " +
+			"NOT raise \"the agent attached no evidence\" (or any equivalent unverifiable-evidence finding) as " +
+			"an agent defect.\n\n")
 	}
 
 	if ev.FlakeRetries > 0 {
