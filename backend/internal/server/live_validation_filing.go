@@ -496,13 +496,34 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 // pre-File 422 or a post-File 502 alike) routes to the filing_failure linked
 // marker, never to a second differently-shaped walk.
 //
-// RESIDUAL: on the epic arm the File itself can still fail (a provider 502),
-// which routes to the filing_failure marker (the operator files by hand), NOT to
-// a companion retry — a second attempt within one approval would reopen the
-// same-approval double-file window. The cap decision no longer fails at file
-// time: {n} is allocated under the held lock BEFORE File, so the resolvable-but-
-// unattachable cases (full, unreadable, non-numbered children) are resolved to
-// companion in resolveWalkParentEpic rather than surfacing as an at-file 422.
+// RESIDUAL — two distinct cases, stated precisely (high/concurrency, #2179
+// fix-up). The earlier comment here overclaimed; both are corrected:
+//
+//  1. A provider CreateIssue failure (a 502) is the ONLY fatal File step; it
+//     routes to the filing_failure marker (the operator files by hand), NOT to a
+//     companion retry — a second attempt within one approval would reopen the
+//     same-approval double-file window.
+//  2. The CROSS-PROCESS cap window is NARROWED, not closed. Allocating {n} under
+//     the held lock BEFORE File resolves the resolvable-but-unattachable cases
+//     (full, unreadable, non-numbered children) to companion WITHIN THIS DAEMON —
+//     so the cap decision no longer fails at file time for filers THIS process
+//     serializes. It does NOT close the window against writers this process
+//     cannot see (another fishhawkd instance, a human adding a sub-issue in the
+//     GitHub UI, the grooming apply hook) reaching the cap between our locked read
+//     and our File. In that window applyAndFileWorkItem's File still CREATES the
+//     [E<epic>.<n>] issue, and the epic attach (Provider.File's linkEpic /
+//     AddSubIssue) is NON-fatal: GitHub rejects the 101st addSubIssue as
+//     ErrValidation, captured as created.EpicLinkError (a WARN, not a File error).
+//     The outcome is a filed-but-UNPARENTED walk — NOT a filing_failure and NOT a
+//     companion, so binding condition 4's companion-degrade is not honored in this
+//     residual window. Closing it needs create-then-attach as SEPARATE
+//     workmgmt.Provider steps (so a cap refusal degrades to a re-LINK, not a
+//     re-FILE that would violate the #2045 single-filing invariant); that is a
+//     provider-seam change out of #2179's scope, and is DECLINED here rather than
+//     silently substituting the operator-pre-rejected lock-tighter-only design.
+//     A filed unparented walk is still a better outcome than a hook that errors,
+//     and the residual is rare and visible via the EpicLinkError WARN. See
+//     backend/internal/server/README.md.
 func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (string, bool) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {

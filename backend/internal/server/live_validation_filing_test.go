@@ -756,6 +756,16 @@ func TestFileOrLinkLiveValidationWalk_EpicArm(t *testing.T) {
 	if len(req.Item.Title) < len(wantPrefix) || req.Item.Title[:len(wantPrefix)] != wantPrefix {
 		t.Errorf("walk title = %q, want prefix %q (the epic's discovered child number)", req.Item.Title, wantPrefix)
 	}
+	// Deterministic full title (approval condition 2, low/untested-path fix-up):
+	// {n}=4 is allocated under the HELD per-epic lock and passed EXPLICITLY, so
+	// deriveChildNumberTitleVar must short-circuit (not re-take the non-reentrant
+	// lock — a re-entry regression DEADLOCKS this synchronous call and times the
+	// test out). Asserting the exact rendered title pins that the locked-allocated
+	// {n} reached the filed item rather than "whatever came back".
+	wantTitle := "[E48.4] Operator live-validation walk for #" + strconv.Itoa(liveValParentIssue)
+	if req.Item.Title != wantTitle {
+		t.Errorf("walk title = %q, want exactly %q (locked-allocated {n} rendered)", req.Item.Title, wantTitle)
+	}
 	linked, ok := h.newestLinked(t)
 	if !ok || linked.FilingFailed || linked.WalkRef == "" {
 		t.Errorf("linked marker = %+v (ok=%v), want a healthy walk_ref", linked, ok)
