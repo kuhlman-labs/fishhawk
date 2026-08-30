@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -58,19 +59,44 @@ func (p *liveValFileProvider) File(_ context.Context, req workmgmt.ProviderReque
 	}, nil
 }
 
-// newLiveValIssueGitHub returns a GitHub client whose GetIssue answers with the
-// given title (so deriveEpicTitleVar can resolve {epic} from a leading [E<n>]
-// token — the epic-parented branch). Every other endpoint 404s.
-func newLiveValIssueGitHub(t *testing.T, title string) *githubclient.Client {
+// liveValParentFixture configures the GraphQL IssueParent answer newLiveValGitHub
+// serves for the epic-arm tests: a populated parent (number+title), a null
+// parent (parent nil → the null-parent fallback mode), or an errors envelope
+// (errs → the IssueParent-error fallback mode).
+type liveValParentFixture struct {
+	number int
+	title  string
+	errs   bool
+}
+
+// newLiveValGitHub returns a GitHub client that serves BOTH the REST GetIssue
+// (answering restTitle — kept so the pre-#2179 callers are unaffected) AND the
+// GraphQL IssueParent query resolveWalkParentEpic issues. `parent` drives the
+// IssueParent answer; a nil parent serves `parent:null` (the null-parent
+// fallback mode). Every other endpoint 404s.
+func newLiveValGitHub(t *testing.T, restTitle string, parent *liveValParentFixture) *githubclient.Client {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}",
 		func(w http.ResponseWriter, r *http.Request) {
 			num, _ := strconv.Atoi(r.PathValue("number"))
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"number": num, "title": title, "body": "", "state": "open",
+				"number": num, "title": restTitle, "body": "", "state": "open",
 			})
 		})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case parent != nil && parent.errs:
+			_, _ = io.WriteString(w, `{"errors":[{"message":"Field 'parent' doesn't exist on type 'Issue'"}]}`)
+		case parent == nil:
+			_, _ = io.WriteString(w, `{"data":{"repository":{"issue":{"parent":null}}}}`)
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
+				"issue": map[string]any{"parent": map[string]any{"number": parent.number, "title": parent.title}},
+			}}})
+		}
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &githubclient.Client{
@@ -78,6 +104,34 @@ func newLiveValIssueGitHub(t *testing.T, title string) *githubclient.Client {
 		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
 	}
+}
+
+// liveValEpicFileProvider is liveValFileProvider PLUS the EpicChildrenQuerier
+// capability, so resolveWalkParentEpic's mode-6 pre-check passes and
+// deriveChildNumberTitleVar can discover a deterministic {n} under the epic. It
+// EMBEDS the file provider so File/Name and the call/req counters are shared —
+// h.provider still points at the embedded value.
+type liveValEpicFileProvider struct {
+	*liveValFileProvider
+	children    []workmgmt.EpicChild
+	childrenErr error
+}
+
+func (p *liveValEpicFileProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	if p.childrenErr != nil {
+		return nil, p.childrenErr
+	}
+	return &workmgmt.EpicChildrenResult{Children: p.children}, nil
+}
+
+// numberedEpicChildren builds n children titled [E<epic>.1..n] so
+// NextChildNumber deterministically allocates <epic>.<n+1>.
+func numberedEpicChildren(epic string, n int) []workmgmt.EpicChild {
+	out := make([]workmgmt.EpicChild, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, workmgmt.EpicChild{Number: 1000 + i, Title: fmt.Sprintf("[E%s.%d] child %d", epic, i, i)})
+	}
+	return out
 }
 
 type liveValConfig struct {
@@ -89,6 +143,12 @@ type liveValConfig struct {
 	// leaving the intent-marker append (a distinct category) to succeed — the
 	// partial-failure interleaving.
 	linkedAppendFail bool
+	// providerQuerier registers the EpicChildrenQuerier-capable provider variant
+	// (serving epicChildren / epicChildrenErr) instead of the plain file provider,
+	// so the epic arm's mode-6 pre-check and {n} discovery are reachable.
+	providerQuerier bool
+	epicChildren    []workmgmt.EpicChild
+	epicChildrenErr error
 }
 
 type liveValHarness struct {
@@ -135,7 +195,11 @@ func liveValPlanBytes(t *testing.T, marked bool) []byte {
 func newLiveValHarness(t *testing.T, cfg liveValConfig) *liveValHarness {
 	t.Helper()
 	provider := &liveValFileProvider{name: workmgmt.Default().Provider, fail: cfg.providerFail}
-	workmgmt.Register(provider)
+	if cfg.providerQuerier {
+		workmgmt.Register(&liveValEpicFileProvider{liveValFileProvider: provider, children: cfg.epicChildren, childrenErr: cfg.epicChildrenErr})
+	} else {
+		workmgmt.Register(provider)
+	}
 
 	au := newAuditFake()
 	if cfg.linkedAppendFail {
@@ -369,10 +433,10 @@ func TestFileOrLinkLiveValidationWalk_NoMarkedCriterion_NoOp(t *testing.T) {
 // high/correctness — the walk must not parent to the triggering E48.35 CHILD):
 // the walk is filed as a SINGLE companion-link to the triggering issue — never
 // parented to it — with a self-consistent [E<issue>.1] title. This holds whether
-// or not a GitHub client is wired: the old "derivable" epic-parented branch is
-// gone (true epic-parenting needs an out-of-scope sub-issue-parent query), so a
-// resolvable [E48.35] title no longer produces an [E48.1]-titled walk parented to
-// #2045. Exactly one walk is filed either way.
+// or not a GitHub client is wired: with no client, mode 1 fires; with a client
+// wired whose GraphQL IssueParent answers a NULL parent (this fixture), mode 4
+// fires. Either way the walk companion-links; exactly one walk is filed. (The
+// derivable-epic HAPPY path is TestFileOrLinkLiveValidationWalk_EpicArm.)
 func TestFileOrLinkLiveValidationWalk_CompanionLink(t *testing.T) {
 	parentRef := "#" + strconv.Itoa(liveValParentIssue)
 	wantTitlePrefix := "[E" + strconv.Itoa(liveValParentIssue) + ".1]"
@@ -389,10 +453,9 @@ func TestFileOrLinkLiveValidationWalk_CompanionLink(t *testing.T) {
 			inst := int64(77)
 			cfg := liveValConfig{marked: true, installID: &inst}
 			if tc.withGitHub {
-				// Even when the triggering issue's [E48.35] title WOULD have
-				// resolved {epic}=48 for the old parent-epic branch, the walk still
-				// companion-links — it is never parented to the #2045 child.
-				cfg.github = newLiveValIssueGitHub(t, "[E48.35] first-class live-validation criteria")
+				// A GitHub client is wired but its GraphQL IssueParent answers a
+				// NULL parent, so resolveWalkParentEpic takes mode 4 → companion.
+				cfg.github = newLiveValGitHub(t, "[E48.35] first-class live-validation criteria", nil)
 			}
 			h := newLiveValHarness(t, cfg)
 			h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
@@ -427,7 +490,7 @@ func TestFileOrLinkLiveValidationWalk_CompanionLink(t *testing.T) {
 // design must call File exactly once regardless.
 func TestFileOrLinkLiveValidationWalk_SingleFilingNoDoubleFile(t *testing.T) {
 	inst := int64(77)
-	gh := newLiveValIssueGitHub(t, "[E48.35] first-class live-validation criteria")
+	gh := newLiveValGitHub(t, "[E48.35] first-class live-validation criteria", nil)
 	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, github: gh, providerFail: true})
 	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
 
@@ -628,5 +691,194 @@ func TestFileOrLinkLiveValidationWalk_IntentAppendFailure(t *testing.T) {
 	}
 	if h.markerCount(liveValidationWalkLinkedKind) != 0 {
 		t.Errorf("linked markers written, want 0 when the intent append failed")
+	}
+}
+
+// --- epic-arm parenting (#2179) -------------------------------------------
+
+// liveValEpicFixture is the shared happy-epic setup: a GraphQL IssueParent
+// answering the [E48] epic #1940, a querier provider with three numbered
+// children so {n} deterministically discovers 4.
+func liveValEpicHarness(t *testing.T, extra func(*liveValConfig)) *liveValHarness {
+	t.Helper()
+	inst := int64(77)
+	cfg := liveValConfig{
+		marked:          true,
+		installID:       &inst,
+		github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] SDLC dogfooding"}),
+		providerQuerier: true,
+		epicChildren:    numberedEpicChildren("48", 3),
+	}
+	if extra != nil {
+		extra(&cfg)
+	}
+	return newLiveValHarness(t, cfg)
+}
+
+// TestFileOrLinkLiveValidationWalk_EpicArm (T1, the DONE-MEANS test + the
+// binding counterfactual target): with the triggering child's sub-issue parent
+// resolving to the [E48] epic #1940, the walk is filed EXACTLY once, parented to
+// the EPIC (#1940) — NOT the triggering child #2045 — with CompanionTo empty and
+// the rendered title carrying the real epic's discovered [E48.4] prefix.
+func TestFileOrLinkLiveValidationWalk_EpicArm(t *testing.T) {
+	h := liveValEpicHarness(t, nil)
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d walks, want exactly 1", len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if req.Item.Relations.ParentEpic != "#1940" {
+		t.Errorf("parent_epic = %q, want #1940 (the EPIC, not the triggering child)", req.Item.Relations.ParentEpic)
+	}
+	if len(req.Item.Relations.CompanionTo) != 0 {
+		t.Errorf("companion_to = %v, want empty on the epic arm", req.Item.Relations.CompanionTo)
+	}
+	const wantPrefix = "[E48.4]"
+	if len(req.Item.Title) < len(wantPrefix) || req.Item.Title[:len(wantPrefix)] != wantPrefix {
+		t.Errorf("walk title = %q, want prefix %q (the epic's discovered child number)", req.Item.Title, wantPrefix)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || linked.FilingFailed || linked.WalkRef == "" {
+		t.Errorf("linked marker = %+v (ok=%v), want a healthy walk_ref", linked, ok)
+	}
+}
+
+// assertCompanionArm asserts the walk was filed EXACTLY once with the unchanged
+// companion shape: parent_epic empty, companion_to == [#2045], title [E2045.1].
+func assertCompanionArm(t *testing.T, h *liveValHarness) {
+	t.Helper()
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if h.provider.calls != 1 {
+		t.Fatalf("provider File called %d times, want exactly 1", h.provider.calls)
+	}
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d walks, want exactly 1", len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if req.Item.Relations.ParentEpic != "" {
+		t.Errorf("parent_epic = %q, want empty (companion arm)", req.Item.Relations.ParentEpic)
+	}
+	parentRef := "#" + strconv.Itoa(liveValParentIssue)
+	if len(req.Item.Relations.CompanionTo) != 1 || req.Item.Relations.CompanionTo[0] != parentRef {
+		t.Errorf("companion_to = %v, want [%s]", req.Item.Relations.CompanionTo, parentRef)
+	}
+	wantPrefix := "[E" + strconv.Itoa(liveValParentIssue) + ".1]"
+	if len(req.Item.Title) < len(wantPrefix) || req.Item.Title[:len(wantPrefix)] != wantPrefix {
+		t.Errorf("walk title = %q, want prefix %q (self-consistent companion)", req.Item.Title, wantPrefix)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_FallbackModes drives one companion-arm test
+// per resolveWalkParentEpic fallback mode (#2179 + binding condition 4). Each
+// asserts the UNCHANGED companion shape and exactly one File call.
+func TestFileOrLinkLiveValidationWalk_FallbackModes(t *testing.T) {
+	inst := int64(77)
+
+	t.Run("no_github_client", func(t *testing.T) { // mode 1
+		h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, providerQuerier: true})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("zero_scope", func(t *testing.T) { // mode 2: github wired but no installation → zero scope
+		h := newLiveValHarness(t, liveValConfig{
+			marked:          true, // installID intentionally nil so target.Scope stays zero
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] x"}),
+			providerQuerier: true, epicChildren: numberedEpicChildren("48", 3),
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("issue_parent_error", func(t *testing.T) { // mode 3
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{errs: true}),
+			providerQuerier: true, epicChildren: numberedEpicChildren("48", 3),
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("null_parent", func(t *testing.T) { // mode 4
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", nil),
+			providerQuerier: true, epicChildren: numberedEpicChildren("48", 3),
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("child_form_parent_title", func(t *testing.T) { // mode 5: parent is another CHILD [E48.35]
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 999, title: "[E48.35] a sibling child"}),
+			providerQuerier: true, epicChildren: numberedEpicChildren("48", 3),
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("provider_without_querier", func(t *testing.T) { // mode 6
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] x"}),
+			providerQuerier: false, // plain provider: no EpicChildrenQuerier
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("full_epic", func(t *testing.T) { // mode 7 (binding condition 4): epic at the 100 sub-issue cap
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] x"}),
+			providerQuerier: true, epicChildren: numberedEpicChildren("48", githubSubIssueParentCap),
+		})
+		assertCompanionArm(t, h)
+	})
+
+	t.Run("epic_children_error", func(t *testing.T) { // mode 7: child count unreadable
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] x"}),
+			providerQuerier: true, epicChildrenErr: errors.New("epic children: injected transport error"),
+		})
+		assertCompanionArm(t, h)
+	})
+}
+
+// TestFileOrLinkLiveValidationWalk_EpicArmSingleFilingUnderFailure (T8): an
+// epic-arm filing whose provider.File FAILS calls File EXACTLY once and records
+// filing_failed with an empty ref — the single-filing invariant under the new arm.
+func TestFileOrLinkLiveValidationWalk_EpicArmSingleFilingUnderFailure(t *testing.T) {
+	h := liveValEpicHarness(t, func(c *liveValConfig) { c.providerFail = true })
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Errorf("provider File called %d times, want exactly 1 on the epic arm under a File failure", h.provider.calls)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed || linked.WalkRef != "" {
+		t.Errorf("linked marker = %+v (ok=%v), want filing_failed with an empty ref", linked, ok)
+	}
+}
+
+// TestLiveValidationWalkBody_CompanionByteIdentity (binding condition 3): the
+// companion-arm body is byte-IDENTICAL to the frozen pre-#2179 output, so the
+// fallback arm that fires today for every walk is unchanged.
+func TestLiveValidationWalkBody_CompanionByteIdentity(t *testing.T) {
+	crits := []plan.AcceptanceCriterion{
+		{ID: "ac1", Statement: "the webhook fires on a real push"},
+		{ID: "ac2", Statement: "the response is 200"},
+	}
+	const want = "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
+		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
+		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
+		"operator live check so nothing ships silently unvalidated (#2045).\n\n" +
+		"Companion to #2045.\n\n" +
+		"## Done-means\n\nEach criterion below has been live-validated by the operator against the real target:\n\n" +
+		"- [ ] `ac1` — the webhook fires on a real push\n" +
+		"- [ ] `ac2` — the response is 200\n"
+	// epicRef is ignored on the companion arm; pass a non-empty value to prove it.
+	got := liveValidationWalkBody("#2045", "#1940", crits, true)
+	if got != want {
+		t.Errorf("companion body drifted from the frozen golden.\n got: %q\nwant: %q", got, want)
 	}
 }
