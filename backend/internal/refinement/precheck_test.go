@@ -213,8 +213,20 @@ func TestEvaluateDraftCriteria_MissingLiveValidationMarker_SurfacedAtIntake(t *t
 //
 // The plan for this change expected case 1 to be a positive assertion (an
 // all-skip draft PRODUCING the finding). It cannot be: the intake shape has no
-// channel for the skip markers. Asserting the inertness is the honest and
-// stronger statement, and it is what the counterfactual below discriminates on.
+// channel for the skip markers, so asserting the inertness is the honest
+// statement.
+//
+// It is however NOT a discriminating control, and an earlier revision of this
+// comment wrongly implied it was: because the finding never appears here, the
+// assertions above stay green whether or not the rule is made blocking, so the
+// mandated "make it blocking, watch it go red" counterfactual is unattainable
+// ON THIS TEST. TestChildNeedsAttention_AllSkipFindingIsNotBlocking below is
+// the refinement-side control that CAN go red — it drives the same production
+// needs-attention derivation (childNeedsAttention) over findings the real
+// shared evaluator produced from a genuine all-skip plan.Verification. This
+// test's job is narrower and still worth keeping: it pins the intake-shape
+// invariant, so a future draft field that DOES carry skip markers is a
+// deliberate change rather than an accident.
 func TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked(t *testing.T) {
 	d := EpicDraft{
 		Epic: EpicSpec{Summary: "e", Scope: "s"},
@@ -257,4 +269,84 @@ func TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked(t *testing.T) {
 	if childFinding(mixed, 1, plan.RuleAllCriteriaSkipExpected) != nil {
 		t.Errorf("all_criteria_skip_expected fired on a mixed draft: %+v", mixed.Children[0].Findings)
 	}
+}
+
+// TestChildNeedsAttention_AllSkipFindingIsNotBlocking is CONDITION 1's
+// refinement half made NON-VACUOUS (#3026 fix-up).
+//
+// The sibling test above honestly records that all_criteria_skip_expected is
+// structurally INERT through EvaluateDraftCriteria — the intake
+// []string -> plan.Verification mapping sets no skip markers, so the finding
+// can never appear there — but that inertness is exactly why it cannot
+// discriminate: its NeedsAttention assertions stay green whether or not the
+// rule is blocking, so the mandated "make it blocking, watch it go red"
+// counterfactual is unattainable on it.
+//
+// This test can discriminate. It builds a REAL all-skip plan.Verification, runs
+// the SHARED evaluator so the finding is genuinely PRESENT in the findings it
+// asserts on, and then drives refinement's ACTUAL needs-attention derivation —
+// childNeedsAttention, the very function EvaluateDraftCriteria calls — over
+// those findings, asserting the NON-BLOCKED outcome directly.
+//
+// COUNTERFACTUAL (run, observed red, restored): adding
+// `|| f.Rule == plan.RuleAllCriteriaSkipExpected` to childNeedsAttention in
+// precheck.go makes the load-bearing assertion below fail.
+func TestChildNeedsAttention_AllSkipFindingIsNotBlocking(t *testing.T) {
+	v := plan.Verification{
+		AcceptanceCriteria: []plan.AcceptanceCriterion{
+			{
+				ID:               "a1",
+				Statement:        "the payload records the headline",
+				SkipExpected:     true,
+				ExpectationBasis: "covered by the server payload unit test",
+			},
+			{
+				ID:               "a2",
+				Statement:        "the renderer emits the consequence line",
+				SkipExpected:     true,
+				ExpectationBasis: "covered by the prompt render unit test",
+			},
+		},
+	}
+
+	findings := plan.EvaluateAcceptanceCriteria(v)
+
+	// PRECONDITION: the finding is genuinely PRESENT, so the assertion below is
+	// about the rule being advisory — not about the rule being absent. Without
+	// this the test would be vacuous in the same way its sibling is.
+	present := false
+	for _, f := range findings {
+		if f.Rule == plan.RuleAllCriteriaSkipExpected {
+			present = true
+			break
+		}
+	}
+	if !present {
+		t.Fatalf("want an all_criteria_skip_expected finding on an all-skip verification; got %+v", findings)
+	}
+
+	// NON-BLOCKED OUTCOME, through the real refinement seam.
+	if childNeedsAttention(findings) {
+		t.Errorf("childNeedsAttention = true on findings carrying all_criteria_skip_expected; the rule is ADVISORY and must never mark a child (and so the draft) needs_attention: %+v", findings)
+	}
+
+	// Control: the one rule that DOES flip the marker still does, so a green
+	// above cannot come from childNeedsAttention having stopped working.
+	blocking := plan.EvaluateAcceptanceCriteria(plan.Verification{})
+	if f := findingFor(blocking, plan.RuleNoBlockingCriterion); f == nil {
+		t.Fatalf("want a no_blocking_criterion finding on an empty verification; got %+v", blocking)
+	}
+	if !childNeedsAttention(blocking) {
+		t.Errorf("childNeedsAttention = false on findings carrying no_blocking_criterion; the intake trigger must still fire: %+v", blocking)
+	}
+}
+
+// findingFor returns the first finding of the given rule, or nil.
+func findingFor(findings []plan.AcceptanceFinding, rule string) *plan.AcceptanceFinding {
+	for i := range findings {
+		if findings[i].Rule == rule {
+			return &findings[i]
+		}
+	}
+	return nil
 }

@@ -76,13 +76,7 @@ func EvaluateDraftCriteria(d EpicDraft) CriteriaPrecheck {
 			AcceptanceCriteria: mapped,
 			OutOfScope:         oos,
 		})
-		childFlagged := false
-		for _, f := range findings {
-			if f.Rule == plan.RuleNoBlockingCriterion {
-				childFlagged = true
-				break
-			}
-		}
+		childFlagged := childNeedsAttention(findings)
 		if childFlagged {
 			needsAttention = true
 		}
@@ -97,4 +91,27 @@ func EvaluateDraftCriteria(d EpicDraft) CriteriaPrecheck {
 		NeedsAttention: needsAttention,
 		Children:       children,
 	}
+}
+
+// childNeedsAttention reports whether one child's pre-check findings include
+// the ONE rule that flips the intake needs-attention marker:
+// no_blocking_criterion, the issue's trigger (an unjustified missing blocking
+// criterion). EVERY other rule in the shared set — including the advisory
+// acceptance rules undecidable_criterion, missing_live_validation_marker and
+// all_criteria_skip_expected — RENDERS in the preview without marking the child
+// or the draft needs_attention.
+//
+// This is a named function rather than the inline loop it replaces so that the
+// non-blocking property is directly testable against findings the REAL shared
+// evaluator produced, including finding shapes the intake
+// []string -> plan.Verification mapping cannot itself construct — all-skip
+// being exactly such a shape, since the mapping sets no skip markers (#3026).
+// Behaviour is unchanged.
+func childNeedsAttention(findings []plan.AcceptanceFinding) bool {
+	for _, f := range findings {
+		if f.Rule == plan.RuleNoBlockingCriterion {
+			return true
+		}
+	}
+	return false
 }

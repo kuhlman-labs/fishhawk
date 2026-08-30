@@ -1411,6 +1411,17 @@ type GateViolation struct {
 // having verified ZERO criteria. It renders one extra CONSEQUENCE line and
 // renders NOTHING when false, so the gate-evidence bytes stay byte-identical
 // for every other plan.
+//
+// INVARIANT: AllSkipShortCircuit is DERIVED from the all_criteria_skip_expected
+// finding by the server's runAcceptancePrecheck — it is never set
+// independently, so true implies Findings carries that finding. The renderer
+// deliberately does NOT re-check the findings list before writing the
+// CONSEQUENCE line, so a hand-constructed value that sets the flag true with an
+// empty Findings would render the consequence immediately followed by
+// "findings: none (checked and clean)". That block is self-contradictory and is
+// unreachable on the real path; a caller that ever populates this struct from
+// somewhere other than the finding must preserve the invariant or add the
+// guard.
 type AcceptancePrecheckEvidence struct {
 	AcceptanceStageID   string
 	CriteriaCount       int
