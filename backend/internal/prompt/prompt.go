@@ -6122,8 +6122,14 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment, issueURL st
 // non-http(s) scheme ("javascript:…", "ftp://…") likewise fails and degrades to
 // the safe sentence — we never emit a partially-scrubbed URL or the raw value.
 // neutralizeEnvelopeDelimiters is kept on whatever is emitted as defense in
-// depth. Pure and deterministic, so the package's byte-identical-replay
-// invariant holds.
+// depth, and that layer is NOT vestigial: a `<<<`/`>>>` run in the URL's QUERY
+// component (e.g. "…/issues/1?q=<<<x>>>") round-trips url.Parse byte-for-byte —
+// net/url does not percent-escape `<`/`>` in a query — so the allow-list
+// ACCEPTS it and the run reaches the rendered line, where neutralizeEnvelopeDelimiters
+// defangs it so an accepted URL still cannot forge a `<<<END …>>>` delimiter.
+// TestBuild_Plan_PerComment_RetrievalURLAllowList/accepted_delimiter_url_neutralized
+// pins that surviving case as a distinct discriminator. Pure and deterministic,
+// so the package's byte-identical-replay invariant holds.
 func issueCommentRetrievalPointer(issueURL string) string {
 	const agnostic = "To read the full comment, open the issue thread on the forge. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments."
 	if u, err := url.Parse(issueURL); err == nil &&
