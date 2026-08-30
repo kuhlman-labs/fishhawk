@@ -657,6 +657,143 @@ func TestE2E_Fixup_OperatorConcernMintedToDurableStore(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_WaivedConcernsSuppressHintAndAgreeWithGateView is the #3043
+// cross-boundary seam the per-layer units cannot cover: concern store → run
+// HTTP response → MCP review-action hint → next_actions classifier, with the
+// gate view read at the same instant. It drives an implement review that lands
+// approve_with_concerns with 2 concerns (BOTH in the audit AND the durable
+// store), asserts review_action_hint.concerns == 2 from the AUTHORITATIVE store
+// (source=store) and next_actions.state == implement_concerns_open; then WAIVES
+// every concern through the REAL waive path (fishhawk_waive_concern) and asserts
+// on a fresh snapshot that the hint is ABSENT, next_actions is NOT
+// implement_concerns_open, the run.concerns block is present with open:0 /
+// open_implement:0, AND fishhawk_get_gate_view returns open:[] — the two
+// surfaces agreeing at one instant, the defect's done-means.
+func TestE2E_Fixup_WaivedConcernsSuppressHintAndAgreeWithGateView(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// Implement stage parked at the review gate.
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	// The audit records the approve_with_concerns verdict (what the audit
+	// fallback would count), AND the durable store holds the two OPEN
+	// implement-stage concern rows (the authoritative set).
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "guard the nil stage"},
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "rename the var"})
+	rows, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                fx.runID,
+		StageID:              stage.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns: []concern.RaisedConcern{
+			{Severity: "medium", Category: "scope", Note: "guard the nil stage"},
+			{Severity: "low", Category: "style", Note: "rename the var"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("seeded concern rows = %d, want 2", len(rows))
+	}
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// Before waiving: the hint reports 2 from the AUTHORITATIVE store.
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatalf("review_action_hint absent; want a populated hint with 2 concerns")
+	}
+	if hint.Concerns != 2 {
+		t.Errorf("review_action_hint.concerns = %d, want 2", hint.Concerns)
+	}
+	if hint.Source != "store" {
+		t.Errorf("review_action_hint.source = %q, want store (a wired concern store is authoritative)", hint.Source)
+	}
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open" {
+		t.Fatalf("next_actions = %+v, want implement_concerns_open before waiving", na)
+	}
+
+	// Waive BOTH concerns through the REAL waive path.
+	for _, row := range rows {
+		res, werr := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: "fishhawk_waive_concern",
+			Arguments: map[string]any{
+				"concern_id": row.ID.String(),
+				"reason":     "accepted trade-off; not blocking the merge",
+			},
+		})
+		if werr != nil {
+			t.Fatalf("CallTool fishhawk_waive_concern: %v", werr)
+		}
+		if res.IsError {
+			t.Fatalf("waive tool returned error: %s", toolContentString(t, res))
+		}
+	}
+
+	// After waiving: the hint is SUPPRESSED and next_actions is no longer
+	// implement_concerns_open — the two surfaces agree the gate is clear.
+	if hint := getReviewActionHint(t, ctx, session, fx.runID); hint != nil {
+		t.Errorf("review_action_hint = %+v, want ABSENT after every concern is waived (the #3043 defect)", hint)
+	}
+	na = getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State == "implement_concerns_open" {
+		t.Errorf("next_actions = %+v, want a state that is NOT implement_concerns_open after waiving", na)
+	}
+
+	// The run.concerns block is present with open:0 / open_implement:0.
+	var runStatus struct {
+		Concerns *struct {
+			Open          int `json:"open"`
+			OpenImplement int `json:"open_implement"`
+		} `json:"concerns"`
+	}
+	getRunJSON(t, ctx, httpSrv.URL, fx.operatorTok, fx.runID, &runStatus)
+	if runStatus.Concerns == nil {
+		t.Fatalf("run.concerns absent after waiving; want present with open:0 (authoritative read)")
+	}
+	if runStatus.Concerns.Open != 0 || runStatus.Concerns.OpenImplement != 0 {
+		t.Errorf("run.concerns open=%d open_implement=%d, want 0/0", runStatus.Concerns.Open, runStatus.Concerns.OpenImplement)
+	}
+
+	// The gate view agrees at the same instant: open:[].
+	gate := getGateViewJSON(t, ctx, httpSrv.URL, fx.operatorTok, fx.runID)
+	if len(gate.Open) != 0 {
+		t.Errorf("gate-view open = %d, want 0 (agreeing with the run-status open set)", len(gate.Open))
+	}
+}
+
 // gateViewView is the minimal decode of GET /v0/runs/{run_id}/gate-view the
 // #2623 integration test reads.
 type gateViewView struct {
@@ -2259,6 +2396,7 @@ type reviewActionHint struct {
 	RemainingFixupBudget int    `json:"remaining_fixup_budget"`
 	OverrideAvailable    bool   `json:"override_available"`
 	Message              string `json:"message"`
+	Source               string `json:"source"`
 }
 
 // getReviewActionHint calls fishhawk_get_run_status and returns the decoded

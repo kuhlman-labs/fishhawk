@@ -16,17 +16,33 @@ import (
 // stripped from the marshalled payload, not merely hidden client-side.
 // Two opt-in flags restore today's full shape.
 
-// stripReviewProse clears the free-text fields from each typed implement
-// review IN PLACE: the review-level free_form and every concern's note.
-// Everything an operator gates on — verdict, authority, reviewer_kind,
-// reviewer_model, reason, and each concern's severity/category (the
-// "concern keys") — is left intact. Called on the default (no
-// include_review_prose) get_run_status path.
+// elidedReviewProseMarker is the visible stand-in stripReviewProse writes in
+// place of a NON-EMPTY review free_form or concern note on the compact-default
+// get_run_status path (#3043). Before, the field was blanked to "",
+// INDISTINGUISHABLE from a concern that genuinely carries no note — the elision
+// the operator on #3043 mistook for an empty backend note. The marker makes the
+// elision legible and names the surfaces that restore the full text. It is set
+// ONLY when the field was non-empty, so a genuinely-empty note still reads as
+// empty: the two states an operator must be able to tell apart stay distinct.
+const elidedReviewProseMarker = "…(elided; full text via fishhawk_get_gate_view, or include_review_prose=true)"
+
+// stripReviewProse replaces the free-text fields of each typed implement
+// review IN PLACE with a visible elision marker: the review-level free_form and
+// every concern's note. A field that was ALREADY empty is left empty — the
+// marker is written only over non-empty text, so an elided note and a
+// genuinely-empty one remain distinguishable (#3043). Everything an operator
+// gates on — verdict, authority, reviewer_kind, reviewer_model, reason, and
+// each concern's severity/category (the "concern keys") — is left intact.
+// Called on the default (no include_review_prose) get_run_status path.
 func stripReviewProse(reviews []PlanReview) {
 	for i := range reviews {
-		reviews[i].FreeForm = ""
+		if reviews[i].FreeForm != "" {
+			reviews[i].FreeForm = elidedReviewProseMarker
+		}
 		for j := range reviews[i].Concerns {
-			reviews[i].Concerns[j].Note = ""
+			if reviews[i].Concerns[j].Note != "" {
+				reviews[i].Concerns[j].Note = elidedReviewProseMarker
+			}
 		}
 	}
 }

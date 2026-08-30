@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -555,6 +556,11 @@ func TestGetRun_SurfacesOpenConcerns(t *testing.T) {
 	if resp.Concerns.ByState["raised"] != 2 {
 		t.Errorf("by_state[raised] = %d, want 2", resp.Concerns.ByState["raised"])
 	}
+	// open_implement counts ONLY the implement-stage open concern (#3043); the
+	// open plan-stage concern is excluded.
+	if resp.Concerns.OpenImplement != 1 {
+		t.Errorf("open_implement = %d, want 1 (implement-stage only; the plan concern is excluded)", resp.Concerns.OpenImplement)
+	}
 	ids := map[uuid.UUID]string{}
 	for _, item := range resp.Concerns.Items {
 		ids[item.ID] = item.StageKind
@@ -564,6 +570,130 @@ func TestGetRun_SurfacesOpenConcerns(t *testing.T) {
 	}
 	if _, present := ids[resolved.ID]; present {
 		t.Error("resolved (addressed) concern must not be listed")
+	}
+}
+
+// TestGetRun_ConcernsMatchGateViewOpenSet (#3043) is the issue's second
+// acceptance criterion: the run-status concerns block's OPEN set equals the
+// gate view's open[] for the same run, asserted across every concern state
+// over ONE shared concern-store fixture. Seeds one concern per state
+// (raised / addressed_pending / reopened = open; waived / deferred / addressed
+// = settled) and asserts the id set of handleGetRun's concerns.items EQUALS the
+// id set of handleGetRunGateView's open[], and that each settled row appears in
+// the gate view's settled[] and in NEITHER open set.
+func TestGetRun_ConcernsMatchGateViewOpenSet(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr, AuditRepo: au})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	implStageID := uuid.New()
+	ctx := context.Background()
+
+	// raised (open).
+	raised := seedConcernRow(t, cr, got.ID, implStageID, "implement", 10, "raised concern")
+	// addressed_pending (open).
+	addrPending := seedConcernRow(t, cr, got.ID, implStageID, "implement", 11, "pending concern")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{addrPending.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	// reopened (open): raised -> addressed_pending -> reopened.
+	reopened := seedConcernRow(t, cr, got.ID, implStageID, "implement", 12, "reopened concern")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{reopened.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending(reopened): %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, reopened.ID, concern.StateReopened, "re-review found drift"); err != nil {
+		t.Fatalf("ApplyResolution(reopened): %v", err)
+	}
+	// waived (settled).
+	waived := seedConcernRow(t, cr, got.ID, implStageID, "implement", 13, "waived concern")
+	if _, err := cr.ApplyResolution(ctx, waived.ID, concern.StateWaived, "false positive"); err != nil {
+		t.Fatalf("ApplyResolution(waived): %v", err)
+	}
+	// deferred (settled).
+	deferred := seedConcernRow(t, cr, got.ID, implStageID, "implement", 14, "deferred concern")
+	if _, err := cr.ApplyResolution(ctx, deferred.ID, concern.StateDeferred, "follow-up filed"); err != nil {
+		t.Fatalf("ApplyResolution(deferred): %v", err)
+	}
+	// addressed (settled): raised -> addressed_pending -> addressed.
+	addressed := seedConcernRow(t, cr, got.ID, implStageID, "implement", 15, "addressed concern")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{addressed.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending(addressed): %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, addressed.ID, concern.StateAddressed, "fixed"); err != nil {
+		t.Fatalf("ApplyResolution(addressed): %v", err)
+	}
+
+	openIDs := map[uuid.UUID]bool{raised.ID: true, addrPending.ID: true, reopened.ID: true}
+	settledIDs := map[uuid.UUID]bool{waived.ID: true, deferred.ID: true, addressed.ID: true}
+
+	// Run-status concerns block.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get run status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal run: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block absent:\n%s", w.Body.String())
+	}
+	runOpen := map[uuid.UUID]bool{}
+	for _, it := range resp.Concerns.Items {
+		runOpen[it.ID] = true
+	}
+	if resp.Concerns.Open != 3 || len(runOpen) != 3 {
+		t.Errorf("run-status open = %d / items = %d, want 3/3", resp.Concerns.Open, len(runOpen))
+	}
+	// All three implement-stage open concerns count toward open_implement.
+	if resp.Concerns.OpenImplement != 3 {
+		t.Errorf("open_implement = %d, want 3", resp.Concerns.OpenImplement)
+	}
+
+	// Gate view (authorized read, invoked directly like the gateview tests).
+	gvReq := httptest.NewRequest(http.MethodGet, "/v0/runs/"+got.ID.String()+"/gate-view", nil)
+	gvReq.SetPathValue("run_id", got.ID.String())
+	gvReq = injectIdentity(gvReq, Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{scopeGateViewRead}})
+	gvW := httptest.NewRecorder()
+	s.handleGetRunGateView(gvW, gvReq)
+	if gvW.Code != http.StatusOK {
+		t.Fatalf("gate-view = %d, want 200:\n%s", gvW.Code, gvW.Body.String())
+	}
+	var gv gateViewResponse
+	if err := json.Unmarshal(gvW.Body.Bytes(), &gv); err != nil {
+		t.Fatalf("unmarshal gate-view: %v", err)
+	}
+	gvOpen := map[uuid.UUID]bool{}
+	for _, c := range gv.Open {
+		gvOpen[c.ID] = true
+	}
+	gvSettled := map[uuid.UUID]bool{}
+	for _, c := range gv.Settled {
+		gvSettled[c.ID] = true
+	}
+
+	// The two open sets are EQUAL by construction.
+	if !reflect.DeepEqual(runOpen, gvOpen) {
+		t.Errorf("run-status open set %v != gate-view open set %v", runOpen, gvOpen)
+	}
+	if !reflect.DeepEqual(runOpen, openIDs) {
+		t.Errorf("open set %v != expected %v", runOpen, openIDs)
+	}
+	// Every settled row appears in gate-view settled[] and in NEITHER open set.
+	for id := range settledIDs {
+		if !gvSettled[id] {
+			t.Errorf("settled concern %s missing from gate-view settled[]", id)
+		}
+		if runOpen[id] || gvOpen[id] {
+			t.Errorf("settled concern %s leaked into an open set", id)
+		}
 	}
 }
 
@@ -616,9 +746,12 @@ func TestGetRun_SurfacesHasSuggestedPatch(t *testing.T) {
 	}
 }
 
-// TestGetRun_NoConcernsOmitsBlock: a run with nothing open carries no
-// concerns key at all (omitempty), and a nil ConcernRepo behaves the same.
-func TestGetRun_NoConcernsOmitsBlock(t *testing.T) {
+// TestGetRun_ZeroOpenConcernsPresentBlock (#3043): a SUCCESSFUL store read
+// with zero open concerns now returns the block PRESENT (open:0, items:[]) —
+// presence is authoritative, so present == read, and absent is reserved for
+// UNAVAILABLE. Previously the block was omitted for a zero-open run, making
+// "zero" and "unreadable" indistinguishable on the wire.
+func TestGetRun_ZeroOpenConcernsPresentBlock(t *testing.T) {
 	repo := newFakeRepo()
 	cr := newFakeConcernRepo()
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
@@ -633,10 +766,47 @@ func TestGetRun_NoConcernsOmitsBlock(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block absent on a successful zero-open read; want present with open:0:\n%s", w.Body.String())
+	}
+	if resp.Concerns.Open != 0 || resp.Concerns.OpenImplement != 0 {
+		t.Errorf("open = %d / open_implement = %d, want 0/0", resp.Concerns.Open, resp.Concerns.OpenImplement)
+	}
+	// items renders as [] (non-null) so a consumer can iterate without a nil guard.
+	if resp.Concerns.Items == nil {
+		t.Errorf("items = nil, want a non-nil empty slice")
+	}
+	if !strings.Contains(w.Body.String(), `"items":[]`) {
+		t.Errorf("wire items should be [] not null:\n%s", w.Body.String())
+	}
+}
+
+// TestGetRun_NilConcernRepoOmitsBlock: with NO concern store wired the block
+// is ABSENT — the unavailability signal (#3043). This is the distinction the
+// zero-open case above depends on: absent means the store could not be read,
+// never "zero".
+func TestGetRun_NilConcernRepoOmitsBlock(t *testing.T) {
+	repo := newFakeRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo}) // no ConcernRepo
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
 	var raw map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &raw)
 	if _, present := raw["concerns"]; present {
-		t.Errorf("concerns key present on a run with no open concerns:\n%s", w.Body.String())
+		t.Errorf("concerns key present with no concern store wired (should signal unavailable by absence):\n%s", w.Body.String())
 	}
 }
 
