@@ -365,10 +365,21 @@ func TestEveryResponsePathIsClassified(t *testing.T) {
 
 // bandedElisions drives the whole matrix: every tier band from a generous
 // budget down to the floor, returning each band's emitted elisions.
+//
+// The 13 KiB band is inside the diagnosis-skeleton fit window (#3043). Adding
+// run.concerns.open_implement as an itemised skeleton omission (consistent with
+// its siblings run.concerns.open / by_state, since skeletonRunStatus never
+// copies Run.Concerns) grows the skeleton to a constant 12465 bytes, so it no
+// longer fits the 12 KiB band and its fit window shifts to [~12465, ~16383].
+// Without a band in that window no probe would engage the skeleton tier at all,
+// and the skeleton-ONLY next_actions.actions computed elision — which
+// TestElisions_ComputedCarryNoPointer requires — would vanish from the matrix.
+// TestElisions_SkeletonBandEngagesSkeletonTier pins that this band actually
+// engages the skeleton, so the coverage is restored, not merely the green.
 func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 	t.Helper()
 	out := map[int]*Elisions{}
-	for _, b := range []int{28 * 1024, 20 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
+	for _, b := range []int{28 * 1024, 20 * 1024, 13 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
 		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(b))
 		if err != nil {
 			t.Fatalf("budget %d: %v", b, err)
@@ -379,6 +390,45 @@ func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 		out[b] = bounded.Elisions
 	}
 	return out
+}
+
+// TestElisions_SkeletonBandEngagesSkeletonTier is the amendment's binding
+// condition (#3043): the 13 KiB band added to bandedElisions must POSITIVELY
+// engage the diagnosis-skeleton tier and carry the skeleton-only
+// next_actions.actions computed elision — not merely make TestElisions_*
+// pass by probing nothing. If a future field addition shifts the skeleton fit
+// window past 13 KiB, this fails LOUDLY (naming the tier it landed on and the
+// measured skeleton size to re-diagnose) instead of the coverage silently
+// evaporating. The skeleton is a constant 12465 bytes; the fit window is
+// [~12465, ~16383], so 13 KiB (13312) sits ~850 B above the floor and ~3 KiB
+// below the T9 ceiling — comfortably inside, one band suffices.
+func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
+	runID := uuid.NewString()
+	const band = 13 * 1024
+	bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
+	if err != nil {
+		t.Fatalf("band %d: %v", band, err)
+	}
+	if bounded.Elisions == nil {
+		t.Fatalf("band %d produced no elisions block", band)
+	}
+	if bounded.Elisions.Tier != "skeleton" {
+		raw, _ := json.Marshal(bounded)
+		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~12465B, serialized here %dB) — re-pick the band inside the new window",
+			band, bounded.Elisions.Tier, len(raw))
+	}
+	found := false
+	for _, f := range bounded.Elisions.Fields {
+		if f.Field == "next_actions.actions" {
+			found = true
+			if f.Class != string(classComputed) {
+				t.Errorf("next_actions.actions elision class = %q, want computed", f.Class)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("band %d skeleton carries no next_actions.actions computed elision — the coverage this band restores", band)
+	}
 }
 
 func TestElisions_ComputedCarryNoPointer(t *testing.T) {

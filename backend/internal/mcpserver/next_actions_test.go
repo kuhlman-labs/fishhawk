@@ -309,6 +309,21 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone, consumesNone, consumesNewRun},
 		},
 		{
+			// #3043: every concern waived/deferred/addressed -> the store-derived
+			// hint is nil, so an implement stage still parked at its review gate
+			// (awaiting_approval, review complete) must NOT classify
+			// implement_concerns_open — it falls through to the settled arm. The
+			// old audit-derived count kept firing implement_concerns_open here.
+			name:         "h_concerns_all_waived_hint_nil_not_concerns_open",
+			run:          naRun("running"),
+			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")},
+			implRS:       naReviewStatus("implement", "complete"),
+			hint:         nil,
+			wantState:    "implement_gate_settled",
+			wantActions:  []string{"approve_pr", "fishhawk_merge_run"},
+			wantConsumes: []string{consumesNone, consumesNone},
+		},
+		{
 			name:         "implement_gate_settled_merge_ritual",
 			run:          naRun("running"),
 			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},

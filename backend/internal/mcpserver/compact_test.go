@@ -7,9 +7,10 @@ import (
 	"unicode/utf8"
 )
 
-// TestStripReviewProse asserts the typed strip clears free_form + concern
-// notes while leaving every gated key (verdict/authority/reviewer_*/
-// reason and each concern's severity/category) intact.
+// TestStripReviewProse asserts the typed strip replaces a NON-EMPTY free_form
+// and each non-empty concern note with the visible elision marker (#3043),
+// while leaving every gated key (verdict/authority/reviewer_*/reason and each
+// concern's severity/category) intact.
 func TestStripReviewProse(t *testing.T) {
 	reviews := []PlanReview{
 		{
@@ -29,16 +30,20 @@ func TestStripReviewProse(t *testing.T) {
 	stripReviewProse(reviews)
 
 	rev := reviews[0]
-	if rev.FreeForm != "" {
-		t.Errorf("FreeForm = %q, want cleared", rev.FreeForm)
+	// A non-empty free_form becomes the marker, which names the full-note surface.
+	if rev.FreeForm != elidedReviewProseMarker {
+		t.Errorf("FreeForm = %q, want the elision marker", rev.FreeForm)
+	}
+	if !strings.Contains(rev.FreeForm, "fishhawk_get_gate_view") {
+		t.Errorf("marker should name fishhawk_get_gate_view; got %q", rev.FreeForm)
 	}
 	// Gated keys survive.
 	if rev.Verdict != "approve_with_concerns" || rev.Authority != "advisory" || rev.ReviewerKind != "agent" || rev.ReviewerModel != "claude-opus-4-8" {
 		t.Errorf("gated review keys altered: %+v", rev)
 	}
 	for i, c := range rev.Concerns {
-		if c.Note != "" {
-			t.Errorf("Concerns[%d].Note = %q, want cleared", i, c.Note)
+		if c.Note != elidedReviewProseMarker {
+			t.Errorf("Concerns[%d].Note = %q, want the elision marker", i, c.Note)
 		}
 	}
 	if rev.Concerns[0].Severity != "low" || rev.Concerns[0].Category != "scope" {
@@ -46,6 +51,41 @@ func TestStripReviewProse(t *testing.T) {
 	}
 	if rev.Concerns[1].Severity != "high" || rev.Concerns[1].Category != "security" {
 		t.Errorf("Concerns[1] keys altered: %+v", rev.Concerns[1])
+	}
+}
+
+// TestStripReviewProse_EmptyStaysEmpty is condition 2's must-land distinction
+// (#3043): a genuinely-EMPTY free_form / concern note is left empty — the
+// marker is written ONLY over non-empty text, so an operator can tell an elided
+// note (marker) apart from a note the reviewer never wrote (empty). This is the
+// counterfactual for the "only when non-empty" guard in stripReviewProse: with
+// the guard removed, the empty fields would get the marker and this test reddens.
+func TestStripReviewProse_EmptyStaysEmpty(t *testing.T) {
+	reviews := []PlanReview{
+		{
+			ReviewerKind: "agent",
+			Verdict:      "approve_with_concerns",
+			FreeForm:     "", // genuinely empty
+			Concerns: []PlanReviewConcern{
+				{Severity: "low", Category: "scope", Note: ""},                 // genuinely empty
+				{Severity: "high", Category: "security", Note: "real concern"}, // elided
+			},
+		},
+	}
+
+	stripReviewProse(reviews)
+
+	rev := reviews[0]
+	if rev.FreeForm != "" {
+		t.Errorf("empty FreeForm = %q, want it left empty (not the marker)", rev.FreeForm)
+	}
+	if rev.Concerns[0].Note != "" {
+		t.Errorf("empty concern Note = %q, want it left empty (not the marker)", rev.Concerns[0].Note)
+	}
+	// The non-empty sibling is elided to the marker — proving the guard
+	// distinguishes the two states rather than blanking both.
+	if rev.Concerns[1].Note != elidedReviewProseMarker {
+		t.Errorf("non-empty concern Note = %q, want the elision marker", rev.Concerns[1].Note)
 	}
 }
 

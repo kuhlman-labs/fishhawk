@@ -378,10 +378,29 @@ type runAutoAdvancePayload struct {
 // bytes, one line; #2488) so one default get_run_status call maps each
 // concern id to a recognisable defect. The gate view and the originating
 // *_reviewed audit entry remain the surfaces for the full untruncated note.
+//
+// PRESENCE is authoritative (#3043): handleGetRun emits this block whenever
+// the concern-store read SUCCEEDED — including a zero-open run (open:0,
+// by_state:{}, items:[]). The field is left ABSENT only when the store is
+// UNAVAILABLE (ConcernRepo unwired, or ListOpenByRun errored — both
+// warn-logged). So present == an authoritative store read; absent == the
+// open set could not be read, NEVER "zero". The MCP review-action hint reads
+// this distinction: a present block is the count authority, an absent block
+// degrades it to the audit-derived fallback.
 type runConcernsPayload struct {
 	Open    int                 `json:"open"`
 	ByState map[string]int      `json:"by_state"`
 	Items   []runConcernPayload `json:"items"`
+	// OpenImplement is the AUTHORITATIVE count of open IMPLEMENT-stage
+	// concerns, computed at the source over the FULL open set — before any
+	// bounding/trimming/compaction the surfaces apply to Items (#3043). It
+	// equals fishhawk_get_gate_view(stage_kind="implement").open, and the MCP
+	// review-action hint reads THIS number rather than re-deriving a count
+	// from the (possibly-partial) transported Items list. Only implement-stage
+	// concerns can be routed into an implement fix-up, so a run whose only open
+	// concerns are plan-stage ones reports OpenImplement:0 and the hint
+	// correctly suppresses.
+	OpenImplement int `json:"open_implement"`
 }
 
 // runConcernPayload is one open concern on the wire.
@@ -2370,12 +2389,15 @@ func concernShortSummary(note string) string {
 }
 
 // buildRunConcernsPayload renders the open-concern summary for the
-// single-run read. Returns nil (field omitted) when there is nothing
-// open.
+// single-run read from a SUCCESSFUL store read (#964, #3043). It is called
+// only on the success path (handleGetRun leaves the field nil on the
+// unwired / read-error paths), so it now returns a POPULATED payload even
+// for an empty open set (open:0, by_state:{}, items:[]) — making PRESENCE
+// authoritative: present == the store was read; absent == it was not. Items
+// stays a non-nil slice so the JSON renders `[]`, not `null`. OpenImplement
+// is computed here over the FULL open set — the authoritative implement-stage
+// count the MCP hint transports rather than re-deriving from a bounded Items.
 func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
-	if len(open) == 0 {
-		return nil
-	}
 	out := &runConcernsPayload{
 		Open:    len(open),
 		ByState: make(map[string]int, 3),
@@ -2383,6 +2405,9 @@ func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
 	}
 	for _, c := range open {
 		out.ByState[string(c.State)]++
+		if c.StageKind == concern.StageKindImplement {
+			out.OpenImplement++
+		}
 		out.Items = append(out.Items, runConcernPayload{
 			ID:                c.ID,
 			StageKind:         c.StageKind,

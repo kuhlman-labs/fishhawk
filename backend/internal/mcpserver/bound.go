@@ -613,6 +613,7 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.concerns.open", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.by_state", Tier: "skeleton", Class: classStored, Surfaces: gateView},
+	{Path: "run.concerns.open_implement", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.items", Tier: "T9", Class: classStored, Surfaces: gateView},
 
 	// --- stages[].* ------------------------------------------------------
@@ -1018,6 +1019,18 @@ var skeletonRetainedPaths = map[string]struct{}{
 	"acceptance_stage_wait_status": {},
 	"next_actions.state":           {},
 	"elisions":                     {},
+	// run.concerns.open_implement is deliberately NOT retained here (#3043):
+	// skeletonRunStatus builds its projection by hand and never copies
+	// Run.Concerns at all, so its whole run.concerns block — open, by_state,
+	// open_implement, items — is dropped at the diagnosis skeleton and each is
+	// ITEMISED as an omission by the runStatusPathTable rows. Listing
+	// open_implement as retained would make the elision ledger claim a field
+	// survives the diagnosis skeleton when it does not, contradicting its
+	// siblings run.concerns.open / by_state, which are correctly itemised. The
+	// "reads as zero when dropped" risk is closed structurally by the presence
+	// contract, not by retention: an absent concerns block means UNAVAILABLE,
+	// never zero (buildRunConcernsPayload / the hint's audit fallback both key
+	// off that).
 }
 
 // skeletonRunStatus projects to the retained field set and itemises every

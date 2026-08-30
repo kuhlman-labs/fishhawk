@@ -4683,11 +4683,13 @@ func TestGetRunStatus_CompactDefault_OmitsHeavyFreeText(t *testing.T) {
 	if len(out.ImplementReviews) != 1 {
 		t.Fatalf("len(ImplementReviews) = %d, want 1", len(out.ImplementReviews))
 	}
-	if out.ImplementReviews[0].FreeForm != "" {
-		t.Errorf("ImplementReviews[0].FreeForm = %q, want cleared", out.ImplementReviews[0].FreeForm)
+	// The heavy free-text is elided to the visible marker (#3043), not the
+	// reviewer's prose — distinct from a genuinely-empty note.
+	if out.ImplementReviews[0].FreeForm != elidedReviewProseMarker {
+		t.Errorf("ImplementReviews[0].FreeForm = %q, want the elision marker", out.ImplementReviews[0].FreeForm)
 	}
-	if n := out.ImplementReviews[0].Concerns[0].Note; n != "" {
-		t.Errorf("concern Note = %q, want cleared", n)
+	if n := out.ImplementReviews[0].Concerns[0].Note; n != elidedReviewProseMarker {
+		t.Errorf("concern Note = %q, want the elision marker", n)
 	}
 	// Wire-bytes proof: the heavy keys must not survive serialization.
 	raw, err := json.Marshal(out)
@@ -4696,11 +4698,74 @@ func TestGetRunStatus_CompactDefault_OmitsHeavyFreeText(t *testing.T) {
 	}
 	// "issue_context" as a bare substring would false-match the
 	// "issue_context_fetched" audit category name, so assert on the JSON
-	// key form ("issue_context":) plus the heavy values themselves.
-	for _, banned := range []string{`"issue_context":`, `"free_form":`, "the big issue body", "recent payload prose", "unvalidated input note", "recent payload issue body"} {
+	// key form ("issue_context":) plus the heavy values themselves. The
+	// review free_form KEY now legitimately carries the short elision marker
+	// (#3043) — so the reviewer's PROSE is what must be absent, not the key.
+	for _, banned := range []string{`"issue_context":`, "the big issue body", "reviewer free-text prose", "recent payload prose", "unvalidated input note", "recent payload issue body"} {
 		if strings.Contains(string(raw), banned) {
 			t.Errorf("wire bytes must not contain %q (compact default), got it in payload", banned)
 		}
+	}
+	// The elision is VISIBLE: the marker (distinctive prose that names the
+	// full-note surface) survives where the reviewer's prose was.
+	if !strings.Contains(string(raw), "elided; full text via fishhawk_get_gate_view") {
+		t.Errorf("compact default should carry the visible elision marker naming fishhawk_get_gate_view:\n%s", raw)
+	}
+}
+
+// TestGetRunStatus_CompactDefault_HintReadsPreCompactionStoreConcerns is
+// approval condition 3's must-land ordering assertion (#3043): on the
+// compact-BY-DEFAULT getRunStatus path, the review-action hint must read the
+// PRE-compaction runRow.Concerns block — so an AUTHORITATIVE store block (a
+// non-nil OpenImplement) drives the hint with source="store", NOT a fallback
+// marker. If a compaction lever ever turned a present authoritative block into
+// an absent one BEFORE the hint read it, the hint would degrade to the stale
+// audit count under a fallback marker — reintroducing this issue's symptom
+// through the new code. The fixture seeds an audit sum (2) that DIFFERS from the
+// authoritative store count (1), so a hint reporting 1/store proves the store
+// block reached the hint intact under compaction; a hint reporting 2 (or any
+// audit_fallback_* source) would prove the block was lost first.
+func TestGetRunStatus_CompactDefault_HintReadsPreCompactionStoreConcerns(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	openImplement := 1
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running",
+		Concerns: &RunConcerns{
+			Open:          1,
+			ByState:       map[string]int{"raised": 1},
+			OpenImplement: &openImplement, // AUTHORITATIVE scalar present
+			Items:         []RunConcernItem{{ID: uuid.NewString(), StageKind: "implement", Severity: "low", Category: "scope", State: "raised"}},
+		},
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+	}
+	// Audit sum (2) deliberately differs from the store's authoritative count (1).
+	seedImplementReviewAudit(fb, runID, PlanReview{
+		ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory",
+		Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{
+			{Severity: "high", Category: "security", Note: "one"},
+			{Severity: "low", Category: "scope", Note: "two"},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	// Compact by DEFAULT: no include_* flags.
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ReviewActionHint == nil {
+		t.Fatalf("review_action_hint absent; want a populated hint from the store block")
+	}
+	if out.ReviewActionHint.Source != hintSourceStore {
+		t.Errorf("hint.Source = %q, want store (the PRE-compaction authoritative block must reach the hint)", out.ReviewActionHint.Source)
+	}
+	if out.ReviewActionHint.Concerns != 1 {
+		t.Errorf("hint.Concerns = %d, want 1 (the authoritative store count, NOT the audit sum of 2)", out.ReviewActionHint.Concerns)
 	}
 }
 
@@ -4720,9 +4785,10 @@ func TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload(t *testing.T) {
 	if !strings.Contains(string(raw), "recent payload issue body") {
 		t.Errorf("recent_audit issue body should be restored under include_issue_context")
 	}
-	// Review prose still stripped (the other flag was not set).
-	if out.ImplementReviews[0].FreeForm != "" {
-		t.Errorf("review free_form should still be stripped when only include_issue_context is set")
+	// Review prose still stripped to the elision marker (the other flag was
+	// not set) — not the reviewer's original prose.
+	if out.ImplementReviews[0].FreeForm != elidedReviewProseMarker {
+		t.Errorf("review free_form should still be elided to the marker when only include_issue_context is set; got %q", out.ImplementReviews[0].FreeForm)
 	}
 }
 

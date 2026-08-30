@@ -85,30 +85,58 @@ const categoryStageFixupRecovered = "stage_fixup_recovered"
 // consume budget, so the MCP mirror keeps only the "C" signals.
 const failureCategoryC = "C"
 
+// hintSourceStore / hintSourceStoreUnavailable / hintSourceLegacyPeer are the
+// THREE values of ReviewActionHint.Source (#3043), one per distinguishable
+// state of the run-status concerns block — they must stay apart because a
+// degraded note that asserts something FALSE is worse than no note (it teaches
+// an operator to distrust a signal that is actually fine):
+//
+//   - hintSourceStore ("store") — AUTHORITATIVE: the concerns block was present
+//     AND carried the open_implement scalar. The count is that scalar, the same
+//     open set fishhawk_get_gate_view reads. No degraded marker.
+//   - hintSourceStoreUnavailable ("audit_fallback_store_unavailable") —
+//     DEGRADED, block ABSENT: the store read genuinely failed or the repo is
+//     unwired, so the block is nil. "Unavailable" is TRUE here. The count fell
+//     back to the audit-derived per-round sum.
+//   - hintSourceLegacyPeer ("audit_fallback_legacy_peer") — DEGRADED, block
+//     PRESENT but open_implement ABSENT: an older backend peer that predates
+//     the field. The store read SUCCEEDED; only the authoritative scalar is
+//     missing. Saying "store unavailable" here would be FALSE, so this state
+//     carries its own marker and its own wording naming what is actually
+//     missing (the authoritative implement-stage count).
+//
+// Both degraded states fall back to the same audit-derived per-round sum, which
+// has no knowledge of concern lifecycle (a waived/deferred concern still
+// appears in the audit payload) — but they are distinguishable in the OUTPUT,
+// not merely internally, so an operator sees which fact produced the count.
+const (
+	hintSourceStore            = "store"
+	hintSourceStoreUnavailable = "audit_fallback_store_unavailable"
+	hintSourceLegacyPeer       = "audit_fallback_legacy_peer"
+)
+
 // ReviewActionHint is a DISPLAY-ONLY next-action pointer surfaced on
 // fishhawk_get_run_status and fishhawk_run_stage when an implement review
 // has landed with unresolved approve_with_concerns concerns and the bounded
 // fix-up budget is not yet spent (#777). It NEVER gates a run — like the
-// periodic-budget block (#693/#759), it is advisory and computed entirely
-// from audit data the MCP layer already reads. It is suppressed once the
-// concerns are resolved (a fresh review with no concerns) or the fix-up
-// budget is exhausted.
+// periodic-budget block (#693/#759), it is advisory. Its concern count is the
+// store-derived open implement-stage count agreeing with the gate view (#3043),
+// with an audit-derived degraded fallback marked by Source. It is suppressed
+// once the concerns are resolved (open implement count 0) or the fix-up budget
+// is exhausted past the ceiling.
 //
 // It is NOT surfaced on fishhawk_start_run: no implement review exists at
 // run start, so the field would always be empty there.
 //
-// Direction D (#860): when the bounded budget is SPENT but the latest
-// review round still carries concerns, the hint is NO LONGER suppressed —
-// it surfaces the exhaustion plus the remaining options (an operator
-// override pass while below the hard ceiling, or merge-with-follow-up /
-// a fresh run at the ceiling). OverrideAvailable reports whether
-// force_additional_pass can still grant one more pass. The concern count is
-// scoped to the LATEST review round (concerns landing after the most-recent
-// stage_fixup_triggered entry) so it is not inflated across rounds. The
-// concerns==0 early return still suppresses the genuinely-resolved case (a
-// fresh review with no concerns).
+// Direction D (#860): when the bounded budget is SPENT but concerns remain
+// open, the hint is NO LONGER suppressed — it surfaces the exhaustion plus the
+// remaining options (an operator override pass while below the hard ceiling, or
+// merge-with-follow-up / a fresh run at the ceiling). OverrideAvailable reports
+// whether force_additional_pass can still grant one more pass. The concerns==0
+// early return still suppresses the genuinely-resolved case.
 type ReviewActionHint struct {
-	Concerns             int    `json:"concerns" jsonschema:"number of unresolved approve_with_concerns concerns from the LATEST implement-review round (summed across reviewers; scoped to concerns that landed after the most-recent fix-up so the count is not inflated across rounds)"`
+	Concerns             int    `json:"concerns" jsonschema:"number of open approve_with_concerns implement-stage concerns. AUTHORITATIVE by default: the open implement-stage count from the run's store-derived concern block, equal to fishhawk_get_gate_view(stage_kind=implement).open. Falls back to the LATEST-round audit-derived sum only in the two degraded source states (the concern block was unavailable, or a legacy peer omitted the authoritative count)"`
+	Source               string `json:"source,omitempty" jsonschema:"provenance of the concern count: 'store' (authoritative — the store-derived open concern block, agreeing with the gate view); 'audit_fallback_store_unavailable' (degraded — the concern block was ABSENT because the store read failed or is unwired, so the count came from audit payloads); or 'audit_fallback_legacy_peer' (degraded — the block was PRESENT but a backend peer predating the authoritative count omitted it, so the store read succeeded yet the count still came from audit payloads). Audit payloads do not track concern lifecycle; on either fallback, verify with fishhawk_get_gate_view. Always set on a live hint"`
 	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries that were NOT refunded); 0 once the budget is spent, restored when a prior pass produced no changes (#967) OR died category-C without delivering anything to the PR branch (#1957)"`
 	OverrideAvailable    bool   `json:"override_available" jsonschema:"true when the NORMAL budget is spent but an operator override pass (fishhawk_fixup_stage with force_additional_pass=true) can still be granted below the hard ceiling of 3 total passes; false below budget (no override needed) and at/above the ceiling (no override left)"`
 	Message              string `json:"message" jsonschema:"one-line advisory pointer at the next action: route concerns back with fishhawk_fixup_stage vs approving to merge (below budget), the operator override vs merge-with-follow-up (budget spent, below ceiling), or merge-with-follow-up vs a fresh run (at the ceiling); display-only, never gates the run"`
@@ -247,9 +275,29 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 //     make the hint and the server-side applicability predicate disagree;
 //   - the implement review is not complete (status != "complete"): no landed
 //     verdict to act on yet;
-//   - the LATEST review round carries zero approve_with_concerns concerns:
-//     nothing to route back (the genuinely-resolved case — including
-//     resolved-after-fix-up, since the count is round-scoped).
+//   - there are zero OPEN implement-stage concerns to route back — the
+//     genuinely-resolved case, INCLUDING every concern waived/deferred/
+//     addressed (the #3043 bug: the audit-derived count still saw them and
+//     the hint mis-fired implement_concerns_open while the gate view read
+//     open:[]).
+//
+// The concern count's AUTHORITY is the run row's store-derived open-concern
+// block (storeConcerns), the SAME set fishhawk_get_gate_view reads, so all
+// three surfaces (run-status concerns block, gate view, this hint) agree by
+// construction (#3043). The count is the block's OpenImplement — computed at
+// the SOURCE over the full open set, so it is correct regardless of any
+// bounding/trimming/compaction the transported Items underwent, and it counts
+// ONLY implement-stage concerns (the routable set: only an implement-stage
+// concern can enter an implement fix-up, so an open PLAN-stage concern must
+// NOT make the hint recommend a fix-up). The count DEGRADES to the
+// audit-derived latest-round sum (latestRoundConcerns) in the two NON-authoritative
+// states, so a stale/unwired backend keeps today's behavior instead of silently
+// suppressing the hint: storeConcerns ABSENT (nil — the store read failed or the
+// repo is unwired) marks Source hintSourceStoreUnavailable, and a PRESENT block
+// whose OpenImplement pointer is nil (an older peer predating the field) marks
+// Source hintSourceLegacyPeer with its own wording — the pointer is what keeps
+// that legacy state from reading as an authoritative zero. Source records which
+// of the three paths produced the count.
 //
 // Unlike before (#860 direction D), a SPENT fix-up budget no longer
 // suppresses the hint when concerns remain: it surfaces the exhaustion and
@@ -260,10 +308,10 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 // implement stage so the complete/none gate and the adjacent
 // ImplementReviewStatus field derive from one audit read (getRunStatus
 // passes the value it already resolved; run_stage queries reviewStatusFor
-// itself and passes the result). The concern COUNT, however, is recomputed
-// here from a sequence-aware audit read so it can be scoped to the latest
-// review round.
-func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, runState string, implementStatus *ReviewStatus) (*ReviewActionHint, error) {
+// itself and passes the result). storeConcerns is the run row's concerns
+// block, which both call sites ALREADY fetched (getRunStatus decodes it off
+// GET /v0/runs/{id}; run_stage reads runView.Concerns) — no extra round-trip.
+func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, runState string, implementStatus *ReviewStatus, storeConcerns *RunConcerns) (*ReviewActionHint, error) {
 	if runStateIsTerminal(runState) {
 		return nil, nil
 	}
@@ -276,12 +324,46 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		return nil, err
 	}
 
-	// Scope the concern count to the latest review round: only concerns that
-	// landed after the most-recent stage_fixup_triggered entry (with no prior
-	// fix-up, latestFixupSeq is 0 and every round counts — a single round).
-	concerns, err := r.latestRoundConcerns(ctx, runID, implementStageID, latestFixupSeq)
-	if err != nil {
-		return nil, err
+	// Concern count + provenance (#3043), one branch per distinguishable state
+	// of the concerns block — the THREE states must stay apart:
+	//
+	//   1. block PRESENT with the open_implement scalar -> AUTHORITATIVE: take
+	//      the scalar (the count computed at the source over the full open set).
+	//   2. block ABSENT (nil) -> the store was genuinely UNAVAILABLE (unwired /
+	//      read error). Degrade to the audit-derived latest-round sum.
+	//   3. block PRESENT but open_implement ABSENT (nil pointer) -> an older
+	//      backend peer that predates the field. The store read SUCCEEDED; only
+	//      the authoritative scalar is missing. Degrade to the same audit sum but
+	//      under a DISTINCT marker — saying "store unavailable" here would be
+	//      false.
+	//
+	// The pointer is what makes states 1 and 3 distinguishable: a nil
+	// OpenImplement is "the peer never sent it", NOT an authoritative zero that
+	// would wrongly suppress the hint.
+	var (
+		concerns int
+		source   string
+	)
+	switch {
+	case storeConcerns != nil && storeConcerns.OpenImplement != nil:
+		concerns = *storeConcerns.OpenImplement
+		source = hintSourceStore
+	default:
+		// Both degraded states share the audit-derived count; only the marker
+		// differs. Scope the audit-derived count to the latest review round: only
+		// concerns that landed after the most-recent stage_fixup_triggered entry
+		// (with no prior fix-up, latestFixupSeq is 0 and every round counts).
+		concerns, err = r.latestRoundConcerns(ctx, runID, implementStageID, latestFixupSeq)
+		if err != nil {
+			return nil, err
+		}
+		if storeConcerns != nil {
+			// State 3: present block, missing scalar — a legacy peer.
+			source = hintSourceLegacyPeer
+		} else {
+			// State 2: absent block — the store was unavailable.
+			source = hintSourceStoreUnavailable
+		}
 	}
 	if concerns == 0 {
 		return nil, nil
@@ -335,21 +417,21 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	// because the stage-keyed no-change dedup caps refunds at 1). No override
 	// left — merge-with-follow-up, a commit-and-vouch for a late CI/SAST finding
 	// (#1097), or a fresh run.
-	if priorPasses >= fixupCeiling {
-		return &ReviewActionHint{
+	var hint *ReviewActionHint
+	switch {
+	case priorPasses >= fixupCeiling:
+		hint = &ReviewActionHint{
 			Concerns:             concerns,
 			RemainingFixupBudget: 0,
 			OverrideAvailable:    false,
 			Message: fmt.Sprintf(
 				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
 				concerns, fixupCeiling),
-		}, nil
-	}
-
-	// Below the normal budget (after refunds): the original route-back vs
-	// approve pointer. A refunded no-op restores a normal route-back here, so
-	// the message explains WHY budget is non-zero after a spent pass.
-	if effectiveConsumed < maxFixupPasses {
+		}
+	case effectiveConsumed < maxFixupPasses:
+		// Below the normal budget (after refunds): the original route-back vs
+		// approve pointer. A refunded no-op restores a normal route-back here, so
+		// the message explains WHY budget is non-zero after a spent pass.
 		var msg string
 		if refunds > 0 {
 			msg = fmt.Sprintf(
@@ -360,26 +442,39 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 				"%d concern(s) from the implement review — route them back with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id; positional indices are deprecated), or approve to merge. Remaining fix-up budget: %d.",
 				concerns, implementStageID, remaining)
 		}
-		return &ReviewActionHint{
+		hint = &ReviewActionHint{
 			Concerns:             concerns,
 			RemainingFixupBudget: remaining,
 			OverrideAvailable:    false,
 			Message:              msg,
-		}, nil
+		}
+	default:
+		// Budget spent but the hard ceiling still has headroom (the ceiling arm
+		// above already handled priorPasses >= fixupCeiling, so this is reached
+		// only below the ceiling): surface the exhaustion plus the two options —
+		// the bounded operator override or merge-with-follow-up.
+		hint = &ReviewActionHint{
+			Concerns:             concerns,
+			RemainingFixupBudget: 0,
+			OverrideAvailable:    true,
+			Message: fmt.Sprintf(
+				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
+				concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
+		}
 	}
 
-	// Budget spent but the hard ceiling still has headroom (the ceiling arm above
-	// already returned for priorPasses >= fixupCeiling, so this is reached only
-	// below the ceiling): surface the exhaustion plus the two options — the
-	// bounded operator override or merge-with-follow-up.
-	return &ReviewActionHint{
-		Concerns:             concerns,
-		RemainingFixupBudget: 0,
-		OverrideAvailable:    true,
-		Message: fmt.Sprintf(
-			"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
-			concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
-	}, nil
+	// Stamp provenance and, on each degraded path, say so at the surface (#3043)
+	// so a fallback count is never mistaken for an authoritative one — and the
+	// two degraded states carry DISTINCT wording, because a note that claims the
+	// store was unavailable when it was NOT is worse than no note.
+	hint.Source = source
+	switch source {
+	case hintSourceStoreUnavailable:
+		hint.Message += " (count from audit fallback — the concern store was unavailable, so this figure is derived from audit payloads that do not track concern lifecycle; verify with fishhawk_get_gate_view)"
+	case hintSourceLegacyPeer:
+		hint.Message += " (count from audit fallback — this backend peer predates the authoritative implement-stage concern count, so the store read SUCCEEDED but this figure is derived from audit payloads that do not track concern lifecycle; verify with fishhawk_get_gate_view)"
+	}
+	return hint, nil
 }
 
 // fixupPassesAndLatestSeq returns, from ONE stage_fixup_triggered audit read:

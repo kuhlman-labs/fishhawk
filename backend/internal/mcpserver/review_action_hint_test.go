@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -198,6 +199,24 @@ func TestReviewActionHintFor(t *testing.T) {
 		// contains this substring — used to pin the #1097 commit-and-vouch
 		// wording on the hard-ceiling arm.
 		wantMessageContains string
+		// storeAbsent passes a nil *RunConcerns block so the count DEGRADES to
+		// the audit-derived path (#3043). Default (false) passes an authoritative
+		// store block whose OpenImplement drives the count.
+		storeAbsent bool
+		// storeOpenImplement overrides the store block's authoritative
+		// OpenImplement count; nil defaults it to seedConcerns (so existing
+		// budget/ceiling cases keep wantConcerns == seedConcerns via the store).
+		storeOpenImplement *int
+		// storeOpen overrides the store block's Open field; 0 defaults it to
+		// seedConcerns. Used to model a block whose open set includes plan-stage
+		// concerns (Open > OpenImplement).
+		storeOpen int
+		// storeItems sets how many (dummy) items the transported block carries,
+		// independent of OpenImplement — to prove a truncated/partial Items list
+		// never changes the authoritative count.
+		storeItems int
+		// wantSource, when non-empty, asserts hint.Source.
+		wantSource string
 	}{
 		{
 			name:    "nil status -> no hint",
@@ -498,6 +517,78 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantRemaining: 0,
 			wantOverride:  true,
 		},
+		{
+			// #3043 (a): the store block is authoritative. The audit says 2
+			// concerns, but the store reports OpenImplement:0 (every concern
+			// waived/deferred/addressed) -> the hint suppresses. This is the core
+			// defect: the old audit-derived count mis-fired here.
+			name:               "store open_implement:0 despite audit=2 -> no hint",
+			status:             completeStatus(),
+			seedConcerns:       2,
+			storeOpenImplement: intPtr(0),
+			storeOpen:          0,
+			wantNil:            true,
+		},
+		{
+			// #3043 (b): the count comes from the store's OpenImplement, not the
+			// audit sum. Audit seeds 5, store reports 1 -> concerns:1, source store.
+			name:               "store open_implement:1 wins over larger audit sum -> concerns 1",
+			status:             completeStatus(),
+			seedConcerns:       5,
+			storeOpenImplement: intPtr(1),
+			storeOpen:          1,
+			wantNil:            false,
+			wantConcerns:       1,
+			wantRemaining:      1,
+			wantOverride:       false,
+			wantSource:         hintSourceStore,
+		},
+		{
+			// #3043 (c): the store carries ONLY a plan-stage open concern
+			// (Open:1, OpenImplement:0) -> the hint suppresses (the stage-kind
+			// filter). Without it the hint would route a plan concern into an
+			// implement fix-up.
+			name:               "store open holds only a plan concern -> no hint",
+			status:             completeStatus(),
+			seedConcerns:       0,
+			storeOpen:          1,
+			storeOpenImplement: intPtr(0),
+			wantNil:            true,
+		},
+		{
+			// #3043 (d): the concerns block is UNAVAILABLE (nil) -> the count
+			// degrades to the audit-derived path with today's behavior, marked
+			// source=audit_fallback_store_unavailable and the message says the
+			// store was unavailable, so a degraded count is not mistaken for an
+			// authoritative one.
+			name:                "store absent -> audit fallback fires with the old count",
+			status:              completeStatus(),
+			seedConcerns:        2,
+			storeAbsent:         true,
+			wantNil:             false,
+			wantConcerns:        2,
+			wantRemaining:       1,
+			wantOverride:        false,
+			wantSource:          hintSourceStoreUnavailable,
+			wantMessageContains: "the concern store was unavailable",
+		},
+		{
+			// #3043 (e): a TRUNCATED transported Items list never changes the
+			// authoritative count. OpenImplement:3 with only 1 retained item ->
+			// concerns:3, not 1. (A mixed-stage variant is
+			// TestReviewActionHintFor_TruncatedMixedStage.)
+			name:               "truncated items -> count from authoritative OpenImplement, not item count",
+			status:             completeStatus(),
+			seedConcerns:       0,
+			storeOpen:          5,
+			storeOpenImplement: intPtr(3),
+			storeItems:         1,
+			wantNil:            false,
+			wantConcerns:       3,
+			wantRemaining:      1,
+			wantOverride:       false,
+			wantSource:         hintSourceStore,
+		},
 	}
 
 	for _, tc := range tests {
@@ -552,7 +643,27 @@ func TestReviewActionHintFor(t *testing.T) {
 			if runState == "" {
 				runState = "running"
 			}
-			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status)
+			// Build the authoritative store block (#3043) unless the case models
+			// an UNAVAILABLE block (nil -> audit fallback). OpenImplement defaults
+			// to seedConcerns so the existing budget/ceiling cases keep
+			// wantConcerns == seedConcerns via the store path.
+			var store *RunConcerns
+			if !tc.storeAbsent {
+				openImplement := tc.seedConcerns
+				if tc.storeOpenImplement != nil {
+					openImplement = *tc.storeOpenImplement
+				}
+				open := tc.seedConcerns
+				if tc.storeOpen != 0 {
+					open = tc.storeOpen
+				}
+				store = &RunConcerns{
+					Open:          open,
+					OpenImplement: &openImplement,
+					Items:         make([]RunConcernItem, tc.storeItems),
+				}
+			}
+			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status, store)
 			if err != nil {
 				t.Fatalf("reviewActionHintFor: %v", err)
 			}
@@ -564,6 +675,9 @@ func TestReviewActionHintFor(t *testing.T) {
 			}
 			if hint == nil {
 				t.Fatalf("hint = nil, want a populated hint")
+			}
+			if tc.wantSource != "" && hint.Source != tc.wantSource {
+				t.Errorf("Source = %q, want %q", hint.Source, tc.wantSource)
 			}
 			if hint.Concerns != tc.wantConcerns {
 				t.Errorf("Concerns = %d, want %d", hint.Concerns, tc.wantConcerns)
@@ -597,9 +711,11 @@ func TestReviewActionHintFor(t *testing.T) {
 	}
 }
 
-// TestReviewActionHintFor_LatestRoundOnly proves the concern count is scoped
-// to the latest review round: a first round with 2 concerns, then a fix-up,
-// then a second round with 1 concern must surface 1 — not 3 (#860).
+// TestReviewActionHintFor_LatestRoundOnly proves the AUDIT-FALLBACK count is
+// scoped to the latest review round: a first round with 2 concerns, then a
+// fix-up, then a second round with 1 concern must surface 1 — not 3 (#860).
+// Exercised with a nil store block so the degraded audit path (the only path
+// that round-scopes) is under test (#3043).
 func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
@@ -611,12 +727,16 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 	seedImplementReviewedAudit(fb, runID, stageID, 1)
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus())
+	// nil store -> the audit fallback, which is what round-scopes.
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
 	if hint == nil {
 		t.Fatal("hint = nil, want a populated hint")
+	}
+	if hint.Source != hintSourceStoreUnavailable {
+		t.Errorf("Source = %q, want audit_fallback_store_unavailable (nil store block)", hint.Source)
 	}
 	if hint.Concerns != 1 {
 		t.Errorf("Concerns = %d, want 1 (latest round only, not summed across rounds)", hint.Concerns)
@@ -624,6 +744,106 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 	// One fix-up pass spent the normal budget; below the ceiling -> override.
 	if !hint.OverrideAvailable {
 		t.Errorf("OverrideAvailable = false, want true (budget spent, below ceiling)")
+	}
+}
+
+// TestReviewActionHintFor_TruncatedMixedStage is condition 1's must-land
+// uncovered case (#3043): a TRUNCATED, MIXED-STAGE transported block — more
+// implied open concerns than the retained items, spanning plan and implement —
+// must report the true implement-stage open count from the authoritative
+// OpenImplement, NOT the retained-item count. A count re-derived from the
+// (bounded) Items list would be the same defect this issue exists to fix.
+func TestReviewActionHintFor_TruncatedMixedStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// The audit carries a large sum; it must be ignored on the store path.
+	seedImplementReviewedAudit(fb, runID, stageID, 9)
+
+	// The transported block: 5 open concerns total (Open), of which 3 are
+	// implement-stage (OpenImplement, the authority). Items is TRUNCATED to a
+	// mixed subset of 2 (one plan, one implement) plus a terminal-looking one —
+	// far fewer than either count, and not all implement.
+	openImplement := 3
+	store := &RunConcerns{
+		Open:          5,
+		OpenImplement: &openImplement,
+		Items: []RunConcernItem{
+			{ID: uuid.NewString(), StageKind: "implement", State: "raised"},
+			{ID: uuid.NewString(), StageKind: "plan", State: "raised"},
+		},
+	}
+
+	r := newResolver(srv, nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store)
+	if err != nil {
+		t.Fatalf("reviewActionHintFor: %v", err)
+	}
+	if hint == nil {
+		t.Fatal("hint = nil, want a populated hint")
+	}
+	if hint.Source != hintSourceStore {
+		t.Errorf("Source = %q, want store", hint.Source)
+	}
+	if hint.Concerns != 3 {
+		t.Errorf("Concerns = %d, want 3 (the authoritative implement-stage open count, NOT the %d retained items nor the %d audit sum)",
+			hint.Concerns, len(store.Items), 9)
+	}
+}
+
+// TestReviewActionHintFor_LegacyPeerNoScalar is condition 1/2's must-land
+// mixed-version case (#3043): a PRESENT concerns block from a backend peer that
+// PREDATES the open_implement field — carrying open implement items but NO
+// open_implement key — must decode OpenImplement to nil and DEGRADE to the audit
+// fallback under the DISTINCT audit_fallback_legacy_peer marker, never suppress.
+// The block is decoded from a LEGACY JSON body (not a hand-built struct) so the
+// realistic wire shape is what is asserted; a plain-int OpenImplement would
+// decode the absent key to an authoritative 0 and suppress the hint — the very
+// defect the pointer closes. The message must NOT claim the store was
+// unavailable (it was not — the read succeeded).
+func TestReviewActionHintFor_LegacyPeerNoScalar(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// The audit is the fallback source once the scalar is absent.
+	seedImplementReviewedAudit(fb, runID, stageID, 2)
+
+	// A legacy wire body: a present concerns block with open implement items and
+	// NO open_implement key at all.
+	legacy := `{"open":2,"by_state":{"raised":2},"items":[` +
+		`{"id":"` + uuid.NewString() + `","stage_kind":"implement","severity":"medium","category":"scope","state":"raised"},` +
+		`{"id":"` + uuid.NewString() + `","stage_kind":"implement","severity":"low","category":"style","state":"raised"}]}`
+	var store RunConcerns
+	if err := json.Unmarshal([]byte(legacy), &store); err != nil {
+		t.Fatalf("unmarshal legacy concerns body: %v", err)
+	}
+	if store.OpenImplement != nil {
+		t.Fatalf("legacy body decoded OpenImplement = %v, want nil (absent key)", *store.OpenImplement)
+	}
+
+	r := newResolver(srv, nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), &store)
+	if err != nil {
+		t.Fatalf("reviewActionHintFor: %v", err)
+	}
+	if hint == nil {
+		t.Fatal("hint = nil, want the audit fallback to FIRE (never suppress on a legacy peer)")
+	}
+	if hint.Source != hintSourceLegacyPeer {
+		t.Errorf("Source = %q, want audit_fallback_legacy_peer", hint.Source)
+	}
+	if hint.Concerns != 2 {
+		t.Errorf("Concerns = %d, want 2 (the audit fallback count)", hint.Concerns)
+	}
+	// The wording names what is actually missing and does NOT falsely claim the
+	// store was unavailable.
+	if !strings.Contains(hint.Message, "predates the authoritative implement-stage concern count") {
+		t.Errorf("legacy-peer message should name the missing authoritative count; got %q", hint.Message)
+	}
+	if strings.Contains(hint.Message, "the concern store was unavailable") {
+		t.Errorf("legacy-peer message must NOT claim the store was unavailable (the read succeeded); got %q", hint.Message)
 	}
 }
 

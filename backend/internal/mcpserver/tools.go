@@ -1919,7 +1919,11 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// field stays nil — never fails the snapshot.
 	var reviewActionHint *ReviewActionHint
 	if implementStageID, ok := stageIDOfType(stages, "implement"); ok {
-		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus)
+		// runRow.Concerns is the store-derived open-concern block decoded off
+		// GET /v0/runs/{id} above — the authoritative count source (#3043); nil
+		// (backend could not read the store) degrades the hint to the audit
+		// fallback.
+		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus, runRow.Concerns)
 	}
 
 	// Stage-execution wait status (#879/#880, ADR-037), derived from the

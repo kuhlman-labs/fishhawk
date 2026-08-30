@@ -1540,10 +1540,19 @@ components:
         server-minted stable UUIDs; this block surfaces what is still
         unresolved plus the IDs fix-up routing needs, in one read. Each
         item carries a BOUNDED note-derived `short_summary` label (at most
-        100 bytes, one line; #2488) — the gate view and the originating
-        `*_reviewed` audit entry remain the surfaces for the full
-        untruncated note.
-      required: [open, by_state, items]
+        100 bytes, one line; #2488); the run-status block carries NO full
+        `note` field BY DESIGN (payload size) — the gate view
+        (`GET /v0/runs/{run_id}/gate-view`) and the originating `*_reviewed`
+        audit entry are the surfaces for the full untruncated note.
+
+        PRESENCE is authoritative (#3043): this block is emitted whenever the
+        concern-store read SUCCEEDED, INCLUDING a zero-open run (`open: 0`,
+        `by_state: {}`, `items: []`). It is ABSENT only when the store was
+        UNAVAILABLE (no concern store wired, or the read errored). So present
+        means an authoritative store read; absent means unavailable, NEVER
+        "zero". The `open` set equals the gate view's `open[]` for the same
+        run by construction (both read the store's open predicate).
+      required: [open, by_state, open_implement, items]
       properties:
         open:
           type: integer
@@ -1555,6 +1564,19 @@ components:
             type: integer
           description: Open-concern count per lifecycle state.
           example: { raised: 2, addressed_pending: 1 }
+        open_implement:
+          type: integer
+          minimum: 0
+          description: |
+            AUTHORITATIVE count of open IMPLEMENT-stage concerns, computed at
+            the source over the FULL open set — not derived from the
+            (possibly-bounded) `items` list (#3043). Equals
+            `GET /v0/runs/{run_id}/gate-view?stage_kind=implement`'s `open[]`
+            length. The MCP `review_action_hint`'s concern count reads this,
+            so a trimmed `items` list can never undercount. Only
+            implement-stage concerns are routable into an implement fix-up, so
+            a run whose only open concerns are plan-stage ones reports
+            `open_implement: 0`.
         items:
           type: array
           items:
@@ -1562,7 +1584,12 @@ components:
 
     RunConcernItem:
       type: object
-      description: One open review concern.
+      description: |
+        One open review concern. Carries NO full `note` field BY DESIGN
+        (payload size, #3043) — only the bounded `short_summary` label below.
+        The full untruncated note is served by
+        `GET /v0/runs/{run_id}/gate-view` (and the originating `*_reviewed`
+        audit entry).
       required: [id, stage_kind, severity, category, state, has_suggested_patch]
       properties:
         id:

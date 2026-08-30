@@ -178,11 +178,14 @@ type RunStageOutput struct {
 	// populated only after an IMPLEMENT stage when its review landed with
 	// unresolved approve_with_concerns concerns and the bounded fix-up
 	// budget is not yet spent. It points at fishhawk_fixup_stage (route the
-	// concerns back to the agent) vs approving to merge. Omitted on plan and
-	// review stages (no implement review exists there) and when there is
+	// concerns back to the agent) vs approving to merge. Its concern count is
+	// the OPEN (store-derived) implement-stage count agreeing with the gate
+	// view by construction (#3043), not a per-round audit sum — so it no longer
+	// mis-fires once every concern is waived/deferred/addressed. Omitted on plan
+	// and review stages (no implement review exists there) and when there is
 	// nothing to act on — never gates the stage. Plan stages and start_run
 	// are intentionally excluded.
-	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer after an implement stage whose review returned unresolved approve_with_concerns concerns and a non-spent fix-up budget; points at fishhawk_fixup_stage vs approving to merge. Omitted for non-implement stages and when there is nothing to act on. Never gates the stage"`
+	ReviewActionHint *ReviewActionHint `json:"review_action_hint,omitempty" jsonschema:"display-only next-action pointer after an implement stage whose review returned unresolved approve_with_concerns concerns and a non-spent fix-up budget; points at fishhawk_fixup_stage vs approving to merge. The concern count is the OPEN store-derived implement-stage count (agreeing with fishhawk_get_gate_view), with an audit-derived fallback marked by a source of audit_fallback_store_unavailable or audit_fallback_legacy_peer. Omitted for non-implement stages and when there is nothing to act on. Never gates the stage"`
 
 	// NextActions is the server-suggested next-action block (#1024),
 	// computed after the post-stage fetches (run row + drive view, stage
@@ -780,11 +783,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	var reviewActionHint *ReviewActionHint
 	if in.Stage == "implement" && irsErr == nil {
 		runState := ""
+		// storeConcerns is the run row's store-derived open-concern block — the
+		// authoritative count source (#3043). When the post-run run fetch failed
+		// (runView == nil) it stays nil and the hint takes the documented audit
+		// fallback.
+		var storeConcerns *RunConcerns
 		if runView != nil {
 			runState = runView.State
+			storeConcerns = runView.Concerns
 		}
 		var hintErr error
-		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus)
+		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus, storeConcerns)
 		if hintErr != nil {
 			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
 		}

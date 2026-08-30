@@ -265,11 +265,42 @@ type RunLiveValidation struct {
 // the run's OPEN review concerns (states raised, addressed_pending,
 // reopened). Each item carries a BOUNDED note-derived short_summary label
 // (at most 100 bytes, one line; #2488); the gate view and the originating
-// *_reviewed audit entry remain the surfaces for the full untruncated note.
+// *_reviewed audit entry remain the surfaces for the full untruncated note —
+// the run-status block carries NO note field BY DESIGN (payload size).
+//
+// PRESENCE is authoritative (#3043): the backend emits this block whenever
+// the concern-store read SUCCEEDED, INCLUDING a zero-open run (open:0,
+// items omitted). It is ABSENT (nil) only when the store was UNAVAILABLE
+// (unwired / read error). So a decoded non-nil block == an authoritative
+// store read; nil == unavailable, NEVER "zero". The review-action hint reads
+// this: a present block is the count authority; a nil block degrades it to
+// the audit-derived fallback. An OLDER backend that omits the block for a
+// zero-open run reads as nil (unavailable) here — the documented version-skew
+// degrade, dev-loop-only since both binaries ship from this repo.
 type RunConcerns struct {
 	Open    int              `json:"open" jsonschema:"number of open review concerns on the run"`
 	ByState map[string]int   `json:"by_state,omitempty" jsonschema:"open-concern count per lifecycle state (raised, addressed_pending, reopened)"`
 	Items   []RunConcernItem `json:"items,omitempty" jsonschema:"the open concerns; each carries the stable id to pass to fishhawk_fixup_stage concern_ids"`
+	// OpenImplement is the AUTHORITATIVE count of open IMPLEMENT-stage
+	// concerns, computed by the backend over the FULL open set — not derived
+	// from the (possibly-bounded) Items above (#3043). It equals
+	// fishhawk_get_gate_view(stage_kind="implement").open. The review-action
+	// hint reads THIS number so a trimmed Items list can never undercount.
+	//
+	// It is a POINTER because ABSENT and ZERO are different facts that must not
+	// collapse: a peer that PREDATES this field returns a present concerns block
+	// carrying no open_implement key, which must decode to nil (unknown) and
+	// degrade the hint to the audit fallback — NOT to an authoritative zero,
+	// which would silently SUPPRESS the hint while implement concerns are
+	// genuinely open (the mixed-version defect this pointer closes). A plain int
+	// cannot tell "the peer never sent it" from "the peer sent 0". `omitempty`
+	// on a pointer omits ONLY nil, so a re-serialized authoritative zero still
+	// emits open_implement:0, mirroring the backend's non-omitempty REST
+	// contract (a present block always carries the key). The json tag MUST
+	// byte-match the backend's runConcernsPayload field or it decodes to nil
+	// silently — the #371-class hand-maintained-wire-mirror trap, exactly as the
+	// adjacent ShortSummary field warns.
+	OpenImplement *int `json:"open_implement,omitempty" jsonschema:"authoritative count of OPEN implement-stage concerns, computed over the full open set (not the bounded items); equals fishhawk_get_gate_view(stage_kind=implement).open. The review-action hint's concern count reads this. ABSENT (nil) means a backend peer that predates the field — the count degrades to the audit fallback rather than reading as an authoritative zero"`
 }
 
 // RunConcernItem is one open concern. ID is the stable server-minted
