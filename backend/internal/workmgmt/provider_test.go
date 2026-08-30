@@ -314,16 +314,38 @@ func TestDependsEdgeTargetRef(t *testing.T) {
 			t.Errorf("TargetRef = %q, want %q", got, want)
 		}
 	})
-	t.Run("no input renders issue:0", func(t *testing.T) {
+	t.Run("unresolvable edge never renders issue:0", func(t *testing.T) {
+		// Every case here is an UNRESOLVABLE edge (non-empty ToRefDigest, To=0);
+		// the load-bearing assertion is that none render issue:0. A resolvable
+		// To:0 edge legitimately renders issue:0 and is covered by the sibling
+		// subtests, so it is not a case here (routed test-vacuity concern).
 		for _, e := range []DependsEdge{
-			{From: 1, To: 0}, // resolvable-zero: issue:0 is acceptable here (numeric), not an unresolvable render
 			{From: 1, To: 0, ToRef: "x", ToRefDigest: "deadbeefdeadbeef"},
 			{From: 1, To: 0, ToRefDigest: "deadbeefdeadbeef"},
 		} {
 			got := e.TargetRef()
-			if e.ToRefDigest != "" && got == "issue:0" {
+			if got == "issue:0" {
 				t.Errorf("unresolvable edge %+v rendered issue:0 — forbidden", e)
 			}
+		}
+	})
+	t.Run("non-hex digest falls back to the sentinel", func(t *testing.T) {
+		// A directly-constructed edge whose ToRefDigest is NOT the 16-hex parser
+		// shape (an oversize, control-laden value a future constructor might
+		// supply) must never interpolate the raw digest into the operator message:
+		// TargetRef substitutes the <invalid-digest> sentinel (#2956, routed
+		// digest-symmetry concern). Counterfactual vehicle for boundTargetRefDigest.
+		got := DependsEdge{To: 0, ToRef: "other/repo#12",
+			ToRefDigest: "NOThex\x1b[31m/" + strings.Repeat("z", 9000)}.TargetRef()
+		if !strings.Contains(got, "<invalid-digest>") {
+			t.Errorf("TargetRef = %q, want the <invalid-digest> sentinel for a non-hex digest", got)
+		}
+		if strings.Contains(got, "\x1b") || strings.Contains(got, "zzz") {
+			t.Errorf("TargetRef = %q leaked the raw non-hex digest — must be replaced by the sentinel", got)
+		}
+		const ceiling = 200
+		if len(got) > ceiling {
+			t.Errorf("TargetRef len = %d, want <= %d (a non-hex digest must not blow up the render)", len(got), ceiling)
 		}
 	})
 	t.Run("ANSI / newline / quote are escaped and control-free", func(t *testing.T) {

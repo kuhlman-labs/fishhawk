@@ -2741,6 +2741,87 @@ func TestParseDependsOnMarker_CanonicalFormCollapsesWhitespaceVariants(t *testin
 	}
 }
 
+// TestParseDependsOnMarker_OverflowAndWhitespaceTokens (routed #2956 untested
+// paths): a regex-matching but int-OVERFLOWING digit string
+// (`99999999999999999999`, which dependsOnRefRE accepts but strconv.Atoi rejects)
+// is carried through UNRESOLVABLE with a digest and its verbatim display rather
+// than silently dropped; and a token carrying an internal whitespace RUN of mixed
+// classes — ASCII space, a tab, and a printable Unicode space (U+00A0) — has that
+// run collapsed to a single ASCII space in RawDisplay.
+func TestParseDependsOnMarker_OverflowAndWhitespaceTokens(t *testing.T) {
+	refs := parseDependsOnMarker("Depends on: 99999999999999999999, other/repo\t #12")
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want 2", refs)
+	}
+	// The overflow token: matches the ref regex but Atoi overflows, so it lands in
+	// the strconv.Atoi failure branch — unresolvable, Number 0, digest-bearing, and
+	// with its digits preserved verbatim in the display (never issue:0).
+	over := refs[0]
+	if over.Resolvable || over.Number != 0 {
+		t.Errorf("overflow ref = %+v, want unresolvable with Number 0", over)
+	}
+	if !isHex16(over.RawDigest) {
+		t.Errorf("overflow RawDigest = %q, want 16 hex chars", over.RawDigest)
+	}
+	if over.RawDisplay != "99999999999999999999" {
+		t.Errorf("overflow RawDisplay = %q, want the digit string verbatim", over.RawDisplay)
+	}
+	// The whitespace-run token: every whitespace class between owner/repo and #12
+	// collapses to ONE ASCII space (a tab is normalized, not dropped; the Unicode
+	// space is collapsed, not passed through).
+	ws := refs[1]
+	if ws.Resolvable {
+		t.Errorf("whitespace ref = %+v, want unresolvable", ws)
+	}
+	if ws.RawDisplay != "other/repo #12" {
+		t.Errorf("whitespace RawDisplay = %q, want %q (mixed whitespace run collapsed to one space)", ws.RawDisplay, "other/repo #12")
+	}
+	if !isHex16(ws.RawDigest) {
+		t.Errorf("whitespace RawDigest = %q, want 16 hex chars", ws.RawDigest)
+	}
+}
+
+// TestResolveDependencies_OverflowNumericToken_UnresolvableNoForgeLookup (routed
+// #2956 verification): a depends_on marker whose sole token is a regex-matching but
+// int-OVERFLOWING digit string produces ONE DroppedEdge stamped
+// DropTargetStateUnreadable carrying a digest/display identity, triggers NO GetIssue
+// for the (unresolvable) target, and never renders issue:0. This exercises the
+// strconv.Atoi failure branch END TO END through the provider — diff-only evidence
+// left it unverified.
+func TestResolveDependencies_OverflowNumericToken_UnresolvableNoForgeLookup(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: 99999999999999999999", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 1 {
+		t.Fatalf("DroppedEdges = %+v, want exactly one", res.DroppedEdges)
+	}
+	e := res.DroppedEdges[0]
+	if e.Reason != workmgmt.DropTargetStateUnreadable {
+		t.Errorf("Reason = %q, want %q", e.Reason, workmgmt.DropTargetStateUnreadable)
+	}
+	if !isHex16(e.ToRefDigest) {
+		t.Errorf("ToRefDigest = %q, want 16 hex chars", e.ToRefDigest)
+	}
+	if e.ToRef != "99999999999999999999" {
+		t.Errorf("ToRef = %q, want the overflow digit string verbatim", e.ToRef)
+	}
+	if ref := e.TargetRef(); strings.Contains(ref, "issue:0") {
+		t.Errorf("TargetRef = %q, must never render issue:0 for an unresolvable overflow target", ref)
+	}
+	// The overflow target is UNRESOLVABLE, so classifyOutOfSetTarget returns before
+	// any forge call: GetIssue is reached ONLY for the in-set fetch of 2032.
+	if got := api.getIssueCalls[2032]; got != 1 {
+		t.Errorf("GetIssue(2032) called %d times, want 1 (the in-set fetch)", got)
+	}
+	if len(api.getIssueCalls) != 1 {
+		t.Errorf("GetIssue call set = %v, want exactly {2032} — the overflow target must never reach a forge lookup", api.getIssueCalls)
+	}
+}
+
 // TestResolveDependencies_TwoDistinctCrossRepoTokens_ReportedSeparately (7.v): one
 // item body naming TWO distinct cross-repo tokens yields TWO DroppedEdges, both
 // DropTargetStateUnreadable, with DIFFERENT ToRefDigests (#2956, CF1 vehicle).

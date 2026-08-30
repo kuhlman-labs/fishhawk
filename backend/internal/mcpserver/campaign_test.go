@@ -2083,6 +2083,34 @@ func TestStartCampaign_UnreadableNumericToken_OmitsCrossRepoExplanation(t *testi
 	}
 }
 
+// TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanation
+// (routed #2956 untested path): unreadableRemedyClause is called from BOTH the
+// grooming-source branch and the non-grooming branch, but the sibling #2956 tests
+// all drive the non-grooming path. This drives the GROOMING branch — details carry
+// dangling_source: grooming_order plus a dangling_state_unreadable unparsable:
+// entry — and asserts the token AND the conditional cross-repo sentence appear in
+// the grooming remedy too.
+func TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanation(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"unreadable edge","details":{"dangling_source":"grooming_order","grooming_run_id":"abc","grooming_order_limit":3,"dangling_state_unreadable":["issue:2032->unparsable:0123456789abcdef:\"other/repo#12\""]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", GroomingRunID: "11111111-1111-1111-1111-111111111111"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	msg := err.Error()
+	for _, want := range []string{"could not be read", "other/repo#12", "unparsable:", "cross-repo"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("grooming remedy %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "issue:0") {
+		t.Errorf("grooming remedy %q renders issue:0 — forbidden", msg)
+	}
+}
+
 // unparsableE2EGHAPI is a minimal stub of the exported workmgmt/github.API
 // interface for the #2956 end-to-end test: only GetIssue is meaningful, the rest
 // return zero values (the same pattern boardSyncGHAPI uses). It records GetIssue

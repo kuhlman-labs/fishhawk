@@ -1187,17 +1187,26 @@ func sanitizeDependsOnToken(canonical string) string {
 	var runes []rune
 	prevSpace := false
 	for _, r := range canonical {
-		if r == '\uFEFF' || !unicode.IsPrint(r) {
-			continue
-		}
-		if r == ' ' {
+		// Normalize EVERY whitespace class \u2014 the ASCII space, a tab, and any
+		// printable Unicode space (U+00A0 no-break, U+2003 em, \u2026) \u2014 to ONE
+		// collapsed ASCII space, so display normalization is consistent across
+		// classes (#2956, routed whitespace concern). This is checked BEFORE the
+		// IsPrint drop so a tab (which unicode.IsPrint rejects) collapses to a
+		// space rather than being silently discarded, and an exotic Unicode space
+		// is collapsed rather than passed through unchanged. U+FEFF is NOT
+		// White_Space, so it still falls through to the drop below.
+		if unicode.IsSpace(r) {
 			if prevSpace {
 				continue
 			}
 			prevSpace = true
-		} else {
-			prevSpace = false
+			runes = append(runes, ' ')
+			continue
 		}
+		if r == '\uFEFF' || !unicode.IsPrint(r) {
+			continue
+		}
+		prevSpace = false
 		runes = append(runes, r)
 	}
 	s := strings.TrimSpace(string(runes))

@@ -293,11 +293,38 @@ func (e DependsEdge) TargetRef() string {
 	if e.ToRefDigest == "" {
 		return "issue:" + strconv.Itoa(e.To)
 	}
+	// Bound the digest as well as the display: in production only the parser sets
+	// ToRefDigest (16 lowercase hex from dependsOnTokenDigest), but the "holds for
+	// every DependsEdge however constructed" guarantee is asymmetric if a future
+	// constructor supplies a non-hex digest that is interpolated raw into an
+	// operator message. A digest that is not the 16-hex shape falls back to a fixed
+	// sentinel rather than being emitted unescaped (#2956, routed digest-symmetry
+	// concern).
+	digest := boundTargetRefDigest(e.ToRefDigest)
 	display := boundTargetRefDisplay(e.ToRef)
 	if display == "" {
-		return "unparsable:" + e.ToRefDigest + ":<unprintable>"
+		return "unparsable:" + digest + ":<unprintable>"
 	}
-	return "unparsable:" + e.ToRefDigest + ":" + strconv.Quote(display)
+	return "unparsable:" + digest + ":" + strconv.Quote(display)
+}
+
+// boundTargetRefDigest returns d when it is the 16-lowercase-hex shape
+// dependsOnTokenDigest emits, and the fixed `<invalid-digest>` sentinel
+// otherwise. It keeps TargetRef's guarantee symmetric across ToRef and
+// ToRefDigest: a directly-constructed edge whose digest bypassed the parser can
+// never interpolate an unbounded, control-laden, or non-hex digest into an
+// operator message (#2956, routed digest-symmetry concern). A parser-produced
+// digest is always 16 hex, so this is a no-op on the production path.
+func boundTargetRefDigest(d string) string {
+	if len(d) != 16 {
+		return "<invalid-digest>"
+	}
+	for _, r := range d {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return "<invalid-digest>"
+		}
+	}
+	return d
 }
 
 // boundTargetRefDisplay caps a display string at targetRefDisplayMaxRunes runes,
