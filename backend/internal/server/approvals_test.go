@@ -9981,15 +9981,86 @@ func TestSubmitApproval_HumanReviewGate_OperatorAgentToken_Forbidden(t *testing.
 }
 
 // Neither agent refusal leaks onto a PR-merge-managed review stage: that gate
-// is not admitted, so the ordinary ADR-018 409 still wins.
+// is not admitted, so the ordinary ADR-018 409 still wins — and it must do so
+// for BOTH agent identities. Pinning only the run-bound one would let a future
+// reordering start answering 403 for the delegated operator-agent and 409 for
+// the run-bound token on the SAME gate with nothing noticing.
 func TestSubmitApproval_AgentToken_PullRequestManagedGate_Still409(t *testing.T) {
-	s, _, rr, _ := newApprovalServer(t)
-	st := seedReviewStage(rr, "feature_change", featureChangeReviewSpec, run.ExecutorHuman, true)
-	id := runBoundIdentity(st.RunID, "write:approvals")
+	cases := []struct {
+		name string
+		mint func(runID uuid.UUID) Identity
+	}{
+		{"run-bound token", func(runID uuid.UUID) Identity { return runBoundIdentity(runID, "write:approvals") }},
+		{"delegated operator-agent token", func(uuid.UUID) Identity { return operatorAgentIdentity() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			st := seedReviewStage(rr, "feature_change", featureChangeReviewSpec, run.ExecutorHuman, true)
+			id := tc.mint(st.RunID)
 
-	w := submitApprovalWithIdentity(t, s, st.ID, &id, `{"decision":"approve","comment":"x"}`)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			w := submitApprovalWithIdentity(t, s, st.ID, &id, `{"decision":"approve","comment":"x"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "review_stage_managed_by_github" {
+				t.Errorf("code = %q, want review_stage_managed_by_github (the guard must defer to admission, not answer 403)", code)
+			}
+			if got := details["admission_reason"]; got != "pull_request_managed" {
+				t.Errorf("details.admission_reason = %v, want pull_request_managed", got)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
+
+// submitApprovalRawStageIDWithIdentity is submitApprovalWithIdentity for a
+// stage_id that is NOT a UUID, so a test can drive the handler's own parse
+// rung. It cannot reuse the typed helper, whose parameter is a uuid.UUID.
+func submitApprovalRawStageIDWithIdentity(t *testing.T, s *Server, rawStageID string, id Identity, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/stages/"+rawStageID+"/approvals", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", rawStageID)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleSubmitApproval(w, req)
+	return w
+}
+
+// The pre-scope guard must not SWALLOW the malformed-path ladder. On a
+// non-UUID {stage_id} lookupStageForPath returns nil, so the guard falls
+// through and the handler's own uuid.Parse writes the ordinary 400 — for
+// either agent identity. Both tokens carry write:approvals so the assertion
+// lands on the parse rung rather than on the scope check the guard sits ahead
+// of.
+func TestSubmitApproval_AgentToken_MalformedStageID_FallsThroughToLadder(t *testing.T) {
+	cases := []struct {
+		name string
+		id   Identity
+	}{
+		{"run-bound token", runBoundIdentity(uuid.New(), "write:approvals")},
+		{"delegated operator-agent token", operatorAgentIdentity()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := newApprovalServer(t)
+
+			w := submitApprovalRawStageIDWithIdentity(t, s, "not-a-uuid", tc.id,
+				`{"decision":"approve","comment":"x"}`)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed (the guard must not shadow the malformed-path ladder)", code)
+			}
+			if got := details["field"]; got != "stage_id" {
+				t.Errorf("details.field = %v, want stage_id", got)
+			}
+		})
 	}
 }
 
