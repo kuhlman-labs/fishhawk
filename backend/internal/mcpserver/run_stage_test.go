@@ -1868,6 +1868,60 @@ func TestRunStage_NextActions_SurfacedAfterStage(t *testing.T) {
 	}
 }
 
+// TestRunStage_ReviewActionHint_StoreUnavailableWhenRunFetchFails is routed
+// concern 1ea5f48e item (1)'s must-land coverage (#3043): the run_stage.go
+// call-site arm where the POST-RUN run fetch FAILS -> runView == nil ->
+// storeConcerns nil -> the review-action hint degrades to the audit fallback
+// under the audit_fallback_store_unavailable marker. TestGetRunStatus_Hint-
+// StoreUnavailableBlock proves reviewActionHintFor handles a nil block, but
+// only THIS test proves run_stage.go actually hands nil THROUGH when its GET
+// /v0/runs/{id} fetch errors — the caller-hands-the-wrong-thing failure mode
+// the operator named. The GET is forced to 500 for this run so
+// fetchRunDriveView returns an error (runView nil), NOT a zero view with a nil
+// Concerns field; the pre-spawn runner_kind guard fails OPEN and the stdio
+// working_dir resolver degrades to the explicit path on the same error, so the
+// stage still runs to the hint computation.
+func TestRunStage_ReviewActionHint_StoreUnavailableWhenRunFetchFails(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio: an unreadable run degrades to the explicit working_dir
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	// The audit fallback source: two implement-stage concerns in the latest round.
+	seedImplementReviewedAudit(fb, runID, stageID, 2)
+	// Force GET /v0/runs/{id} to 500 for THIS run so the post-run
+	// fetchRunDriveView errors and runView is nil — the arm under test.
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+		WorkingDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.ReviewActionHint == nil {
+		t.Fatalf("review_action_hint absent; want the audit fallback to fire when the post-run run fetch fails")
+	}
+	if out.ReviewActionHint.Source != hintSourceStoreUnavailable {
+		t.Errorf("hint.Source = %q, want audit_fallback_store_unavailable (runView nil -> storeConcerns nil)", out.ReviewActionHint.Source)
+	}
+	if out.ReviewActionHint.Concerns != 2 {
+		t.Errorf("hint.Concerns = %d, want 2 (the audit fallback count)", out.ReviewActionHint.Concerns)
+	}
+	if !strings.Contains(out.ReviewActionHint.Message, "the concern store was unavailable") {
+		t.Errorf("store-unavailable message should say the store was unavailable; got %q", out.ReviewActionHint.Message)
+	}
+}
+
 // TestRunStage_BlocksHostDispatchAgainstActionsLockedRun asserts the #1355
 // guardrail on the SYNCHRONOUS host-dispatch verb: a run already LOCKED to
 // runner_kind=github_actions returns a non-nil error and spawns ZERO runners,

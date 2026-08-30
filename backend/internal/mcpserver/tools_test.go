@@ -4833,9 +4833,9 @@ func TestGetRunStatus_HintLegacyPeerBlock(t *testing.T) {
 // under the audit_fallback_store_unavailable marker, whose wording DOES say the
 // store was unavailable (true here). This is the same degraded reviewActionHintFor
 // path the run_stage.go call site reaches when its post-run run fetch fails
-// (runView == nil -> storeConcerns nil); run_stage_test.go is outside this
-// change's scope, so the store-unavailable marker is pinned through this call
-// site instead (see the fix-up commit body).
+// (runView == nil -> storeConcerns nil); that run_stage.go arm is pinned directly
+// by TestRunStage_ReviewActionHint_StoreUnavailableWhenRunFetchFails, so this
+// case pins the getRunStatus (tools.go) call site for the same marker.
 func TestGetRunStatus_HintStoreUnavailableBlock(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
