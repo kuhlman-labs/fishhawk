@@ -4446,9 +4446,20 @@ func (s *Server) loadClarificationAnswers(ctx context.Context, runID uuid.UUID) 
 // loadRevisionConstraint scans the run's plan_revised audit entries
 // (newest-first) for the first entry carrying a non-empty rendered
 // `conditions` blob — the operator's binding design constraint for a
-// plan-gate `revise` re-open (#1099). Returns the blob (capped at 4000
-// bytes) or nil when none is found. Best-effort: WARN-logs and returns
-// nil on any error.
+// plan-gate `revise` re-open (#1099). Returns the blob RAW — uncapped — or
+// nil when none is found. Best-effort: WARN-logs and returns nil on any error.
+//
+// The loader deliberately does NOT cap (#2871). Exactly one site owns this
+// channel's cap: the renderer (prompt.writeOperatorConstraint via
+// prompt.MaxRevisionConstraintBytes), with handleRevisePlan gate-REFUSING an
+// over-cap constraint before it can ever be persisted. Capping here as well was
+// a SECOND silent truncation, and the lower of the two caps won — so a
+// constraint the gate accepted could still be cut on the way to the prompt.
+// This mirrors the loader/renderer split loadPriorRejectionFeedback already
+// uses. An over-cap blob can therefore only be a legacy entry stored before the
+// gate shipped; it is WARN-logged as its own event (distinct from the ordinary
+// INFO load) so it is conspicuous to whoever is watching logs, and the renderer
+// elides it loudly with an ADR-077 retrieval marker rather than a bare cut.
 //
 // This is a DEDICATED channel, isolated from loadApprovalConditions
 // (approval_submitted) and loadClarificationAnswers (clarification_
@@ -4476,12 +4487,25 @@ func (s *Server) loadRevisionConstraint(ctx context.Context, runID uuid.UUID) *s
 			continue
 		}
 		if payload.Conditions != "" {
-			c, _ := prompt.CapText(payload.Conditions, prompt.MaxConditionBytes)
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-				"prompt: loaded revision constraint into re-dispatched plan prompt",
-				slog.String("run_id", runID.String()),
-				slog.Int("constraint_bytes", len(payload.Conditions)),
-			)
+			c := payload.Conditions
+			if len(c) > prompt.MaxRevisionConstraintBytes {
+				// A legacy over-cap entry: stored before handleRevisePlan
+				// gained its refusal, so the renderer will elide it. WARN, not
+				// INFO — this is an operational anomaly a log watcher should
+				// see, not a routine load (#2871).
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"prompt: revision constraint exceeds the cap and will be elided in the plan prompt",
+					slog.String("run_id", runID.String()),
+					slog.Int("constraint_bytes", len(c)),
+					slog.Int("max_bytes", prompt.MaxRevisionConstraintBytes),
+				)
+			} else {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+					"prompt: loaded revision constraint into re-dispatched plan prompt",
+					slog.String("run_id", runID.String()),
+					slog.Int("constraint_bytes", len(c)),
+				)
+			}
 			return &c
 		}
 	}

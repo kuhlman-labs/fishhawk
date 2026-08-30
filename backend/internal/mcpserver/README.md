@@ -681,7 +681,7 @@ Inputs:
 | Field | Required | Notes |
 |---|---|---|
 | `run_id` | **yes** | The run whose plan stage to revise. |
-| `constraint` | **yes** | The binding design constraint the planner must revise the prior plan to satisfy. Injected into the re-dispatched plan prompt as a dedicated, binding **"Revision constraint"** section (the [#558](https://github.com/kuhlman-labs/fishhawk/issues/558) condition-delivery framing: MANDATORY, wins on conflict), with the prior plan carried as the **revision base**. Empty constraints are rejected (`validation_failed`, also caught locally before the HTTP hop). |
+| `constraint` | **yes** | The binding design constraint the planner must revise the prior plan to satisfy. Injected into the re-dispatched plan prompt as a dedicated, binding **"Revision constraint"** section (the [#558](https://github.com/kuhlman-labs/fishhawk/issues/558) condition-delivery framing: MANDATORY, wins on conflict), with the prior plan carried as the **revision base**. Empty constraints are rejected (`validation_failed`, also caught locally before the HTTP hop). **Capped at 12000 BYTES** on the whitespace-trimmed value — the same cap the binding approve-with-conditions comment carries — and an over-cap constraint is **REFUSED, never silently truncated** ([#2871](https://github.com/kuhlman-labs/fishhawk/issues/2871)); see below. |
 | `force_additional_pass` | no | Bounded operator override — grant ONE revise pass **beyond** the normal budget when it is already spent (`revise_budget_exhausted`), hard-capped at 3 total passes per stage. The forced pass is audited. |
 
 When to reach for revise vs the alternatives:
@@ -707,7 +707,14 @@ What a revise does — and how it differs from `fishhawk_reject_plan`:
 - **Residual operator-facing consequence:** the refusal budget is ONE pass per run. Once spent, a further undeclared narrowing degrades to the prior behaviour — the plan reaches the gate carrying the regression evidence, and the pass does NOT consume the normal revise budget, so the operator still gets a free recovery pass. The hard ceiling counts every pass either way.
 - The tool description pins this contract (`TestRevisePlanDescription_DocumentsScopeRefusal`), so it cannot silently drift back to describing the old silent-drop behaviour.
 
-Error surfaces propagated as tool errors: `validation_failed` (400, empty constraint), `cross_run_revise` (403), `stage_not_found` (404), `revise_not_applicable` (409, the stage is not a plan stage parked at `awaiting_approval`), `revise_budget_exhausted` (409), `revise_ceiling_reached` (409). The OpenAPI/`v0.md` surface remains the authoritative parameter reference.
+**Constraint byte cap — refuse, never truncate ([#2871](https://github.com/kuhlman-labs/fishhawk/issues/2871)).** The constraint is BINDING in exactly the sense an approve-with-conditions comment is, so it takes the same posture rather than the advisory one:
+
+- Over `prompt.MaxRevisionConstraintBytes` (12000, measured in BYTES on the trimmed value) → `400 validation_failed`, with `details` carrying `field`, `bytes`, `max_bytes` and `overflow_bytes`. Remedy: split the constraint across revise passes, tighten it, or reject the plan to a fresh-run replan.
+- **The refusal precedes every stateful step** — the stage read, the subject-binding guard, the pass counting and the `plan_revised` append — so a refused call consumes **no revise pass** and writes **no audit entry**; the plan stage stays parked at its gate.
+- An accepted constraint is stored on the `plan_revised` entry's `conditions` key **byte-for-byte** and rendered whole into the plan prompt. Previously the handler sliced it at 4000 and the truncated text was what landed in the hash-chained audit record, so the durable record corroborated the loss and a later reader could not detect it at all — unlike [#2583](https://github.com/kuhlman-labs/fishhawk/issues/2583) on `approve_plan`, whose audit record stayed intact.
+- The rendered constraint is terminated by `--- END OF OPERATOR CONSTRAINT ---`, and the instruction to expect that terminator is written into the prompt scaffolding **before** the constraint, so a cut in transit is detectable rather than silent.
+
+Error surfaces propagated as tool errors: `validation_failed` (400, empty constraint, or a constraint over the 12000-byte cap), `cross_run_revise` (403), `stage_not_found` (404), `revise_not_applicable` (409, the stage is not a plan stage parked at `awaiting_approval`), `revise_budget_exhausted` (409), `revise_ceiling_reached` (409). The OpenAPI/`v0.md` surface remains the authoritative parameter reference.
 
 ## Concern waiver (`fishhawk_waive_concern`)
 

@@ -12973,6 +12973,22 @@ paths:
                     prompt as a dedicated, binding "Revision constraint"
                     section (MANDATORY, wins on conflict), with the prior plan
                     as the revision base. Empty/whitespace-only is rejected.
+
+                    Capped at 12000 BYTES (not characters), measured on the
+                    whitespace-trimmed value — the same cap the binding
+                    approve-with-conditions comment carries, because both
+                    channels carry binding operator instructions. An over-cap
+                    constraint is REFUSED with `400 validation_failed`, NEVER
+                    silently truncated (#2871): the refusal precedes every
+                    stateful step, so no revise pass is consumed and no
+                    `plan_revised` audit entry is written. An accepted
+                    constraint is stored on that entry's `conditions` key
+                    byte-for-byte and rendered whole into the plan prompt,
+                    terminated by an explicit
+                    `--- END OF OPERATOR CONSTRAINT ---` line so a cut in
+                    transit is structurally detectable. Remedy for an over-cap
+                    constraint: split it across revise passes, tighten it, or
+                    reject the plan to a fresh-run replan.
                 force_additional_pass:
                   type: boolean
                   default: false
@@ -12994,7 +13010,10 @@ paths:
         '400':
           description: |
             `validation_failed` — the `stage_id` is not a valid UUID, the body
-            is not valid JSON, or `constraint` is empty/whitespace-only.
+            is not valid JSON, `constraint` is empty/whitespace-only, or
+            `constraint` exceeds the 12000-byte cap (#2871). On the over-cap
+            arm, `details` carries `field: "constraint"`, `bytes`, `max_bytes`
+            and `overflow_bytes`, and the refused call consumes no revise pass.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

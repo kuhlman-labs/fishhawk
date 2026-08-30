@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -57,11 +58,34 @@ type reviseRequest struct {
 	ForceAdditionalPass bool   `json:"force_additional_pass"`
 }
 
-// maxRevisionConstraintBytes caps the operator constraint stored on the
-// plan_revised audit entry, matching the 4000-byte cap the prompt
-// renderer applies to the other resume channels (clarification answers,
-// approval conditions, prior-rejection feedback).
-const maxRevisionConstraintBytes = 4000
+// validateReviseConstraint enforces the binding revision-constraint byte cap
+// (#2871), mirroring approvals.go validateApprovalComment.
+//
+// The constraint is BINDING — it is injected verbatim into the re-dispatched
+// plan prompt as the "Revision constraint (MANDATORY — wins on conflict)"
+// section — so an over-cap constraint is REFUSED here rather than silently cut.
+// The historical behavior sliced it to 4000 bytes and returned 200, and because
+// the plan_revised audit payload carried the ALREADY-TRUNCATED text the
+// hash-chained record corroborated the shortened version: unlike #2583 on
+// approve_plan, the loss was undetectable after the fact.
+//
+// The cap is measured in BYTES (len) on the TRIMMED constraint — the value
+// actually persisted and rendered — matching prompt.CapTextWithRetrieval's
+// byte-based cut, not characters. Returns (true, "", nil) when admissible.
+func validateReviseConstraint(constraint string) (ok bool, message string, details map[string]any) {
+	if len(constraint) <= prompt.MaxRevisionConstraintBytes {
+		return true, "", nil
+	}
+	msg := fmt.Sprintf(
+		"revise constraint is %d bytes; the maximum is %d (it is injected verbatim into the re-dispatched plan prompt as a binding revision constraint and must not be silently truncated as a binding instruction). Split the constraint across multiple revise passes, tighten it, or reject the plan to a fresh-run replan for a wholesale redirection",
+		len(constraint), prompt.MaxRevisionConstraintBytes)
+	return false, msg, map[string]any{
+		"field":          "constraint",
+		"bytes":          len(constraint),
+		"max_bytes":      prompt.MaxRevisionConstraintBytes,
+		"overflow_bytes": len(constraint) - prompt.MaxRevisionConstraintBytes,
+	}
+}
 
 // handleRevisePlan implements POST /v0/stages/{stage_id}/revise.
 //
@@ -89,6 +113,11 @@ const maxRevisionConstraintBytes = 4000
 //     revise_ceiling_reached
 //   - empty constraint                                           → 400
 //     validation_failed
+//   - constraint over prompt.MaxRevisionConstraintBytes           → 400
+//     validation_failed (#2871: the constraint is BINDING, so it is refused
+//     rather than silently truncated; details carries bytes / max_bytes /
+//     overflow_bytes). The check precedes every stateful step, so the refused
+//     call consumes NO revise pass and writes NO plan_revised entry.
 //
 // Distinct from POST /v0/stages/{stage_id}/retry: retry re-opens a FAILED
 // stage; revise re-opens a HEALTHY plan gate and is bounded
@@ -127,8 +156,14 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "constraint"})
 		return
 	}
-	if len(constraint) > maxRevisionConstraintBytes {
-		constraint = constraint[:maxRevisionConstraintBytes]
+	// Over-cap refusal (#2871). Placed BEFORE every stateful step — the
+	// GetStage read, the subject-binding guard, the pass counting, and above
+	// all RevisePlanStage with its plan_revised audit append — so a refused
+	// call consumes NO revise pass, appends NO audit entry, and leaves the
+	// plan stage parked at awaiting_approval.
+	if ok, msg, details := validateReviseConstraint(constraint); !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg, details)
+		return
 	}
 
 	// Pre-fetch the stage for the subject-binding guard and the audit
@@ -434,7 +469,12 @@ var errReviseAuditAppendFailed = errors.New("append plan_revised audit entry fai
 // bounded-pass receipt fields, and whether the pass was operator-forced.
 // The `conditions` key carries the constraint blob the plan-stage prompt
 // builder reads back (loadRevisionConstraint), mirroring how
-// clarification_answered carries the resumed plan's answers.
+// clarification_answered carries the resumed plan's answers. Since #2871 that
+// blob is the operator's constraint VERBATIM — the whitespace-trimmed
+// submission byte-for-byte, never truncated here. An over-cap constraint is
+// gate-refused upstream (validateReviseConstraint) before this hook can run, so
+// the durable hash-chained record can no longer corroborate a shortened
+// version of a binding instruction.
 //
 // It is wired as RevisePlanStage's OnAdmit hook so it runs BEFORE the
 // awaiting_approval → pending transition: the plan prompt path loads the

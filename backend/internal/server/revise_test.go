@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -716,4 +718,261 @@ func TestRevisePlan_InsufficientScope(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleRevisePlan(w, req)
 	assertScopeError(t, w, http.StatusForbidden, "insufficient_scope")
+}
+
+// --- #2871: the binding constraint is refused over-cap, never truncated ---
+
+// atCapConstraint builds a constraint of EXACTLY
+// prompt.MaxRevisionConstraintBytes bytes whose tail is a MULTI-BYTE rune, and
+// asserts that length in the fixture itself so the boundary case cannot
+// silently drift to cap-1 or cap+1 (the operator's CONDITION 3 guard). The
+// measurement is BYTES, not runes: the defect this pins was a bare byte slice
+// `constraint[:cap]` with no rune awareness, which is why the reported live cut
+// landed mid-word. The multi-byte tail means a naive byte cut at any offset
+// inside the trailing rune emits a replacement/partial rune instead of the
+// exact submission, so a byte-for-byte comparison catches it.
+func atCapConstraint(t *testing.T) string {
+	t.Helper()
+	const tail = "…é🜂" // 3 + 2 + 4 = 9 bytes, all multi-byte runes
+	s := strings.Repeat("C", prompt.MaxRevisionConstraintBytes-len(tail)) + tail
+	if len(s) != prompt.MaxRevisionConstraintBytes {
+		t.Fatalf("at-cap fixture is %d bytes, want exactly %d (BYTES, not runes)",
+			len(s), prompt.MaxRevisionConstraintBytes)
+	}
+	return s
+}
+
+// reviseBody JSON-encodes a revise request body carrying the given constraint,
+// so a fixture with quotes/newlines/multi-byte runes round-trips intact.
+func reviseBody(t *testing.T, constraint string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"constraint": constraint})
+	if err != nil {
+		t.Fatalf("marshal revise body: %v", err)
+	}
+	return string(b)
+}
+
+// TestRevisePlan_OverCapConstraint_400 pins the refusal itself: a constraint
+// ONE byte over prompt.MaxRevisionConstraintBytes is rejected with 400
+// validation_failed and details carrying the exact accounting, instead of being
+// sliced and accepted with a 200 (the #2871 defect).
+func TestRevisePlan_OverCapConstraint_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _ := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+	over := strings.Repeat("x", prompt.MaxRevisionConstraintBytes+1)
+	w := revisePlan(t, s, stageID, reviseBody(t, over))
+	assertScopeError(t, w, http.StatusBadRequest, "validation_failed")
+
+	var body struct {
+		Error struct {
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v (%s)", err, w.Body.String())
+	}
+	for key, want := range map[string]float64{
+		"bytes":          float64(prompt.MaxRevisionConstraintBytes + 1),
+		"max_bytes":      float64(prompt.MaxRevisionConstraintBytes),
+		"overflow_bytes": 1,
+	} {
+		got, ok := body.Error.Details[key].(float64)
+		if !ok || got != want {
+			t.Errorf("details[%q] = %v, want %v", key, body.Error.Details[key], want)
+		}
+	}
+	if got, _ := body.Error.Details["field"].(string); got != "constraint" {
+		t.Errorf("details[\"field\"] = %q, want \"constraint\"", got)
+	}
+	// The message must be actionable about WHY it is refused rather than cut.
+	if !strings.Contains(body.Error.Message, "must not be silently truncated") {
+		t.Errorf("refusal message does not explain the refuse-not-truncate posture: %q", body.Error.Message)
+	}
+}
+
+// TestRevisePlan_OverCapConstraint_ConsumesNoPass is the COMMITTED-STATE half
+// of the refusal, and the assertion the error identity alone cannot make: a 400
+// looks byte-identical whether the guard fired before the audit append or after
+// it and rolled back. So this reads the state AFTER the refused call — zero
+// plan_revised entries for the stage, the stage still parked at
+// awaiting_approval — and then proves the budget is genuinely UNSPENT by
+// driving a subsequent at-cap revise that must succeed on the normal budget of
+// one. A handler that appended the entry and then refused would fail the second
+// call with revise_budget_exhausted.
+func TestRevisePlan_OverCapConstraint_ConsumesNoPass(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+	over := strings.Repeat("x", prompt.MaxRevisionConstraintBytes+1)
+	w := revisePlan(t, s, stageID, reviseBody(t, over))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+
+	for _, e := range au.appended {
+		if e.Category == CategoryPlanRevised {
+			t.Errorf("refused revise appended a plan_revised audit entry: %s", e.Payload)
+		}
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (the gate must be intact)", got)
+	}
+	for _, c := range rr.transitionStageCalls {
+		if c.To == run.StageStatePending {
+			t.Errorf("refused revise re-opened the stage to pending")
+		}
+	}
+
+	// The normal budget (1) is unspent: an admissible revise still succeeds.
+	w2 := revisePlan(t, s, stageID, reviseBody(t, atCapConstraint(t)))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("follow-up at-cap revise status = %d, want 200 (the refused call must not have spent the budget):\n%s",
+			w2.Code, w2.Body.String())
+	}
+}
+
+// TestRevisePlan_AtCapConstraint_StoredByteForByte is the boundary case a
+// refusal-only test cannot make: an implementation that refuses over-cap but
+// still truncates AT cap-1 passes TestRevisePlan_OverCapConstraint_400 and
+// fails here.
+//
+// AUTHORITATIVE EQUALITY RULE (operator CONDITION 3): the stored value is the
+// TRIMMED submission, byte-for-byte. strings.TrimSpace is applied first and is
+// pre-existing behavior this change does not alter, so "byte-for-byte" means
+// against the trimmed text — which is also the value the cap is measured on and
+// the value the prompt renders. The padded sub-case below pins exactly that: a
+// submission whose RAW length exceeds the cap but whose TRIMMED length is at
+// the cap is ACCEPTED, and what lands in the audit record is the trimmed text
+// with no marker, no cut, and no surviving padding.
+func TestRevisePlan_AtCapConstraint_StoredByteForByte(t *testing.T) {
+	atCap := atCapConstraint(t)
+
+	for _, tc := range []struct {
+		name      string
+		submitted string
+	}{
+		{"exactly at cap", atCap},
+		{"whitespace-padded to over cap, trims to cap", "  \n\t" + atCap + "\n  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, _, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+			w := revisePlan(t, s, stageID, reviseBody(t, tc.submitted))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if len(au.appended) != 1 {
+				t.Fatalf("audit entries = %d, want 1", len(au.appended))
+			}
+			var payload struct {
+				Conditions string `json:"conditions"`
+			}
+			if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+				t.Fatalf("decode plan_revised payload: %v", err)
+			}
+			if payload.Conditions != atCap {
+				t.Errorf("stored conditions differ from the trimmed submission: got %d bytes, want %d; first difference at byte %d",
+					len(payload.Conditions), len(atCap), firstDiff(payload.Conditions, atCap))
+			}
+			if strings.Contains(payload.Conditions, "...[truncated]") ||
+				strings.Contains(payload.Conditions, "...[ELIDED") {
+				t.Errorf("an at-cap constraint was marked truncated: %q", tail(payload.Conditions, 40))
+			}
+		})
+	}
+}
+
+// firstDiff returns the byte offset of the first difference between a and b,
+// or -1 when they are equal.
+func firstDiff(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	if len(a) != len(b) {
+		return n
+	}
+	return -1
+}
+
+// tail returns the last n bytes of s (for readable failure output).
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// TestLoadRevisionConstraint_ReturnsRawOverCapText pins the single-cap-owner
+// invariant (#2871): the loader returns the stored blob UNCAPPED so the
+// renderer is the only site that elides. A loader that re-capped would cut at
+// the LOWER of two caps, silently shortening a constraint the gate accepted.
+func TestLoadRevisionConstraint_ReturnsRawOverCapText(t *testing.T) {
+	runID := uuid.New()
+	au := newAuditFake()
+	rid := runID
+	// A legacy entry stored before the gate existed: over the renderer cap.
+	stored := strings.Repeat("L", prompt.MaxRevisionConstraintBytes+500)
+	payload, _ := json.Marshal(map[string]any{"conditions": stored})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Category: CategoryPlanRevised, Payload: payload})
+
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: au,
+		Logger:    slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	got := s.loadRevisionConstraint(context.Background(), runID)
+	if got == nil {
+		t.Fatal("loadRevisionConstraint = nil, want the stored blob")
+	}
+	if *got != stored {
+		t.Errorf("loader returned %d bytes, want the raw %d (the loader must not cap)", len(*got), len(stored))
+	}
+	if strings.Contains(*got, "...[truncated]") {
+		t.Errorf("loader appended a truncation marker")
+	}
+	// CONDITION 4: the legacy over-cap read is a WARN, not an INFO with a flag.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "level=WARN") ||
+		!strings.Contains(logged, "revision constraint exceeds the cap") {
+		t.Errorf("over-cap legacy read did not WARN-log:\n%s", logged)
+	}
+}
+
+// TestLoadRevisionConstraint_UnderCapLogsInfoNotWarn is the paired control for
+// CONDITION 4: the ordinary load must stay at INFO, so the WARN above is a
+// signal about an anomaly rather than noise on every revise.
+func TestLoadRevisionConstraint_UnderCapLogsInfoNotWarn(t *testing.T) {
+	runID := uuid.New()
+	au := newAuditFake()
+	rid := runID
+	payload, _ := json.Marshal(map[string]any{"conditions": "an ordinary constraint"})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Category: CategoryPlanRevised, Payload: payload})
+
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: au,
+		Logger:    slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if got := s.loadRevisionConstraint(context.Background(), runID); got == nil || *got != "an ordinary constraint" {
+		t.Fatalf("loadRevisionConstraint = %v, want the stored blob", got)
+	}
+	logged := logBuf.String()
+	if strings.Contains(logged, "level=WARN") {
+		t.Errorf("an under-cap load WARN-logged:\n%s", logged)
+	}
+	if !strings.Contains(logged, "loaded revision constraint") {
+		t.Errorf("an under-cap load did not INFO-log:\n%s", logged)
+	}
 }

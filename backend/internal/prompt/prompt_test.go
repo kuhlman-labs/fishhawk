@@ -2044,27 +2044,234 @@ func TestBuild_Plan_RevisionConstraint_BindsWithoutBase(t *testing.T) {
 	}
 }
 
-// TestBuild_Plan_RevisionConstraint_Truncated mirrors the other resume
-// channels' 4000-byte cap so a runaway constraint/base can't blow the
-// prompt budget.
-func TestBuild_Plan_RevisionConstraint_Truncated(t *testing.T) {
-	longConstraint := strings.Repeat("y", 5000)
+// TestBuild_Plan_RevisionBase_Truncated pins the revision BASE plan's unchanged
+// 4000-byte cap. The base blob is a server-derived convenience (superseded by
+// the enumerated carry-forward scope list), not an operator instruction, so it
+// keeps the historical bare-marker cut — unlike the CONSTRAINT, which #2871
+// moved to MaxRevisionConstraintBytes with a loud elision block.
+func TestBuild_Plan_RevisionBase_Truncated(t *testing.T) {
+	constraint := "keep the change additive"
 	longBase := strings.Repeat("z", 5000)
 	got, err := Build("plan", Trigger{
 		IssueNumber:        7,
 		Repo:               "x/y",
-		RevisionConstraint: &longConstraint,
+		RevisionConstraint: &constraint,
 		RevisionBasePlan:   &longBase,
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "...[truncated]") {
-		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	if !strings.Contains(got, longBase[:4000]+"...[truncated]") {
+		t.Errorf("plan prompt missing the base-plan cap+marker fragment:\n%s", got)
 	}
-	if strings.Contains(got, longConstraint) {
-		t.Errorf("untruncated long constraint appeared in prompt")
+	if strings.Contains(got, longBase) {
+		t.Errorf("untruncated long base plan appeared in prompt")
 	}
+}
+
+// --- #2871: the binding constraint is delivered WHOLE, or elided LOUDLY ---
+
+// atCapRevisionConstraint builds a constraint of EXACTLY
+// MaxRevisionConstraintBytes bytes ending in MULTI-BYTE runes, asserting that
+// byte length in the fixture itself so the boundary cannot silently drift to
+// cap-1 or cap+1. Byte length, not rune count: the historical cut was a bare
+// byte slice, and a multi-byte tail is what makes a rune-unsafe cut visible
+// (it emits a partial rune instead of the exact submission).
+func atCapRevisionConstraint(t *testing.T) string {
+	t.Helper()
+	const tail = "\u2026\u00e9\U0001F702" // 3 + 2 + 4 = 9 bytes
+	s := strings.Repeat("C", MaxRevisionConstraintBytes-len(tail)) + tail
+	if len(s) != MaxRevisionConstraintBytes {
+		t.Fatalf("at-cap fixture is %d bytes, want exactly %d (BYTES, not runes)",
+			len(s), MaxRevisionConstraintBytes)
+	}
+	return s
+}
+
+// TestBuild_Plan_RevisionConstraint_AtCap_RenderedWhole is the test that goes
+// RED if the renderer's cap is reverted to the historical 4000: a constraint of
+// exactly MaxRevisionConstraintBytes bytes must render VERBATIM, with its final
+// (multi-byte) bytes present and no truncation marker of either shape.
+func TestBuild_Plan_RevisionConstraint_AtCap_RenderedWhole(t *testing.T) {
+	constraint := atCapRevisionConstraint(t)
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		RevisionConstraint: &constraint,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, constraint) {
+		t.Errorf("the at-cap constraint was not rendered whole (last 20 bytes wanted: %q)",
+			constraint[len(constraint)-20:])
+	}
+	if strings.Contains(got, "...[truncated]") {
+		t.Errorf("an at-cap constraint drew the bare truncation marker")
+	}
+	if strings.Contains(got, "...[ELIDED") {
+		t.Errorf("an at-cap constraint drew the elision marker")
+	}
+	if strings.Contains(got, revisionConstraintElidedNotice) {
+		t.Errorf("an at-cap constraint drew the truncation notice")
+	}
+}
+
+// TestBuild_Plan_RevisionConstraint_OverCap_ElidedLoudly pins the residual
+// over-cap render path — reachable only for a constraint persisted BEFORE the
+// handler gate shipped, since handleRevisePlan now refuses above the cap. It
+// must draw the ADR-077 elision block (byte accounting + the plan_revised
+// retrieval pointer + the INCOMPLETE statement) AND the renderer-emitted
+// risks_and_assumptions instruction, never the bare "...[truncated]" marker
+// that made the loss easy to miss.
+func TestBuild_Plan_RevisionConstraint_OverCap_ElidedLoudly(t *testing.T) {
+	constraint := strings.Repeat("y", MaxRevisionConstraintBytes+1)
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		RevisionConstraint: &constraint,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"...[ELIDED",
+		fmt.Sprintf("%d of %d bytes shown", MaxRevisionConstraintBytes, len(constraint)),
+		"1 bytes dropped",
+		fmt.Sprintf("at the %d-byte cap", MaxRevisionConstraintBytes),
+		"Do NOT read the visible text as the whole instruction",
+		"plan_revised audit entry (conditions payload key",
+		"record in the plan's risks_and_assumptions that the revision constraint was truncated",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("over-cap constraint render missing %q:\n%s", w, tailOf(got, 1200))
+		}
+	}
+	if strings.Contains(got, "...[truncated]") {
+		t.Errorf("over-cap constraint drew the BARE truncation marker instead of the elision block")
+	}
+	if strings.Contains(got, constraint) {
+		t.Errorf("the untruncated over-cap constraint appeared in the prompt")
+	}
+}
+
+// TestBuild_Plan_RevisionConstraint_EndMarkerRendered pins the terminator on an
+// ordinary under-cap constraint: it follows the constraint body, in that order.
+func TestBuild_Plan_RevisionConstraint_EndMarkerRendered(t *testing.T) {
+	constraint := "route the retry through the existing httpclient helper."
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		RevisionConstraint: &constraint,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Assert the ADJACENCY directly rather than comparing indices: the
+	// expectation sentence quotes the marker literal ahead of the body, so an
+	// index comparison alone would report a confusing ordering failure when the
+	// terminator is missing entirely. This form says exactly what is required —
+	// the constraint body, a blank line, then the marker on its own line.
+	if !strings.Contains(got, constraint+"\n\n"+RevisionConstraintEndMarker+"\n") {
+		t.Errorf("the end-of-constraint marker does not terminate the constraint body:\n%s", tailOf(got, 600))
+	}
+	// Exactly twice: once quoted in the expectation, once as the terminator.
+	if n := strings.Count(got, RevisionConstraintEndMarker); n != 2 {
+		t.Errorf("marker occurrences = %d, want 2 (the quoted expectation + the terminator)", n)
+	}
+}
+
+// TestBuild_Plan_RevisionConstraint_AbsentMarkerIsDetectable is the test that
+// matters, and the one a "the renderer emits a marker" assertion cannot make
+// (operator CONDITION 1). The failure mode is a delivery whose marker is
+// ABSENT, and the safeguard is only real if the instruction to NOTICE the
+// absence survives the same cut that removed the marker.
+//
+// It asserts the ORDERING invariant — the expectation is written into the
+// stable scaffolding strictly BEFORE the constraint body and the terminator —
+// and then simulates the cut directly: truncate the rendered prompt at the
+// point where the constraint body begins (exactly what an upstream channel
+// dropping the tail would produce) and assert the surviving prefix STILL tells
+// the planner that a terminator must appear and what to do when it does not.
+// A safeguard written after the marker fails this outright.
+func TestBuild_Plan_RevisionConstraint_AbsentMarkerIsDetectable(t *testing.T) {
+	constraint := "CONSTRAINT_BODY_MARKER prefer the existing helper."
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		RevisionConstraint: &constraint,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	expectationAt := strings.Index(got, "Integrity check — read this BEFORE the constraint")
+	bodyAt := strings.Index(got, constraint)
+	markerAt := strings.LastIndex(got, "\n"+RevisionConstraintEndMarker+"\n")
+	if expectationAt < 0 {
+		t.Fatalf("the end-marker expectation is absent from the prompt:\n%s", got)
+	}
+	if bodyAt < 0 || markerAt < 0 {
+		t.Fatalf("constraint body (%d) or end marker (%d) absent", bodyAt, markerAt)
+	}
+	if expectationAt >= bodyAt {
+		t.Errorf("the expectation is written at %d, AT OR AFTER the constraint body at %d — a cut that removes the body would remove the instruction to notice it",
+			expectationAt, bodyAt)
+	}
+	if expectationAt >= markerAt {
+		t.Errorf("the expectation is written at %d, AT OR AFTER the terminator at %d — self-defeating",
+			expectationAt, markerAt)
+	}
+
+	// Simulate the cut: everything from the constraint body onward is dropped,
+	// so the terminator is GONE. The surviving prompt must still carry both the
+	// statement that a terminator is expected and the instruction for its
+	// absence.
+	cut := got[:bodyAt]
+	// The full prompt names the marker twice — once quoted inside the
+	// expectation, once as the terminator. The cut must leave only the quoted
+	// one, i.e. the TERMINATOR is gone.
+	if before, after := strings.Count(cut, RevisionConstraintEndMarker), strings.Count(got, RevisionConstraintEndMarker); before != 1 || after != 2 {
+		t.Fatalf("marker occurrences: cut=%d (want 1, the quoted expectation), full=%d (want 2) — the fixture is wrong", before, after)
+	}
+	for _, want := range []string{
+		RevisionConstraintEndMarker,
+		"was TRUNCATED in transit",
+		"Record in the plan's risks_and_assumptions that the operator constraint arrived truncated",
+	} {
+		if !strings.Contains(cut, want) {
+			t.Errorf("a truncated delivery lost the absent-marker instruction %q:\n%s", want, cut)
+		}
+	}
+}
+
+// TestBuild_Plan_RevisionConstraint_Nil_NoEndMarker confirms the terminator and
+// its expectation are confined to the RevisionConstraint branch, so a
+// first-pass plan prompt is byte-unchanged.
+func TestBuild_Plan_RevisionConstraint_Nil_NoEndMarker(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		Repo:        "x/y",
+		// RevisionConstraint deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, RevisionConstraintEndMarker) {
+		t.Errorf("a first-pass plan prompt carries the end-of-constraint marker:\n%s", got)
+	}
+	if strings.Contains(got, "Integrity check — read this BEFORE the constraint") {
+		t.Errorf("a first-pass plan prompt carries the end-marker expectation")
+	}
+}
+
+// tailOf returns the last n bytes of s, for readable failure output on a large
+// prompt.
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
 }
 
 // TestRevisionConstraintIsTrustedMarker pins that the "Revision
@@ -2149,20 +2356,38 @@ func TestBuild_Plan_ScopeRestoration_Rendered(t *testing.T) {
 // which BOTH #2516 sections render — for the nil-scope-channel Trigger in
 // TestBuild_Plan_ScopeChannels_Nil_PromptByteUnchanged.
 //
-// PROVENANCE: captured by running Build("plan", that exact Trigger) against
-// prompt.go as it stood at commit bfdced97 — the commit BEFORE the #2516
-// channels existed. That is what makes the compatibility claim checkable: the
-// assertion compares today's output against the PRE-CHANGE bytes, not against
-// a second render by the same code (which is equal by construction whatever
-// the renderer does). When the revision-section wording is deliberately
-// changed, regenerate this constant and say so.
+// PROVENANCE — PARTIALLY DEGRADED, stated honestly. Originally captured by
+// running Build("plan", that exact Trigger) against prompt.go as it stood at
+// commit bfdced97, the commit BEFORE the #2516 channels existed, which made the
+// #2516 compatibility claim checkable against genuinely pre-change bytes rather
+// than a self-render. #2871 DELIBERATELY changed this section's wording — it
+// added the END-marker integrity expectation ahead of the constraint and the
+// terminator line after it — so the frozen capture could not survive verbatim;
+// following this constant's own instruction, it was REGENERATED at #2871's head
+// with exactly those two additions folded in and nothing else.
+//
+// It is therefore no longer pre-change evidence about #2871 itself (the
+// dedicated #2871 renderer tests are), but it REMAINS pre-change evidence about
+// #2516: the anti-vacuity guard at the bottom of the test still rejects a span
+// carrying either #2516 section, so a regeneration that quietly let the scope
+// channels leak into the nil-channel render is still caught. When the
+// revision-section wording is deliberately changed again, regenerate and say
+// so here.
 const wantPreChangeRevisionSpan = "### Revision constraint (binding — revise this plan to satisfy)\n" +
 	"\n" +
 	"The operator reviewed your previous plan and approved its direction, but requires a design change before it can proceed. They routed a binding constraint back through the revise channel (#558). Treat it as authoritative: REVISE the prior plan below to satisfy it — do NOT replan blank-slate, and do NOT discard the parts of the plan the constraint does not touch. Re-emit a complete, valid standard_v1 plan that honours the constraint.\n" +
 	"\n" +
+	"Integrity check — read this BEFORE the constraint. The operator constraint below is delivered WHOLE and its last line is exactly:\n" +
+	"\n" +
+	"--- END OF OPERATOR CONSTRAINT ---\n" +
+	"\n" +
+	"This sentence is written by the prompt renderer OUTSIDE the constraint, so it survives a cut that removes the constraint's tail. If you reach the end of this prompt without having seen that terminator line after the constraint, the constraint was TRUNCATED in transit: do NOT treat the visible prefix as the whole instruction. Record in the plan's risks_and_assumptions that the operator constraint arrived truncated, quote the last text you did see, and ask the operator to re-send the dropped portion.\n" +
+	"\n" +
 	"Operator constraint (MANDATORY — wins on conflict with the prior plan):\n" +
 	"\n" +
 	"keep the change additive.\n" +
+	"\n" +
+	"--- END OF OPERATOR CONSTRAINT ---\n" +
 	"\n" +
 	"Triggering issue: #7\n" +
 	"\n" +
@@ -10059,6 +10284,13 @@ var groomingProseMarkers = []string{
 // holds only for the grooming markers the first anti-vacuity guard still
 // enforces.
 //
+// REGENERATED AGAIN at #2871. preChangeGoldenTrigger sets RevisionConstraint,
+// so the golden renders the revise path, and #2871 DELIBERATELY changed that
+// section: the END-marker integrity expectation now precedes the constraint and
+// the terminator follows it. The regeneration folded in exactly those two
+// additions (verifiable as an 8-line insertion in the golden's diff) and
+// nothing else; both anti-vacuity guards below still hold.
+//
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden
 //     regenerated from the grooming-forked path is rejected (retained from the
@@ -10361,11 +10593,17 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		// single document-wide marker check would stay green with truncation
 		// removed from any three of the four channels; asserting each channel's own
 		// fragment fails closed on exactly that regression.
+		//
+		// The revision CONSTRAINT is no longer one of them (#2871): it shares the
+		// gate-refused MaxRevisionConstraintBytes cap with the plan path, so it
+		// gets an over-12000 payload and is asserted on the LOUD elision block
+		// below instead. Leaving it in the 4000 table would have re-opened the
+		// silent-drop hole for every constraint the revise gate now accepts.
 		const cap4000 = 4000
 		const marker = "...[truncated]"
 		schemaErr := strings.Repeat("s", 5000)
 		revBase := strings.Repeat("b", 5000)
-		revConstraint := strings.Repeat("c", 5000)
+		revConstraint := strings.Repeat("c", MaxRevisionConstraintBytes+1)
 		answers := strings.Repeat("a", 5000)
 		tr.PriorRejectionFeedback = &big
 		tr.PriorSchemaValidationError = &schemaErr
@@ -10388,7 +10626,6 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		}{
 			{"prior schema-validation failure", schemaErr},
 			{"revision base report", revBase},
-			{"revision constraint", revConstraint},
 			{"clarification answers", answers},
 		} {
 			want := ch.payload[:cap4000] + marker
@@ -10400,6 +10637,27 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 			if strings.Contains(got, ch.payload) {
 				t.Errorf("the %s channel rendered its full untruncated payload:\n%s", ch.name, got)
 			}
+		}
+		// The revision constraint takes the #2871 treatment on the grooming path
+		// too: the LOUD elision block with its byte accounting and retrieval
+		// pointer, the risks-declaration notice, and the END marker — never the
+		// bare 4000-byte cut this channel used to take here.
+		for _, want := range []string{
+			revConstraint[:MaxRevisionConstraintBytes] + "\n\n...[ELIDED",
+			fmt.Sprintf("1 bytes dropped at the %d-byte cap", MaxRevisionConstraintBytes),
+			"plan_revised audit entry (conditions payload key",
+			revisionConstraintElidedNotice,
+			RevisionConstraintEndMarker,
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("the grooming revision-constraint channel missing %q:\n%s", want, tailOf(got, 1500))
+			}
+		}
+		if strings.Contains(got, revConstraint[:MaxRevisionConstraintBytes]+marker) {
+			t.Errorf("the grooming revision constraint took the bare truncation marker instead of the elision block")
+		}
+		if strings.Contains(got, revConstraint) {
+			t.Errorf("the grooming revision-constraint channel rendered its full untruncated payload")
 		}
 	})
 }

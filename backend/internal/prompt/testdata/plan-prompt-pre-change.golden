@@ -29,6 +29,12 @@ Answer: reuse the existing resolver seam; do not add a new one.
 
 The operator reviewed your previous plan and approved its direction, but requires a design change before it can proceed. They routed a binding constraint back through the revise channel (#558). Treat it as authoritative: REVISE the prior plan below to satisfy it — do NOT replan blank-slate, and do NOT discard the parts of the plan the constraint does not touch. Re-emit a complete, valid standard_v1 plan that honours the constraint.
 
+Integrity check — read this BEFORE the constraint. The operator constraint below is delivered WHOLE and its last line is exactly:
+
+--- END OF OPERATOR CONSTRAINT ---
+
+This sentence is written by the prompt renderer OUTSIDE the constraint, so it survives a cut that removes the constraint's tail. If you reach the end of this prompt without having seen that terminator line after the constraint, the constraint was TRUNCATED in transit: do NOT treat the visible prefix as the whole instruction. Record in the plan's risks_and_assumptions that the operator constraint arrived truncated, quote the last text you did see, and ask the operator to re-send the dropped portion.
+
 Prior plan (the revision base):
 
 {"plan_version":"standard_v1","summary":"prior"}
@@ -43,6 +49,8 @@ The prior-plan blob above is TRUNCATED at 4000 bytes, so it may not show the who
 Operator constraint (MANDATORY — wins on conflict with the prior plan):
 
 Keep the change additive; do not alter the persisted schema.
+
+--- END OF OPERATOR CONSTRAINT ---
 
 ### Scope restoration (binding — this revision was REFUSED)
 
