@@ -115,11 +115,25 @@ type liveValEpicFileProvider struct {
 	*liveValFileProvider
 	children    []workmgmt.EpicChild
 	childrenErr error
+	// childrenAfter, when non-nil, is returned from the SECOND EpicChildren call
+	// onward (children is returned on the first), modeling a concurrent filer that
+	// adds a child between resolveWalkParentEpic's unlocked pre-count and its
+	// locked authoritative read — the high/concurrency TOCTOU counterfactual.
+	childrenAfter []workmgmt.EpicChild
+	epicMu        sync.Mutex
+	epicCalls     int
 }
 
 func (p *liveValEpicFileProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
 	if p.childrenErr != nil {
 		return nil, p.childrenErr
+	}
+	p.epicMu.Lock()
+	p.epicCalls++
+	call := p.epicCalls
+	p.epicMu.Unlock()
+	if call >= 2 && p.childrenAfter != nil {
+		return &workmgmt.EpicChildrenResult{Children: p.childrenAfter}, nil
 	}
 	return &workmgmt.EpicChildrenResult{Children: p.children}, nil
 }
@@ -149,6 +163,10 @@ type liveValConfig struct {
 	providerQuerier bool
 	epicChildren    []workmgmt.EpicChild
 	epicChildrenErr error
+	// epicChildrenAfter, when non-nil, is served from the SECOND EpicChildren call
+	// onward so a test can make the epic reach the cap DURING the arm decision (the
+	// high/concurrency TOCTOU: pre-count sees room, the locked read sees the cap).
+	epicChildrenAfter []workmgmt.EpicChild
 }
 
 type liveValHarness struct {
@@ -196,7 +214,7 @@ func newLiveValHarness(t *testing.T, cfg liveValConfig) *liveValHarness {
 	t.Helper()
 	provider := &liveValFileProvider{name: workmgmt.Default().Provider, fail: cfg.providerFail}
 	if cfg.providerQuerier {
-		workmgmt.Register(&liveValEpicFileProvider{liveValFileProvider: provider, children: cfg.epicChildren, childrenErr: cfg.epicChildrenErr})
+		workmgmt.Register(&liveValEpicFileProvider{liveValFileProvider: provider, children: cfg.epicChildren, childrenErr: cfg.epicChildrenErr, childrenAfter: cfg.epicChildrenAfter})
 	} else {
 		workmgmt.Register(provider)
 	}
@@ -842,6 +860,45 @@ func TestFileOrLinkLiveValidationWalk_FallbackModes(t *testing.T) {
 		})
 		assertCompanionArm(t, h)
 	})
+
+	t.Run("non_numbered_children", func(t *testing.T) { // mode 7: children exist but none numbered → {n} unallocatable (#2101)
+		h := newLiveValHarness(t, liveValConfig{
+			marked: true, installID: &inst,
+			github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] x"}),
+			providerQuerier: true,
+			epicChildren:    []workmgmt.EpicChild{{Number: 1001, Title: "[E48.X] placeholder"}},
+		})
+		assertCompanionArm(t, h)
+	})
+}
+
+// TestFileOrLinkLiveValidationWalk_FullEpicRace (high/concurrency TOCTOU,
+// #2179 fix-up): the epic reaches the per-parent sub-issue cap DURING the arm
+// decision — resolveWalkParentEpic's unlocked pre-count sees 99 (room), but the
+// AUTHORITATIVE read under the per-epic allocation lock sees 100 (full). The
+// capacity decision is effective under that lock, so the walk degrades to the
+// mandatory companion fallback (binding condition 4) and files exactly ONE
+// successful companion walk rather than taking the epic arm to a doomed over-cap
+// attachment. This is the counterfactual target for the locked cap check:
+// deleting that check reddens this test (the arm goes epic, parent_epic set).
+func TestFileOrLinkLiveValidationWalk_FullEpicRace(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{
+		marked: true, installID: &inst,
+		github:          newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "[E48] SDLC dogfooding"}),
+		providerQuerier: true,
+		// Pre-count (call 1) sees 99 → room; the locked authoritative read (call 2)
+		// sees the cap reached → companion.
+		epicChildren:      numberedEpicChildren("48", githubSubIssueParentCap-1),
+		epicChildrenAfter: numberedEpicChildren("48", githubSubIssueParentCap),
+	})
+	assertCompanionArm(t, h)
+
+	// The companion filing succeeded — a healthy walk ref, never a filing failure.
+	linked, ok := h.newestLinked(t)
+	if !ok || linked.FilingFailed || linked.WalkRef == "" {
+		t.Errorf("linked marker = %+v (ok=%v), want a healthy walk_ref (companion filed)", linked, ok)
+	}
 }
 
 // TestFileOrLinkLiveValidationWalk_EpicArmSingleFilingUnderFailure (T8): an
