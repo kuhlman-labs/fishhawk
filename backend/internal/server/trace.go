@@ -3603,6 +3603,19 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// section (buildImplementReview) and the provenance fold (scopeProvenanceForReview,
 	// which receives trig by value below). nil for every non-decomposed run.
 	trig.ChildAmendedScopeFiles = s.childApprovedAmendmentScopePaths(ctx, runID)
+	// Mid-stage amendment rollup (#2874): a path the operator APPROVED via
+	// fishhawk_decide_scope_amendment WHILE THIS STAGE RAN was folded into the
+	// runner's ENFORCED scope, but this review prompt is built from the raw
+	// approved plan — so without surfacing it the reviewer flags a correctly-
+	// amended file as drift (run bff9a242: two reviewers, two waivers, one
+	// spurious medium). The resolver is DELIBERATELY stage-scoped
+	// (a.StageID == stageID, the SAME filter the enforced fold
+	// resolveApprovedScopeAmendments applies), so the rendered section is a
+	// SUBSET of the runner-enforced permission and can never assert in-scope a
+	// path the scope gate would have rejected. Consumed by the review section
+	// only: the #1407 operatorAdded union and scopeProvenanceForReview already
+	// union approvedAmendmentScopePaths, so re-folding here would double-count.
+	trig.MidStageAmendedScopeFiles = s.stageApprovedAmendmentScopePaths(ctx, runID, stageID, approvedPlan)
 	if runRow.IssueContext != nil {
 		trig.IssueTitle = runRow.IssueContext.Title
 		trig.IssueBody = runRow.IssueContext.Body
@@ -4126,7 +4139,11 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 // resolveApprovalAddScopeFiles (#824 structured add_scope_files) — so the
 // review-side, stage-side, and enforced-scope folds all stay in lockstep (single
 // source of truth). The name is retained to avoid churn (the #1225 regression
-// test pins it). The #730 approve-reason prose fold
+// test pins it). It is NOT the only amendment channel the review prompt now
+// carries: approved MID-STAGE amendments reach the reviewer through the separate
+// stageApprovedAmendmentScopePaths resolver (#2874), threaded onto
+// Trigger.MidStageAmendedScopeFiles and rendered as its own section — this
+// helper deliberately still folds only the approval-time paths. The #730 approve-reason prose fold
 // (extractScopePathsFromConditions over resolveApprovalConditions) was removed
 // from BOTH sides in #1225: a repo-relative token scraped out of the operator's
 // free-text reason no longer mutates scope, so the review side must no longer
@@ -4176,14 +4193,23 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 // (resolveApprovedScopeAmendments, the SAME stage filter — a.StageID == stageID
 // — the ENFORCED fold mergeApprovedScopeAmendments applies).
 //
-// It is DELIBERATELY separate from amendedScopeFilesForReview: that helper is
-// shared by the REVIEW trigger surface (trace.go, buildTriggerForReview) whose
-// contract is to fold ONLY resolveApprovalAddScopeFiles and NEVER approved
-// mid-stage amendments — widening the reviewer's drift baseline would be wrong.
-// Only the agent PROMPT gains the amendment paths, so a retried/dispatched
-// implement stage shows the agent the mid-stage-amendment paths it is already
-// permitted to touch and does not defensively re-file an identical request
-// (which would burn its last amendment slot — the #2095 retry_stage incident).
+// It is DELIBERATELY separate from amendedScopeFilesForReview: that helper folds
+// ONLY resolveApprovalAddScopeFiles, so the agent PROMPT gains the mid-stage
+// amendment paths here and a retried/dispatched implement stage does not
+// defensively re-file an identical request (which would burn its last amendment
+// slot — the #2095 retry_stage incident).
+//
+// #2874 REVERSED the original rationale for that separation. This comment used
+// to record that the review surface must NEVER see approved mid-stage
+// amendments because "widening the reviewer's drift baseline would be wrong".
+// Field evidence overturned it: on run bff9a242 both implement reviewers flagged
+// an operator-approved amended path as scope drift, costing two waivers and a
+// spurious medium. The review surface now DOES carry them — through the separate
+// stageApprovedAmendmentScopePaths resolver (stage_scope_amendment.go), which
+// applies this same stage filter and renders a distinct "Scope amended
+// mid-stage" section with the operator's decision reason. The two helpers stay
+// separate because they feed different Trigger fields and different sections,
+// not because the review side is forbidden the paths.
 //
 // The shown set is STAGE-SCOPED by construction — it is a SUBSET of what the
 // enforced fold permits for THIS stage, never a superset — so it can never

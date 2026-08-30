@@ -5501,6 +5501,188 @@ func seedApprovedAmendment(t *testing.T, sa *fakeScopeAmendmentRepo, runID, stag
 	}
 }
 
+// midStageAmendedSectionBody returns the body of the implement-review prompt's
+// "### Scope amended mid-stage" section — everything from its heading up to the
+// next "### " heading — or "" when the section is absent. Assertions on the
+// mid-stage amendment MUST be scoped to this span, never to the whole document:
+// an amended path also legitimately appears in the prompt's diff file list, so a
+// document-wide substring match would stay GREEN with the wiring deleted and the
+// test would be vacuous (#2874).
+func midStageAmendedSectionBody(prompt string) string {
+	const heading = "### Scope amended mid-stage"
+	i := strings.Index(prompt, heading)
+	if i < 0 {
+		return ""
+	}
+	rest := prompt[i+len(heading):]
+	if j := strings.Index(rest, "\n### "); j >= 0 {
+		return heading + rest[:j]
+	}
+	return heading + rest
+}
+
+// seedDecidedAmendment inserts one amendment for (runID, stageID) in the given
+// terminal status with the given operator decision reason, returning its id. It
+// writes the row BY CONSTRUCTION rather than through Create→Decide because the
+// STATUS is the control under test — producing it by exercising the decision
+// path would rest the fixture on the same code the test discriminates against.
+func seedDecidedAmendment(sa *fakeScopeAmendmentRepo, runID, stageID uuid.UUID, status scopeamendment.Status, decisionReason, path string) uuid.UUID {
+	return seedStageAmendment(sa, runID, stageID, status, &decisionReason, path)
+}
+
+// TestRunImplementReviews_ShowsApprovedMidStageAmendment is the #2874
+// cross-boundary integration test: a mid-stage scope amendment the operator
+// APPROVED for the implement stage must reach the implement-review prompt's
+// "Scope amended mid-stage" section, carrying the amendment id and the
+// operator's decision reason, so the reviewer evaluates against the stage's
+// EFFECTIVE scope rather than its declared scope. It drives the REAL
+// runImplementReviews, so it pins the persistence → resolver → Trigger →
+// rendered-prompt seam that per-layer units miss: a resolver returning the right
+// records while trace.go never assigns them passes every unit test and ships the
+// bug unchanged (run bff9a242).
+//
+// COUNTERFACTUAL VEHICLE: deleting the trig.MidStageAmendedScopeFiles assignment
+// in runImplementReviews must turn this RED. Every assertion below is scoped to
+// the extracted section body for exactly that reason — the amended path also
+// appears in the diff file list.
+func TestRunImplementReviews_ShowsApprovedMidStageAmendment(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const amendPath = "backend/internal/audit/categories.go"
+	const decisionReason = "the audit category table is the coupled registration"
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	amendID := seedDecidedAmendment(sa, runRow.ID, implStage.ID, scopeamendment.StatusApproved, decisionReason, amendPath)
+
+	// The committed diff touches the amended path — exactly the shape that read
+	// as drift before #2874.
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: amendPath, Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	section := midStageAmendedSectionBody(reviewer.calls[0])
+	if section == "" {
+		t.Fatalf("mid-stage-amendment section absent from the reviewer prompt:\n%s", reviewer.calls[0])
+	}
+	for _, want := range []string{amendPath, amendID.String(), decisionReason} {
+		if !strings.Contains(section, want) {
+			t.Errorf("mid-stage-amendment section missing %q:\n%s", want, section)
+		}
+	}
+}
+
+// TestRunImplementReviews_OmitsDeniedMidStageAmendment is the #2874
+// over-correction guard, an EQUAL partner to the approved case: an amendment the
+// operator DENIED confers nothing, so its path must never be presented to the
+// reviewer as in-scope. Treating every request as a grant would silently bless
+// scope the operator refused — a worse defect than the false drift signal #2874
+// repairs. The assertion is scoped to the section body because the denied path
+// is deliberately present in the diff (an agent that edited it anyway is exactly
+// the case the reviewer must still be able to flag).
+func TestRunImplementReviews_OmitsDeniedMidStageAmendment(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const approvedPath = "backend/internal/audit/categories.go"
+	const deniedPath = "backend/internal/denied/denied.go"
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedDecidedAmendment(sa, runRow.ID, implStage.ID, scopeamendment.StatusApproved, "coupled registration", approvedPath)
+	seedDecidedAmendment(sa, runRow.ID, implStage.ID, scopeamendment.StatusDenied, "adapt within scope", deniedPath)
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: approvedPath, Status: policy.StatusModified},
+			{Path: deniedPath, Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	section := midStageAmendedSectionBody(reviewer.calls[0])
+	if section == "" {
+		t.Fatalf("mid-stage-amendment section absent (the approved sibling must still render):\n%s", reviewer.calls[0])
+	}
+	if !strings.Contains(section, approvedPath) {
+		t.Errorf("approved path missing from the section:\n%s", section)
+	}
+	if strings.Contains(section, deniedPath) {
+		t.Errorf("DENIED path presented as in-scope — a refused request must never read as a grant:\n%s", section)
+	}
+}
+
+// TestRunImplementReviews_MidStageAmendment_NoCrossStageLeak is the CROSS-STAGE
+// NON-LEAKAGE criterion (#2874 approval condition 2), asserted at the
+// review-context level rather than only at the resolver: a stage under review
+// must not present an approved amendment belonging to a SIBLING stage of the
+// same run. A wiring defect that passed the run id but the wrong stage id would
+// satisfy every other criterion here and still leak.
+func TestRunImplementReviews_MidStageAmendment_NoCrossStageLeak(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, _, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// A sibling stage of the SAME run, with its own approved amendment.
+	siblingStage := rr.seedStage(runRow.ID, 2, run.StageStateSucceeded)
+	const ownPath = "backend/internal/audit/categories.go"
+	const siblingPath = "backend/internal/sibling/sibling.go"
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedDecidedAmendment(sa, runRow.ID, implStage.ID, scopeamendment.StatusApproved, "coupled registration", ownPath)
+	seedDecidedAmendment(sa, runRow.ID, siblingStage.ID, scopeamendment.StatusApproved, "approved for the OTHER stage", siblingPath)
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: ownPath, Status: policy.StatusModified},
+			{Path: siblingPath, Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	section := midStageAmendedSectionBody(reviewer.calls[0])
+	if !strings.Contains(section, ownPath) {
+		t.Fatalf("this stage's own approved amendment must render:\n%s", reviewer.calls[0])
+	}
+	if strings.Contains(section, siblingPath) {
+		t.Errorf("a SIBLING stage's approved amendment leaked into this stage's review context:\n%s", section)
+	}
+}
+
 // operatorScopeUndeliveredAuditPaths returns the undelivered_paths recorded by
 // the single operator_scope_path_undelivered audit entry (#1407), or nil when
 // no such entry was appended. Fails the test if more than one entry exists (the

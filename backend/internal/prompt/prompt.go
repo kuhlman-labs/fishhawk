@@ -715,6 +715,21 @@ type Trigger struct {
 	// bundle-carried) and nil for every non-decomposed run, keeping the prompt
 	// byte-identical for the common case (audit prompt-hash replay stability).
 	ChildAmendedScopeFiles []ChildAmendedScopePath
+	// MidStageAmendedScopeFiles is the set of paths the operator APPROVED
+	// mid-stage via fishhawk_decide_scope_amendment FOR THE STAGE UNDER REVIEW
+	// (#2874). The runner folds an approved amendment into the stage's ENFORCED
+	// scope, so an edit to one of these paths is authorized — but the review
+	// prompt is built from the raw approved plan, so without this field the
+	// reviewer reads a correctly-amended file as scope drift (observed on run
+	// bff9a242, where both reviewers independently flagged the same amended
+	// path forty-eight minutes after the operator approved it).
+	// runImplementReviews resolves the rows (stageApprovedAmendmentScopePaths)
+	// and threads them here so buildImplementReview renders a "Scope amended
+	// mid-stage" section naming the authorizing amendment and the operator's
+	// decision reason per path. It is backend-DERIVED (never bundle-carried),
+	// implement-review-only, and nil/empty for every stage with no approved
+	// amendment — such a build renders NO section at all.
+	MidStageAmendedScopeFiles []MidStageAmendedScopePath
 	// PriorConcerns carries the stage's previously recorded review
 	// concerns for the implement-review prompt's delta-verification
 	// section (E22.X / #984): open-state concerns the reviewer must
@@ -1106,6 +1121,25 @@ type ChildAmendedScopePath struct {
 	// SliceIndex is the child's 0-based sub-plan position when known, nil
 	// otherwise.
 	SliceIndex *int
+}
+
+// MidStageAmendedScopePath is one path the operator APPROVED mid-stage — via
+// the fishhawk_decide_scope_amendment channel — for the stage under review
+// (#2874). The runner folded the path into the stage's ENFORCED scope, so an
+// edit to it is authorized; the review prompt is built from the raw approved
+// plan, so without naming it here the reviewer reads a correctly-amended file
+// as scope drift.
+type MidStageAmendedScopePath struct {
+	// Path is the repo-relative path the operator authorized mid-stage.
+	Path string
+	// AmendmentID is the authorizing scope-amendment row's uuid string — what
+	// fishhawk_list_scope_amendments and the scope_amendment_decided audit entry
+	// key on — so a reader can follow it back to the approval.
+	AmendmentID string
+	// DecisionReason is the operator's decide-time reason verbatim. It may be
+	// EMPTY: the decision endpoint does not require one. An empty reason renders
+	// the path without a reason clause rather than an empty parenthetical.
+	DecisionReason string
 }
 
 // GateFixupSelfReportDivergence is the advisory fix-up self-report divergence
@@ -4321,9 +4355,11 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
 	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
-		"Files listed in the 'Scope amended at approval' section below (when present) ARE in-scope — they were " +
-		"operator-authorized at approval time — and must NOT be flagged as drift. Only files the diff touches " +
-		"that are in NEITHER scope.files NOR the amended-scope list are drift. " +
+		"Files listed in the 'Scope amended at approval', 'Scope amended mid-stage', and 'Scope authorized by " +
+		"child slice amendments' sections below (when present) ARE in-scope — the operator authorized them at " +
+		"approval time, mid-stage, or on a fan-out child slice — and must NOT be flagged as drift. Only files " +
+		"the diff touches that are in NONE of scope.files, the approval-amended list, the mid-stage-amended " +
+		"list, or the child-slice-amended list are drift. " +
 		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
 	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
 		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
@@ -4522,6 +4558,35 @@ func buildImplementReview(t Trigger) string {
 			fmt.Fprintf(&b, "- %s\n", p)
 		}
 		b.WriteString("\n")
+	}
+
+	// Scope-amended-mid-stage section (#2874). While the implement stage was
+	// RUNNING the agent stopped and filed a scope-amendment request; the
+	// operator APPROVED it and the runner folded the path into the stage's
+	// ENFORCED scope. The review prompt is built from the raw approved plan, so
+	// without naming the path here the reviewer flags a correctly-amended file
+	// as drift under criterion 4 (run bff9a242: both reviewers flagged the same
+	// path independently, forty-eight minutes after the approval). The set is
+	// STAGE-SCOPED and APPROVED-only, so it is a subset of what the runner
+	// actually permitted — a denied or pending request confers nothing. Empty/nil
+	// (every stage with no approved amendment) renders NO section.
+	if len(t.MidStageAmendedScopeFiles) > 0 {
+		b.WriteString("### Scope amended mid-stage (operator-approved — in-scope, NOT drift)\n\n")
+		b.WriteString("While this stage was RUNNING the agent stopped and filed a scope-amendment request for the " +
+			"paths below, and the operator APPROVED it — the runner folded each path into the stage's ENFORCED " +
+			"scope, so touching it was authorized. They ARE in-scope. Do NOT record a scope-drift concern for any " +
+			"of them, and do NOT write a resolution asking for an amendment that already exists:\n\n")
+		for _, p := range t.MidStageAmendedScopeFiles {
+			if p.DecisionReason != "" {
+				fmt.Fprintf(&b, "- %s (approved amendment %s: %s)\n", p.Path, p.AmendmentID, p.DecisionReason)
+			} else {
+				fmt.Fprintf(&b, "- %s (approved amendment %s)\n", p.Path, p.AmendmentID)
+			}
+		}
+		b.WriteString("\nThe operator's decision reason is shown so you can judge the amendment on its merits: if " +
+			"you disagree with the justification for a path, raise that as a NON-scope concern naming the " +
+			"amendment id. Disagreeing with an amendment is useful signal; mislabelling an approved path as " +
+			"drift is not.\n\n")
 	}
 
 	// Scope-authorized-by-child-slice-amendments section (#2820). This run is a
