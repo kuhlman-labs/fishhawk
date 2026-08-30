@@ -15,7 +15,7 @@ import (
 // internally.
 type RevisePlanInput struct {
 	RunID      string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being revised"`
-	Constraint string `json:"constraint" jsonschema:"REQUIRED binding design constraint the planner must revise the prior plan to satisfy. Injected into the re-dispatched plan prompt as a binding 'Revision constraint' section (the #558 channel), with the prior plan as the revision base. Use this when the plan's direction is sound but needs a design change, rather than rejecting it to a fresh-run replan"`
+	Constraint string `json:"constraint" jsonschema:"REQUIRED binding design constraint the planner must revise the prior plan to satisfy. Injected into the re-dispatched plan prompt as a binding 'Revision constraint' section (the #558 channel), with the prior plan as the revision base. Use this when the plan's direction is sound but needs a design change, rather than rejecting it to a fresh-run replan. Capped at 12000 BYTES (not characters), matching fishhawk_approve_plan's binding reason. An over-cap constraint is REFUSED with 400 validation_failed naming the byte count, the cap and the overflow — it is NEVER silently truncated, and the refused call consumes no revise pass. Remedy: split the constraint across passes, tighten it, or reject to a fresh-run replan"`
 	// ForceAdditionalPass is the bounded operator override.
 	ForceAdditionalPass bool `json:"force_additional_pass,omitempty" jsonschema:"bounded operator override: set true to grant ONE revise pass BEYOND the normal budget when it is already spent (you got revise_budget_exhausted) but the plan still needs a design tweak. Hard-capped at 3 total passes per stage; the forced pass is audited. At the ceiling the tool returns revise_ceiling_reached and the override no longer helps. Default false."`
 }
@@ -101,16 +101,32 @@ the pass does NOT consume the normal revise budget, so you get a free
 recovery pass to put the files back. The hard ceiling still counts every
 pass, so total work stays bounded.
 
+Constraint byte cap — refuse, never truncate: the constraint is capped at
+12000 BYTES (not characters), the same cap fishhawk_approve_plan's binding
+reason carries, because both channels carry BINDING operator instructions.
+An over-cap constraint is REFUSED with 400 validation_failed naming the
+actual byte count, the cap and the overflow; it is NEVER silently
+truncated, and the refused call consumes NO revise pass and writes no
+plan_revised audit entry, so the plan stage stays parked at its gate.
+Remedy: split the constraint across revise passes, tighten it, or reject
+the plan to a fresh-run replan for a wholesale redirection. Under the cap
+the constraint is delivered WHOLE — the audit record stores it verbatim
+and the re-dispatched prompt renders it terminated by an explicit
+"--- END OF OPERATOR CONSTRAINT ---" line so a cut in transit is
+structurally detectable by the planner.
+
 Inputs:
   - run_id     : the run whose plan stage to revise.
   - constraint : REQUIRED binding design constraint to revise the plan
-    against.
+    against. Max 12000 bytes; over-cap is refused, not truncated.
   - force_additional_pass : bounded operator override (see above).
 
 Returns the re-opened Stage row (pending → dispatched) and the resolved
 plan-stage UUID. Returns a tool error on:
   - "no plan stage" (the run has no plan stage)
-  - validation_failed (empty constraint, 400)
+  - validation_failed (empty constraint, 400; or a constraint over the
+    12000-byte cap, 400 — details carries bytes, max_bytes and
+    overflow_bytes)
   - cross_run_revise (a run-bound token reaching another run's stage, 403)
   - stage_not_found (404)
   - revise_not_applicable (the stage is not a plan stage parked at

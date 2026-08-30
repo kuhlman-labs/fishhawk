@@ -2,12 +2,16 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // --- fishhawk_revise_plan (E22.X / #1099) ---
@@ -202,5 +206,93 @@ func TestRevisePlanDescription_DocumentsScopeRefusal(t *testing.T) {
 	// The stale claim must be gone: a drop is no longer silent.
 	if strings.Contains(lower, "silently drop") {
 		t.Errorf("description still claims a revise can 'silently DROP' files; the gate now refuses:\n%s", desc)
+	}
+}
+
+// TestRevisePlanDescription_DocumentsConstraintCap is the done-means test for a
+// DOCUMENTED CONSTANT (#2871): the 12000-byte cap and its refuse-not-truncate
+// posture are values no compiler enforces, so a comment-only touch of revise.go
+// would satisfy the scope-completeness gate while leaving the operator-facing
+// surface describing behavior the server no longer has.
+//
+// It asserts BOTH operator-facing surfaces — the tool DESCRIPTION and the
+// Constraint field's INPUT SCHEMA — because a driving agent reads whichever one
+// its client renders, and the two desynchronising is exactly how an operator
+// comes to believe a 20 KB constraint was accepted whole.
+func TestRevisePlanDescription_DocumentsConstraintCap(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_revise_plan" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_revise_plan not registered/visible over ListTools")
+	}
+
+	capStr := strconv.Itoa(prompt.MaxRevisionConstraintBytes)
+	for _, want := range []string{
+		capStr,              // the concrete cap, keyed to the shared constant
+		"byte",              // measured in bytes, not characters
+		"refused",           // over-cap is refused …
+		"validation_failed", // … with this error identity
+		"never silently",    // … and never cut (the word wraps in the description)
+		"truncated",         // … stated with the word an operator will grep for
+	} {
+		if !strings.Contains(strings.ToLower(tool.Description), strings.ToLower(want)) {
+			t.Errorf("fishhawk_revise_plan description missing %q (constraint-cap contract, #2871):\n%s", want, tool.Description)
+		}
+	}
+
+	// The Constraint property's own schema description must carry it too. The
+	// wire-level InputSchema is opaque (any), so decode it the way a client
+	// would rather than reaching into a Go struct the SDK does not expose here.
+	if tool.InputSchema == nil {
+		t.Fatal("fishhawk_revise_plan has no input schema")
+	}
+	rawSchema, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(rawSchema, &schema); err != nil {
+		t.Fatalf("decode input schema: %v (%s)", err, rawSchema)
+	}
+	prop, ok := schema.Properties["constraint"]
+	if !ok {
+		t.Fatalf("input schema has no 'constraint' property: %s", rawSchema)
+	}
+	for _, want := range []string{capStr, "byte", "refused", "validation_failed"} {
+		if !strings.Contains(strings.ToLower(prop.Description), strings.ToLower(want)) {
+			t.Errorf("constraint input-schema description missing %q (#2871):\n%s", want, prop.Description)
+		}
 	}
 }

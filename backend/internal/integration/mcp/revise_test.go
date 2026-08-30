@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -827,5 +830,212 @@ func TestE2E_Revise_ConcurrentScopeRetryShips_GrantsExactlyOneRefusal(t *testing
 	}
 	if len(regEntries) == 0 {
 		t.Errorf("plan_scope_regression entries = 0; the evidence must survive the concurrent refusal")
+	}
+}
+
+// --- #2871: the binding constraint survives the whole seam, or is refused ---
+
+// reviseHarness stands up the shared cross-component rig the two #2871 cases
+// drive: a backend over the fixture's Postgres pool with the artifact, audit,
+// signing and approval repos wired (GitHub too, so prompt-render serves), a
+// plan stage parked at the approval gate carrying a revision-base plan
+// artifact, and a connected MCP client speaking to the REAL fishhawk-mcp
+// binary.
+func reviseHarness(t *testing.T, ctx context.Context, fx *e2eFixture) (audit.Repository, *runpkg.Stage, *mcp.ClientSession, string) {
+	t.Helper()
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schema,
+		Content:     regressionPlanJSON("base plan 2871", []string{"backend/internal/server/revise.go"}),
+		ContentHash: "basehash2871",
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	return auditRepo, planStage, session, httpSrv.URL
+}
+
+// largeMultiItemConstraint builds an ~11000-byte enumerated operator constraint
+// — the realistic shape of the two live losses (~7500 and 6000-9000 bytes) —
+// comfortably over the historical 4000-byte cut and under
+// prompt.MaxRevisionConstraintBytes, and returns it with its LAST item's text.
+// The last item is what the old code dropped, so it is the discriminating
+// assertion; it carries a multi-byte rune so a rune-unsafe cut is visible too.
+func largeMultiItemConstraint(t *testing.T) (constraint, lastItem string) {
+	t.Helper()
+	var b strings.Builder
+	i := 1
+	for b.Len() < 10500 {
+		fmt.Fprintf(&b, "C%d. %s\n\n", i, strings.Repeat("this condition must land verbatim. ", 12))
+		i++
+	}
+	lastItem = fmt.Sprintf("C%d. FINAL_CONDITION_MARKER — keep the change additive; do not bump the schema major. ✅", i)
+	b.WriteString(lastItem)
+	constraint = b.String()
+	if len(constraint) <= 4000 {
+		t.Fatalf("fixture is %d bytes; it must exceed the historical 4000-byte cut to discriminate", len(constraint))
+	}
+	if len(constraint) > prompt.MaxRevisionConstraintBytes {
+		t.Fatalf("fixture is %d bytes; it must stay under the %d-byte cap so it is ACCEPTED",
+			len(constraint), prompt.MaxRevisionConstraintBytes)
+	}
+	return constraint, lastItem
+}
+
+// TestE2E_Revise_LargeConstraintDeliveredWhole is the cross-layer done-means
+// test for #2871. Per-layer units cannot cover it together: the handler, the
+// audit store, the loader and the renderer each looked correct in isolation
+// while the SEAM dropped the tail, which is exactly the defect.
+//
+// It drives the REAL fishhawk-mcp binary → the REAL backend HTTP revise path →
+// the plan_revised entry in Postgres → the prompt renderer reading it back, and
+// asserts (i) the persisted `conditions` equals the submitted constraint
+// BYTE-FOR-BYTE (the audit half — the critical one, because a truncated audit
+// payload makes the loss undetectable after the fact) and (ii) the re-dispatched
+// plan prompt carries the constraint's LAST item verbatim, followed by the
+// end-of-constraint marker.
+func TestE2E_Revise_LargeConstraintDeliveredWhole(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo, planStage, session, baseURL := reviseHarness(t, ctx, fx)
+	constraint, lastItem := largeMultiItemConstraint(t)
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_revise_plan",
+		Arguments: map[string]any{"run_id": fx.runID.String(), "constraint": constraint},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_revise_plan: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("revise tool returned error: %s", toolContentString(t, result))
+	}
+
+	// (i) The AUDIT half: the durable hash-chained record stores the operator's
+	// constraint verbatim, so a later reader can detect any loss downstream.
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryPlanRevised)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("plan_revised entries = %d, want 1", len(entries))
+	}
+	var revised struct {
+		Conditions string `json:"conditions"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &revised); err != nil {
+		t.Fatalf("unmarshal plan_revised payload: %v", err)
+	}
+	if revised.Conditions != constraint {
+		t.Errorf("stored conditions is %d bytes, want the submitted %d byte-for-byte (tail stored: %q)",
+			len(revised.Conditions), len(constraint),
+			revised.Conditions[max(0, len(revised.Conditions)-60):])
+	}
+
+	// (ii) The PROMPT half: the tail the old code dropped reaches the planner,
+	// and the terminator follows it.
+	rendered := getPromptRender(t, ctx, baseURL, planStage.ID)
+	if !strings.Contains(rendered, lastItem) {
+		t.Errorf("the re-dispatched plan prompt is missing the constraint's LAST item %q", lastItem)
+	}
+	if !strings.Contains(rendered, constraint) {
+		t.Errorf("the re-dispatched plan prompt does not carry the constraint whole")
+	}
+	if !strings.Contains(rendered, lastItem+"\n\n"+prompt.RevisionConstraintEndMarker) {
+		t.Errorf("the end-of-constraint marker does not follow the constraint's last item:\n%s",
+			rendered[max(0, len(rendered)-600):])
+	}
+	if strings.Contains(rendered, "...[truncated]") || strings.Contains(rendered, "...[ELIDED") {
+		t.Errorf("an under-cap constraint drew a truncation marker in the rendered prompt")
+	}
+}
+
+// TestE2E_Revise_OverCapConstraintRefusedNoPassSpent is the refusal half across
+// the same seam: the 400 surfaces THROUGH the MCP tool as a tool error, no
+// plan_revised entry is written, and — the committed-state assertion an error
+// identity cannot make — the revise budget is genuinely unspent, proved by a
+// subsequent normal revise that succeeds.
+func TestE2E_Revise_OverCapConstraintRefusedNoPassSpent(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo, _, session, _ := reviseHarness(t, ctx, fx)
+
+	over := strings.Repeat("x", prompt.MaxRevisionConstraintBytes+1)
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_revise_plan",
+		Arguments: map[string]any{"run_id": fx.runID.String(), "constraint": over},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_revise_plan: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("an over-cap constraint was ACCEPTED through the MCP tool; want a refusal")
+	}
+	msg := toolContentString(t, res)
+	for _, want := range []string{"validation_failed", strconv.Itoa(prompt.MaxRevisionConstraintBytes)} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("tool error missing %q:\n%s", want, msg)
+		}
+	}
+
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryPlanRevised)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("plan_revised entries after the refused call = %d, want 0 (no pass may be consumed)", len(entries))
+	}
+
+	// The budget is unspent: a normal revise still succeeds on the first pass.
+	callRevise(t, ctx, session, fx.runID, "REFUSAL_FOLLOWUP_MARKER keep it additive")
+	entries, err = auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryPlanRevised)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory (post-followup): %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("plan_revised entries after the follow-up revise = %d, want 1", len(entries))
+	}
+	var revised struct {
+		PassOrdinal int `json:"pass_ordinal"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &revised); err != nil {
+		t.Fatalf("unmarshal plan_revised payload: %v", err)
+	}
+	if revised.PassOrdinal != 1 {
+		t.Errorf("pass_ordinal = %d, want 1 — the refused call must not have consumed a pass", revised.PassOrdinal)
 	}
 }

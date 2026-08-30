@@ -1808,11 +1808,39 @@ func buildImplement(t Trigger) string {
 // visible by a server-side approval_conditions_truncated audit entry.
 const MaxApprovalConditionBytes = 12000
 
-// MaxConditionBytes caps the three sibling operator-text channels that share
-// this rendering path — clarification answers, the revision constraint, and
-// the recovery resume reason — at their historical 4000-byte behavior. These
-// channels are advisory or bounded and are deliberately NOT gate-refused, so
-// their cap is unchanged.
+// MaxRevisionConstraintBytes caps the plan-gate `revise` operator constraint —
+// the text a revise injects into the re-dispatched plan prompt as the binding
+// "Revision constraint" section (#1099). That text is BINDING in exactly the
+// sense the approve-with-conditions channel is (#558: it AMENDS the plan and
+// wins on conflict with the plan steps), so it gets the same posture: an
+// over-cap constraint is REFUSED at the revise gate
+// (server.handleRevisePlan → 400 validation_failed naming the byte count, the
+// cap and the overflow) rather than silently cut, and no accepted call is ever
+// truncated — the plan_revised audit `conditions` blob equals the operator's
+// (whitespace-trimmed) submission byte-for-byte.
+//
+// #2871: raised from the historical 4000 that the handler and BOTH renderers
+// each independently sliced. That cut was silent on every layer — the call
+// returned 200, and because the audit payload was ITSELF truncated the
+// hash-chained record corroborated the shortened text, so a later reader could
+// not detect the loss at all (unlike #2583 on approve_plan, where the audit
+// record stayed intact). It cost two observed live losses: run bff9a242 dropped
+// conditions C5-C7 of seven, and the #2062 drive lost a BINDING item for four
+// consecutive rounds and the loss was misattributed to agent non-compliance.
+// 12000 matches MaxApprovalConditionBytes because both channels carry binding
+// operator instructions and there is no reason the revise channel should be a
+// third the size; the observed live constraints were ~7500 and 6000-9000 bytes.
+// Failing loud matters more than the exact number — the refusal is independent
+// of the value, so re-tuning this constant alone re-tunes the whole channel.
+const MaxRevisionConstraintBytes = 12000
+
+// MaxConditionBytes caps the two sibling operator-text channels that share
+// this rendering path — clarification answers (server.loadClarificationAnswers)
+// and the recovery resume reason (server.loadRecoveryResumeReason) — at their
+// historical 4000-byte behavior. These channels are advisory or bounded and are
+// deliberately NOT gate-refused, so their cap is unchanged. The revision
+// constraint is NO LONGER one of them (#2871): it is binding, gate-refused, and
+// capped by MaxRevisionConstraintBytes.
 const MaxConditionBytes = 4000
 
 // MaxRejectionFeedbackBytes caps the PriorRejectionFeedback channel — the
@@ -1890,6 +1918,70 @@ func priorRejectionRetrievalPointer(runID string) string {
 			runID)
 	}
 	return "To recover the dropped tail: read the rejecting run's approval_submitted audit entry (rejection_comment payload key, via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion."
+}
+
+// RevisionConstraintEndMarker terminates the rendered operator constraint on
+// the plan-gate `revise` re-open (#2871). It is the STRUCTURAL half of the
+// truncation safeguard: a constraint that arrives without this line was cut
+// somewhere in transit, and the planner is told — by
+// revisionConstraintEndMarkerExpectation, written BEFORE the constraint — to
+// notice its absence and declare it rather than proceed on the visible prefix.
+// Exported so the server-side and cross-layer tests can assert the delivered
+// prompt carries it without re-spelling the literal.
+const RevisionConstraintEndMarker = "--- END OF OPERATOR CONSTRAINT ---"
+
+// revisionConstraintEndMarkerExpectation states that the constraint MUST end
+// with RevisionConstraintEndMarker. Its PLACEMENT is the whole point and is
+// load-bearing (#2871): it is written by the RENDERER into the stable prompt
+// scaffolding OUTSIDE and BEFORE the constraint block, so a cut that removes
+// the constraint's tail — and with it the terminator — cannot also remove the
+// instruction to expect the terminator. An expectation written after the marker
+// would be a control that disappears exactly when it is needed. This mirrors
+// why buildPlan emits the CapTextWithRetrieval risks_and_assumptions
+// instruction from the renderer rather than inside the truncatable text.
+const revisionConstraintEndMarkerExpectation = "Integrity check — read this BEFORE the constraint. The operator constraint below is delivered WHOLE and its last line is exactly:\n\n" +
+	RevisionConstraintEndMarker + "\n\n" +
+	"This sentence is written by the prompt renderer OUTSIDE the constraint, so it survives a cut that removes the constraint's tail. If you reach the end of this prompt without having seen that terminator line after the constraint, the constraint was TRUNCATED in transit: do NOT treat the visible prefix as the whole instruction. Record in the plan's risks_and_assumptions that the operator constraint arrived truncated, quote the last text you did see, and ask the operator to re-send the dropped portion.\n\n"
+
+// revisionConstraintElidedNotice is the renderer-emitted instruction that fires
+// when and only when the constraint itself overflows MaxRevisionConstraintBytes
+// here. Same shape as the prior-rejection-feedback channel's notice: the
+// recipient of truncated BINDING steering must DECLARE the incompleteness in
+// the plan so the operator sees that a constraint item may not have landed.
+const revisionConstraintElidedNotice = "IMPORTANT: the operator constraint below was TRUNCATED — the visible text is INCOMPLETE, so some of the operator's BINDING instruction is not shown. You MUST record in the plan's risks_and_assumptions that the revision constraint was truncated and that you could not see all of it (naming what you could not see if you recover the dropped tail via the pointer in the elision marker below).\n\n"
+
+// revisionConstraintRetrievalPointer is the CapTextWithRetrieval pointer for
+// the revision-constraint channel: the run's own plan_revised audit entry
+// carries the constraint under the `conditions` payload key, which is exactly
+// what loadRevisionConstraint read to build this prompt. Like the
+// prior-rejection pointer it does not DEPEND on retrieval succeeding — whether
+// fishhawk_list_audit is wired into a given plan agent's tool set is
+// best-effort (ADR-021) — which is why revisionConstraintElidedNotice also
+// instructs the planner to declare the gap in risks_and_assumptions.
+const revisionConstraintRetrievalPointer = "To recover the dropped tail: read this run's newest plan_revised audit entry (conditions payload key, via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion."
+
+// writeOperatorConstraint renders the operator constraint body shared by
+// buildPlan and buildGroomingPropose: the elision notice (only when the text
+// overflows), the caller's noun-specific lead line, the constraint itself, and
+// the END marker.
+//
+// MaxRevisionConstraintBytes is the ONE cap this channel has — the loader
+// (server.loadRevisionConstraint) returns the stored blob raw and the handler
+// refuses above the cap, so this elision path is reachable only for a
+// constraint persisted BEFORE that gate shipped. It is retained rather than
+// deleted precisely because silently dropping the tail is the defect: a legacy
+// entry still renders, but loudly.
+func writeOperatorConstraint(b *strings.Builder, constraint, leadLine string) {
+	capped, elided := CapTextWithRetrieval(constraint, MaxRevisionConstraintBytes, revisionConstraintRetrievalPointer)
+	if elided {
+		b.WriteString(revisionConstraintElidedNotice)
+	}
+	b.WriteString(leadLine)
+	b.WriteString("\n\n")
+	b.WriteString(capped)
+	b.WriteString("\n\n")
+	b.WriteString(RevisionConstraintEndMarker)
+	b.WriteString("\n\n")
 }
 
 // writeInjectedDocuments renders Trigger.InjectedDocuments (E55.1 / #2242) as
@@ -3135,6 +3227,11 @@ func buildPlan(t Trigger) string {
 			"channel (#558). Treat it as authoritative: REVISE the prior plan below to satisfy it — do NOT " +
 			"replan blank-slate, and do NOT discard the parts of the plan the constraint does not touch. " +
 			"Re-emit a complete, valid standard_v1 plan that honours the constraint.\n\n")
+		// #2871: the END-marker expectation is written HERE — in the stable
+		// scaffolding, ahead of the base plan, the scope list and the
+		// constraint itself — so a cut that removes the constraint's tail
+		// cannot also remove the instruction to notice the missing terminator.
+		b.WriteString(revisionConstraintEndMarkerExpectation)
 		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
 			base := *t.RevisionBasePlan
 			const maxBaseBytes = 4000
@@ -3177,14 +3274,8 @@ func buildPlan(t Trigger) string {
 			}
 			b.WriteString("\n")
 		}
-		constraint := *t.RevisionConstraint
-		const maxConstraintBytes = 4000
-		if len(constraint) > maxConstraintBytes {
-			constraint = constraint[:maxConstraintBytes] + "...[truncated]"
-		}
-		b.WriteString("Operator constraint (MANDATORY — wins on conflict with the prior plan):\n\n")
-		b.WriteString(constraint)
-		b.WriteString("\n\n")
+		writeOperatorConstraint(&b, *t.RevisionConstraint,
+			"Operator constraint (MANDATORY — wins on conflict with the prior plan):")
 	}
 
 	// Scope restoration (#2516): the plan gate REFUSED the previous revision
@@ -3627,6 +3718,10 @@ func buildGroomingPropose(t Trigger) (string, error) {
 			"change before it can proceed. Treat the constraint below as authoritative: REVISE the prior report — do NOT " +
 			"regroom blank-slate, and do NOT discard the findings the constraint does not touch. Re-emit a complete, valid " +
 			plan.GroomingReportVersion + " report that honours the constraint.\n\n")
+		// #2871: same placement rule as buildPlan — the END-marker expectation
+		// is scaffolding written BEFORE the constraint, so a cut that removes
+		// the terminator cannot remove the instruction to expect it.
+		b.WriteString(revisionConstraintEndMarkerExpectation)
 		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
 			base := *t.RevisionBasePlan
 			const maxBaseBytes = 4000
@@ -3637,14 +3732,13 @@ func buildGroomingPropose(t Trigger) (string, error) {
 			b.WriteString(base)
 			b.WriteString("\n\n")
 		}
-		constraint := *t.RevisionConstraint
-		const maxConstraintBytes = 4000
-		if len(constraint) > maxConstraintBytes {
-			constraint = constraint[:maxConstraintBytes] + "...[truncated]"
-		}
-		b.WriteString("Operator constraint (MANDATORY — wins on conflict with the prior report):\n\n")
-		b.WriteString(constraint)
-		b.WriteString("\n\n")
+		// The grooming revise rides the SAME loader and the same gate-refused
+		// handler as the plan revise, so it must share the same cap owner:
+		// leaving this at 4000 would re-open the silent-drop hole for every
+		// constraint the handler now accepts between 4000 and
+		// MaxRevisionConstraintBytes (#2871).
+		writeOperatorConstraint(&b, *t.RevisionConstraint,
+			"Operator constraint (MANDATORY — wins on conflict with the prior report):")
 	}
 
 	// Clarification answers on the #558 binding-conditions channel, worded for
