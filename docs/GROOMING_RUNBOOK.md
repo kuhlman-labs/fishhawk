@@ -82,7 +82,7 @@ stage was removed (#2851).
 
 - `hygiene` applies (labels, fields, boarding, epic links — objective and reversible),
   **except a proposed `autonomy:` delegation-tier label**, which is refused with a named
-  audited skip and needs your hand or #2843 (see §7).
+  audited skip and needs your hand or #2843 (see §8).
 - `ordering`, `dedup`, `scoping` receive no decision and apply nothing. They are
   non-delegable by construction and refused at `mode: auto` at parse time.
 
@@ -90,7 +90,47 @@ stage was removed (#2851).
 reported eight applied while every applied VALUE was garbage. An audit row saying
 `applied` is not the same claim as the tracker carrying the change.
 
-## 5. Turning the ranking into work
+## 5. Confirming is the second write
+
+The `confirm` stage is a `type: review` gate declaring `executor: human` with
+`approvals: {count: 1, not: [agent]}`. It is where you record that you checked the FORGE
+rather than the summary (§4). Until #3041 it had no approvable surface anywhere: the
+approval endpoint refused EVERY review stage with 409 `review_stage_managed_by_github`
+(ADR-018), which is correct for a PR-merge-managed review gate and wrong here — a
+grooming run could be started but never finished, parking in `running` indefinitely.
+
+**There is no MCP verb and no CLI verb for this gate. A human runs the curl.** That is
+the gate working as declared, not a gap:
+
+```
+curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/stages/<confirm_stage_id>/approvals" \
+  -H "Authorization: Bearer $FISHHAWK_OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"decision":"approve","comment":"checked the forge: #2801 carries area:runner and the parent link; #2799 label landed"}'
+```
+
+- The credential must be a **human-held operator credential**. Both a run-bound `fhm_`
+  token (403 `self_decision`) and a delegated operator-agent token (403
+  `operator_agent_forbidden`) are refused BY DESIGN — an MCP tool is invoked under
+  exactly the second identity, which is why no such tool exists. **After #3041 an agent
+  still cannot approve this gate. A human must.**
+- The `comment` is the **attestation and is REQUIRED**: an empty or whitespace-only
+  comment on an approve is refused 400 `attestation_required`. State what you checked. A
+  `reject` needs no comment — it fails the stage category D.
+- Approving takes the run **terminal** (`succeeded`); the orchestrator finds no remaining
+  stage and completes the run.
+- Get `<confirm_stage_id>` from `fishhawk_get_run_status` — it is the `review` stage
+  sitting at `awaiting_approval`.
+- **An approval is bound to the STAGE ROW, not to the run's intent.** Retrying or
+  re-running creates new stage rows, so a prior approval cannot be reused; you approve
+  the new row.
+- A 409 with `details.admission_reason` means the gate was not admitted. `pull_request_managed`
+  means you are looking at a PR-merge review stage (approve it by merging the PR);
+  anything else (`workflow_spec_unparseable`, `multiple_review_spec_stages`,
+  `not_human_executor_row`, …) names a fail-closed resolution failure against the run's
+  CACHED workflow spec.
+
+## 6. Turning the ranking into work
 
 An approved order seeds a campaign directly:
 
@@ -111,7 +151,7 @@ and recovery are the weaker subsystems in this product and have needed manual dr
 The alternative — walking the ranked list downward with individual `fishhawk_start_run`
 calls — respects the ordering and skips nothing. Slower, more reliable.
 
-## 6. Autonomy tiers
+## 7. Autonomy tiers
 
 **Policy for this repo: only agents author code.** `autonomy:low` therefore means an
 agent STRUCTURALLY CANNOT do it, not that the work is sensitive — sensitivity is what
@@ -135,7 +175,7 @@ items), leaving 20 genuine human-led work items. 36 issues were re-tiered to
 #2274 is the durable fix — it introduces an `execution:` namespace so "cannot" and
 "should not be delegated" stop sharing one label.
 
-## 7. Hazards
+## 8. Hazards
 
 **A groom still PROPOSES a tier; the apply refuses it (#2855, shipped).** The groomer
 proposed `autonomy:medium` for #1512 on one run and `autonomy:low` on the next, and
@@ -167,7 +207,7 @@ concern), and counterfactual results ride the sidecar's `counterfactuals` array 
 stay on the runner: only the triple crosses the upload boundary, and the reviewer is told
 plainly that it is an agent CLAIM, not a runner observation.
 
-## 8. Open follow-ups
+## 9. Open follow-ups
 
 | Issue | Subject |
 |---|---|
@@ -178,7 +218,7 @@ plainly that it is an agent CLAIM, not a runner observation.
 | #2845 | plans omit `requires_live_validation` |
 | #2274 | migrate issues to `execution:agent` |
 
-## 9. Verification discipline
+## 10. Verification discipline
 
 Habits that cost time when skipped:
 

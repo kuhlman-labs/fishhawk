@@ -280,6 +280,17 @@ func validateApprovalComment(decision approval.Decision, comment string) (ok boo
 // carry the existing row's provenance, no gates re-run, and no audit
 // entries are emitted. The first decision wins for any_of-style gates.
 func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
+	// Human-executor review-gate actor refusal (E54.53 / #3041), placed AHEAD
+	// of the write-scope check on purpose: a real run-bound fhm_ token does NOT
+	// carry write:approvals, so behind requireWriteScope the message an
+	// operator sees in production is insufficient_scope, which names nothing
+	// about the executor constraint. See refuseAgentOnHumanReviewGate. It
+	// no-ops (false) for every non-agent identity and for every stage that is
+	// not an ADMITTED human-executor review gate, so the ladder below is
+	// unchanged for every other caller.
+	if s.refuseAgentOnHumanReviewGate(w, r) {
+		return
+	}
 	if !s.requireWriteScope(w, r, "write:approvals") {
 		return
 	}
@@ -369,9 +380,20 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// URL so the caller knows where the merge gate actually lives.
 	// Plan-stage approvals are unaffected — Fishhawk's vote at plan
 	// time is independent and has no GitHub-side equivalent.
+	// ...but NOT every review stage: a review stage whose PERSISTED executor
+	// is human, whose sole review spec stage also declares executor.human, and
+	// which declares NO pull_request input is not GitHub-managed at all — it is
+	// backlog_grooming's `confirm` gate, which had no approvable surface
+	// anywhere (E54.53 / #3041). Admit exactly that shape; every other review
+	// stage, and every resolution failure, keeps today's 409 (fail closed).
 	if stage.Type == run.StageTypeReview {
-		s.rejectReviewStageApproval(w, r, stage)
-		return
+		if reason := s.resolveReviewGateAdmission(r.Context(), stage); reason != reviewGateAdmitOK {
+			s.rejectReviewStageApproval(w, r, stage, reason)
+			return
+		}
+		if !s.requireReviewGateAttestation(w, r, stage, decision, req.Comment) {
+			return
+		}
 	}
 
 	// Authorization: when a RoleResolver is wired, the subject
@@ -1913,10 +1935,18 @@ func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gate
 // 409 (not 410) because the resource still exists — only the
 // action against this stage type is no longer valid. Plan-stage
 // approvals continue to use the same endpoint.
-func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Request, stage *run.Stage) {
+//
+// Since #3041 this is the NOT-ADMITTED arm of resolveReviewGateAdmission
+// rather than an unconditional refusal, and `reason` names WHICH leg failed
+// under details.admission_reason so a refused caller can tell a
+// PR-merge-managed gate from an unparseable cached spec. The code, message and
+// pull_request_url detail are byte-identical to pre-#3041 for every reason, so
+// the ADR-018 contract existing clients match on is unchanged.
+func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Request, stage *run.Stage, reason reviewGateAdmitReason) {
 	details := map[string]any{
-		"stage_id":   stage.ID.String(),
-		"stage_type": string(stage.Type),
+		"stage_id":         stage.ID.String(),
+		"stage_type":       string(stage.Type),
+		"admission_reason": reason.String(),
 	}
 	if s.cfg.RunRepo != nil {
 		if runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); err == nil &&

@@ -9796,3 +9796,356 @@ func TestSliceMoveScopeFiles_ResolvedSortedByToSliceThenPath(t *testing.T) {
 		t.Errorf("move_scope_files_resolved = %+v,\nwant %+v (ordered by (to_slice, path) despite scrambled input)", gotResolved, wantResolved)
 	}
 }
+
+// --- E54.53 / #3041: the human-executor review gate at the HTTP surface ---
+//
+// Every case below drives the real handleSubmitApproval and asserts the
+// SHIPPED status + error code + message, not an internal predicate.
+
+// approvalErrorBody decodes the handler's error envelope so a test can assert
+// on the code, message and details it actually ships.
+func approvalErrorBody(t *testing.T, w *httptest.ResponseRecorder) (code, message string, details map[string]any) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v (raw: %s)", err, w.Body.String())
+	}
+	return body.Error.Code, body.Error.Message, body.Error.Details
+}
+
+// runBoundIdentity mints a run-bound `mcp:run:<uuid>` agent identity. scopes
+// is explicit so a test can mint one WITH write:approvals (proving the
+// executor refusal is an independent control, not an accident of the runner's
+// scope configuration) and one WITHOUT it (the realistic production shape).
+func runBoundIdentity(runID uuid.UUID, scopes ...string) Identity {
+	return Identity{
+		Subject: "mcp:run:" + runID.String(),
+		TokenID: "tok-run-bound",
+		Scopes:  scopes,
+	}
+}
+
+// assertReviewGateUntouched pins the COMMITTED STATE after a refusal: the
+// stage is still parked at awaiting_approval and no approval row was
+// inserted. A control that fires and then rolls back would return a
+// byte-identical error, so error identity alone cannot discriminate.
+func assertReviewGateUntouched(t *testing.T, ar *fakeApprovalRepo, rr *approvalRunRepo, stageID uuid.UUID) {
+	t.Helper()
+	cur, err := rr.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %s, want awaiting_approval (a refusal must not advance the gate)", cur.State)
+	}
+	rows, err := ar.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("approval rows = %d, want 0 (a pre-Submit refusal records nothing)", len(rows))
+	}
+}
+
+// The gate this whole change exists for: an operator approving
+// backlog_grooming's human-executor `confirm` stage now succeeds, where it
+// used to draw an unconditional 409.
+func TestSubmitApproval_HumanReviewGate_OperatorApprove_Succeeds(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	st := seedReviewStage(rr, "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, true)
+
+	const attestation = "checked the forge: all 8 label mutations landed on the tracker"
+	w := submitApproval(t, s, st.ID, `{"decision":"approve","comment":"`+attestation+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	cur, err := rr.GetStage(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if cur.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %s, want succeeded", cur.State)
+	}
+	if got := countAppendedCategory(au, "approval_submitted"); got != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", got)
+	}
+	rows, err := ar.ListForStage(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("approval rows = %d, want 1", len(rows))
+	}
+	if rows[0].Comment == nil || *rows[0].Comment != attestation {
+		t.Errorf("recorded comment = %v, want the attestation %q", rows[0].Comment, attestation)
+	}
+}
+
+// The ADR-018 regression pin: a PR-merge-managed review stage keeps today's
+// 409, byte-identical code and message. This is the single outcome the change
+// must never produce a 200 for.
+func TestSubmitApproval_PullRequestManagedReviewGate_StillRefused(t *testing.T) {
+	cases := []struct {
+		name       string
+		workflowID string
+		specYAML   string
+	}{
+		{"artifact: pull_request", "feature_change", featureChangeReviewSpec},
+		{"source: pull_request", "routine_change", routineChangeReviewSpec},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			// No pull_request_url is stamped on the run row: leg 3 keys on the
+			// SPEC's declared input, not on mutable run state.
+			st := seedReviewStage(rr, tc.workflowID, tc.specYAML, run.ExecutorHuman, true)
+
+			w := submitApproval(t, s, st.ID, `{"decision":"approve","comment":"looks good"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "review_stage_managed_by_github" {
+				t.Errorf("code = %q, want review_stage_managed_by_github", code)
+			}
+			if got := details["admission_reason"]; got != "pull_request_managed" {
+				t.Errorf("details.admission_reason = %v, want pull_request_managed", got)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
+
+// A run-bound agent token is refused with the NAMED executor refusal whether
+// or not it carries write:approvals. The scope-less variant is the realistic
+// production shape (a real fhm_ token does not carry write:approvals), which
+// is why the refusal is placed AHEAD of requireWriteScope.
+func TestSubmitApproval_HumanReviewGate_RunBoundToken_SelfDecision(t *testing.T) {
+	cases := []struct {
+		name   string
+		scopes []string
+	}{
+		{"without write:approvals (the realistic token)", []string{"write:scope-amendments", "write:stages"}},
+		{"with write:approvals (minted deliberately)", []string{"write:approvals", "write:stages"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			st := seedReviewStage(rr, "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, true)
+			id := runBoundIdentity(st.RunID, tc.scopes...)
+
+			w := submitApprovalWithIdentity(t, s, st.ID, &id,
+				`{"decision":"approve","comment":"checked the forge"}`)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+			}
+			code, message, _ := approvalErrorBody(t, w)
+			if code != "self_decision" {
+				t.Fatalf("code = %q, want self_decision", code)
+			}
+			if !strings.Contains(message, "executor: human") || !strings.Contains(message, "not: [agent]") {
+				t.Errorf("message does not name the executor constraint: %q", message)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
+
+// A DELEGATED operator-agent token is refused too: an MCP tool runs under
+// exactly this identity, so the gate's `not: [agent]` makes the grooming
+// confirm gate human-only by design.
+func TestSubmitApproval_HumanReviewGate_OperatorAgentToken_Forbidden(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	st := seedReviewStage(rr, "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, true)
+	id := operatorAgentIdentity()
+
+	w := submitApprovalWithIdentity(t, s, st.ID, &id,
+		`{"decision":"approve","comment":"checked the forge"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	code, message, _ := approvalErrorBody(t, w)
+	if code != "operator_agent_forbidden" {
+		t.Fatalf("code = %q, want operator_agent_forbidden", code)
+	}
+	if !strings.Contains(message, "executor: human") || !strings.Contains(message, "not: [agent]") {
+		t.Errorf("message does not name the executor constraint: %q", message)
+	}
+	assertReviewGateUntouched(t, ar, rr, st.ID)
+}
+
+// Neither agent refusal leaks onto a PR-merge-managed review stage: that gate
+// is not admitted, so the ordinary ADR-018 409 still wins — and it must do so
+// for BOTH agent identities. Pinning only the run-bound one would let a future
+// reordering start answering 403 for the delegated operator-agent and 409 for
+// the run-bound token on the SAME gate with nothing noticing.
+func TestSubmitApproval_AgentToken_PullRequestManagedGate_Still409(t *testing.T) {
+	cases := []struct {
+		name string
+		mint func(runID uuid.UUID) Identity
+	}{
+		{"run-bound token", func(runID uuid.UUID) Identity { return runBoundIdentity(runID, "write:approvals") }},
+		{"delegated operator-agent token", func(uuid.UUID) Identity { return operatorAgentIdentity() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			st := seedReviewStage(rr, "feature_change", featureChangeReviewSpec, run.ExecutorHuman, true)
+			id := tc.mint(st.RunID)
+
+			w := submitApprovalWithIdentity(t, s, st.ID, &id, `{"decision":"approve","comment":"x"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "review_stage_managed_by_github" {
+				t.Errorf("code = %q, want review_stage_managed_by_github (the guard must defer to admission, not answer 403)", code)
+			}
+			if got := details["admission_reason"]; got != "pull_request_managed" {
+				t.Errorf("details.admission_reason = %v, want pull_request_managed", got)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
+
+// submitApprovalRawStageIDWithIdentity is submitApprovalWithIdentity for a
+// stage_id that is NOT a UUID, so a test can drive the handler's own parse
+// rung. It cannot reuse the typed helper, whose parameter is a uuid.UUID.
+func submitApprovalRawStageIDWithIdentity(t *testing.T, s *Server, rawStageID string, id Identity, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/stages/"+rawStageID+"/approvals", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", rawStageID)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleSubmitApproval(w, req)
+	return w
+}
+
+// The pre-scope guard must not SWALLOW the malformed-path ladder. On a
+// non-UUID {stage_id} lookupStageForPath returns nil, so the guard falls
+// through and the handler's own uuid.Parse writes the ordinary 400 — for
+// either agent identity. Both tokens carry write:approvals so the assertion
+// lands on the parse rung rather than on the scope check the guard sits ahead
+// of.
+func TestSubmitApproval_AgentToken_MalformedStageID_FallsThroughToLadder(t *testing.T) {
+	cases := []struct {
+		name string
+		id   Identity
+	}{
+		{"run-bound token", runBoundIdentity(uuid.New(), "write:approvals")},
+		{"delegated operator-agent token", operatorAgentIdentity()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := newApprovalServer(t)
+
+			w := submitApprovalRawStageIDWithIdentity(t, s, "not-a-uuid", tc.id,
+				`{"decision":"approve","comment":"x"}`)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed (the guard must not shadow the malformed-path ladder)", code)
+			}
+			if got := details["field"]; got != "stage_id" {
+				t.Errorf("details.field = %v, want stage_id", got)
+			}
+		})
+	}
+}
+
+// The attestation IS what this gate records, so an approve must carry one.
+// The paired REJECT case proves the guard is decision-scoped rather than a
+// blanket comment requirement.
+func TestSubmitApproval_HumanReviewGate_AttestationRequired(t *testing.T) {
+	for _, body := range []string{
+		`{"decision":"approve"}`,
+		`{"decision":"approve","comment":"   "}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			st := seedReviewStage(rr, "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, true)
+
+			w := submitApproval(t, s, st.ID, body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			code, _, _ := approvalErrorBody(t, w)
+			if code != "attestation_required" {
+				t.Fatalf("code = %q, want attestation_required", code)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
+
+func TestSubmitApproval_HumanReviewGate_RejectNeedsNoAttestation(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	st := seedReviewStage(rr, "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, true)
+
+	w := submitApproval(t, s, st.ID, `{"decision":"reject"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	cur, err := rr.GetStage(context.Background(), st.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %s, want failed", cur.State)
+	}
+	if cur.FailureCategory == nil || *cur.FailureCategory != run.FailureD {
+		t.Errorf("failure category = %v, want D", cur.FailureCategory)
+	}
+}
+
+// Every remaining fail-closed resolve arm keeps the 409 and names itself under
+// details.admission_reason.
+func TestSubmitApproval_ReviewGateAdmission_FailClosedReasons(t *testing.T) {
+	cases := []struct {
+		name       string
+		workflowID string
+		specYAML   string
+		executor   run.ExecutorKind
+		seedRun    bool
+		wantReason string
+	}{
+		{"agent-executor row", "backlog_grooming", groomingReviewSpec, run.ExecutorAgent, true, "not_human_executor_row"},
+		{"unreadable run row", "backlog_grooming", groomingReviewSpec, run.ExecutorHuman, false, "run_unavailable"},
+		{"empty cached spec", "backlog_grooming", "", run.ExecutorHuman, true, "no_workflow_spec"},
+		{"unparseable cached spec", "backlog_grooming", "version: \"1.0\"\nworkflows: [nope", run.ExecutorHuman, true, "workflow_spec_unparseable"},
+		{"workflow absent from spec", "not_declared", groomingReviewSpec, run.ExecutorHuman, true, "workflow_missing"},
+		{"no review spec stage", "backlog_grooming", noReviewSpec, run.ExecutorHuman, true, "no_review_spec_stage"},
+		{"two review spec stages", "backlog_grooming", twoReviewSpec, run.ExecutorHuman, true, "multiple_review_spec_stages"},
+		{"spec stage is agent-executor", "backlog_grooming", agentReviewSpec, run.ExecutorHuman, true, "spec_stage_not_human_executor"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, _ := newApprovalServer(t)
+			st := seedReviewStage(rr, tc.workflowID, tc.specYAML, tc.executor, tc.seedRun)
+
+			w := submitApproval(t, s, st.ID, `{"decision":"approve","comment":"checked the forge"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			code, _, details := approvalErrorBody(t, w)
+			if code != "review_stage_managed_by_github" {
+				t.Errorf("code = %q, want review_stage_managed_by_github", code)
+			}
+			if got := details["admission_reason"]; got != tc.wantReason {
+				t.Errorf("details.admission_reason = %v, want %s", got, tc.wantReason)
+			}
+			assertReviewGateUntouched(t, ar, rr, st.ID)
+		})
+	}
+}
