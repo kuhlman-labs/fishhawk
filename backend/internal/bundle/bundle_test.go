@@ -1513,3 +1513,60 @@ func TestExtractGateEvidence_FixupReportingObligationCarriesNoAgentText(t *testi
 			got.FixupReportingObligations[0], want)
 	}
 }
+
+// fixupCounterfactualsWireFixture is the SHARED literal JSON that pins the
+// runner↔backend gate-evidence wire contract for #3042. Its byte-for-byte twin
+// lives in runner/cmd/fishhawk-runner/gateevidence_test.go, where the REAL
+// composer is asserted to EMIT exactly this from the agent's raw self-report
+// JSON; here the backend is asserted to DECODE exactly this. No import can
+// cross the module seam, so a one-sided json-tag edit fails on the other side.
+const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+
+// TestExtractGateEvidence_DecodesFixupCounterfactuals is the backend half of the
+// #3042 lockstep pair: the shared literal decodes field-for-field, including the
+// explicit `"restored": false`, which must survive as false rather than being
+// collapsed with an absent key.
+func TestExtractGateEvidence_DecodesFixupCounterfactuals(t *testing.T) {
+	payload := json.RawMessage(`{"scope_facts":{"declared_files":1},` + fixupCounterfactualsWireFixture + `}`)
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: payload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	want := []FixupCounterfactualEvidence{
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+	}
+	if len(got.FixupCounterfactuals) != len(want) {
+		t.Fatalf("FixupCounterfactuals = %+v, want %+v", got.FixupCounterfactuals, want)
+	}
+	for i := range want {
+		if got.FixupCounterfactuals[i] != want[i] {
+			t.Errorf("FixupCounterfactuals[%d] = %+v, want %+v — the runner↔backend json tags diverged",
+				i, got.FixupCounterfactuals[i], want[i])
+		}
+	}
+}
+
+// TestExtractGateEvidence_OlderBundleWithoutFixupCounterfactuals: the
+// additive/omitempty proof — a payload without the key decodes to nil.
+func TestExtractGateEvidence_OlderBundleWithoutFixupCounterfactuals(t *testing.T) {
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: json.RawMessage(`{"scope_facts":{"declared_files":1}}`)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.FixupCounterfactuals != nil {
+		t.Errorf("FixupCounterfactuals = %+v, want nil for an older/non-fix-up bundle", got.FixupCounterfactuals)
+	}
+}

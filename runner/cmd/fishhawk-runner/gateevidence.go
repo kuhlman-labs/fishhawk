@@ -86,6 +86,20 @@ type gateEvidencePayload struct {
 	// DISABLES the backend's undelivered signal, which is why the pair is pinned
 	// from BOTH modules against one shared literal JSON fixture.
 	FixupReportingObligations []fixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
+	// FixupCounterfactuals digests the agent's VALIDATED counterfactual
+	// self-report for a fix-up pass (#3042): one
+	// {control_path, observed, restored} triple per control the pass added or
+	// tightened and then deleted, re-ran and restored. Already fail-closed
+	// validated by validateFixupCounterfactuals, which retains NO agent-authored
+	// free text — the required `record` narrative is checked on the runner and
+	// discarded there, exactly as #2737 does for obligation record/reason.
+	// Folded from the fixup_counterfactuals event. Absent (the byte-identical
+	// default) when there was no fix-up pass, the agent reported none, or no
+	// entry survived validation. The json tag MUST stay identical to the
+	// backend's bundle.FixupCounterfactualEvidence mirror — a one-sided edit
+	// silently DISABLES the reviewer's counterfactual signal, which is why the
+	// pair is pinned from BOTH modules against one shared literal JSON fixture.
+	FixupCounterfactuals []fixupCounterfactualEvidence `json:"fixup_counterfactuals,omitempty"`
 	// DiffCoverage digests the workflow-v1.6 `diff_coverage` measurement
 	// (ADR-059 / #1888): what the customer coverage command was, how it
 	// exited, and how much of the stage's added-line set the resulting
@@ -149,6 +163,34 @@ type fixupSelfReportDivergenceEvidence struct {
 type fixupReportingObligationEvidence struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+}
+
+// fixupCounterfactualEvidence is one validated counterfactual self-report
+// (#3042): the declared-scope control path the agent counterfactually tested,
+// the outcome literal it claims it observed (`red` | `green` | `not_run`), and
+// whether it restored the control afterwards.
+//
+// There is deliberately NO free-text field. The agent's `record` narrative —
+// what it mutated and what it saw — is REQUIRED (it forces the agent to have
+// actually run the mutation) but validated on the runner and discarded there
+// (validateFixupCounterfactuals): the fix-up agent runs arbitrary repository
+// commands, so that text is agent-controlled and would cross this upload
+// boundary into the reviewer's prompt without ever appearing in the committed
+// diff. ControlPath is not free text either — it must be a member of the
+// stage's already-declared scope.files set, so it can carry nothing the
+// reviewer prompt does not already name.
+//
+// Everything here is an agent CLAIM, not a runner observation: the runner never
+// witnessed the mutation, so `observed: red` does NOT close the
+// no-op-mutation class. The reviewer prompt says so explicitly.
+//
+// The json tags MUST stay identical to the backend's
+// bundle.FixupCounterfactualEvidence mirror — the same lockstep runner↔backend
+// wire contract as the parent payload.
+type fixupCounterfactualEvidence struct {
+	ControlPath string `json:"control_path"`
+	Observed    string `json:"observed"`
+	Restored    bool   `json:"restored"`
 }
 
 // scopeExemptionEvidence is one validated scope self-exemption (#1153): a
@@ -258,7 +300,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "diff_coverage":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage":
 			gateRan = true
 		}
 	}
@@ -376,6 +418,14 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				continue
 			}
 			payload.FixupReportingObligations = append(payload.FixupReportingObligations, w.Obligations...)
+		case "fixup_counterfactuals":
+			var w struct {
+				Counterfactuals []fixupCounterfactualEvidence `json:"counterfactuals"`
+			}
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			payload.FixupCounterfactuals = append(payload.FixupCounterfactuals, w.Counterfactuals...)
 		case "diff_coverage":
 			var w diffCoverageEvidence
 			if json.Unmarshal(e.Payload, &w) != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -705,5 +706,97 @@ func TestComposeGateEvidence_FixupReportingObligationsMalformedPayloadSkipped(t 
 	if p.FixupReportingObligations != nil {
 		t.Errorf("a malformed fixup_reporting_obligations payload must contribute nothing, got %+v",
 			p.FixupReportingObligations)
+	}
+}
+
+// fixupCounterfactualsWireFixture is the SHARED literal JSON every module pins
+// the runner↔backend gate-evidence wire contract for #3042 against. Byte-for-byte
+// twins live in backend/internal/bundle/bundle_test.go (asserted to DECODE it)
+// and backend/internal/server/trace_test.go (asserted to RENDER it into the
+// reviewer prompt). No import can cross the module seam, so a one-sided json-tag
+// edit fails on the other side — the same lockstep defense this file already
+// applies to fixup_reporting_obligations.
+const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+
+// TestFixupCounterfactuals_SelfReportToWire_EndToEnd is the RUNNER half of the
+// #3042 cross-boundary span (binding condition 2). It starts from the agent's
+// raw self-report JSON on disk and drives the REAL chain — loadFixupSelfReport
+// (whole-sidecar rules + validateFixupCounterfactuals) -> fixupCounterfactualsEvent
+// -> the REAL composeGateEvidence -> the emitted bundle JSON — then asserts the
+// emitted gate_evidence payload carries the shared wire fixture BYTE-FOR-BYTE.
+// Nothing here hand-writes the evidence shape: the fixture is what the real
+// composer produced. The backend half consumes that exact literal.
+func TestFixupCounterfactuals_SelfReportToWire_EndToEnd(t *testing.T) {
+	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
+	scope := []string{"runner/cmd/fishhawk-runner/main.go", "backend/internal/prompt/prompt.go"}
+
+	dir := t.TempDir()
+	orig := fixupSelfReportDir
+	fixupSelfReportDir = dir
+	t.Cleanup(func() { fixupSelfReportDir = orig })
+
+	// The agent's sidecar, verbatim JSON — including a record narrative that
+	// must NOT survive the boundary, an out-of-scope entry that must be dropped,
+	// and an explicit `"restored": false` that must be RETAINED.
+	const sidecar = `{
+	  "run_id": "run-cccc",
+	  "stage_id": "stage-dddd",
+	  "verify_status": "passed",
+	  "counterfactuals": [
+	    {"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,
+	     "record":"deleted the scope-membership check; the drop test went red; restored"},
+	    {"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false,
+	     "record":"deleted the render branch; the prompt test still passed"},
+	    {"control_path":"never/declared/elsewhere.go","observed":"red","restored":true,
+	     "record":"out of scope, must be dropped"}
+	  ]
+	}`
+	if err := os.WriteFile(fixupSelfReportPath(cfg.runID, cfg.stageID), []byte(sidecar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logSink strings.Builder
+	report := loadFixupSelfReport(cfg, scope, &logSink)
+	if len(report.counterfactuals) != 2 {
+		t.Fatalf("validated counterfactuals = %+v, want the 2 in-scope entries (log %q)",
+			report.counterfactuals, logSink.String())
+	}
+	ev := composeGateEvidence([]agent.Event{fixupCounterfactualsEvent(cfg, report.counterfactuals)}, 0)
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil; a fixup_counterfactuals event must count as a gate")
+	}
+	raw := string(ev.Payload)
+	if !strings.Contains(raw, fixupCounterfactualsWireFixture) {
+		t.Errorf("gate_evidence payload does not carry the shared wire fixture.\ngot:  %s\nwant substring: %s",
+			raw, fixupCounterfactualsWireFixture)
+	}
+	// The wire shape carries the scope-member path, the observed literal and the
+	// restored bool and NOTHING else, so the agent's record narrative has no
+	// field to ride out on.
+	for _, k := range []string{"record", "reason", "detail", "text", "test"} {
+		if strings.Contains(raw, `"`+k+`":`) {
+			t.Errorf("gate_evidence payload carries a %q member — agent-authored text must not cross the "+
+				"upload boundary:\n%s", k, raw)
+		}
+	}
+	p := decodeEvidence(t, ev)
+	if len(p.FixupCounterfactuals) != 2 ||
+		p.FixupCounterfactuals[0] != (fixupCounterfactualEvidence{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true}) ||
+		p.FixupCounterfactuals[1] != (fixupCounterfactualEvidence{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false}) {
+		t.Errorf("FixupCounterfactuals = %+v, want the two validated triples", p.FixupCounterfactuals)
+	}
+}
+
+// TestComposeGateEvidence_NoFixupCounterfactualsField: the additive/omitempty
+// proof — a stage with no counterfactual event emits no member at all, so every
+// existing bundle stays byte-identical.
+func TestComposeGateEvidence_NoFixupCounterfactualsField(t *testing.T) {
+	ev := composeGateEvidence([]agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+	}, 0)
+	if strings.Contains(string(ev.Payload), "fixup_counterfactuals") {
+		t.Errorf("payload %s carries a fixup_counterfactuals member, want it omitted", ev.Payload)
 	}
 }

@@ -12067,3 +12067,219 @@ func TestWriteTrustedFixupConcerns_StatesTheNotAttemptedObligation(t *testing.T)
 		t.Errorf("empty concern set rendered %q", empty.String())
 	}
 }
+
+// --- #3042 fix-up re-review evidence -------------------------------------
+
+// implementReviewWithGateEvidence builds an implement_review prompt around one
+// GateEvidence, so the #3042 render cases differ ONLY in the evidence.
+func implementReviewWithGateEvidence(t *testing.T, ev *GateEvidence) string {
+	t.Helper()
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		IssueNumber:  3042,
+		IssueTitle:   "fix-up evidence",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return got
+}
+
+// TestWriteGateEvidence_VerifyTailRenders is the populated-path baseline: a
+// GateEvidence carrying verify runs + a summary renders the command, the output
+// tail and the summary line — the evidence a fix-up re-review previously never
+// received at all.
+func TestWriteGateEvidence_VerifyTailRenders(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{
+			Command: "scripts/test verify", ExitCode: 0, Outcome: "passed",
+			OutputTail: "ok  github.com/example/pkg  1.2s\nVERIFY_TAIL_SENTINEL",
+		}},
+		VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+	})
+	for _, w := range []string{
+		"Verify runs (committed-tree gate):",
+		"- command: scripts/test verify",
+		"VERIFY_TAIL_SENTINEL",
+		"Verify summary: outcome=passed (iterations 1/3)",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestWriteGateEvidence_UnavailableReason_RendersNamedAbsence pins the
+// named-absence block: with NO verify runs and NO summary but a backend-side
+// machine reason, the reviewer is told the evidence is missing, told the
+// machine reason, told the tree is UNVERIFIED, and told plainly that this is a
+// transport gap it must NOT raise as an agent defect (the #3042 re-raise loop).
+func TestWriteGateEvidence_UnavailableReason_RendersNamedAbsence(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyEvidenceUnavailableReason: "no_redacted_trace_for_stage",
+	})
+	for _, w := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Machine reason: `no_redacted_trace_for_stage`.",
+		"Compile/test state is UNVERIFIED for this head",
+		"BACKEND/RUNNER-side transport gap, NOT an agent omission",
+		"attached no evidence",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail pins the THIRD
+// verify state (#3042 fix-up pass 2): a round carrying a verify SUMMARY but no
+// per-command run tail.
+//
+// The discrimination this test exists for is the NEGATIVE half. Folding this
+// state into the NOT-ATTACHED block would render "Compile/test state is
+// UNVERIFIED for this head" over a real passing summary — a FALSE statement
+// that teaches the reviewer to distrust genuine evidence, which is a worse
+// defect than the silent omission being fixed. So the summary must render, the
+// note must name only the missing TAIL under its own distinct machine literal,
+// and the UNVERIFIED wording must be ABSENT.
+func TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifySummary:                   &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+		VerifyEvidenceUnavailableReason: "no_verify_run_tail_in_gate_evidence",
+	})
+	for _, w := range []string{
+		"Verify summary: outcome=passed (iterations 1/3)",
+		"Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Machine reason: `no_verify_run_tail_in_gate_evidence`.",
+		"IS committed-tree evidence and STANDS",
+		"BACKEND/RUNNER-side transport gap, NOT an agent omission",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q:\n%s", w, got)
+		}
+	}
+	for _, w := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Compile/test state is UNVERIFIED for this head",
+	} {
+		if strings.Contains(got, w) {
+			t.Errorf("prompt asserts %q over a real verify summary — the two absences must stay apart:\n%s", w, got)
+		}
+	}
+}
+
+// TestWriteGateEvidence_UnavailableReason_SummaryOnlyWithoutReasonStaysSilent is
+// the companion control: with a summary and NO reason set, neither absence block
+// renders, so the new block cannot perturb an existing summary-only prompt
+// (prompt-hash replay stability).
+func TestWriteGateEvidence_UnavailableReason_SummaryOnlyWithoutReasonStaysSilent(t *testing.T) {
+	base := GateEvidence{VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3}}
+	got := implementReviewWithGateEvidence(t, &base)
+	if strings.Contains(got, "NOT ATTACHED TO THIS ROUND") {
+		t.Errorf("an absence block rendered with no reason set:\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_UnavailableReason_SuppressedWhenPopulated is the
+// byte-identity control: a populated verify path renders EXACTLY the same bytes
+// whether or not a reason is also set, so the new block cannot perturb any
+// existing prompt (prompt-hash replay stability).
+func TestWriteGateEvidence_UnavailableReason_SuppressedWhenPopulated(t *testing.T) {
+	populated := GateEvidence{
+		VerifyRuns:    []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+		VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+	}
+	withReason := populated
+	withReason.VerifyEvidenceUnavailableReason = "no_redacted_trace_for_stage"
+
+	base := implementReviewWithGateEvidence(t, &populated)
+	with := implementReviewWithGateEvidence(t, &withReason)
+	if base != with {
+		t.Errorf("a populated verify path must render byte-identically with a reason set;\nbase:\n%s\nwith:\n%s", base, with)
+	}
+	if strings.Contains(with, "NOT ATTACHED TO THIS ROUND") {
+		t.Errorf("the named-absence block must not render alongside real verify runs:\n%s", with)
+	}
+}
+
+// TestWriteGateEvidence_FixupCounterfactuals_RenderPerObserved renders one case
+// per observed literal plus the restored:false row, and pins the
+// authority-framing lines that keep an agent CLAIM distinguishable from the
+// runner's OBSERVED verify tail.
+func TestWriteGateEvidence_FixupCounterfactuals_RenderPerObserved(t *testing.T) {
+	cases := []struct {
+		name string
+		cf   GateFixupCounterfactual
+		want string
+	}{
+		{"red", GateFixupCounterfactual{ControlPath: "a/guard.go", Observed: "red", Restored: true},
+			"- a/guard.go — observed: red, restored: yes"},
+		{"green", GateFixupCounterfactual{ControlPath: "a/guard.go", Observed: "green", Restored: true},
+			"- a/guard.go — observed: green, restored: yes"},
+		{"not_run", GateFixupCounterfactual{ControlPath: "a/guard.go", Observed: "not_run", Restored: true},
+			"- a/guard.go — observed: not_run, restored: yes"},
+		{"restored_false", GateFixupCounterfactual{ControlPath: "a/guard.go", Observed: "red", Restored: false},
+			"- a/guard.go — observed: red, restored: NO"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := implementReviewWithGateEvidence(t, &GateEvidence{
+				FixupCounterfactuals: []GateFixupCounterfactual{tc.cf},
+			})
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("prompt missing %q:\n%s", tc.want, got)
+			}
+			for _, w := range []string{
+				"### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)",
+				"The verify runs above are what the RUNNER MEASURED",
+				"only what the AGENT SAYS IT DID",
+				"`observed: red` does NOT establish that the control discriminates",
+			} {
+				if !strings.Contains(got, w) {
+					t.Errorf("prompt missing authority framing %q:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty: an empty slice
+// keeps the prompt byte-identical to the pre-change render.
+func TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+	})
+	if strings.Contains(got, "Fix-up counterfactual self-report") {
+		t.Errorf("empty counterfactual slice must render nothing:\n%s", got)
+	}
+}
+
+// TestWriteFixupSelfReport_CounterfactualsInstruction pins the agent-facing
+// rules bullet: the array, its four fields, the closed observed enum, the
+// PRESENCE requirement on restored, the drop rule, the cap, and the plain
+// statement that the record text is discarded on the runner.
+func TestWriteFixupSelfReport_CounterfactualsInstruction(t *testing.T) {
+	var b strings.Builder
+	writeFixupSelfReport(&b, Trigger{
+		ImplementRunID:   "11111111-1111-1111-1111-111111111111",
+		ImplementStageID: "22222222-2222-2222-2222-222222222222",
+	})
+	got := b.String()
+	for _, w := range []string{
+		"`counterfactuals` is OPTIONAL",
+		"ONE entry per control this pass ADDED or TIGHTENED",
+		"`control_path` MUST be one of the declared scope.files paths",
+		"MUST be exactly `red`, `green`, or `not_run`",
+		"an absent `restored` is NOT the same claim as `false`",
+		"any entry past the first 20",
+		"`record` TEXT is checked on the runner and then discarded",
+		"\"counterfactuals\":[{\"control_path\"",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up self-report instruction missing %q:\n%s", w, got)
+		}
+	}
+}

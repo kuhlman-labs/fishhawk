@@ -411,6 +411,96 @@ preserved from `#1210` — reporting truthfully, INCLUDING an honest `declined`,
 never fails, re-opens, or re-budgets the pass. Long-form contract:
 `backend/internal/fixupobligation/README.md`.
 
+## Fix-up re-review evidence: two blocks, two authorities (E68.20 / #3042)
+
+Since #2884 every fix-up re-review is dispatched from the `fixup_pushed` push
+report (`maybeBackstopFixupReReview`), whose call site had no bundle in hand and
+passed `gateEvidence = nil` — so the implement reviewers received NO "Gate
+evidence" verify section at all and correctly, but unresolvably, re-raised the
+same unverifiable-evidence concern against each new head. `writeGateEvidence`
+now carries two blocks for that path, and they are deliberately framed under
+DIFFERENT authority:
+
+**Half A — runner OBSERVATION.** The backend loads the fix-up stage's own
+uploaded redacted bundle (`Server.resolveStageGateEvidence`) and renders the
+committed-tree verify runs + summary exactly as the trace-time path does. When it
+cannot be loaded, `GateEvidence.VerifyEvidenceUnavailableReason` carries a
+BACKEND-side machine literal (never agent text) — `trace_store_not_wired`,
+`trace_list_failed`, `no_redacted_trace_for_stage`, `trace_fetch_failed`,
+`trace_read_failed`, `no_gate_evidence_in_trace`, `gate_evidence_parse_failed`,
+`no_verify_runs_in_gate_evidence`, `no_verify_run_tail_in_gate_evidence` — and
+the render states the absence EXPLICITLY: the tree is UNVERIFIED for this
+head, AND the absence is a backend/runner-side transport gap that the reviewer
+MUST NOT raise as an agent defect. That second line is the point: a silently
+omitted section is what let the concern re-raise every round. The block renders
+ONLY when there is no verify evidence at all AND a reason is set, so every
+populated path stays byte-identical (prompt-hash replay stability), pinned by a
+byte-identity control in `prompt_test.go`.
+
+`no_verify_runs_in_gate_evidence` is the PARTIAL-bundle literal and the reason
+the resolver's second return value means "why the verify tail is unavailable",
+not "the load failed". A gate_evidence payload can parse cleanly and still carry
+no verify tail — a counterfactual-only or scope-facts-only payload is
+well-formed, and a stage whose verify never ran emits exactly that. Returning an
+EMPTY reason there would leave `VerifyEvidenceUnavailableReason` unset, so the
+named-absence block (gated on a non-empty reason) would not render and the round
+would be back to the silently omitted section. So the resolver returns the
+evidence — its counterfactuals and scope facts are real and must render — WITH
+the literal stamped onto it. Read the pair as: a non-empty reason with a
+**nil** evidence is a LOAD degrade (the caller allocates a reason-only
+`GateEvidence`); a non-empty reason with a **non-nil** evidence is the partial
+case, already stamped, nothing for the caller to allocate.
+
+THREE verify states, not two. The partial case splits, and the split is
+load-bearing rather than cosmetic:
+
+| state | literal | render |
+|---|---|---|
+| verify runs present | (empty) | the runs + summary, unchanged |
+| no run, no summary | `no_verify_runs_in_gate_evidence` | `Verify runs … NOT ATTACHED`, tree **UNVERIFIED** |
+| no run, summary PRESENT | `no_verify_run_tail_in_gate_evidence` | the summary, plus `Verify run output tail … NOT ATTACHED` — the summary **STANDS** |
+
+The third row is NOT folded into the second on purpose. The UNVERIFIED block
+asserts that compile/test state is unknown for this head; with a verify summary
+present that statement is FALSE — a summary is real committed-tree evidence,
+weaker than a per-command tail but not nothing — and asserting UNVERIFIED over a
+passing summary would teach the reviewer to distrust a true signal. That
+over-correction would be a worse defect than the silent omission being fixed. So
+the summary-without-tail state carries its own literal and its own narrower
+note, which names only the missing per-command output and says the summary
+stands. The two render blocks are mutually exclusive on `VerifySummary`'s
+nil-ness, so exactly one of the three states renders;
+`TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail` asserts BOTH halves
+— the tail note present AND the UNVERIFIED wording absent — because the negative
+half is the whole reason the state exists separately.
+
+ORDERING is an accepted, named failure mode rather than something the resolver
+verifies. On the normal path the fix-up stage ships its trace BEFORE the push
+report reaches the backend (the #794 forward gate), so the `trace_uploaded`
+audit row and the bundle are both durable by dispatch time. The resolver reads
+the audit ledger at ONE instant and cannot observe that ordering; a
+`trace_uploaded` row landing LATE degrades to `no_redacted_trace_for_stage` and
+the reviewer gets the named-absence block instead of the verify tail. That is
+honest-about-what-it-lacks, which is the whole point of the named literal.
+
+**Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
+`{control_path, observed, restored}` triples the runner validated out of the
+fix-up self-report sidecar (`runner/README.md` for the fail-closed drop rules).
+The render says plainly that the verify runs above are what the RUNNER MEASURED
+while this block is only what the AGENT SAYS IT DID: the runner never witnessed
+the mutation and cannot tell a real counterfactual from a no-op one, so
+`observed: red` does NOT establish that the control discriminates. There is
+deliberately no test name and no narrative on the wire — the agent's `record`
+text is validated on the runner and discarded before the upload boundary (#2737's
+rationale), so the block carries nothing the operator's declared scope does not
+already name. `green`, `not_run` and `restored: NO` are each named as defect
+signals for the reviewer to weigh against the diff. ADVISORY: it never failed,
+re-opened or re-budgeted the pass.
+
+`writeFixupSelfReport` gains the matching agent-facing `counterfactuals` rules
+bullet, including that an absent `restored` is NOT the same claim as `false` and
+that the `record` text is discarded on the runner.
+
 ## Injected repo-authored documents (E55.1 / #2242)
 
 `Trigger.InjectedDocuments` carries repo-authored governance documents the

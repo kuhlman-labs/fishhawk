@@ -298,6 +298,28 @@ Any reason → `ErrFixupWorkStranded` (category B), the failure path reports `{f
 
 The unit contract for the helpers is pinned in `cmd/fishhawk-runner/fixupland_test.go` (one case per probe mode + error identity) and `internal/gitops/commit_test.go` (`RemoteBranchTipURL`'s absent-vs-failure discrimination); the end-to-end run() contract in `cmd/fishhawk-runner/main_test.go` (M1–M7, one per named failure mode, each with a deletion counterfactual).
 
+### Fix-up counterfactual self-report (E68.20 / #3042)
+
+The fix-up self-report sidecar (`/tmp/fishhawk-fixup-selfreport-<run>-<stage>.json`, `#1210`) carries an OPTIONAL `counterfactuals` array beside `verify_status` and `obligations`: one entry per control the pass ADDED or TIGHTENED and then counterfactually tested. Each entry is `{"control_path": "...", "observed": "red|green|not_run", "restored": true, "record": "<what you mutated and saw>"}`.
+
+`validateFixupCounterfactuals` (main.go) validates it fail-closed PER ENTRY, DROPPING an entry with a named `fixup_counterfactual_dropped` log event — never widening the whole-sidecar rules (malformed JSON / a stale run/stage id still discards everything, including the counterfactuals, before per-entry validation runs):
+
+| Drop reason | Rule |
+|---|---|
+| `path_not_in_scope` | `control_path` is not a member of the stage's declared `scope.files` set |
+| `unknown_observed` | `observed` is not exactly `red`, `green` or `not_run` |
+| `missing_restored` | the `restored` key is ABSENT from the entry |
+| `missing_record` | `record` is empty or whitespace |
+| `over_cap` | the cap's worth of entries has already been retained; this one is past `maxFixupCounterfactuals` (20) |
+
+`over_cap` is checked FIRST in the loop, ahead of the per-entry rules. Once the cap's worth of entries has been retained nothing further CAN be retained, so the cap is the reason the entry is dropped and diagnosing its (now irrelevant) malformation would misattribute it. Cap-first also makes the tally deterministic — every entry the loop sees after the retained set fills logs exactly `over_cap` — which is what lets `TestValidateFixupCounterfactuals_Cap` assert an exact drop COUNT and the FIRST-N-in-sidecar-order retention, rather than a length-only check a validator retaining an arbitrary twenty would pass. Retention identity comes from a UNIQUE `control_path` per fixture entry (`cfScopeN`), NOT from the `{observed, restored}` enums: those have only six combinations and cycle every six entries, so an enum-only marker is byte-identical under a window shifted by six, twelve or eighteen and the test would catch only *some* permutations. The path is the one per-entry field with an open (scope-bounded) value space, so with one path per entry the retained sequence is uniquely determined position by position and ANY permutation or shift reddens; the enums still cycle alongside, but nothing rests on them. `TestValidateFixupCounterfactuals_CapWinsOverMalformation` pins the ordering itself.
+
+`restored` is decoded into a `*bool`, and that is load-bearing. A plain `bool` decodes an OMITTED key to `false` and RETAINS the entry, rendering `restored:false` — indistinguishable from an agent that ran the mutation and honestly reported it did NOT restore the control. The pointer keeps the two claims distinct: absent is DROPPED, an explicit `false` is RETAINED and rendered.
+
+**The `record` text NEVER crosses the upload boundary.** It is REQUIRED (it forces the agent to have actually run the mutation) and then DISCARDED on the runner, verbatim to #2737's rationale: the fix-up agent runs arbitrary repository commands, so it controls every byte of that text, and carrying it over the trace bundle into a reviewer prompt would be an egress path for repository content that never appears in the committed diff. What crosses is the `{control_path, observed, restored}` triple — a path the operator already declared, a closed enum, and a bool. `control_path` is constrained to the declared scope set for the same reason, not merely checked non-empty. The drop log echoes only sanitized values (`<not-in-scope>` / `<invalid>`).
+
+The surviving triples ride the `fixup_counterfactuals` trace event into `gate_evidence` (`gateevidence.go`), and the backend renders them to the implement re-review under explicitly AGENT-CLAIM authority — the runner never witnessed the mutation, so `observed: red` does NOT close the no-op-mutation class. EVIDENCE ONLY: the block never touches `res.OK`, `res.FailureCategory` or budget.
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:

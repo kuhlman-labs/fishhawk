@@ -3445,6 +3445,180 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 	return diff.Patch, renderDiffForReview(diff)
 }
 
+// resolveStageGateEvidence loads the stage's own committed-tree gate evidence
+// out of its newest REDACTED trace bundle (#3042), reusing the exact
+// ListForRunByCategory("trace_uploaded") -> pickRedactedTraceHash ->
+// TraceStore.Get -> bundle.Extract* seam resolveFixupPriorDiff uses.
+//
+// It exists for the fix-up re-review backstop (maybeBackstopFixupReReview),
+// which dispatches from the fixup_pushed PUSH REPORT and therefore has no
+// bundle in hand at its call site. The trace-time hook (#793) — the only other
+// path that extracts gate_evidence — is deliberately SKIPPED for a push_fixup
+// manifest, so before this every fix-up re-review reached the implement
+// reviewers with NO verify tail and no verify summary at all, and they correctly
+// but unresolvably re-raised the same unverifiable-evidence concern against each
+// new head.
+//
+// ORDERING (binding condition 3, resolved EXPLICITLY here rather than left as a
+// pre-seeded test's implicit assumption). The fix-up stage ships its trace
+// BEFORE the push report reaches the backend — that is the #794 forward gate: a
+// push_fixup stage is held in `running` at trace-upload time precisely so the
+// later /pull-request report can drive the terminal transition. So on the normal
+// path the trace_uploaded audit row and the bundle are both durable by the time
+// this runs. This function does NOT verify that ordering and cannot: it reads
+// the audit ledger at one instant. A trace_uploaded row that lands LATE — after
+// the push report — degrades to (nil, "no_redacted_trace_for_stage") and the
+// reviewer gets the named-absence block instead of the verify tail. That is an
+// ACCEPTED, NAMED failure mode: the round is honest about what it does not have
+// rather than silently omitting the section, which is the defect this change
+// closes.
+//
+// The redacted variant is pinned (never the raw one) for the same ADR-029
+// reason resolveFixupPriorDiff documents: the redacted bundle is pre-redacted by
+// the runner and carries only repo-derived gate output, never IssueBody /
+// IssueComments.
+//
+// On a FULL success returns (evidence, ""). Every LOAD degrade returns
+// (nil, reason) with one DISTINCT machine literal per branch —
+// trace_store_not_wired, trace_list_failed, no_redacted_trace_for_stage,
+// trace_fetch_failed, trace_read_failed, no_gate_evidence_in_trace,
+// gate_evidence_parse_failed — so the caller can render an explicit named
+// absence. Every branch logs and returns; this helper NEVER blocks or fails a
+// dispatch.
+//
+// PARTIAL evidence is a THIRD outcome, not a success (#3042 fix-up). A bundle
+// can parse cleanly and yet carry NO verify tail at all — a counterfactual-only
+// or scope-facts-only gate_evidence payload is well-formed, and a stage whose
+// verify never ran emits exactly that. Returning ("") there would leave
+// VerifyEvidenceUnavailableReason empty, so writeGateEvidence's named-absence
+// block (gated on a non-empty reason) would NOT render and the round would be
+// back to the silently-omitted verify section this change exists to end. So
+// when the mapped evidence has no verify RUN this returns a named reason AND
+// stamps that literal onto the returned evidence's
+// VerifyEvidenceUnavailableReason — the evidence is still handed over (its
+// counterfactuals / scope facts are real and must render), but the missing
+// verify tail is NAMED rather than absent. The second return value is therefore
+// "the reason the verify tail is unavailable", not "the load failed": a
+// non-empty reason with a NON-nil evidence is a partial case, with a nil
+// evidence the load-degrade case.
+//
+// The partial case is itself TWO states, kept apart on purpose (#3042 fix-up
+// pass 2) — three verify states in total, not two:
+//
+//   - no run AND no summary -> no_verify_runs_in_gate_evidence. There is no
+//     committed-tree verify evidence of any kind, so writeGateEvidence renders
+//     the NOT-ATTACHED block, which states that compile/test state is
+//     UNVERIFIED for this head.
+//   - no run but a summary IS present -> no_verify_run_tail_in_gate_evidence.
+//     Only the per-command output tail is missing; the summary is REAL
+//     committed-tree evidence (weaker than a tail, but not nothing). Rendering
+//     the UNVERIFIED block over it would assert something FALSE and would teach
+//     the reviewer to distrust a passing summary — a worse defect than the one
+//     being fixed. So this literal is DISTINCT and draws its own short note
+//     that narrows what is missing without impeaching the summary.
+//
+// Both render blocks in writeGateEvidence are mutually exclusive on
+// VerifySummary's nil-ness, so exactly one of the three states renders.
+func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uuid.UUID) (*prompt.GateEvidence, string) {
+	if s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
+		return nil, "trace_store_not_wired"
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "trace_uploaded")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list trace_uploaded audit for stage gate evidence failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, "trace_list_failed"
+	}
+	hash, ok := pickRedactedTraceHash(entries, stageID)
+	if !ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: no redacted trace for stage gate evidence",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return nil, "no_redacted_trace_for_stage"
+	}
+	body, err := s.cfg.TraceStore.Get(ctx, tracestore.BundleRef{
+		RunID:       runID,
+		Variant:     tracestore.VariantRedacted,
+		ContentHash: hash,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get redacted trace bundle for stage gate evidence failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, "trace_fetch_failed"
+	}
+	defer func() { _ = body.Close() }()
+	bundleBytes, err := io.ReadAll(body)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: read redacted trace bundle for stage gate evidence failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, "trace_read_failed"
+	}
+	ev, err := bundle.ExtractGateEvidence(bundleBytes)
+	if err != nil {
+		// ErrNoGateEvidence is the ordinary older-bundle / no-gate-ran case —
+		// INFO, matching the trace handler's silent-degrade posture. Any other
+		// error is a real parse failure and WARNs.
+		if errors.Is(err, bundle.ErrNoGateEvidence) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace carries no gate evidence",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+			return nil, "no_gate_evidence_in_trace"
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: extract gate evidence from redacted trace failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, "gate_evidence_parse_failed"
+	}
+	// The fold record reconciles the review-presentation drift surfaces exactly
+	// as the trace handler does (#1317); a failure subtracts nothing.
+	folded, ferr := bundle.ExtractScopeAmendmentsFolded(bundleBytes)
+	if ferr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: extract scope amendments folded for stage gate evidence failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", ferr.Error()),
+		)
+		folded = nil
+	}
+	out := gateEvidenceForReview(ev, folded)
+	// Partial-bundle paths: the payload parsed fine, but the verify tail is
+	// wholly or partly absent. Name it on the evidence itself so
+	// writeGateEvidence renders the required named absence instead of omitting
+	// the section (see the doc comment). The two partial states are kept APART
+	// deliberately — collapsing them onto one literal would assert
+	// compile/test-state-UNVERIFIED over a real passing summary.
+	if len(out.VerifyRuns) == 0 {
+		if out.VerifySummary == nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries no verify runs",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			)
+			out.VerifyEvidenceUnavailableReason = "no_verify_runs_in_gate_evidence"
+			return out, "no_verify_runs_in_gate_evidence"
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries a verify summary but no run tail",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		out.VerifyEvidenceUnavailableReason = "no_verify_run_tail_in_gate_evidence"
+		return out, "no_verify_run_tail_in_gate_evidence"
+	}
+	return out, ""
+}
+
 // resolveFixupExpectedHeadSHA returns the run's recorded head SHA — the
 // newest head_sha across the run's reported-head ledger entries
 // (lineageLedgerCategories: pull_request_opened / child_pushed /

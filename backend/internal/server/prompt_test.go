@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/google/uuid"
@@ -12093,5 +12094,351 @@ func TestResolveFixupApplyPatches_ObligationConcernWithoutPatchIsIneligible(t *t
 	// one that will be asked to report it.
 	if got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0); len(got) != 1 {
 		t.Errorf("resolveFixupReportObligations = %+v, want the one obligation", got)
+	}
+}
+
+// --- #3042 resolveStageGateEvidence --------------------------------------
+
+// errReadTraceStore is a tracestore.Storage whose Get succeeds but whose body
+// fails on Read — the trace_read_failed branch, which a Get error cannot reach.
+type errReadTraceStore struct{}
+
+func (errReadTraceStore) Put(context.Context, tracestore.BundleRef, io.Reader) error { return nil }
+func (errReadTraceStore) Get(context.Context, tracestore.BundleRef) (io.ReadCloser, error) {
+	return io.NopCloser(iotest.ErrReader(errors.New("read blew up"))), nil
+}
+func (errReadTraceStore) Stat(context.Context, tracestore.BundleRef) (tracestore.Stat, error) {
+	return tracestore.Stat{}, errors.New("errReadTraceStore: Stat not used")
+}
+func (errReadTraceStore) List(context.Context, uuid.UUID) ([]tracestore.BundleRef, error) {
+	return nil, errors.New("errReadTraceStore: List not used")
+}
+
+// makeRedactedGateEvidenceBundle builds a gzipped JSONL trace bundle whose
+// gate_evidence event carries the given raw JSON payload. gateJSON == "" omits
+// the event entirely (the ErrNoGateEvidence case).
+func makeRedactedGateEvidenceBundle(t *testing.T, gateJSON string) []byte {
+	t.Helper()
+	return makeRedactedGateEvidenceBundleWithPolicy(t, gateJSON, "")
+}
+
+// makeRedactedGateEvidenceBundleWithPolicy is makeRedactedGateEvidenceBundle
+// plus an optional policy_event line carrying policyJSON verbatim. It exists to
+// reach resolveStageGateEvidence's ExtractScopeAmendmentsFolded-failure branch,
+// which needs a bundle that parses as a bundle and yields gate_evidence while
+// its policy_event payload is undecodable. policyJSON == "" omits the line, so
+// the delegating caller above stays byte-identical to the pre-change helper.
+func makeRedactedGateEvidenceBundleWithPolicy(t *testing.T, gateJSON, policyJSON string) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata}}
+	if gateJSON != "" {
+		lines = append(lines, line{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: json.RawMessage(gateJSON)})
+	}
+	if policyJSON != "" {
+		lines = append(lines, line{Seq: len(lines) + 1, Kind: bundle.EventKindPolicyEvent, Data: json.RawMessage(policyJSON)})
+	}
+	lines = append(lines, line{Seq: len(lines) + 1, Kind: "trailer", Data: json.RawMessage(`{}`)})
+
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return gz.Bytes()
+}
+
+// TestResolveStageGateEvidence_DegradeReasons is the per-failure-mode table:
+// ONE case per named degrade literal, each asserting a nil evidence AND the
+// exact reason string. A branch that returned the wrong literal — or an empty
+// one, which would silently omit the reviewer's named-absence block — fails here.
+func TestResolveStageGateEvidence_DegradeReasons(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("b", 64)
+	trace := func() *feedbackAuditRepo {
+		return &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}}
+	}
+
+	cases := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "trace_store_not_wired (no TraceStore)",
+			cfg:  Config{Addr: "127.0.0.1:0", AuditRepo: trace()},
+			want: "trace_store_not_wired",
+		},
+		{
+			name: "trace_store_not_wired (no AuditRepo)",
+			cfg:  Config{Addr: "127.0.0.1:0", TraceStore: &priorDiffTraceStore{}},
+			want: "trace_store_not_wired",
+		},
+		{
+			name: "trace_list_failed",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  &feedbackAuditRepo{listErr: errors.New("audit down")},
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")}},
+			want: "trace_list_failed",
+		},
+		{
+			name: "no_redacted_trace_for_stage",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  &feedbackAuditRepo{},
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("must not be called")}},
+			want: "no_redacted_trace_for_stage",
+		},
+		{
+			name: "trace_fetch_failed",
+			cfg: Config{Addr: "127.0.0.1:0",
+				AuditRepo:  trace(),
+				TraceStore: &priorDiffTraceStore{getErr: errors.New("storage down")}},
+			want: "trace_fetch_failed",
+		},
+		{
+			name: "trace_read_failed",
+			cfg:  Config{Addr: "127.0.0.1:0", AuditRepo: trace(), TraceStore: errReadTraceStore{}},
+			want: "trace_read_failed",
+		},
+		{
+			name: "no_gate_evidence_in_trace",
+			cfg: Config{Addr: "127.0.0.1:0", AuditRepo: trace(),
+				TraceStore: &priorDiffTraceStore{body: makeRedactedGateEvidenceBundle(t, "")}},
+			want: "no_gate_evidence_in_trace",
+		},
+		{
+			name: "gate_evidence_parse_failed",
+			cfg: Config{Addr: "127.0.0.1:0", AuditRepo: trace(),
+				TraceStore: &priorDiffTraceStore{body: []byte("not a gzip bundle at all")}},
+			want: "gate_evidence_parse_failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+			if ev != nil {
+				t.Errorf("evidence = %+v, want nil on the %s degrade", ev, tc.want)
+			}
+			if reason != tc.want {
+				t.Errorf("reason = %q, want %q", reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveStageGateEvidence_Success: a stored redacted bundle carrying
+// gate_evidence resolves to a mapped prompt.GateEvidence with an EMPTY reason,
+// so the caller renders the populated section rather than a named absence.
+func TestResolveStageGateEvidence_Success(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	hash := strings.Repeat("c", 64)
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", hash)},
+		}},
+		TraceStore: &priorDiffTraceStore{body: makeRedactedGateEvidenceBundle(t,
+			`{"scope_facts":{"declared_files":2},"verify_runs":[{"command":"scripts/test verify","exit_code":0,`+
+				`"outcome":"passed","output_tail":"RESOLVER_TAIL_SENTINEL"}]}`)},
+	})
+	ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+	if reason != "" {
+		t.Fatalf("reason = %q, want empty on the success path", reason)
+	}
+	if ev == nil || len(ev.VerifyRuns) != 1 || ev.VerifyRuns[0].OutputTail != "RESOLVER_TAIL_SENTINEL" {
+		t.Fatalf("evidence = %+v, want the bundle's verify run", ev)
+	}
+}
+
+// resolverStageGateEvidenceServer wires a Server whose audit ledger carries one
+// redacted trace_uploaded row for (runID, stageID) and whose trace store serves
+// body for it — the shared fixture the partial-evidence and folded-failure cases
+// below both need.
+func resolverStageGateEvidenceServer(t *testing.T, runID, stageID uuid.UUID, body []byte) *Server {
+	t.Helper()
+	return New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeTraceUploadedEntry(t, 1, runID, stageID, "redacted", strings.Repeat("d", 64))},
+		}},
+		TraceStore: &priorDiffTraceStore{body: body},
+	})
+}
+
+// TestResolveStageGateEvidence_ParsedButNoVerifyRuns is the partial-bundle
+// path: a gate_evidence payload that parses CLEANLY but carries no verify RUN
+// tail.
+//
+// Returning ("") there is the defect — writeGateEvidence's named-absence blocks
+// are gated on a NON-EMPTY VerifyEvidenceUnavailableReason, so an empty reason
+// renders NO verify section whatsoever and the round is back to the silent
+// omission this change exists to end.
+//
+// THREE verify states, asserted as three, because collapsing them is itself a
+// defect (#3042 fix-up pass 2):
+//
+//   - no run AND no summary -> no_verify_runs_in_gate_evidence, and the
+//     NOT-ATTACHED block that declares compile/test state UNVERIFIED;
+//   - no run but a summary IS present -> no_verify_run_tail_in_gate_evidence,
+//     the summary RENDERED, a narrower tail-only note, and specifically NOT the
+//     UNVERIFIED wording — asserting UNVERIFIED over a real passing summary
+//     would be false and would teach the reviewer to distrust it;
+//   - a populated run tail -> the empty reason and neither block (covered by
+//     TestResolveStageGateEvidence_FoldedExtractFailureStillReturnsEvidence).
+//
+// The counterfactual-only case additionally asserts the counterfactual ROW
+// still renders. That is the whole point of returning `out` rather than nil on
+// this branch: the non-verify evidence is real and must reach the reviewer. A
+// future change that returned nil here would keep every other assertion in this
+// test green while silently discarding the payload.
+func TestResolveStageGateEvidence_ParsedButNoVerifyRuns(t *testing.T) {
+	const unverifiedBlock = "Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND"
+	const tailOnlyNote = "Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND"
+	for _, tc := range []struct {
+		name       string
+		gateJSON   string
+		wantReason string
+		wantIn     []string
+		wantNotIn  []string
+	}{
+		{
+			name: "counterfactual-only",
+			gateJSON: `{"fixup_counterfactuals":[{"control_path":"backend/internal/server/prompt.go",` +
+				`"observed":"red","restored":true}]}`,
+			wantReason: "no_verify_runs_in_gate_evidence",
+			wantIn: []string{
+				unverifiedBlock,
+				"`no_verify_runs_in_gate_evidence`",
+				// The non-verify half of the payload MUST survive the branch.
+				"- backend/internal/server/prompt.go — observed: red, restored: yes",
+			},
+			wantNotIn: []string{tailOnlyNote},
+		},
+		{
+			name:       "scope-facts-only",
+			gateJSON:   `{"scope_facts":{"declared_files":2}}`,
+			wantReason: "no_verify_runs_in_gate_evidence",
+			wantIn: []string{
+				unverifiedBlock,
+				"`no_verify_runs_in_gate_evidence`",
+				"- declared scope.files: 2",
+			},
+			wantNotIn: []string{tailOnlyNote},
+		},
+		{
+			// The state gpt named: a summary but no per-run tail. It must NOT
+			// take the UNVERIFIED block — the summary is real evidence.
+			name: "summary-only",
+			gateJSON: `{"verify_summary":{"outcome":"passed","iterations":1,"max_iterations":3,` +
+				`"detail":"SUMMARY_ONLY_DETAIL_SENTINEL"}}`,
+			wantReason: "no_verify_run_tail_in_gate_evidence",
+			wantIn: []string{
+				tailOnlyNote,
+				"`no_verify_run_tail_in_gate_evidence`",
+				// The summary itself still renders, verbatim.
+				"Verify summary: outcome=passed (iterations 1/3) — detail: SUMMARY_ONLY_DETAIL_SENTINEL",
+				"IS committed-tree evidence and STANDS",
+			},
+			wantNotIn: []string{
+				// The UNVERIFIED claim must never be asserted over a summary.
+				unverifiedBlock,
+				"Compile/test state is UNVERIFIED for this head",
+				"`no_verify_runs_in_gate_evidence`",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s := resolverStageGateEvidenceServer(t, runID, stageID, makeRedactedGateEvidenceBundle(t, tc.gateJSON))
+			ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+			if ev == nil {
+				t.Fatal("evidence = nil, want the parsed evidence still returned (its non-verify content is real)")
+			}
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+			if ev.VerifyEvidenceUnavailableReason != tc.wantReason {
+				t.Errorf("VerifyEvidenceUnavailableReason = %q, want it STAMPED on the returned evidence as %q — "+
+					"the caller only allocates a reason-carrying evidence when this one is nil",
+					ev.VerifyEvidenceUnavailableReason, tc.wantReason)
+			}
+			// The point of the reason is what the reviewer SEES: render it.
+			out, berr := prompt.Build("implement_review", prompt.Trigger{GateEvidence: ev})
+			if berr != nil {
+				t.Fatal(berr)
+			}
+			for _, want := range tc.wantIn {
+				if !strings.Contains(out, want) {
+					t.Errorf("rendered prompt is missing %q:\n%s", want, out)
+				}
+			}
+			for _, notWant := range tc.wantNotIn {
+				if strings.Contains(out, notWant) {
+					t.Errorf("rendered prompt carries %q, which this state must NOT claim:\n%s", notWant, out)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveStageGateEvidence_FoldedExtractFailureStillReturnsEvidence covers
+// the ExtractScopeAmendmentsFolded-failure branch: the fold record is a
+// review-presentation reconciliation (#1317) and its failure must SUBTRACT
+// nothing — the evidence still comes back, with an EMPTY reason, so the verify
+// tail renders normally. A branch that propagated the fold error as a degrade
+// would strip a perfectly good verify tail off the round.
+func TestResolveStageGateEvidence_FoldedExtractFailureStillReturnsEvidence(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s := resolverStageGateEvidenceServer(t, runID, stageID, makeRedactedGateEvidenceBundleWithPolicy(t,
+		`{"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed",`+
+			`"output_tail":"FOLD_BRANCH_TAIL_SENTINEL"}]}`,
+		// `check` is typed as a string in the payload struct, so a number makes
+		// ExtractScopeAmendmentsFolded fail to unmarshal while the bundle itself
+		// and its gate_evidence event stay perfectly well-formed.
+		`{"check":42}`))
+	// The branch's ONLY observable besides the (unchanged) return values is its
+	// WARN, so capture it: without this the case would pass identically against a
+	// bundle whose fold extract SUCCEEDED, and would not pin the branch at all.
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ev, reason := s.resolveStageGateEvidence(context.Background(), runID, stageID)
+	if !strings.Contains(logBuf.String(), "extract scope amendments folded for stage gate evidence failed") {
+		t.Fatalf("the fold-extract failure branch was not entered — the fixture no longer discriminates; log: %s",
+			logBuf.String())
+	}
+	if reason != "" {
+		t.Fatalf("reason = %q, want EMPTY — a fold-extract failure subtracts nothing", reason)
+	}
+	if ev == nil || len(ev.VerifyRuns) != 1 || ev.VerifyRuns[0].OutputTail != "FOLD_BRANCH_TAIL_SENTINEL" {
+		t.Fatalf("evidence = %+v, want the bundle's verify run to survive the fold-extract failure", ev)
+	}
+	if ev.VerifyEvidenceUnavailableReason != "" {
+		t.Errorf("VerifyEvidenceUnavailableReason = %q, want empty on a populated verify tail",
+			ev.VerifyEvidenceUnavailableReason)
 	}
 }

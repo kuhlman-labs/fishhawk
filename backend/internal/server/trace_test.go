@@ -9462,3 +9462,199 @@ func TestEmitReviewDiffTruncated_NilAuditRepo_NoPanic(t *testing.T) {
 		reviewDiffTruncation{Reason: "runner_patch_cap", OmittedFiles: []string{"a.go (no hunks shown)"}}, 0, false)
 	// Reaching here without a panic is the assertion.
 }
+
+// --- #3042 fix-up re-review gate evidence --------------------------------
+
+// fixupCounterfactualsWireFixture is the SHARED literal JSON that pins the
+// runner↔backend gate-evidence wire contract for #3042. Its byte-for-byte twins
+// live in runner/cmd/fishhawk-runner/gateevidence_test.go — where the REAL
+// composeGateEvidence is asserted to EMIT exactly this from the agent's raw
+// self-report JSON, through the real loadFixupSelfReport +
+// validateFixupCounterfactuals chain — and in backend/internal/bundle's decode
+// pin. Here the SAME literal is driven through backend extraction into the
+// RENDERED reviewer prompt, so the two halves join on identical bytes and
+// neither side hand-writes the evidence shape. No import can cross the module
+// seam, so a one-sided json-tag edit fails on the other side.
+const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+
+// buildFixupReReviewBundle builds a gzipped JSONL redacted trace bundle whose
+// gate_evidence event carries a committed-tree verify run + verify summary
+// alongside the shared counterfactual wire fixture — the shape a fix-up stage
+// uploads before its push report reaches the backend (#794 forward gate).
+func buildFixupReReviewBundle(t *testing.T) []byte {
+	t.Helper()
+	gate := `{"scope_facts":{"declared_files":1},` +
+		`"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed",` +
+		`"output_tail":"ok  github.com/example/pkg\nFIXUP_VERIFY_TAIL_SENTINEL"}],` +
+		`"verify_summary":{"outcome":"passed","iterations":2,"max_iterations":3},` +
+		fixupCounterfactualsWireFixture + `}`
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata},
+		{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: json.RawMessage(gate)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return gz.Bytes()
+}
+
+// seedTraceUploaded appends a trace_uploaded audit entry for the stage so
+// pickRedactedTraceHash resolves the seeded bundle.
+func seedTraceUploaded(t *testing.T, au *auditFake, runID, stageID uuid.UUID, hash string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"run_id": runID.String(), "stage_id": stageID.String(),
+		"variant": "redacted", "content_hash": hash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &stageID, Timestamp: time.Now().UTC(),
+		Category: "trace_uploaded", Payload: payload,
+	}); err != nil {
+		t.Fatalf("seed trace_uploaded: %v", err)
+	}
+}
+
+// TestBackstopFixupReReview_GateEvidence_EndToEnd is the #3042 cross-boundary
+// seam test (binding condition 2, backend half). It drives the REAL fix-up
+// re-review dispatch — maybeBackstopFixupReReview -> resolveStageGateEvidence ->
+// pickRedactedTraceHash -> TraceStore.Get -> bundle.ExtractGateEvidence ->
+// gateEvidenceForReview -> runImplementReviews -> the rendered reviewer prompt —
+// over a stored bundle carrying the runner's verify tail AND the SHARED
+// counterfactual wire fixture, and asserts BOTH reach the prompt the implement
+// reviewer is actually handed. The runner half (self-report JSON -> validation ->
+// event -> the real composeGateEvidence -> that same literal) is pinned in
+// runner/cmd/fishhawk-runner/gateevidence_test.go, so together the chain spans
+// every seam. A drift in any json tag or mapping breaks one half or the other.
+func TestBackstopFixupReReview_GateEvidence_EndToEnd(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	hash := strings.Repeat("d", 64)
+	s.cfg.TraceStore = &priorDiffTraceStore{body: buildFixupReReviewBundle(t)}
+	seedTraceUploaded(t, au, runRow.ID, implStage.ID, hash)
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invocations = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, w := range []string{
+		// Half A: the runner's OBSERVED committed-tree verify evidence, which
+		// this dispatch previously never carried at all.
+		"Verify runs (committed-tree gate):",
+		"- command: scripts/test verify",
+		"FIXUP_VERIFY_TAIL_SENTINEL",
+		"Verify summary: outcome=passed (iterations 2/3)",
+		// Half B: the agent's CLAIMED counterfactual rows, under their own
+		// explicitly weaker authority framing.
+		"### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)",
+		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
+		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
+		"The verify runs above are what the RUNNER MEASURED",
+		"`observed: red` does NOT establish that the control discriminates",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up re-review prompt missing %q:\n%s", w, got)
+		}
+	}
+	// With real evidence attached, the named-absence block must NOT render.
+	if strings.Contains(got, "NOT ATTACHED TO THIS ROUND") {
+		t.Errorf("named-absence block rendered despite a populated bundle:\n%s", got)
+	}
+}
+
+// TestBackstopFixupReReview_NoBundle_RendersNamedAbsence is the degrade twin:
+// with NO trace bundle stored for the stage, the dispatch still carries a
+// gate-evidence section — an EXPLICIT named absence with the machine reason —
+// instead of silently omitting it, and tells the reviewer not to raise the
+// missing evidence as an agent defect (the #3042 re-raise loop).
+func TestBackstopFixupReReview_NoBundle_RendersNamedAbsence(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	// TraceStore wired but no trace_uploaded entry for the stage, so
+	// pickRedactedTraceHash misses and the Get is never reached.
+	s.cfg.TraceStore = &priorDiffTraceStore{getErr: errors.New("must not be called")}
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invocations = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, w := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Machine reason: `no_redacted_trace_for_stage`.",
+		"Compile/test state is UNVERIFIED for this head",
+		"BACKEND/RUNNER-side transport gap, NOT an agent omission",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up re-review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestGateEvidenceForReview_MapsFixupCounterfactuals pins the bundle ->
+// prompt mapper for the counterfactual triple, including the explicit
+// restored:false, and the no-signal default.
+func TestGateEvidenceForReview_MapsFixupCounterfactuals(t *testing.T) {
+	got := gateEvidenceForReview(bundle.GateEvidence{
+		FixupCounterfactuals: []bundle.FixupCounterfactualEvidence{
+			{ControlPath: "a/guard.go", Observed: "red", Restored: true},
+			{ControlPath: "b/guard.go", Observed: "green", Restored: false},
+		},
+	}, nil)
+	want := []prompt.GateFixupCounterfactual{
+		{ControlPath: "a/guard.go", Observed: "red", Restored: true},
+		{ControlPath: "b/guard.go", Observed: "green", Restored: false},
+	}
+	if len(got.FixupCounterfactuals) != len(want) {
+		t.Fatalf("FixupCounterfactuals = %+v, want %+v", got.FixupCounterfactuals, want)
+	}
+	for i := range want {
+		if got.FixupCounterfactuals[i] != want[i] {
+			t.Errorf("FixupCounterfactuals[%d] = %+v, want %+v", i, got.FixupCounterfactuals[i], want[i])
+		}
+	}
+	if none := gateEvidenceForReview(bundle.GateEvidence{}, nil); none.FixupCounterfactuals != nil {
+		t.Errorf("FixupCounterfactuals = %+v, want nil for a bundle without the signal", none.FixupCounterfactuals)
+	}
+}

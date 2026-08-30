@@ -158,7 +158,14 @@ under `mode: auto` and under a whole-report approval alike. What you still have 
 than failing the run. Plans have omitted this four runs running (#2845).
 
 **A fix-up pass cannot rewrite the PR body.** It is composed once at PR-open. Route
-attestations to the fix-up self-report sidecar instead.
+attestations to the fix-up self-report sidecar instead — and since E68.20 / #3042 the
+sidecar REACHES the reviewers. The committed-tree verify tail is attached automatically
+from the fix-up stage's OWN uploaded bundle (or the round names the machine reason it
+could not be, so "no evidence attached" is never again an unresolvable agent-shaped
+concern), and counterfactual results ride the sidecar's `counterfactuals` array as
+`{control_path, observed, restored}` triples. Both the record narrative and the test name
+stay on the runner: only the triple crosses the upload boundary, and the reviewer is told
+plainly that it is an agent CLAIM, not a runner observation.
 
 ## 8. Open follow-ups
 

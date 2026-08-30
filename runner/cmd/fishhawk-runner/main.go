@@ -2163,7 +2163,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// NEVER touches res.OK / res.FailureCategory / budget (that would reintroduce
 	// the #1150 budget-wedge family).
 	if stageType == "implement" && cfg.fixup {
-		selfReport := loadFixupSelfReport(cfg, logSink)
+		selfReport := loadFixupSelfReport(cfg, scopePaths(cfg.scopeFiles), logSink)
 		claimed := selfReport.verifyStatus
 		actual := terminalVerifyOutcome(res.Events)
 		if fixupSelfReportDiverges(claimed, actual) {
@@ -2176,6 +2176,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// NEVER touches res.OK / res.FailureCategory / budget.
 		if len(selfReport.obligations) > 0 {
 			res.Events = append(res.Events, fixupReportingObligationsEvent(cfg, selfReport.obligations))
+		}
+		// Counterfactual self-reports (#3042): carry the surviving
+		// {control_path, observed, restored} triples so the implement re-review
+		// can weigh the agent's counterfactual CLAIM beside the runner's
+		// OBSERVED verify tail. EVIDENCE ONLY, same as the two siblings above —
+		// this block NEVER touches res.OK / res.FailureCategory / budget.
+		if len(selfReport.counterfactuals) > 0 {
+			res.Events = append(res.Events, fixupCounterfactualsEvent(cfg, selfReport.counterfactuals))
 		}
 	}
 
@@ -8815,6 +8823,28 @@ type fixupSelfReport struct {
 	// Obligations is the OPTIONAL per-obligation report array (#2737): one
 	// entry per routed REPORTING obligation the fix-up prompt named by id.
 	Obligations []fixupObligationReport `json:"obligations"`
+	// Counterfactuals is the OPTIONAL counterfactual report array (#3042): one
+	// entry per control the pass added or tightened and then counterfactually
+	// tested (delete the control, re-run the guarding test, restore).
+	Counterfactuals []fixupCounterfactualReport `json:"counterfactuals"`
+}
+
+// fixupCounterfactualReport is one agent entry in the sidecar's
+// `counterfactuals` array (#3042): the declared-scope path of the control, the
+// outcome the agent claims it observed, whether it restored the control, and
+// the required narrative of what it mutated and saw.
+//
+// Restored is a *bool, NOT a bool, and that is load-bearing: a plain bool
+// decodes an OMITTED `restored` key to false and RETAINS the entry, rendering
+// `restored:false` — indistinguishable from an agent that ran the mutation and
+// honestly reported it did not restore the control. The pointer keeps
+// absent/false distinguishable so validateFixupCounterfactuals can DROP the
+// absent case (missing_restored) while RETAINING the honest false.
+type fixupCounterfactualReport struct {
+	ControlPath string `json:"control_path"`
+	Observed    string `json:"observed"`
+	Restored    *bool  `json:"restored"`
+	Record      string `json:"record"`
 }
 
 // fixupObligationReport is one agent entry in the sidecar's `obligations`
@@ -8833,8 +8863,9 @@ type fixupObligationReport struct {
 // survived fail-closed validation, already reduced to the transmissible
 // {id, status} shape.
 type fixupSelfReportResult struct {
-	verifyStatus string
-	obligations  []fixupReportingObligationEvidence
+	verifyStatus    string
+	obligations     []fixupReportingObligationEvidence
+	counterfactuals []fixupCounterfactualEvidence
 }
 
 // maxFixupObligationIDDigits bounds the numeric suffix a valid obligation id may
@@ -8951,6 +8982,123 @@ func validateFixupObligationReports(cfg config, in []fixupObligationReport, logS
 	return out
 }
 
+// maxFixupCounterfactuals bounds the retained counterfactual set (#3042). A
+// fix-up pass adds a handful of controls at most, so twenty is far above any
+// real set while keeping a pathological sidecar from growing the reviewer
+// prompt without bound. Entries past the cap are DROPPED with a named log
+// reason, never silently absorbed.
+const maxFixupCounterfactuals = 20
+
+// safeFixupCounterfactualObserved returns observed when it is one of the three
+// literals the sidecar may carry and "<invalid>" otherwise, so a drop log never
+// echoes an arbitrary agent-authored string back into the runner log — the same
+// reason safeFixupObligationStatus exists.
+func safeFixupCounterfactualObserved(observed string) string {
+	switch observed {
+	case "red", "green", "not_run":
+		return observed
+	}
+	return "<invalid>"
+}
+
+// safeFixupCounterfactualPath returns path when it is a member of the declared
+// scope set and "<not-in-scope>" otherwise. The path is AGENT-authored, so an
+// unconstrained echo into the runner log would be the same free-text channel
+// the record text is discarded to close; a member of the declared set names
+// nothing the operator did not already declare.
+func safeFixupCounterfactualPath(path string, scope map[string]struct{}) string {
+	if _, ok := scope[path]; ok {
+		return path
+	}
+	return "<not-in-scope>"
+}
+
+// validateFixupCounterfactuals applies the fail-closed PER-ENTRY rules to the
+// sidecar's `counterfactuals` array (#3042). An entry is DROPPED — with a named
+// fixup_counterfactual_dropped log event carrying only sanitized values — when:
+//
+//   - control_path is not a member of the stage's declared scope.files set
+//     (path_not_in_scope): the path is the only agent-authored string that
+//     crosses the upload boundary, so it is constrained to a set the operator
+//     already declared rather than merely checked non-empty;
+//   - observed is not exactly one of red | green | not_run (unknown_observed);
+//   - restored is ABSENT (missing_restored): an omitted key would decode to
+//     false and render as an honest "did not restore" claim, which is a
+//     DIFFERENT statement from "said nothing" — see fixupCounterfactualReport;
+//   - record is empty/whitespace (missing_record): the narrative is required
+//     because it forces the agent to have actually run the mutation.
+//
+// Entries beyond maxFixupCounterfactuals are dropped as over_cap. That check is
+// deliberately the FIRST rule in the loop, ahead of the per-entry validity
+// rules: once the cap's worth of entries has been retained NOTHING further can
+// be retained, so the cap IS the reason the entry is dropped and diagnosing its
+// (irrelevant) malformation instead would misattribute the drop. Ordering the
+// cap first also makes the drop tally deterministic — every entry the loop sees
+// after `out` fills logs exactly `over_cap` — which is what lets the cap test
+// assert an exact over_cap COUNT rather than mere presence.
+//
+// The `record` TEXT is required but NOT retained, verbatim to #2737's
+// rationale: the fix-up agent runs arbitrary repository commands, so it
+// controls every byte of that text, and carrying it over the trace bundle into
+// the reviewer's prompt would be an egress path for repository content that
+// never appears in the committed diff. What crosses the boundary is the
+// scope-member path, the closed observed enum, and the restored bool.
+//
+// Dropping is the SAFE direction: a dropped entry simply is not shown to the
+// reviewer, whereas admitting a malformed one would present an unvalidated
+// claim under the same framing as a validated one.
+//
+// These rules NEVER widen the existing whole-sidecar rules: malformed JSON, a
+// run/stage id mismatch, and an unknown verify_status keep today's exact
+// behavior and logs, and are handled by the caller before this runs.
+func validateFixupCounterfactuals(cfg config, in []fixupCounterfactualReport, scope []string, logSink io.Writer) []fixupCounterfactualEvidence {
+	scopeSet := make(map[string]struct{}, len(scope))
+	for _, p := range scope {
+		scopeSet[p] = struct{}{}
+	}
+	var out []fixupCounterfactualEvidence
+	for _, e := range in {
+		drop := func(reason string) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_counterfactual_dropped","run_id":%q,"stage_id":%q,"control_path":%q,"observed":%q,"reason":%q}`+"\n",
+				cfg.runID, cfg.stageID,
+				safeFixupCounterfactualPath(e.ControlPath, scopeSet),
+				safeFixupCounterfactualObserved(e.Observed), reason)
+		}
+		if len(out) >= maxFixupCounterfactuals {
+			drop("over_cap")
+			continue
+		}
+		if _, ok := scopeSet[e.ControlPath]; !ok {
+			drop("path_not_in_scope")
+			continue
+		}
+		switch e.Observed {
+		case "red", "green", "not_run":
+		default:
+			drop("unknown_observed")
+			continue
+		}
+		if e.Restored == nil {
+			drop("missing_restored")
+			continue
+		}
+		if strings.TrimSpace(e.Record) == "" {
+			drop("missing_record")
+			continue
+		}
+		// Only the scope-member path, the observed literal and the restored
+		// bool are retained; the agent-authored record text is deliberately
+		// dropped on the floor here.
+		out = append(out, fixupCounterfactualEvidence{
+			ControlPath: e.ControlPath,
+			Observed:    e.Observed,
+			Restored:    *e.Restored,
+		})
+	}
+	return out
+}
+
 // sweepStaleFixupSelfReport deletes any leftover fix-up self-report sidecar at
 // this run/stage's keyed path before the agent is invoked (#1210) — the
 // pre-invoke freshness defense mirroring sweepStaleScopeJustification. Best-
@@ -8989,7 +9137,7 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 //
 // Returns the validated claimed verify status ("passed" | "failed", or "") plus
 // the surviving obligation reports.
-func loadFixupSelfReport(cfg config, logSink io.Writer) fixupSelfReportResult {
+func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSelfReportResult {
 	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -9024,6 +9172,7 @@ func loadFixupSelfReport(cfg config, logSink io.Writer) fixupSelfReportResult {
 		out.verifyStatus = doc.VerifyStatus
 	}
 	out.obligations = validateFixupObligationReports(cfg, doc.Obligations, logSink)
+	out.counterfactuals = validateFixupCounterfactuals(cfg, doc.Counterfactuals, scope, logSink)
 	return out
 }
 
@@ -9378,6 +9527,27 @@ func fixupReportingObligationsEvent(cfg config, entries []fixupReportingObligati
 			"run_id":      cfg.runID,
 			"stage_id":    cfg.stageID,
 			"obligations": entries,
+		}),
+	}
+}
+
+// fixupCounterfactualsEvent carries the VALIDATED counterfactual self-reports
+// (#3042) into the trace bundle so composeGateEvidence folds them into
+// gate_evidence for the implement re-review's prompt.
+//
+// Each entry is {control_path, observed, restored} and NOTHING else, matching
+// the backend's bundle.FixupCounterfactualEvidence mirror. The agent's `record`
+// narrative is validated on the runner and discarded there
+// (validateFixupCounterfactuals) rather than transmitted: it is agent-controlled
+// free text that would otherwise reach the reviewer's prompt without ever
+// appearing in the committed diff.
+func fixupCounterfactualsEvent(cfg config, entries []fixupCounterfactualEvidence) agent.Event {
+	return agent.Event{
+		Kind: "fixup_counterfactuals",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":          cfg.runID,
+			"stage_id":        cfg.stageID,
+			"counterfactuals": entries,
 		}),
 	}
 }
