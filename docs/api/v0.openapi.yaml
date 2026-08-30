@@ -12461,6 +12461,15 @@ paths:
               and truncating it would silently drop a condition tail. A
               `reject` comment is EXEMPT from the cap (advisory
               prior-rejection feedback, not a binding condition).
+            - `attestation_required` — E54.53 / #3041: an `approve` of an
+              ADMITTED human-executor review gate (see
+              `review_stage_managed_by_github` under 409) carried an empty
+              or whitespace-only `comment`. The attestation IS what such a
+              gate records — the operator states what they checked on the
+              forge — so the approve is refused before any approval row is
+              recorded. `details` carries `stage_id` and `field: comment`.
+              A `reject` needs no attestation and is unaffected; so are
+              plan-gate and deploy-gate approvals.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -12521,6 +12530,21 @@ paths:
               `resolved_permission`, `member_of`, `member_resolved`, and
               `result` (`rejected`). `agent` / delegated submissions are
               recorded-but-never-counted and skip this check.
+            - `self_decision` — E54.53 / #3041: a run-bound `mcp:run:`
+              agent token targeting an ADMITTED human-executor review gate,
+              even for its OWN run. Such a gate declares `executor: human`
+              with `not: [agent]`, and this refusal is what ENFORCES that
+              declaration at the surface. Checked BEFORE the
+              `write:approvals` scope gate on purpose: a real run token does
+              not carry that scope, so behind it the operator would only
+              ever see `insufficient_scope`, which names nothing about the
+              executor constraint. No approval row is recorded.
+            - `operator_agent_forbidden` — the same refusal for a DELEGATED
+              operator-agent token (`operator-agent/...` subject), keyed on
+              the same predicate that classifies a delegated writer as
+              `actor_kind=agent`. Consequence, stated plainly: an agent
+              cannot approve a human-executor review gate at all — a human
+              must. `details` carries `stage_id` and `subject`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -12547,8 +12571,9 @@ paths:
               approval row and its `approval_submitted` audit entry
               are still recorded — only the advance is refused.
             - `review_stage_managed_by_github` — the target stage is
-              a review stage. ADR-018 / #311 moved review-stage
-              approval onto GitHub: the `pull_request.closed`
+              a review stage that FAILS the human-executor admission
+              conjunction (E54.53 / #3041). ADR-018 / #311 moved review-
+              stage approval onto GitHub: the `pull_request.closed`
               webhook with `merged=true` transitions the stage;
               `pull_request_review.submitted` events feed the audit
               log. Branch protection's required-reviewers is the
@@ -12556,6 +12581,31 @@ paths:
               includes the run's `pull_request_url` when stamped so
               the caller knows where the merge gate lives. Plan-
               stage approvals continue to use this endpoint.
+
+              Since #3041 this is no longer UNCONDITIONAL. A review
+              stage is ADMITTED to this endpoint when all three legs
+              hold: the persisted stage row's `executor_kind` is
+              `human`; the run's workflow declares exactly ONE review
+              stage and that stage declares `executor.human`; and that
+              stage declares NO `pull_request` input (neither
+              `source: pull_request` nor `artifact: pull_request`).
+              That is `backlog_grooming`'s `confirm` gate, which had no
+              approvable surface anywhere and parked its run in
+              `running` forever. Every other review stage, and every
+              resolution failure, keeps this 409 — the fail-closed
+              direction preserves the ADR-018 contract exactly.
+
+              `details.admission_reason` names WHICH leg failed, one of:
+              `not_human_executor_row`, `run_unavailable`,
+              `no_workflow_spec`, `workflow_spec_unparseable`,
+              `workflow_missing`, `no_review_spec_stage`,
+              `multiple_review_spec_stages` (a workflow declaring more
+              than one review stage is refused outright, so admission
+              and the first-match-by-type quorum readers can never
+              resolve different spec stages), `spec_stage_not_human_executor`,
+              or `pull_request_managed`. The code, message and
+              `pull_request_url` detail are byte-identical to pre-#3041
+              for every reason.
             - `agent_review_pending` — ADR-036 / #875: the target is
               a plan stage whose workflow declares `reviewers.agent`
               > 0, a plan review was dispatched

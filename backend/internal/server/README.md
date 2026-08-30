@@ -1214,6 +1214,67 @@ C1's placement is itself part of the control: the call sits in `finishApprovalAd
 
 **Known operational residual.** This repository's Project #7 is USER-owned, and a GitHub App installation token cannot reach a user-owned Projects v2 board — board placement routes onto `FISHHAWKD_PROJECTS_TOKEN` instead ([#1114](https://github.com/kuhlman-labs/fishhawk/issues/1114)). With that token unset, the `unboarded` and `missing_estimate` hygiene defects dispatch and are recorded outcome `failed`, not `applied`. That is correct continue-and-report behaviour, not a defect: label-set and epic-link mutations land first. It doubles as a **kill switch without a deploy** — leave the token unset, or reject the groom gate instead of approving it.
 
+## Human-executor review-gate admission (`review_gate_admission.go`, E54.53 / [#3041](https://github.com/kuhlman-labs/fishhawk/issues/3041))
+
+ADR-018 (#311, #313) moved review-stage approval onto GitHub, and `handleSubmitApproval` implemented that by refusing EVERY `type: review` stage with `409 review_stage_managed_by_github`. That is correct for `feature_change` and `routine_change`, whose review stages ARE the PR merge gate. It is wrong for `backlog_grooming`'s `confirm` stage — `executor: human`, `approvals: {count: 1, not: [agent]}`, no `pull_request` input — which had no approvable surface ANYWHERE, so a grooming run could be started but never finished and parked in `running` indefinitely (run `1499bdb0`).
+
+### The three legs
+
+`resolveReviewGateAdmission` is the ONE predicate every caller reaches. All three legs must hold; the order is fixed so the most specific reason is reported.
+
+| Leg | Condition | Why it is the right key |
+|---|---|---|
+| 1 | the PERSISTED stage row's `executor_kind` is `human` | written at stage-create by `webhook.CreateStagesFromSpec` / `mapExecutor` directly from THAT spec stage's own executor, so this leg needs no resolver and cannot be confused by a sibling stage |
+| 2 | the workflow's SOLE review spec stage declares `executor.human` | a row/spec disagreement is an anomaly, not a tie to break — it fails closed |
+| 3 | that spec stage declares NO `pull_request` input | the discriminator that keeps the ADR-018 merge gate closed. Keyed on the SPEC's declaration, not on a stamped `pull_request_url`: the declaration is a stable property of the workflow, while the URL is mutable run state, so an implement stage that failed before opening a PR would leave a PR-managed gate spuriously admissible |
+
+Leg 3 recognizes BOTH spellings that ship in this repository — `feature_change`'s `artifact: pull_request, from_stage: implement` and `routine_change`'s `source: pull_request, required: true`. Checking only one would admit the other workflow's merge gate; `TestSpecStageDeclaresPullRequestInput` and the two-case `TestSubmitApproval_PullRequestManagedReviewGate_StillRefused` pin each spelling independently (deleting either arm reddens exactly its own case).
+
+### Resolution is all-or-nothing, not ordinal
+
+The deploy side resolves its spec stage by DEPLOY ORDINAL (`deployStageForRunStage`, E23.19 / #2642), because a workflow may legally declare several deploy stages. The schema permits several review stages too — but the sibling review-side readers `fetchApprovalsForStage` and `fetchGateForStage` still resolve FIRST-MATCH-BY-TYPE. An ordinal resolver here would let admission read the k-th review stage while quorum read the first, splitting ONE authorization decision across TWO spec stages.
+
+So `soleReviewSpecStage` refuses a workflow declaring more than one review stage outright (`multiple_review_spec_stages`). No workflow in this repository declares two, so nothing is lost today, and admission and quorum cannot disagree by construction. Genuine multi-review support must converge all three call sites at once — tracked as a follow-up, deliberately NOT done here.
+
+There is no persisted spec-stage identifier to prefer instead: the `stages` table carries `stage_type` / `executor_kind` / `sequence` but no spec stage id or name, and `run.Stage` has no such field.
+
+### Every non-OK reason is today's 409
+
+The fail-closed direction is PRESERVING current behavior — an unresolvable spec can never open a merge gate. `rejectReviewStageApproval` keeps its code, message and `pull_request_url` detail byte-identical and adds `details.admission_reason`, a stable snake_case string, so a refused caller learns WHICH leg failed.
+
+| `admission_reason` | Meaning | Test |
+|---|---|---|
+| `not_human_executor_row` | leg 1: persisted `executor_kind` is not `human` (or a nil stage) | `TestSubmitApproval_ReviewGateAdmission_FailClosedReasons/agent-executor_row` |
+| `run_unavailable` | the run row could not be read (or `RunRepo` is unwired) | `..._FailClosedReasons/unreadable_run_row`, `TestResolveReviewGateAdmission_NilRunRepo_FailsClosed` |
+| `no_workflow_spec` | the run carries no cached spec | `..._FailClosedReasons/empty_cached_spec` |
+| `workflow_spec_unparseable` | the cached spec does not parse | `..._FailClosedReasons/unparseable_cached_spec` |
+| `workflow_missing` | the run's workflow id is absent from the parsed spec | `..._FailClosedReasons/workflow_absent_from_spec` |
+| `no_review_spec_stage` | the workflow declares no review stage | `..._FailClosedReasons/no_review_spec_stage` |
+| `multiple_review_spec_stages` | more than one review stage — refused outright, see above | `..._FailClosedReasons/two_review_spec_stages` |
+| `spec_stage_not_human_executor` | leg 2: human ROW, agent SPEC stage | `..._FailClosedReasons/spec_stage_is_agent-executor` |
+| `pull_request_managed` | leg 3: ADR-018 owns this gate | `TestSubmitApproval_PullRequestManagedReviewGate_StillRefused` (both spellings) |
+
+### The surface enforces `not: [agent]`, and it does so BEFORE the scope check
+
+The gate declares `not: [agent]` today, but that was honored only because no surface existed — which is not the same as enforced. `refuseAgentOnHumanReviewGate` adds the two rungs, mirroring `grooming_dispositions.go`'s G2/G3:
+
+- **`403 self_decision`** — a run-bound `mcp:run:` agent token, even for its OWN run.
+- **`403 operator_agent_forbidden`** — a DELEGATED operator-agent token, keyed on `operatorrole.IsTokenSubject`, the same predicate `actor.go` uses to classify a delegated writer as `actor_kind=agent`. This is a reuse of the existing notion of agent identity, not a new one.
+
+**The placement ahead of `requireWriteScope` is load-bearing, not stylistic.** A real `fhm_` run token does NOT carry `write:approvals`, so behind the scope check the message an operator actually sees in production is `insufficient_scope`, which names nothing about the executor constraint — only an artificially minted token would ever reach the named refusal. `TestSubmitApproval_HumanReviewGate_RunBoundToken_SelfDecision` tables BOTH shapes; moving the call after `requireWriteScope` reddens the scope-less (realistic) case with `code = "insufficient_scope", want self_decision`, verified empirically.
+
+The guard returns immediately for every non-agent identity, so the common operator path pays no extra repository read, and an unresolvable stage or a non-admitted gate falls through to the ordinary 400 / 404 / 409 ladder rather than shadowing it (`TestSubmitApproval_AgentToken_PullRequestManagedGate_Still409`).
+
+**Consequence, stated plainly: after this change an agent still cannot approve the grooming confirm gate. A human must.** That is the gate working as declared, not a gap — which is also why no MCP verb was added: an MCP tool is invoked under exactly the delegated operator-agent identity the second rung refuses, so the verb would be refused by its own handler on every real call. The human path (the exact `curl`) is documented in `docs/GROOMING_RUNBOOK.md` §5.
+
+### The attestation is required on an approve
+
+`requireReviewGateAttestation` refuses an `approve` carrying an empty or whitespace-only comment with `400 attestation_required`. The confirm gate exists because an audit row saying `applied` is not the same claim as the tracker CARRYING the change (walk #2844 / #2847) — the attestation IS what the gate records. The guard is DECISION-SCOPED: a `reject` is itself the judgment and needs no attestation, and plan-gate / deploy-gate approve comments are untouched. `TestRequireReviewGateAttestation_DecisionScoped` and the paired `TestSubmitApproval_HumanReviewGate_RejectNeedsNoAttestation` pin both directions — deleting the decision scoping reddens the reject case, neutralizing the emptiness check reddens the approve cases.
+
+### Downstream is reused unchanged
+
+An admitted approve flows through the EXISTING path with no new state machine: `checkApproverAuthorization` → the #986 duplicate pre-check → quorum/predicates (whose `eligibleApprover` agent floor remains the independent COUNTING control) → `ApprovalRepo.Submit` → `writeApprovalAudit` → `advanceStage` → `Orchestrator.Advance` → `completeRun`. `TestHumanReviewGate_BacklogGrooming_EndToEnd_PgBacked` is the cross-boundary proof: it reads the SHIPPED `docs/spec/examples/workflow-v2-backlog-grooming.yaml`, persists stage rows through `webhook.CreateStagesFromSpec` (so `executor_kind` comes from the production mapping, never hand-set), lets the REAL orchestrator park the human stage at `awaiting_approval`, approves over HTTP, and asserts BOTH the confirm stage succeeded AND the RUN row reached terminal `succeeded` — the state run `1499bdb0` cannot reach today.
+
 ## Per-entry grooming disposition capture (`grooming_dispositions.go`, E54.30 / [#2843](https://github.com/kuhlman-labs/fishhawk/issues/2843))
 
 `POST` / `GET /v0/runs/{run_id}/grooming-dispositions` record and read back an operator's verdict on INDIVIDUAL entries of a run's grooming report, keyed by the entry's stable DERIVED id. Each disposition persists as one chained `grooming_disposition_recorded` audit row.
