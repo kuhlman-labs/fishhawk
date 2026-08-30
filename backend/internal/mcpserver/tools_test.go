@@ -4769,6 +4769,104 @@ func TestGetRunStatus_CompactDefault_HintReadsPreCompactionStoreConcerns(t *test
 	}
 }
 
+// TestGetRunStatus_HintLegacyPeerBlock is approval condition 1's "test all three"
+// source states asserted THROUGH the real getRunStatus (tools.go) call site
+// rather than only via direct reviewActionHintFor calls (#3043). A run row whose
+// concerns block is PRESENT but predates the open_implement scalar (a legacy
+// peer: OpenImplement nil) must decode to the audit fallback under the DISTINCT
+// audit_fallback_legacy_peer marker — never suppress, and never claim the store
+// was unavailable when the read in fact succeeded. The store block carries open
+// implement items, so a plain-int decode of the absent scalar would read as an
+// authoritative zero and wrongly suppress; the pointer is what keeps this legacy
+// state distinguishable. The audit sum (2) is the fallback source.
+func TestGetRunStatus_HintLegacyPeerBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implementStageID := uuid.New()
+	// A legacy concerns block: present, with open items, but NO open_implement
+	// scalar (OpenImplement stays nil). The store read SUCCEEDED.
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running",
+		Concerns: &RunConcerns{
+			Open:          2,
+			ByState:       map[string]int{"raised": 2},
+			OpenImplement: nil, // legacy peer: scalar absent
+			Items: []RunConcernItem{
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "medium", Category: "scope", State: "raised"},
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "low", Category: "style", State: "raised"},
+			},
+		},
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implementStageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+	}
+	// The audit fallback source: two implement-stage concerns in the latest round.
+	seedImplementReviewedAudit(fb, runID, implementStageID, 2)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ReviewActionHint == nil {
+		t.Fatalf("review_action_hint absent; want the audit fallback to fire (a legacy peer must never suppress)")
+	}
+	if out.ReviewActionHint.Source != hintSourceLegacyPeer {
+		t.Errorf("hint.Source = %q, want audit_fallback_legacy_peer", out.ReviewActionHint.Source)
+	}
+	if out.ReviewActionHint.Concerns != 2 {
+		t.Errorf("hint.Concerns = %d, want 2 (the audit fallback count)", out.ReviewActionHint.Concerns)
+	}
+	if !strings.Contains(out.ReviewActionHint.Message, "predates the authoritative implement-stage concern count") {
+		t.Errorf("legacy-peer message should name the missing authoritative count; got %q", out.ReviewActionHint.Message)
+	}
+	if strings.Contains(out.ReviewActionHint.Message, "the concern store was unavailable") {
+		t.Errorf("legacy-peer message must NOT claim the store was unavailable (the read succeeded); got %q", out.ReviewActionHint.Message)
+	}
+}
+
+// TestGetRunStatus_HintStoreUnavailableBlock is the third of condition 1's
+// source states asserted through the real getRunStatus (tools.go) call site
+// (#3043): a run row whose concerns block is ABSENT (nil — the backend could not
+// read the store, or the repo is unwired) must degrade to the audit fallback
+// under the audit_fallback_store_unavailable marker, whose wording DOES say the
+// store was unavailable (true here). This is the same degraded reviewActionHintFor
+// path the run_stage.go call site reaches when its post-run run fetch fails
+// (runView == nil -> storeConcerns nil); run_stage_test.go is outside this
+// change's scope, so the store-unavailable marker is pinned through this call
+// site instead (see the fix-up commit body).
+func TestGetRunStatus_HintStoreUnavailableBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implementStageID := uuid.New()
+	// No concerns block at all: the store was unavailable.
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", Concerns: nil}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implementStageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+	}
+	seedImplementReviewedAudit(fb, runID, implementStageID, 2)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ReviewActionHint == nil {
+		t.Fatalf("review_action_hint absent; want the audit fallback to fire when the store block is absent")
+	}
+	if out.ReviewActionHint.Source != hintSourceStoreUnavailable {
+		t.Errorf("hint.Source = %q, want audit_fallback_store_unavailable", out.ReviewActionHint.Source)
+	}
+	if out.ReviewActionHint.Concerns != 2 {
+		t.Errorf("hint.Concerns = %d, want 2 (the audit fallback count)", out.ReviewActionHint.Concerns)
+	}
+	if !strings.Contains(out.ReviewActionHint.Message, "the concern store was unavailable") {
+		t.Errorf("store-unavailable message should say the store was unavailable; got %q", out.ReviewActionHint.Message)
+	}
+}
+
 // TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload asserts the
 // opt-in restores IssueContext and the recent-audit body/comments.
 func TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload(t *testing.T) {

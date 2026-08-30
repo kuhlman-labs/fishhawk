@@ -207,10 +207,14 @@ func TestReviewActionHintFor(t *testing.T) {
 		// OpenImplement count; nil defaults it to seedConcerns (so existing
 		// budget/ceiling cases keep wantConcerns == seedConcerns via the store).
 		storeOpenImplement *int
-		// storeOpen overrides the store block's Open field; 0 defaults it to
-		// seedConcerns. Used to model a block whose open set includes plan-stage
-		// concerns (Open > OpenImplement).
-		storeOpen int
+		// storeOpen overrides the store block's Open field; nil defaults it to
+		// seedConcerns. A *int (not a plain int) so a case can model a genuinely
+		// zero-open block: a plain 0 is indistinguishable from "unset" and the
+		// harness would silently default it back to seedConcerns, making the
+		// fixture model something other than its comment claims. Used to model a
+		// block whose open set includes plan-stage concerns (Open > OpenImplement)
+		// and the zero-open case (a).
+		storeOpen *int
 		// storeItems sets how many (dummy) items the transported block carries,
 		// independent of OpenImplement — to prove a truncated/partial Items list
 		// never changes the authoritative count.
@@ -526,7 +530,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			status:             completeStatus(),
 			seedConcerns:       2,
 			storeOpenImplement: intPtr(0),
-			storeOpen:          0,
+			storeOpen:          intPtr(0), // genuinely zero-open block, honestly modelled
 			wantNil:            true,
 		},
 		{
@@ -536,7 +540,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			status:             completeStatus(),
 			seedConcerns:       5,
 			storeOpenImplement: intPtr(1),
-			storeOpen:          1,
+			storeOpen:          intPtr(1),
 			wantNil:            false,
 			wantConcerns:       1,
 			wantRemaining:      1,
@@ -551,7 +555,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			name:               "store open holds only a plan concern -> no hint",
 			status:             completeStatus(),
 			seedConcerns:       0,
-			storeOpen:          1,
+			storeOpen:          intPtr(1),
 			storeOpenImplement: intPtr(0),
 			wantNil:            true,
 		},
@@ -580,7 +584,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			name:               "truncated items -> count from authoritative OpenImplement, not item count",
 			status:             completeStatus(),
 			seedConcerns:       0,
-			storeOpen:          5,
+			storeOpen:          intPtr(5),
 			storeOpenImplement: intPtr(3),
 			storeItems:         1,
 			wantNil:            false,
@@ -654,8 +658,8 @@ func TestReviewActionHintFor(t *testing.T) {
 					openImplement = *tc.storeOpenImplement
 				}
 				open := tc.seedConcerns
-				if tc.storeOpen != 0 {
-					open = tc.storeOpen
+				if tc.storeOpen != nil {
+					open = *tc.storeOpen
 				}
 				store = &RunConcerns{
 					Open:          open,
