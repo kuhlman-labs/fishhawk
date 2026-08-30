@@ -3358,11 +3358,14 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 		// implement stage regardless of authority, re-arming the merge gate.
 		//
 		// Gate evidence (#3042): load the fix-up stage's OWN uploaded bundle so
-		// the re-review carries the committed-tree verify tail. On a degrade,
-		// allocate a GateEvidence carrying only the named reason (the
-		// established allocate-if-needed pattern OperatorScopeUndelivered uses)
-		// so the section renders as an EXPLICIT named absence instead of being
-		// omitted.
+		// the re-review carries the committed-tree verify tail. On a LOAD degrade
+		// (nil evidence + a named reason), allocate a GateEvidence carrying only
+		// that reason (the established allocate-if-needed pattern
+		// OperatorScopeUndelivered uses) so the section renders as an EXPLICIT
+		// named absence instead of being omitted. On the PARTIAL path a NON-nil
+		// evidence comes back WITH the reason already stamped onto it — nothing to
+		// allocate, the resolver owns the naming — so the guard below is
+		// deliberately keyed on `gateEvidence == nil`, not on `reason != ""`.
 		gateEvidence, reason := s.resolveStageGateEvidence(reviewCtx, runID, stageID)
 		if gateEvidence == nil && reason != "" {
 			gateEvidence = &prompt.GateEvidence{VerifyEvidenceUnavailableReason: reason}

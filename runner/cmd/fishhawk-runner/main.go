@@ -9028,7 +9028,14 @@ func safeFixupCounterfactualPath(path string, scope map[string]struct{}) string 
 //   - record is empty/whitespace (missing_record): the narrative is required
 //     because it forces the agent to have actually run the mutation.
 //
-// Entries beyond maxFixupCounterfactuals are dropped as over_cap.
+// Entries beyond maxFixupCounterfactuals are dropped as over_cap. That check is
+// deliberately the FIRST rule in the loop, ahead of the per-entry validity
+// rules: once the cap's worth of entries has been retained NOTHING further can
+// be retained, so the cap IS the reason the entry is dropped and diagnosing its
+// (irrelevant) malformation instead would misattribute the drop. Ordering the
+// cap first also makes the drop tally deterministic — every entry the loop sees
+// after `out` fills logs exactly `over_cap` — which is what lets the cap test
+// assert an exact over_cap COUNT rather than mere presence.
 //
 // The `record` TEXT is required but NOT retained, verbatim to #2737's
 // rationale: the fix-up agent runs arbitrary repository commands, so it
@@ -9058,6 +9065,10 @@ func validateFixupCounterfactuals(cfg config, in []fixupCounterfactualReport, sc
 				safeFixupCounterfactualPath(e.ControlPath, scopeSet),
 				safeFixupCounterfactualObserved(e.Observed), reason)
 		}
+		if len(out) >= maxFixupCounterfactuals {
+			drop("over_cap")
+			continue
+		}
 		if _, ok := scopeSet[e.ControlPath]; !ok {
 			drop("path_not_in_scope")
 			continue
@@ -9074,10 +9085,6 @@ func validateFixupCounterfactuals(cfg config, in []fixupCounterfactualReport, sc
 		}
 		if strings.TrimSpace(e.Record) == "" {
 			drop("missing_record")
-			continue
-		}
-		if len(out) >= maxFixupCounterfactuals {
-			drop("over_cap")
 			continue
 		}
 		// Only the scope-member path, the observed literal and the restored

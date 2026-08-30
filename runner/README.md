@@ -310,7 +310,9 @@ The fix-up self-report sidecar (`/tmp/fishhawk-fixup-selfreport-<run>-<stage>.js
 | `unknown_observed` | `observed` is not exactly `red`, `green` or `not_run` |
 | `missing_restored` | the `restored` key is ABSENT from the entry |
 | `missing_record` | `record` is empty or whitespace |
-| `over_cap` | the entry is past `maxFixupCounterfactuals` (20) |
+| `over_cap` | the cap's worth of entries has already been retained; this one is past `maxFixupCounterfactuals` (20) |
+
+`over_cap` is checked FIRST in the loop, ahead of the per-entry rules. Once the cap's worth of entries has been retained nothing further CAN be retained, so the cap is the reason the entry is dropped and diagnosing its (now irrelevant) malformation would misattribute it. Cap-first also makes the tally deterministic — every entry the loop sees after the retained set fills logs exactly `over_cap` — which is what lets `TestValidateFixupCounterfactuals_Cap` assert an exact drop COUNT and the FIRST-N-in-sidecar-order retention (each fixture entry carries a distinguishable `{observed, restored}` pattern drawn from the closed enums), rather than a length-only check a validator retaining an arbitrary twenty would pass. `TestValidateFixupCounterfactuals_CapWinsOverMalformation` pins the ordering itself.
 
 `restored` is decoded into a `*bool`, and that is load-bearing. A plain `bool` decodes an OMITTED key to `false` and RETAINS the entry, rendering `restored:false` — indistinguishable from an agent that ran the mutation and honestly reported it did NOT restore the control. The pointer keeps the two claims distinct: absent is DROPPED, an explicit `false` is RETAINED and rendered.
 

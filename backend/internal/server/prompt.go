@@ -3478,12 +3478,29 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 // the runner and carries only repo-derived gate output, never IssueBody /
 // IssueComments.
 //
-// On success returns (evidence, ""). Every degrade returns (nil, reason) with
-// one DISTINCT machine literal per branch — trace_store_not_wired,
-// trace_list_failed, no_redacted_trace_for_stage, trace_fetch_failed,
-// trace_read_failed, no_gate_evidence_in_trace, gate_evidence_parse_failed — so
-// the caller can render an explicit named absence. Every branch logs and
-// returns; this helper NEVER blocks or fails a dispatch.
+// On a FULL success returns (evidence, ""). Every LOAD degrade returns
+// (nil, reason) with one DISTINCT machine literal per branch —
+// trace_store_not_wired, trace_list_failed, no_redacted_trace_for_stage,
+// trace_fetch_failed, trace_read_failed, no_gate_evidence_in_trace,
+// gate_evidence_parse_failed — so the caller can render an explicit named
+// absence. Every branch logs and returns; this helper NEVER blocks or fails a
+// dispatch.
+//
+// PARTIAL evidence is a THIRD outcome, not a success (#3042 fix-up). A bundle
+// can parse cleanly and yet carry NO verify tail at all — a counterfactual-only
+// or scope-facts-only gate_evidence payload is well-formed, and a stage whose
+// verify never ran emits exactly that. Returning ("") there would leave
+// VerifyEvidenceUnavailableReason empty, so writeGateEvidence's named-absence
+// block (gated on a non-empty reason) would NOT render and the round would be
+// back to the silently-omitted verify section this change exists to end. So
+// when the mapped evidence has neither a verify run nor a verify summary this
+// returns (evidence, "no_verify_runs_in_gate_evidence") AND stamps that literal
+// onto the returned evidence's VerifyEvidenceUnavailableReason — the evidence is
+// still handed over (its counterfactuals / scope facts are real and must
+// render), but the missing verify tail is NAMED rather than absent. The second
+// return value is therefore "the reason the verify tail is unavailable", not
+// "the load failed": a non-empty reason with a NON-nil evidence is the partial
+// case, with a nil evidence the load-degrade case.
 func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uuid.UUID) (*prompt.GateEvidence, string) {
 	if s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
 		return nil, "trace_store_not_wired"
@@ -3558,7 +3575,19 @@ func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uu
 		)
 		folded = nil
 	}
-	return gateEvidenceForReview(ev, folded), ""
+	out := gateEvidenceForReview(ev, folded)
+	// Partial-bundle path: parsed fine, but there is no verify tail to attach.
+	// Name it on the evidence itself so writeGateEvidence renders the required
+	// named absence instead of omitting the section (see the doc comment).
+	if len(out.VerifyRuns) == 0 && out.VerifySummary == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "prompt: redacted trace gate evidence carries no verify runs",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		out.VerifyEvidenceUnavailableReason = "no_verify_runs_in_gate_evidence"
+		return out, "no_verify_runs_in_gate_evidence"
+	}
+	return out, ""
 }
 
 // resolveFixupExpectedHeadSHA returns the run's recorded head SHA — the

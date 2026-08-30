@@ -427,14 +427,38 @@ committed-tree verify runs + summary exactly as the trace-time path does. When i
 cannot be loaded, `GateEvidence.VerifyEvidenceUnavailableReason` carries a
 BACKEND-side machine literal (never agent text) — `trace_store_not_wired`,
 `trace_list_failed`, `no_redacted_trace_for_stage`, `trace_fetch_failed`,
-`trace_read_failed`, `no_gate_evidence_in_trace`, `gate_evidence_parse_failed` —
-and the render states the absence EXPLICITLY: the tree is UNVERIFIED for this
+`trace_read_failed`, `no_gate_evidence_in_trace`, `gate_evidence_parse_failed`,
+`no_verify_runs_in_gate_evidence` — and the render states the absence
+EXPLICITLY: the tree is UNVERIFIED for this
 head, AND the absence is a backend/runner-side transport gap that the reviewer
 MUST NOT raise as an agent defect. That second line is the point: a silently
 omitted section is what let the concern re-raise every round. The block renders
 ONLY when there is no verify evidence at all AND a reason is set, so every
 populated path stays byte-identical (prompt-hash replay stability), pinned by a
 byte-identity control in `prompt_test.go`.
+
+`no_verify_runs_in_gate_evidence` is the PARTIAL-bundle literal and the reason
+the resolver's second return value means "why the verify tail is unavailable",
+not "the load failed". A gate_evidence payload can parse cleanly and still carry
+no verify tail — a counterfactual-only or scope-facts-only payload is
+well-formed, and a stage whose verify never ran emits exactly that. Returning an
+EMPTY reason there would leave `VerifyEvidenceUnavailableReason` unset, so the
+named-absence block (gated on a non-empty reason) would not render and the round
+would be back to the silently omitted section. So the resolver returns the
+evidence — its counterfactuals and scope facts are real and must render — WITH
+the literal stamped onto it. Read the pair as: a non-empty reason with a
+**nil** evidence is a LOAD degrade (the caller allocates a reason-only
+`GateEvidence`); a non-empty reason with a **non-nil** evidence is the partial
+case, already stamped, nothing for the caller to allocate.
+
+ORDERING is an accepted, named failure mode rather than something the resolver
+verifies. On the normal path the fix-up stage ships its trace BEFORE the push
+report reaches the backend (the #794 forward gate), so the `trace_uploaded`
+audit row and the bundle are both durable by dispatch time. The resolver reads
+the audit ledger at ONE instant and cannot observe that ordering; a
+`trace_uploaded` row landing LATE degrades to `no_redacted_trace_for_stage` and
+the reviewer gets the named-absence block instead of the verify tail. That is
+honest-about-what-it-lacks, which is the whole point of the named literal.
 
 **Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
 `{control_path, observed, restored}` triples the runner validated out of the

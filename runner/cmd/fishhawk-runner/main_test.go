@@ -24321,22 +24321,81 @@ func TestValidateFixupCounterfactuals_RecordDiscarded(t *testing.T) {
 // TestValidateFixupCounterfactuals_Cap: entries past maxFixupCounterfactuals are
 // dropped with the named over_cap reason, so a pathological sidecar cannot grow
 // the reviewer prompt without bound.
+//
+// It asserts three things, not one. A cap that merely truncated to the right
+// LENGTH is not enough: a validator that retained an ARBITRARY twenty would pass
+// a len-only check. So each input entry carries a DISTINGUISHABLE pattern drawn
+// from the closed enums the wire shape allows — its {observed, restored} pair
+// cycles over the six combinations of the three observed literals and the two
+// restored values — and the retained set must be the FIRST twenty in SIDECAR
+// ORDER, position by position. And the over_cap drops are counted EXACTLY
+// (len(in)-cap, i.e. maxFixupCounterfactuals+3-maxFixupCounterfactuals = 3)
+// rather than merely looked for, so a validator that logged over_cap once and
+// dropped the rest silently — or logged it for an entry it actually retained —
+// fails here too.
 func TestValidateFixupCounterfactuals_Cap(t *testing.T) {
 	cfg := fixupReportCfg()
-	in := make([]fixupCounterfactualReport, 0, maxFixupCounterfactuals+3)
-	for i := 0; i < maxFixupCounterfactuals+3; i++ {
+	const overBy = 3
+	observed := []string{"red", "green", "not_run"}
+	in := make([]fixupCounterfactualReport, 0, maxFixupCounterfactuals+overBy)
+	for i := 0; i < maxFixupCounterfactuals+overBy; i++ {
 		in = append(in, fixupCounterfactualReport{
-			ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
-			Restored: boolPtr(true), Record: "mutated and saw red",
+			ControlPath: "runner/cmd/fishhawk-runner/main.go",
+			Observed:    observed[i%len(observed)],
+			Restored:    boolPtr(i%2 == 0),
+			Record:      "mutated and saw a result",
 		})
 	}
 	var logSink strings.Builder
 	got := validateFixupCounterfactuals(cfg, in, cfScope(), &logSink)
 	if len(got) != maxFixupCounterfactuals {
-		t.Errorf("retained = %d entries, want the cap of %d", len(got), maxFixupCounterfactuals)
+		t.Fatalf("retained = %d entries, want the cap of %d", len(got), maxFixupCounterfactuals)
 	}
-	if !strings.Contains(logSink.String(), `"reason":"over_cap"`) {
-		t.Errorf("expected over_cap drop reason, got %q", logSink.String())
+	// The retained set must be the FIRST cap entries, in order.
+	for i, e := range got {
+		if e.Observed != in[i].Observed || e.Restored != *in[i].Restored {
+			t.Errorf("retained[%d] = {observed:%q restored:%v}, want the sidecar's entry %d "+
+				"{observed:%q restored:%v} — the cap must keep the FIRST %d in order",
+				i, e.Observed, e.Restored, i, in[i].Observed, *in[i].Restored, maxFixupCounterfactuals)
+		}
+	}
+	if n := strings.Count(logSink.String(), `"reason":"over_cap"`); n != overBy {
+		t.Errorf("over_cap drops = %d, want exactly %d (len(in)=%d - cap=%d); log: %q",
+			n, overBy, len(in), maxFixupCounterfactuals, logSink.String())
+	}
+}
+
+// TestValidateFixupCounterfactuals_CapWinsOverMalformation pins the RULE
+// ORDERING the cap check depends on: an entry seen after the cap is full is
+// dropped as over_cap even when it is ALSO malformed. Diagnosing its (now
+// irrelevant) malformation instead would misattribute the drop and would make
+// the exact over_cap count above depend on the tail entries' well-formedness.
+func TestValidateFixupCounterfactuals_CapWinsOverMalformation(t *testing.T) {
+	cfg := fixupReportCfg()
+	in := make([]fixupCounterfactualReport, 0, maxFixupCounterfactuals+1)
+	for i := 0; i < maxFixupCounterfactuals; i++ {
+		in = append(in, fixupCounterfactualReport{
+			ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red",
+			Restored: boolPtr(true), Record: "mutated and saw red",
+		})
+	}
+	// Past the cap AND malformed on every per-entry rule at once.
+	in = append(in, fixupCounterfactualReport{
+		ControlPath: "some/other/never-declared.go", Observed: "RED",
+		Restored: nil, Record: "  ",
+	})
+	var logSink strings.Builder
+	got := validateFixupCounterfactuals(cfg, in, cfScope(), &logSink)
+	if len(got) != maxFixupCounterfactuals {
+		t.Fatalf("retained = %d entries, want the cap of %d", len(got), maxFixupCounterfactuals)
+	}
+	if n := strings.Count(logSink.String(), `"reason":"over_cap"`); n != 1 {
+		t.Errorf("over_cap drops = %d, want exactly 1; log: %q", n, logSink.String())
+	}
+	for _, other := range []string{"path_not_in_scope", "unknown_observed", "missing_restored", "missing_record"} {
+		if strings.Contains(logSink.String(), `"reason":"`+other+`"`) {
+			t.Errorf("past-cap entry drew %q, want over_cap to win; log: %q", other, logSink.String())
+		}
 	}
 }
 
