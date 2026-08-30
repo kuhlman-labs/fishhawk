@@ -6103,9 +6103,35 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment, issueURL st
 // source-agnostic phrasing (no empty-URL fragment) when issueURL is empty.
 func issueCommentRetrievalPointer(issueURL string) string {
 	if issueURL != "" {
-		return fmt.Sprintf("To read the full comment, open the issue thread at %s. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments.", issueURL)
+		return fmt.Sprintf("To read the full comment, open the issue thread at %s. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments.", sanitizeRetrievalURL(issueURL))
 	}
 	return "To read the full comment, open the issue thread on the forge. The issue BODY is not per-comment capped, so durable handoff content belongs there or split across several comments."
+}
+
+// sanitizeRetrievalURL makes a caller-supplied issue URL structurally safe to
+// interpolate into the elision marker's retrieval pointer (#2946 fix-up). The
+// marker line lands at column 0 INSIDE the <<<BEGIN/END UNTRUSTED ISSUE
+// COMMENTS>>> envelope but OUTSIDE the per-line `| ` quoting of
+// sanitizeUntrustedComment, so an attacker who controls the inline issue_context
+// URL could otherwise embed a newline to open a trusted-looking line at column
+// 0, or an "<<<END UNTRUSTED ISSUE COMMENTS>>>" token to close the quarantine
+// envelope early and inject instructions the planner reads as trusted. A
+// well-formed forge URL carries neither, so the transform strips every ASCII
+// control byte (CR/LF/TAB and the rest of < 0x20 plus DEL — never a UTF-8 lead
+// or continuation byte, which are all >= 0x80) and then runs the shared
+// neutralizeEnvelopeDelimiters, defanging every `<<<`/`>>>` run. Pure and
+// deterministic, so the package's byte-identical-replay invariant holds.
+func sanitizeRetrievalURL(url string) string {
+	var b strings.Builder
+	b.Grow(len(url))
+	for i := 0; i < len(url); i++ {
+		c := url[i]
+		if c < 0x20 || c == 0x7f {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return neutralizeEnvelopeDelimiters(b.String())
 }
 
 // quoteRepo backticks an "owner/name" string for inline display.

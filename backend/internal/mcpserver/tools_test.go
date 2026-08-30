@@ -7899,24 +7899,57 @@ func TestStartRun_OverCapCommentWarning(t *testing.T) {
 		}
 	})
 
-	t.Run("gh_missing_warning_still_additive", func(t *testing.T) {
-		// gh absent → no fetch → inline context still scanned. The gh-missing
-		// warning and the over-cap warning must BOTH surface.
+	t.Run("gh_missing_warning_fires_and_overcap_is_additive", func(t *testing.T) {
+		// The prior version installed withFakeGhMissing but supplied inline
+		// IssueContext, so gh was NEVER consulted (startRun only fetches when
+		// issueNumber > 0 && issueContext == nil) — the gh-missing warning never
+		// fired and the case would have stayed green with that warning deleted.
+		//
+		// In startRun the gh-missing warning (needs a fetch attempt: an issue
+		// number and NO inline context) and the over-cap warning (needs a
+		// non-nil issue context) arise from MUTUALLY EXCLUSIVE branches: a
+		// successful fetch yields context but no gh warning, a failed fetch
+		// yields a gh warning but nil context. They cannot ride one result, so
+		// each branch is exercised where it actually fires.
+
+		// Branch 1 — fetch attempted with gh absent: the gh-missing warning
+		// must surface. This is the assertion the prior case lacked; it reddens
+		// if the "gh CLI not on PATH" warning is removed.
 		_, srv := newFakeBackend(t)
 		r := newResolver(srv, nil)
 		withFakeGhMissing(t)
-		meta, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		meta1, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, Issue: "5",
+		})
+		if err != nil {
+			t.Fatalf("startRun (fetch path): %v", err)
+		}
+		text1 := rejectResultText(t, meta1)
+		if !strings.Contains(text1, "gh CLI not on PATH") {
+			t.Errorf("gh-missing fetch path must surface the gh-missing warning:\n%s", text1)
+		}
+		if strings.Contains(text1, "issue comment(s) exceed the") {
+			t.Errorf("no over-cap warning expected when the failed fetch produced no context:\n%s", text1)
+		}
+
+		// Branch 2 — inline over-cap context (gh irrelevant): the over-cap
+		// warning is APPENDED to the warning slice (overCapCommentWarnings is
+		// additive), so it surfaces on the inline path.
+		_, srv2 := newFakeBackend(t)
+		r2 := newResolver(srv2, nil)
+		withFakeGhMissing(t)
+		meta2, _, err := r2.startRun(context.Background(), nil, StartRunInput{
 			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
 			TriggerSource: string(runpkg.TriggerOnDemand),
 			IssueContext: &IssueContext{Title: "X", Body: "Y", URL: "https://github.com/x/y/issues/1", Number: 1,
 				Comments: []IssueComment{{Author: "alice", Body: over(5), CreatedAt: "2026-05-01T00:00:00Z"}}},
 		})
 		if err != nil {
-			t.Fatalf("startRun: %v", err)
+			t.Fatalf("startRun (inline path): %v", err)
 		}
-		text := rejectResultText(t, meta)
-		if !strings.Contains(text, "1 issue comment(s) exceed the") {
-			t.Errorf("over-cap warning must surface on the inline path:\n%s", text)
+		text2 := rejectResultText(t, meta2)
+		if !strings.Contains(text2, "1 issue comment(s) exceed the") {
+			t.Errorf("over-cap warning must surface on the inline path:\n%s", text2)
 		}
 	})
 }
