@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -340,34 +342,188 @@ func (s *Server) writeLiveValidationFilingFailedMarker(ctx context.Context, runR
 	}
 }
 
+// githubSubIssueParentCap is GitHub's per-parent sub-issue limit: a parent
+// issue can hold at most 100 sub-issues, so the addSubIssue mutation REJECTS the
+// 101st with a GraphQL error (surfaced through doGraphQL as ErrValidation).
+// resolveWalkParentEpic treats an epic already at this cap as unattachable and
+// degrades to the companion arm, so a full epic files a safe self-consistent
+// companion walk rather than an [E<epic>.<n>]-titled walk that could never
+// attach (binding condition 4 — E22 #389, E48 #1940, E67 #2561 are each at the
+// cap today). See backend/internal/server/README.md.
+const githubSubIssueParentCap = 100
+
+// walkEpicTitleRE matches ONLY the bracket-CLOSED [E<n>] epic title form. It is
+// deliberately DISTINCT from workitems.go's epicTitleRE (`^\s*\[E(\d+)`), which
+// stops at the first non-digit and so ACCEPTS a CHILD title like [E48.35] —
+// exactly the mis-parenting #2179 exists to prevent. The `\]` anchor after the
+// digit run rejects a child title, so only a true epic parents the walk.
+var walkEpicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)\]`)
+
+// resolveWalkParentEpic decides whether the live-validation walk should be
+// parented under the triggering child's TRUE epic (#2179) instead of companion-
+// linked to the child. It returns ("#<epic issue>", "<epic digits>",
+// "<child number>", unlock, true) only when EVERY precondition holds — where
+// unlock is a HELD per-epic allocation lock the caller must release AFTER its
+// File (see the TOCTOU note below); otherwise ok=false, unlock is nil, and the
+// caller files the UNCHANGED companion walk. Each fallback mode is an explicit
+// early return:
+//
+//	(1) no GitHub client wired;
+//	(2) a zero credential scope;
+//	(3) IssueParent errors;
+//	(4) IssueParent returns no parent (the triggering issue has no sub-issue parent);
+//	(5) the parent's title is not the bracket-closed [E<n>] epic form (e.g. it is
+//	    another child, [E48.35]) — walkEpicTitleRE, NOT the child-accepting epicTitleRE;
+//	(6) the resolved provider is unregistered (workmgmt.Get errors) or does not
+//	    implement EpicChildrenQuerier, so {n} could never be discovered and the
+//	    epic-arm filing would 422 at renderTitle — both degrade the same safe way;
+//	(7) the epic is resolvable but UNATTACHABLE — it already holds the per-parent
+//	    sub-issue cap, its child count could not be read, or its children carry no
+//	    numbered [E<epic>.<n>] form so {n} cannot be allocated (#2101); degrade to
+//	    companion the same way an unresolvable epic does (binding condition 4).
+//
+// CAP DECISION UNDER THE ALLOCATION LOCK (high/concurrency TOCTOU, #2179 fix-up).
+// The capacity decision and the {n} allocation are BOTH made under the SAME
+// per-epic childNumberLock applyAndFileWorkItem's deriveChildNumberTitleVar
+// takes, and the lock stays HELD (returned to the caller as unlock) across the
+// caller's File. The unlocked pre-count is only a fast reject of an obviously-
+// full epic; the AUTHORITATIVE check is the second read UNDER the lock. Without
+// this a concurrent filer could add the cap-th child between an unlocked count
+// and the File, after which this walk would take the epic arm and fail
+// attachment instead of using the mandatory companion fallback. Because the arm
+// pre-computes {n} here, the caller supplies it explicitly so
+// deriveChildNumberTitleVar short-circuits and does NOT re-take the lock (no
+// deadlock, no second discovery read).
+func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.CredentialScope, owner, name string, childIssue int, conv workmgmt.Conventions) (string, string, string, func(), bool) {
+	if s.cfg.GitHub == nil {
+		return "", "", "", nil, false // (1)
+	}
+	if scope.IsZero() {
+		return "", "", "", nil, false // (2)
+	}
+	parent, err := s.cfg.GitHub.IssueParent(ctx, scope, forge.RepoRef{Owner: owner, Name: name}, childIssue)
+	if err != nil {
+		return "", "", "", nil, false // (3)
+	}
+	if parent == nil {
+		return "", "", "", nil, false // (4)
+	}
+	m := walkEpicTitleRE.FindStringSubmatch(parent.Title)
+	if m == nil {
+		return "", "", "", nil, false // (5) not the bracket-closed epic form
+	}
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		return "", "", "", nil, false // (6) unregistered provider → no querier capability reachable, safe companion degrade
+	}
+	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
+	if !ok {
+		return "", "", "", nil, false // (6) no capability to discover {n}
+	}
+	choreType, ok := conv.Types["chore"]
+	if !ok || !strings.Contains(choreType.TitleFormat, "{n}") {
+		return "", "", "", nil, false // (6) the chore type carries no {n} placeholder to allocate → companion
+	}
+	epicRef := "#" + strconv.Itoa(parent.Number)
+	target := workmgmt.Target{
+		Repo:    workmgmt.Repo{Owner: owner, Name: name},
+		Project: conv.Project,
+		Jira:    conv.Jira,
+		Scope:   scope,
+	}
+
+	// Fast reject: an obviously-full (or unreadable) epic degrades to companion
+	// without taking the allocation lock. This unlocked pre-count is ONLY an
+	// optimization — the AUTHORITATIVE capacity decision is the locked read below.
+	if res, perr := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: epicRef}); perr != nil {
+		return "", "", "", nil, false // (7) child count unreadable → companion
+	} else if len(res.Children) >= githubSubIssueParentCap {
+		return "", "", "", nil, false // (7) full epic → companion (binding condition 4)
+	}
+
+	// AUTHORITATIVE decision under the per-epic allocation lock, HELD across the
+	// caller's File so the capacity decision is effective under the same
+	// synchronization deriveChildNumberTitleVar uses (high/concurrency TOCTOU).
+	unlock := lockChildNumberKey(childNumberLockKey(target, epicRef))
+	res, err := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: epicRef})
+	if err != nil {
+		unlock()
+		return "", "", "", nil, false // (7) child count unreadable under the lock → companion
+	}
+	if len(res.Children) >= githubSubIssueParentCap {
+		// Raced to the cap between the pre-count and here: degrade to companion
+		// rather than take the epic arm to a doomed over-cap attachment.
+		unlock()
+		return "", "", "", nil, false // (7) full epic (binding condition 4)
+	}
+	n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, m[1], res.Children)
+	if !ok {
+		// Children exist but none carry the numbered [E<epic>.<n>] form, so {n}
+		// cannot be allocated (#2101). Degrade to companion — a filed companion is
+		// a better outcome than a filing failure (binding condition 4 spirit).
+		unlock()
+		return "", "", "", nil, false // (7)
+	}
+	return epicRef, m[1], strconv.Itoa(n), unlock, true
+}
+
 // fileLiveValidationChore files the `chore`-type operator-validation walk work
 // item and returns ("#N", true) on a successful filing and ("", false) on any
 // failure (the caller then writes a filing-failure linked marker).
 //
-// COMPANION-LINK, not parent-epic. The originating issue (#2045) asks for the
-// walk filed "under the epic", but this hook only knows the TRIGGERING issue —
-// an E48.35 CHILD, not the E48 epic. Parenting the walk to that child is the
-// wrong hierarchy (a child cannot be the walk's epic — the implement-review
-// concern), and resolving the child's OWN parent-epic issue number would need a
-// sub-issue-PARENT forge query githubclient does not expose (only children-
-// direction ListSubIssues exists) — out of this hook's scope. So the walk
-// COMPANION-LINKS to the triggering issue with an explicit {epic}=<issue>/{n}=1
-// title that always renders ([E<issue>.1], mirroring split_filing.go's
-// best-effort child titles for exactly this triggering-issue-as-parent case). A
-// self-consistent [E<issue>.1] companion (rather than an [E48.1] title parented
-// to #2045) neither mis-parents nor collides with the real epic's child
-// numbering. Filing the walk under the TRUE epic is a follow-up (it needs the
-// sub-issue-parent query above); see backend/internal/server/README.md.
+// TWO ARMS, ONE FILING (#2179). The originating issue (#2045) asks for the walk
+// filed "under the epic"; this hook now resolves the triggering child's TRUE
+// epic via resolveWalkParentEpic (the sub-issue-PARENT query Client.IssueParent
+// added). When that resolves — the parent's title is the bracket-closed [E<n>]
+// epic form, the provider can discover a child number, and the epic is not full
+// — the walk is filed with Relations.ParentEpic = "#<epic>" and TitleVars{epic,n}
+// resolved under a HELD per-epic lock resolveWalkParentEpic returns. The lock is
+// held across applyAndFileWorkItem and released here (defer unlockEpic), so the
+// capacity decision AND the File are serialized against a concurrent filer
+// (high/concurrency TOCTOU, #2179 fix-up). The explicit {n} means
+// deriveChildNumberTitleVar short-circuits and does NOT re-take the lock. On
+// EVERY resolution failure — the fallback modes enumerated on
+// resolveWalkParentEpic (no client, zero scope, IssueParent error, null parent,
+// non-epic parent title, unregistered/no-EpicChildrenQuerier provider, or a
+// resolvable-but-UNATTACHABLE epic: full, unreadable, or non-numbered children)
+// — it falls back to today's exact companion-link filing byte-for-byte: an
+// explicit {epic}=<issue>/{n}=1 title that renders [E<issue>.1] and CompanionTo
+// the triggering issue, which neither mis-parents nor collides with the real
+// epic's child numbering.
 //
-// A SINGLE filing (no epic-parented-then-companion-fallback pair): the earlier
-// two-attempt design opened a same-approval DOUBLE-FILE window — a provider 502
-// AFTER attempt 1's provider.File had already created the issue server-side would
-// still trigger attempt 2, filing a second walk (the intent-marker guard only
-// dedupes ACROSS approvals, not within one). One deterministic filing closes
-// that window: any error (a pre-File 422 or a post-File 502 alike) routes to the
-// filing_failure linked marker, never to a second differently-shaped walk. The
-// explicit {epic}/{n} title vars also mean applyAndFileWorkItem's deriveEpicTitleVar
-// and child-number discovery both short-circuit — no forge round-trip, no lock.
+// The arm is decided ONCE, BEFORE the single applyAndFileWorkItem call, so the
+// single-filing / no-double-file invariant (#2045) is untouched: any error (a
+// pre-File 422 or a post-File 502 alike) routes to the filing_failure linked
+// marker, never to a second differently-shaped walk.
+//
+// RESIDUAL — two distinct cases, stated precisely (high/concurrency, #2179
+// fix-up). The earlier comment here overclaimed; both are corrected:
+//
+//  1. A provider CreateIssue failure (a 502) is the ONLY fatal File step; it
+//     routes to the filing_failure marker (the operator files by hand), NOT to a
+//     companion retry — a second attempt within one approval would reopen the
+//     same-approval double-file window.
+//  2. The CROSS-PROCESS cap window is NARROWED, not closed. Allocating {n} under
+//     the held lock BEFORE File resolves the resolvable-but-unattachable cases
+//     (full, unreadable, non-numbered children) to companion WITHIN THIS DAEMON —
+//     so the cap decision no longer fails at file time for filers THIS process
+//     serializes. It does NOT close the window against writers this process
+//     cannot see (another fishhawkd instance, a human adding a sub-issue in the
+//     GitHub UI, the grooming apply hook) reaching the cap between our locked read
+//     and our File. In that window applyAndFileWorkItem's File still CREATES the
+//     [E<epic>.<n>] issue, and the epic attach (Provider.File's linkEpic /
+//     AddSubIssue) is NON-fatal: GitHub rejects the 101st addSubIssue as
+//     ErrValidation, captured as created.EpicLinkError (a WARN, not a File error).
+//     The outcome is a filed-but-UNPARENTED walk — NOT a filing_failure and NOT a
+//     companion, so binding condition 4's companion-degrade is not honored in this
+//     residual window. Closing it needs create-then-attach as SEPARATE
+//     workmgmt.Provider steps (so a cap refusal degrades to a re-LINK, not a
+//     re-FILE that would violate the #2045 single-filing invariant); that is a
+//     provider-seam change out of #2179's scope, and is DECLINED here rather than
+//     silently substituting the operator-pre-rejected lock-tighter-only design.
+//     A filed unparented walk is still a better outcome than a hook that errors,
+//     and the residual is rare and visible via the EpicLinkError WARN. See
+//     backend/internal/server/README.md.
 func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (string, bool) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
@@ -391,16 +547,45 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 	parentRef := "#" + strconv.Itoa(parentIssue)
 	summary := "Operator live-validation walk for " + parentRef
 
-	req := workmgmt.FilingRequest{
-		Type:      "chore",
-		Summary:   summary,
-		Body:      liveValidationWalkBody(parentRef, crits, true),
-		Labels:    []string{liveValidationWalkArea},
-		TitleVars: map[string]string{"epic": strconv.Itoa(parentIssue), "n": "1"},
-		Relations: workmgmt.Relations{
-			CompanionTo:  []string{parentRef},
-			EvidenceRuns: []string{runRow.ID.String()},
-		},
+	// Decide the arm ONCE, before the single File call below. On the epic arm
+	// resolveWalkParentEpic returns the pre-computed child number AND a HELD
+	// per-epic allocation lock (unlockEpic); hold it across applyAndFileWorkItem
+	// so the capacity decision and the File are serialized against a concurrent
+	// filer, then release it (high/concurrency TOCTOU, #2179 fix-up).
+	epicRef, epicVar, epicN, unlockEpic, epicArm := s.resolveWalkParentEpic(ctx, target.Scope, owner, name, parentIssue, conv)
+	if epicArm {
+		defer unlockEpic()
+	}
+
+	var req workmgmt.FilingRequest
+	if epicArm {
+		// Epic arm: parent under the TRUE epic with the {n} allocated under the
+		// held lock. Passing {n} EXPLICITLY makes deriveChildNumberTitleVar
+		// short-circuit so it does not re-take the per-epic lock (no deadlock).
+		req = workmgmt.FilingRequest{
+			Type:      "chore",
+			Summary:   summary,
+			Body:      liveValidationWalkBody(parentRef, epicRef, crits, false),
+			Labels:    []string{liveValidationWalkArea},
+			TitleVars: map[string]string{"epic": epicVar, "n": epicN},
+			Relations: workmgmt.Relations{
+				ParentEpic:   epicRef,
+				EvidenceRuns: []string{runRow.ID.String()},
+			},
+		}
+	} else {
+		// Companion arm: the pre-#2179 filing, unchanged byte-for-byte.
+		req = workmgmt.FilingRequest{
+			Type:      "chore",
+			Summary:   summary,
+			Body:      liveValidationWalkBody(parentRef, "", crits, true),
+			Labels:    []string{liveValidationWalkArea},
+			TitleVars: map[string]string{"epic": strconv.Itoa(parentIssue), "n": "1"},
+			Relations: workmgmt.Relations{
+				CompanionTo:  []string{parentRef},
+				EvidenceRuns: []string{runRow.ID.String()},
+			},
+		}
 	}
 	if _, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name); werr == nil {
 		return fmt.Sprintf("#%d", created.Number), true
@@ -410,16 +595,22 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 	}
 }
 
-// liveValidationWalkBody assembles the walk body: what the walk is, the
-// criteria awaiting an operator live check, and either a parent-epic reference
-// or (companion=true) a companion-link to the triggering issue.
-func liveValidationWalkBody(parentRef string, crits []plan.AcceptanceCriterion, companion bool) string {
+// liveValidationWalkBody assembles the walk body: what the walk is, the criteria
+// awaiting an operator live check, and either (companion=true) a companion-link
+// to the triggering issue or (companion=false, the epic arm) a Parent-epic
+// reference plus a Filed-for line. The companion=true output is byte-IDENTICAL
+// to the pre-#2179 body (pinned by TestLiveValidationWalkBody_CompanionByteIdentity),
+// so the fallback arm — the one that fires today for every walk — is unchanged.
+func liveValidationWalkBody(triggerRef, epicRef string, crits []plan.AcceptanceCriterion, companion bool) string {
 	body := "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
 		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
 		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
 		"operator live check so nothing ships silently unvalidated (#2045).\n\n"
 	if companion {
-		body += "Companion to " + parentRef + ".\n\n"
+		body += "Companion to " + triggerRef + ".\n\n"
+	} else {
+		body += "Parent epic: " + epicRef + ".\n\n"
+		body += "Filed for " + triggerRef + ".\n\n"
 	}
 	body += "## Done-means\n\nEach criterion below has been live-validated by the operator against the real target:\n\n"
 	for _, c := range crits {

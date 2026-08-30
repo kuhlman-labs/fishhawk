@@ -1285,3 +1285,109 @@ func TestListRepoIssues_MaxItemsAboveAvailableReturnsEverything(t *testing.T) {
 		t.Errorf("requests = %d, want 1 (no extra probe past the end of the connection)", got)
 	}
 }
+
+// --- IssueParent (the sub-issue PARENT query, #2179) ----------------------
+
+// TestIssueParent_PopulatedParentDecodes: a populated parent decodes its
+// number+title, and the request carries owner/name/number and selects `parent`.
+func TestIssueParent_PopulatedParentDecodes(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueParent"] = `{"data":{"repository":{"issue":{"parent":{"number":1940,"title":"[E48] SDLC dogfooding"}}}}}`
+	got, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 2179)
+	if err != nil {
+		t.Fatalf("IssueParent: %v", err)
+	}
+	if got == nil || got.Number != 1940 || got.Title != "[E48] SDLC dogfooding" {
+		t.Fatalf("parent = %+v, want {1940, [E48] ...}", got)
+	}
+	if vars := pf.gotGraphQLVars["IssueParent"]; vars["owner"] != "o" || vars["name"] != "r" || vars["number"] != float64(2179) {
+		t.Errorf("request vars = %+v, want owner=o name=r number=2179", pf.gotGraphQLVars["IssueParent"])
+	}
+	if q := pf.gotGraphQLQuery["IssueParent"]; !strings.Contains(q, "parent") {
+		t.Errorf("query %q must select `parent`", q)
+	}
+}
+
+// TestIssueParent_NullParentIsNotAnError: parent:null returns (nil, nil).
+func TestIssueParent_NullParentIsNotAnError(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueParent"] = `{"data":{"repository":{"issue":{"parent":null}}}}`
+	got, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 2179)
+	if err != nil || got != nil {
+		t.Fatalf("got (%+v, %v), want (nil, nil) for a null parent", got, err)
+	}
+}
+
+// TestIssueParent_NullIssueAndNullRepository: a null issue and a null repository
+// each return (nil, nil) — no error.
+func TestIssueParent_NullIssueAndNullRepository(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"null_issue", `{"data":{"repository":{"issue":null}}}`},
+		{"null_repository", `{"data":{"repository":null}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newProjectsFake(t)
+			pf.graphqlByOp["IssueParent"] = tc.body
+			got, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 2179)
+			if err != nil || got != nil {
+				t.Fatalf("got (%+v, %v), want (nil, nil)", got, err)
+			}
+		})
+	}
+}
+
+// TestIssueParent_ErrorsEnvelopeIsValidation: a GraphQL {errors:[...]} envelope
+// surfaces as an ErrValidation-wrapped error and a nil parent.
+func TestIssueParent_ErrorsEnvelopeIsValidation(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueParent"] = `{"errors":[{"message":"Field 'parent' doesn't exist on type 'Issue'"}]}`
+	got, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 2179)
+	if got != nil {
+		t.Errorf("parent = %+v, want nil on an errors envelope", got)
+	}
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+}
+
+// TestIssueParent_GuardsRejectWithoutRequest: blank owner, blank name, and
+// number<=0 each return an error WITHOUT issuing a request.
+func TestIssueParent_GuardsRejectWithoutRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		owner  string
+		rname  string
+		number int
+		want   string
+	}{
+		{"blank_owner", "", "r", 5, "owner and name required"},
+		{"blank_name", "o", "", 5, "owner and name required"},
+		{"nonpositive_number", "o", "r", 0, "must be > 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newProjectsFake(t)
+			pf.graphqlByOp["IssueParent"] = `{"data":{"repository":{"issue":{"parent":{"number":1,"title":"x"}}}}}`
+			_, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: tc.owner, Name: tc.rname}, tc.number)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+			if got := pf.gotGraphQLReqs["IssueParent"]; got != 0 {
+				t.Errorf("issued %d requests, want 0 (guard rejects before any request)", got)
+			}
+		})
+	}
+}
+
+// TestIssueParent_ZeroNumberedParentIsNil: a parent decoding with number 0
+// returns (nil, nil) rather than a bogus "#0" ref.
+func TestIssueParent_ZeroNumberedParentIsNil(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueParent"] = `{"data":{"repository":{"issue":{"parent":{"number":0,"title":"[E48] x"}}}}}`
+	got, err := c.IssueParent(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 2179)
+	if err != nil || got != nil {
+		t.Fatalf("got (%+v, %v), want (nil, nil) for a zero-numbered parent", got, err)
+	}
+}

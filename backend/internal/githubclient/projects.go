@@ -755,6 +755,79 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 	return results, nil
 }
 
+// IssueParent is the sub-issue PARENT of an issue: the parent's human Number
+// and Title. It is the parent-direction peer of ListSubIssues (which walks the
+// children direction) — the one query the live-validation walk hook needs to
+// resolve the TRUE epic of a triggering child issue (#2179).
+type IssueParent struct {
+	Number int
+	Title  string
+}
+
+// IssueParent resolves an issue's sub-issue PARENT by number in ONE GraphQL
+// round trip:
+//
+//	query IssueParent($owner,$name,$number) { repository(owner,name){ issue(number){ parent { number title } } } }
+//
+// It goes number -> parent directly, so unlike AddSubIssue (which keys on node
+// ids) it needs no IssueNodeID pre-step. A nil repository, a nil issue, or a
+// nil parent all return (nil, nil) — an issue with NO sub-issue parent is the
+// NORMAL answer, not a failure — as does a parent that decodes with Number <= 0
+// (a bogus "#0" ref is never returned). It rejects a blank owner/name or a
+// number <= 0 with a `githubclient: ...` error BEFORE issuing any request,
+// mirroring ListSubIssues' guard style. It propagates doGraphQL's
+// ErrForbidden / ErrValidation / transport errors verbatim.
+//
+// Sub-issues are repo-scoped (see ListSubIssues), so it honors the installation
+// token path — no WithProjectsToken opt-in.
+func (c *Client) IssueParent(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int) (*IssueParent, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	const query = `query IssueParent($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      parent { number title }
+    }
+  }
+}`
+	var data struct {
+		Repository *struct {
+			Issue *struct {
+				Parent *struct {
+					Number int    `json:"number"`
+					Title  string `json:"title"`
+				} `json:"parent"`
+			} `json:"issue"`
+		} `json:"repository"`
+	}
+	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
+		"owner":  repo.Owner,
+		"name":   repo.Name,
+		"number": number,
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Repository == nil || data.Repository.Issue == nil || data.Repository.Issue.Parent == nil {
+		return nil, nil // no sub-issue parent is a normal answer, not a failure
+	}
+	p := data.Repository.Issue.Parent
+	if p.Number <= 0 {
+		return nil, nil // guard a bogus "#0" ref
+	}
+	return &IssueParent{Number: p.Number, Title: p.Title}, nil
+}
+
 // projectsTokenKey is the unexported context-key type for the
 // request-scoped flag that asks doGraphQL to authenticate with the
 // static projects token (Client.ProjectsToken) instead of the
