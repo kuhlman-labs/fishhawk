@@ -257,7 +257,12 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 				// condition-1/7 requirement that a done-but-not_planned dependency is
 				// NOT offered a limit change it can never satisfy.
 				const closedIncompleteRemedy = "a depends_on targets an issue closed WITHOUT completing (not_planned/duplicate); its work did not land, so widening the batch cannot include it — reopen or replace the dependency, or drop the edge"
-				const unreadableRemedy = "a depends_on target's state could not be read, so assembly refused rather than assume satisfaction; retry"
+				// unreadableRemedyClause (defined below) names the unreadable edges and
+				// only appends the cross-repo `unparsable:` explanation when at least
+				// one rendered edge actually carries that prefix (#2956, operator
+				// condition 5) — a transient forge-read failure on a numeric target
+				// renders `issue:N` and must not be labelled a cross-repo cause.
+				unreadableEdges, _ := ae.Details["dangling_state_unreadable"].([]any)
 
 				// A grooming-order / no-epic batch has its OWN not_child remedy: the
 				// operator cannot "fix the epic's edges" for a batch that has no epic
@@ -275,7 +280,7 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 						clauses = append(clauses, closedIncompleteRemedy)
 					}
 					if unreadable {
-						clauses = append(clauses, unreadableRemedy)
+						clauses = append(clauses, unreadableRemedyClause(unreadableEdges))
 					}
 					if len(clauses) == 0 {
 						// Older backend sent no categories under the grooming source:
@@ -298,7 +303,7 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 					clauses = append(clauses, closedIncompleteRemedy)
 				}
 				if unreadable {
-					clauses = append(clauses, unreadableRemedy)
+					clauses = append(clauses, unreadableRemedyClause(unreadableEdges))
 				}
 				if len(clauses) == 0 {
 					// Older backend / no categories: keep the pre-#2120 not_child
@@ -688,4 +693,34 @@ func formatDanglingEdges(edges []any) string {
 		return ""
 	}
 	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// unreadableRemedyClause renders the DropTargetStateUnreadable remedy, naming the
+// unreadable edges (#2956) — where the clause previously named none — and
+// appending the cross-repo `unparsable:` explanation ONLY when at least one
+// rendered edge actually carries that prefix (operator condition 5). The common
+// cause of an unreadable edge is a TRANSIENT forge-read failure on a numeric
+// target, which renders `issue:N`; labelling that a cross-repo cause would be
+// misleading noise, so the explanation is conditional on a real `unparsable:`
+// edge being present in the rendered list.
+func unreadableRemedyClause(edges []any) string {
+	base := "a depends_on target's state could not be read" + formatDanglingEdges(edges) +
+		", so assembly refused rather than assume satisfaction; retry"
+	if danglingEdgesHaveUnparsable(edges) {
+		base += " — an `unparsable:<digest>:` target is a depends_on token that is not a same-repo issue number (e.g. a cross-repo ref), which Fishhawk cannot resolve"
+	}
+	return base
+}
+
+// danglingEdgesHaveUnparsable reports whether at least one rendered dangling edge
+// carries the `unparsable:` prefix (a cross-repo / unparseable depends_on token),
+// so the cross-repo explanation is emitted only when it actually applies (#2956,
+// operator condition 5). The edges arrive as decoded JSON ([]any of strings).
+func danglingEdgesHaveUnparsable(edges []any) bool {
+	for _, e := range edges {
+		if s, ok := e.(string); ok && strings.Contains(s, "unparsable:") {
+			return true
+		}
+	}
+	return false
 }

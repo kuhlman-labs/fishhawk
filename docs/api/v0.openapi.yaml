@@ -10261,10 +10261,20 @@ paths:
             also covers an `items` subset that includes an item whose
             `depends_on` points at an EXCLUDED item that is not yet complete (an
             excluded closed-and-completed target is a satisfied dependency and
-            assembles, #2120) — for a `grooming_source` batch the details
-            additionally carry `dangling_source: grooming_order`,
-            `grooming_run_id` and `grooming_order_limit` so the remedy can name
-            the widen-the-batch / drop-the-edge choice;
+            assembles, #2120). The details carry per-cause string arrays
+            (`dangling_not_child` / `dangling_excluded_incomplete` /
+            `dangling_closed_incomplete` / `dangling_state_unreadable`) whose
+            entries render each blocking edge as `issue:<from>-><target>`. The
+            target side is normally `issue:<to>`, but a cross-repo /
+            unparseable `depends_on` token (which is never resolved to a local
+            number) renders as `unparsable:<digest>:"<token>"` under
+            `dangling_state_unreadable` — a stable 16-hex digest plus the
+            bounded, quoted token — so two distinct cross-repo tokens are named
+            separately instead of both collapsing to `issue:0` (#2956). For a
+            `grooming_source` batch the details additionally carry
+            `dangling_source: grooming_order`, `grooming_run_id` and
+            `grooming_order_limit` so the remedy can name the widen-the-batch /
+            drop-the-edge choice;
             `campaign_item_not_child` — an `items` entry is not a child of the
             epic.
 

@@ -9,12 +9,16 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -620,13 +624,15 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	// query, so N depends_on references to the same closed target cost ONE
 	// GetIssue (#2953).
 	stateCache := map[int]targetState{}
-	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// Collapse duplicate edges so a repeated depends_on token
 	// (`Depends on: #1639, #1639` — an untrusted body preserves every
 	// occurrence) yields AT MOST ONE edge in whichever slice it classifies into
-	// (#2953 condition 3). Keyed by (From,To); an unresolvable ref keys (From,0),
-	// so duplicate cross-repo tokens collapse too (they are indistinguishable
-	// To=0 unreadable entries).
-	seenEdge := map[[2]int]bool{}
+	// (#2953 condition 3). Keyed by (From, To, ToRefDigest): the digest is what
+	// makes the key DISTINGUISH two DIFFERENT cross-repo tokens (both To=0) while
+	// still collapsing the SAME canonical token repeated — a resolvable numeric
+	// ref carries an empty digest, so its key reduces to (From, To) as before
+	// (#2956).
+	seenEdge := map[dependsEdgeKey]bool{}
 	for _, s := range subs {
 		children = append(children, workmgmt.EpicChild{
 			Number:   s.Number,
@@ -650,10 +656,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			URL:  s.URL,
 		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
-			if seenEdge[[2]int{s.Number, dep.Number}] {
-				continue // duplicate depends_on token: classify (From,To) once.
+			key := dependsEdgeKey{From: s.Number, To: dep.Number, Digest: dep.RawDigest}
+			if seenEdge[key] {
+				continue // duplicate depends_on token: classify once per identity.
 			}
-			seenEdge[[2]int{s.Number, dep.Number}] = true
+			seenEdge[key] = true
 			if dep.Resolvable && isChild[dep.Number] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep.Number})
 				continue
@@ -675,7 +682,13 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 					From: s.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
 				})
 			} else {
-				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep.Number, Reason: cls.reason})
+				dropped = append(dropped, workmgmt.DependsEdge{
+					From: s.Number, To: dep.Number, Reason: cls.reason,
+					// Carry the unresolvable token's identity onto the dropped edge so
+					// the renderer names WHICH token (#2956); both empty on a numeric
+					// dropped edge, keeping its shape unchanged.
+					ToRef: dep.RawDisplay, ToRefDigest: dep.RawDigest,
+				})
 			}
 		}
 	}
@@ -684,6 +697,16 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	sortEdges(dropped)
 	sortSatisfiedEdges(satisfied)
 	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
+}
+
+// dependsEdgeKey is the per-item dedup key (#2956): (From, To, ToRefDigest). The
+// digest component distinguishes two DISTINCT unresolvable cross-repo tokens
+// (both To=0) so they no longer collapse into one identity-less edge, while a
+// repeated IDENTICAL canonical token still collapses (its digest is equal) and a
+// resolvable numeric ref (empty digest) keys exactly as the old (From, To) pair.
+type dependsEdgeKey struct {
+	From, To int
+	Digest   string
 }
 
 // targetState is the memoized classification of one out-of-set depends_on
@@ -779,14 +802,21 @@ func (p *Provider) classifyOutOfSetTarget(ctx context.Context, scope forge.Crede
 	return ts, nil
 }
 
-// sortEdges deterministically orders depends_on edges by (From, To) so an
-// EpicChildrenResult is stable across runs.
+// sortEdges deterministically orders depends_on edges by (From, To, ToRefDigest)
+// so an EpicChildrenResult is stable across runs. The ToRefDigest tiebreak
+// (#2956) fully determines the order of a set of UNRESOLVABLE edges that share
+// (From, To=0) but carry distinct token digests — without it sort.Slice (which
+// is not stable) leaves their order to the input, which it does not preserve
+// above the insertion-sort threshold.
 func sortEdges(es []workmgmt.DependsEdge) {
 	sort.Slice(es, func(i, j int) bool {
 		if es[i].From != es[j].From {
 			return es[i].From < es[j].From
 		}
-		return es[i].To < es[j].To
+		if es[i].To != es[j].To {
+			return es[i].To < es[j].To
+		}
+		return es[i].ToRefDigest < es[j].ToRefDigest
 	})
 }
 
@@ -866,10 +896,12 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	// GetIssue (#2953). The in-set issue fetches below are separate (each named
 	// issue is fetched once via the inSet dedup already applied).
 	stateCache := map[int]targetState{}
-	// Collapse duplicate (From,To) edges so a repeated depends_on token
+	// Collapse duplicate edges so a repeated depends_on token
 	// (`Depends on: #1639, #1639`) yields AT MOST ONE edge in whichever slice it
-	// classifies into (#2953 condition 3) — the same guard EpicChildren applies.
-	seenEdge := map[[2]int]bool{}
+	// classifies into (#2953 condition 3) — the same (From, To, ToRefDigest) key
+	// EpicChildren applies, so two DISTINCT cross-repo tokens stay two edges while
+	// the same canonical token repeated collapses (#2956).
+	seenEdge := map[dependsEdgeKey]bool{}
 	for _, n := range numbers {
 		issue, err := p.api.GetIssue(ctx, scope, repo, n)
 		if err != nil {
@@ -886,10 +918,11 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
 		})
 		for _, dep := range parseDependsOnMarker(issue.Body) {
-			if seenEdge[[2]int{issue.Number, dep.Number}] {
-				continue // duplicate depends_on token: classify (From,To) once.
+			key := dependsEdgeKey{From: issue.Number, To: dep.Number, Digest: dep.RawDigest}
+			if seenEdge[key] {
+				continue // duplicate depends_on token: classify once per identity.
 			}
-			seenEdge[[2]int{issue.Number, dep.Number}] = true
+			seenEdge[key] = true
 			if dep.Resolvable && inSet[dep.Number] {
 				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep.Number})
 				continue
@@ -909,7 +942,13 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 					From: issue.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
 				})
 			} else {
-				dropped = append(dropped, workmgmt.DependsEdge{From: issue.Number, To: dep.Number, Reason: cls.reason})
+				dropped = append(dropped, workmgmt.DependsEdge{
+					From: issue.Number, To: dep.Number, Reason: cls.reason,
+					// Carry the unresolvable token's identity onto the dropped edge so
+					// the renderer names WHICH token (#2956); both empty on a numeric
+					// dropped edge, keeping its shape unchanged.
+					ToRef: dep.RawDisplay, ToRefDigest: dep.RawDigest,
+				})
 			}
 		}
 	}
@@ -1097,7 +1136,84 @@ func appendDependsOnRef(body, ref string) (string, bool) {
 type dependsOnRef struct {
 	Number     int
 	Resolvable bool
+	// RawDigest and RawDisplay give an UNRESOLVABLE token an identity in the
+	// dropped edge it produces (#2956), so two distinct cross-repo tokens no
+	// longer both collapse to the identity-less `issue:From->issue:0`. Both are
+	// empty on a resolvable numeric ref (its edge keeps its byte-identical
+	// zero-valued shape). RawDigest is dependsOnTokenDigest over the CANONICAL
+	// (pre-sanitization) form, so control-rune stripping and rune truncation
+	// cannot merge two distinct canonical tokens; RawDisplay is the sanitized,
+	// rune-bounded human form (the raw token is untrusted issue-body content and
+	// must never reach a message or log unsanitized).
+	RawDigest  string
+	RawDisplay string
 }
+
+// dependsOnTokenCanonical is the single definition of a depends_on token's
+// IDENTITY relation (#2956): the whitespace-trimmed, PRE-sanitization text. Two
+// tokens sharing a canonical form ARE one token and correctly collapse to one
+// edge (the #2953 condition-3 dedup this change preserves on purpose); distinct
+// canonical forms are distinguished by dependsOnTokenDigest.
+func dependsOnTokenCanonical(tok string) string {
+	return strings.TrimSpace(tok)
+}
+
+// dependsOnTokenDigest is the 16-hex-char (64-bit) truncated SHA-256 of a
+// token's canonical form, the stable identity a dropped unresolvable edge
+// carries (#2956). For k distinct canonical tokens compared within one item the
+// birthday-bound probability that any two share a digest is about k^2/2^65
+// (~2.7e-16 at k=100), so the identity claim is explicitly PROBABILISTIC, not
+// absolute — the digest is an operator-facing DIAGNOSTIC identifier, never an
+// authorization or satisfaction control. It is computed on the CANONICAL form,
+// BEFORE any sanitization, so control-rune stripping or rune truncation can
+// never merge two distinct canonical tokens onto one digest.
+func dependsOnTokenDigest(canonical string) string {
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:8])
+}
+
+// sanitizeDependsOnToken renders a canonical token into the bounded, printable
+// human DISPLAY form carried on RawDisplay and, ultimately, into an operator
+// message (#2956). It drops unicode control / non-printable runes (and U+FEFF),
+// collapses internal whitespace runs to single spaces, and bounds the result to
+// dependsOnDisplayMaxRunes runes, appending a horizontal-ellipsis rune on
+// truncation. It returns "" when nothing printable survives, which the renderer
+// turns into the bounded `<unprintable>` sentinel rather than an empty ref.
+//
+// Sanitization is a DISPLAY transform ONLY: it runs AFTER the digest is taken,
+// never before, so it can never merge two distinct canonical tokens — that
+// ordering is the identity guarantee (#2956, digest-before-sanitize).
+func sanitizeDependsOnToken(canonical string) string {
+	var runes []rune
+	prevSpace := false
+	for _, r := range canonical {
+		if r == '\uFEFF' || !unicode.IsPrint(r) {
+			continue
+		}
+		if r == ' ' {
+			if prevSpace {
+				continue
+			}
+			prevSpace = true
+		} else {
+			prevSpace = false
+		}
+		runes = append(runes, r)
+	}
+	s := strings.TrimSpace(string(runes))
+	if utf8.RuneCountInString(s) > dependsOnDisplayMaxRunes {
+		rs := []rune(s)
+		s = string(rs[:dependsOnDisplayMaxRunes-1]) + "…"
+	}
+	return s
+}
+
+// dependsOnDisplayMaxRunes bounds the sanitized display form of a depends_on
+// token so a maliciously long issue body cannot blow up an operator message.
+// The renderer (workmgmt.DependsEdge.TargetRef) enforces the SAME bound on any
+// directly-constructed edge, so the guarantee holds however a DependsEdge is
+// built (#2956, operator condition 1).
+const dependsOnDisplayMaxRunes = 64
 
 // parseDependsOnMarker parses the depends_on body marker line into its referenced
 // targets. It reads the FIRST `Depends on:` line and splits the captured list on
@@ -1117,22 +1233,36 @@ func parseDependsOnMarker(body string) []dependsOnRef {
 	}
 	var refs []dependsOnRef
 	for _, tok := range strings.Split(m[1], ",") {
-		if strings.TrimSpace(tok) == "" {
+		// The canonical form (whitespace-trimmed, pre-sanitization) is the token's
+		// identity (#2956): computed ONCE, it drives both the empty-token skip and
+		// the digest so control-rune stripping / truncation cannot merge two
+		// distinct canonical tokens.
+		canon := dependsOnTokenCanonical(tok)
+		if canon == "" {
 			continue // trailing comma / whitespace: not a reference at all.
 		}
 		rm := dependsOnRefRE.FindStringSubmatch(tok)
 		if rm == nil {
 			// A non-empty token that is NOT a bare same-repo numeric ref — a
 			// cross-repo `owner/repo#N`, an owner-qualified ref, or garbage. Carry
-			// it through as UNRESOLVABLE so the classifier fails it closed rather
-			// than dropping it (a dropped cross-repo ref would let the dependency
-			// vanish and the campaign assemble on an unsatisfied prerequisite).
-			refs = append(refs, dependsOnRef{Resolvable: false})
+			// it through as UNRESOLVABLE, now with an IDENTITY (digest over the
+			// canonical form + sanitized display), so the classifier fails it closed
+			// AND the dropped edge names WHICH token — two distinct cross-repo tokens
+			// no longer collapse to one identity-less `issue:From->issue:0` (#2956).
+			refs = append(refs, dependsOnRef{
+				Resolvable: false,
+				RawDigest:  dependsOnTokenDigest(canon),
+				RawDisplay: sanitizeDependsOnToken(canon),
+			})
 			continue
 		}
 		n, err := strconv.Atoi(rm[1])
 		if err != nil {
-			refs = append(refs, dependsOnRef{Resolvable: false})
+			refs = append(refs, dependsOnRef{
+				Resolvable: false,
+				RawDigest:  dependsOnTokenDigest(canon),
+				RawDisplay: sanitizeDependsOnToken(canon),
+			})
 			continue
 		}
 		refs = append(refs, dependsOnRef{Number: n, Resolvable: true})

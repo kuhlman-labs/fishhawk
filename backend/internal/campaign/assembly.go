@@ -80,11 +80,14 @@ func (e *DanglingDependencyError) Error() string {
 func (*DanglingDependencyError) Unwrap() error { return ErrDanglingDependency }
 
 // formatEdges renders a slice of edges as `[issue:From->issue:To ...]` in the
-// campaign ref convention, matching the pre-#2120 message shape.
+// campaign ref convention, matching the pre-#2120 message shape. The target side
+// routes through the single renderer DependsEdge.TargetRef (#2956): a resolvable
+// edge still renders `issue:To`, while an unresolvable edge renders
+// `unparsable:<digest>:"token"` instead of the identity-less `issue:0`.
 func formatEdges(edges []workmgmt.DependsEdge) []string {
 	parts := make([]string, 0, len(edges))
 	for _, e := range edges {
-		parts = append(parts, fmt.Sprintf("%s->%s", issueRef(e.From), issueRef(e.To)))
+		parts = append(parts, fmt.Sprintf("%s->%s", issueRef(e.From), e.TargetRef()))
 	}
 	return parts
 }

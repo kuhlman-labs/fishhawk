@@ -285,3 +285,64 @@ func TestSatisfiedEdgeCarriedThroughDispatch(t *testing.T) {
 		t.Errorf("SatisfiedEdge = %+v, want {2032 1639 closed completed}", e)
 	}
 }
+
+// TestDependsEdgeTargetRef pins the single rendering authority for a depends_on
+// target (#2956), asserting the SHIPPED string shape: a resolvable edge renders
+// issue:<To> unchanged; an unresolvable edge renders unparsable:<digest>:"token"
+// or the <unprintable> sentinel; NO input renders issue:0; a display carrying an
+// ANSI escape / newline / quote is control-free (strconv.Quote-escaped) in the
+// output; and a 10,000-rune token — supplied DIRECTLY, bypassing the parser — is
+// bounded (operator condition 1).
+func TestDependsEdgeTargetRef(t *testing.T) {
+	t.Run("resolvable renders issue:To unchanged", func(t *testing.T) {
+		got := DependsEdge{From: 1, To: 99}.TargetRef()
+		if got != "issue:99" {
+			t.Errorf("TargetRef = %q, want issue:99", got)
+		}
+	})
+	t.Run("unresolvable with display renders unparsable:digest:quoted", func(t *testing.T) {
+		got := DependsEdge{From: 2032, To: 0, ToRef: "other/repo#12", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		want := `unparsable:0123456789abcdef:"other/repo#12"`
+		if got != want {
+			t.Errorf("TargetRef = %q, want %q", got, want)
+		}
+	})
+	t.Run("unresolvable with empty display renders the sentinel", func(t *testing.T) {
+		got := DependsEdge{From: 2032, To: 0, ToRef: "", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		want := "unparsable:0123456789abcdef:<unprintable>"
+		if got != want {
+			t.Errorf("TargetRef = %q, want %q", got, want)
+		}
+	})
+	t.Run("no input renders issue:0", func(t *testing.T) {
+		for _, e := range []DependsEdge{
+			{From: 1, To: 0}, // resolvable-zero: issue:0 is acceptable here (numeric), not an unresolvable render
+			{From: 1, To: 0, ToRef: "x", ToRefDigest: "deadbeefdeadbeef"},
+			{From: 1, To: 0, ToRefDigest: "deadbeefdeadbeef"},
+		} {
+			got := e.TargetRef()
+			if e.ToRefDigest != "" && got == "issue:0" {
+				t.Errorf("unresolvable edge %+v rendered issue:0 — forbidden", e)
+			}
+		}
+	})
+	t.Run("ANSI / newline / quote are escaped and control-free", func(t *testing.T) {
+		got := DependsEdge{To: 0, ToRef: "a\x1b[31m\nb\"c", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		for _, bad := range []string{"\x1b", "\n"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("TargetRef %q contains a raw control byte %q — must be escaped", got, bad)
+			}
+		}
+		if !strings.HasPrefix(got, "unparsable:0123456789abcdef:") {
+			t.Errorf("TargetRef = %q, want the unparsable-prefixed render", got)
+		}
+	})
+	t.Run("10000-rune token renders bounded", func(t *testing.T) {
+		got := DependsEdge{To: 0, ToRef: strings.Repeat("z", 10000), ToRefDigest: "0123456789abcdef"}.TargetRef()
+		// Ceiling: prefix (~30) + a 64-rune quoted display + quotes/escapes.
+		const ceiling = 200
+		if len(got) > ceiling {
+			t.Errorf("TargetRef len = %d, want <= %d (a directly-supplied oversize token must be bounded by the renderer)", len(got), ceiling)
+		}
+	})
+}

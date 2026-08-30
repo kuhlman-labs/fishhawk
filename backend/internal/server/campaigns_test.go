@@ -7829,3 +7829,40 @@ func TestCampaignStatus_AdvertisedActionIsLegal(t *testing.T) {
 		})
 	}
 }
+
+// TestDanglingDependencyDetails_UnparsableRefsUnderStateUnreadable pins that an
+// unresolvable dropped edge (ToRef/ToRefDigest, #2956) lands under the
+// dangling_state_unreadable key as a plain JSON string naming the token, never
+// issue:0.
+func TestDanglingDependencyDetails_UnparsableRefsUnderStateUnreadable(t *testing.T) {
+	de := &campaign.DanglingDependencyError{
+		StateUnreadable: []workmgmt.DependsEdge{{
+			From: 2032, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+			ToRef: "other/repo#12", ToRefDigest: "0123456789abcdef",
+		}},
+	}
+	details := DanglingDependencyDetails(de, "#25")
+	raw, ok := details["dangling_state_unreadable"]
+	if !ok {
+		t.Fatalf("details missing dangling_state_unreadable: %+v", details)
+	}
+	refs, ok := raw.([]string)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("dangling_state_unreadable = %#v, want one string ref", raw)
+	}
+	if !strings.Contains(refs[0], "other/repo#12") || !strings.Contains(refs[0], "unparsable:") {
+		t.Errorf("ref %q does not name the unparsable token", refs[0])
+	}
+	if strings.Contains(refs[0], "issue:0") {
+		t.Errorf("ref %q renders issue:0 for an unresolvable target — forbidden", refs[0])
+	}
+	// The details map JSON-marshals to plain strings (the wire shape the MCP
+	// consumer decodes as []any of string).
+	b, err := json.Marshal(details)
+	if err != nil {
+		t.Fatalf("marshal details: %v", err)
+	}
+	if !strings.Contains(string(b), `unparsable:0123456789abcdef:\"other/repo#12\"`) {
+		t.Errorf("marshaled details %s missing the quoted unparsable ref", b)
+	}
+}

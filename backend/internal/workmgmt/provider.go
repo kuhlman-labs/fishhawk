@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
@@ -144,9 +146,11 @@ type EpicChildrenResult struct {
 	// (#2953). They are kept out of Edges (the wave DAG is over the epic's own
 	// children) but surfaced here rather than silently discarded, so campaign
 	// assembly (E25.3) can fail closed on a missing dependency instead of
-	// dropping it. Like Edges, it is deterministically sorted by (From, To).
-	// Empty when every depends_on reference points at a sibling or an
-	// already-completed target.
+	// dropping it. Like Edges, it is deterministically sorted by (From, To,
+	// ToRefDigest) — the digest tiebreak fully orders a set of unresolvable edges
+	// sharing (From, To=0) but naming distinct cross-repo tokens (#2956). Empty
+	// when every depends_on reference points at a sibling or an already-completed
+	// target.
 	DroppedEdges []DependsEdge
 	// SatisfiedEdges are depends_on edges deliberately elided from BOTH the
 	// DroppedEdges dangling check AND the wave DAG because the target is a
@@ -244,10 +248,69 @@ const (
 // To. Both are child issue numbers of the queried epic. Reason categorizes a
 // DROPPED edge (why it could not be honored) and is "" on a satisfied edge in
 // Edges (#2120).
+//
+// ToRef/ToRefDigest give an UNRESOLVABLE dropped edge — one whose target is a
+// cross-repo / owner-qualified / unparseable depends_on token, not a same-repo
+// number — an IDENTITY (#2956), so two DISTINCT such tokens no longer both
+// render `issue:From->issue:0` and no longer collapse to one edge under the
+// per-item dedup key (From, To, ToRefDigest). ToRefDigest is the 16-hex-char
+// digest of the token's canonical form; ToRef is its sanitized, rune-bounded
+// display. BOTH are empty on a resolvable/numeric edge (its downstream shape is
+// byte-identical to before, so every existing equality assertion is unchanged).
+// The one rendering authority for a depends_on target is TargetRef — an
+// unresolvable edge must never render `issue:0`.
+//
+// This type is an in-memory query result only: it carries NO json struct tags
+// and is marshaled into no REST or MCP payload (an edge always reaches the wire
+// as a string rendered through TargetRef). Adding these two fields therefore
+// changes no public payload shape (#2956, operator condition 2, verified at
+// implement time).
 type DependsEdge struct {
-	From   int
-	To     int
-	Reason DropReason
+	From        int
+	To          int
+	Reason      DropReason
+	ToRef       string
+	ToRefDigest string
+}
+
+// targetRefDisplayMaxRunes bounds the rendered display of an unresolvable
+// depends_on target so a maliciously long or control-rune-laden token cannot
+// blow up an operator message — enforced HERE in the renderer, not only in the
+// upstream GitHub-parser sanitizer, so the bound holds for a DependsEdge built
+// by ANY constructor (#2956, operator condition 1).
+const targetRefDisplayMaxRunes = 64
+
+// TargetRef is the SINGLE rendering authority for a depends_on edge's target
+// (#2956). A resolvable/numeric edge (empty ToRefDigest) renders `issue:<To>`,
+// byte-identical to the pre-#2956 hand-rolled `"issue:"+To` formatters it
+// replaces. An UNRESOLVABLE edge renders `unparsable:<digest>:"<token>"` — with
+// the token bounded to targetRefDisplayMaxRunes runes and strconv.Quote'd so an
+// embedded control rune, newline, ANSI escape or quote is escaped rather than
+// emitted raw — or the bounded greppable sentinel `unparsable:<digest>:<unprintable>`
+// when the display sanitized to empty. It can never render `issue:0` for an
+// unresolvable target, nor be confused with a genuine numeric unreadable edge.
+func (e DependsEdge) TargetRef() string {
+	if e.ToRefDigest == "" {
+		return "issue:" + strconv.Itoa(e.To)
+	}
+	display := boundTargetRefDisplay(e.ToRef)
+	if display == "" {
+		return "unparsable:" + e.ToRefDigest + ":<unprintable>"
+	}
+	return "unparsable:" + e.ToRefDigest + ":" + strconv.Quote(display)
+}
+
+// boundTargetRefDisplay caps a display string at targetRefDisplayMaxRunes runes,
+// appending a horizontal-ellipsis rune on truncation. A parser-produced ToRef is
+// already within the bound so this is a no-op there; it bites only on a
+// directly-constructed edge whose ToRef bypassed the parser sanitizer (#2956,
+// operator condition 1).
+func boundTargetRefDisplay(s string) string {
+	if utf8.RuneCountInString(s) <= targetRefDisplayMaxRunes {
+		return s
+	}
+	rs := []rune(s)
+	return string(rs[:targetRefDisplayMaxRunes-1]) + "…"
 }
 
 // DiscoverNumbersRequest is the resolved input to NumberDiscoverer: the
