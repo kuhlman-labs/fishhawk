@@ -2338,6 +2338,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 				CreatedAt: c.CreatedAt,
 			})
 		}
+		s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
 		return
 	}
 
@@ -2380,6 +2381,39 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 			CreatedAt: c.CreatedAt,
 		})
 	}
+	s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
+}
+
+// warnOverCapComments emits a single greppable WARN when any resolved issue
+// comment exceeds prompt.MaxIssueCommentBytes, covering the run paths that have
+// no operator tool result to carry the fishhawk_start_run warning — the
+// webhook-fetch branch and the campaign-hydrated cached-context branch (both of
+// which land the comments on runRow.IssueContext.Comments and flow through
+// fillIssueContext, #2946). It logs at most ONE line per prompt build (never per
+// comment) and never fails or alters the prompt build — the truncation itself is
+// handled by the renderer's elision marker; this only makes it visible in
+// fishhawkd's logs. Mirrors the exceeds_rejection_feedback_cap attribute shape.
+func (s *Server) warnOverCapComments(ctx context.Context, runRow *run.Run, issueNumber int, comments []prompt.IssueComment) {
+	overCap := 0
+	largest := 0
+	for _, c := range comments {
+		if len(c.Body) > prompt.MaxIssueCommentBytes {
+			overCap++
+			if len(c.Body) > largest {
+				largest = len(c.Body)
+			}
+		}
+	}
+	if overCap == 0 {
+		return
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: issue comment over per-comment cap; truncated with elision marker",
+		slog.String("run_id", runRow.ID.String()),
+		slog.Int("issue", issueNumber),
+		slog.Int("over_cap_comments", overCap),
+		slog.Int("largest_comment_bytes", largest),
+		slog.Int("cap_bytes", prompt.MaxIssueCommentBytes),
+	)
 }
 
 // issueGetter returns the configured client cast to the small
