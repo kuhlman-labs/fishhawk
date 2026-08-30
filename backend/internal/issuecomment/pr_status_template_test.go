@@ -484,3 +484,117 @@ func TestRenderPRStatusBody_EmbedsStickyMarker(t *testing.T) {
 		t.Errorf("PR status body must not carry the anchor marker")
 	}
 }
+
+// TestRenderPRWhatNow_AcceptancePrecedence is the per-arm behavioral table for
+// the #3026 hoist: the acceptance-derived switch now runs AHEAD of the
+// StateSucceeded arm, while StateCancelled and StateFailed keep precedence over
+// both. One case per arm — the list is exhaustive and matches the plan's
+// verification strategy.
+//
+// Case (c) is the DISCRIMINATING control for the reworded acceptance criterion:
+// a completed run whose acceptance was ACCEPTED must render the pre-existing
+// acceptance-passed sentence VERBATIM (a MOVE, not a rewrite) and must NEVER
+// render the not-validated wording.
+func TestRenderPRWhatNow_AcceptancePrecedence(t *testing.T) {
+	const (
+		sentReady        = "_What now: run complete — the PR is ready to merge._"
+		sentCancelled    = "_What now: run cancelled — the PR will not merge from this run._"
+		sentFailed       = "_What now: a stage failed — review the failure, then retry or replan before merging._"
+		sentAccepted     = "_What now: acceptance passed — review the verdicts below and merge when ready._"
+		sentRejected     = "_What now: acceptance failed — see the criteria table below and triage before merging._"
+		zeroVerification = "ZERO criteria were verified"
+	)
+	// Stages that would otherwise select the in-progress "being implemented
+	// and reviewed" sentence, so case (g) proves the acceptance arm wins over
+	// the stage-derived fallback rather than merely over a nil stage list.
+	inFlight := []*run.Stage{{Type: run.StageTypeReview, State: run.StageStateRunning}}
+
+	cases := []struct {
+		name     string
+		state    run.State
+		acc      *prAcceptanceView
+		want     string   // exact sentence, when the arm renders a fixed string
+		contains []string // substrings, for the two zero-verification arms
+		absent   []string
+	}{
+		{
+			name:     "(a) succeeded + not_validated names zero verification and #2347",
+			state:    run.StateSucceeded,
+			acc:      &prAcceptanceView{outcome: acceptanceOutcomeNotValidated},
+			contains: []string{"NOT validated", zeroVerification, "#2347", "merge-eligible"},
+			absent:   []string{sentReady},
+		},
+		{
+			name:     "(b) succeeded + undecidable names zero verification and #2347",
+			state:    run.StateSucceeded,
+			acc:      &prAcceptanceView{outcome: acceptanceOutcomeUndecidable},
+			contains: []string{"UNDECIDABLE", zeroVerification, "#2347", "merge-eligible"},
+			absent:   []string{sentReady},
+		},
+		{
+			name:   "(c) succeeded + accepted renders the acceptance-passed sentence VERBATIM",
+			state:  run.StateSucceeded,
+			acc:    &prAcceptanceView{outcome: "accepted"},
+			want:   sentAccepted,
+			absent: []string{"NOT validated", zeroVerification, sentReady},
+		},
+		{
+			name:  "(d) succeeded + no acceptance view still renders the ready-to-merge sentence",
+			state: run.StateSucceeded,
+			acc:   nil,
+			want:  sentReady,
+		},
+		{
+			name:  "(e) FAILED + not_validated keeps the failed sentence",
+			state: run.StateFailed,
+			acc:   &prAcceptanceView{outcome: acceptanceOutcomeNotValidated},
+			want:  sentFailed,
+		},
+		{
+			name:  "(f) CANCELLED + not_validated keeps the cancelled sentence",
+			state: run.StateCancelled,
+			acc:   &prAcceptanceView{outcome: acceptanceOutcomeNotValidated},
+			want:  sentCancelled,
+		},
+		{
+			name:     "(g) in-progress + not_validated renders the acceptance-derived sentence",
+			state:    run.StateRunning,
+			acc:      &prAcceptanceView{outcome: acceptanceOutcomeNotValidated},
+			contains: []string{"NOT validated", zeroVerification, "#2347"},
+			absent:   []string{"being implemented and reviewed"},
+		},
+		{
+			name:  "(h) succeeded + rejected renders the acceptance-failed sentence verbatim",
+			state: run.StateSucceeded,
+			acc:   &prAcceptanceView{outcome: "rejected"},
+			want:  sentRejected,
+		},
+		{
+			name:  "(i) succeeded + an outcome no arm names falls through to the state sentence",
+			state: run.StateSucceeded,
+			acc:   &prAcceptanceView{outcome: "something_new"},
+			want:  sentReady,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := prStatusRun()
+			r.State = tc.state
+			got := renderPRWhatNow(r, inFlight, tc.acc)
+			if tc.want != "" && got != tc.want {
+				t.Fatalf("renderPRWhatNow = %q, want %q", got, tc.want)
+			}
+			for _, w := range tc.contains {
+				if !strings.Contains(got, w) {
+					t.Errorf("renderPRWhatNow = %q, missing %q", got, w)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("renderPRWhatNow = %q, must not contain %q", got, a)
+				}
+			}
+		})
+	}
+}

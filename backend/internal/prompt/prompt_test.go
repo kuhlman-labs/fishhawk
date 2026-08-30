@@ -4515,6 +4515,66 @@ func TestBuild_PlanReview_GateEvidence_AcceptanceNilByteIdentical(t *testing.T) 
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders pins the #3026
+// consequence line: it renders when AllSkipShortCircuit is true and is ABSENT
+// when false — the always-on control the issue's second acceptance criterion
+// demands. The surrounding gate-evidence block is otherwise unchanged, which
+// the byte-identity assertion at the end proves: stripping exactly the one
+// consequence line reproduces the flag-false prompt.
+func TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders(t *testing.T) {
+	mk := func(allSkip bool) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: fixturePlan(),
+			PlanGateEvidence: &PlanGateEvidence{
+				AcceptancePrecheck: &AcceptancePrecheckEvidence{
+					AcceptanceStageID:   "acceptance",
+					CriteriaCount:       2,
+					BlockingCount:       2,
+					OutOfScopeCount:     0,
+					AllSkipShortCircuit: allSkip,
+					Findings: []AcceptanceFindingEvidence{
+						{Rule: "all_criteria_skip_expected", Detail: "every acceptance criterion is marked skip_expected"},
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	const consequence = "- CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis, so the " +
+		"acceptance stage will short-circuit to a not_validated verdict with no runner spawn and no preview — ZERO " +
+		"criteria will be verified. The run stays merge-eligible, but this is NOT a validated pass (#2347). Ask whether " +
+		"a drivable criterion genuinely exists for this change; an all-skip plan is not a cheap green.\n"
+
+	on := mk(true)
+	for _, want := range []string{consequence, "ZERO", "#2347", "not a cheap green"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("plan_review prompt missing all-skip consequence element %q:\n%s", want, on)
+		}
+	}
+	off := mk(false)
+	if strings.Contains(off, "CONSEQUENCE: every acceptance criterion") {
+		t.Errorf("the consequence line must be ABSENT when AllSkipShortCircuit is false:\n%s", off)
+	}
+	// The line is a clean additive insertion: stripping it reproduces the
+	// flag-false prompt byte-for-byte, so no other gate-evidence byte moved.
+	if strings.Replace(on, consequence, "", 1) != off {
+		t.Error("the consequence line is not a clean additive insertion over the flag-false prompt")
+	}
+	// Position: after the out_of_scope count, before the findings list.
+	iCount := strings.Index(on, "- out_of_scope entries: 0")
+	iCons := strings.Index(on, "- CONSEQUENCE:")
+	iFind := strings.Index(on, "- FINDING all_criteria_skip_expected")
+	if iCount >= iCons || iCons >= iFind {
+		t.Errorf("consequence line is misordered: out_of_scope=%d consequence=%d findings=%d", iCount, iCons, iFind)
+	}
+}
+
 // planWithAcceptanceCriteria returns fixturePlan with a criteria set and an
 // out_of_scope list added to Verification, for the criteria-rendering tests.
 func planWithAcceptanceCriteria() *plan.Plan {

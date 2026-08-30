@@ -191,3 +191,70 @@ func TestEvaluateDraftCriteria_MissingLiveValidationMarker_SurfacedAtIntake(t *t
 		t.Errorf("missing_live_validation_marker must render without setting NeedsAttention; got %+v", c)
 	}
 }
+
+// TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked is CONDITION 1's
+// refinement half (#3026): the second consumer of the shared rule set must not
+// be BLOCKED by the new advisory. It asserts the non-blocked OUTCOME directly —
+// the draft-level and child-level NeedsAttention markers stay FALSE — not
+// merely that a findings slice does or does not contain an entry.
+//
+// It also records, as a behavioral fact rather than a prose claim, that
+// all_criteria_skip_expected is structurally INERT at intake and is so TWICE
+// over:
+//
+//  1. EvaluateDraftCriteria maps a child's []string acceptance_criteria into a
+//     synthetic plan.Verification that sets only ID and Statement — never
+//     SkipExpected or ExpectationBasis. AcceptanceSkippableAllSkipWithBasis is
+//     therefore false for every possible draft, so the rule cannot fire here no
+//     matter what the criteria prose says (the criteria below deliberately
+//     WORD themselves as skip-expected, and still draw nothing).
+//  2. Even if it did fire, refinement's needs-attention trigger keys on
+//     no_blocking_criterion ALONE, so the marker would stay false.
+//
+// The plan for this change expected case 1 to be a positive assertion (an
+// all-skip draft PRODUCING the finding). It cannot be: the intake shape has no
+// channel for the skip markers. Asserting the inertness is the honest and
+// stronger statement, and it is what the counterfactual below discriminates on.
+func TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked(t *testing.T) {
+	d := EpicDraft{
+		Epic: EpicSpec{Summary: "e", Scope: "s"},
+		Children: []ChildDraft{{
+			Summary: "c1",
+			AcceptanceCriteria: []string{
+				"skip_expected: the acceptance stage short-circuits, expectation_basis is the unit test",
+				"skip_expected: the payload records the headline, expectation_basis is the server test",
+			},
+		}},
+	}
+
+	pc := EvaluateDraftCriteria(d)
+
+	// NON-BLOCKED OUTCOME — the assertion Condition 1 asks for.
+	if pc.NeedsAttention {
+		t.Errorf("draft NeedsAttention = true; an advisory acceptance rule must never mark the draft needs_attention")
+	}
+	child := childCheck(pc, 1)
+	if child == nil {
+		t.Fatal("want a child check at ordinal 1")
+	}
+	if child.NeedsAttention {
+		t.Errorf("child NeedsAttention = true; an advisory acceptance rule must never mark a child needs_attention")
+	}
+
+	// Inertness (1): the rule cannot fire through the intake mapping.
+	if childFinding(pc, 1, plan.RuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("all_criteria_skip_expected fired at intake; the mapping sets no skip markers, so it must be inert here: %+v", child.Findings)
+	}
+
+	// A mixed-shaped draft is likewise unflagged and unblocked.
+	mixed := EvaluateDraftCriteria(EpicDraft{
+		Epic:     EpicSpec{Summary: "e", Scope: "s"},
+		Children: []ChildDraft{{Summary: "c1", AcceptanceCriteria: []string{"the plan gate admits the plan"}}},
+	})
+	if mixed.NeedsAttention {
+		t.Errorf("mixed draft NeedsAttention = true, want false")
+	}
+	if childFinding(mixed, 1, plan.RuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("all_criteria_skip_expected fired on a mixed draft: %+v", mixed.Children[0].Findings)
+	}
+}

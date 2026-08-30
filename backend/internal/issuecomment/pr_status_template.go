@@ -152,10 +152,30 @@ func renderPRStatusHeader(r *run.Run, externalURL string) string {
 // renderPRWhatNow is the merge-scoped "what now" line — a single sentence
 // telling the reader what the PR is waiting on. Derived from run + stage state,
 // enriched by the settled acceptance outcome when present.
+//
+// PRECEDENCE (#3026, E32.50). The acceptance-derived switch is HOISTED ahead
+// of the StateSucceeded arm. Before this change a completed run short-circuited
+// to "run complete — the PR is ready to merge", pre-empting the acceptance arms
+// entirely: THIS is the sentence a human reads before clicking merge, and on a
+// short-circuited run it said the PR was ready while ZERO criteria had been
+// verified. The two zero-verification outcomes — not_validated and its post-run
+// twin undecidable — now name that plainly and point at the #2347
+// acknowledge-in-your-merge-verdict contract.
+//
+// StateCancelled and StateFailed KEEP precedence over the acceptance switch: a
+// cancelled or failed run's sentence is about the RUN, not about a verdict.
+// Everything else falls through unchanged.
+//
+// Two deliberate, operator-ratified consequences of taking the FULL hoist
+// rather than narrowing it to the not_validated arm (which would have left the
+// same precedence bug in place for every other outcome):
+//   - a succeeded run whose acceptance was ACCEPTED now renders the
+//     pre-existing acceptance-passed sentence (byte-identical, moved not
+//     rewritten) instead of "run complete — the PR is ready to merge";
+//   - a NON-TERMINAL run whose acceptance outcome has already settled renders
+//     the acceptance-derived sentence, which is the more informative reading.
 func renderPRWhatNow(r *run.Run, stages []*run.Stage, acc *prAcceptanceView) string {
 	switch r.State {
-	case run.StateSucceeded:
-		return "_What now: run complete — the PR is ready to merge._"
 	case run.StateCancelled:
 		return "_What now: run cancelled — the PR will not merge from this run._"
 	case run.StateFailed:
@@ -167,7 +187,16 @@ func renderPRWhatNow(r *run.Run, stages []*run.Stage, acc *prAcceptanceView) str
 			return "_What now: acceptance passed — review the verdicts below and merge when ready._"
 		case "rejected":
 			return "_What now: acceptance failed — see the criteria table below and triage before merging._"
+		case acceptanceOutcomeNotValidated:
+			return "_What now: acceptance was NOT validated — the stage short-circuited and ZERO criteria were verified. " +
+				"The PR is merge-eligible, but this is not a validated pass: acknowledge the zero verification in your merge verdict (#2347)._"
+		case acceptanceOutcomeUndecidable:
+			return "_What now: acceptance was UNDECIDABLE — criteria could not be decided, so ZERO criteria were verified. " +
+				"The PR is merge-eligible, but this is not a validated pass: acknowledge the zero verification in your merge verdict (#2347)._"
 		}
+	}
+	if r.State == run.StateSucceeded {
+		return "_What now: run complete — the PR is ready to merge._"
 	}
 	for _, st := range stages {
 		if st.Type != run.StageTypeReview && st.Type != run.StageTypeImplement {

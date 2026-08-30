@@ -1160,3 +1160,144 @@ func TestMissingLiveValidationMarker_RuleName(t *testing.T) {
 		t.Errorf("rule = %q, want missing_live_validation_marker", RuleMissingLiveValidationMarker)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// all_criteria_skip_expected (#3026, E32.50)
+// ---------------------------------------------------------------------------
+
+// countFindings counts findings matching rule AND criterion_id. Matching by
+// rule+criterion_id rather than slice index keeps these assertions
+// ORDER-INDEPENDENT, so the position of the new append inside
+// EvaluateAcceptanceCriteria is not silently pinned.
+func countFindings(findings []AcceptanceFinding, rule, criterionID string) int {
+	n := 0
+	for _, f := range findings {
+		if f.Rule == rule && f.CriterionID == criterionID {
+			n++
+		}
+	}
+	return n
+}
+
+// skipCriterion builds a criterion marked skip_expected with the given basis.
+func skipCriterion(id, statement, basis string) AcceptanceCriterion {
+	return AcceptanceCriterion{
+		ID:               id,
+		Statement:        statement,
+		Source:           CriterionSourceExplicit,
+		SourceRef:        "#3026",
+		SkipExpected:     true,
+		ExpectationBasis: basis,
+	}
+}
+
+// (a) Every criterion skip_expected with a non-empty basis -> exactly ONE
+// plan-level finding, CriterionID empty. This is the case the counterfactual
+// deletion of the EvaluateAcceptanceCriteria append must redden.
+func TestEvaluateAcceptanceCriteria_AllSkipWithBasis_FlagsOnce(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			skipCriterion("a1", "the CLI prints the resolved plan", "covered by cli/internal/plan unit test"),
+			skipCriterion("a2", "the payload records the count", "covered by the server integration test"),
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if n := countFindings(findings, RuleAllCriteriaSkipExpected, ""); n != 1 {
+		t.Fatalf("want exactly 1 plan-level all_criteria_skip_expected finding; got %d in %+v", n, findings)
+	}
+	f := findingFor(findings, RuleAllCriteriaSkipExpected)
+	if f.CriterionID != "" {
+		t.Errorf("CriterionID = %q, want empty (this is a plan-level, not per-criterion, condition)", f.CriterionID)
+	}
+	if !strings.Contains(f.Detail, "ZERO criteria") || !strings.Contains(f.Detail, "#2347") {
+		t.Errorf("Detail must name the zero-verification consequence and #2347; got %q", f.Detail)
+	}
+	// The rule and the runtime short-circuit are the SAME boolean.
+	if !AcceptanceSkippableAllSkipWithBasis(v) {
+		t.Error("the predicate the orchestrator short-circuits on must agree with the finding")
+	}
+}
+
+// (b) Zero criteria -> NO finding. The empty-criteria short-circuit is a
+// DISJOINT predicate (AcceptanceSkippableEmptyCriteria) and must not borrow
+// this rule's advisory.
+func TestEvaluateAcceptanceCriteria_ZeroCriteria_NoAllSkipFinding(t *testing.T) {
+	v := Verification{OutOfScope: []string{"a doc-only change authors no criteria"}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleAllCriteriaSkipExpected) != nil {
+		t.Fatalf("zero criteria must not fire all_criteria_skip_expected; got %+v", findings)
+	}
+	if AcceptanceSkippableAllSkipWithBasis(v) {
+		t.Error("predicate disagrees: zero criteria is not the all-skip shape")
+	}
+}
+
+// (c) One drivable criterion among skipped ones -> no finding. The stage
+// dispatches normally so that criterion IS validated.
+func TestEvaluateAcceptanceCriteria_OneDrivableCriterion_NoAllSkipFinding(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			skipCriterion("a1", "the CLI prints the resolved plan", "covered by a unit test"),
+			{ID: "a2", Statement: "the rendered page shows the count", Source: CriterionSourceExplicit, SourceRef: "#3026"},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleAllCriteriaSkipExpected) != nil {
+		t.Fatalf("a drivable criterion must suppress all_criteria_skip_expected; got %+v", findings)
+	}
+	if AcceptanceSkippableAllSkipWithBasis(v) {
+		t.Error("predicate disagrees: a drivable criterion is not the all-skip shape")
+	}
+}
+
+// (d) Every criterion skip_expected but ONE basis whitespace-only -> no
+// finding, matching AcceptanceSkippableAllSkipWithBasis's TrimSpace semantics.
+// This is the edge where gate advisory and runtime short-circuit must agree:
+// the runtime dispatches acceptance normally, so the gate must not claim it
+// will short-circuit.
+func TestEvaluateAcceptanceCriteria_WhitespaceBasis_NoAllSkipFinding(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			skipCriterion("a1", "the CLI prints the resolved plan", "covered by a unit test"),
+			skipCriterion("a2", "the payload records the count", "   \t\n  "),
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleAllCriteriaSkipExpected) != nil {
+		t.Fatalf("a whitespace-only expectation_basis must not fire all_criteria_skip_expected; got %+v", findings)
+	}
+	if AcceptanceSkippableAllSkipWithBasis(v) {
+		t.Error("gate advisory and runtime short-circuit disagree on the whitespace-basis edge")
+	}
+}
+
+// (e) NO cross-rule suppression. An all-skip plan whose criteria statements
+// name a LIVE forge target draws the all_criteria_skip_expected finding AND
+// the pre-existing missing_live_validation_marker findings, one per criterion,
+// unchanged. (An all-skip plan cannot also carry an unmarked-and-undecidable
+// criterion by construction — skip_expected-with-basis exempts
+// undecidable_criterion — so live-target marking is the observable pairing.)
+func TestEvaluateAcceptanceCriteria_AllSkip_NoCrossRuleSuppression(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			skipCriterion("a1", "a live GitHub API round-trip closes the originating issue", "covered by the fake-forge integration test"),
+			skipCriterion("a2", "the deployed environment serves the new route", "covered by the handler unit test"),
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if n := countFindings(findings, RuleAllCriteriaSkipExpected, ""); n != 1 {
+		t.Fatalf("want 1 all_criteria_skip_expected finding; got %d in %+v", n, findings)
+	}
+	for _, id := range []string{"a1", "a2"} {
+		if n := countFindings(findings, RuleMissingLiveValidationMarker, id); n != 1 {
+			t.Errorf("want 1 missing_live_validation_marker for %s; got %d in %+v — the new rule must not suppress it", id, n, findings)
+		}
+	}
+}
+
+// (rule name) The wire contract consumers key on.
+func TestAllCriteriaSkipExpected_RuleName(t *testing.T) {
+	if RuleAllCriteriaSkipExpected != "all_criteria_skip_expected" {
+		t.Errorf("rule = %q, want all_criteria_skip_expected", RuleAllCriteriaSkipExpected)
+	}
+}
