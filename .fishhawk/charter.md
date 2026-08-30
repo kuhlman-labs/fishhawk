@@ -121,6 +121,7 @@ and the report should say which it is rather than blending them into one number.
 | **R3** | A correctness or data-integrity defect on a load-bearing path. |
 | **R4** | Compounding cost: the item gets more expensive the longer it waits, typically because more code is written against the shape it should have had. |
 | **R5** | Reputational exposure at the current phase — something an external operator would hit early and read as unreadiness. |
+| **R6** | Verification integrity: a control that cannot fail for the reason it names. An assertion, gate or harness that stays green when the property it claims to protect is removed; a control whose deletion leaves the suite passing; an invariant asserted in prose or a doc comment with no executable counterpart. Rank at or above a comparable missing-coverage item — an unfalsifiable test is worse than an absent one, because it also suppresses the signal that the test is missing. A proposal citing this line names the counterfactual that would demonstrate the control is load-bearing: delete it, observe the failure, restore. |
 
 ### Dependency unblocking — what does it free?
 
