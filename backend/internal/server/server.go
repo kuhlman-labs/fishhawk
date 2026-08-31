@@ -719,6 +719,20 @@ type Config struct {
 	// SECRET are set.
 	RegionPinner *account.RegionPinner
 
+	// SingleTenantProfile is the deployment's configured single-tenant profile
+	// (ADR-057 Mode 1), threaded from the FISHHAWKD_SINGLE_TENANT_* flags in
+	// serve.go so the login gate can NAME it in the no-admitting-account denial
+	// log (#2468). It is DIAGNOSTIC ONLY: read on that single denial branch and
+	// NOWHERE ELSE. It is NEVER an admission input, never consulted by the
+	// membership resolver, and never reaches the /access-denied redirect, its
+	// reason code, or the rendered page. Admission remains exactly
+	// s.cfg.AuthMembership.ResolveAccounts(...). A zero value means "no
+	// single-tenant profile configured" (the hosted multi-tenant posture);
+	// emptiness is decided by SingleTenantConfig.Enabled(), the same predicate
+	// account.EnsureSingleTenantAccount consults, so the diagnostic and the
+	// bootstrap agree on "configured" by construction.
+	SingleTenantProfile account.SingleTenantConfig
+
 	// OAuthASIssuer is the RFC 8414 issuer this deployment's OAuth 2.1
 	// authorization server (ADR-076 slice 3, #2436) advertises, e.g.
 	// https://as.example. EMPTY leaves the AS DISABLED — all four OAuth routes

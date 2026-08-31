@@ -195,6 +195,17 @@ The third row is the load-bearing one. Reading a half-configured profile as
 and nothing says why. That is the failure this profile exists to prevent, so it
 fails closed instead.
 
+`SingleTenantConfig.Resolved()` is the exported, read-only **diagnostic** view
+of the profile: it delegates verbatim to the internal `resolveDefaults`, so a
+caller OUTSIDE this package (the server's no-admitting-account denial log,
+#2468) can report the EFFECTIVE configuration — every field trimmed, the
+`github` / `enterprise` / `member` defaults filled — rather than the raw, still
+empty flag values. It is a view, not a predicate: `Enabled()` remains the SINGLE
+enablement signal, and a caller must gate on `Enabled()` before reporting a
+`Resolved()` view. Because both the diagnostic and `EnsureSingleTenantAccount`
+resolve through the same `resolveDefaults`, they can never describe different
+effective profiles.
+
 ### Fail-closed branches
 
 | Branch | Result |
