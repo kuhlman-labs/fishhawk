@@ -792,6 +792,8 @@ func TestClassifyErr(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", agent.ErrExternalAPI), "external_api"},
 		{agent.ErrAgentQuotaUnavailable, "agent_quota_unavailable"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentQuotaUnavailable), "agent_quota_unavailable"},
+		{agent.ErrTraceStreamRead, "trace_stream_read"},
+		{fmt.Errorf("wrapped: %w", agent.ErrTraceStreamRead), "trace_stream_read"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},
@@ -808,6 +810,40 @@ func TestClassifyErr(t *testing.T) {
 				t.Errorf("classifyErr(%v) = %q, want %q", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// traceErrInjectingReader returns a genuine non-EOF read error on the first
+// Read, modelling a stdout-pipe I/O fault injected via the adapter's TraceStream
+// seam (#3020).
+type traceErrInjectingReader struct{ err error }
+
+func (e *traceErrInjectingReader) Read(p []byte) (int, error) { return 0, e.err }
+
+// TestClassifyErr_TraceStreamReadEndToEnd is the cross-boundary proof for
+// #3020: it drives a REAL claudecode.Invoker — whose TraceStream seam injects a
+// genuine non-EOF read error against a real helper child — through the adapter's
+// sentinel path into the runner's REAL classifyErr, in one hop. Asserting each
+// layer in isolation would not prove the adapter->sentinel->classifier seam
+// actually yields err_class=trace_stream_read with category A retained.
+func TestClassifyErr_TraceStreamReadEndToEnd(t *testing.T) {
+	boom := errors.New("injected stdout pipe fault")
+	cc := claudecode.New("")
+	cc.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, os.Args[0],
+			"-test.run=TestHelperProcessAgentEnvDump", "--", agentEnvHelperMarker)
+	}
+	cc.TraceStream = func(io.Reader) io.Reader { return &traceErrInjectingReader{err: boom} }
+
+	res, err := cc.Invoke(context.Background(), agent.Invocation{RunID: "rid-e2e", Stage: "implement"})
+	if got := classifyErr(err); got != "trace_stream_read" {
+		t.Fatalf("classifyErr = %q, want trace_stream_read (err=%v)", got, err)
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A (retained so recovery still works)", res.FailureCategory)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("end-to-end error must not wrap ErrAgentFailed")
 	}
 }
 

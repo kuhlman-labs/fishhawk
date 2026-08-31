@@ -214,6 +214,12 @@ This makes a previously invisible boundary crossing (the #601 class) visible in 
 - **Residual gap.** It catches writes through the Write/Edit **tools** only. **Bash-mediated writes** (shell `>` redirects) are NOT visible to it. Closing that gap, and confining writes rather than merely surfacing them, is the OS-sandbox ADR's domain.
 - Containment is resolved against the target's deepest **existing** ancestor (the common case is a brand-new file that doesn't exist yet) and canonicalises symlinks first, so e.g. macOS's `/tmp` → `/private/tmp` symlink does not cause false positives.
 
+### Over-long trace line → `trace_stream_read` err_class (#3020)
+
+The agent adapters read the child's stream-json trace via `agent.TraceLineReader` (see `internal/agent/README.md`), which TRUNCATES a line whose content exceeds 4 MiB and continues, instead of the old `bufio.Scanner` behaviour where one over-long line (a large quoted diff) aborted the whole ~37-minute pass and misclassified it as an agent failure. A truncated line is surfaced as a `trace_line_truncated` event and is NEVER parsed, so it cannot fabricate a terminal result.
+
+A genuine non-EOF I/O error on the stdout pipe — which truncation cannot absorb — is reclassified off the agent: the peer sentinel `agent.ErrTraceStreamRead` maps to the `err_class=trace_stream_read` label on the `runner_completed` log line (`classifyErr` in `cmd/fishhawk-runner/main.go`), so the label names the READER rather than the agent. `Result.FailureCategory` stays **`"A"`** on that path, so every downstream category-A behaviour (stage retryability, the bundle signal) is unchanged — only the label moves off `agent_failed`.
+
 ### Acceptance-stage egress containment + target credentials (E31.4 / #1532, ADR-050)
 
 The acceptance stage is the one agent invocation that holds code execution, network access, and credentials at once, so the runner contains it (packages `internal/egressproxy` + `internal/acceptenv`; consumed by the E31.7 acceptance executor):
