@@ -277,6 +277,24 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+
+		// Per-stage budget tripwire (E48.55 / #2328). INSIDE the raw guard,
+		// AFTER the run-budget short-circuit: the runner POSTs a raw AND a
+		// redacted variant of the same bundle with identical signed token
+		// counts (#678), so evaluating outside this guard would re-sum on the
+		// redacted POST and can fire a spurious breach. On a BLOCKING breach the
+		// run is HALTED (cancelled) and we short-circuit here so no further
+		// stage is dispatched; an ADVISORY breach audits and returns false, so
+		// the stage advances normally.
+		if s.checkStageBudget(r.Context(), runID, stageID) {
+			s.writeJSON(w, r, http.StatusAccepted, traceUploadResponse{
+				RunID:       runID,
+				StageID:     stageID,
+				Variant:     string(variant),
+				ContentHash: contentHash,
+			})
+			return
+		}
 	}
 
 	// Advance the stage so the approval handler can act on it.
@@ -1693,6 +1711,16 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	// agent-reported `model`. Empty value/source means today's default spawn.
 	rm := s.resolvedImplementModelForRunID(ctx, runID)
 
+	// content_hash is the bundle-identity stamp per-stage cost summation dedups
+	// on (E48.55 / #2328). It is sha256Hex over the SAME bundleBytes the upload
+	// handler hashes (trace.go's contentHash), so the two values are
+	// byte-identical by construction — no signature change, no caller
+	// compile-break. A repeated raw POST of the same bundle (a runner retry, an
+	// operator re-POST) would otherwise append a SECOND cost_recorded row and
+	// let a naive stage sum manufacture a breach that never happened;
+	// sumStageCostUSD counts each distinct content_hash at most once.
+	ch := sha256Hex(bundleBytes)
+
 	// cache_read_input_tokens / cache_write_input_tokens are added ADDITIVELY
 	// (#1349) alongside the unchanged input_tokens (FRESH/cache-exclusive) and
 	// output_tokens keys, so the read/write split is on the ledger and
@@ -1711,6 +1739,7 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 		"estimated":                true,
 		"resolved_model":           rm.Value,
 		"resolved_model_source":    string(rm.Source),
+		"content_hash":             ch,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2742,6 +2771,264 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 		total += p.InputTokens + p.OutputTokens + p.CacheReadInputTokens + p.CacheWriteInputTokens
 	}
 	return total
+}
+
+// sumStageCostUSD totals the US$ cost of a SINGLE stage's cost_recorded audit
+// entries (E48.55 / #2328). It reads the run's cost_recorded ledger via
+// ListForRunByCategory (there is no stage-scoped query, so the per-stage filter
+// is applied in Go over e.StageID) and accumulates ONLY entries whose StageID
+// matches, so one stage's spend never leaks into another's ceiling.
+//
+// Idempotency: a repeated raw POST of the same bundle appends a second
+// cost_recorded row (the upload handler does not dedup), so the sum counts each
+// DISTINCT non-empty content_hash AT MOST ONCE. An entry with an EMPTY
+// content_hash (a legacy row written before #2328) is counted INDIVIDUALLY —
+// legacy rows carry no identity, so we cannot dedup them and we do not pretend
+// to; that is the honest degrade.
+//
+// Best-effort, matching sumRunTokens: a list failure or an unparsable payload
+// contributes 0 rather than unwinding the upload, so the stage tripwire fails
+// OPEN (a missed ceiling) rather than false-halting a healthy run on a read
+// error.
+func (s *Server) sumStageCostUSD(ctx context.Context, runID, stageID uuid.UUID) float64 {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "cost_recorded")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: list cost_recorded entries failed — stage total may be low",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return 0
+	}
+	var total float64
+	seen := map[string]struct{}{}
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p struct {
+			USD         float64 `json:"usd"`
+			ContentHash string  `json:"content_hash"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.ContentHash != "" {
+			if _, dup := seen[p.ContentHash]; dup {
+				continue
+			}
+			seen[p.ContentHash] = struct{}{}
+		}
+		total += p.USD
+	}
+	return total
+}
+
+// specStageForRunStage resolves a runtime stage row to its workflow-spec stage
+// by TYPE ORDINAL: the k-th runtime row of type T resolves to the k-th spec
+// stage of type T (E48.55 / #2328). It is a literal generalisation of the
+// already-shipped, already-tested deployStageForRunStage (approvals.go) from
+// the deploy type to ANY type — see that function's doc comment, which
+// documents this exact hazard.
+//
+// WHY ordinal, not stage.Sequence-as-spec-index: two production paths build a
+// run's stages from a plan-FILTERED subset of the spec (webhook/dispatcher.go
+// CI-retry children and server/recover.go recovery children, both via
+// webhook.FilterOutPlanStages), which renumbers Sequence densely from 0 over
+// the subset. FilterOutPlanStages drops ONLY plan stages and PRESERVES relative
+// order, and webhook.CreateStagesFromSpec creates exactly one row per spec
+// stage in spec order, so the k-th row of a type is ALWAYS the k-th spec stage
+// of that type — under a subset filter and with repeated same-type stages,
+// which a type comparison alone cannot distinguish. An index-keyed lookup would
+// land on the wrong def (a different stage's ceiling) on a retry/recovery child.
+//
+// It sorts a COPY of rows by Sequence (ties broken by stage ID for a total,
+// stable order) rather than trusting repo order: the in-package fake
+// ListStagesForRun iterates a Go map, whose order is randomized.
+//
+// Returns ok=false on: a nil stage; a stage absent from rows; or a workflow
+// declaring fewer than k+1 stages of that type. Every ok=false FAILS OPEN at
+// the call site (enforce nothing), per the ruling that a missed ceiling is a
+// gap while a wrongly-enforced one cancels a healthy run.
+func specStageForRunStage(wf spec.Workflow, rows []*run.Stage, stage *run.Stage) (spec.Stage, bool) {
+	if stage == nil {
+		return spec.Stage{}, false
+	}
+	sorted := make([]*run.Stage, len(rows))
+	copy(sorted, rows)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Sequence != sorted[j].Sequence {
+			return sorted[i].Sequence < sorted[j].Sequence
+		}
+		return sorted[i].ID.String() < sorted[j].ID.String()
+	})
+	// k = the number of same-type rows preceding this stage in sorted order
+	// (its type ordinal). The walk also proves the stage is present in rows.
+	k := 0
+	found := false
+	for _, st := range sorted {
+		if st.ID == stage.ID {
+			found = true
+			break
+		}
+		if string(st.Type) == string(stage.Type) {
+			k++
+		}
+	}
+	if !found {
+		return spec.Stage{}, false
+	}
+	// Return the k-th spec stage of the same type. run.StageType and
+	// spec.StageType share identical string values, so compare as strings.
+	seen := 0
+	for _, sp := range wf.Stages {
+		if string(sp.Type) != string(stage.Type) {
+			continue
+		}
+		if seen == k {
+			return sp, true
+		}
+		seen++
+	}
+	return spec.Stage{}, false
+}
+
+// checkStageBudget enforces the per-stage cost ceiling (E48.55 / #2328): the
+// stage-scoped sibling of checkRunBudget. On a raw trace upload it resolves the
+// stage's spec definition, sums the stage's own cost_recorded ledger, and — for
+// a v2 spec with a positive limit_usd — compares the sum against the ceiling.
+// In BLOCKING mode a breach cancels the run (SYSTEM actor) and appends a
+// stage_budget_exceeded audit entry, then returns true so the caller
+// short-circuits stage advancement. In ADVISORY mode (the default, and what
+// this repo's own workflows declare on every agent stage) a breach appends the
+// audit entry, WARN-logs, and returns FALSE — the run PROCEEDS.
+//
+// Fail-open ladder (each returns false, the run proceeds): nil deps; GetStage
+// error; workflow-def unresolvable; ListStagesForRun error; the row's spec
+// stage unresolvable by type ordinal (the recovery-case fail-open); no
+// declared budget; spec major below 2 or a non-positive limit_usd (the
+// StageEnforcementApplies gate); or the sum under the ceiling. A missed ceiling
+// is a gap; a wrongly-enforced one cancels a healthy run, so the whole ladder
+// fails open.
+//
+// On a BLOCKING breach whose cancel transition fails it returns true WITHOUT
+// appending — a detected breach must never dispatch further work, but we must
+// not leave a stage_budget_exceeded entry for a run we could not halt (the
+// same transition-first / append-only-on-success ordering checkRunBudget uses).
+func (s *Server) checkStageBudget(ctx context.Context, runID, stageID uuid.UUID) bool {
+	// FIRST LINE: the evaluation probe (nil in production). Placed before any
+	// guard or read so a test counts EVALUATIONS, not breaches — which is what
+	// makes the raw-variant-only placement (#678) observable.
+	if s.stageBudgetProbe != nil {
+		s.stageBudgetProbe(stageID)
+	}
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return false
+	}
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: get stage failed — skipping ceiling",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	parsed, wf, _, _, ok, err := s.resolveRunWorkflowDef(ctx, runID)
+	if err != nil || !ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: resolve workflow def failed — skipping ceiling",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Bool("resolved", ok))
+		return false
+	}
+	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: list stages failed — skipping ceiling",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	def, ok := specStageForRunStage(wf, rows, stage)
+	if !ok {
+		// The recovery-case fail-open: the runtime row has no resolvable spec
+		// counterpart (absent from rows, or the workflow declares fewer stages
+		// of this type). Enforce nothing.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: stage has no resolvable spec definition — skipping ceiling",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("stage_type", string(stage.Type)))
+		return false
+	}
+	if def.Budget == nil {
+		return false
+	}
+	major := spec.VersionMajor(parsed.Version)
+	if !budget.StageEnforcementApplies(major, def.Budget.LimitUSD) {
+		return false
+	}
+	d := budget.EvaluateStage(s.sumStageCostUSD(ctx, runID, stageID), def.Budget.LimitUSD)
+	if !d.Over {
+		return false
+	}
+
+	blocking := def.Budget.Enforcement == spec.EnforcementBlocking
+	enforcement := string(spec.EnforcementAdvisory)
+	terminalState := ""
+	if blocking {
+		enforcement = string(spec.EnforcementBlocking)
+		terminalState = string(run.StateCancelled)
+		// TRANSITION FIRST: cancel the run before recording the breach. On a
+		// transition failure (already terminal or repo error) still return true
+		// — the breach is real, so no further work dispatches — but skip the
+		// append to avoid a stage_budget_exceeded entry for a run we could not
+		// halt.
+		if _, err := s.cfg.RunRepo.TransitionRun(ctx, runID, run.StateCancelled); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"stage budget: cancel transition failed — run already terminal or repo error",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+			return true
+		}
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":       stageID.String(),
+		"stage_type":     string(stage.Type),
+		"cost_usd_total": d.CostUSD,
+		"max_stage_usd":  d.LimitUSD,
+		"enforcement":    enforcement,
+		"terminal_state": terminalState,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: s.nowFunc().UTC(),
+		Category:  "stage_budget_exceeded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"stage budget: append stage_budget_exceeded audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"stage budget: per-stage ceiling breached",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.String("enforcement", enforcement),
+		slog.Float64("cost_usd_total", d.CostUSD),
+		slog.Float64("max_stage_usd", d.LimitUSD))
+	return blocking
 }
 
 // familyAggregationLimit bounds the ListRuns page the family-aggregation

@@ -98,6 +98,16 @@ type approvalRunRepo struct {
 	transitionErr  error
 	transitions    []approvalTransition
 	rejectionFails bool
+
+	// transitionRunEnabled makes TransitionRun functional (E48.55 / #2328).
+	// It defaults false so TransitionRun returns the same errors.New("not
+	// used") every existing caller (notably the checkRunBudget tests in
+	// budget_alert_test.go, which cannot be edited) sees today. When true,
+	// TransitionRun returns transitionRunErr if set, else mutates the seeded
+	// run row's State and records the transition in runTransitions.
+	transitionRunEnabled bool
+	transitionRunErr     error
+	runTransitions       []run.State
 }
 
 type approvalTransition struct {
@@ -231,8 +241,24 @@ func (r *approvalRunRepo) GetRunByIdempotencyKey(context.Context, string, string
 func (r *approvalRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, errors.New("not used")
 }
-func (r *approvalRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
-	return nil, errors.New("not used")
+func (r *approvalRunRepo) TransitionRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Default OFF: byte-for-byte the pre-#2328 behaviour so every existing
+	// caller (budget_alert_test.go's checkRunBudget tests) is unchanged.
+	if !r.transitionRunEnabled {
+		return nil, errors.New("not used")
+	}
+	if r.transitionRunErr != nil {
+		return nil, r.transitionRunErr
+	}
+	rn, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	rn.State = to
+	r.runTransitions = append(r.runTransitions, to)
+	return rn, nil
 }
 func (r *approvalRunRepo) RetryRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")
@@ -5522,6 +5548,18 @@ func (r *approvalRunRepo) seedStageOnRun(runID uuid.UUID, typ run.StageType, sta
 	}
 	r.mu.Lock()
 	r.stages[st.ID] = st
+	r.mu.Unlock()
+	return st
+}
+
+// seedStageOnRunSeq is seedStageOnRun with an explicit Sequence (E48.55 /
+// #2328). seedStageOnRun leaves every row at Sequence 0, but the type-ordinal
+// resolver sorts by Sequence, so the stage-budget tests seed distinct,
+// deliberate sequences to fix the sort order.
+func (r *approvalRunRepo) seedStageOnRunSeq(runID uuid.UUID, seq int, typ run.StageType, state run.StageState) *run.Stage {
+	st := r.seedStageOnRun(runID, typ, state)
+	r.mu.Lock()
+	st.Sequence = seq
 	r.mu.Unlock()
 	return st
 }

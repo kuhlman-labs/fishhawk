@@ -1102,10 +1102,19 @@ func (c Constraint) postHocKindName() string {
 // max_runtime_minutes. Use Runtime() to read the runtime cap without caring
 // which spelling a document used.
 //
-// DECODED ONLY (no consumer). No reader of Stage.Budget exists anywhere in the
-// repo today, and this slice adds none: it unifies the GRAMMAR only. Wiring a
-// consumer — stage-budget enforcement at the limit_usd ceiling — is #2328's
-// (E48.55) work. A future reader should learn that here rather than by grepping.
+// LimitUSD is now READ by the server's per-stage enforcement path (E48.55 /
+// #2328): at spec major 2 and above, a stage's summed cost_recorded spend is
+// compared against LimitUSD on each raw trace upload — enforcement: blocking
+// cancels the run, advisory (the default) audits only. See
+// backend/internal/server/trace.go's checkStageBudget and
+// backend/internal/budget/stagebudget.go.
+//
+// MaxTokens and MaxRuntime/MaxRuntimeMinutes remain DECLARED BUT UNENFORCED
+// (#2328). Under the cache-aware four-bucket token sum (ADR-044 / #1349) real
+// E52 runs show 43k–93k output tokens against 11M–25M cache-read tokens, so a
+// max_tokens: 500000 ceiling is breached by every stage of every run before it
+// does anything interesting; those numbers are calibration-pending, not
+// enforcement-pending. limit_usd is the ceiling that becomes real.
 type Budget struct {
 	MaxTokens         int `json:"max_tokens,omitempty" yaml:"max_tokens,omitempty"`
 	MaxRuntimeMinutes int `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty"`
@@ -1129,8 +1138,9 @@ type Budget struct {
 // carries a time.ParseDuration'd value (spec.Duration decodes via
 // time.ParseDuration), so its parse is byte-identical to the one
 // ResolveStageTimeout reads for executor.timeout / verify.timeout /
-// policy.max_stage_runtime. DECODED ONLY — see the Budget doc; no consumer
-// reads this yet.
+// policy.max_stage_runtime. DECLARED BUT UNENFORCED — see the Budget doc:
+// limit_usd is the enforced ceiling (#2328); the runtime cap is
+// calibration-pending, so no consumer reads this yet.
 func (b Budget) Runtime() time.Duration {
 	if b.MaxRuntime.Duration != 0 {
 		return b.MaxRuntime.Duration

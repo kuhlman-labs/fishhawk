@@ -7019,3 +7019,39 @@ func TestParseV2_GroomingStageRejectsDiffConstraint(t *testing.T) {
 		t.Errorf("Message = %q, want the produces-no-pull_request rejection", ve.Message)
 	}
 }
+
+// TestVersionMajor_ExportedDelegates pins the exported spec.VersionMajor
+// wrapper (E48.55 / #2328) that the server's stage-budget enforcement gates
+// on. Every input carries its OWN explicit expected value — no "the last N
+// return 0" shorthand — because a rule returning 0 for "2.3" would disarm
+// enforcement for every valid 2.x spec, the exact versions this feature
+// targets. Named to avoid the existing TestSpecVersionMajor (internal test).
+func TestVersionMajor_ExportedDelegates(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"0", 0},
+		{"0.7", 0},
+		{"1", 1},
+		{"1.6", 1},
+		{"2", 2},
+		{"2.0", 2},
+		{"2.3", 2}, // major 2 — must not disarm 2.x enforcement
+		{"3", 3},
+		{"10.1", 10},
+		{"1.2.3", 1},
+		{"abc", 0},
+		{"x.1", 0},
+		{"v2", 0},
+		{" 2", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := spec.VersionMajor(tc.in); got != tc.want {
+				t.Errorf("VersionMajor(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

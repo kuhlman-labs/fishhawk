@@ -866,6 +866,15 @@ type Server struct {
 	// fake to drive TTL expiry without sleeping or to fix the spend-alert hour.
 	nowFunc func() time.Time
 
+	// stageBudgetProbe is nil in production. When a test sets it, it is
+	// invoked at the TOP of checkStageBudget — before any read or guard — so
+	// the test can observe how many times the stage-budget check is EVALUATED
+	// rather than only its side effect. That is what makes the raw-variant-only
+	// placement (the runner POSTs a raw AND a redacted variant of the same
+	// bundle, #678) a falsifiable property: moving the call outside the raw
+	// guard makes this fire twice. No New() default installs it.
+	stageBudgetProbe func(stageID uuid.UUID)
+
 	// appBotIdentity{Mu,Resolved,Name,Email} memoize the GitHub App bot
 	// account's git commit identity (#722). The App slug and bot user-id are
 	// App-global and immutable for the process, so resolveAppBotIdentity runs

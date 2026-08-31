@@ -100,6 +100,16 @@ func EmbeddedSchemaHashV1() string { return embeddedSchemaHashes[1] }
 // detect v2 drift.
 func EmbeddedSchemaHashV2() string { return embeddedSchemaHashes[2] }
 
+// VersionMajor is the EXPORTED form of the same-package specVersionMajor
+// (validate.go), so out-of-package callers — the server's per-stage
+// stage-budget enforcement (E48.55 / #2328) — can gate on a spec's major
+// version without re-implementing the parse. It lives here in parse.go because
+// major-routing (schemaForVersion, computeSupportedMajors, the embeddedSchemas
+// table) already lives here. Semantics are unchanged and NOT re-derived: split
+// at the first '.', Atoi the leading part, return 0 on any parse failure or
+// empty string.
+func VersionMajor(version string) int { return specVersionMajor(version) }
+
 func mustCompileSchemas() map[int]*jsonschema.Schema {
 	out := make(map[int]*jsonschema.Schema, len(embeddedSchemas))
 	for _, es := range embeddedSchemas {
