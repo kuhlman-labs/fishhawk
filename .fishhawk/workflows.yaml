@@ -11,419 +11,30 @@
 # operator agent may do unattended, and an ordered list of stages, each
 # of which may declare an executor, reviewers, constraints, a budget and
 # gates. A gate is where the run stops and waits for a decision.
+#
+# The workflows are declared in the order a development cycle runs
+# them, so the file reads top to bottom as one turn of the loop:
+#
+#   backlog_grooming   decide what to build
+#   feature_change     build it — plan, implement, verify, approve
+#   routine_change     the low-risk variant the agent carries alone
+#   human_led_change   the variant a human writes and the log records
+#   release            ship it
+#
+# Key order in a YAML mapping carries no meaning to the parser, so this
+# ordering is for the reader. Stage order within a workflow is a
+# different matter — stages run in the order they are declared, and a
+# stage may only consume an artifact from one declared before it.
 
 version: "2"
 workflows:
   # ---------------------------------------------------------------------------
-  # feature_change — the default workflow for product work.
+  # backlog_grooming — decide what to build.
   #
-  # The agent plans and implements; agent reviewers read both the plan and
-  # the resulting diff; a human approves at two points; an acceptance agent
-  # validates the running candidate against the plan before merge.
-  # ---------------------------------------------------------------------------
-  feature_change:
-    # No `applies_to` on purpose. This is the catch-all workflow — where
-    # anything that does not fit a narrower one belongs — so any routing
-    # envelope would either be wide enough to say nothing or would refuse
-    # legitimate work. An absent `applies_to` accepts any change, which is
-    # the accurate statement of intent.
-    description: >-
-      Default workflow for feature work and non-trivial changes. The agent plans and implements; a human approves the plan and the pull request; an acceptance agent validates the running candidate against the approved plan's acceptance criteria before merge.
-    # Auto-advance mechanical transitions (review settlement, fix-up
-    # re-park, derived merge-readiness) instead of parking on each one, and
-    # surface the next action. Judgment points still stop for a decision.
-    auto_advance: true
-    # Delegation tier for the operator agent. `high` lets it approve on a
-    # clean dual review, route a fix-up on convergent concerns, retry an
-    # infrastructure flake, waive a lone low-severity concern, and merge
-    # once gates are resolved and CI is green. Anything outside those
-    # conditions still pages a human, as does every event in the tier's
-    # page list (a gating reviewer reject, a plan rejection, a scope
-    # amendment, a budget or policy override, an exception request, a
-    # requirement arbitration).
-    autonomy: high
-    # Per-path escalations: a change touching a listed path gets a stricter
-    # policy than the workflow's own. These are the surfaces where a defect
-    # is hardest to detect after the fact — the spec parser and validator,
-    # the audit log, the policy engine, and the auth surfaces — so agent
-    # autonomy is clamped for them.
-    #
-    # `max_autonomy: medium` keeps approve, fix-up and retry delegated but
-    # returns waive and merge to a human: an agent may not waive a concern
-    # or merge its own change on this code. An escalation may only ever
-    # raise the bar, never lower it, and one that would change nothing is
-    # refused at validation.
-    #
-    # Deliberately no `approvals` raise alongside it. Raising the count to
-    # two would be honest about intent and dishonest about capability: this
-    # repository has one eligible approver, so a count of two is
-    # unsatisfiable and every escalated run would stop at a gate no one can
-    # clear. A control that cannot be satisfied is not a stricter control,
-    # it is an outage. Add `approvals: {count: 2}` here once a second
-    # approver exists.
-    #
-    # `match.paths` is evaluated against the approved plan's declared file
-    # scope at the approval gate, so it is only meaningful on a workflow
-    # that declares a plan stage. Declaring it on one that does not is
-    # refused at validation rather than silently never firing.
-    escalations:
-      - match:
-          paths:
-            - "backend/internal/spec/**"
-            - "cli/internal/spec/**"
-            - "backend/internal/audit/**"
-            - "backend/internal/policy/**"
-            - "backend/internal/auth/**"
-            - "backend/internal/githubapp/**"
-            - "verifier/**"
-        require:
-          max_autonomy: medium
-    policy:
-      max_stage_runtime: "30m"
-    # Periodic cost ceiling. Advisory: it emits an alert to the audit log
-    # and the originating issue at the warn threshold and again at 100%,
-    # and never blocks a run. Set `enforcement: blocking` to refuse new
-    # runs once the period limit is exhausted.
-    budgets:
-      - period: weekly
-        limit_usd: 1000
-        warn_at: 0.8
-        enforcement: advisory
-    # Re-dispatch the implement stage once if a required CI check fails.
-    # A routine test or lint regression is the agent's to fix; one retry
-    # is resilience to a flaky check without spinning on a real bug.
-    on_ci_failure:
-      max_retries: 1
-    stages:
-      - id: plan
-        type: plan
-        executor:
-          agent: claude-code
-          # The plan stage is the cheapest agent stage and plan quality is
-          # the strongest lever on downstream rework, so it pins the most
-          # capable model rather than taking the deployment default.
-          model: claude-opus-5
-        # Advisory plan review: agent reviewers surface verdicts before the
-        # human gate below, which stays authoritative (agent reviewers plus
-        # a human reviewer resolves to advisory authority). Two providers
-        # review concurrently — independent models disagree in useful ways,
-        # and a concern only one of them raises is still surfaced.
-        reviewers:
-          agents:
-            - provider: claudecode
-              model: claude-fable-5
-            - provider: codex
-              model: gpt-5.6-sol
-              reasoning_effort: high
-          human: 1
-        inputs:
-          - source: github_issue
-            required: true
-        produces:
-          - artifact: plan
-            schema: standard_v1
-            # The plan is rendered as a comment on the originating issue so
-            # it can be read in context, and written to the audit log as the
-            # canonical copy the later stages are checked against.
-            persistence:
-              - target: originating_issue
-                mode: rendered_comment
-                update_on_change: true
-              - target: fishhawk_audit_log
-                mode: canonical
-        budget:
-          max_tokens: 200000
-          max_runtime: 15m
-          enforcement: advisory
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              members: [kuhlman-labs]
-              # Exclude the change's author and any agent identity. Taking
-              # part in the loop — answering a clarification, attaching
-              # approval conditions, driving a stage — is not authorship, so
-              # this does not lock out the sole approver; it bites only on a
-              # real authorship signal such as an operator-vouched commit.
-              not: [author, agent]
-      - id: implement
-        type: implement
-        executor:
-          agent: claude-code
-          # Execution-grounded verifier. After the agent exits, run the
-          # project's test command against the committed, scope-only tree
-          # (not the working tree). On failure, feed the captured output
-          # back to the agent for a bounded fix loop and re-verify, all
-          # before the pull request opens — so a defect is fixed while the
-          # agent is still live rather than red-lining CI after it is gone.
-          #
-          # `scripts/test verify` runs lint before the race-detector test
-          # loop, so a formatting or lint defect fails here too.
-          # max_iterations: 1 allows a single fix attempt; 0, or removing
-          # this block, makes the stage single-shot.
-          verify:
-            command: "scripts/test verify"
-            timeout: "15m"
-            max_iterations: 1
-        # Advisory implement review: the same two providers read the diff
-        # against the approved plan and surface verdicts, including a
-        # scope-drift flag when the diff exceeds what the plan declared.
-        # Verdicts land shortly after the stage's trace is uploaded. This is
-        # the last quality gate before merge, so it runs the most capable
-        # reviewer models.
-        reviewers:
-          agents:
-            - provider: claudecode
-              model: claude-fable-5
-            - provider: codex
-              model: gpt-5.6-sol
-              reasoning_effort: high
-          human: 1
-        inputs:
-          - artifact: plan
-            from_stage: plan
-        produces:
-          - artifact: pull_request
-        constraints:
-          # Post-hoc diff constraints, checked against the produced pull
-          # request. A change larger than this cap fails the stage rather
-          # than merging unreviewably wide; if a change is genuinely
-          # irreducible past it, raise the cap here as a tracked, reverted
-          # exception rather than leaving it loose. An approval-time scope
-          # override does not reach this constraint — the spec is the only
-          # lever that moves it.
-          max_files_changed: 45
-          # Paths the stage may not rewrite. The CI workflow directory is
-          # what executes the agent and this spec directory is what governs
-          # it, so neither is the agent's to edit — an agent able to change
-          # them could widen its own permissions inside the very change it
-          # is proposing. The legal files are neither, but are likewise not
-          # the agent's to edit.
-          forbidden_paths:
-            - ".github/workflows/**"
-            - ".fishhawk/**"
-            - "LICENSE"
-            - "NOTICE"
-          required_outcomes:
-            - tests_added_or_updated
-            - ci_green
-        budget:
-          max_tokens: 500000
-          max_runtime: 30m
-          enforcement: advisory
-      - id: review
-        type: review
-        executor:
-          human: true
-        inputs:
-          - artifact: pull_request
-            from_stage: implement
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              members: [kuhlman-labs]
-              # Same predicate as the plan gate: one approval, excluding the
-              # author and any agent identity.
-              not: [author, agent]
-      # Acceptance: does the change actually do what the plan promised?
-      #
-      # The acceptance agent exercises the running candidate against the
-      # approved plan's acceptance criteria and submits a signed verdict.
-      # A failing verdict does not fail the stage — it routes to the right
-      # remedy instead (a fix-up for a code defect, a re-run for a flaky
-      # check, a page for anything the loop cannot classify), and merge
-      # stays conditioned on a passing or explicitly arbitrated result.
-      - id: acceptance
-        type: acceptance
-        executor:
-          # An acceptance stage must run under an agent or human executor.
-          agent: claude-code
-        inputs:
-          - artifact: plan
-            from_stage: plan
-          - artifact: pull_request
-            from_stage: implement
-        # The acceptance agent's network egress is default-deny. This is the
-        # one allowance the workflow declares: the host serving the preview
-        # instance under test. The model API endpoint and the Fishhawk
-        # backend are added by the runner and are not declarable here.
-        # Hosts, not URLs — no scheme and no path.
-        egress:
-          target_hosts:
-            - localhost:8090
-        # A durable record of the verdict, the per-criterion results, and
-        # content-hash references to the captured evidence. Valid only on an
-        # acceptance stage.
-        produces:
-          - artifact: acceptance
-        budget:
-          max_tokens: 200000
-          max_runtime: 20m
-          enforcement: advisory
-
-  # ---------------------------------------------------------------------------
-  # human_led_change — a human writes the code; the workflow records it.
-  #
-  # For load-bearing surfaces (cryptography, the policy engine, audit
-  # integrity, forge app authentication) where the author is a person, not
-  # an agent. The workflow exists so the change still lands in the audit
-  # log with a recorded approver, not to delegate anything.
-  # ---------------------------------------------------------------------------
-  human_led_change:
-    # No `applies_to` on purpose. This workflow is the escape hatch for the
-    # riskiest surfaces, and a routing envelope would refuse a change that
-    # belongs here for a bookkeeping reason — refusing the safest route is
-    # the wrong failure direction. A path envelope would express the intent
-    # exactly, but paths are evaluated at a plan gate and this workflow
-    # declares no plan stage.
-    description: >-
-      Workflow for human-authored changes to load-bearing surfaces (cryptography, policy engine, audit integrity, forge app authentication). The audit log records what was changed and who approved it.
-    # Advance the mechanical transitions automatically. Nothing is delegated
-    # here — with no `autonomy` declared, every action class defaults to
-    # gated — so this only removes bookkeeping stops, not decisions.
-    auto_advance: true
-    stages:
-      - id: review
-        type: review
-        executor:
-          human: true
-        inputs:
-          - source: pull_request
-            required: true
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              members: [kuhlman-labs]
-              not: [author, agent]
-
-  # ---------------------------------------------------------------------------
-  # routine_change — low-risk, high-volume work the agent carries to merge.
-  #
-  # Documentation, dependency bumps, formatting fixes and tests for existing
-  # behavior: changes where the cost of a mistake is contained and CI is a
-  # sufficient check. No human approval gate at all.
-  # ---------------------------------------------------------------------------
-  routine_change:
-    # This is the workflow that permits an agent merge, so what may be
-    # routed here is a real governance question rather than a habit. The
-    # label envelope is enforced at run admission on every entry point: a
-    # change must be filed as a chore to be routed here, and anything else
-    # is refused before any work begins. Expect it to refuse something
-    # eventually — that is the control working, and the fix is amending
-    # this file rather than reaching for a routing override.
-    #
-    # No `paths` envelope here. A path predicate is evaluated at the plan
-    # gate and this workflow declares no plan stage, so it could never be
-    # evaluated and is refused at validation. The path envelope for this
-    # workflow is the implement stage's `allowed_paths` below, which is a
-    # post-hoc diff constraint: it catches a violation after the agent has
-    # run rather than refusing it at routing.
-    applies_to:
-      labels: ["type:chore"]
-    description: >-
-      Workflow for documentation, dependency bumps, lint and format fixes, and tests for existing behavior. The agent may merge once all gates pass.
-    auto_advance: true
-    # The agent carries the change to merge unattended. Nothing was
-    # human-approved upstream, so the delegation has to cover the whole
-    # path: approve, fix-up, retry, waive a lone low-severity concern, and
-    # merge once CI is green. The `allowed_paths` constraint below, not a
-    # human, is what bounds the blast radius.
-    autonomy: high
-    # Self-healing is the point here: nothing was human-approved, so the
-    # agent's job is to keep the change merging cleanly. One retry balances
-    # resilience to a flaky check against spinning on a real bug.
-    on_ci_failure:
-      max_retries: 1
-    stages:
-      - id: implement
-        type: implement
-        executor:
-          agent: claude-code
-        produces:
-          - artifact: pull_request
-        constraints:
-          max_files_changed: 20
-          # An allow-list, not a deny-list: on a workflow that merges
-          # without human approval, anything not named here fails the stage.
-          allowed_paths:
-            - "docs/**"
-            - "**/*.md"
-            - "go.mod"
-            - "go.sum"
-            - "**/*_test.go"
-          required_outcomes:
-            - ci_green
-      - id: review
-        type: review
-        executor:
-          agent: claude-code
-        gates:
-          # A `check` gate carries no approval predicate: it lets the run
-          # advance once the forge's own branch protection is satisfied.
-          # Merge readiness is owned there rather than restated here, so the
-          # two cannot disagree.
-          - type: check
-
-  # ---------------------------------------------------------------------------
-  # release — delegating deploy.
-  #
-  # Fishhawk holds no deploy logic and no deploy credentials. This stage
-  # triggers an external pipeline, passing the run and stage identifiers the
-  # pipeline echoes back for correlation, then monitors it to a terminal
-  # state and records a deployment artifact and audit trail. Operator-
-  # triggered once the corresponding feature_change run has merged.
-  #
-  # `required_upstream` is deliberately omitted: it evaluates the current
-  # run's own implement and review state, which a deploy-only release run
-  # does not have, so declaring it would fail closed on every release. The
-  # approval gate below is the control point, and the operator confirms the
-  # change merged before triggering.
-  # ---------------------------------------------------------------------------
-  release:
-    # No `applies_to`. The natural envelope is a trigger predicate, but
-    # every trigger source in use today normalizes to `diff`, so a trigger
-    # declaration cannot yet distinguish an operator-triggered release from
-    # anything else — it would match nothing and refuse every real run.
-    description: >-
-      Delegating deploy workflow: triggers an external release pipeline and monitors it to a terminal state. Fishhawk holds no deploy logic or credentials. Operator-triggered after the corresponding feature_change run merges.
-    auto_advance: true
-    # No `autonomy` and therefore no delegation: a production deploy always
-    # pages a human at the gate below, whatever the rest of the file allows.
-    policy:
-      max_stage_runtime: "30m"
-    stages:
-      - id: deploy
-        type: deploy
-        # A deploy stage must delegate — it takes no agent or human
-        # executor. Fishhawk dispatches the named pipeline and watches it.
-        executor:
-          delegate:
-            target: github_actions
-            workflow_ref: deploy.yml
-            git_ref: main
-        # Pre-flight constraints, evaluated at the gate before anything is
-        # dispatched. `change_freeze: false` declares the surface without
-        # blocking; set it to true to hold releases.
-        constraints:
-          allowed_environments: [staging, production]
-          change_freeze: false
-        produces:
-          - artifact: deployment
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              members: [kuhlman-labs]
-              not: [author, agent]
-
-  # ---------------------------------------------------------------------------
-  # backlog_grooming — propose a ranking, gate it, apply it.
-  #
-  # A workflow that produces no code at any stage. It reads the backlog
-  # against a checked-in charter, proposes a report, and applies the
-  # approved mutations to the tracker.
+  # The cycle starts before any code: what is worth doing next, and in
+  # what order? This workflow reads the backlog against a checked-in
+  # charter, proposes a ranking, and applies the approved mutations to
+  # the tracker. It produces no code at any stage.
   #
   # Nothing here can auto-close an issue, and that is structural rather
   # than a default: `ordering`, `dedup` and `scoping` are registered as
@@ -534,3 +145,438 @@ workflows:
               count: 1
               members: [kuhlman-labs]
               not: [agent]
+
+  # ---------------------------------------------------------------------------
+  # feature_change — build it. The default workflow for product work.
+  #
+  # One turn of the development cycle, in the order the work actually
+  # happens:
+  #
+  #   plan       propose an approach; agent reviewers advise, a human approves
+  #   implement  write the code, verify it, open a pull request
+  #   acceptance validate the running candidate against the plan's criteria
+  #   review     a human approves the change, verdict already in hand
+  #
+  # Verification precedes approval on purpose. The acceptance verdict is
+  # evidence the reviewer needs, so producing it before the gate means the
+  # human decides once, with the result, rather than approving and then
+  # waiting to learn whether the change actually worked.
+  # ---------------------------------------------------------------------------
+  feature_change:
+    # No `applies_to` on purpose. This is the catch-all workflow — where
+    # anything that does not fit a narrower one belongs — so any routing
+    # envelope would either be wide enough to say nothing or would refuse
+    # legitimate work. An absent `applies_to` accepts any change, which is
+    # the accurate statement of intent.
+    description: >-
+      Default workflow for feature work and non-trivial changes. The agent plans and implements; an acceptance agent validates the running candidate against the approved plan's acceptance criteria; a human approves the plan up front and the pull request at the end.
+    # Auto-advance mechanical transitions (review settlement, fix-up
+    # re-park, derived merge-readiness) instead of parking on each one, and
+    # surface the next action. Judgment points still stop for a decision.
+    auto_advance: true
+    # Delegation tier for the operator agent. `high` lets it approve on a
+    # clean dual review, route a fix-up on convergent concerns, retry an
+    # infrastructure flake, waive a lone low-severity concern, and merge
+    # once gates are resolved and CI is green. Anything outside those
+    # conditions still pages a human, as does every event in the tier's
+    # page list (a gating reviewer reject, a plan rejection, a scope
+    # amendment, a budget or policy override, an exception request, a
+    # requirement arbitration).
+    autonomy: high
+    # Per-path escalations: a change touching a listed path gets a stricter
+    # policy than the workflow's own. These are the surfaces where a defect
+    # is hardest to detect after the fact — the spec parser and validator,
+    # the audit log, the policy engine, and the auth surfaces — so agent
+    # autonomy is clamped for them.
+    #
+    # `max_autonomy: medium` keeps approve, fix-up and retry delegated but
+    # returns waive and merge to a human: an agent may not waive a concern
+    # or merge its own change on this code. An escalation may only ever
+    # raise the bar, never lower it, and one that would change nothing is
+    # refused at validation.
+    #
+    # Deliberately no `approvals` raise alongside it. Raising the count to
+    # two would be honest about intent and dishonest about capability: this
+    # repository has one eligible approver, so a count of two is
+    # unsatisfiable and every escalated run would stop at a gate no one can
+    # clear. A control that cannot be satisfied is not a stricter control,
+    # it is an outage. Add `approvals: {count: 2}` here once a second
+    # approver exists.
+    #
+    # `match.paths` is evaluated against the approved plan's declared file
+    # scope at the approval gate, so it is only meaningful on a workflow
+    # that declares a plan stage. Declaring it on one that does not is
+    # refused at validation rather than silently never firing.
+    escalations:
+      - match:
+          paths:
+            - "backend/internal/spec/**"
+            - "cli/internal/spec/**"
+            - "backend/internal/audit/**"
+            - "backend/internal/policy/**"
+            - "backend/internal/auth/**"
+            - "backend/internal/githubapp/**"
+            - "verifier/**"
+        require:
+          max_autonomy: medium
+    policy:
+      max_stage_runtime: "30m"
+    # Periodic cost ceiling. Advisory: it emits an alert to the audit log
+    # and the originating issue at the warn threshold and again at 100%,
+    # and never blocks a run. Set `enforcement: blocking` to refuse new
+    # runs once the period limit is exhausted.
+    budgets:
+      - period: weekly
+        limit_usd: 1000
+        warn_at: 0.8
+        enforcement: advisory
+    # Re-dispatch the implement stage once if a required CI check fails.
+    # A routine test or lint regression is the agent's to fix; one retry
+    # is resilience to a flaky check without spinning on a real bug.
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      # 1. Plan — propose an approach before writing anything.
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          # The plan stage is the cheapest agent stage and plan quality is
+          # the strongest lever on downstream rework, so it pins the most
+          # capable model rather than taking the deployment default.
+          model: claude-opus-5
+        # Advisory plan review: agent reviewers surface verdicts before the
+        # human gate below, which stays authoritative (agent reviewers plus
+        # a human reviewer resolves to advisory authority). Two providers
+        # review concurrently — independent models disagree in useful ways,
+        # and a concern only one of them raises is still surfaced.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-fable-5
+            - provider: codex
+              model: gpt-5.6-sol
+              reasoning_effort: high
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            # The plan is rendered as a comment on the originating issue so
+            # it can be read in context, and written to the audit log as the
+            # canonical copy the later stages are checked against.
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime: 15m
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Exclude the change's author and any agent identity. Taking
+              # part in the loop — answering a clarification, attaching
+              # approval conditions, driving a stage — is not authorship, so
+              # this does not lock out the sole approver; it bites only on a
+              # real authorship signal such as an operator-vouched commit.
+              not: [author, agent]
+
+      # 2. Implement — write the code against the approved plan and open
+      #    the pull request.
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          # Execution-grounded verifier. After the agent exits, run the
+          # project's test command against the committed, scope-only tree
+          # (not the working tree). On failure, feed the captured output
+          # back to the agent for a bounded fix loop and re-verify, all
+          # before the pull request opens — so a defect is fixed while the
+          # agent is still live rather than red-lining CI after it is gone.
+          #
+          # `scripts/test verify` runs lint before the race-detector test
+          # loop, so a formatting or lint defect fails here too.
+          # max_iterations: 1 allows a single fix attempt; 0, or removing
+          # this block, makes the stage single-shot.
+          verify:
+            command: "scripts/test verify"
+            timeout: "15m"
+            max_iterations: 1
+        # Advisory implement review: the same two providers read the diff
+        # against the approved plan and surface verdicts, including a
+        # scope-drift flag when the diff exceeds what the plan declared.
+        # Verdicts land shortly after the stage's trace is uploaded.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-fable-5
+            - provider: codex
+              model: gpt-5.6-sol
+              reasoning_effort: high
+          human: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          # Post-hoc diff constraints, checked against the produced pull
+          # request. A change larger than this cap fails the stage rather
+          # than merging unreviewably wide; if a change is genuinely
+          # irreducible past it, raise the cap here as a tracked, reverted
+          # exception rather than leaving it loose. An approval-time scope
+          # override does not reach this constraint — the spec is the only
+          # lever that moves it.
+          max_files_changed: 45
+          # Paths the stage may not rewrite. The CI workflow directory is
+          # what executes the agent and this spec directory is what governs
+          # it, so neither is the agent's to edit — an agent able to change
+          # them could widen its own permissions inside the very change it
+          # is proposing. The legal files are neither, but are likewise not
+          # the agent's to edit.
+          forbidden_paths:
+            - ".github/workflows/**"
+            - ".fishhawk/**"
+            - "LICENSE"
+            - "NOTICE"
+          required_outcomes:
+            - tests_added_or_updated
+            - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime: 30m
+          enforcement: advisory
+
+      # 3. Acceptance — does the change actually do what the plan promised?
+      #
+      # The acceptance agent exercises the running candidate against the
+      # approved plan's acceptance criteria and submits a signed verdict
+      # with evidence. It runs before the review gate so the reviewer
+      # decides with that verdict in hand.
+      #
+      # A failing verdict does not fail the stage — it routes to the right
+      # remedy instead (a fix-up for a code defect, a re-run for a flaky
+      # check, a page for anything the loop cannot classify), and merge
+      # stays conditioned on a passing or explicitly arbitrated result.
+      - id: acceptance
+        type: acceptance
+        executor:
+          # An acceptance stage must run under an agent or human executor.
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        # The acceptance agent's network egress is default-deny. This is the
+        # one allowance the workflow declares: the host serving the preview
+        # instance under test. The model API endpoint and the Fishhawk
+        # backend are added by the runner and are not declarable here.
+        # Hosts, not URLs — no scheme and no path.
+        egress:
+          target_hosts:
+            - localhost:8090
+        # A durable record of the verdict, the per-criterion results, and
+        # content-hash references to the captured evidence. Valid only on an
+        # acceptance stage.
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 200000
+          max_runtime: 20m
+          enforcement: advisory
+
+      # 4. Review — the last gate before merge. By the time a human reads
+      #    this, the plan was approved, the diff was reviewed by two agent
+      #    reviewers, the test command ran against the committed tree, and
+      #    the acceptance verdict is recorded. The decision is whether to
+      #    ship, not whether it works.
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Same predicate as the plan gate: one approval, excluding the
+              # author and any agent identity.
+              not: [author, agent]
+
+  # ---------------------------------------------------------------------------
+  # routine_change — the same cycle, compressed.
+  #
+  # Documentation, dependency bumps, formatting fixes and tests for existing
+  # behavior: changes where the cost of a mistake is contained and CI is a
+  # sufficient check. No plan stage and no human approval gate — implement,
+  # then let branch protection decide.
+  # ---------------------------------------------------------------------------
+  routine_change:
+    # This is the workflow that permits an agent merge, so what may be
+    # routed here is a real governance question rather than a habit. The
+    # label envelope is enforced at run admission on every entry point: a
+    # change must be filed as a chore to be routed here, and anything else
+    # is refused before any work begins. Expect it to refuse something
+    # eventually — that is the control working, and the fix is amending
+    # this file rather than reaching for a routing override.
+    #
+    # No `paths` envelope here. A path predicate is evaluated at the plan
+    # gate and this workflow declares no plan stage, so it could never be
+    # evaluated and is refused at validation. The path envelope for this
+    # workflow is the implement stage's `allowed_paths` below, which is a
+    # post-hoc diff constraint: it catches a violation after the agent has
+    # run rather than refusing it at routing.
+    applies_to:
+      labels: ["type:chore"]
+    description: >-
+      Workflow for documentation, dependency bumps, lint and format fixes, and tests for existing behavior. The agent may merge once all gates pass.
+    auto_advance: true
+    # The agent carries the change to merge unattended. Nothing was
+    # human-approved upstream, so the delegation has to cover the whole
+    # path: approve, fix-up, retry, waive a lone low-severity concern, and
+    # merge once CI is green. The `allowed_paths` constraint below, not a
+    # human, is what bounds the blast radius.
+    autonomy: high
+    # Self-healing is the point here: nothing was human-approved, so the
+    # agent's job is to keep the change merging cleanly. One retry balances
+    # resilience to a flaky check against spinning on a real bug.
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      # 1. Implement — no plan stage: for work this small the diff is the
+      #    proposal, and the allow-list below is what bounds it.
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        constraints:
+          max_files_changed: 20
+          # An allow-list, not a deny-list: on a workflow that merges
+          # without human approval, anything not named here fails the stage.
+          allowed_paths:
+            - "docs/**"
+            - "**/*.md"
+            - "go.mod"
+            - "go.sum"
+            - "**/*_test.go"
+          required_outcomes:
+            - ci_green
+      # 2. Review — the gate, held by CI rather than a person.
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+        gates:
+          # A `check` gate carries no approval predicate: it lets the run
+          # advance once the forge's own branch protection is satisfied.
+          # Merge readiness is owned there rather than restated here, so the
+          # two cannot disagree.
+          - type: check
+
+  # ---------------------------------------------------------------------------
+  # human_led_change — the cycle inverted: a human writes the code, and the
+  # workflow records it.
+  #
+  # For load-bearing surfaces (cryptography, the policy engine, audit
+  # integrity, forge app authentication) where the author is a person, not
+  # an agent. There is no plan or implement stage because neither is the
+  # agent's to run; what remains is the gate and the audit trail.
+  # ---------------------------------------------------------------------------
+  human_led_change:
+    # No `applies_to` on purpose. This workflow is the escape hatch for the
+    # riskiest surfaces, and a routing envelope would refuse a change that
+    # belongs here for a bookkeeping reason — refusing the safest route is
+    # the wrong failure direction. A path envelope would express the intent
+    # exactly, but paths are evaluated at a plan gate and this workflow
+    # declares no plan stage.
+    description: >-
+      Workflow for human-authored changes to load-bearing surfaces (cryptography, policy engine, audit integrity, forge app authentication). The audit log records what was changed and who approved it.
+    # Advance the mechanical transitions automatically. Nothing is delegated
+    # here — with no `autonomy` declared, every action class defaults to
+    # gated — so this only removes bookkeeping stops, not decisions.
+    auto_advance: true
+    stages:
+      # The only stage: a gate on a pull request a person already wrote.
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - source: pull_request
+            required: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              not: [author, agent]
+
+  # ---------------------------------------------------------------------------
+  # release — ship it. The last step of the cycle, and a separate run.
+  #
+  # Fishhawk holds no deploy logic and no deploy credentials. This stage
+  # triggers an external pipeline, passing the run and stage identifiers the
+  # pipeline echoes back for correlation, then monitors it to a terminal
+  # state and records a deployment artifact and audit trail.
+  #
+  # It is deliberately its own workflow rather than a fifth stage on
+  # feature_change: a release usually ships several merged changes at once,
+  # and tying the deploy to one feature run would force a one-to-one that
+  # does not hold. The operator triggers it once the changes have merged.
+  #
+  # `required_upstream` is likewise omitted: it evaluates the current run's
+  # own implement and review state, which a deploy-only release run does not
+  # have, so declaring it would fail closed on every release. The approval
+  # gate below is the control point, and the operator confirms the changes
+  # merged before triggering.
+  # ---------------------------------------------------------------------------
+  release:
+    # No `applies_to`. The natural envelope is a trigger predicate, but
+    # every trigger source in use today normalizes to `diff`, so a trigger
+    # declaration cannot yet distinguish an operator-triggered release from
+    # anything else — it would match nothing and refuse every real run.
+    description: >-
+      Delegating deploy workflow: triggers an external release pipeline and monitors it to a terminal state. Fishhawk holds no deploy logic or credentials. Operator-triggered after the corresponding feature_change runs merge.
+    auto_advance: true
+    # No `autonomy` and therefore no delegation: a production deploy always
+    # pages a human at the gate below, whatever the rest of the file allows.
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: deploy
+        type: deploy
+        # A deploy stage must delegate — it takes no agent or human
+        # executor. Fishhawk dispatches the named pipeline and watches it.
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        # Pre-flight constraints, evaluated at the gate before anything is
+        # dispatched. `change_freeze: false` declares the surface without
+        # blocking; set it to true to hold releases.
+        constraints:
+          allowed_environments: [staging, production]
+          change_freeze: false
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              not: [author, agent]
