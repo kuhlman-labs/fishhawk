@@ -348,6 +348,21 @@ func TestDependsEdgeTargetRef(t *testing.T) {
 			t.Errorf("TargetRef len = %d, want <= %d (a non-hex digest must not blow up the render)", len(got), ceiling)
 		}
 	})
+	t.Run("exact-length non-hex digest falls back to the sentinel", func(t *testing.T) {
+		// The prior case is 9000 chars, so it returns at boundTargetRefDigest's
+		// len != 16 branch and never reaches the per-rune check. This case pins the
+		// rune loop: a digest that IS exactly 16 chars but carries a
+		// non-lowercase-hex rune ('g') must still fall back to <invalid-digest>,
+		// never leaking the raw digest (#2956, routed untested-path concern).
+		got := DependsEdge{To: 0, ToRef: "other/repo#12",
+			ToRefDigest: "0123456789abcdeg"}.TargetRef()
+		if !strings.Contains(got, "<invalid-digest>") {
+			t.Errorf("TargetRef = %q, want the <invalid-digest> sentinel for a 16-char non-hex digest", got)
+		}
+		if strings.Contains(got, "0123456789abcdeg") {
+			t.Errorf("TargetRef = %q leaked the raw 16-char non-hex digest — must be replaced by the sentinel", got)
+		}
+	})
 	t.Run("ANSI / newline / quote are escaped and control-free", func(t *testing.T) {
 		got := DependsEdge{To: 0, ToRef: "a\x1b[31m\nb\"c", ToRefDigest: "0123456789abcdef"}.TargetRef()
 		for _, bad := range []string{"\x1b", "\n"} {
