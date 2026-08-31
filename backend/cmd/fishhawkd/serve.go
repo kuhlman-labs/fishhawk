@@ -884,6 +884,13 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 // (backend/internal/repodoc), not to this wiring.
 var documentInjectionForgeIDs = []string{"github", "gitlab"}
 
+// newServer indirects server.New so serve_test can observe the FULLY
+// CONSTRUCTED server.Config runServe builds — the seam the cross-layer
+// single-tenant-profile-reaches-the-denial-log test (#2468) captures through.
+// A zero-branch func var, never a production nil check; runServe calls it
+// exactly where it called server.New.
+var newServer = server.New
+
 // forgeGetter is the registry read the document-injection wiring performs.
 // Injected rather than called directly so serve_test.go can assert the
 // preference order without mutating the process-wide forge registry.
@@ -2125,20 +2132,29 @@ func runServe(args []string, logSink io.Writer) int {
 	if pool != nil {
 		singleTenantQueries = accountdb.New(pool)
 	}
+	// Build the profile ONCE from the flags, so the bootstrap and the diagnostic
+	// cfg.SingleTenantProfile (read only on the login gate's no-admitting-account
+	// denial log, #2468) can never describe different profiles.
+	singleTenantProfile := account.SingleTenantConfig{
+		Provider:     *singleTenantProvider,
+		AccountKey:   *singleTenantAccountKey,
+		DisplayName:  *singleTenantDisplayName,
+		Granularity:  *singleTenantGranularity,
+		AutoJoinRole: *singleTenantAutoJoinRole,
+	}
 	if _, bootstrapped, err := account.EnsureSingleTenantAccount(context.Background(), singleTenantQueries,
-		account.SingleTenantConfig{
-			Provider:     *singleTenantProvider,
-			AccountKey:   *singleTenantAccountKey,
-			DisplayName:  *singleTenantDisplayName,
-			Granularity:  *singleTenantGranularity,
-			AutoJoinRole: *singleTenantAutoJoinRole,
-		}, logger); err != nil {
+		singleTenantProfile, logger); err != nil {
 		logger.Error("single-tenant profile bootstrap failed", slog.String("error", err.Error()))
 		return exitFailure
 	} else if !bootstrapped {
 		logger.Info("single-tenant profile not configured; running hosted multi-tenant (sign-in admits only against existing accounts rows)",
 			slog.String("ref", "#1833"))
 	}
+	// Diagnostic-only (#2468): the login gate reads this to NAME the configured
+	// profile in the no-admitting-account denial log. cfg is declared at the
+	// server.Config literal ~200 lines above; assign the same value the bootstrap
+	// saw. Never an admission input.
+	cfg.SingleTenantProfile = singleTenantProfile
 
 	// Regional handoff surface (ADR-062, E44.7 / #1831). Constructed only when
 	// the cell's own region, the shared secret, AND a database are all present;
@@ -2816,7 +2832,7 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("ref", "#2234"))
 	}
 
-	srv = server.New(cfg)
+	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
 	// .fishhawk/work-management.yaml from the filing repo's OWN forge,

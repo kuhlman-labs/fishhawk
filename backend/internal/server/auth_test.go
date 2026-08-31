@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -717,6 +720,127 @@ func TestGitHubCallback_NoAdmittingAccount_RedirectsAccessDenied(t *testing.T) {
 	assertNoAuthCookies(t, w)
 	if len(repo.users) != 0 {
 		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
+	}
+}
+
+// --- #2468: the no-admitting-account denial log names the configured profile ---
+
+// newDenialLogServer builds a server whose membership resolver denies EVERY
+// sign-in (empty result), with a caller-chosen OAuth profile login and
+// single-tenant profile, capturing structured log output to buf.
+func newDenialLogServer(t *testing.T, login string, profile account.SingleTenantConfig) (*Server, *fakeAuthRepo, *bytes.Buffer) {
+	t.Helper()
+	repo := newFakeAuthRepo()
+	_, gh := stubGitHubOAuthServerWithLogin(t, login)
+	var buf bytes.Buffer
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		AuthRepo:            repo,
+		GitHubOAuth:         gh,
+		AuthMembership:      &fakeMembershipResolver{}, // empty result = deny
+		SingleTenantProfile: profile,
+		Logger:              slog.New(slog.NewJSONHandler(&buf, nil)),
+	})
+	return s, repo, &buf
+}
+
+// denialLogRecord returns the flattened attributes of the
+// "oauth sign-in denied: no admitting account" log record, failing if absent.
+func denialLogRecord(t *testing.T, buf *bytes.Buffer) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if m["msg"] == "oauth sign-in denied: no admitting account" {
+			return m
+		}
+	}
+	t.Fatalf("no 'oauth sign-in denied: no admitting account' record in log:\n%s", buf.String())
+	return nil
+}
+
+// (1) enabled profile: the denial record names the RESOLVED configured profile
+// beside the authenticated login. The account key comes from the config
+// (octocat) while the login comes from the OAuth profile (Octocat) — distinct
+// values, so the assertion proves each field's provenance; granularity is the
+// RESOLVED default (enterprise) from an EMPTY flag, the assertion that goes red
+// if the log ever reported the raw config instead of Resolved().
+func TestGitHubCallback_NoAdmittingAccount_LogNamesConfiguredProfile(t *testing.T) {
+	s, repo, buf := newDenialLogServer(t, "Octocat",
+		account.SingleTenantConfig{AccountKey: "octocat", Granularity: ""})
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	// The browser-facing denial contract is unchanged (operator condition 5).
+	assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
+	}
+
+	rec := denialLogRecord(t, buf)
+	for k, want := range map[string]string{
+		"login":                  "Octocat",
+		"configured_provider":    "github",
+		"configured_account_key": "octocat",
+		"configured_granularity": "enterprise",
+	} {
+		if got, _ := rec[k].(string); got != want {
+			t.Errorf("denial record %s = %q, want %q\nfull record: %+v", k, got, want, rec)
+		}
+	}
+}
+
+// (2) unconfigured (zero-value) profile: NONE of the configured_* keys appear
+// and the unconfigured marker does — the guarded-vs-unguarded distinction that
+// only the zero-value state can observe.
+func TestGitHubCallback_NoAdmittingAccount_UnconfiguredProfileLogsNoProfileFields(t *testing.T) {
+	s, _, buf := newDenialLogServer(t, "octocat", account.SingleTenantConfig{})
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
+	assertNoAuthCookies(t, w)
+
+	rec := denialLogRecord(t, buf)
+	for _, k := range []string{"configured_provider", "configured_account_key", "configured_granularity"} {
+		if _, ok := rec[k]; ok {
+			t.Errorf("denial record carries %s for an unconfigured profile; want absent\nfull record: %+v", k, rec)
+		}
+	}
+	if got, _ := rec["single_tenant_profile"].(string); got != "unconfigured" {
+		t.Errorf("single_tenant_profile = %q, want %q\nfull record: %+v", got, "unconfigured", rec)
+	}
+}
+
+// (3) FALSIFIABLE diagnostic-only regression (operator condition 2): the
+// DISCRIMINATING fixture — account key BYTE-EQUAL to the stub OAuth login under
+// `user` granularity, so the profile ALONE would admit — while the membership
+// resolver still returns empty. The request MUST still be denied. This is the
+// only shape that goes red if the profile ever becomes an admission input; a
+// casing-mismatch fixture would deny under both a correct and an incorrect
+// implementation and could never fail.
+func TestGitHubCallback_SingleTenantProfileIsNotAnAdmissionInput(t *testing.T) {
+	s, repo, _ := newDenialLogServer(t, "octocat",
+		account.SingleTenantConfig{Provider: "github", AccountKey: "octocat", Granularity: "user"})
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	assertAccessDeniedLocation(t, w, accessDeniedNoAccount)
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 — the profile is diagnostic, never an admission input", len(repo.users))
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -2751,6 +2752,173 @@ func TestServe_SingleTenantPartialConfig_FailsStartup(t *testing.T) {
 				t.Errorf("accounts rows = %d, want 0", n)
 			}
 		})
+	}
+}
+
+// denyAllMembership is a deny-all auth.MembershipResolver for the cross-layer
+// denial-log test: it returns an empty account set, driving the callback down
+// the no-admitting-account branch.
+type denyAllMembership struct{}
+
+func (denyAllMembership) ResolveAccounts(_ context.Context, _, _ string, _ authpkg.GitHubProfile) ([]uuid.UUID, error) {
+	return nil, nil
+}
+
+// stubGitHubOAuthForDenial mirrors the server package's OAuth stub in package
+// main: an httptest forge returning the given login, wrapped in a real
+// *auth.GitHubOAuth so the callback exercises the full exchange + profile fetch.
+func stubGitHubOAuthForDenial(t *testing.T, login string) *authpkg.GitHubOAuth {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"gho_xxx"}`))
+	})
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := json.Marshal(map[string]any{"id": int64(42), "login": login, "name": "The Octo Cat", "email": "octo@example.com"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return authpkg.NewGitHubOAuth("client-id", "secret", "https://example.com/cb",
+		authpkg.OAuthURLs{
+			AuthorizeURL: srv.URL + "/login/oauth/authorize",
+			TokenURL:     srv.URL + "/login/oauth/access_token",
+			UserURL:      srv.URL + "/user",
+		})
+}
+
+// TestServe_SingleTenantProfileReachesDenialLog is the WHOLE-PATH test
+// (operator condition 1/3): FLAGS → serve wiring → server.Config → a denied
+// OAuth callback → the emitted denial log record. It captures the FULLY
+// CONSTRUCTED server.Config through the newServer seam — reached because the
+// --review-resolution abort (bootstrapAbortFlag) runs AFTER newServer(cfg) and
+// before the listener binds — then rebuilds a server from that captured config
+// (overriding only Logger, GitHubOAuth, AuthMembership: exactly the three the
+// deny path touches; the deny path never calls SignIn or reaches the closed
+// pool stores) and drives the denied callback. It asserts the denial record
+// carries the account key and granularity that came FROM THE FLAGS through
+// serve.go's wiring, not from a hand-built Config — so it goes red both when
+// auth.go stops reading the field and when serve.go stops assigning it, the
+// seam mismatch neither per-layer half alone catches.
+func TestServe_SingleTenantProfileReachesDenialLog(t *testing.T) {
+	var captured server.Config
+	orig := newServer
+	newServer = func(cfg server.Config) *server.Server {
+		captured = cfg
+		return orig(cfg)
+	}
+	t.Cleanup(func() { newServer = orig })
+
+	code, log := serveWithProfile(t, "-db", pgtest.NewURL(t),
+		"-single-tenant-account-key", "Octocat",
+		"-single-tenant-granularity", "user",
+		bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if !captured.SingleTenantProfile.Enabled() {
+		t.Fatalf("captured server.Config carries no single-tenant profile — the flags did not reach cfg.SingleTenantProfile; log:\n%s", log)
+	}
+
+	// Rebuild a server from the CAPTURED config, overriding only the three
+	// fields the deny path exercises.
+	var buf bytes.Buffer
+	captured.Logger = slog.New(slog.NewJSONHandler(&buf, nil))
+	captured.GitHubOAuth = stubGitHubOAuthForDenial(t, "octocat")
+	captured.AuthMembership = denyAllMembership{}
+	denialSrv := server.New(captured)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/github/callback?code=abc&state=st", nil)
+	req.AddCookie(&http.Cookie{Name: authpkg.StateCookieName, Value: "st"})
+	w := httptest.NewRecorder()
+	denialSrv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+
+	var rec map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if m["msg"] == "oauth sign-in denied: no admitting account" {
+			rec = m
+			break
+		}
+	}
+	if rec == nil {
+		t.Fatalf("no denial record in log:\n%s", buf.String())
+	}
+	if got, _ := rec["configured_account_key"].(string); got != "Octocat" {
+		t.Errorf("configured_account_key = %q, want %q (the flag value threaded through serve.go)\nrecord: %+v", got, "Octocat", rec)
+	}
+	if got, _ := rec["configured_granularity"].(string); got != "user" {
+		t.Errorf("configured_granularity = %q, want %q (the flag value threaded through serve.go)\nrecord: %+v", got, "user", rec)
+	}
+}
+
+// TestEnvExampleDocumentsSingleTenantProfile is the done-means test for the
+// residual-B .env.example block (operator condition 6): a config-file change no
+// compiler enforces. It asserts, at the same width as the acceptance criterion,
+// that the five FISHHAWKD_SINGLE_TENANT_* names occur, each COMMENTED OUT (so a
+// fresh copy never accidentally enables the profile), that the enablement
+// guidance names the account key as the sole signal AND states the partial-
+// configuration startup error, that the personal-namespace guidance names
+// granularity `user`, and that the block points at docs/deploy/self-hosted.md.
+func TestEnvExampleDocumentsSingleTenantProfile(t *testing.T) {
+	raw, err := os.ReadFile("../../../.env.example")
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	text := string(raw)
+
+	names := []string{
+		"FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY",
+		"FISHHAWKD_SINGLE_TENANT_GRANULARITY",
+		"FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE",
+		"FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME",
+		"FISHHAWKD_SINGLE_TENANT_PROVIDER",
+	}
+	lines := strings.Split(text, "\n")
+	for _, name := range names {
+		found, commented := false, true
+		for _, ln := range lines {
+			if strings.Contains(ln, name) {
+				found = true
+				if !strings.HasPrefix(strings.TrimSpace(ln), "#") {
+					commented = false
+				}
+			}
+		}
+		if !found {
+			t.Errorf(".env.example does not document %s", name)
+		}
+		if !commented {
+			t.Errorf(".env.example has an UNCOMMENTED %s line — a fresh copy would enable the profile", name)
+		}
+	}
+
+	// Enablement guidance: the account key is the SOLE enablement signal, and a
+	// non-key variable with the key empty is a startup error.
+	if !strings.Contains(text, "FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY alone enables") {
+		t.Error(".env.example does not state that the account key ALONE enables the profile")
+	}
+	if !strings.Contains(text, "startup error") {
+		t.Error(".env.example does not warn that a partially-configured profile is a startup error")
+	}
+	// Personal-namespace guidance names granularity `user`.
+	if !strings.Contains(text, "GRANULARITY=user") {
+		t.Error(".env.example does not document the personal-namespace GRANULARITY=user posture")
+	}
+	// Pointer to the operator doc.
+	if !strings.Contains(text, "docs/deploy/self-hosted.md") {
+		t.Error(".env.example does not point at docs/deploy/self-hosted.md")
 	}
 }
 

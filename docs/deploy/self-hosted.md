@@ -206,8 +206,10 @@ Two consequences to plan for:
   comparison is byte-exact with no normalization. GitHub returns the canonically
   cased login from its profile API, so set `singleTenant.accountKey` to that
   exact string. A casing mismatch denies the owner on the very first sign-in of
-  a fresh install, with `no admitting account` and nothing else to point at —
-  this is the first-boot foot-gun to check before anything else.
+  a fresh install — check it first by comparing the `configured_account_key` and
+  `login` fields the denial log now prints side by side (see [If sign-in shows
+  "Access denied"](#if-sign-in-shows-access-denied)). Set the profile from the
+  `FISHHAWKD_SINGLE_TENANT_*` variables in [`.env.example`](../../.env.example).
 - **Admission does not depend on the forge, but a healthy forge is still read**
   for a login that *also* belongs to auto-join orgs/groups: the user-tier
   admission and the forge-derived admissions are unioned, so configuring `user`
@@ -268,8 +270,21 @@ request in both topologies, so a login on its URL is an unverifiable parameter
 — claiming an identity from one would let a crafted URL show a misleading login
 on your own denial page.
 
-To learn WHO was denied, read the fishhawkd log: the callback logs
-`oauth sign-in denied` with the provider and the login before it redirects.
+To learn WHO was denied, read the fishhawkd log: on the `no_admitting_account`
+branch the callback logs `oauth sign-in denied: no admitting account` with the
+authenticated `login` **and the configured single-tenant profile beside it** —
+`configured_provider`, `configured_account_key`, and `configured_granularity`
+(the RESOLVED values, so an unset granularity shows `enterprise`, the value
+admission actually uses), or a single `single_tenant_profile=unconfigured`
+marker when no profile is set (#2468). That one line makes both first-boot
+foot-guns readable without correlating anything: compare `configured_account_key`
+against `login` byte-for-byte to catch a **casing mismatch**, and check
+`configured_granularity` to catch a personal-namespace install left on
+`enterprise` (it should be `user` — see [Personal-namespace
+install](#personal-namespace-install)). The profile fields come from the
+`FISHHAWKD_SINGLE_TENANT_*` variables documented in
+[`.env.example`](../../.env.example); the log is server-side only, so the
+browser-facing denial page is unchanged and still names no login.
 
 If the page shows the generic body instead of a branch, the deployment recorded
 the reason but did not carry it — check the same log line.

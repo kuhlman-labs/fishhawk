@@ -110,6 +110,59 @@ func TestSingleTenantConfig_Validate(t *testing.T) {
 	}
 }
 
+// Resolved() is the diagnostic view the login gate's denial log reports
+// (#2468): it fills each internal default independently, trims whitespace on
+// every field, leaves an explicitly-set value alone, and delegates verbatim to
+// the internal resolveDefaults so the diagnostic and the bootstrap can never
+// diverge.
+func TestSingleTenantConfig_Resolved(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   SingleTenantConfig
+		want SingleTenantConfig
+	}{
+		{
+			name: "empty provider defaults to github",
+			in:   SingleTenantConfig{AccountKey: "acme", Granularity: "organization", AutoJoinRole: "member"},
+			want: SingleTenantConfig{Provider: "github", AccountKey: "acme", Granularity: "organization", AutoJoinRole: "member"},
+		},
+		{
+			name: "empty granularity defaults to enterprise",
+			in:   SingleTenantConfig{Provider: "github", AccountKey: "acme", AutoJoinRole: "member"},
+			want: SingleTenantConfig{Provider: "github", AccountKey: "acme", Granularity: "enterprise", AutoJoinRole: "member"},
+		},
+		{
+			name: "empty role defaults to member",
+			in:   SingleTenantConfig{Provider: "github", AccountKey: "acme", Granularity: "enterprise"},
+			want: SingleTenantConfig{Provider: "github", AccountKey: "acme", Granularity: "enterprise", AutoJoinRole: "member"},
+		},
+		{
+			name: "whitespace trimmed on every field",
+			in:   SingleTenantConfig{Provider: " github ", AccountKey: " acme ", DisplayName: " Acme ", Granularity: " user ", AutoJoinRole: " admin "},
+			want: SingleTenantConfig{Provider: "github", AccountKey: "acme", DisplayName: "Acme", Granularity: "user", AutoJoinRole: "admin"},
+		},
+		{
+			name: "explicit user granularity survives (the personal-namespace denial-log case)",
+			in:   SingleTenantConfig{AccountKey: "octocat", Granularity: "user"},
+			want: SingleTenantConfig{Provider: "github", AccountKey: "octocat", Granularity: "user", AutoJoinRole: "member"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.Resolved(); got != tc.want {
+				t.Errorf("Resolved() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// Delegation: Resolved() and the internal resolveDefaults() must return an
+	// identical struct, so the exported diagnostic accessor cannot silently
+	// diverge from the bootstrap's own resolution.
+	rep := SingleTenantConfig{AccountKey: " Acme-Corp ", Granularity: "user"}
+	if rep.Resolved() != rep.resolveDefaults() {
+		t.Errorf("Resolved() = %+v, resolveDefaults() = %+v — must be identical", rep.Resolved(), rep.resolveDefaults())
+	}
+}
+
 // (a) Nothing set: the bootstrap is skipped and NOTHING is written — the
 // hosted multi-tenant posture, unchanged.
 func TestEnsureSingleTenantAccount_UnconfiguredSkips(t *testing.T) {

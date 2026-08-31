@@ -3271,6 +3271,23 @@ on a bare `ServeMux` 404 with no explanation. (The companion `GET /favicon.ico
 | `no_membership_resolver` | `Config.AuthMembership == nil` | The login gate has no membership resolver wired, so EVERY sign-in is denied. A **deployment-configuration** fault, not a per-user one; the remedy is wiring the database and the workspace profile. |
 | `no_admitting_account` | `len(accountIDs) == 0` | No workspace account admits this login — no invited membership, no auto-join match. Remedies: `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY`, or an admin invite. |
 
+On the `no_admitting_account` branch the callback ALSO logs
+`oauth sign-in denied: no admitting account` at Info naming, beside the
+authenticated `login`, the **configured** single-tenant profile
+(`configured_provider` / `configured_account_key` / `configured_granularity`),
+read from `Config.SingleTenantProfile` (#2468). That field is threaded from the
+`FISHHAWKD_SINGLE_TENANT_*` flags in serve.go and is **diagnostic only**: it is
+read on this one denial branch and NOWHERE else — never an admission input,
+never consulted by the membership resolver, and never disclosed to the browser
+(the redirect, its reason code, and the rendered page are unchanged). It reports
+the RESOLVED profile (`SingleTenantConfig.Resolved()`) so an operator who left
+granularity empty sees `enterprise`, the value admission actually uses, and the
+fields are emitted ONLY when `SingleTenantProfile.Enabled()` — an unconfigured
+profile logs a single `single_tenant_profile=unconfigured` marker with no empty
+placeholders. This makes the two first-boot foot-guns (a byte-exact account-key
+casing mismatch; a personal-namespace install left on the default `enterprise`
+granularity) diagnosable from one server-side log line.
+
 Absent or unrecognized → the generic body naming both remedies. `reason` is
 matched by `parseAccessDeniedReason`, a **closed allow-list, not a
 passthrough**: the value arrives on the query string of a public,
