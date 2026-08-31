@@ -3269,8 +3269,10 @@ func buildPlan(t Trigger) string {
 	writeInjectedDocuments(&b, t)
 
 	if t.DecomposeRequired {
-		b.WriteString("IMPORTANT: Your previous plan was rejected because predicted_runtime_minutes " +
+		b.WriteString("IMPORTANT: Your previous plan was rejected because its runtime estimate " +
 			"exceeded the implement-stage budget without a decomposition block. " +
+			"The gate reads the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, so if you reported a " +
+			"pre-calibration raw estimate it is that number the gate compared, and shrinking only the calibrated value will not clear it. " +
 			"You MUST populate decomposition.sub_plans in this plan — omitting it will block approval again.\n\n")
 	}
 
@@ -3526,7 +3528,7 @@ func buildPlan(t Trigger) string {
 	b.WriteString("`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version (\"standard_v1\"), ticket_reference, generated_by, summary, scope, approach, verification, predicted_runtime_minutes, predicted_runtime_confidence. ")
 	b.WriteString("predicted_runtime_minutes and predicted_runtime_confidence are MUST-populate fields — every plan artifact must carry your runtime estimate and confidence level. ")
 	fmt.Fprintf(&b,
-		"Populate decomposition.sub_plans if and only if your predicted_runtime_minutes estimate exceeds the implement-stage budget (%d minutes). ",
+		"Populate decomposition.sub_plans if and only if your runtime estimate exceeds the implement-stage budget (%d minutes) — measured against the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, which is the number the budget gate reads. ",
 		implMins,
 	)
 	b.WriteString("Do not echo the plan in your final response — only write it to the file. ")
@@ -3722,7 +3724,14 @@ func buildPlan(t Trigger) string {
 			fmt.Fprintf(&b, "- %s: %d samples, %d within 1.5x of prediction\n",
 				level, band.Samples, band.WithinScale)
 		}
-		fmt.Fprintf(&b, "Multiply your raw estimate by %.2f to get a calibrated value.\n", t.CalibrationHint.CalibrationRatio)
+		fmt.Fprintf(&b, "Multiply your raw estimate by %.2f to get a calibrated value. "+
+			"Report BOTH numbers: write the CALIBRATED value to predicted_runtime_minutes (its meaning is unchanged) "+
+			"and the PRE-calibration number you started from to raw_predicted_runtime_minutes. "+
+			"The implement-budget gate evaluates the LARGER of the two, so applying this factor cannot dissolve a decomposition requirement: "+
+			"if your RAW estimate exceeds the implement-stage budget (%d minutes) you MUST populate decomposition.sub_plans, "+
+			"however far below the budget the calibrated value lands. "+
+			"Omitting raw_predicted_runtime_minutes is legal but draws a plan-gate advisory, because the gate then cannot verify calibration did not clear the budget.\n",
+			t.CalibrationHint.CalibrationRatio, implMins)
 		if highBand, ok := t.CalibrationHint.ConfidenceBands["high"]; ok && highBand.Samples >= 5 {
 			if float64(highBand.WithinScale)/float64(highBand.Samples) <= 0.25 {
 				fmt.Fprintf(&b, "→ \"high\" has been the LEAST accurate band historically (%d/%d within 1.5x). "+
