@@ -507,9 +507,11 @@ type Config struct {
 	// ReviewGroundingDisabled is the kill switch for review grounding (#2486):
 	// when true the plan- and implement-review loops never export a source tree
 	// and both adapters run in their diff-only posture. serve.go sets it from
-	// FISHHAWKD_REVIEW_GROUNDING=false (grounding is ON by default). It lets an
-	// operator turn off the behaviour change — what a grounded reviewer may read —
-	// without a rollback. The environment scrub is independent of this flag and is
+	// FISHHAWKD_REVIEW_GROUNDING. Grounding is OFF by default: #2522 bounds what a
+	// grounded reviewer may read per-adapter, but the flip to on-by-default is a
+	// SEPARATE operator-filed follow-up gated on a recorded operator harness run
+	// passing on BOTH adapters. It lets an operator turn off the behaviour change
+	// — what a grounded reviewer may read — without a rollback. The environment scrub is independent of this flag and is
 	// always applied.
 	ReviewGroundingDisabled bool
 

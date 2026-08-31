@@ -1753,10 +1753,14 @@ func runServe(args []string, logSink io.Writer) int {
 		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false),
 		"ground plan-/implement-review agents against an exported read-only source tree (#2486): "+
 			"the reviewer can read and search the repository's tracked files at the reviewed commit to "+
-			"confirm diff-invisible facts. OFF by default (#2522): reviewer reads are NOT confined to "+
-			"the export — cmd.Dir and --add-dir select a working directory, they do not jail reads, so a "+
-			"grounded reviewer can read any file the daemon user can read and its verdict text is an "+
-			"egress path. Set FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
+			"confirm diff-invisible facts. OFF by default. #2522 added per-adapter READ BOUNDS, and they "+
+			"are NOT equivalent: codex gets OS-enforced deny-by-default confinement via a synthesized "+
+			"`confined` permission profile, claude gets a bounded credential-root deny-rule BLOCKLIST "+
+			"(defence-in-depth, not confinement — a read outside the named roots is still permitted). "+
+			"The default stays OFF because live enforcement of the shipped flag combination is not "+
+			"proven at merge; flipping it is a separate follow-up gated on a recorded operator run of "+
+			"backend/internal/reviewsandbox/live_confinement_test.go on BOTH adapters. Set "+
+			"FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
 			"The environment scrub is independent of this flag and always applied")
 	reviewerEnvPassthrough := fs.String("reviewer-env-passthrough",
 		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""),
@@ -1995,10 +1999,13 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.PlanReviewers = planReviewers
 
 	// Review grounding (#2486): grounding is OFF unless FISHHAWKD_REVIEW_GROUNDING
-	// is true. It ships DORMANT because reviewer reads are not confined to the
-	// exported tree (#2522) — verified live: claude reads out-of-tree absolute
-	// paths and codex lists ~/.ssh — so enabling it is an explicit operator
-	// choice for a trusted single-tenant host, not a default posture. The
+	// is true. It still ships DORMANT after #2522 added the per-adapter read
+	// bounds: codex is genuinely confined (OS-enforced allowlist), claude only
+	// gets a bounded credential-root blocklist, and the live denial behaviour of
+	// the shipped flag combination is UNPROVEN at merge (the opt-in harness in
+	// backend/internal/reviewsandbox measures it). So enabling it stays an
+	// explicit operator choice for a trusted single-tenant host, not a default
+	// posture, and the flip is a separate operator-gated follow-up. The
 	// environment scrub is NOT gated on this flag and always applies.
 	// The passthrough list is also carried on the
 	// server config so the grounding-side wiring and the adapter-side scrub read

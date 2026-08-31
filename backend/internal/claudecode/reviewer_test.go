@@ -825,6 +825,11 @@ func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
 	var cmd *exec.Cmd
 	r := NewReviewer(testConfig())
 	r.client.Cmd = capturingHelper("happy", true, nil, &cmd)
+	// #2522: the grounded path builds the deny-rule set from the host seam.
+	// Inject temp dirs so the rules are deterministic and independent of the
+	// developer's real home layout.
+	r.client.HostPaths = testHostPaths(t)
+	r.client.GOOS = "linux"
 
 	verdict, _, err := r.ReviewGrounded(context.Background(), "review", treeDir)
 	if err != nil {
@@ -833,7 +838,9 @@ func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
 	if verdict.Verdict != planreview.VerdictApprove {
 		t.Errorf("verdict = %q, want approve", verdict.Verdict)
 	}
+	// The grounded cwd is the CANONICAL export path (#2522), which the injected
+	// identity canonicalizer above leaves equal to treeDir.
 	if cmd.Dir != treeDir {
-		t.Errorf("cmd.Dir = %q, want the tree %q", cmd.Dir, treeDir)
+		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, treeDir)
 	}
 }

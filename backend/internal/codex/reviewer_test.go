@@ -246,6 +246,11 @@ func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
 	var cmd *exec.Cmd
 	r := NewReviewer(testConfig())
 	r.client.Cmd = capturingHelper("happy", true, nil, &cmd)
+	// #2522: the grounded path builds a confined CODEX_HOME. Inject the host
+	// seam — without it this test would synthesize one inside the developer's or
+	// CI runner's REAL ~/.codex and copy their live auth.json into it.
+	r.client.HostPaths = testHostPaths(t)
+	r.client.GOOS = "linux"
 
 	verdict, _, err := r.ReviewGrounded(context.Background(), "review", treeDir)
 	if err != nil {
@@ -254,7 +259,10 @@ func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
 	if verdict.Verdict != planreview.VerdictApprove {
 		t.Errorf("verdict = %q, want approve", verdict.Verdict)
 	}
+	// The grounded cwd is the CANONICAL export path (#2522): on darwin
+	// t.TempDir() returns a /var/folders alias of a /private/var/folders real
+	// path, and the codex grant is written in canonical form.
 	if cmd.Dir != treeDir {
-		t.Errorf("cmd.Dir = %q, want the tree %q", cmd.Dir, treeDir)
+		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, treeDir)
 	}
 }

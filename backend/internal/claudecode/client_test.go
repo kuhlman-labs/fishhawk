@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewsandbox"
 )
 
 // The #2486 scrub-probe sentinels. scrubSentinelEnv is a secret that must be
@@ -96,12 +98,35 @@ func capturingHelper(mode string, passEnv bool, argv *[]string, capturedCmd **ex
 // The MCP pin is load-bearing: --tools bounds only the BUILT-IN toolset, so
 // without these flags the operator's MCP tools (browser, Gmail, GitHub) load
 // past the restriction and defeat the never-network property (#2486 fix-up).
+
+// testHostPaths builds the injectable #2522 host seam over temp dirs. Every
+// GROUNDED-path test MUST use it: without it the adapter falls through to
+// reviewsandbox.DefaultHostPaths(), so the emitted deny rules would depend on
+// the developer's real home layout instead of being deterministic.
+func testHostPaths(t *testing.T) *reviewsandbox.HostPaths {
+	t.Helper()
+	home := t.TempDir()
+	codexHome := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatalf("mkdir codex home: %v", err)
+	}
+	return &reviewsandbox.HostPaths{
+		HomeDir:   home,
+		CodexHome: codexHome,
+		TempDir:   t.TempDir(),
+		Canonical: func(p string) (string, error) { return p, nil },
+	}
+}
+
 func TestInvokeGrounded_ClaudeArgvAndCwd(t *testing.T) {
 	treeDir := t.TempDir()
+	hp := testHostPaths(t)
 	var argv []string
 	var cmd *exec.Cmd
 	c := NewClient(testConfig())
 	c.Cmd = capturingHelper("happy", true, &argv, &cmd)
+	c.HostPaths = hp
+	c.GOOS = "linux"
 
 	if _, _, _, err := c.InferenceInTree(context.Background(), "review", treeDir); err != nil {
 		t.Fatalf("InferenceInTree(grounded): %v", err)
@@ -115,6 +140,74 @@ func TestInvokeGrounded_ClaudeArgvAndCwd(t *testing.T) {
 	assertContains(t, argv, "--strict-mcp-config")
 	assertContainsPair(t, argv, "--mcp-config", `{"mcpServers":{}}`)
 	assertNoDangerous(t, argv)
+	// #2522: none of the flags above BOUNDS what the granted Read/Grep/Glob
+	// tools may reach — an operator A/B confirmed a grounded child reads an
+	// arbitrary out-of-tree file straight through this argv. The bound is
+	// --disallowed-tools, and BOTH rule forms must be present: `/**` covers
+	// everything beneath the denied root, the BARE form covers a plain FILE
+	// sitting AT it.
+	di := slices.Index(argv, "--disallowed-tools")
+	if di < 0 {
+		t.Fatalf("grounded argv missing --disallowed-tools: %v", argv)
+	}
+	homeRule := strings.TrimPrefix(hp.HomeDir, "/")
+	for _, want := range []string{"Read(//" + homeRule + ")", "Read(//" + homeRule + "/**)"} {
+		if !slices.Contains(argv[di:], want) {
+			t.Errorf("grounded deny rules missing %q: %v", want, argv[di:])
+		}
+	}
+	// Non-vacuity: the deny rules must not blind the reviewer against the very
+	// tree --add-dir just granted.
+	for _, r := range argv[di:] {
+		if strings.Contains(r, treeDir) {
+			t.Errorf("a deny rule names the exported tree: %q", r)
+		}
+	}
+}
+
+// TestInvokeUngrounded_ClaudeNoDenyRules pins the degrade side: the #2522
+// grounded-only deny rules must not leak into the diff-only posture, whose argv
+// stays byte-for-byte as before this change.
+func TestInvokeUngrounded_ClaudeNoDenyRules(t *testing.T) {
+	var argv []string
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, nil)
+	c.HostPaths = testHostPaths(t)
+	c.GOOS = "linux"
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", ""); err != nil {
+		t.Fatalf("InferenceInTree(ungrounded): %v", err)
+	}
+	if slices.Contains(argv, "--disallowed-tools") || slices.Contains(argv, "--add-dir") {
+		t.Errorf("ungrounded argv %v must not carry the grounded-only read-bound flags", argv)
+	}
+}
+
+// TestInvokeGrounded_ClaudeDenyRuleFailureFailsClosed: a deny-rule build error
+// FAILS the invocation. Spawning a grounded reviewer with NO deny rules would be
+// the unbounded posture this change exists to close — a degraded advisory review
+// is strictly better than a silent unbounding.
+func TestInvokeGrounded_ClaudeDenyRuleFailureFailsClosed(t *testing.T) {
+	hp := testHostPaths(t)
+	// A HOME spelling carrying a rule metacharacter: expressible as a directory,
+	// NOT expressible as an unambiguous Tool(//path) rule.
+	hp.HomeDir = "/Users/op (work)"
+	var argv []string
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, nil)
+	c.HostPaths = hp
+	c.GOOS = "linux"
+
+	_, _, _, err := c.InferenceInTree(context.Background(), "review", t.TempDir())
+	if err == nil {
+		t.Fatal("a deny-rule build failure must FAIL the invocation, not spawn an unbounded reviewer")
+	}
+	if !strings.Contains(err.Error(), "deny rules") {
+		t.Errorf("err = %v, want it to name the deny-rule build", err)
+	}
+	if len(argv) != 0 {
+		t.Errorf("no subprocess may be built on the fail-closed path; argv = %v", argv)
+	}
 }
 
 // TestInvokeUngrounded_ClaudeEmptyScratchCwd pins the C2 fix: an UNGROUNDED
