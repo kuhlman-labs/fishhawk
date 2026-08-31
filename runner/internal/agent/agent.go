@@ -310,6 +310,19 @@ var (
 	// re-running the same prompt against an unreset cap would fail
 	// identically.
 	ErrAgentQuotaUnavailable = errors.New("agent: model quota unavailable")
+
+	// ErrTraceStreamRead marks a genuine non-EOF I/O error reading the child
+	// agent's trace stream — a fault on the stdout pipe itself, which line
+	// truncation cannot absorb (an over-long line is now truncated and reading
+	// continues; #3020). Like ErrAgentThinkingBlock, ErrLoopDetected,
+	// ErrExternalAPI and ErrAgentQuotaUnavailable it is a PEER sentinel and
+	// deliberately does NOT wrap ErrAgentFailed, so err_class classification is
+	// unambiguous and the label names the READER rather than the agent
+	// (err_class=trace_stream_read, not agent_failed). Downstream category-A
+	// handling keys off Result.FailureCategory=="A" (still set on this path), so
+	// stage retryability and the bundle signal are unchanged — only the label
+	// moves off the agent.
+	ErrTraceStreamRead = errors.New("agent: trace stream read failed")
 )
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for

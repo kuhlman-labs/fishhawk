@@ -3110,6 +3110,11 @@ func classifyErr(err error) string {
 		return "external_api"
 	case errors.Is(err, agent.ErrAgentQuotaUnavailable):
 		return "agent_quota_unavailable"
+	case errors.Is(err, agent.ErrTraceStreamRead):
+		// Placed BEFORE the ErrAgentFailed arm defensively — the sentinel is a
+		// peer that does not wrap ErrAgentFailed (agent_test pins that), so the
+		// switch reads correctly either way, but ordering makes the intent plain.
+		return "trace_stream_read"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:
