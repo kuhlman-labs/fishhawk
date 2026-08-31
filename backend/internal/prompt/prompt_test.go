@@ -12343,3 +12343,106 @@ func TestWriteFixupSelfReport_CounterfactualsInstruction(t *testing.T) {
 		}
 	}
 }
+
+// TestBuild_Plan_CalibrationHint_RequiresRawEstimate pins the #2862 rewrite of
+// the calibration-hint block: when a hint IS rendered, the planner is told to
+// report BOTH numbers — the calibrated one in predicted_runtime_minutes and the
+// pre-calibration one in raw_predicted_runtime_minutes — and that the budget
+// gate reads the LARGER of the two, so applying a sub-1.0 factor cannot dissolve
+// a decomposition requirement. Without that instruction the raw estimate is
+// destroyed at the source and the gate has nothing to compare (the defect the
+// issue reports), so this is the prompt-side half of the fix.
+func TestBuild_Plan_CalibrationHint_RequiresRawEstimate(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:           7,
+		Repo:                  "x/y",
+		ImplementStageTimeout: 60 * time.Minute,
+		CalibrationHint: &CalibrationHint{
+			Samples:          9,
+			CalibrationRatio: 0.56,
+			ConfidenceBands: map[string]CalibrationBand{
+				"medium": {Samples: 9, WithinScale: 7},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// The field the planner must populate, named exactly as the schema spells it.
+		"raw_predicted_runtime_minutes",
+		// The calibrated value keeps its existing meaning.
+		"write the CALIBRATED value to predicted_runtime_minutes",
+		// The max/larger-of-the-two rule the gate applies.
+		"evaluates the LARGER of the two",
+		// The consequence: the RAW estimate is what decides decomposition,
+		// resolved against this run's real implement budget.
+		"if your RAW estimate exceeds the implement-stage budget (60 minutes) you MUST populate decomposition.sub_plans",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("hint-bearing plan prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_NoCalibrationHint_OmitsRawEstimateInstruction is the negative
+// half (#2862): a workflow with no resolvable calibration history renders no
+// hint, so the prompt must NOT carry the report-both-numbers instruction — a
+// planner shown no factor has no meaningful raw/calibrated distinction to draw,
+// and instructing it anyway would invite a fabricated second number. The
+// decomposition instruction still NAMES the field (the gate reads it whenever
+// it is present), so this asserts on the hint block's instruction text, not on
+// the bare field name.
+func TestBuild_Plan_NoCalibrationHint_OmitsRawEstimateInstruction(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:           7,
+		Repo:                  "x/y",
+		ImplementStageTimeout: 60 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Calibration hint") {
+		t.Fatalf("precondition failed: no hint was configured but the section rendered:\n%s", got)
+	}
+	for _, bad := range []string{
+		"write the CALIBRATED value to predicted_runtime_minutes",
+		"evaluates the LARGER of the two",
+	} {
+		if strings.Contains(got, bad) {
+			t.Errorf("hint-less plan prompt should not carry the calibration instruction %q:\n%s", bad, got)
+		}
+	}
+	// The artifact-contract instruction is NOT conditional on the hint: the gate
+	// reads raw_predicted_runtime_minutes whenever the plan carries it, so even a
+	// hint-less prompt must state which number the budget is measured against.
+	// This is also what keeps the absence assertions above non-vacuous — they
+	// target the hint block's report-both-numbers wording, not the bare field name.
+	if !strings.Contains(got, "measured against the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, which is the number the budget gate reads") {
+		t.Errorf("hint-less plan prompt should still state which number the decomposition threshold is measured against:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_DecomposeRequired_NamesGateNumber pins the re-plan preamble
+// (#2862): a plan rejected for exceeding the budget is told the gate reads the
+// LARGER of the two estimates, so a replan that shrinks only the calibrated
+// value will not clear it.
+func TestBuild_Plan_DecomposeRequired_NamesGateNumber(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:       7,
+		Repo:              "x/y",
+		DecomposeRequired: true,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"The gate reads the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes",
+		"shrinking only the calibrated value will not clear it",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("decompose-required preamble missing %q:\n%s", w, got)
+		}
+	}
+}

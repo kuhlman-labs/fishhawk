@@ -1616,7 +1616,11 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the #2412 top-level irreducible field
+// no validation behavior — most recently the #2862 top-level
+// raw_predicted_runtime_minutes field (the planner's PRE-calibration runtime
+// estimate, which the implement-budget gate reads via Plan.GateRuntimeMinutes as
+// max(predicted, raw) so a sub-1.0 fleet calibration factor cannot dissolve a
+// required decomposition). Before that: the #2412 top-level irreducible field
 // (the structured DECLINE-a-split declaration for a compile-atomic over-cap
 // change, which the server gate reads to widen the over-cap reject into an
 // advisory). Before that: the #2516 top-level scope_removals
@@ -1636,7 +1640,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "05c90d40d7080a0a2f3d98a7f575c8360b4e30b4481bcbdf89b3094a2fbb1274"
+	const wantHash = "6d4433c40030e02acc8e72cbc5e366efead73b0a1344ab7457bcd1693a47eab4"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -2216,6 +2220,95 @@ func TestIrreducible_Declared_TruthTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.in.Declared(); got != tc.want {
 				t.Errorf("Declared() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParse_RawPredictedRuntimeMinutes_RoundTrips pins the additive-optional
+// pre-calibration estimate (#2862): a plan carrying it parses and the field
+// reaches the typed struct. If the schema mirror the BACKEND embeds were left
+// un-synced, the root's additionalProperties:false would reject these bytes
+// here — so this is also the backend half of the mirror-sync assertion.
+func TestParse_RawPredictedRuntimeMinutes_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["predicted_runtime_minutes"] = 50
+		m["raw_predicted_runtime_minutes"] = 90
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.RawPredictedRuntimeMinutes != 90 {
+		t.Errorf("RawPredictedRuntimeMinutes = %d, want 90", p.RawPredictedRuntimeMinutes)
+	}
+	if p.PredictedRuntimeMinutes != 50 {
+		t.Errorf("PredictedRuntimeMinutes = %d, want 50 (the calibrated value keeps its meaning)", p.PredictedRuntimeMinutes)
+	}
+	if _, err := json.Marshal(p); err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+}
+
+// TestParse_WithoutRawPredictedRuntimeMinutes_StillValidates confirms the field
+// is optional (#2862): the legacy plan shape still validates against the
+// additionalProperties:false root and decodes to a zero raw estimate.
+func TestParse_WithoutRawPredictedRuntimeMinutes_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.RawPredictedRuntimeMinutes != 0 {
+		t.Errorf("RawPredictedRuntimeMinutes = %d, want 0 when the field is omitted", p.RawPredictedRuntimeMinutes)
+	}
+}
+
+// TestParse_RawPredictedRuntimeMinutesZero_Rejected proves the embedded mirror
+// the backend compiles actually carries the new property's minimum:1 constraint
+// rather than the edit landing only in docs/spec/ (#2862). A zero raw estimate
+// is the "reported nothing" sentinel on the struct, so the wire form must not
+// be able to spell it explicitly.
+func TestParse_RawPredictedRuntimeMinutesZero_Rejected(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["raw_predicted_runtime_minutes"] = 0
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	if err == nil {
+		t.Fatal("Parse accepted raw_predicted_runtime_minutes: 0; the embedded mirror is missing minimum:1")
+	}
+	var serr *plan.SchemaError
+	if !errors.As(err, &serr) {
+		t.Fatalf("error = %T (%v), want *plan.SchemaError", err, err)
+	}
+}
+
+// TestGateRuntimeMinutes is the table over the ONE place the structure-ADDING-
+// direction rule is expressed (#2862). A sub-1.0 calibration factor shrinks the
+// calibrated value and the maximum keeps the raw estimate in charge; a factor
+// above 1.0 grows it and the maximum lets calibration still DEMAND structure;
+// an absent raw estimate returns the calibrated value unchanged (exact legacy
+// behavior).
+func TestGateRuntimeMinutes(t *testing.T) {
+	cases := []struct {
+		name      string
+		predicted int
+		raw       int
+		want      int
+	}{
+		{"raw absent (legacy plan) -> predicted", 50, 0, 50},
+		{"raw below predicted (factor > 1.0) -> predicted", 70, 40, 70},
+		{"raw above predicted (factor < 1.0) -> raw", 50, 90, 90},
+		{"raw equals predicted (factor 1.0) -> that value", 60, 60, 60},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &plan.Plan{
+				PredictedRuntimeMinutes:    tc.predicted,
+				RawPredictedRuntimeMinutes: tc.raw,
+			}
+			if got := p.GateRuntimeMinutes(); got != tc.want {
+				t.Errorf("GateRuntimeMinutes() = %d, want %d (predicted=%d raw=%d)",
+					got, tc.want, tc.predicted, tc.raw)
 			}
 		})
 	}
