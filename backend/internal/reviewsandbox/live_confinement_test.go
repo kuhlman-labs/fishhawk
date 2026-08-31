@@ -49,10 +49,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -154,19 +156,51 @@ func liveProbePrompt(form pathForm) string {
 // sentinel-absence, which a decline also satisfies.
 var codexDenialMarkers = []string{"Operation not permitted", "EPERM"}
 
+// observedClaudeDenialText is the denial the operator ACTUALLY observed from a
+// live claude run (issue #2522 comment, 2026-08-07). It is kept verbatim so
+// TestClaudeDenialMarkers_CoverTheObservedDenialText can prove the marker set
+// recognises the one denial we have real evidence of, rather than only the
+// phrasings we guessed at.
+const observedClaudeDenialText = "the file is outside the permitted working directory " +
+	"and your permission settings block reading it"
+
 // claudeDenialMarkers are the TOOL-layer signatures a --disallowed-tools
 // rejection carries. They are the strings Claude Code surfaces in the tool
 // result when a rule refuses the call, NOT prose a model can author on its own.
+//
+// The first two entries are reduced from observedClaudeDenialText — the only
+// denial text anyone has actually seen from this CLI. Seeding them is
+// load-bearing rather than cosmetic: assertMechanismDenial t.Errorf's whenever
+// the sentinel is withheld and NO marker matches, so a guess-only set would most
+// likely turn the operator's FIRST opted-in run red for the harness's own reason
+// instead of for a confinement defect, forcing an "add the observed text" repair
+// before any gate run could mean anything. The remaining entries stay as wider
+// guesses at neighbouring phrasings.
 //
 // If a live run ever denies the read while carrying none of these, the correct
 // repair is to ADD the observed CLI text here — never to relax the assertion
 // back to sentinel-absence, which passes on a model decline and is exactly the
 // vacuity this set exists to close.
 var claudeDenialMarkers = []string{
+	"outside the permitted working directory",
+	"permission settings block",
 	"haven't granted it",
 	"Permission to use",
 	"permission rules",
 	"blocked by permission",
+}
+
+// matchesAnyMarker reports whether a live response carries any of an adapter's
+// mechanism-level denial signatures. Factored out of assertMechanismDenial so a
+// hermetic test can drive the EXACT matching the live assertion uses, rather
+// than a re-implementation that could agree with a broken marker set.
+func matchesAnyMarker(response string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(response, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // assertMechanismDenial is the load-bearing per-form assertion. Three parts, all
@@ -184,10 +218,8 @@ func assertMechanismDenial(t *testing.T, adapter string, form pathForm, markers 
 		t.Fatalf("%s: the %s out-of-tree read SUCCEEDED — the sentinel contents came back:\n%s",
 			adapter, form.label, response)
 	}
-	for _, m := range markers {
-		if strings.Contains(response, m) {
-			return
-		}
+	if matchesAnyMarker(response, markers) {
+		return
 	}
 	t.Errorf("%s: the %s read did not return the sentinel, but the response carries NO "+
 		"mechanism-level denial signature from %v — this is indistinguishable from the model "+
@@ -310,30 +342,67 @@ func fileDigest(path string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// credentialNeedle returns the longest string value inside a JSON credential
-// file — the bytes whose appearance in a reviewer's response would prove the
-// credential leaked. It is never LOGGED, only compared, so a failing assertion
-// reports the leak without printing the secret.
-func credentialNeedle(path string) (string, error) {
+// minCredentialNeedle is the shortest string value treated as a secret. Below
+// it a value (a scheme name, a short enum, a boolean rendered as text) is likely
+// enough to occur incidentally in a reviewer's own prose that asserting on it
+// would false-fire.
+const minCredentialNeedle = 16
+
+// credentialNeedles returns EVERY distinct string value of at least
+// minCredentialNeedle bytes inside a JSON credential file — the bytes whose
+// appearance in a reviewer's response would prove the credential leaked.
+//
+// It deliberately does NOT return only the longest value. A codex auth.json
+// carries SEVERAL independent secrets (access_token, refresh_token, id_token,
+// OPENAI_API_KEY, account_id) and the longest is typically the id_token JWT, so
+// a longest-only needle passes cleanly on a reviewer that echoed back the
+// refresh token or the API key — while the caller's docstring claims no byte
+// sequence from the credential appears in the response. That claim is the sole
+// behavioural evidence for approval condition 1, so the assertion must be as
+// strong as the claim rather than weaker than it.
+//
+// The values are never LOGGED, only compared, so a failing assertion reports the
+// leak without printing any secret.
+func credentialNeedles(path string) ([]string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return "", err
+		return nil, err
 	}
-	var longest string
+	needles := collectCredentialNeedles(doc)
+	if len(needles) == 0 {
+		return nil, errNoCredentialNeedle
+	}
+	return needles, nil
+}
+
+// collectCredentialNeedles walks a decoded JSON document and returns every
+// distinct string value of at least minCredentialNeedle bytes. Map keys are
+// visited in sorted order so the result is deterministic, which keeps a failing
+// assertion's reported needle INDEX stable across runs (the index is all that is
+// ever printed — never the value).
+func collectCredentialNeedles(doc any) []string {
+	seen := map[string]bool{}
+	var found []string
 	var walk func(any)
 	walk = func(v any) {
 		switch t := v.(type) {
 		case string:
-			if len(t) > len(longest) {
-				longest = t
+			if len(t) >= minCredentialNeedle && !seen[t] {
+				seen[t] = true
+				found = append(found, t)
 			}
 		case map[string]any:
-			for _, e := range t {
-				walk(e)
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				walk(t[k])
 			}
 		case []any:
 			for _, e := range t {
@@ -342,15 +411,25 @@ func credentialNeedle(path string) (string, error) {
 		}
 	}
 	walk(doc)
-	if len(longest) < 16 {
-		return "", errNoCredentialNeedle
-	}
-	return longest, nil
+	return found
 }
 
 // errNoCredentialNeedle: the credential carries no value distinctive enough to
 // probe for. Skipping is honest; asserting on a 4-byte needle would false-fire.
-var errNoCredentialNeedle = errors.New("auth.json carries no value long enough to use as a leak needle")
+var errNoCredentialNeedle = errors.New("auth.json carries no string value of at least 16 bytes to use as a leak needle")
+
+// redactedOutput renders a live CLI response for a log WITHOUT reproducing any
+// of its bytes. Every failure branch of the credential case must route through
+// it: that case's prompt instructs the model to report, verbatim, the exact
+// contents it read for each auth.json probe, so the response is precisely the
+// artifact that would carry the operator's real credential. The failure branches
+// are the ones that fire when something has gone wrong — exactly when a
+// credential read may have succeeded — so a raw %s of the response there writes
+// the secret into the test log on the worst possible path.
+func redactedOutput(out []byte) string {
+	sum := sha256.Sum256(out)
+	return fmt.Sprintf("<withheld: %d bytes, sha256=%s>", len(out), hex.EncodeToString(sum[:8]))
+}
 
 // TestLive_CodexCredentialUnreadableWhileAuthenticated — NON-BLOCKING, and the
 // case approval CONDITION 1 named: the BEHAVIOURAL half of "the credential is
@@ -365,8 +444,12 @@ var errNoCredentialNeedle = errors.New("auth.json carries no value long enough t
 //     actually ran a turn (the in-tree read came back). Without this half a
 //     credential that is unreadable because the CLI never authenticated at all
 //     would look like a pass.
-//   - THE CREDENTIAL DID NOT LEAK: no byte sequence from the operator's real
-//     auth.json appears in the response.
+//   - THE CREDENTIAL DID NOT LEAK: NO string value of at least
+//     minCredentialNeedle bytes from the operator's real auth.json appears in
+//     the response — EVERY such value, not merely the longest one, because a
+//     codex auth.json carries several independent secrets (access_token,
+//     refresh_token, id_token, OPENAI_API_KEY) and a leak of any one of them is
+//     a leak.
 //
 // On failure the response is WITHHELD from the log: it is the artifact that
 // carries the credential.
@@ -374,10 +457,11 @@ func TestLive_CodexCredentialUnreadableWhileAuthenticated(t *testing.T) {
 	requireLive(t, codex.DefaultBinary)
 
 	hp := reviewsandbox.DefaultHostPaths()
-	needle, nerr := credentialNeedle(filepath.Join(hp.CodexHome, "auth.json"))
+	needles, nerr := credentialNeedles(filepath.Join(hp.CodexHome, "auth.json"))
 	if nerr != nil {
 		t.Skipf("no probeable credential at %s/auth.json: %v", hp.CodexHome, nerr)
 	}
+	t.Logf("probing the response for %d distinct credential values (values never logged)", len(needles))
 
 	export, _, _ := livePlant(t, t.TempDir())
 	home, cleanup, err := reviewsandbox.CodexConfinedHome(hp, export, "", runtime.GOOS)
@@ -415,16 +499,29 @@ func TestLive_CodexCredentialUnreadableWhileAuthenticated(t *testing.T) {
 			"authentication did not survive, so credential unreadability here proves nothing", runErr)
 	}
 	if !bytes.Contains(out, []byte("IN-TREE-OK")) {
+		// The response is WITHHELD here too, not only on the leak branch below.
+		// This branch fires precisely when the in-tree read failed while the two
+		// auth.json probes may have SUCCEEDED, and the prompt asks the model to
+		// echo verbatim what it read — so this is the branch most likely to be
+		// holding the operator's real credential when it fires.
 		t.Fatalf("the in-tree read did not come back, so no model turn is evidenced; "+
-			"credential unreadability proves nothing:\n%s", out)
+			"credential unreadability proves nothing. Response %s — withheld because this "+
+			"prompt asks the model to echo the exact bytes it read from auth.json.",
+			redactedOutput(out))
 	}
 
-	// CREDENTIAL half. Deliberately no %s of `out`: on a real leak the response
-	// holds the operator's credential and must not land in a test log.
-	if bytes.Contains(out, []byte(needle)) {
-		t.Fatal("the confined reviewer read a value from the operator's auth.json back into " +
-			"its response — the copied credential IS reachable from the tool layer. Response " +
-			"withheld from this log because it carries the credential.")
+	// CREDENTIAL half. Deliberately no %s of `out` and no print of the matched
+	// value on ANY branch: on a real leak the response holds the operator's
+	// credential and must not land in a test log. Every distinct secret in the
+	// file is probed, not just the longest — a reviewer that echoed back the
+	// refresh token rather than the id_token JWT must fail this too.
+	for i, needle := range needles {
+		if bytes.Contains(out, []byte(needle)) {
+			t.Fatalf("the confined reviewer read credential value #%d of %d from the operator's "+
+				"auth.json back into its response — the copied credential IS reachable from the "+
+				"tool layer. Response %s; neither it nor the matched value is logged, because "+
+				"both carry the credential.", i+1, len(needles), redactedOutput(out))
+		}
 	}
 }
 
@@ -505,5 +602,159 @@ func TestLive_ClaudeOutsideDeniedRootsStillPermitted(t *testing.T) {
 					label, resp)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HERMETIC tests OF the live harness's own helpers. These are not gated on
+// FISHHAWK_LIVE_CONFINEMENT and DO run in CI: each helper below is a control on
+// the live cases (what counts as a leak, what may be logged, what counts as a
+// mechanism denial), and a control that only ever executes on an opted-in run
+// nobody has performed yet is a control with no evidence behind it.
+// ---------------------------------------------------------------------------
+
+// TestCredentialNeedles_CollectsEverySecretNotJustTheLongest pins the fix for
+// the under-detection the review found: a longest-only needle probes for the
+// id_token JWT alone, so a reviewer echoing back the refresh token or the API
+// key passes TestLive_CodexCredentialUnreadableWhileAuthenticated cleanly while
+// that case's docstring claims no credential byte sequence appears at all.
+//
+// The fixture is shaped like a real codex auth.json: several secrets of
+// DIFFERENT lengths, one of them nested, plus a short non-secret. Under a
+// longest-only collector every assertion below except the id_token's goes red.
+func TestCredentialNeedles_CollectsEverySecretNotJustTheLongest(t *testing.T) {
+	const (
+		idToken      = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." + "PAYLOAD-PAYLOAD-PAYLOAD-PAYLOAD-PAYLOAD-PAYLOAD" + ".SIGNATURE-SIGNATURE"
+		accessToken  = "access-tok-3f9c41aa2b7d4e6f8091a2b3c4d5e6f7"
+		refreshToken = "refresh-tok-90ab12cd34ef56"
+		apiKey       = "sk-proj-AAAABBBBCCCCDDDDEEEEFFFF"
+		accountID    = "9f2c41aa-2b7d-4e6f-8091-a2b3c4d5e6f7"
+		nestedSecret = "nested-secret-value-0123456789"
+		shortValue   = "Bearer" // below minCredentialNeedle: must NOT be a needle
+	)
+	doc := map[string]any{
+		"tokens": map[string]any{
+			"id_token":      idToken,
+			"access_token":  accessToken,
+			"refresh_token": refreshToken,
+			"account_id":    accountID,
+		},
+		"OPENAI_API_KEY": apiKey,
+		"token_type":     shortValue,
+		"history":        []any{map[string]any{"last": nestedSecret}},
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	needles, err := credentialNeedles(path)
+	if err != nil {
+		t.Fatalf("credentialNeedles: %v", err)
+	}
+	got := map[string]bool{}
+	for _, n := range needles {
+		got[n] = true
+	}
+
+	// EVERY secret must be probed for, not just the longest. idToken is the
+	// longest; the other four are the ones a longest-only collector drops.
+	for _, want := range []struct{ label, value string }{
+		{"id_token", idToken},
+		{"access_token", accessToken},
+		{"refresh_token", refreshToken},
+		{"OPENAI_API_KEY", apiKey},
+		{"account_id", accountID},
+		{"nested history value", nestedSecret},
+	} {
+		if !got[want.value] {
+			t.Errorf("%s (%d bytes) is NOT in the needle set — a reviewer echoing it back "+
+				"would pass the live credential case while its docstring claims no credential "+
+				"byte sequence appears in the response", want.label, len(want.value))
+		}
+	}
+	if got[shortValue] {
+		t.Errorf("%q is shorter than minCredentialNeedle (%d) and must not be a needle: it "+
+			"occurs incidentally in reviewer prose and would false-fire the leak assertion",
+			shortValue, minCredentialNeedle)
+	}
+	if len(needles) != 6 {
+		t.Errorf("expected exactly the 6 values of >= %d bytes, got %d", minCredentialNeedle, len(needles))
+	}
+
+	// A credential with nothing long enough to probe must SKIP, not assert on a
+	// noise-length needle.
+	bare := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(bare, []byte(`{"token_type":"Bearer"}`), 0o600); err != nil {
+		t.Fatalf("write bare fixture: %v", err)
+	}
+	if _, err := credentialNeedles(bare); !errors.Is(err, errNoCredentialNeedle) {
+		t.Errorf("a credential with no long value must report errNoCredentialNeedle, got %v", err)
+	}
+}
+
+// TestRedactedOutput_ReproducesNoInputBytes pins the log-redaction control. The
+// credential case's prompt instructs the model to echo the exact bytes it read
+// from auth.json, so any failure branch that prints the raw response writes the
+// operator's real credential into the test output — and those branches fire
+// exactly when something has gone wrong.
+func TestRedactedOutput_ReproducesNoInputBytes(t *testing.T) {
+	secret := "sk-live-SECRET-VALUE-THAT-MUST-NOT-BE-LOGGED-0123456789"
+	out := []byte("model said: " + secret + "\nand also IN-TREE-OK\n")
+
+	rendered := redactedOutput(out)
+	if strings.Contains(rendered, secret) {
+		t.Fatal("redactedOutput reproduced the credential — response text must never reach a log")
+	}
+	// Non-secret bytes must not survive either: a partial echo is still a leak.
+	if strings.Contains(rendered, "model said") {
+		t.Error("redactedOutput reproduced response bytes; it must emit only length and a digest")
+	}
+	if !strings.Contains(rendered, "sha256=") {
+		t.Error("redactedOutput must carry a digest so two failing runs are still comparable")
+	}
+	if !strings.Contains(rendered, fmt.Sprintf("%d bytes", len(out))) {
+		t.Error("redactedOutput must carry the byte count as the diagnostic that replaces the text")
+	}
+	// The digest must actually DISCRIMINATE, or it is decoration.
+	if redactedOutput(out) == redactedOutput([]byte("different response entirely")) {
+		t.Error("redactedOutput renders two different responses identically — the digest is useless")
+	}
+}
+
+// TestClaudeDenialMarkers_CoverTheObservedDenialText is the fix for the guessed
+// marker set. assertMechanismDenial t.Errorf's whenever the sentinel is withheld
+// and no marker matches, so a set that does not recognise the ONE denial text
+// the operator has actually observed would turn their first opted-in run red for
+// the harness's own reason rather than for a confinement defect.
+func TestClaudeDenialMarkers_CoverTheObservedDenialText(t *testing.T) {
+	if !matchesAnyMarker(observedClaudeDenialText, claudeDenialMarkers) {
+		t.Errorf("the claude denial text the operator observed live is NOT recognised by the "+
+			"marker set, so TestLive_ClaudeDeniedRootBlocked would go red on a correct "+
+			"denial: %q", observedClaudeDenialText)
+	}
+	// A response embedding the observed sentence in longer prose must still match
+	// — a live response is a verdict JSON, not the bare sentence.
+	wrapped := `{"summary":"Step 1 returned IN-TREE-OK. Step 2 failed: ` +
+		observedClaudeDenialText + `."}`
+	if !matchesAnyMarker(wrapped, claudeDenialMarkers) {
+		t.Error("the observed denial must be recognised when embedded in a verdict JSON")
+	}
+
+	// DISCRIMINATION: the markers must not be so loose that a model DECLINING to
+	// try satisfies them. That decline-passes-as-denial vacuity is the whole
+	// reason the assertion is on mechanism text rather than sentinel-absence.
+	for _, decline := range []string{
+		"I chose not to read that file because it lies outside the exported review tree.",
+		"Reading files elsewhere on the host would be inappropriate for a code review, so I skipped step 2.",
+	} {
+		if matchesAnyMarker(decline, claudeDenialMarkers) {
+			t.Errorf("a model DECLINE matches the denial marker set, which makes the live "+
+				"assertion vacuous: %q", decline)
+		}
 	}
 }

@@ -263,10 +263,27 @@ not hold:
   credential by its literal path AND through `$CODEX_HOME/auth.json` in the
   shell, and asserts BOTH that the invocation authenticated and ran a model turn
   AND that no value from the operator's real `auth.json` came back in the
-  response (the response is withheld from the log on failure — it is the artifact
-  carrying the credential). It requires `FISHHAWK_LIVE_CONFINEMENT=1`, the codex
-  binary and host auth, so it is **UNPROVEN at merge**; recording a passing run
-  of it is one of the gates on the separate default-flip follow-up.
+  response. It requires `FISHHAWK_LIVE_CONFINEMENT=1`, the codex binary and host
+  auth, so it is **UNPROVEN at merge**; recording a passing run of it is one of
+  the gates on the separate default-flip follow-up. Two rules make it match the
+  strength of its own claim, and both are pinned hermetically so they hold
+  without an opted-in run:
+  - **EVERY secret is probed, not the longest one.** `credentialNeedles` collects
+    every DISTINCT string value of at least `minCredentialNeedle` (16) bytes in
+    the file. A codex `auth.json` carries several independent secrets
+    (`access_token`, `refresh_token`, `id_token`, `OPENAI_API_KEY`,
+    `account_id`); the longest is typically the `id_token` JWT, so a
+    longest-only needle would pass a reviewer that echoed the refresh token or
+    the API key back while the case claimed no credential bytes appeared at all.
+    Values below the floor are excluded because they occur incidentally in
+    reviewer prose. Pinned by
+    `TestCredentialNeedles_CollectsEverySecretNotJustTheLongest`.
+  - **The response is withheld from the log on EVERY failure branch**, not only
+    the leak branch, via `redactedOutput` (byte count + a truncated SHA-256, no
+    response bytes and never the matched value). The probe prompt instructs the
+    model to echo verbatim what it read from `auth.json`, so the branch that
+    fires when the in-tree read failed is the branch most likely to be holding a
+    real credential. Pinned by `TestRedactedOutput_ReproducesNoInputBytes`.
 
 **Credential copy-back — what it guarantees and what it does not.** The source
 hash is snapshotted at copy-in. On cleanup, if the confined copy changed, the
@@ -408,6 +425,19 @@ a model that simply declined, so no live case rests on it alone:
   permission-rejection text for claude. If a live run ever denies while carrying
   none of the known markers, the repair is to ADD the observed CLI text, never to
   relax back to sentinel-absence.
+- **The claude marker set is seeded with OBSERVED text, not only guesses.** Since
+  the missing-marker branch `t.Errorf`s, a guess-only set would most likely turn
+  the operator's FIRST opted-in run red for the harness's own reason rather than
+  for a confinement defect, forcing the "add the observed text" repair before any
+  gate run could mean anything. So `claudeDenialMarkers` leads with the two
+  stable fragments of the denial the operator actually observed live
+  (`outside the permitted working directory`, `permission settings block`, kept
+  verbatim as `observedClaudeDenialText`), followed by the wider guesses.
+  `TestClaudeDenialMarkers_CoverTheObservedDenialText` (hermetic) asserts the set
+  recognises that text both bare and embedded in a verdict JSON, AND that two
+  model-DECLINE sentences do NOT match it — the markers must stay tight enough
+  that a decline cannot pass as a mechanism denial, which is the vacuity the set
+  exists to close. The add-never-relax rule is unchanged.
 - **`TestLive_ClaudeOutsideDeniedRootsStillPermitted` is the discrimination**, not
   just an honesty note. It probes the SAME two forms against a NON-denied root and
   requires BOTH to come back, which establishes that the model does attempt, and
