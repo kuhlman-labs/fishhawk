@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -1168,6 +1169,46 @@ func TestEpicChildrenCrossRepoRefFailsClosed(t *testing.T) {
 	}
 }
 
+// TestClassifyOutOfSetTarget_UnresolvableWithPositiveNumber_NeverReadsForge pins
+// the `!ref.Resolvable` early return in classifyOutOfSetTarget as a DIRECTLY
+// discriminating control (operator condition 2 / CF5). The parser-driven
+// cross-repo tests above cannot vehicle it: parseDependsOnMarker never emits an
+// unresolvable ref carrying a positive Number, so the separate `number <= 0`
+// guard independently blocks the forge call there and deleting the resolvable
+// guard leaves those tests GREEN. This test constructs the ref DIRECTLY with
+// Resolvable:false AND a positive Number pointing at a closed+completed same-repo
+// issue — exactly the reduce-to-local-number bug the guard exists to stop — and
+// asserts GetIssue is NEVER called and the outcome is DropTargetStateUnreadable
+// (not a false satisfaction). Deleting the `!ref.Resolvable` return turns this RED
+// (GetIssue(#1639) is called and the edge is wrongly satisfied).
+func TestClassifyOutOfSetTarget_UnresolvableWithPositiveNumber_NeverReadsForge(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		// A closed+completed same-repo #1639: were the unresolvable ref reduced to
+		// this number, the classifier would read it and FALSELY satisfy the edge.
+		1639: {Number: 1639, State: "closed", StateReason: "completed"},
+	}}
+	p := New(api)
+	ts, err := p.classifyOutOfSetTarget(
+		context.Background(),
+		forge.FromGitHubInstallationID(99),
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"},
+		dependsOnRef{Resolvable: false, Number: 1639, RawDigest: "0123456789abcdef", RawDisplay: "other/repo#1639"},
+		map[int]targetState{},
+	)
+	if err != nil {
+		t.Fatalf("classifyOutOfSetTarget: %v", err)
+	}
+	if got := api.getIssueCalls[1639]; got != 0 {
+		t.Errorf("GetIssue(#1639) called %d times, want ZERO (an unresolvable ref must never read a local number even when it carries one)", got)
+	}
+	if ts.satisfied {
+		t.Errorf("targetState = %+v, want NOT satisfied (an unresolvable ref is never satisfied)", ts)
+	}
+	if ts.reason != workmgmt.DropTargetStateUnreadable {
+		t.Errorf("reason = %q, want %q", ts.reason, workmgmt.DropTargetStateUnreadable)
+	}
+}
+
 // TestResolveDependenciesMemoizesTargetRead pins the per-call memoization
 // (#2953): three in-set items each depending on the SAME closed target cost
 // exactly ONE GetIssue for that target.
@@ -1436,19 +1477,25 @@ func TestDependsOnMarker_RoundTrip(t *testing.T) {
 	// A cross-repo / owner-qualified token is carried through UNRESOLVABLE, not
 	// silently dropped and not reduced to a local number (#2953, condition 2): so a
 	// cross-repo dependency fails the campaign closed rather than vanishing. An
-	// empty token (trailing comma) is skipped entirely.
+	// empty token (trailing comma) is skipped entirely. Each unresolvable token now
+	// carries an IDENTITY (#2956): a 16-hex digest over its canonical form and the
+	// sanitized display, so its dropped edge names WHICH token.
 	mixed := parseDependsOnMarker("Depends on: #7, other/repo#1639, , owner/name#3")
-	want := []dependsOnRef{
-		{Number: 7, Resolvable: true},
-		{Resolvable: false},
-		{Resolvable: false},
+	if len(mixed) != 3 {
+		t.Fatalf("parse of mixed marker = %+v, want 3 refs", mixed)
 	}
-	if len(mixed) != len(want) {
-		t.Fatalf("parse of mixed marker = %+v, want %+v", mixed, want)
+	if mixed[0] != (dependsOnRef{Number: 7, Resolvable: true}) {
+		t.Errorf("mixed[0] = %+v, want resolvable #7", mixed[0])
 	}
-	for i := range want {
-		if mixed[i] != want[i] {
-			t.Errorf("mixed[%d] = %+v, want %+v", i, mixed[i], want[i])
+	for i, wantDisplay := range map[int]string{1: "other/repo#1639", 2: "owner/name#3"} {
+		if mixed[i].Resolvable {
+			t.Errorf("mixed[%d] = %+v, want unresolvable", i, mixed[i])
+		}
+		if mixed[i].RawDisplay != wantDisplay {
+			t.Errorf("mixed[%d].RawDisplay = %q, want %q", i, mixed[i].RawDisplay, wantDisplay)
+		}
+		if !isHex16(mixed[i].RawDigest) {
+			t.Errorf("mixed[%d].RawDigest = %q, want 16 hex chars", i, mixed[i].RawDigest)
 		}
 	}
 }
@@ -2592,5 +2639,324 @@ func TestDependsOnMarkerRefs_ReadsEveryLineNormalized(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// isHex16 reports whether s is exactly 16 lowercase hex characters — the shape
+// dependsOnTokenDigest emits (#2956).
+func isHex16(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// TestParseDependsOnMarker_UnresolvableTokenCarriesDigestAndDisplay (7.i): a
+// mixed marker yields resolvable numeric refs plus an UNRESOLVABLE cross-repo ref
+// carrying a 16-hex digest and the sanitized display (#2956).
+func TestParseDependsOnMarker_UnresolvableTokenCarriesDigestAndDisplay(t *testing.T) {
+	refs := parseDependsOnMarker("Depends on: #1639, other/repo#12, 42")
+	if len(refs) != 3 {
+		t.Fatalf("refs = %+v, want 3 (resolvable 1639, unresolvable cross-repo, resolvable 42)", refs)
+	}
+	if refs[0] != (dependsOnRef{Number: 1639, Resolvable: true}) {
+		t.Errorf("refs[0] = %+v, want resolvable #1639", refs[0])
+	}
+	if refs[2] != (dependsOnRef{Number: 42, Resolvable: true}) {
+		t.Errorf("refs[2] = %+v, want resolvable #42", refs[2])
+	}
+	if refs[1].Resolvable {
+		t.Errorf("refs[1] = %+v, want unresolvable", refs[1])
+	}
+	if refs[1].RawDisplay != "other/repo#12" {
+		t.Errorf("refs[1].RawDisplay = %q, want %q", refs[1].RawDisplay, "other/repo#12")
+	}
+	if !isHex16(refs[1].RawDigest) {
+		t.Errorf("refs[1].RawDigest = %q, want 16 lowercase hex chars", refs[1].RawDigest)
+	}
+}
+
+// TestParseDependsOnMarker_ControlRuneOnlyTokens_DistinctDigests (7.ii): two
+// tokens made solely of DIFFERENT control runes both sanitize to "" yet carry
+// DIFFERENT digests — the digest is over the canonical (pre-sanitization) form,
+// so control-rune stripping cannot merge them (#2956, CF2 vehicle).
+func TestParseDependsOnMarker_ControlRuneOnlyTokens_DistinctDigests(t *testing.T) {
+	refs := parseDependsOnMarker("Depends on: \x01, \x02")
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want 2 control-rune tokens", refs)
+	}
+	for i, r := range refs {
+		if r.Resolvable {
+			t.Errorf("refs[%d] = %+v, want unresolvable", i, r)
+		}
+		if r.RawDisplay != "" {
+			t.Errorf("refs[%d].RawDisplay = %q, want empty (control runes sanitize away)", i, r.RawDisplay)
+		}
+		if !isHex16(r.RawDigest) {
+			t.Errorf("refs[%d].RawDigest = %q, want 16 hex chars", i, r.RawDigest)
+		}
+	}
+	if refs[0].RawDigest == refs[1].RawDigest {
+		t.Errorf("distinct control-rune tokens share a digest %q — digest must be over the canonical, not the sanitized, form", refs[0].RawDigest)
+	}
+}
+
+// TestParseDependsOnMarker_TokensDifferingOnlyPastTruncation_DistinctDigests
+// (7.iii): two 200-rune tokens identical for the first 64 runes carry DIFFERENT
+// digests (the full canonical form is hashed) but EQUAL truncated displays.
+func TestParseDependsOnMarker_TokensDifferingOnlyPastTruncation_DistinctDigests(t *testing.T) {
+	a := strings.Repeat("a", 64) + strings.Repeat("b", 136)
+	b := strings.Repeat("a", 64) + strings.Repeat("c", 136)
+	refs := parseDependsOnMarker("Depends on: " + a + ", " + b)
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want 2", refs)
+	}
+	if refs[0].RawDigest == refs[1].RawDigest {
+		t.Errorf("tokens differing past rune 64 share a digest — the FULL canonical form must be hashed, not the truncated display")
+	}
+	if refs[0].RawDisplay != refs[1].RawDisplay {
+		t.Errorf("displays differ (%q vs %q); both should truncate to the same first-64-rune prefix", refs[0].RawDisplay, refs[1].RawDisplay)
+	}
+	// The display is rune-bounded.
+	if n := len([]rune(refs[0].RawDisplay)); n > 64 {
+		t.Errorf("RawDisplay is %d runes, want <= 64", n)
+	}
+}
+
+// TestParseDependsOnMarker_CanonicalFormCollapsesWhitespaceVariants (7.iv): two
+// tokens differing only in surrounding whitespace share ONE canonical form and
+// therefore ONE digest — the identity relation asserted positively (#2956).
+func TestParseDependsOnMarker_CanonicalFormCollapsesWhitespaceVariants(t *testing.T) {
+	refs := parseDependsOnMarker("Depends on:   other/repo#12 , other/repo#12")
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want 2 whitespace variants of one token", refs)
+	}
+	if refs[0].RawDigest == "" || refs[0].RawDigest != refs[1].RawDigest {
+		t.Errorf("whitespace variants have digests %q / %q, want ONE shared non-empty digest", refs[0].RawDigest, refs[1].RawDigest)
+	}
+}
+
+// TestParseDependsOnMarker_OverflowAndWhitespaceTokens (routed #2956 untested
+// paths): a regex-matching but int-OVERFLOWING digit string
+// (`99999999999999999999`, which dependsOnRefRE accepts but strconv.Atoi rejects)
+// is carried through UNRESOLVABLE with a digest and its verbatim display rather
+// than silently dropped; and a token carrying an internal whitespace RUN of mixed
+// classes — ASCII space, a tab, and a printable Unicode space (U+00A0) — has that
+// run collapsed to a single ASCII space in RawDisplay.
+func TestParseDependsOnMarker_OverflowAndWhitespaceTokens(t *testing.T) {
+	refs := parseDependsOnMarker("Depends on: 99999999999999999999, other/repo\t #12")
+	if len(refs) != 2 {
+		t.Fatalf("refs = %+v, want 2", refs)
+	}
+	// The overflow token: matches the ref regex but Atoi overflows, so it lands in
+	// the strconv.Atoi failure branch — unresolvable, Number 0, digest-bearing, and
+	// with its digits preserved verbatim in the display (never issue:0).
+	over := refs[0]
+	if over.Resolvable || over.Number != 0 {
+		t.Errorf("overflow ref = %+v, want unresolvable with Number 0", over)
+	}
+	if !isHex16(over.RawDigest) {
+		t.Errorf("overflow RawDigest = %q, want 16 hex chars", over.RawDigest)
+	}
+	if over.RawDisplay != "99999999999999999999" {
+		t.Errorf("overflow RawDisplay = %q, want the digit string verbatim", over.RawDisplay)
+	}
+	// The whitespace-run token: every whitespace class between owner/repo and #12
+	// collapses to ONE ASCII space (a tab is normalized, not dropped; the Unicode
+	// space is collapsed, not passed through).
+	ws := refs[1]
+	if ws.Resolvable {
+		t.Errorf("whitespace ref = %+v, want unresolvable", ws)
+	}
+	if ws.RawDisplay != "other/repo #12" {
+		t.Errorf("whitespace RawDisplay = %q, want %q (mixed whitespace run collapsed to one space)", ws.RawDisplay, "other/repo #12")
+	}
+	if !isHex16(ws.RawDigest) {
+		t.Errorf("whitespace RawDigest = %q, want 16 hex chars", ws.RawDigest)
+	}
+}
+
+// TestResolveDependencies_OverflowNumericToken_UnresolvableNoForgeLookup (routed
+// #2956 verification): a depends_on marker whose sole token is a regex-matching but
+// int-OVERFLOWING digit string produces ONE DroppedEdge stamped
+// DropTargetStateUnreadable carrying a digest/display identity, triggers NO GetIssue
+// for the (unresolvable) target, and never renders issue:0. This exercises the
+// strconv.Atoi failure branch END TO END through the provider — diff-only evidence
+// left it unverified.
+func TestResolveDependencies_OverflowNumericToken_UnresolvableNoForgeLookup(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: 99999999999999999999", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 1 {
+		t.Fatalf("DroppedEdges = %+v, want exactly one", res.DroppedEdges)
+	}
+	e := res.DroppedEdges[0]
+	if e.Reason != workmgmt.DropTargetStateUnreadable {
+		t.Errorf("Reason = %q, want %q", e.Reason, workmgmt.DropTargetStateUnreadable)
+	}
+	if !isHex16(e.ToRefDigest) {
+		t.Errorf("ToRefDigest = %q, want 16 hex chars", e.ToRefDigest)
+	}
+	if e.ToRef != "99999999999999999999" {
+		t.Errorf("ToRef = %q, want the overflow digit string verbatim", e.ToRef)
+	}
+	if ref := e.TargetRef(); strings.Contains(ref, "issue:0") {
+		t.Errorf("TargetRef = %q, must never render issue:0 for an unresolvable overflow target", ref)
+	}
+	// The overflow target is UNRESOLVABLE, so classifyOutOfSetTarget returns before
+	// any forge call: GetIssue is reached ONLY for the in-set fetch of 2032.
+	if got := api.getIssueCalls[2032]; got != 1 {
+		t.Errorf("GetIssue(2032) called %d times, want 1 (the in-set fetch)", got)
+	}
+	if len(api.getIssueCalls) != 1 {
+		t.Errorf("GetIssue call set = %v, want exactly {2032} — the overflow target must never reach a forge lookup", api.getIssueCalls)
+	}
+}
+
+// TestResolveDependencies_TwoDistinctCrossRepoTokens_ReportedSeparately (7.v): one
+// item body naming TWO distinct cross-repo tokens yields TWO DroppedEdges, both
+// DropTargetStateUnreadable, with DIFFERENT ToRefDigests (#2956, CF1 vehicle).
+func TestResolveDependencies_TwoDistinctCrossRepoTokens_ReportedSeparately(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: other/a#1, other/b#2", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 2 {
+		t.Fatalf("DroppedEdges = %+v, want 2 distinct cross-repo edges", res.DroppedEdges)
+	}
+	for _, e := range res.DroppedEdges {
+		if e.From != 2032 || e.To != 0 || e.Reason != workmgmt.DropTargetStateUnreadable {
+			t.Errorf("edge = %+v, want {From:2032 To:0 unreadable}", e)
+		}
+		if !isHex16(e.ToRefDigest) {
+			t.Errorf("edge %+v ToRefDigest not 16 hex", e)
+		}
+	}
+	if res.DroppedEdges[0].ToRefDigest == res.DroppedEdges[1].ToRefDigest {
+		t.Errorf("two distinct cross-repo tokens collapsed to one digest %q", res.DroppedEdges[0].ToRefDigest)
+	}
+}
+
+// TestResolveDependencies_RepeatedIdenticalCrossRepoToken_CollapsesToOneEdge
+// (7.vi): the SAME cross-repo token repeated on one item collapses to exactly ONE
+// dropped edge (the #2953 condition-3 dedup preserved under the new digest key).
+func TestResolveDependencies_RepeatedIdenticalCrossRepoToken_CollapsesToOneEdge(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: other/a#1, other/a#1", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 1 {
+		t.Fatalf("DroppedEdges = %+v, want exactly 1 (repeated identical token collapses)", res.DroppedEdges)
+	}
+}
+
+// TestResolveDependencies_EmptySanitizingTokenAndNumericUnreadableEdgeCoexist
+// (7.vii): an item naming BOTH a control-rune-only token (sanitizes to empty) AND
+// a numeric ref whose GetIssue errors yields TWO distinct dropped edges whose
+// rendered TargetRef strings differ and neither of which is `issue:0` (#2956).
+func TestResolveDependencies_EmptySanitizingTokenAndNumericUnreadableEdgeCoexist(t *testing.T) {
+	api := &fakeAPI{
+		getIssues: map[int]*githubclient.Issue{
+			2032: {Number: 2032, Title: "in-set", Body: "Depends on: \x01, #1700", State: "open"},
+		},
+		getIssueErrs: map[int]error{1700: errors.New("github rejected the read")},
+	}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("2032"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 2 {
+		t.Fatalf("DroppedEdges = %+v, want 2 (empty-sanitizing token + numeric unreadable)", res.DroppedEdges)
+	}
+	rendered := map[string]bool{}
+	for _, e := range res.DroppedEdges {
+		if e.Reason != workmgmt.DropTargetStateUnreadable {
+			t.Errorf("edge %+v Reason = %q, want unreadable", e, e.Reason)
+		}
+		tr := e.TargetRef()
+		if tr == "issue:0" {
+			t.Errorf("edge %+v rendered issue:0 — an unresolvable target must never render issue:0", e)
+		}
+		rendered[tr] = true
+	}
+	if len(rendered) != 2 {
+		t.Errorf("rendered targets = %v, want two DISTINCT non-issue:0 refs", rendered)
+	}
+	if !rendered["issue:1700"] {
+		t.Errorf("rendered = %v, want the numeric unreadable edge to render issue:1700", rendered)
+	}
+}
+
+// TestSortEdges_ThirteenUnresolvableEdges_DigestOrdered (7.viii / CF4): 13
+// unresolvable edges sharing (From, To=0) with distinct digests, fed in
+// NON-digest-ascending (reversed) order, come back digest-ascending. The input
+// order is the actual control (operator condition 3): without the ToRefDigest
+// tiebreak the comparator treats them as equal and sort.Slice does not preserve
+// the reversed input above the insertion-sort threshold, so the exact-order
+// assertion fails. 13 (> the 12-element insertion-sort threshold) is chosen so
+// pdqsort's partitioning path — not the order-preserving small-slice path — runs.
+func TestSortEdges_ThirteenUnresolvableEdges_DigestOrdered(t *testing.T) {
+	const n = 13
+	edges := make([]workmgmt.DependsEdge, 0, n)
+	for i := 0; i < n; i++ {
+		d := dependsOnTokenDigest("tok" + strconv.Itoa(i))
+		edges = append(edges, workmgmt.DependsEdge{From: 2032, To: 0, Reason: workmgmt.DropTargetStateUnreadable, ToRefDigest: d})
+	}
+	// Ascending-by-digest expectation.
+	wantDigests := make([]string, n)
+	for i, e := range edges {
+		wantDigests[i] = e.ToRefDigest
+	}
+	sort.Strings(wantDigests)
+	// Feed the fixture in REVERSED (non-ascending) order so input order cannot
+	// accidentally satisfy the assertion.
+	sort.Slice(edges, func(i, j int) bool { return edges[i].ToRefDigest > edges[j].ToRefDigest })
+	sortEdges(edges)
+	for i := range edges {
+		if edges[i].ToRefDigest != wantDigests[i] {
+			t.Fatalf("edges[%d].ToRefDigest = %q, want %q (digest-ascending order not established)", i, edges[i].ToRefDigest, wantDigests[i])
+		}
+	}
+}
+
+// TestEpicChildren_TwoDistinctCrossRepoTokens_ReportedSeparately (7.ix, EpicChildren
+// mirror of 7.v): a child naming two distinct cross-repo tokens yields two dropped
+// edges with distinct digests.
+func TestEpicChildren_TwoDistinctCrossRepoTokens_ReportedSeparately(t *testing.T) {
+	res := epicChildrenResultBody(t, 43, "Depends on: other/a#1, other/b#2", nil)
+	if len(res.DroppedEdges) != 2 {
+		t.Fatalf("DroppedEdges = %+v, want 2 distinct cross-repo edges", res.DroppedEdges)
+	}
+	if res.DroppedEdges[0].ToRefDigest == res.DroppedEdges[1].ToRefDigest {
+		t.Errorf("two distinct cross-repo tokens collapsed to one digest on the epic path")
+	}
+	for _, e := range res.DroppedEdges {
+		if e.From != 43 || e.Reason != workmgmt.DropTargetStateUnreadable {
+			t.Errorf("edge = %+v, want {From:43 unreadable}", e)
+		}
+	}
+}
+
+// TestEpicChildren_RepeatedIdenticalCrossRepoToken_CollapsesToOneEdge (7.ix,
+// EpicChildren mirror of 7.vi).
+func TestEpicChildren_RepeatedIdenticalCrossRepoToken_CollapsesToOneEdge(t *testing.T) {
+	res := epicChildrenResultBody(t, 43, "Depends on: other/a#1, other/a#1", nil)
+	if len(res.DroppedEdges) != 1 {
+		t.Fatalf("DroppedEdges = %+v, want exactly 1 (repeated identical token collapses)", res.DroppedEdges)
 	}
 }

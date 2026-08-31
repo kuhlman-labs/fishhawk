@@ -596,3 +596,32 @@ func TestPersist_ThreadsGroomingSource(t *testing.T) {
 		t.Errorf("GroomingSource persisted as %s, want %s", f.campaignGot.GroomingSource, provenance)
 	}
 }
+
+// TestAssemble_DanglingUnparsableTokenNamedNotIssueZero pins that an unresolvable
+// (cross-repo/unparseable) dropped edge — carrying ToRef/ToRefDigest (#2956) —
+// renders through DependsEdge.TargetRef into the DanglingDependencyError message
+// naming the TOKEN, never the identity-less issue:0.
+func TestAssemble_DanglingUnparsableTokenNamedNotIssueZero(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 2032}},
+		DroppedEdges: []workmgmt.DependsEdge{{
+			From: 2032, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+			ToRef: "other/repo#12", ToRefDigest: "0123456789abcdef",
+		}},
+	}
+	_, err := campaign.Assemble("", res)
+	var de *campaign.DanglingDependencyError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want *DanglingDependencyError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "other/repo#12") {
+		t.Errorf("message %q does not name the unparsable token", msg)
+	}
+	if !strings.Contains(msg, "unparsable:") {
+		t.Errorf("message %q missing the unparsable: prefix", msg)
+	}
+	if strings.Contains(msg, "issue:0") {
+		t.Errorf("message %q renders issue:0 for an unresolvable target — forbidden (#2956)", msg)
+	}
+}

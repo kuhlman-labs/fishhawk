@@ -285,3 +285,101 @@ func TestSatisfiedEdgeCarriedThroughDispatch(t *testing.T) {
 		t.Errorf("SatisfiedEdge = %+v, want {2032 1639 closed completed}", e)
 	}
 }
+
+// TestDependsEdgeTargetRef pins the single rendering authority for a depends_on
+// target (#2956), asserting the SHIPPED string shape: a resolvable edge renders
+// issue:<To> unchanged; an unresolvable edge renders unparsable:<digest>:"token"
+// or the <unprintable> sentinel; NO input renders issue:0; a display carrying an
+// ANSI escape / newline / quote is control-free (strconv.Quote-escaped) in the
+// output; and a 10,000-rune token — supplied DIRECTLY, bypassing the parser — is
+// bounded (operator condition 1).
+func TestDependsEdgeTargetRef(t *testing.T) {
+	t.Run("resolvable renders issue:To unchanged", func(t *testing.T) {
+		got := DependsEdge{From: 1, To: 99}.TargetRef()
+		if got != "issue:99" {
+			t.Errorf("TargetRef = %q, want issue:99", got)
+		}
+	})
+	t.Run("unresolvable with display renders unparsable:digest:quoted", func(t *testing.T) {
+		got := DependsEdge{From: 2032, To: 0, ToRef: "other/repo#12", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		want := `unparsable:0123456789abcdef:"other/repo#12"`
+		if got != want {
+			t.Errorf("TargetRef = %q, want %q", got, want)
+		}
+	})
+	t.Run("unresolvable with empty display renders the sentinel", func(t *testing.T) {
+		got := DependsEdge{From: 2032, To: 0, ToRef: "", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		want := "unparsable:0123456789abcdef:<unprintable>"
+		if got != want {
+			t.Errorf("TargetRef = %q, want %q", got, want)
+		}
+	})
+	t.Run("unresolvable edge never renders issue:0", func(t *testing.T) {
+		// Every case here is an UNRESOLVABLE edge (non-empty ToRefDigest, To=0);
+		// the load-bearing assertion is that none render issue:0. A resolvable
+		// To:0 edge legitimately renders issue:0 and is covered by the sibling
+		// subtests, so it is not a case here (routed test-vacuity concern).
+		for _, e := range []DependsEdge{
+			{From: 1, To: 0, ToRef: "x", ToRefDigest: "deadbeefdeadbeef"},
+			{From: 1, To: 0, ToRefDigest: "deadbeefdeadbeef"},
+		} {
+			got := e.TargetRef()
+			if got == "issue:0" {
+				t.Errorf("unresolvable edge %+v rendered issue:0 — forbidden", e)
+			}
+		}
+	})
+	t.Run("non-hex digest falls back to the sentinel", func(t *testing.T) {
+		// A directly-constructed edge whose ToRefDigest is NOT the 16-hex parser
+		// shape (an oversize, control-laden value a future constructor might
+		// supply) must never interpolate the raw digest into the operator message:
+		// TargetRef substitutes the <invalid-digest> sentinel (#2956, routed
+		// digest-symmetry concern). Counterfactual vehicle for boundTargetRefDigest.
+		got := DependsEdge{To: 0, ToRef: "other/repo#12",
+			ToRefDigest: "NOThex\x1b[31m/" + strings.Repeat("z", 9000)}.TargetRef()
+		if !strings.Contains(got, "<invalid-digest>") {
+			t.Errorf("TargetRef = %q, want the <invalid-digest> sentinel for a non-hex digest", got)
+		}
+		if strings.Contains(got, "\x1b") || strings.Contains(got, "zzz") {
+			t.Errorf("TargetRef = %q leaked the raw non-hex digest — must be replaced by the sentinel", got)
+		}
+		const ceiling = 200
+		if len(got) > ceiling {
+			t.Errorf("TargetRef len = %d, want <= %d (a non-hex digest must not blow up the render)", len(got), ceiling)
+		}
+	})
+	t.Run("exact-length non-hex digest falls back to the sentinel", func(t *testing.T) {
+		// The prior case is 9000 chars, so it returns at boundTargetRefDigest's
+		// len != 16 branch and never reaches the per-rune check. This case pins the
+		// rune loop: a digest that IS exactly 16 chars but carries a
+		// non-lowercase-hex rune ('g') must still fall back to <invalid-digest>,
+		// never leaking the raw digest (#2956, routed untested-path concern).
+		got := DependsEdge{To: 0, ToRef: "other/repo#12",
+			ToRefDigest: "0123456789abcdeg"}.TargetRef()
+		if !strings.Contains(got, "<invalid-digest>") {
+			t.Errorf("TargetRef = %q, want the <invalid-digest> sentinel for a 16-char non-hex digest", got)
+		}
+		if strings.Contains(got, "0123456789abcdeg") {
+			t.Errorf("TargetRef = %q leaked the raw 16-char non-hex digest — must be replaced by the sentinel", got)
+		}
+	})
+	t.Run("ANSI / newline / quote are escaped and control-free", func(t *testing.T) {
+		got := DependsEdge{To: 0, ToRef: "a\x1b[31m\nb\"c", ToRefDigest: "0123456789abcdef"}.TargetRef()
+		for _, bad := range []string{"\x1b", "\n"} {
+			if strings.Contains(got, bad) {
+				t.Errorf("TargetRef %q contains a raw control byte %q — must be escaped", got, bad)
+			}
+		}
+		if !strings.HasPrefix(got, "unparsable:0123456789abcdef:") {
+			t.Errorf("TargetRef = %q, want the unparsable-prefixed render", got)
+		}
+	})
+	t.Run("10000-rune token renders bounded", func(t *testing.T) {
+		got := DependsEdge{To: 0, ToRef: strings.Repeat("z", 10000), ToRefDigest: "0123456789abcdef"}.TargetRef()
+		// Ceiling: prefix (~30) + a 64-rune quoted display + quotes/escapes.
+		const ceiling = 200
+		if len(got) > ceiling {
+			t.Errorf("TargetRef len = %d, want <= %d (a directly-supplied oversize token must be bounded by the renderer)", len(got), ceiling)
+		}
+	})
+}

@@ -927,7 +927,11 @@ func edgeRefs(edges []workmgmt.DependsEdge) []string {
 	}
 	refs := make([]string, 0, len(edges))
 	for _, e := range edges {
-		refs = append(refs, "issue:"+strconv.Itoa(e.From)+"->issue:"+strconv.Itoa(e.To))
+		// Target side routes through the single renderer DependsEdge.TargetRef
+		// (#2956): a resolvable edge still renders `issue:To`, while an unresolvable
+		// cross-repo/unparseable edge renders `unparsable:<digest>:"token"` instead
+		// of the identity-less `issue:0`.
+		refs = append(refs, "issue:"+strconv.Itoa(e.From)+"->"+e.TargetRef())
 	}
 	return refs
 }

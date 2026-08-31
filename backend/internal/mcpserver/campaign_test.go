@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,10 +20,13 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	wmgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // --- fishhawk_start_campaign (E25.8 / #1447) ---
@@ -2028,5 +2032,222 @@ func TestStartCampaign_GroomingDanglingDoesNotStealEpicRemedy(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "WIDEN the batch") {
 		t.Fatalf("epic campaign got the grooming-order remedy: %v", err)
+	}
+}
+
+// TestStartCampaign_UnreadableUnparsableToken_NamesTokenAndExplanation is the
+// #2956 consumer test: an unreadable-only details map whose edge carries an
+// `unparsable:` ref renders the token INSIDE the unreadable remedy clause (which
+// previously named no edges) AND the cross-repo explanation.
+func TestStartCampaign_UnreadableUnparsableToken_NamesTokenAndExplanation(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"unreadable edge","details":{"epic_ref":"#25","dangling_state_unreadable":["issue:2032->unparsable:0123456789abcdef:\"other/repo#12\""]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	msg := err.Error()
+	for _, want := range []string{"could not be read", "other/repo#12", "unparsable:", "cross-repo"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("err %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "issue:0") {
+		t.Errorf("err %q renders issue:0 — forbidden", msg)
+	}
+}
+
+// TestStartCampaign_UnreadableNumericToken_OmitsCrossRepoExplanation pins operator
+// condition 5: a transient forge-read failure on a NUMERIC target (issue:N, no
+// unparsable: prefix) must NOT append the cross-repo explanation — that would be
+// misleading noise on the common transient-error case.
+func TestStartCampaign_UnreadableNumericToken_OmitsCrossRepoExplanation(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"unreadable edge","details":{"epic_ref":"#25","dangling_state_unreadable":["issue:2032->issue:1700"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "could not be read") || !strings.Contains(msg, "issue:1700") {
+		t.Errorf("err %q missing the base unreadable clause naming issue:1700", msg)
+	}
+	if strings.Contains(msg, "cross-repo") || strings.Contains(msg, "unparsable:") {
+		t.Errorf("err %q wrongly labels a numeric transient-read failure a cross-repo cause", msg)
+	}
+}
+
+// TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanation
+// (routed #2956 untested path): unreadableRemedyClause is called from BOTH the
+// grooming-source branch and the non-grooming branch, but the sibling #2956 tests
+// all drive the non-grooming path. This drives the GROOMING branch — details carry
+// dangling_source: grooming_order plus a dangling_state_unreadable unparsable:
+// entry — and asserts the token AND the conditional cross-repo sentence appear in
+// the grooming remedy too.
+func TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanation(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"unreadable edge","details":{"dangling_source":"grooming_order","grooming_run_id":"abc","grooming_order_limit":3,"dangling_state_unreadable":["issue:2032->unparsable:0123456789abcdef:\"other/repo#12\""]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", GroomingRunID: "11111111-1111-1111-1111-111111111111"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	msg := err.Error()
+	for _, want := range []string{"could not be read", "other/repo#12", "unparsable:", "cross-repo"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("grooming remedy %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "issue:0") {
+		t.Errorf("grooming remedy %q renders issue:0 — forbidden", msg)
+	}
+}
+
+// unparsableE2EGHAPI is a minimal stub of the exported workmgmt/github.API
+// interface for the #2956 end-to-end test: only GetIssue is meaningful, the rest
+// return zero values (the same pattern boardSyncGHAPI uses). It records GetIssue
+// calls per number so the test can pin that the anchored regex kept the cross-repo
+// token from ever reaching a local lookup (operator condition 4).
+type unparsableE2EGHAPI struct {
+	issues   map[int]*githubclient.Issue
+	getCalls map[int]int
+}
+
+func (f *unparsableE2EGHAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	if f.getCalls == nil {
+		f.getCalls = map[int]int{}
+	}
+	f.getCalls[number]++
+	if iss, ok := f.issues[number]; ok {
+		return iss, nil
+	}
+	return nil, fmt.Errorf("githubclient: issue #%d not found", number)
+}
+
+func (f *unparsableE2EGHAPI) CreateIssue(context.Context, forge.CredentialScope, githubclient.RepoRef, githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	return nil, errors.New("unused")
+}
+func (f *unparsableE2EGHAPI) IssueNodeID(context.Context, forge.CredentialScope, githubclient.RepoRef, int) (string, error) {
+	return "", nil
+}
+func (f *unparsableE2EGHAPI) ProjectFields(context.Context, forge.CredentialScope, githubclient.ProjectCoord, string) (*githubclient.ProjectMeta, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) ProjectItemStatus(context.Context, forge.CredentialScope, string, string, string) (*githubclient.ProjectItemStatus, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) AddProjectItem(context.Context, forge.CredentialScope, string, string) (string, error) {
+	return "", nil
+}
+func (f *unparsableE2EGHAPI) SetProjectItemSingleSelect(context.Context, forge.CredentialScope, string, string, string, string) error {
+	return nil
+}
+func (f *unparsableE2EGHAPI) AddSubIssue(context.Context, forge.CredentialScope, string, string) error {
+	return nil
+}
+func (f *unparsableE2EGHAPI) ListSubIssues(context.Context, forge.CredentialScope, string) ([]githubclient.SubIssue, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) SearchIssuesByTitle(context.Context, forge.CredentialScope, string) ([]githubclient.IssueTitleResult, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) ListRepoIssues(context.Context, forge.CredentialScope, githubclient.RepoRef, githubclient.ListRepoIssuesOptions) ([]githubclient.RepoIssue, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) UpdateIssue(context.Context, forge.CredentialScope, githubclient.RepoRef, int, githubclient.UpdateIssueParams) (*githubclient.Issue, error) {
+	return nil, nil
+}
+func (f *unparsableE2EGHAPI) ProjectsTokenConfigured() bool { return false }
+
+// TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd is
+// the CROSS-BOUNDARY binding test (#2956 step 9): it starts from a REAL
+// `Depends on: #1639, other/repo#12, 42` marker string served by a stub of the
+// exported workmgmt/github.API, drives the ACTUAL provider path
+// (github.New(stub).ResolveDependencies) so RawDigest/RawDisplay/ToRef/ToRefDigest
+// are populated by PRODUCTION code (no hand-built edge), carries the provider-
+// produced result through campaign.Assemble -> server.DanglingDependencyDetails
+// -> a json.Marshal'd 422 envelope served over the httptest fake backend ->
+// r.startCampaign, and asserts the final operator text names the cross-repo token,
+// carries `unparsable:`, and never `issue:0`.
+//
+// It ALSO pins operator condition 4: GetIssue is called exactly for the out-of-set
+// numeric targets {1639, 42} (plus the in-set fetch of 2032) and NEVER for the
+// reduced cross-repo number 12 — the anchored regex kept the cross-repo ref from
+// ever reaching a local lookup.
+func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(t *testing.T) {
+	stub := &unparsableE2EGHAPI{issues: map[int]*githubclient.Issue{
+		// The in-set item whose body carries the mixed marker.
+		2032: {Number: 2032, Title: "in-set", Body: "Depends on: #1639, other/repo#12, 42", State: "open"},
+		// The two out-of-set NUMERIC targets are ordinary references (open), so
+		// they still classify as dangling — and are READ by classifyOutOfSetTarget.
+		1639: {Number: 1639, Title: "num a", State: "open"},
+		42:   {Number: 42, Title: "num b", State: "open"},
+	}}
+
+	// Drive the REAL provider path — the marker is parsed by production code.
+	res, err := wmgithub.New(stub).ResolveDependencies(context.Background(), workmgmt.IssueSetRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Items:  []string{"2032"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+
+	// Operator condition 4: GetIssue reached the two out-of-set numbers and the
+	// in-set fetch, and NEVER the reduced cross-repo number 12.
+	if stub.getCalls[1639] == 0 || stub.getCalls[42] == 0 {
+		t.Errorf("GetIssue calls = %v, want a read for both out-of-set numeric targets 1639 and 42", stub.getCalls)
+	}
+	if got := stub.getCalls[12]; got != 0 {
+		t.Errorf("GetIssue(#12) called %d times — the cross-repo token other/repo#12 must NEVER reach a local lookup", got)
+	}
+	if len(stub.getCalls) != 3 { // 2032 (in-set), 1639, 42
+		t.Errorf("GetIssue call set = %v, want exactly {2032,1639,42}", stub.getCalls)
+	}
+
+	// Carry the provider-produced result through Assemble (fails closed on the
+	// dropped edges) -> the REAL server details-map builder -> the 422 envelope.
+	_, aerr := campaign.Assemble("", res)
+	var de *campaign.DanglingDependencyError
+	if !errors.As(aerr, &de) {
+		t.Fatalf("Assemble err = %v, want *DanglingDependencyError", aerr)
+	}
+	body, merr := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "campaign_dangling_dependency",
+			"message": de.Error(),
+			"details": server.DanglingDependencyDetails(de, ""),
+		},
+	})
+	if merr != nil {
+		t.Fatalf("marshal envelope: %v", merr)
+	}
+
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = string(body)
+	r := newResolver(srv, nil)
+
+	_, _, gotErr := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "kuhlman-labs/fishhawk", Items: []string{"2032"}})
+	if gotErr == nil {
+		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
+	}
+	msg := gotErr.Error()
+	if !strings.Contains(msg, "other/repo#12") {
+		t.Errorf("operator message %q does not name the cross-repo token", msg)
+	}
+	if !strings.Contains(msg, "unparsable:") {
+		t.Errorf("operator message %q missing the unparsable: prefix", msg)
+	}
+	if strings.Contains(msg, "issue:0") {
+		t.Errorf("operator message %q renders issue:0 for the unresolvable target — forbidden (#2956)", msg)
 	}
 }
