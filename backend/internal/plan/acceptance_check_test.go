@@ -1638,6 +1638,24 @@ func TestPhraseHeadIndices_Bounds(t *testing.T) {
 func TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase(t *testing.T) {
 	const statement = "no real dispatch is attempted while the loader still calls the github apis on every request"
 
+	// BRANCH ISOLATION. MissingLiveValidationMarker emits ONE rule-level
+	// finding whether M1 or M2 fired, so a bare-case finding count alone does
+	// not establish that the SUBSTRING occurrence ("github api" inside "github
+	// apis") is what fired — the statement also carries the qualifier-action
+	// pair "real dispatch", which is M2's conjunct 1. These two white-box
+	// assertions separate the branches directly: M2 is false on this statement
+	// (it carries no "against …" phrase, so conjunct 2 fails), and M1 is true.
+	// Should M1 ever stop matching the substring, the bare assertion below can
+	// no longer be carried by M2 and this test fails rather than staying green
+	// on the other branch.
+	lowered := strings.ToLower(statement)
+	if livenessProximityMatch(acceptanceTokens(lowered)) {
+		t.Fatalf("M2 must NOT fire on the flagship statement (no against-phrase); the bare finding below would then not isolate M1")
+	}
+	if !liveTargetCorpusMatch(lowered) {
+		t.Fatalf("M1 must match the substring occurrence of a liveTarget corpus phrase in %q", statement)
+	}
+
 	// Non-vacuity: M1 really does fire on this statement. Without a stated
 	// in-repository verification method conjunct S fails and the finding
 	// stands, so the suppression below is the post-filter acting, not the
@@ -1649,6 +1667,23 @@ func TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase(t *testing
 	}
 	if got := findingsFor(EvaluateAcceptanceCriteria(bare), RuleMissingLiveValidationMarker); len(got) != 1 {
 		t.Fatalf("M1 must fire on the substring occurrence; want 1 finding, got %d: %+v", len(got), got)
+	}
+
+	// The same isolation at the RULE level, black-box: strip the "real
+	// dispatch" pair so conjunct 1 — and with it every M2 anchor — is gone,
+	// leaving the substring occurrence as the only thing that can fire. A
+	// finding here is unambiguously M1's.
+	const m1Only = "the loader still calls the github apis on every request"
+	if qualifierNearAction(acceptanceTokens(m1Only)) {
+		t.Fatalf("the M1-only control must carry no qualifier-action pair: %q", m1Only)
+	}
+	m1Bare := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "mixed-m1-only", Statement: m1Only, Source: CriterionSourceExplicit, SourceRef: "#3016"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(m1Bare), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M1 alone must fire on the substring occurrence; want 1 finding, got %d: %+v", len(got), got)
 	}
 
 	// The hole: one negated M2 anchor plus an UNCOUNTED live-target occurrence
