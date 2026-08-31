@@ -3241,12 +3241,14 @@ func TestMcpRouteServerConfig(t *testing.T) {
 // server.Config, so the env > flag resolution AND the Config wiring are
 // unit-testable without booting the server. It builds the two Config fields
 // exactly as runServe builds them (ReviewGroundingDisabled = !review-grounding).
+// The unset default MUST track serve.go's — a drifted mirror asserts a posture
+// the daemon does not ship, which is exactly what #2522 found here.
 func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
 	t.Helper()
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	grounding := fs.Bool("review-grounding",
-		envOrBool("FISHHAWKD_REVIEW_GROUNDING", true), "test")
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false), "test")
 	passthrough := fs.String("reviewer-env-passthrough",
 		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""), "test")
 	if err := fs.Parse(args); err != nil {
@@ -3258,16 +3260,22 @@ func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
 	}
 }
 
-// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is ON when
-// unset (ReviewGroundingDisabled false), OFF when FISHHAWKD_REVIEW_GROUNDING is
+// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is OFF when
+// unset (ReviewGroundingDisabled true), OFF when FISHHAWKD_REVIEW_GROUNDING is
 // false, and the passthrough list parses to trimmed, case-preserving names.
+//
+// The unset default was corrected DOWN to false here (#2522): this mirror helper
+// had drifted from serve.go's real default, so the subtest asserted — and named —
+// a posture the daemon does not ship. Flipping the default is a SEPARATE
+// operator-filed follow-up gated on a recorded operator harness run passing on
+// BOTH adapters.
 func TestResolveReviewGroundingConfig(t *testing.T) {
-	t.Run("grounding on by default", func(t *testing.T) {
+	t.Run("grounding off by default", func(t *testing.T) {
 		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
 		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
 		cfg := resolveReviewGroundingConfig(t, nil)
-		if cfg.ReviewGroundingDisabled {
-			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding ON")
+		if !cfg.ReviewGroundingDisabled {
+			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding OFF")
 		}
 		if len(cfg.ReviewerEnvPassthrough) != 0 {
 			t.Errorf("passthrough = %v, want empty", cfg.ReviewerEnvPassthrough)

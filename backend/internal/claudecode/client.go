@@ -50,6 +50,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -112,6 +114,13 @@ type Client struct {
 	// Cmd builds the *exec.Cmd. Defaults to exec.CommandContext; overridable
 	// by tests to redirect to a fake binary.
 	Cmd func(ctx context.Context, name string, args ...string) *exec.Cmd
+	// HostPaths is the injectable host-filesystem seam the #2522 deny rules are
+	// built from. nil means reviewsandbox.DefaultHostPaths(). Grounded-path
+	// TESTS set it to temp dirs so the emitted rules are deterministic and no
+	// test depends on (or reads) the developer's real home.
+	HostPaths *reviewsandbox.HostPaths
+	// GOOS selects the platform deny-root table. Empty means runtime.GOOS.
+	GOOS string
 }
 
 // NewClient constructs a Client from cfg, defaulting Binary to DefaultBinary
@@ -272,11 +281,54 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// --permission-mode bypassPermissions. --add-dir/--tools/--allowed-tools are
 	// the grounded-only tree-read grant; the MCP pin above is posture-independent.
 	if treeDir != "" {
+		// Read bound, grounded posture only (#2522). --add-dir grants the export;
+		// nothing above BOUNDS what else the Read/Grep/Glob tools may reach, and
+		// an operator A/B confirmed a grounded child reads an arbitrary
+		// out-of-tree file straight through this argv. --disallowed-tools rules
+		// over a FIXED set of well-known credential roots close the realistic
+		// egress paths.
+		//
+		// Call it what it is: a BLOCKLIST at the TOOL layer, not confinement.
+		// Anything outside the named roots (/opt, /srv, a mounted volume) stays
+		// readable — a CI non-vacuity control asserts that gap rather than
+		// letting the docs imply a bound that does not exist. Real claude
+		// confinement needs an OS sandbox (#611).
+		//
+		// FAIL CLOSED: a rule-build error fails the invocation rather than
+		// spawning a grounded reviewer with NO deny rules at all.
+		hp := reviewsandbox.DefaultHostPaths()
+		if c.HostPaths != nil {
+			hp = *c.HostPaths
+		}
+		goos := c.GOOS
+		if goos == "" {
+			goos = runtime.GOOS
+		}
+		// The export is canonicalized for --add-dir and cmd.Dir for the same
+		// reason the deny paths are: on darwin os.MkdirTemp returns a /var alias
+		// of a /private real path, and mixing the two spellings makes a rule and
+		// a grant disagree about the same directory.
+		canonTree, cerr := filepath.EvalSymlinks(treeDir)
+		if hp.Canonical != nil {
+			canonTree, cerr = hp.Canonical(treeDir)
+		}
+		if cerr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: canonicalize review tree: %w", cerr)
+		}
+		denyRules, derr := reviewsandbox.ClaudeDenyRules(hp, treeDir, goos)
+		if derr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: build reviewer deny rules: %w", derr)
+		}
+		workDir = canonTree
 		args = append(args,
-			"--add-dir", treeDir,
+			"--add-dir", canonTree,
 			"--tools", "Read,Grep,Glob",
 			"--allowed-tools", "Read", "Grep", "Glob",
 		)
+		// Each rule is its OWN argv element — the shape the operator verified
+		// live against Claude Code 2.1.224.
+		args = append(args, "--disallowed-tools")
+		args = append(args, denyRules...)
 	}
 	args = append(args, "-p", prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
