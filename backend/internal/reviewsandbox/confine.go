@@ -35,11 +35,14 @@ package reviewsandbox
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 )
@@ -77,6 +80,27 @@ var (
 	// copy-back is skipped. Fail SAFE — the operator's on-disk bytes are left
 	// exactly as they are.
 	errCredentialLockUnavailable = errors.New("reviewsandbox: credential lock unavailable")
+
+	// errCredentialShapeChanged: the bytes left in the confined auth.json are
+	// not a credential-shaped refresh of the operator's own file, so they are
+	// NOT written back.
+	//
+	// The copy-back is a trust edge the rest of this file does not otherwise
+	// create: whatever ends up in the synthesized home's auth.json after the
+	// reviewer child ran is written into the operator's real credential, and the
+	// reviewer child is the process that ingests the untrusted diff. The
+	// placement + profile design intends only codex-cli's own token refresh to
+	// be able to change that file — but the profile mechanism is undocumented
+	// and can change without notice (see README.md), so a version whose write
+	// block is weaker than believed would turn a prompt-steered write into a
+	// credential SWAP into the operator's real config, and every later codex
+	// session would authenticate as an attacker-controlled account.
+	//
+	// This guard does not depend on the sandbox holding: it validates the NEW
+	// bytes structurally. It is a cheap narrowing, NOT authentication of the
+	// content — a swap that preserves the top-level key set still passes, and
+	// that limit is stated in README.md rather than papered over.
+	errCredentialShapeChanged = errors.New("reviewsandbox: refused credential copy-back: refreshed bytes are not shaped like the operator's credential")
 )
 
 // HostPaths is the injectable host-filesystem seam both bounds are built from.
@@ -484,10 +508,27 @@ func writeConfined(dir, base, block string) error {
 	return nil
 }
 
+// credentialSnapshot is what the operator's auth.json looked like at copy-in.
+// It carries TWO gates, and they answer different questions:
+//
+//   - hash gates WHETHER to write back at all (has the source moved
+//     independently since we copied it?);
+//   - object/keys gate WHAT may be written back (are the refreshed bytes still
+//     shaped like a credential of the same form?).
+type credentialSnapshot struct {
+	hash [32]byte
+	// object reports whether the source parsed as a JSON OBJECT. Only then is
+	// keys meaningful — a source that is not an object is held to json validity
+	// alone rather than to a key set it never had.
+	object bool
+	// keys is the sorted top-level key set of the source object.
+	keys []string
+}
+
 // copyCredentialIn copies the operator's auth.json into the synthesized home at
-// 0600 and returns the SOURCE content hash, which gates the copy-back. A missing
+// 0600 and returns the SOURCE snapshot, which gates the copy-back. A missing
 // auth.json is NOT fatal — an OPENAI_API_KEY deployment has none.
-func copyCredentialIn(src, dst string) (snapshot [32]byte, copied bool, err error) {
+func copyCredentialIn(src, dst string) (snapshot credentialSnapshot, copied bool, err error) {
 	data, rerr := os.ReadFile(src)
 	if rerr != nil {
 		if errors.Is(rerr, fs.ErrNotExist) {
@@ -498,7 +539,52 @@ func copyCredentialIn(src, dst string) (snapshot [32]byte, copied bool, err erro
 	if werr := os.WriteFile(dst, data, 0o600); werr != nil {
 		return snapshot, false, fmt.Errorf("reviewsandbox: write confined auth.json: %w", werr)
 	}
-	return sha256.Sum256(data), true, nil
+	snapshot.hash = sha256.Sum256(data)
+	if keys, ok := topLevelKeys(data); ok {
+		snapshot.object, snapshot.keys = true, keys
+	}
+	return snapshot, true, nil
+}
+
+// topLevelKeys returns the sorted top-level key set of a JSON OBJECT document.
+// ok is false for anything that is not an object (including `null`, which
+// unmarshals into a nil map without error and would otherwise look like an
+// object with no keys).
+func topLevelKeys(data []byte) (keys []string, ok bool) {
+	var doc any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, false
+	}
+	obj, isObj := doc.(map[string]any)
+	if !isObj {
+		return nil, false
+	}
+	keys = make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, true
+}
+
+// guardCredentialShape refuses to write back bytes that are not a
+// credential-shaped refresh of the snapshot. Only key NAMES are named in the
+// error — never a value, which is the secret.
+func guardCredentialShape(snapshot credentialSnapshot, newData []byte) error {
+	if !json.Valid(newData) {
+		return fmt.Errorf("%w: refreshed content is not valid JSON", errCredentialShapeChanged)
+	}
+	if !snapshot.object {
+		return nil
+	}
+	keys, ok := topLevelKeys(newData)
+	if !ok {
+		return fmt.Errorf("%w: refreshed content is not a JSON object (the source was)", errCredentialShapeChanged)
+	}
+	if !slices.Equal(keys, snapshot.keys) {
+		return fmt.Errorf("%w: top-level keys %v, want %v", errCredentialShapeChanged, keys, snapshot.keys)
+	}
+	return nil
 }
 
 // credentialLockRetries / credentialLockDelay bound the wait for the credential
@@ -531,7 +617,8 @@ func withCredentialLock(lockPath string, fn func() error) error {
 
 // copyCredentialBack returns a refreshed credential to the operator's real
 // auth.json, under the lock, gated on the SOURCE still hashing to the snapshot
-// taken at copy-in, and via a same-directory temp file plus rename.
+// taken at copy-in, on the NEW bytes still being shaped like that credential,
+// and via a same-directory temp file plus rename.
 //
 // What that DOES guarantee: an independently newer credential written by another
 // LOCK-RESPECTING Fishhawk invocation is never clobbered — the re-verify happens
@@ -543,7 +630,12 @@ func withCredentialLock(lockPath string, fn func() error) error {
 // this lock — codex-cli refreshing the credential itself — can land between the
 // re-verify and the rename and be overwritten. The window is narrow (a hash
 // compare and a rename) but real, and it is the named residual in README.md.
-func copyCredentialBack(hp HostPaths, dir, src string, snapshot [32]byte) error {
+//
+// The NEW bytes are validated too (guardCredentialShape) before anything is
+// written. That check is the one gate on this edge that does NOT depend on the
+// codex sandbox holding, so it still fires if the profile's write block turns
+// out to be weaker than believed on some codex-cli version.
+func copyCredentialBack(hp HostPaths, dir, src string, snapshot credentialSnapshot) error {
 	confined := filepath.Join(dir, "auth.json")
 	newData, err := os.ReadFile(confined)
 	if err != nil {
@@ -552,8 +644,14 @@ func copyCredentialBack(hp HostPaths, dir, src string, snapshot [32]byte) error 
 		}
 		return fmt.Errorf("reviewsandbox: read confined auth.json: %w", err)
 	}
-	if sha256.Sum256(newData) == snapshot {
+	if sha256.Sum256(newData) == snapshot.hash {
 		return nil // unchanged; nothing to write back
+	}
+	// Refuse BEFORE taking the lock: nothing is written, so the operator's
+	// on-disk bytes are left exactly as they are and the caller logs the named
+	// refusal as a warning.
+	if serr := guardCredentialShape(snapshot, newData); serr != nil {
+		return serr
 	}
 
 	return withCredentialLock(src+".fishhawk-lock", func() error {
@@ -561,7 +659,7 @@ func copyCredentialBack(hp HostPaths, dir, src string, snapshot [32]byte) error 
 		if rerr != nil {
 			return fmt.Errorf("reviewsandbox: skipped credential copy-back: re-read source: %w", rerr)
 		}
-		if sha256.Sum256(cur) != snapshot {
+		if sha256.Sum256(cur) != snapshot.hash {
 			return fmt.Errorf("reviewsandbox: skipped credential copy-back: %q changed since copy-in", src)
 		}
 		if hp.duringCredentialCopyBack != nil {

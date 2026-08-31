@@ -985,3 +985,94 @@ func TestWithCredentialLock_NonExistFailureIsNotRetried(t *testing.T) {
 		t.Fatalf("err = %v, want errCredentialLockUnavailable", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Copy-back content validation — the NEW bytes, not just the source.
+// ---------------------------------------------------------------------------
+
+// TestCredentialCopyBack_MalformedNewContentRefused: the reviewer child is the
+// process that ingests the untrusted diff, and the copy-back writes whatever it
+// left behind into the operator's real credential. The source is UNCHANGED here
+// (so the hash gate passes and cannot account for the refusal) and the confined
+// copy holds non-JSON bytes — only guardCredentialShape can refuse it.
+func TestCredentialCopyBack_MalformedNewContentRefused(t *testing.T) {
+	hp := fixtureHostPaths(t, nil)
+	src, home, cleanup := seedConfined(t, hp, `{"token":"old"}`)
+
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte("not json at all"), 0o600); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	werr := cleanup()
+
+	// COMMITTED STATE first: the refusal's effect is what is left on disk.
+	if got := readFile(t, src); got != `{"token":"old"}` {
+		t.Errorf("source = %q, want the operator's credential UNTOUCHED", got)
+	}
+	if !errors.Is(werr, errCredentialShapeChanged) {
+		t.Fatalf("cleanup warning = %v, want errCredentialShapeChanged", werr)
+	}
+	if !strings.Contains(werr.Error(), "not valid JSON") {
+		t.Errorf("warning does not name the refusal reason: %v", werr)
+	}
+}
+
+// TestCredentialCopyBack_ChangedTopLevelKeySetRefused: the swap case. The bytes
+// are perfectly valid JSON — a json.Valid-only guard would pass them — but the
+// top-level key set differs from the credential that was copied in, so they are
+// not a refresh of it.
+func TestCredentialCopyBack_ChangedTopLevelKeySetRefused(t *testing.T) {
+	hp := fixtureHostPaths(t, nil)
+	src, home, cleanup := seedConfined(t, hp, `{"token":"old"}`)
+
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"attacker_token":"swap"}`), 0o600); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	werr := cleanup()
+
+	if got := readFile(t, src); got != `{"token":"old"}` {
+		t.Errorf("source = %q, want the operator's credential UNTOUCHED", got)
+	}
+	if !errors.Is(werr, errCredentialShapeChanged) {
+		t.Fatalf("cleanup warning = %v, want errCredentialShapeChanged", werr)
+	}
+	if !strings.Contains(werr.Error(), "top-level keys") {
+		t.Errorf("warning does not name the refusal reason: %v", werr)
+	}
+}
+
+// TestCredentialCopyBack_NonObjectSourceHeldToJSONValidityOnly: a source that
+// was never a JSON object is held to json validity alone rather than to a key
+// set it never had — the guard must not refuse a legitimate refresh of a shape
+// it cannot reason about.
+func TestCredentialCopyBack_NonObjectSourceHeldToJSONValidityOnly(t *testing.T) {
+	hp := fixtureHostPaths(t, nil)
+	src, home, cleanup := seedConfined(t, hp, `"bare-string-credential"`)
+
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`"refreshed-string"`), 0o600); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	if werr := cleanup(); werr != nil {
+		t.Fatalf("cleanup refused a valid-JSON refresh of a non-object source: %v", werr)
+	}
+	if got := readFile(t, src); got != `"refreshed-string"` {
+		t.Errorf("source = %q, want the refreshed credential", got)
+	}
+}
+
+// TestGuardCredentialShape_NullIsNotAnObject pins the edge a json.Unmarshal into
+// a map would silently accept: `null` decodes into a NIL map with no error,
+// which would look like an object carrying no keys — so a source object with no
+// keys would accept a `null` write-back.
+func TestGuardCredentialShape_NullIsNotAnObject(t *testing.T) {
+	empty, ok := topLevelKeys([]byte(`{}`))
+	if !ok || len(empty) != 0 {
+		t.Fatalf("topLevelKeys(`{}`) = %v, %v; want empty set, true", empty, ok)
+	}
+	if _, ok := topLevelKeys([]byte(`null`)); ok {
+		t.Error("topLevelKeys reported `null` as a JSON object")
+	}
+	snapshot := credentialSnapshot{object: true, keys: nil}
+	if err := guardCredentialShape(snapshot, []byte(`null`)); !errors.Is(err, errCredentialShapeChanged) {
+		t.Errorf("guardCredentialShape(`null`) = %v, want errCredentialShapeChanged", err)
+	}
+}

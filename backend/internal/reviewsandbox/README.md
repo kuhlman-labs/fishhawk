@@ -288,6 +288,42 @@ hash inside the lock, and lands via a same-directory temp file plus `rename`.
 - A lock left behind by a SIGKILLed process wedges the copy-back permanently.
   That fails SAFE: the operator's on-disk bytes are left untouched.
 
+**The NEW bytes are validated too, and that check does not rest on the sandbox.**
+The copy-back is a trust edge nothing else here creates: whatever the reviewer
+child left in the confined `auth.json` would be written into the operator's real
+credential, and the reviewer child is the process that ingests the untrusted
+diff. The design intends only codex-cli's own token refresh to be able to change
+that file (`--sandbox read-only` plus a profile that does not grant the
+synthesized home) — but **the profile mechanism is undocumented and can change
+without notice**, so a codex-cli version whose write block is weaker than
+believed would turn a prompt-steered write into a credential SWAP into the
+operator's config, and every later codex session would authenticate as an
+attacker-controlled account.
+
+So `guardCredentialShape` refuses the write-back unless the refreshed bytes are
+valid JSON and — when the source was a JSON object — carry the SAME top-level key
+set. Nothing is written and the caller logs the named refusal
+(`errCredentialShapeChanged`). Because the refusal happens before the lock is
+taken, the operator's bytes are untouched on every refused path.
+
+- What it catches: garbage, truncation, and a swap to a differently-shaped
+  credential document. Pinned by `TestCredentialCopyBack_MalformedNewContentRefused`
+  and `TestCredentialCopyBack_ChangedTopLevelKeySetRefused`, both of which leave
+  the SOURCE unchanged so the hash gate passes and only this guard can account
+  for the refusal.
+- **What it does NOT catch (stated, not implied):** it is a structural narrowing,
+  **not** authentication of the content. A swap that preserves the top-level key
+  set — the realistic shape of a token substitution — passes it. It buys
+  independence from the sandbox, not a proof, and the sandbox remains the primary
+  control on this edge.
+- A source that was not a JSON object is held to JSON validity alone
+  (`TestCredentialCopyBack_NonObjectSourceHeldToJSONValidityOnly`) rather than to
+  a key set it never had.
+- `TestLive_CodexSynthesizedHomeFileSet` records, as an OBSERVATION on a real
+  run, whether the confined `auth.json` changed at all — only its digest reaches
+  the log, never its content. That is how the "only codex-cli's own refresh
+  writes here" assumption stays checkable instead of assumed.
+
 ### claude: a BOUNDED credential-root blocklist
 
 `ClaudeDenyRules` emits `Read/Grep/Glob` rules over a FIXED root set — the
@@ -356,6 +392,34 @@ Two profile keys the operator flagged and this change does NOT set: `network` an
 `workspace_roots`. They are absent from the verified configuration, and inventing
 an unverified value could fail the CLI outright; setting `network` explicitly is
 worth doing on the follow-up once the harness can measure it.
+
+**How the live harness avoids proving nothing.** Sentinel-absence is satisfied by
+a model that simply declined, so no live case rests on it alone:
+
+- **One invocation per path form.** The absolute path and the relative traversal
+  (`../../<sentinel>` from `cmd.Dir`) are probed by SEPARATE invocations each
+  naming exactly ONE out-of-tree path, and each asserted on its own. An
+  invocation naming both forms cannot distinguish "both attempted, both denied"
+  from "one attempted, denied once, the other silently skipped".
+- **A mechanism signature is required.** `assertMechanismDenial` demands (i) the
+  in-tree read came back, so a working tool layer and a real model turn are
+  evidenced; (ii) the sentinel did not; and (iii) a denial signature from an
+  adapter-specific marker set — the OS EPERM text for codex, the tool layer's
+  permission-rejection text for claude. If a live run ever denies while carrying
+  none of the known markers, the repair is to ADD the observed CLI text, never to
+  relax back to sentinel-absence.
+- **`TestLive_ClaudeOutsideDeniedRootsStillPermitted` is the discrimination**, not
+  just an honesty note. It probes the SAME two forms against a NON-denied root and
+  requires BOTH to come back, which establishes that the model does attempt, and
+  can complete, each spelling when nothing denies it. It ASSERTS this (it used to
+  log it), because a log line would have left "the model just declined" as a live
+  alternative explanation for every denial the harness reports.
+- **`TestLive_CodexSynthesizedHomeFileSet` asserts the run SUCCEEDED first** — a
+  clean exit and the in-tree read coming back — before inspecting the file set.
+  Without that, an authentication or startup failure leaves the home holding
+  exactly the three files the BUILDER wrote and the file-set assertion would pass
+  having observed nothing about codex-cli's runtime writes, which is the only
+  thing that case exists to observe.
 
 ### Concurrent-export residual (E44)
 
