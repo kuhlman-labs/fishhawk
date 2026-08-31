@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -9673,12 +9674,13 @@ func TestGateEvidenceForReview_MapsFixupCounterfactuals(t *testing.T) {
 // Per-stage budget enforcement (E48.55 / #2328).
 //
 // checkStageBudget is exercised two ways: DIRECT calls (T1, T2, T5, T6, T11,
-// T12, T13) that seed the cost ledger and drive the resolver + predicate +
-// audit/transition in isolation, and CROSS-BOUNDARY HTTP uploads (T3, T4, T7,
-// T8, T9, T10) that drive the REAL trace-upload handler end to end — signed
-// bundle POST -> recordCost writes a cost_recorded row carrying content_hash ->
-// checkStageBudget resolves the spec, sums the deduped stage-filtered ledger,
-// evaluates, and appends stage_budget_exceeded and/or cancels the run.
+// T12, T13, T14, T15) that seed the cost ledger and drive the resolver +
+// predicate + audit/transition in isolation, and CROSS-BOUNDARY HTTP uploads
+// (T3, T4, T7, T8, T9, T10, T16) that drive the REAL trace-upload handler end to
+// end — signed bundle POST -> recordCost writes a cost_recorded row carrying
+// content_hash -> checkStageBudget resolves the spec, sums the deduped
+// stage-filtered ledger, evaluates, and appends stage_budget_exceeded and/or
+// cancels the run. Sixteen tests in all (T1–T16).
 // -----------------------------------------------------------------------------
 
 // newStageBudgetServer wires signing/tracestore/audit (via newTraceServer) plus
@@ -9690,6 +9692,21 @@ func newStageBudgetServer(t *testing.T) (*Server, *signingFake, *auditFake, *app
 	rr := newApprovalRunRepo()
 	s.cfg.RunRepo = rr
 	return s, sf, au, rr
+}
+
+// captureStageBudgetWarn swaps the server's logger for one writing WARN+ lines
+// into the returned buffer, so a stage-budget test can assert the SPECIFIC
+// fail-open WARN a read failure emits. This is the logger seam Approval
+// CONDITION 5 named: it is what makes T13's get_stage/list_stages arms
+// load-bearing — deleting the guard those arms name flips the emitted WARN to a
+// DIFFERENT fail-open branch's message, which the substring assertion catches
+// even where the run-level outcome (false / no entry / not cancelled) is
+// byte-identical across branches. checkStageBudget is called synchronously on
+// one goroutine in these direct tests, so the plain bytes.Buffer needs no lock.
+func captureStageBudgetWarn(s *Server) *bytes.Buffer {
+	buf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return buf
 }
 
 // seedCostRow appends a cost_recorded entry carrying usd + content_hash tied to
@@ -10236,39 +10253,73 @@ func TestCheckStageBudget_FailedTransitionLeavesNoAuditEntry(t *testing.T) {
 }
 
 // T13 — ReadFailuresFailOpen (direct; the [read-failures-fail-open] blocking
-// criterion — one decidable arm per named read). Each arm asserts
-// checkStageBudget returns false, appends NO stage_budget_exceeded entry, and
-// does not cancel the run.
+// criterion — one FULLY-ARMED, decidable arm per named read). Each arm seeds a
+// running run, a v2 spec whose ceiling sits BELOW a seeded breaching cost row,
+// and an implement stage — a scenario that DOES breach (cancel + one entry +
+// return true) when every read succeeds — then injects exactly ONE read
+// failure. So the injected failure UNIQUELY determines the fail-open outcome:
+// remove the injection and the arm breaches (the ## Notes counterfactuals record
+// each observed flip). Each arm asserts checkStageBudget returns false, appends
+// NO stage_budget_exceeded entry, does NOT cancel the (seeded, readable) run,
+// and emits its read's SPECIFIC fail-open WARN.
+//
+// The WARN assertion is the load-bearing discriminator the routed test-vacuity
+// concerns and Approval CONDITION 5 demanded: for the get_stage and
+// list_stages arms, deleting the named guard in trace.go leaves the run-level
+// outcome (false / no entry / not cancelled) byte-identical — control flow falls
+// through to specStageForRunStage's !found fail-open (nil stage / nil rows) —
+// but the emitted WARN changes to "no resolvable spec definition", so the
+// wantWarn substring flips the arm RED where the run-level assertions alone stay
+// green. The seeded run also makes the not-cancelled assertion decidable
+// (GetRun succeeds, so there is no err==nil short-circuit skipping it).
 func TestCheckStageBudget_ReadFailuresFailOpen(t *testing.T) {
+	// breachingCost sits above the seeded ceiling (2.0), so a fully-read
+	// evaluation breaches; the seeded cost row is what makes each injection
+	// load-bearing rather than trivially green on an empty ledger.
+	const breachingCost = 100.00
 	arms := []struct {
-		name  string
-		setup func(rr *approvalRunRepo, au *auditFake, runID uuid.UUID, stageID uuid.UUID)
+		name     string
+		wantWarn string
+		// setup fully arms a breaching scenario, then injects ONE read failure.
+		setup func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID)
 	}{
 		{
-			name: "get_stage_error",
-			setup: func(rr *approvalRunRepo, _ *auditFake, _ uuid.UUID, _ uuid.UUID) {
-				rr.getErr = errors.New("get stage boom")
-			},
-		},
-		{
-			name: "workflow_def_unresolvable",
-			setup: func(rr *approvalRunRepo, _ *auditFake, runID uuid.UUID, _ uuid.UUID) {
-				// Seed a run with NO WorkflowSpec -> resolveRunWorkflowDef ok=false.
-				rr.seedRun(&run.Run{ID: runID, WorkflowID: "feature_change", State: run.StateRunning})
-			},
-		},
-		{
-			name: "list_stages_error",
-			setup: func(rr *approvalRunRepo, _ *auditFake, runID uuid.UUID, _ uuid.UUID) {
+			name:     "get_stage_error",
+			wantWarn: "get stage failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
 				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
-				rr.listStagesErr = errors.New("list stages boom")
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				rr.getErr = errors.New("get stage boom") // ONLY GetStage fails
 			},
 		},
 		{
-			name: "cost_ledger_read_error",
-			setup: func(rr *approvalRunRepo, au *auditFake, runID uuid.UUID, _ uuid.UUID) {
+			name:     "workflow_def_unresolvable",
+			wantWarn: "resolve workflow def failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				// A running run with NO WorkflowSpec -> resolveRunWorkflowDef
+				// ok=false. GetRun still succeeds, so the not-cancelled assertion
+				// is reached; GetStage succeeds and a breaching cost is seeded, so
+				// the ONLY thing holding enforcement off is the unresolvable def.
+				rr.seedRun(&run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", State: run.StateRunning})
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+			},
+		},
+		{
+			name:     "list_stages_error",
+			wantWarn: "list stages failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
 				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
-				au.listByCategoryErrCategory = "cost_recorded"
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				rr.listStagesErr = errors.New("list stages boom") // ONLY ListStagesForRun fails
+			},
+		},
+		{
+			name:     "cost_ledger_read_error",
+			wantWarn: "list cost_recorded entries failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				au.listByCategoryErrCategory = "cost_recorded" // ONLY the ledger read fails
 			},
 		},
 	}
@@ -10276,6 +10327,7 @@ func TestCheckStageBudget_ReadFailuresFailOpen(t *testing.T) {
 		t.Run(arm.name, func(t *testing.T) {
 			s, _, au, rr := newStageBudgetServer(t)
 			rr.transitionRunEnabled = true
+			warn := captureStageBudgetWarn(s)
 			runID := uuid.New()
 			stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
 			arm.setup(rr, au, runID, stage.ID)
@@ -10286,10 +10338,126 @@ func TestCheckStageBudget_ReadFailuresFailOpen(t *testing.T) {
 			if n := countStageBudgetEntries(au); n != 0 {
 				t.Fatalf("[%s] stage_budget_exceeded entries = %d, want 0", arm.name, n)
 			}
+			// The run is seeded and readable, so the not-cancelled assertion is
+			// always reached (no err==nil short-circuit skipping it).
 			got, err := rr.GetRun(context.Background(), runID)
-			if err == nil && got.State == run.StateCancelled {
+			if err != nil {
+				t.Fatalf("[%s] GetRun error = %v; the arm must seed a readable run so not-cancelled is decidable", arm.name, err)
+			}
+			if got.State == run.StateCancelled {
 				t.Errorf("[%s] run cancelled on a read failure", arm.name)
 			}
+			// The arm's SPECIFIC fail-open WARN — the discriminator that makes
+			// get_stage/list_stages load-bearing where the run-level outcome
+			// alone is not.
+			if w := warn.String(); !strings.Contains(w, arm.wantWarn) {
+				t.Errorf("[%s] WARN log = %q, want substring %q", arm.name, w, arm.wantWarn)
+			}
 		})
+	}
+}
+
+// T14 — BlockingBreachAppendFailureStillCancels (direct; the audit-append
+// failure branch, the routed medium/verification + low/untested-path concerns).
+// A real BLOCKING breach whose cancel SUCCEEDS but whose stage_budget_exceeded
+// append FAILS: the run is cancelled, NO entry lands, checkStageBudget still
+// returns true (a detected breach never dispatches further work), and the
+// failure is WARN-logged — the best-effort posture checkRunBudget uses, now
+// pinned so the ledger distinguishes "halted but could not record" (T14) from
+// "could not halt" (T12, a failed transition). The injected append error is
+// load-bearing: remove it and exactly one entry lands (## Notes counterfactual).
+func TestCheckStageBudget_BlockingBreachAppendFailureStillCancels(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	warn := captureStageBudgetWarn(s)
+	au.appendErrCategory = "stage_budget_exceeded" // ONLY the breach append fails
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 3.00, "h1")
+
+	if !s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned false on a real blocking breach whose append failed")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (append failed)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State != run.StateCancelled {
+		t.Errorf("run.State = %q, want cancelled (transition precedes the failed append)", got.State)
+	}
+	if w := warn.String(); !strings.Contains(w, "append stage_budget_exceeded audit entry failed") {
+		t.Errorf("WARN log = %q, want the append-failure message", w)
+	}
+}
+
+// T15 — AdvisoryBreachAppendFailureProceeds (direct; the audit-append failure
+// branch in ADVISORY mode, the routed medium/verification concern). A real
+// advisory breach whose append FAILS: no transition is attempted, NO entry
+// lands, checkStageBudget returns false (the run proceeds), and the failure is
+// WARN-logged. The injected append error is load-bearing: remove it and one
+// advisory entry lands (## Notes counterfactual).
+func TestCheckStageBudget_AdvisoryBreachAppendFailureProceeds(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	warn := captureStageBudgetWarn(s)
+	au.appendErrCategory = "stage_budget_exceeded"
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 3.00, "h1")
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("advisory breach must return false even when the append fails")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (append failed)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("advisory breach cancelled the run")
+	}
+	if w := warn.String(); !strings.Contains(w, "append stage_budget_exceeded audit entry failed") {
+		t.Errorf("WARN log = %q, want the append-failure message", w)
+	}
+}
+
+// T16 — AdvisoryRepeatedOverCeilingAppendsPerUpload (cross-boundary HTTP; the
+// routed low/untested-path advisory-repeat concern). checkStageBudget has NO
+// per-stage dedup (unlike budget_alert's per-(period,tier) guard), so an
+// advisory stage already over its ceiling appends a FRESH stage_budget_exceeded
+// entry on EVERY evaluating raw upload. The SAME bundle uploaded twice, with the
+// ceiling below one bundle's cost so each evaluation breaches even after the
+// content-hash dedup collapses the repeated bundle to one bundle's cost, yields
+// exactly TWO entries — pinning "one entry per evaluating upload" as a DECISION
+// rather than an accident (also documented in budget/README.md). T7 covers the
+// dual: identical bundles UNDER a between-C-and-2C ceiling stay deduped to zero.
+func TestCheckStageBudget_AdvisoryRepeatedOverCeilingAppendsPerUpload(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	// Ceiling below one bundle's cost -> every evaluating upload breaches even
+	// after content-hash dedup collapses the repeated bundle to one bundle's cost.
+	sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost/2), "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runID.String(), StageID: stage.ID.String(),
+		Agent: "claude-code", Model: sbModel, InputTokens: sbInTok, OutputTokens: sbOutTok,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	priv, _ := sf.issue(t, runID)
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("first upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("second upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countStageBudgetEntries(au); n != 2 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 2 (one advisory entry per over-ceiling upload — no per-stage dedup)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("advisory breach cancelled the run")
 	}
 }
