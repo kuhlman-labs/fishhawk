@@ -249,10 +249,24 @@ export and the schema — **not** the synthesized home. codex-cli reads its own
 (operator-verified against 0.144.1: "codex read its own `CODEX_HOME` auth
 normally under the profile"), so authentication survives while the copied
 credential stays OUTSIDE the reviewer-readable set.
-`TestCodexConfinedHome_CredentialNotGrantedToToolLayer` asserts that no emitted
-grant covers `auth.json` while the export and schema grants ARE present; the
-live half (a real reviewer failing to read `$CODEX_HOME/auth.json` while the CLI
-still authenticates) is a case in the opt-in harness and is UNPROVEN at merge.
+
+Two tests carry that claim, and they prove DIFFERENT things — read the split
+literally, because the first one alone would be a documented protection that does
+not hold:
+
+- `TestCodexConfinedHome_CredentialNotGrantedToToolLayer` (hermetic, blocking)
+  asserts that no emitted grant covers `auth.json` while the export and schema
+  grants ARE present. That is a statement about what the BUILDER writes, and
+  says nothing about what codex-cli enforces.
+- `TestLive_CodexCredentialUnreadableWhileAuthenticated` (opt-in, NON-blocking)
+  is the behavioural half: it asks a real confined reviewer to read the copied
+  credential by its literal path AND through `$CODEX_HOME/auth.json` in the
+  shell, and asserts BOTH that the invocation authenticated and ran a model turn
+  AND that no value from the operator's real `auth.json` came back in the
+  response (the response is withheld from the log on failure — it is the artifact
+  carrying the credential). It requires `FISHHAWK_LIVE_CONFINEMENT=1`, the codex
+  binary and host auth, so it is **UNPROVEN at merge**; recording a passing run
+  of it is one of the gates on the separate default-flip follow-up.
 
 **Credential copy-back — what it guarantees and what it does not.** The source
 hash is snapshotted at copy-in. On cleanup, if the confined copy changed, the
@@ -267,7 +281,10 @@ hash inside the lock, and lands via a same-directory temp file plus `rename`.
   file. An EXTERNAL writer that does not take this lock — codex-cli refreshing
   the credential itself — can land between the re-verify and the `rename` and be
   overwritten. The window is a hash compare plus a rename, but it is real.
-  `TestCredentialCopyBack_ExternalWriterResidual` exercises exactly that path.
+  `TestCredentialCopyBack_ExternalWriterResidual` pins exactly that path as an
+  ASSERTION, not a log line: it drives an external write into the window and
+  requires the rename to clobber it, so a protocol change that made the write
+  survive goes RED and this residual text gets narrowed instead of drifting.
 - A lock left behind by a SIGKILLed process wedges the copy-back permanently.
   That fails SAFE: the operator's on-disk bytes are left untouched.
 

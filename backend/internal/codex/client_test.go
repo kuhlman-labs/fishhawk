@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1214,6 +1215,53 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 		if strings.Contains(strings.ToLower(a), "mcp") {
 			t.Errorf("codex adapter must inject no MCP config into argv %q, found %q", argv, a)
 		}
+	}
+}
+
+// TestInvokeGrounded_CodexCwdIsCanonicalNotRaw drives the grounded adapter with a
+// NON-IDENTITY canonicalizer — a REAL symlink alias standing in for the darwin
+// /var -> /private/var aliasing the wiring exists to handle — and asserts cmd.Dir
+// is the CANONICAL path, never the raw spelling the caller passed.
+//
+// The other grounded tests inject an IDENTITY canonicalizer and compare cmd.Dir
+// with the raw t.TempDir(), so they stay green with the adapter's cwd
+// canonicalization removed: they cannot tell the two spellings apart. This one
+// can. A raw cwd under a canonical profile grant does not BLIND loudly — codex
+// simply cannot read the tree it was pointed at — so the discriminating assertion
+// matters.
+func TestInvokeGrounded_CodexCwdIsCanonicalNotRaw(t *testing.T) {
+	hp := testHostPaths(t)
+	real := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("cannot create a symlink alias on this host: %v", err)
+	}
+	// A REAL resolver, not a stub: EvalSymlinks resolves the alias to `real` and
+	// is identity-ish everywhere else, which is exactly the production seam.
+	hp.Canonical = filepath.EvalSymlinks
+	canonReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatalf("resolve real tree: %v", err)
+	}
+	if canonReal == alias {
+		t.Fatalf("the alias %q and its canonical target are the same path — this test cannot discriminate", alias)
+	}
+
+	var cmd *exec.Cmd
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, nil, &cmd)
+	c.HostPaths = hp
+	c.GOOS = runtime.GOOS
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", alias); err != nil {
+		t.Fatalf("InferenceInTree(grounded): %v", err)
+	}
+	if cmd.Dir == alias {
+		t.Fatalf("cmd.Dir = %q is the RAW alias — a raw cwd under the canonical profile grant "+
+			"BLINDS the reviewer against the very tree it was pointed at", cmd.Dir)
+	}
+	if cmd.Dir != canonReal {
+		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, canonReal)
 	}
 }
 

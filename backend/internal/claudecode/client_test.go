@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -163,6 +164,55 @@ func TestInvokeGrounded_ClaudeArgvAndCwd(t *testing.T) {
 			t.Errorf("a deny rule names the exported tree: %q", r)
 		}
 	}
+}
+
+// TestInvokeGrounded_ClaudeCwdIsCanonicalNotRaw drives the grounded adapter with
+// a NON-IDENTITY canonicalizer — a REAL symlink alias standing in for the darwin
+// /var -> /private/var aliasing the wiring exists to handle — and asserts BOTH
+// cmd.Dir and the --add-dir grant carry the CANONICAL path, never the raw
+// spelling the caller passed.
+//
+// The other grounded tests inject an IDENTITY canonicalizer and compare cmd.Dir
+// with the raw t.TempDir(), so they stay green with the adapter's cwd
+// canonicalization removed: they cannot tell the two spellings apart. This one
+// can. Mixing spellings is what makes a deny rule and a grant disagree about the
+// same directory, and neither half fails loudly on its own.
+func TestInvokeGrounded_ClaudeCwdIsCanonicalNotRaw(t *testing.T) {
+	hp := testHostPaths(t)
+	real := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("cannot create a symlink alias on this host: %v", err)
+	}
+	// A REAL resolver, not a stub: EvalSymlinks resolves the alias to `real` and
+	// is identity-ish everywhere else, which is exactly the production seam.
+	hp.Canonical = filepath.EvalSymlinks
+	canonReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatalf("resolve real tree: %v", err)
+	}
+	if canonReal == alias {
+		t.Fatalf("the alias %q and its canonical target are the same path — this test cannot discriminate", alias)
+	}
+
+	var argv []string
+	var cmd *exec.Cmd
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, &cmd)
+	c.HostPaths = hp
+	c.GOOS = runtime.GOOS
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", alias); err != nil {
+		t.Fatalf("InferenceInTree(grounded): %v", err)
+	}
+	if cmd.Dir == alias {
+		t.Fatalf("cmd.Dir = %q is the RAW alias — the cwd and the canonical --add-dir grant "+
+			"then name the same directory by two spellings", cmd.Dir)
+	}
+	if cmd.Dir != canonReal {
+		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, canonReal)
+	}
+	assertContainsPair(t, argv, "--add-dir", canonReal)
 }
 
 // TestInvokeUngrounded_ClaudeNoDenyRules pins the degrade side: the #2522

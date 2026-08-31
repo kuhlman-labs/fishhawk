@@ -719,9 +719,15 @@ func TestCredentialCopyBack_ExternalWriterResidual(t *testing.T) {
 	if werr := cleanup(); werr != nil {
 		t.Fatalf("cleanup: %v", werr)
 	}
+	// The outcome is DETERMINISTIC, so it is asserted rather than logged: the
+	// hook fires inside the lock AFTER the re-verify and BEFORE the rename, so
+	// the rename always lands on top of the external writer's bytes. A t.Logf
+	// here would pass whether the write was clobbered or preserved, which is
+	// exactly the vacuity that lets a README residual drift out of truth.
 	if got := readFile(t, src); got != `{"token":"reviewer"}` {
-		t.Logf("external in-window write SURVIVED (source = %q) — the residual is narrower "+
-			"than README.md claims; narrow the claim", got)
+		t.Errorf("external in-window write SURVIVED (source = %q, want %q) — the copy-back "+
+			"protocol changed and the README's named residual now OVERSTATES the exposure; "+
+			"narrow the residual text to match", got, `{"token":"reviewer"}`)
 	}
 }
 
