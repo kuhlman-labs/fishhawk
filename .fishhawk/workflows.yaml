@@ -1,61 +1,71 @@
 # Fishhawk's own development workflow.
 #
-# This file exists from day one as a public commitment to the methodology
-# described in docs/METHODOLOGY.md: Fishhawk is built using Fishhawk.
+# Fishhawk is built using Fishhawk: every change to this repository is
+# proposed, reviewed and merged through one of the workflows declared
+# below. This file is therefore both the live configuration and the
+# reference example — if you are reading it to learn the spec, start
+# with docs/spec/workflow-v2.md, which is the complete grammar.
 #
-# It is not yet executed. The Fishhawk runtime that interprets this file is
-# the product being built in this repository. Per docs/MVP_SPEC.md §8, the
-# target for self-execution is day 21 of the v0 build. Until then, this is
-# a placeholder and a public commitment, not a running system.
-#
-# When the product can execute this spec, the syntax may be revised to
-# match the frozen v0 schema. The intent expressed here will not change.
+# The shape of a workflow is: a routing predicate that decides which
+# changes it accepts, a delegation policy that decides how much the
+# operator agent may do unattended, and an ordered list of stages, each
+# of which may declare an executor, reviewers, constraints, a budget and
+# gates. A gate is where the run stops and waits for a decision.
 
 version: "2"
 workflows:
-  # Medium autonomy — the default for most product work.
-  # Agent implements; human approves the plan; human approves the PR; the
-  # acceptance agent validates the merged-candidate against the plan's
-  # acceptance_criteria before the human-gated merge (ADR-049, E31).
+  # ---------------------------------------------------------------------------
+  # feature_change — the default workflow for product work.
+  #
+  # The agent plans and implements; agent reviewers read both the plan and
+  # the resulting diff; a human approves at two points; an acceptance agent
+  # validates the running candidate against the plan before merge.
+  # ---------------------------------------------------------------------------
   feature_change:
-    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED. feature_change is
-    # the broad default — it is where anything that does not fit a narrower
-    # workflow belongs, so any envelope here would either be so wide it says
-    # nothing or would reject legitimate work. An absent applies_to accepts
-    # any change, which is the accurate statement of intent. This is also the
-    # ONLY workflow in this file with a plan stage, and therefore the only one
-    # where a `paths` criterion would actually be evaluated (see #2377).
+    # No `applies_to` on purpose. This is the catch-all workflow — where
+    # anything that does not fit a narrower one belongs — so any routing
+    # envelope would either be wide enough to say nothing or would refuse
+    # legitimate work. An absent `applies_to` accepts any change, which is
+    # the accurate statement of intent.
     description: >-
-      Default workflow for feature work and non-trivial changes, extended with a runner-hosted advisory acceptance stage (ADR-049). Human approves plan and PR; agent implements; the acceptance agent validates the running instance against the approved plan's acceptance_criteria.
-    # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
-    # (review settlement, fixup re-park, derived awaiting_merge) and
-    # surfaces next_action; judgment points still park for the human.
+      Default workflow for feature work and non-trivial changes. The agent plans and implements; a human approves the plan and the pull request; an acceptance agent validates the running candidate against the approved plan's acceptance criteria before merge.
+    # Auto-advance mechanical transitions (review settlement, fix-up
+    # re-park, derived merge-readiness) instead of parking on each one, and
+    # surface the next action. Judgment points still stop for a decision.
     auto_advance: true
-    # Operator-agent delegation (ADR-040 D2 / #1026, dogfood #1028):
-    # the medium autonomy preset per METHODOLOGY.md — approve/fixup/retry
-    # delegated under their named conditions; waive and merge stay human.
-    autonomy: medium
-    # Per-path escalations (E53.4 / #2227), declared now that #2374 closed the
-    # fail-open window that made declaring them premature.
+    # Delegation tier for the operator agent. `high` lets it approve on a
+    # clean dual review, route a fix-up on convergent concerns, retry an
+    # infrastructure flake, waive a lone low-severity concern, and merge
+    # once gates are resolved and CI is green. Anything outside those
+    # conditions still pages a human, as does every event in the tier's
+    # page list (a gating reviewer reject, a plan rejection, a scope
+    # amendment, a budget or policy override, an exception request, a
+    # requirement arbitration).
+    autonomy: high
+    # Per-path escalations: a change touching a listed path gets a stricter
+    # policy than the workflow's own. These are the surfaces where a defect
+    # is hardest to detect after the fact — the spec parser and validator,
+    # the audit log, the policy engine, and the auth surfaces — so agent
+    # autonomy is clamped for them.
     #
-    # This is docs/METHODOLOGY.md's low-autonomy surface list, converted from a
-    # commitment in Markdown into a control the product enforces: the workflow
-    # spec parser and validator, the audit-log integrity layer, the policy
-    # engine, and the auth / GitHub App surfaces. A change touching any of them
-    # clamps agent autonomy to `low`, so no action class resolves to `auto` for
-    # that change — the agent may not self-approve, self-fixup or self-retry
-    # its way through a gate on this repository's most load-bearing code.
+    # `max_autonomy: medium` keeps approve, fix-up and retry delegated but
+    # returns waive and merge to a human: an agent may not waive a concern
+    # or merge its own change on this code. An escalation may only ever
+    # raise the bar, never lower it, and one that would change nothing is
+    # refused at validation.
     #
-    # `max_autonomy` ONLY, deliberately no `approvals` raise. Raising the count
-    # to 2 would be honest about intent and dishonest about capability: this
-    # repository has ONE eligible approver, so a count of 2 is unsatisfiable
-    # and every escalated run would wedge at a gate no one can clear. A control
-    # that cannot be satisfied is not a stricter control, it is an outage. When
-    # a second approver exists, add `approvals: {count: 2}` here.
+    # Deliberately no `approvals` raise alongside it. Raising the count to
+    # two would be honest about intent and dishonest about capability: this
+    # repository has one eligible approver, so a count of two is
+    # unsatisfiable and every escalated run would stop at a gate no one can
+    # clear. A control that cannot be satisfied is not a stricter control,
+    # it is an outage. Add `approvals: {count: 2}` here once a second
+    # approver exists.
     #
-    # `match.paths` is evaluated against the approved plan's scope.files at the
-    # approval gate, which works here because feature_change declares a plan
-    # stage. It would NOT work on this repo's other three workflows (#2382).
+    # `match.paths` is evaluated against the approved plan's declared file
+    # scope at the approval gate, so it is only meaningful on a workflow
+    # that declares a plan stage. Declaring it on one that does not is
+    # refused at validation rather than silently never firing.
     escalations:
       - match:
           paths:
@@ -67,24 +77,21 @@ workflows:
             - "backend/internal/githubapp/**"
             - "verifier/**"
         require:
-          max_autonomy: low
+          max_autonomy: medium
     policy:
       max_stage_runtime: "30m"
-    # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
-    # budget_alert audit entry + originating-issue comment at warn_at
-    # (80%) and the 100% crossing; never blocks a run. Calibrated from
-    # recorded feature_change run costs (avg ~$3.4, max ~$8.4 over the
-    # first 29 costed runs). Weekly reset so the alert re-exercises
-    # during active dogfooding. Flip enforcement to `blocking` to also
-    # dogfood admission-time refusal once the period limit is exhausted.
+    # Periodic cost ceiling. Advisory: it emits an alert to the audit log
+    # and the originating issue at the warn threshold and again at 100%,
+    # and never blocks a run. Set `enforcement: blocking` to refuse new
+    # runs once the period limit is exhausted.
     budgets:
       - period: weekly
         limit_usd: 1000
         warn_at: 0.8
         enforcement: advisory
-    # Auto-retry once on CI failure (#276). The human approves the
-    # plan; the agent should self-heal on a routine test or lint
-    # regression without forcing the reviewer back into the loop.
+    # Re-dispatch the implement stage once if a required CI check fails.
+    # A routine test or lint regression is the agent's to fix; one retry
+    # is resilience to a flaky check without spinning on a real bug.
     on_ci_failure:
       max_retries: 1
     stages:
@@ -92,21 +99,15 @@ workflows:
         type: plan
         executor:
           agent: claude-code
-          # Planner runs on Opus 5 rather than the deployment default.
-          # The plan stage is the cheapest agent stage (~$1.4/run of the
-          # ~$3.9/run implement) and higher plan quality is the lever most
-          # likely to cut downstream implement rework, so it pins the most
-          # capable model. executor.model is the #1013 override rung
-          # (deployment default < this < plan model_recommendation <
-          # operator gate).
+          # The plan stage is the cheapest agent stage and plan quality is
+          # the strongest lever on downstream rework, so it pins the most
+          # capable model rather than taking the deployment default.
           model: claude-opus-5
-        # Advisory plan review (ADR-027): agent reviewers surface verdicts
-        # before the human gate; effective agent count >0 + human>0 →
-        # advisory, so the founder approval below stays authoritative.
-        # Heterogeneous topology (#955): Claude (claudecode subprocess,
-        # #575) and Codex (codex CLI, #844) review concurrently. Codex
-        # reasoning effort stays the deployment-level knob
-        # FISHHAWKD_CODEX_REASONING_EFFORT.
+        # Advisory plan review: agent reviewers surface verdicts before the
+        # human gate below, which stays authoritative (agent reviewers plus
+        # a human reviewer resolves to advisory authority). Two providers
+        # review concurrently — independent models disagree in useful ways,
+        # and a concern only one of them raises is still surfaced.
         reviewers:
           agents:
             - provider: claudecode
@@ -121,6 +122,9 @@ workflows:
         produces:
           - artifact: plan
             schema: standard_v1
+            # The plan is rendered as a comment on the originating issue so
+            # it can be read in context, and written to the audit log as the
+            # canonical copy the later stages are checked against.
             persistence:
               - target: originating_issue
                 mode: rendered_comment
@@ -136,51 +140,37 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # The ADR-055 preset default, restored now that #2358 landed.
-              # Operator gate participation — answering a clarification,
-              # attaching binding approval conditions, driving a stage — no
-              # longer counts as authorship, so `author` no longer makes this
-              # gate unsatisfiable by its sole member. It bites only where the
-              # run carries a real authorship signal (an operator-vouched
-              # commit). `agent` is an unconditional floor either way.
+              # Exclude the change's author and any agent identity. Taking
+              # part in the loop — answering a clarification, attaching
+              # approval conditions, driving a stage — is not authorship, so
+              # this does not lock out the sole approver; it bites only on a
+              # real authorship signal such as an operator-vouched commit.
               not: [author, agent]
       - id: implement
         type: implement
         executor:
           agent: claude-code
-          # #651 execution-grounded verifier (KEPT 2026-06-06, after the
-          # dogfood caught a real drift-excluded test failure and the fix loop
-          # converged it before the PR opened). After the agent exits, run the
-          # project test command against the COMMITTED scope-only tree (the
-          # #800/#766 worktree), NOT the working tree; on a test failure, feed
-          # the captured output back to the agent for a bounded fix loop, then
-          # re-verify, before the PR opens. max_iterations=1 = one fix attempt;
-          # 0 (or removing this block) restores the prior single-shot behavior.
-          # scripts/test is hermetic — integration tests use testcontainers.
-          # Accepted cost: a full scripts/test verify (golangci-lint + -race +
-          # testcontainers) runs on every feature_change implement stage. See
-          # #651; robustness #804.
-          # `scripts/test verify` (#1064) runs golangci-lint run ./... per module
-          # (CI's exact lint invocation; v2 gofmt/goimports formatters included)
-          # BEFORE the -race test loop, so a gofmt/lint-only defect fails the
-          # gate in-loop — where the agent can still fix it — instead of
-          # red-lining the PR in CI after the agent is terminal (the #1060
-          # recurrence). Timeout bumped 12m→15m to absorb the per-module lint.
+          # Execution-grounded verifier. After the agent exits, run the
+          # project's test command against the committed, scope-only tree
+          # (not the working tree). On failure, feed the captured output
+          # back to the agent for a bounded fix loop and re-verify, all
+          # before the pull request opens — so a defect is fixed while the
+          # agent is still live rather than red-lining CI after it is gone.
+          #
+          # `scripts/test verify` runs lint before the race-detector test
+          # loop, so a formatting or lint defect fails here too.
+          # max_iterations: 1 allows a single fix attempt; 0, or removing
+          # this block, makes the stage single-shot.
           verify:
             command: "scripts/test verify"
             timeout: "15m"
             max_iterations: 1
-        # Advisory implement-review (ADR-027 impl 2/2, #561): agent
-        # reviewers read the diff against the approved plan and surface
-        # verdicts (incl. scope-drift flag). Effective agent count >0 +
-        # human>0 → advisory, so it never blocks; the review stage's
-        # founder approval stays the gate. Runs async server-side
-        # post-#584; verdicts land ~60-90s+ after the implement trace
-        # upload (poll the audit / get_run_status). Heterogeneous
-        # topology (#955): same Codex reviewer as the plan stage; the Claude
-        # reviewer runs on Fable 5 — the implement review is the last
-        # quality gate before merge, so the most capable model reviewing the
-        # diff is the highest-leverage place to catch escaped defects.
+        # Advisory implement review: the same two providers read the diff
+        # against the approved plan and surface verdicts, including a
+        # scope-drift flag when the diff exceeds what the plan declared.
+        # Verdicts land shortly after the stage's trace is uploaded. This is
+        # the last quality gate before merge, so it runs the most capable
+        # reviewer models.
         reviewers:
           agents:
             - provider: claudecode
@@ -195,20 +185,20 @@ workflows:
         produces:
           - artifact: pull_request
         constraints:
-          # Raised 30 -> 45 (2026-06-10): run 575e6a74 (#964/PR #982) failed
-          # category-B at 32 files on a plan the gate had approved with a
-          # 32-file scope — the cap lagged real feature sizes. Plan-gate
-          # coherence pre-check (scope.files vs this cap) tracked separately.
-          #
-          # Briefly raised 45 -> 95 on 2026-08-01 for the compile-atomic E66.7
-          # mcpserver extraction (#2408, 92 files) and RESTORED here once it
-          # merged (#2416). Kept as a pointer, not a standing allowance: if a
-          # future change is genuinely irreducible past this cap, raise it the
-          # same way — a tracked exception plus a restore issue filed BEFORE
-          # the raise — rather than leaving the cap loose. Note that an
-          # approval-time --override-scope-cap does NOT reach this constraint
-          # (#2415), so the spec is the only lever that moves it.
+          # Post-hoc diff constraints, checked against the produced pull
+          # request. A change larger than this cap fails the stage rather
+          # than merging unreviewably wide; if a change is genuinely
+          # irreducible past it, raise the cap here as a tracked, reverted
+          # exception rather than leaving it loose. An approval-time scope
+          # override does not reach this constraint — the spec is the only
+          # lever that moves it.
           max_files_changed: 45
+          # Paths the stage may not rewrite. The CI workflow directory is
+          # what executes the agent and this spec directory is what governs
+          # it, so neither is the agent's to edit — an agent able to change
+          # them could widen its own permissions inside the very change it
+          # is proposing. The legal files are neither, but are likewise not
+          # the agent's to edit.
           forbidden_paths:
             - ".github/workflows/**"
             - ".fishhawk/**"
@@ -233,67 +223,66 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # The ADR-055 preset default, restored now that #2358 landed.
-              # Operator gate participation — answering a clarification,
-              # attaching binding approval conditions, driving a stage — no
-              # longer counts as authorship, so `author` no longer makes this
-              # gate unsatisfiable by its sole member. It bites only where the
-              # run carries a real authorship signal (an operator-vouched
-              # commit). `agent` is an unconditional floor either way.
+              # Same predicate as the plan gate: one approval, excluding the
+              # author and any agent identity.
               not: [author, agent]
-      # Runner-hosted advisory acceptance stage (ADR-049 / #1519, E31). It
-      # rides the ordinary agent executor branch — never `delegate` (deploy-
-      # only) — and carries no pre-flight deploy constraint or `deployment`
-      # artifact. The acceptance agent validates the RUNNING preview instance
-      # against the approved plan's `verification.acceptance_criteria` and ships
-      # a signed verdict to POST /v0/runs/{run_id}/acceptance. A failed verdict
-      # leaves the stage `succeeded` and routes through deterministic server-
-      # side triage (class 1 → fix-up, class 2 → acceptance re-run, class 3/4 →
-      # paged); the merge stays gated on the acceptance_passed condition
-      # (ADR-049 decision #6, operator-loop next_actions — not a hard spec gate).
-      # Verbatim from docs/spec/examples/workflow-v1-acceptance.yaml (E31.10).
+      # Acceptance: does the change actually do what the plan promised?
+      #
+      # The acceptance agent exercises the running candidate against the
+      # approved plan's acceptance criteria and submits a signed verdict.
+      # A failing verdict does not fail the stage — it routes to the right
+      # remedy instead (a fix-up for a code defect, a re-run for a flaky
+      # check, a page for anything the loop cannot classify), and merge
+      # stays conditioned on a passing or explicitly arbitrated result.
       - id: acceptance
         type: acceptance
         executor:
-          # An acceptance stage MUST use an agent (or human) executor.
+          # An acceptance stage must run under an agent or human executor.
           agent: claude-code
         inputs:
           - artifact: plan
             from_stage: plan
           - artifact: pull_request
             from_stage: implement
-        # Egress allowance (v1.3, ADR-050 / #1532): the single customer-declared
-        # slot of the acceptance agent's default-deny egress allow-list. Points
-        # at the local dogfood preview (scripts/dev k8s / docker-compose). The
-        # runner adds the model API endpoint and the Fishhawk backend itself;
-        # they are not declarable here. Hosts, not URLs — no scheme, no path.
+        # The acceptance agent's network egress is default-deny. This is the
+        # one allowance the workflow declares: the host serving the preview
+        # instance under test. The model API endpoint and the Fishhawk
+        # backend are added by the runner and are not declarable here.
+        # Hosts, not URLs — no scheme and no path.
         egress:
           target_hosts:
             - localhost:8090
-        # Durable acceptance-evidence record (v1.2, ADR-049 / #1531): the
-        # verdict + per-criterion results + content-hash refs to evidence blobs.
-        # Valid ONLY on an acceptance stage.
+        # A durable record of the verdict, the per-criterion results, and
+        # content-hash references to the captured evidence. Valid only on an
+        # acceptance stage.
         produces:
           - artifact: acceptance
         budget:
           max_tokens: 200000
           max_runtime: 20m
           enforcement: advisory
-  # Low autonomy — human-led work.
-  # Used for cryptographic, policy, and audit-integrity surfaces.
-  # The workflow exists to record the work in the audit log; the agent
-  # is not the author. See docs/METHODOLOGY.md for what falls under this.
+
+  # ---------------------------------------------------------------------------
+  # human_led_change — a human writes the code; the workflow records it.
+  #
+  # For load-bearing surfaces (cryptography, the policy engine, audit
+  # integrity, forge app authentication) where the author is a person, not
+  # an agent. The workflow exists so the change still lands in the audit
+  # log with a recorded approver, not to delegate anything.
+  # ---------------------------------------------------------------------------
   human_led_change:
-    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED, for now. #2360's
-    # draft floated `labels: [autonomy:low]`, but this workflow is the escape
-    # hatch for load-bearing surfaces, and a labels envelope would refuse a
-    # human-led change filed on an issue that happens to lack the label —
-    # refusing the safest route is the wrong failure direction. A `paths`
-    # envelope naming the crypto / policy / audit surfaces would express the
-    # intent, but this workflow has no plan stage, so `paths` is never
-    # evaluated here (#2377). Revisit once that is resolved.
+    # No `applies_to` on purpose. This workflow is the escape hatch for the
+    # riskiest surfaces, and a routing envelope would refuse a change that
+    # belongs here for a bookkeeping reason — refusing the safest route is
+    # the wrong failure direction. A path envelope would express the intent
+    # exactly, but paths are evaluated at a plan gate and this workflow
+    # declares no plan stage.
     description: >-
-      Workflow for human-authored changes to load-bearing surfaces (crypto, policy engine, audit integrity, GitHub App auth). The audit log records what was changed and who approved it.
+      Workflow for human-authored changes to load-bearing surfaces (cryptography, policy engine, audit integrity, forge app authentication). The audit log records what was changed and who approved it.
+    # Advance the mechanical transitions automatically. Nothing is delegated
+    # here — with no `autonomy` declared, every action class defaults to
+    # gated — so this only removes bookkeeping stops, not decisions.
+    auto_advance: true
     stages:
       - id: review
         type: review
@@ -307,46 +296,44 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # The ADR-055 preset default, restored now that #2358 landed.
-              # Operator gate participation — answering a clarification,
-              # attaching binding approval conditions, driving a stage — no
-              # longer counts as authorship, so `author` no longer makes this
-              # gate unsatisfiable by its sole member. It bites only where the
-              # run carries a real authorship signal (an operator-vouched
-              # commit). `agent` is an unconditional floor either way.
               not: [author, agent]
-  # High autonomy — agent implements and merges if gates pass.
-  # Reserved for low-risk, high-volume work where the cost of a mistake
-  # is contained and CI is a sufficient check.
+
+  # ---------------------------------------------------------------------------
+  # routine_change — low-risk, high-volume work the agent carries to merge.
+  #
+  # Documentation, dependency bumps, formatting fixes and tests for existing
+  # behavior: changes where the cost of a mistake is contained and CI is a
+  # sufficient check. No human approval gate at all.
+  # ---------------------------------------------------------------------------
   routine_change:
-    # applies_to (E53.3 / #2226) — THE point of E53.9 (#2360). This is the
-    # workflow whose gate is a degenerate `type: check` and which permits agent
-    # merge, so what may be routed here is a real governance question rather
-    # than a habit.
+    # This is the workflow that permits an agent merge, so what may be
+    # routed here is a real governance question rather than a habit. The
+    # label envelope is enforced at run admission on every entry point: a
+    # change must be filed as a chore to be routed here, and anything else
+    # is refused before any work begins. Expect it to refuse something
+    # eventually — that is the control working, and the fix is amending
+    # this file rather than reaching for a routing override.
     #
-    # `labels` IS enforced, today, at admission — on the API path (#2226) and
-    # the webhook path (#2361) alike. A change must be filed as a chore to be
-    # routed here. Expect this to refuse something eventually; that is the
-    # control working, and the fix is amending this file, not reaching for
-    # --applies-to-override (#2364) out of habit.
-    #
-    # NO `paths` here, deliberately. #2377 resolved the question the earlier
-    # declaration left open: a `paths` criterion is evaluated at the plan gate,
-    # routine_change declares no plan stage, so it could never be evaluated —
-    # and it is now REFUSED at spec validation rather than silently inert. The
-    # path envelope for this workflow is the implement stage's allowed_paths
-    # below, which is a post-hoc diff constraint: it catches a violation after
-    # the agent has run rather than refusing it at routing. That is a real
-    # control, and it is the accurate description of it.
+    # No `paths` envelope here. A path predicate is evaluated at the plan
+    # gate and this workflow declares no plan stage, so it could never be
+    # evaluated and is refused at validation. The path envelope for this
+    # workflow is the implement stage's `allowed_paths` below, which is a
+    # post-hoc diff constraint: it catches a violation after the agent has
+    # run rather than refusing it at routing.
     applies_to:
       labels: ["type:chore"]
     description: >-
-      Workflow for documentation, dependency bumps, lint/format fixes, and tests for existing behavior. Agent may merge if all gates pass.
-    # High-autonomy auto-retry (#276). Routine_change is the
-    # canonical case for self-healing: the human never approved
-    # anything; the agent's job is to keep the change merging
-    # cleanly. One retry strikes the balance between resilience to
-    # flaky CI and not spinning forever on a real bug.
+      Workflow for documentation, dependency bumps, lint and format fixes, and tests for existing behavior. The agent may merge once all gates pass.
+    auto_advance: true
+    # The agent carries the change to merge unattended. Nothing was
+    # human-approved upstream, so the delegation has to cover the whole
+    # path: approve, fix-up, retry, waive a lone low-severity concern, and
+    # merge once CI is green. The `allowed_paths` constraint below, not a
+    # human, is what bounds the blast radius.
+    autonomy: high
+    # Self-healing is the point here: nothing was human-approved, so the
+    # agent's job is to keep the change merging cleanly. One retry balances
+    # resilience to a flaky check against spinning on a real bug.
     on_ci_failure:
       max_retries: 1
     stages:
@@ -358,6 +345,8 @@ workflows:
           - artifact: pull_request
         constraints:
           max_files_changed: 20
+          # An allow-list, not a deny-list: on a workflow that merges
+          # without human approval, anything not named here fails the stage.
           allowed_paths:
             - "docs/**"
             - "**/*.md"
@@ -371,58 +360,52 @@ workflows:
         executor:
           agent: claude-code
         gates:
-          # ADR-017 (#249): GitHub branch protection (and a future
-          # gh pr merge --auto on the runner side, #255) own the
-          # merge-readiness gate for routine_change. The Fishhawk-
-          # side gate is degenerate now — it just lets the run
-          # advance once branch protection clears.
+          # A `check` gate carries no approval predicate: it lets the run
+          # advance once the forge's own branch protection is satisfied.
+          # Merge readiness is owned there rather than restated here, so the
+          # two cannot disagree.
           - type: check
-  # Delegating deploy (ADR-038 / E23, workflow-v1). Operator-triggered
-  # after the corresponding feature_change run merges. Fishhawk holds no
-  # deploy logic or credentials: the deploy stage TRIGGERS an external
-  # pipeline (.github/workflows/deploy.yml via workflow_dispatch, passing
-  # the fishhawk_run_id + fishhawk_stage_id correlation inputs the
-  # deployreconciler re-resolves the run by) and MONITORS it to terminal,
-  # recording a `deployment` artifact + audit trail.
+
+  # ---------------------------------------------------------------------------
+  # release — delegating deploy.
   #
-  # `required_upstream` is intentionally OMITTED here: it evaluates the
-  # CURRENT run's own implement/review state, which a deploy-only release
-  # run lacks, so it would fail closed. Declarative cross-workflow gating
-  # on the feature_change run is tracked in #1417; until it lands, the
-  # fail-closed approval gate below is the control point and the operator
-  # confirms the change merged before triggering the release.
+  # Fishhawk holds no deploy logic and no deploy credentials. This stage
+  # triggers an external pipeline, passing the run and stage identifiers the
+  # pipeline echoes back for correlation, then monitors it to a terminal
+  # state and records a deployment artifact and audit trail. Operator-
+  # triggered once the corresponding feature_change run has merged.
   #
-  # deploy.yml is an echo/no-op validation stub for now (echo-now-real-later,
-  # #1418) — it exercises the full dispatch -> poll -> deployment-artifact
-  # loop without touching real infrastructure.
+  # `required_upstream` is deliberately omitted: it evaluates the current
+  # run's own implement and review state, which a deploy-only release run
+  # does not have, so declaring it would fail closed on every release. The
+  # approval gate below is the control point, and the operator confirms the
+  # change merged before triggering.
+  # ---------------------------------------------------------------------------
   release:
-    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED. The natural envelope
-    # is a `trigger` form, but all three trigger sources v0 mints (github_issue,
-    # cli, ui) map to `diff`, so a trigger declaration cannot distinguish an
-    # operator-triggered release from anything else today. Declaring
-    # `trigger: [scheduled]` or `[on_demand]` would match nothing and refuse
-    # every real run — a control that only ever says no. Revisit when ADR-065's
-    # groomer or ADR-053's incident intake gives those forms a producer.
+    # No `applies_to`. The natural envelope is a trigger predicate, but
+    # every trigger source in use today normalizes to `diff`, so a trigger
+    # declaration cannot yet distinguish an operator-triggered release from
+    # anything else — it would match nothing and refuse every real run.
     description: >-
-      Delegating deploy workflow (ADR-038): triggers an external release pipeline via workflow_dispatch and monitors it to terminal. Fishhawk holds no deploy logic or credentials. Operator-triggered after the feature_change run merges.
-    # Drive mode (#1023): surface next_action and auto-advance mechanical
-    # transitions; the deploy approval below still parks for the human (no
-    # operator_agent delegation is configured, so a production deploy always
-    # pages rather than auto-approving).
+      Delegating deploy workflow: triggers an external release pipeline and monitors it to a terminal state. Fishhawk holds no deploy logic or credentials. Operator-triggered after the corresponding feature_change run merges.
     auto_advance: true
+    # No `autonomy` and therefore no delegation: a production deploy always
+    # pages a human at the gate below, whatever the rest of the file allows.
     policy:
       max_stage_runtime: "30m"
     stages:
       - id: deploy
         type: deploy
-        # A deploy stage MUST delegate (ADR-038): no agent/human executor.
+        # A deploy stage must delegate — it takes no agent or human
+        # executor. Fishhawk dispatches the named pipeline and watches it.
         executor:
           delegate:
             target: github_actions
             workflow_ref: deploy.yml
             git_ref: main
-        # Pre-flight deploy constraints (evaluated BEFORE execution at the
-        # gate). change_freeze:false declares the surface without blocking.
+        # Pre-flight constraints, evaluated at the gate before anything is
+        # dispatched. `change_freeze: false` declares the surface without
+        # blocking; set it to true to hold releases.
         constraints:
           allowed_environments: [staging, production]
           change_freeze: false
@@ -433,52 +416,31 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # The ADR-055 preset default, restored now that #2358 landed.
-              # Operator gate participation — answering a clarification,
-              # attaching binding approval conditions, driving a stage — no
-              # longer counts as authorship, so `author` no longer makes this
-              # gate unsatisfiable by its sole member. It bites only where the
-              # run carries a real authorship signal (an operator-vouched
-              # commit). `agent` is an unconditional floor either way.
               not: [author, agent]
 
   # ---------------------------------------------------------------------------
-  # backlog_grooming (ADR-065 / E54.4 #2236) — the dogfood declaration.
+  # backlog_grooming — propose a ranking, gate it, apply it.
   #
-  # OPERATOR-AUTHORED ON PURPOSE. `.fishhawk/**` is in the feature_change
-  # implement stage's forbidden_paths, so an agent cannot write this block. That
-  # is deliberate: this file is the document that constrains the agent, and an
-  # agent able to edit it could widen its own permissions inside the very change
-  # it is proposing — the same self-serving-edit hazard that makes repodoc
-  # resolve the charter from the BASE ref (#2242). #2236 shipped the grammar,
-  # the validation and the shipped example under test; this block is the
-  # human-led half of that handoff.
+  # A workflow that produces no code at any stage. It reads the backlog
+  # against a checked-in charter, proposes a report, and applies the
+  # approved mutations to the tracker.
   #
-  # MIRRORS docs/spec/examples/workflow-v2-backlog-grooming.yaml. That file is
-  # the shipped example and is read from disk by the TestShippedGrooming*
-  # family, so it — not this block — is what the test suite pins. Keep the two
-  # in step: a divergence here is invisible to those tests.
+  # Nothing here can auto-close an issue, and that is structural rather
+  # than a default: `ordering`, `dedup` and `scoping` are registered as
+  # non-delegable classes carrying no condition at all, so `mode: auto` on
+  # any of them is refused when this file is parsed. Widening one is not a
+  # configuration edit, it is a grammar change.
   #
-  # NOTHING CAN AUTO-CLOSE AN ISSUE UNDER THIS DECLARATION, and that is
-  # structural rather than a default. `ordering`, `dedup` and `scoping` are
-  # registered as NON-DELEGABLE grooming classes carrying no condition, so
-  # `mode: auto` on any of them is refused at PARSE time by two independent
-  # controls. Widening one is not a config edit; it is a grammar change.
+  # The charter is mandatory. Starting a run on this workflow in a
+  # repository whose work-management conventions declare no charter is
+  # refused before any run exists. The charter is what every proposed
+  # ranking must cite, and it is what keeps the approval gate from
+  # degrading into a rubber stamp.
   #
-  # THE CHARTER IS MANDATORY. Starting a run on this workflow in a repo whose
-  # work-management conventions declare no `charter:` block is refused 422
-  # before any run row exists, at BOTH run-creation seams (the HTTP handler and
-  # the campaign path). This repo has no `.fishhawk/work-management.yaml`, so it
-  # resolves the shipped default, which declares `.fishhawk/charter.md` — the
-  # charter that anchors every ranking this workflow proposes.
-  #
-  # NO RUN CAN SELECT THIS WORKFLOW YET, and that is a safety property rather
-  # than a gap. `applies_to: {trigger: [scheduled, on_demand]}` is the non-diff
-  # routing form, and every trigger source v0 mints normalizes to `diff`, so the
-  # groomer cannot be started by an ordinary issue run. The `release` workflow's
-  # applies_to comment above anticipates exactly this: it stays undeclared until
-  # ADR-065's groomer gives those forms a producer. This is that producer,
-  # declared ahead of the scheduler that will drive it.
+  # No ordinary issue run can select this workflow: its routing predicate
+  # is the non-diff trigger form, and every trigger source in use today
+  # normalizes to `diff`. That is a safety property rather than a gap —
+  # the declaration is here ahead of the scheduler that will drive it.
   # ---------------------------------------------------------------------------
   backlog_grooming:
     description: >-
@@ -491,10 +453,11 @@ workflows:
     # The five run-driving classes: nothing delegated.
     autonomy: low
 
-    # The four backlog-grooming classes, disjoint from the tier above.
-    # hygiene is the only one that may act unattended, and only because its
-    # mutations are objective and reversible (labels, fields, boarding, epic
-    # links). The destructive three cannot be widened here — see the header.
+    # The four grooming classes, a disjoint set from the tier above.
+    # `hygiene` is the only one that may act unattended, and only because
+    # its mutations are objective and reversible — a missing label, an
+    # absent parent link, a stale status. The other three change what work
+    # exists or in what order it happens, and cannot be widened here.
     actions:
       hygiene:
         mode: auto
@@ -507,28 +470,24 @@ workflows:
         mode: report
 
     stages:
-      # PROPOSE — emits a grooming_report, not a plan. Every ordering entry must
-      # cite a charter rubric line by id or the artifact fails validation
-      # (#2235); that citation requirement is ADR-065's named mitigation for
-      # charter-specificity risk, and it is what keeps the gate below from
-      # degrading into rubber-stamping.
+      # Propose. This stage emits a grooming report, not a plan. Every
+      # ordering entry must cite a charter rubric line by id or the artifact
+      # fails validation — that citation requirement is what makes the gate
+      # below reviewable.
       #
-      # The approval gate on this stage is ALSO the apply trigger (#2822):
-      # approving it executes the report's hygiene-class mutations server-side
-      # and audits each one. Approving is therefore a write, not a filing
-      # decision — read the report before approving it.
+      # The approval gate on this stage is also the apply trigger: approving
+      # it executes the report's hygiene-class mutations and audits each
+      # one. Approving is a write, not a filing decision — read the report
+      # before approving it.
       - id: groom
         type: plan
         executor:
           agent: claude-code
-          # 45m, not 20m. A real grooming pass over this repository's backlog
-          # measured 1408s (~23.5m) of stage time on run e96bd014 — it scans a
-          # ~300-item window, reads the charter, and writes a ~43KB report with
-          # a rubric citation per ordering entry. The original 20m was set
-          # before any live run existed and was guesswork; it is now measured.
-          # Overrunning is not a cheap failure: on e96bd014 the artifact was
-          # ingested and the churn guard ran, and the stage was still stranded
-          # in `running` with no gate (#2837), so the margin has to be real.
+          # 45m, from measurement rather than estimate: a real pass over
+          # this backlog scans a few hundred items, reads the charter and
+          # writes a report with a rubric citation per ordering entry, and
+          # took roughly 24 minutes. Overrunning is not a cheap failure, so
+          # the margin is deliberate.
           timeout: 45m
         inputs:
           - source: github_issue
@@ -544,35 +503,26 @@ workflows:
               members: [kuhlman-labs]
               not: [author, agent]
 
-      # THERE IS DELIBERATELY NO `apply` STAGE. Do not add one back.
+      # There is deliberately no apply stage between these two, and adding
+      # one back would be a regression. The mutations are executed when the
+      # operator approves the gate above, so an apply stage would spawn an
+      # agent with nothing left to do.
       #
-      # An `apply` stage existed here until #2822 wired the apply path, and it
-      # became vestigial the moment that landed. The mutations are executed
-      # SERVER-SIDE when the operator approves the `groom` gate above
-      # (backend/internal/server/grooming_apply.go), so by the time any apply
-      # stage could be dispatched the work is already done and audited — the
-      # stage would spawn an agent with nothing to do.
-      #
-      # Putting the apply behind the gate rather than in an agent stage is the
-      # design, not an accident: an agent stage between the operator's gate
-      # decision and the tracker write would place an agent inside the very
-      # step this workflow exists to keep human. The apply layer's containment
-      # rules ARE the authorization, and the gate decision is what triggers
-      # them.
-      #
-      # Only the `hygiene` class applies today. `ordering`, `dedup` and
-      # `scoping` receive no decision and stay proposals — see the action
-      # matrix above and #2843, which carries the per-entry disposition surface
-      # the destructive classes need before they can be applied at all.
+      # Putting the apply behind the gate rather than in an agent stage is
+      # the design: an agent stage between the operator's decision and the
+      # tracker write would place an agent inside the very step this
+      # workflow exists to keep human. The gate decision is the
+      # authorization, and the apply layer's containment rules are what
+      # enforce it.
 
-      # CONFIRM — a human checks that the mutations actually landed.
+      # Confirm. A human checks that the mutations actually landed.
       #
       # This is not a second rubber stamp. The apply reports its own outcome
-      # per entry, but an audit row saying `applied` is not the same claim as
-      # the tracker actually carrying the change: on walk #2844 the summary
-      # truthfully reported eight applied while every applied VALUE was prose
-      # garbage (#2847). This gate is where an operator records that they
-      # checked the forge, not the summary.
+      # per entry, but an audit row saying `applied` is a different claim
+      # from the tracker actually carrying the change — a run can truthfully
+      # report eight mutations applied while every applied value is
+      # malformed. This gate is where an operator records that they checked
+      # the tracker, not the summary.
       - id: confirm
         type: review
         executor:
