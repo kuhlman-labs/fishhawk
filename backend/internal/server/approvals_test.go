@@ -376,6 +376,14 @@ type approvalAuditFake struct {
 	appended   []audit.ChainAppendParams
 	appendErr  error
 	allEntries []*audit.Entry
+	// listAllErr makes ListAll fail, driving resolveCalibrationHint's error
+	// path (#2862) so the crossing emit's best-effort fleet-ratio leg is
+	// testable without a real audit store.
+	listAllErr error
+	// appendErrCategory, when set, makes AppendChained fail for THAT category
+	// only (#2862), so a test can drive the crossing emit's append-failure
+	// branch without also breaking the approval flow's own appends.
+	appendErrCategory string
 	// runEntries seeds ListForRun, which resolveChangeAuthor (#1709)
 	// scans for the run's earliest user-kind actor. Keyed by run id.
 	runEntries map[uuid.UUID][]*audit.Entry
@@ -413,6 +421,9 @@ func (a *approvalAuditFake) AppendChained(_ context.Context, p audit.ChainAppend
 	if a.appendErr != nil {
 		return nil, a.appendErr
 	}
+	if a.appendErrCategory != "" && p.Category == a.appendErrCategory {
+		return nil, errors.New("approvalAuditFake: injected append error for " + p.Category)
+	}
 	a.appended = append(a.appended, p)
 	rid := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
@@ -432,6 +443,9 @@ func (a *approvalAuditFake) ListGlobalByAccount(context.Context, *uuid.UUID) ([]
 func (a *approvalAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.listAllErr != nil {
+		return nil, a.listAllErr
+	}
 	return a.allEntries, nil
 }
 func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
@@ -10185,5 +10199,554 @@ func TestSubmitApproval_ReviewGateAdmission_FailClosedReasons(t *testing.T) {
 			}
 			assertReviewGateUntouched(t, ar, rr, st.ID)
 		})
+	}
+}
+
+// --- #2862: the gate reads max(predicted, raw) ---------------------------
+
+// specBudgetImplement60 declares a 60-minute IMPLEMENT budget for workflow "w"
+// (the id orchestratorRepo.seedRun uses) and a deliberately different 10-minute
+// plan budget, so every #2862 case below also re-proves the #994 stage-type
+// fix: the gate must resolve the implement stage's 60m, not the plan stage
+// under approval. With no runtime_observed history seeded, resolvePlanGateBudget
+// leaves the budget at that 60m spec floor.
+var specBudgetImplement60 = []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: "10m"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: "60m"
+        produces:
+          - artifact: pull_request
+`)
+
+// seedCalibrationBudgetRun seeds a run whose implement budget resolves to the
+// 60m spec floor and whose plan stage carries the given plan artifact.
+func seedCalibrationBudgetRun(t *testing.T, rr *orchestratorRepo, art *fakeArtifactRepo, p *plan.Plan) (*run.Run, *run.Stage) {
+	t.Helper()
+	r, stage := seedBudgetRun(t, rr, art, p)
+	r.WorkflowSpec = specBudgetImplement60
+	return r, stage
+}
+
+// crossingEntries returns every plan_budget_calibration_crossing entry the
+// approval appended. Read back from the audit fake AFTER the call returns
+// rather than inferred from the response, because the entry is COMMITTED STATE
+// and the 422's body is byte-identical whether or not the emit fired.
+func crossingEntries(au *approvalAuditFake) []audit.ChainAppendParams {
+	var out []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == "plan_budget_calibration_crossing" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// budgetCrossingPayload mirrors the plan_budget_calibration_crossing payload.
+// ImpliedFactor / FleetRatio are pointers so an OMITTED key is distinguishable
+// from a present zero.
+type budgetCrossingPayload struct {
+	StageID              string   `json:"stage_id"`
+	RawPredictedMinutes  int      `json:"raw_predicted_minutes"`
+	PredictedMinutes     int      `json:"predicted_minutes"`
+	GatePredictedMinutes int      `json:"gate_predicted_minutes"`
+	BudgetMinutes        int      `json:"budget_minutes"`
+	BudgetSource         string   `json:"budget_source"`
+	SpecBudgetMinutes    int      `json:"spec_budget_minutes"`
+	GateOutcome          string   `json:"gate_outcome"`
+	ImpliedFactor        *float64 `json:"implied_factor"`
+	FleetRatio           *float64 `json:"fleet_calibration_ratio"`
+}
+
+func decodeCrossing(t *testing.T, e audit.ChainAppendParams) budgetCrossingPayload {
+	t.Helper()
+	var p budgetCrossingPayload
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("decode plan_budget_calibration_crossing payload: %v", err)
+	}
+	return p
+}
+
+// M1 — THE #2862 DEFECT. A raw estimate of 90 minutes calibrated down to 50
+// against a 60-minute implement budget. Before this change the gate read the
+// calibrated 50, saw 50 <= 60, and let a plan whose real estimate was 90
+// through with no decomposition and nothing in the record — the required
+// decomposition dissolved silently. The gate now reads max(50, 90) = 90 and
+// refuses. The bad state is seeded BY CONSTRUCTION (the artifact literally
+// carries both numbers; no control runs in this test's setup), so reverting the
+// comparison to PredictedRuntimeMinutes reddens the STATUS assertion.
+func TestSubmitApproval_BudgetCheck_RawExceedsBudget_Refused(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50, // calibrated: under the 60m budget
+		RawPredictedRuntimeMinutes: 90, // raw: over it
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — the gate read the CALIBRATED 50 instead of max(50, 90):\n%s",
+			w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_violates_budget"`) {
+		t.Errorf("body missing plan_violates_budget: %s", w.Body.String())
+	}
+	// The 422 details say which number the gate read.
+	for _, want := range []string{`"raw_predicted_minutes":90`, `"gate_predicted_minutes":90`, `"predicted_minutes":50`} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("422 body missing %s:\n%s", want, w.Body.String())
+		}
+	}
+	// PRE-Submit refusal: no approval row, stage did not advance.
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval", stage.State)
+	}
+	// Committed state: the violation entry AND the crossing entry, the latter
+	// recording that calibration is what moved the estimate across.
+	var violation *audit.ChainAppendParams
+	for i, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			violation = &au.appended[i]
+		}
+	}
+	if violation == nil {
+		t.Fatalf("expected plan_violates_budget audit entry, got %+v", au.appended)
+	}
+	var vp struct {
+		PredictedMinutes     int `json:"predicted_minutes"`
+		RawPredictedMinutes  int `json:"raw_predicted_minutes"`
+		GatePredictedMinutes int `json:"gate_predicted_minutes"`
+	}
+	if err := json.Unmarshal(violation.Payload, &vp); err != nil {
+		t.Fatalf("decode plan_violates_budget payload: %v", err)
+	}
+	if vp.RawPredictedMinutes != 90 || vp.GatePredictedMinutes != 90 || vp.PredictedMinutes != 50 {
+		t.Errorf("plan_violates_budget payload = raw %d / gate %d / predicted %d, want 90 / 90 / 50",
+			vp.RawPredictedMinutes, vp.GatePredictedMinutes, vp.PredictedMinutes)
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1; got %+v", len(cx), au.appended)
+	}
+	if got := decodeCrossing(t, cx[0]).GateOutcome; got != "refused" {
+		t.Errorf("gate_outcome = %q, want refused", got)
+	}
+}
+
+// M2 — the same crossing, but the plan carries decomposition.sub_plans: the
+// approval PROCEEDS (decomposition is what the gate wanted) and the crossing is
+// still recorded, with gate_outcome naming the branch that let it through.
+func TestSubmitApproval_BudgetCheck_RawExceedsBudgetWithDecomp_ProceedsAndRecordsCrossing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+		Decomposition: &plan.Decomposition{
+			Rationale: "raw estimate is over the implement budget",
+			SubPlans:  []plan.SubPlanSummary{{Title: "part1", PredictedRuntimeMinutes: 45}},
+		},
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decomposition satisfies the gate):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget when decomposition is present")
+		}
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1 (the crossing must be recorded even on the branch that PROCEEDS)", len(cx))
+	}
+	if got := decodeCrossing(t, cx[0]).GateOutcome; got != "decomposition_satisfied" {
+		t.Errorf("gate_outcome = %q, want decomposition_satisfied", got)
+	}
+}
+
+// M3 — the same crossing with --override-budget: the approval proceeds, BOTH
+// the pre-existing plan_budget_override_acknowledged entry (now carrying the
+// two new keys) and the crossing entry are present.
+func TestSubmitApproval_BudgetCheck_RawExceedsBudgetWithOverride_ProceedsAndRecordsBoth(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"accepted deliberately --override-budget"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (--override-budget):\n%s", w.Code, w.Body.String())
+	}
+	var override *audit.ChainAppendParams
+	for i, e := range au.appended {
+		if e.Category == "plan_budget_override_acknowledged" {
+			override = &au.appended[i]
+		}
+		if e.Category == "plan_violates_budget" {
+			t.Errorf("unexpected plan_violates_budget when --override-budget present")
+		}
+	}
+	if override == nil {
+		t.Fatalf("expected plan_budget_override_acknowledged audit entry, got %+v", au.appended)
+	}
+	var op struct {
+		RawPredictedMinutes  int `json:"raw_predicted_minutes"`
+		GatePredictedMinutes int `json:"gate_predicted_minutes"`
+	}
+	if err := json.Unmarshal(override.Payload, &op); err != nil {
+		t.Fatalf("decode plan_budget_override_acknowledged payload: %v", err)
+	}
+	if op.RawPredictedMinutes != 90 || op.GatePredictedMinutes != 90 {
+		t.Errorf("override payload = raw %d / gate %d, want 90 / 90 — the operator must see which number was overridden",
+			op.RawPredictedMinutes, op.GatePredictedMinutes)
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1", len(cx))
+	}
+	if got := decodeCrossing(t, cx[0]).GateOutcome; got != "override_acknowledged" {
+		t.Errorf("gate_outcome = %q, want override_acknowledged", got)
+	}
+}
+
+// M4 — the structure-ADDING direction is preserved. A fleet factor ABOVE 1.0
+// pushed a raw 40 up to a calibrated 70 against the 60m budget: the gate reads
+// max(70, 40) = 70 and still refuses. This is what makes the change "apply
+// calibration only where it adds structure" rather than "ignore calibration".
+func TestSubmitApproval_BudgetCheck_CalibrationPushesOverBudget_StillRefused(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    70, // calibrated UP, over the 60m budget
+		RawPredictedRuntimeMinutes: 40, // raw: under it
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — a factor above 1.0 must still push a plan over:\n%s",
+			w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"gate_predicted_minutes":70`) {
+		t.Errorf("422 body missing gate_predicted_minutes 70:\n%s", w.Body.String())
+	}
+	// It is still a crossing (the two values straddle 60), recorded as refused.
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1", len(cx))
+	}
+	got := decodeCrossing(t, cx[0])
+	if got.GateOutcome != "refused" {
+		t.Errorf("gate_outcome = %q, want refused", got.GateOutcome)
+	}
+	if got.GatePredictedMinutes != 70 {
+		t.Errorf("gate_predicted_minutes = %d, want 70", got.GatePredictedMinutes)
+	}
+}
+
+// M5 — a LEGACY plan that reports no raw estimate is gated byte-for-byte as it
+// is today: the calibrated value alone decides, and NO crossing entry is
+// written (there is no second number to straddle with). Both sides of the
+// threshold are asserted so the case covers the whole legacy behavior, not just
+// the refusal.
+func TestSubmitApproval_BudgetCheck_RawAbsent_LegacyBehaviorNoCrossing(t *testing.T) {
+	cases := []struct {
+		name      string
+		predicted int
+		wantCode  int
+	}{
+		{"over budget refuses", 70, http.StatusUnprocessableEntity},
+		{"within budget proceeds", 50, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, au, _ := newBudgetCheckServer(t, art)
+
+			p := &plan.Plan{
+				PlanVersion:             "standard_v1",
+				PredictedRuntimeMinutes: tc.predicted,
+				// RawPredictedRuntimeMinutes deliberately absent (zero).
+			}
+			_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (legacy plan, predicted %d vs 60m budget):\n%s",
+					w.Code, tc.wantCode, tc.predicted, w.Body.String())
+			}
+			if cx := crossingEntries(au); len(cx) != 0 {
+				t.Errorf("plan_budget_calibration_crossing entries = %d, want 0 — a plan with no raw estimate cannot cross", len(cx))
+			}
+		})
+	}
+}
+
+// M6 — both estimates under the budget: the approval proceeds and nothing
+// crossed, so no crossing entry. This is the case that proves the entry keys on
+// a STRADDLE and not merely on the raw estimate being present.
+func TestSubmitApproval_BudgetCheck_BothUnderBudget_NoCrossing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    40,
+		RawPredictedRuntimeMinutes: 50,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (max(40, 50) = 50 <= 60):\n%s", w.Code, w.Body.String())
+	}
+	if cx := crossingEntries(au); len(cx) != 0 {
+		t.Errorf("plan_budget_calibration_crossing entries = %d, want 0 — neither value crossed 60", len(cx))
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" || e.Category == "plan_budget_override_acknowledged" {
+			t.Errorf("unexpected budget audit entry within budget: %s", e.Category)
+		}
+	}
+}
+
+// M7 — both estimates OVER the budget: the gate refuses (as it would have
+// before this change) and NO crossing entry is written, because calibration did
+// not move the estimate across the threshold — it was over on both sides.
+func TestSubmitApproval_BudgetCheck_BothOverBudget_RefusedNoCrossing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    80,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if cx := crossingEntries(au); len(cx) != 0 {
+		t.Errorf("plan_budget_calibration_crossing entries = %d, want 0 — both values are over 60, nothing crossed", len(cx))
+	}
+}
+
+// M10 — the crossing payload makes the decision RECONSTRUCTABLE. Every field an
+// operator needs to re-derive why calibration mattered is asserted by name and
+// value: both estimates, the number the gate read, the factor the planner
+// implied, the resolved budget and its provenance, and the outcome. The fleet
+// ratio is asserted ABSENT here (this run has no runtime_observed history, so
+// resolveCalibrationHint returns a nil hint) — the best-effort omission, not a
+// zero.
+func TestSubmitApproval_BudgetCheck_CrossingPayloadIsReconstructable(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1", len(cx))
+	}
+	if cx[0].StageID == nil || *cx[0].StageID != stage.ID {
+		t.Errorf("crossing entry stage_id column = %v, want %s", cx[0].StageID, stage.ID)
+	}
+	if cx[0].ActorKind == nil || string(*cx[0].ActorKind) != "system" {
+		t.Errorf("crossing actor_kind = %v, want system", cx[0].ActorKind)
+	}
+	got := decodeCrossing(t, cx[0])
+	if got.StageID != stage.ID.String() {
+		t.Errorf("payload stage_id = %q, want %s", got.StageID, stage.ID)
+	}
+	if got.RawPredictedMinutes != 90 {
+		t.Errorf("raw_predicted_minutes = %d, want 90", got.RawPredictedMinutes)
+	}
+	if got.PredictedMinutes != 50 {
+		t.Errorf("predicted_minutes = %d, want 50", got.PredictedMinutes)
+	}
+	if got.GatePredictedMinutes != 90 {
+		t.Errorf("gate_predicted_minutes = %d, want 90", got.GatePredictedMinutes)
+	}
+	if got.BudgetMinutes != 60 {
+		t.Errorf("budget_minutes = %d, want 60", got.BudgetMinutes)
+	}
+	if got.SpecBudgetMinutes != 60 {
+		t.Errorf("spec_budget_minutes = %d, want 60", got.SpecBudgetMinutes)
+	}
+	if got.BudgetSource == "" {
+		t.Error("budget_source is empty; the resolved budget's provenance must be recorded")
+	}
+	if got.GateOutcome != "refused" {
+		t.Errorf("gate_outcome = %q, want refused", got.GateOutcome)
+	}
+	if got.ImpliedFactor == nil {
+		t.Fatal("implied_factor absent; the operator cannot re-derive the factor the planner applied")
+	}
+	if wantFactor := 50.0 / 90.0; *got.ImpliedFactor < wantFactor-1e-9 || *got.ImpliedFactor > wantFactor+1e-9 {
+		t.Errorf("implied_factor = %v, want %v (predicted/raw)", *got.ImpliedFactor, wantFactor)
+	}
+	if got.FleetRatio != nil {
+		t.Errorf("fleet_calibration_ratio = %v, want ABSENT — no runtime_observed history, so the hint is nil and the key is omitted", *got.FleetRatio)
+	}
+	// gate_outcome can never be within_budget: a crossing requires one estimate
+	// over the budget and the gate takes the maximum. Pinned so a future refactor
+	// that made the emit unconditional would fail here rather than write an
+	// unreachable outcome into the trail.
+	if got.GateOutcome == "within_budget" {
+		t.Error("gate_outcome = within_budget on a crossing entry; unreachable by construction")
+	}
+}
+
+// The crossing emit is BEST-EFFORT on the fleet-ratio leg and on the append
+// itself: a calibration-hint resolution failure must not block the approval or
+// suppress the entry. Seeding an audit fake whose ListAll fails drives
+// resolveCalibrationHint's error path; the entry must still be written (minus
+// the ratio key) and the gate must still refuse.
+func TestSubmitApproval_BudgetCheck_CrossingFleetRatioResolveFails_StillRecorded(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	au.listAllErr = errors.New("audit store unavailable")
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — a hint-resolution failure must not change the gate verdict:\n%s",
+			w.Code, w.Body.String())
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1 (best-effort ratio must not suppress the entry)", len(cx))
+	}
+	got := decodeCrossing(t, cx[0])
+	if got.FleetRatio != nil {
+		t.Errorf("fleet_calibration_ratio = %v, want ABSENT on a resolution error", *got.FleetRatio)
+	}
+	if got.GateOutcome != "refused" {
+		t.Errorf("gate_outcome = %q, want refused", got.GateOutcome)
+	}
+}
+
+// The crossing payload carries the FLEET calibration ratio when the workflow
+// has enough runtime_observed history for resolveCalibrationHint to return a
+// hint — the branch M10's nil-hint case leaves unexercised. Five 6-minute
+// implement samples against the fixture's 10-minute predictions give a ratio of
+// 0.6; the p95 term (6 × 1.5 = 9m) stays below the 60m spec floor, so the
+// resolved budget is unchanged and the gate verdict is the same as M1's.
+func TestSubmitApproval_BudgetCheck_CrossingCarriesFleetRatio(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	r, stage := seedCalibrationBudgetRun(t, rr, art, p)
+	for i := 0; i < calibrationHintMinSamples; i++ {
+		au.seedAll(runtimeObservedImplementEntry(r.ID, 6))
+	}
+
+	if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	cx := crossingEntries(au)
+	if len(cx) != 1 {
+		t.Fatalf("plan_budget_calibration_crossing entries = %d, want 1", len(cx))
+	}
+	got := decodeCrossing(t, cx[0])
+	if got.FleetRatio == nil {
+		t.Fatal("fleet_calibration_ratio absent; a resolvable hint must reach the payload")
+	}
+	if *got.FleetRatio < 0.6-1e-9 || *got.FleetRatio > 0.6+1e-9 {
+		t.Errorf("fleet_calibration_ratio = %v, want 0.6 (6 actual / 10 predicted)", *got.FleetRatio)
+	}
+	if got.BudgetMinutes != 60 {
+		t.Errorf("budget_minutes = %d, want 60 (p95 6 × 1.5 = 9m stays below the spec floor)", got.BudgetMinutes)
+	}
+}
+
+// The crossing emit is BEST-EFFORT on the APPEND itself: an audit-store failure
+// writing the crossing entry must log and leave the gate verdict untouched,
+// exactly as the sibling plan_violates_budget / plan_budget_override_acknowledged
+// appends do. The injected failure is scoped to the crossing category so the
+// violation entry still lands and the assertion distinguishes "the crossing
+// append failed" from "the whole audit repo is down".
+func TestSubmitApproval_BudgetCheck_CrossingAppendFails_GateUnaffected(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	au.appendErrCategory = "plan_budget_calibration_crossing"
+
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		PredictedRuntimeMinutes:    50,
+		RawPredictedRuntimeMinutes: 90,
+	}
+	_, stage := seedCalibrationBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — a failed crossing append must not change the verdict:\n%s",
+			w.Code, w.Body.String())
+	}
+	if cx := crossingEntries(au); len(cx) != 0 {
+		t.Fatalf("crossing entries = %d, want 0 (the append was injected to fail)", len(cx))
+	}
+	var foundViolation bool
+	for _, e := range au.appended {
+		if e.Category == "plan_violates_budget" {
+			foundViolation = true
+		}
+	}
+	if !foundViolation {
+		t.Errorf("plan_violates_budget entry missing; the crossing failure must not suppress the sibling append")
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
 	}
 }

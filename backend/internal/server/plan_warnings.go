@@ -126,6 +126,18 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
+	// UNREPORTED-RAW-ESTIMATE advisory (#2862), appended AFTER the count-derived
+	// over-cap advisory so the #2053 ordering guarantee holds. It is the
+	// VISIBILITY backstop for the budget gate's stated residual: the gate reads
+	// max(predicted, raw), so it can only check a raw estimate the planner
+	// actually reported. A plan that ignores the calibration hint's instruction
+	// and writes only a calibrated number is gated exactly as it was before
+	// #2862 — this advisory makes that ABSENCE conspicuous to the approver
+	// instead of indistinguishable from a plan that was never over budget.
+	if w := s.unreportedRawEstimateWarning(ctx, runID, &parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	// #2412 advisories, appended AFTER the count-derived over-cap advisory so the
 	// count advisory is emitted FIRST and unchanged — the ordering is the
 	// observable proof that irreducible/phase-cap advisories do not SUPPRESS the
@@ -460,5 +472,66 @@ func (s *Server) overCapSplitRejection(ctx context.Context, runID uuid.UUID, par
 			"expand->migrate->contract split_proposal (each phase at or under the cap), or if the change is "+
 			"genuinely compile-atomic declare it irreducible with a rationale, before approving.",
 		count, capLimit,
+	)
+}
+
+// unreportedRawEstimateWarning is the #2862 visibility backstop: it fires when
+// the run's workflow HAS a resolvable fleet calibration hint (so the planner WAS
+// shown a factor and instructed to report its pre-calibration estimate) and the
+// plan nonetheless omits raw_predicted_runtime_minutes. In that shape the
+// implement-budget gate has only the calibrated number to compare, so it cannot
+// verify that applying the factor did not clear the budget — exactly #2862's
+// failure mode, which this advisory converts from silence into a trace the
+// approver sees at the one gate where they can act on it.
+//
+// FAIL-OPEN on every degrade, returning "" so a plan settle is never blocked and
+// a workflow with no calibration history never fires it:
+//
+//	(a) the plan already reports a raw estimate — nothing to warn about, and the
+//	    gate has both numbers;
+//	(b) nil RunRepo or a GetRun failure — the workflow cannot be resolved, so
+//	    whether a hint exists is unknown;
+//	(c) resolveCalibrationHint returns an error — logged at WARN, no advisory;
+//	(d) resolveCalibrationHint returns a nil hint (fewer than
+//	    calibrationHintMinSamples implement samples for this workflow) — the
+//	    planner was shown NO factor, so an absent raw estimate is the correct,
+//	    expected shape and warning about it would be pure noise.
+//
+// Guard (a) is checked FIRST and needs no repo access, so the common case (a
+// compliant plan) costs nothing.
+func (s *Server) unreportedRawEstimateWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	if parsedPlan.RawPredictedRuntimeMinutes > 0 {
+		return ""
+	}
+	if s.cfg.RunRepo == nil {
+		return ""
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan warnings: get run for unreported-raw check failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return ""
+	}
+	hint, err := s.resolveCalibrationHint(ctx, runRow.WorkflowID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan warnings: resolve calibration hint failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return ""
+	}
+	if hint == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"plan reports predicted_runtime_minutes %d but omits raw_predicted_runtime_minutes, and this workflow's plan prompt "+
+			"carried a fleet calibration factor of %.2f (from %d implement samples) that the planner was told to apply and to "+
+			"report the pre-calibration number for. Because the raw estimate is unreported, the implement-budget gate — which "+
+			"reads max(predicted_runtime_minutes, raw_predicted_runtime_minutes) — could not verify that applying the factor did "+
+			"not clear the budget: a sub-1.0 factor can pull an over-budget estimate under it and dissolve a required "+
+			"decomposition. Treat the quoted estimate as CALIBRATED, not raw, when judging whether this plan needs decomposing.",
+		parsedPlan.PredictedRuntimeMinutes, hint.CalibrationRatio, hint.Samples,
 	)
 }

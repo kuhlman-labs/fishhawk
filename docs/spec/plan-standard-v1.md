@@ -220,7 +220,17 @@ Two required fields capture the agent's estimate of how long the implement stage
 
 #### `predicted_runtime_minutes`
 
-Integer ≥ 1. The agent's estimate in minutes. Used to surface scope problems early: if the estimate exceeds the implement-stage budget (per ADR-025), the agent must also populate `decomposition.sub_plans`.
+Integer ≥ 1. The agent's estimate in minutes, CALIBRATED — when the plan-stage prompt renders a calibration hint, this is the number after the fleet factor has been applied. Used to surface scope problems early: if the estimate exceeds the implement-stage budget (per ADR-025), the agent must also populate `decomposition.sub_plans`. It is also the term the dynamic implement kill cap and the `runtime_observed` calibration series build on, so its meaning is deliberately unchanged by #2862.
+
+#### `raw_predicted_runtime_minutes`
+
+Integer ≥ 1. **Optional** (additive within `standard_v1`, #2862). The agent's PRE-calibration estimate — the number it arrived at *before* multiplying by the fleet calibration factor the hint supplied.
+
+It exists because folding the factor into `predicted_runtime_minutes` destroys the raw estimate at the source: a raw 90 times a 0.56 fleet ratio lands at ~50, the implement-budget gate sees `50 <= 60`, and a required decomposition dissolves with nothing in the artifact recording it was ever triggered.
+
+The implement-budget gate therefore evaluates **`max(predicted_runtime_minutes, raw_predicted_runtime_minutes)`**. Calibration applies only in the structure-ADDING direction: a factor below 1.0 can never pull a plan under the budget, while a factor above 1.0 can still push one over. `raw_predicted_runtime_minutes` equal to `predicted_runtime_minutes` is legitimate (factor 1.0, or no hint rendered) and the schema enforces no relation between the two.
+
+Populate it whenever the prompt rendered a calibration hint. Omitting it is legal and leaves the gate reading `predicted_runtime_minutes` exactly as before, but a hint-bearing plan that omits it draws a plan-gate advisory, because the gate then cannot verify that calibration did not clear the budget.
 
 #### `predicted_runtime_confidence`
 
@@ -232,7 +242,7 @@ One of `"low"`, `"medium"`, or `"high"`.
 | `medium` | Reasonably grounded; agent has read the relevant code |
 | `high` | Well-understood scope; agent has high certainty |
 
-These fields are MUST-populate: every `standard_v1` artifact must carry an estimate. The plan-stage prompt instructs the agent accordingly (ADR-025 D1 framing).
+`predicted_runtime_minutes` and `predicted_runtime_confidence` are MUST-populate: every `standard_v1` artifact must carry an estimate and a confidence level. `raw_predicted_runtime_minutes` is optional and reported alongside them whenever a calibration hint was rendered. The plan-stage prompt instructs the agent accordingly (ADR-025 D1 framing).
 
 ## Optional fields
 
@@ -249,7 +259,7 @@ Free-form strings. The plan-review UI surfaces these in a sidebar. Useful for th
 
 ### Decomposition
 
-Populated when `predicted_runtime_minutes` exceeds the implement-stage budget. Signals that the agent believes the work should be split across multiple runs.
+Populated when the agent's runtime estimate exceeds the implement-stage budget — measured against the LARGER of `predicted_runtime_minutes` and `raw_predicted_runtime_minutes`, which is the number the budget gate reads (#2862). Signals that the agent believes the work should be split across multiple runs.
 
 ```json
 {
