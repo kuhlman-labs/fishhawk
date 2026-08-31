@@ -2149,6 +2149,64 @@ func TestRun_PlanFileMissing_DemotesToCategoryB(t *testing.T) {
 	}
 }
 
+// TestRun_PlanStage_DroppedTerminalResult_DemotesToCategoryB is the binding
+// condition-1 boundary test for #3020: it exercises the ACTUAL missing-result
+// outcome the newly reachable sole-terminal-result truncation path reaches, and
+// asserts its concrete failure state/category — not merely that the adapter
+// returned a result-less state.
+//
+// The adapter-level TestClaudeCode_TruncatedValidJSONPrefixNotInterpreted proves
+// that when the ONLY terminal result line is over-cap and skipped, the claudecode
+// adapter returns exactly this state: res.OK=true (clean child exit), nil
+// StructuredOutput, no result event. That test necessarily STOPS at the adapter
+// boundary — the claudecode package cannot reach the runner's validatePlan. This
+// test picks up at that boundary: a fake invoker reproduces the adapter's
+// dropped-result contract byte-for-byte (agent.Result{OK: true} == OK true,
+// StructuredOutput nil, no result event) and the agent wrote no plan file (its
+// terminal line, which would have carried structured_output, was dropped). The
+// runner's downstream missing-result handling — validatePlan(cfg.planOut) — must
+// then find no valid plan and DEMOTE to res.OK=false / FailureCategory="B", so
+// the dropped result is a visible, correctly-attributed failure rather than a
+// silent success. That is the concrete outcome condition 1 requires.
+func TestRun_PlanStage_DroppedTerminalResult_DemotesToCategoryB(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Byte-for-byte the adapter's dropped-terminal-result state: clean exit,
+	// no structured_output, no result event.
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "plan",
+		"--prompt-file", promptPath,
+		// No plan file at the plan-out path: the terminal result line that
+		// would have carried the plan was dropped, so nothing was written.
+		"--plan-out", filepath.Join(dir, "nonexistent.json"),
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (dropped terminal result must demote, not silently succeed):\n%s", got, stderr.String())
+	}
+	// Guard the adapter contract this test stands on: OK true, StructuredOutput
+	// nil, no result event — the exact shape the truncation skip produces.
+	if fake.gotInv == nil {
+		t.Fatal("invoker was never called")
+	}
+	if !fake.canned.OK || fake.canned.StructuredOutput != nil {
+		t.Fatalf("fixture no longer models the dropped-result state (OK=%v, StructuredOutput=%q)", fake.canned.OK, fake.canned.StructuredOutput)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"category":"B"`) {
+		t.Errorf("missing category B (missing-result must demote): %s", out)
+	}
+	if !strings.Contains(out, `"outcome":"failed"`) {
+		t.Errorf("missing failed outcome: %s", out)
+	}
+}
+
 func TestRun_PlanValidationSkippedOnAgentFailure(t *testing.T) {
 	// If the agent already failed (category A), don't run plan
 	// validation — there's no plan to validate, and the failure

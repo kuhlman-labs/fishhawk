@@ -2497,10 +2497,27 @@ func hasEventKind(res agent.Result, kind string) bool {
 // structured_output; the cap is set to exactly that object's length so the
 // prefix parses cleanly. The skip rule must ensure it is NEVER handed to the
 // parser: NO terminal result is adopted, so res.StructuredOutput stays nil and
-// no result event is derived from that line — which is exactly the result-less
-// state the plan stage's downstream missing-result handling
-// (runner validatePlan -> category B) keys on. The truncation is instead
-// surfaced as a trace_line_truncated event.
+// no result event is derived from that line. The truncation is instead surfaced
+// as a trace_line_truncated event.
+//
+// This test uses Stage:"implement" — the originating incident (run c5ed506a).
+// It necessarily STOPS at the ADAPTER boundary: the claudecode package cannot
+// reach the runner's downstream missing-result handling, which is where the
+// dropped result becomes a visible outcome, and that outcome is STAGE-SPECIFIC
+// (both non-silent):
+//   - plan stage: the result IS the deliverable, so the runner's
+//     validatePlan(cfg.planOut) finds no plan and DEMOTES to res.OK=false /
+//     FailureCategory="B". Asserted end to end by the runner's
+//     TestRun_PlanStage_DroppedTerminalResult_DemotesToCategoryB.
+//   - implement stage: the deliverable is the committed working-tree DIFF, not
+//     the result event, so a dropped result neither fabricates nor loses it;
+//     CommitAndPush commits the real diff and the normal PR/verify/scope gates
+//     decide the stage, while an agent that produced NO work is caught by
+//     CommitAndPush's NoChanges -> implement_no_changes outcome. See the
+//     "Dropped-terminal-result outcome, per stage" table in runner/README.md.
+//
+// This assertion therefore covers only the adapter half (the result-less state);
+// the runner test named above covers the concrete failure category.
 func TestClaudeCode_TruncatedValidJSONPrefixNotInterpreted(t *testing.T) {
 	// Guard the fixture: the prefix MUST be valid JSON, else the counterfactual
 	// (deleting the skip) would leave the test green for the wrong reason.
