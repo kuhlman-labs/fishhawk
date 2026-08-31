@@ -118,7 +118,8 @@ reviewers' lifetime and is removed exactly when the loop returns.
     - the **env scrub** removes env-resident daemon secrets (it does NOT protect
       file-resident secrets — see below);
     - **no network** — codex's read-only sandbox and the claude adapter's
-      empty-MCP set + absence of Bash/WebFetch/WebSearch from `--tools` — cuts
+      empty-MCP set (pinned in BOTH postures, #2524) + absence of
+      Bash/WebFetch/WebSearch from `--tools` — cuts
       the EXFILTRATION leg of the lethal trifecta, so out-of-tree content can
       reach only the advisory verdict (read by the operator and the model
       provider), not an attacker-controlled sink;
@@ -143,15 +144,34 @@ reviewers' lifetime and is removed exactly when the loop returns.
 
 For the claude-code adapter, inheriting the operator's MCP TOOLS was formerly a
 residual and is now CLOSED — do NOT describe it as an accepted residual. The
-grounded claude-code adapter's `--tools Read,Grep,Glob` bounds only the BUILT-IN
-toolset; MCP tools are not built-ins, so they loaded from the operator's config
-and survived the restriction (verified live — a grounded child enumerated
+claude-code adapter's `--tools Read,Grep,Glob` bounds only the BUILT-IN toolset;
+MCP tools are not built-ins, so they loaded from the operator's config and
+survived the restriction (verified live — a grounded child enumerated
 browser/Gmail/GitHub MCP tools, which are network egress and data exfiltration
-that defeat the never-network property). The grounded claude argv now ALSO pins
-an EMPTY MCP server set: `--strict-mcp-config` makes `--mcp-config` the sole
-source of MCP config (ignoring `~/.claude` and project `.mcp.json`) and the
-empty `{"mcpServers":{}}` document loads zero servers; grounding (the tree read)
-is preserved with both flags on.
+that defeat the never-network property). The claude argv pins an EMPTY MCP server
+set: `--strict-mcp-config` makes `--mcp-config` the sole source of MCP config
+(ignoring `~/.claude` and project `.mcp.json`) and the empty `{"mcpServers":{}}`
+document loads zero servers.
+
+The pin applies in BOTH postures (#2524, refining the initial #2486 fix-up),
+not just the grounded argv. Originally the two flags were appended only inside
+the grounded (`treeDir != ""`) block, so the UNGROUNDED (diff-only) posture — the
+SHIPPING posture, since grounding ships dormant behind `FISHHAWKD_REVIEW_GROUNDING`
+(#2522) — omitted them and the child still loaded the operator's MCP servers.
+
+Keep the claim inside the evidence: this is defence-in-depth, not the closure of
+a live egress channel. In ungrounded print mode with no `--allowed-tools`, MCP
+tool INVOCATION was already permission-DENIED (measured on #2524:
+`mcp__MCP_DOCKER__get_me` and `WebFetch` both recorded in `permission_denials`);
+only ENUMERATION leaked. The reason to pin unconditionally is that today's safety
+then rests on the CLI's default-deny permission behavior REMAINING the default —
+a CLI change that auto-approves MCP tools, or a deployment that pre-approves them
+in settings, would turn a listing into an egress channel with no change on our
+side. The unconditional pin removes that dependence and additionally means the
+operator-configured MCP tools are no longer DISCLOSED to the child through CLI
+enumeration (built-in tools remain enumerated, and an attacker can still name MCP
+tools in untrusted text regardless — the effect is non-disclosure of the operator
+tool list, not an impossibility of referencing tools).
 
 ## codex: operator MCP not adapter-neutralized — RESIDUAL (no-network bounds it)
 

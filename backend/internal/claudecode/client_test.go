@@ -260,16 +260,26 @@ func TestInvokeGrounded_ClaudeDenyRuleFailureFailsClosed(t *testing.T) {
 	}
 }
 
-// TestInvokeUngrounded_ClaudeEmptyScratchCwd pins the C2 fix: an UNGROUNDED
-// claude review runs from a fresh EMPTY scratch dir, NOT the process working
-// directory. The echo_cwd helper approves only if that holds.
+// TestInvokeUngrounded_ClaudeEmptyScratchCwd pins the C2 fix plus the #2524
+// posture-independent MCP pin. An UNGROUNDED claude review (a) runs from a fresh
+// EMPTY scratch dir, NOT the process working directory (the echo_cwd helper
+// approves only if that holds), and (b) carries the empty-MCP-config pin
+// (--strict-mcp-config plus --mcp-config {"mcpServers":{}}) even though treeDir
+// is empty — the pin is no longer grounded-only (#2524). It still carries NO
+// --add-dir and no --dangerously-* flag. This is ARGV-ONLY: it captures the
+// adapter's intended argv through the Cmd seam; it never executes the real
+// `claude`, so it cannot observe CLI flag acceptance (see the risk note in the
+// PR). The builder here mirrors capturingHelper but must use HELPER_MODE=echo_cwd
+// with HELPER_PARENT_CWD, so argv capture is threaded inline.
 func TestInvokeUngrounded_ClaudeEmptyScratchCwd(t *testing.T) {
 	parentCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
+	var argv []string
 	c := NewClient(testConfig())
-	c.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+	c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		argv = append([]string{name}, args...)
 		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
 		cmd.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=echo_cwd", "HELPER_PARENT_CWD="+parentCwd)
 		return cmd
@@ -281,6 +291,15 @@ func TestInvokeUngrounded_ClaudeEmptyScratchCwd(t *testing.T) {
 	if !strings.Contains(verdict, `"approve"`) {
 		t.Errorf("ungrounded review verdict = %q, want approve (cwd must be an empty scratch dir, not the process cwd)", verdict)
 	}
+	// #2524: the empty-MCP pin is posture-independent — present with treeDir == "".
+	assertContains(t, argv, "--strict-mcp-config")
+	assertContainsPair(t, argv, "--mcp-config", `{"mcpServers":{}}`)
+	// The grounded-only tree-read grant must NOT leak into the diff-only posture,
+	// and no dangerous flag is ever added.
+	if slices.Contains(argv, "--add-dir") {
+		t.Errorf("ungrounded argv must not carry --add-dir: %v", argv)
+	}
+	assertNoDangerous(t, argv)
 }
 
 // TestInference_EnvScrubClaude proves the allow-list scrub AND the passthrough

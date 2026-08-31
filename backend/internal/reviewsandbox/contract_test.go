@@ -244,9 +244,14 @@ func TestContract_UngroundedPromptMatchesAdapterPosture(t *testing.T) {
 	if slices.Contains(clArgv, "--disallowed-tools") {
 		t.Errorf("ungrounded claude argv must not carry --disallowed-tools: %v", clArgv)
 	}
-	// The grounded-only MCP pin must not leak into the diff-only posture.
-	if slices.Contains(clArgv, "--strict-mcp-config") || slices.Contains(clArgv, "--mcp-config") {
-		t.Errorf("ungrounded claude argv must not carry the grounded-only MCP flags: %v", clArgv)
+	// The empty-MCP pin is NOT grounded-only — it is posture-independent (#2524),
+	// so the diff-only argv must carry both flags, mirroring the grounded side.
+	// --add-dir (asserted absent above) remains the grounded-only flag.
+	if !slices.Contains(clArgv, "--strict-mcp-config") {
+		t.Errorf("ungrounded claude argv missing --strict-mcp-config: %v", clArgv)
+	}
+	if i := slices.Index(clArgv, "--mcp-config"); i < 0 || i+1 >= len(clArgv) || clArgv[i+1] != `{"mcpServers":{}}` {
+		t.Errorf("ungrounded claude argv missing --mcp-config {\"mcpServers\":{}}: %v", clArgv)
 	}
 	// C2: the ungrounded claude cwd is a fresh empty scratch dir, not empty string
 	// and not the tree.
