@@ -847,8 +847,21 @@ var inRepoVerificationMarkers = []string{
 //
 // The M1 scan is TOKEN-SEQUENCE based while liveTargetCorpusMatch is a
 // SUBSTRING test, so a corpus phrase matched only as a substring of a longer
-// word yields no anchor here. That direction is safe: an empty anchor set makes
-// everyLiveTargetAnchorNegated false, so the finding FIRES.
+// word yields no anchor here. That direction is safe ONLY when the anchor set
+// comes out FULLY EMPTY: everyLiveTargetAnchorNegated returns false on an empty
+// set, so the finding FIRES.
+//
+// THE MIXED CASE IS NOT SAFE, and is an accepted residual. A statement in which
+// a corpus phrase matches only as a substring (contributing no anchor) AND a
+// NEGATED M2 qualifier-action anchor is present has a non-empty anchor set
+// whose every COUNTED anchor is negated, so conjunct P holds and an
+// in-repository basis suppresses the finding — even though the live-target
+// occurrence M1 fired on carries no negator of its own. The failure direction
+// is an advisory MISS, consistent with this rule's other residuals, and closing
+// it would mean either anchoring on substring fragments inside unrelated words
+// or dropping the substring matcher M1 has used since #2845. So it is PINNED by
+// TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase rather than
+// papered over here.
 func liveTargetAnchors(lowered string, tokens []string) []int {
 	seen := make(map[int]struct{})
 	var anchors []int

@@ -1606,3 +1606,63 @@ func TestPhraseHeadIndices_Bounds(t *testing.T) {
 		t.Errorf("phraseHeadIndices = %v, want [1]", got)
 	}
 }
+
+// (K — ACCEPTED MIXED-CASE RESIDUAL, pinned rather than asserted) THIS TEST
+// DOCUMENTS CURRENT BEHAVIOUR AND AN ACCEPTED HOLE, NOT A DESIRED OUTCOME.
+//
+// liveTargetCorpusMatch is a SUBSTRING test while phraseHeadIndices requires
+// exact token-sequence equality, so a corpus phrase that matches only as a
+// substring of a longer token contributes NO anchor. The doc block above
+// liveTargetAnchors calls that direction safe, and for a FULLY-EMPTY anchor set
+// it is: everyLiveTargetAnchorNegated returns false and the finding fires.
+//
+// The MIXED case is the hole. Here M1 fires on the corpus phrase "github api",
+// which is present only inside the longer token "apis" and therefore yields no
+// anchor, while a separate NEGATED M2 qualifier-action anchor is present. The
+// anchor set is non-empty, every COUNTED anchor is negated, so conjunct P holds
+// and an in-repository basis suppresses the finding — even though the
+// live-target occurrence M1 fired on carries no negator of its own.
+//
+// Tokens: no(0) real(1) dispatch(2) is(3) attempted(4) while(5) the(6)
+// loader(7) still(8) calls(9) the(10) github(11) apis(12) on(13) every(14)
+// request(15). Counted anchor: the qualifier "real" at 1, negated by "no" at 0
+// (DISTANCE 1). Uncounted occurrence: "github api" inside token 12, whose
+// four-token lookback (7..10 — loader, still, calls, the) holds no negator.
+//
+// The failure direction is an advisory MISS, consistent with this rule's other
+// accepted residuals, and closing it would mean either making the anchor scan
+// substring-based (which would anchor on fragments inside unrelated words) or
+// dropping the substring matcher M1 has used since #2845. So it is pinned:
+// a later change to either matcher's granularity flips this test visibly
+// instead of moving the boundary in silence.
+func TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase(t *testing.T) {
+	const statement = "no real dispatch is attempted while the loader still calls the github apis on every request"
+
+	// Non-vacuity: M1 really does fire on this statement. Without a stated
+	// in-repository verification method conjunct S fails and the finding
+	// stands, so the suppression below is the post-filter acting, not the
+	// matchers failing to match.
+	bare := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "mixed-bare", Statement: statement, Source: CriterionSourceExplicit, SourceRef: "#3016"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(bare), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M1 must fire on the substring occurrence; want 1 finding, got %d: %+v", len(got), got)
+	}
+
+	// The hole: one negated M2 anchor plus an UNCOUNTED live-target occurrence
+	// is enough for conjunct P, so an in-repository basis suppresses.
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "mixed-suppressed", Statement: statement,
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("accepted mixed-case residual (see the doc block above liveTargetAnchors): want 0 findings; got %d: %+v", len(got), got)
+	}
+}
