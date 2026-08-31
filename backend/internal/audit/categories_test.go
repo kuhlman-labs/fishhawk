@@ -415,3 +415,16 @@ func TestKnownCategories_CampaignGroomingSourceResolved(t *testing.T) {
 			"campaign_grooming_source", SuggestCategories("campaign_grooming_source", 5))
 	}
 }
+
+// TestKnownCategories_StageBudgetExceeded pins the E48.55 / #2328 category: the
+// per-stage budget enforcement path (trace.go checkStageBudget) writes it when
+// a stage's summed cost reaches its declared limit_usd ceiling — audit-only in
+// advisory mode, alongside the cancel in blocking mode. An unregistered
+// category is un-awaitable — an operator could not arm fishhawk_await_audit on
+// a stage breach — and categories_completeness_test.go's AST sweep would fail
+// the build on the emit site in trace.go.
+func TestKnownCategories_StageBudgetExceeded(t *testing.T) {
+	if !IsKnownCategory("stage_budget_exceeded") {
+		t.Fatal("stage_budget_exceeded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

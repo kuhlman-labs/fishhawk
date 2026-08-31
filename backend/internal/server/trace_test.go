@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -150,6 +152,12 @@ type auditFake struct {
 	// ListForRunByCategory and is fail-open on a read error (WARN + fall
 	// through); this lets a test exercise that path.
 	listByCategoryErr error
+	// listByCategoryErrCategory, when set, makes ListForRunByCategory fail
+	// ONLY for that category (E48.55 / #2328). checkStageBudget's cost-ledger
+	// read is category-scoped ("cost_recorded"), so this injects the
+	// stage-budget read failure in isolation while the append path (a
+	// different category) still works.
+	listByCategoryErrCategory string
 	// listAllErr, when set, makes ListAll return an error. The spend-alert
 	// and unpriced-model checks (#649 / #1870) read the cost ledger via
 	// ListAll and are best-effort (WARN + return) on a read failure; this
@@ -295,6 +303,9 @@ func (a *auditFake) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, er
 func (a *auditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	if a.listByCategoryErr != nil {
 		return nil, a.listByCategoryErr
+	}
+	if a.listByCategoryErrCategory != "" && category == a.listByCategoryErrCategory {
+		return nil, errors.New("auditFake: injected ListForRunByCategory error for " + category)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -9656,5 +9667,797 @@ func TestGateEvidenceForReview_MapsFixupCounterfactuals(t *testing.T) {
 	}
 	if none := gateEvidenceForReview(bundle.GateEvidence{}, nil); none.FixupCounterfactuals != nil {
 		t.Errorf("FixupCounterfactuals = %+v, want nil for a bundle without the signal", none.FixupCounterfactuals)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Per-stage budget enforcement (E48.55 / #2328).
+//
+// checkStageBudget is exercised two ways: DIRECT calls (T1, T2, T5, T6, T11,
+// T12, T13, T14, T15) that seed the cost ledger and drive the resolver +
+// predicate + audit/transition in isolation, and CROSS-BOUNDARY HTTP uploads
+// (T3, T4, T7, T8, T9, T10, T16) that drive the REAL trace-upload handler end to
+// end — signed bundle POST -> recordCost writes a cost_recorded row carrying
+// content_hash -> checkStageBudget resolves the spec, sums the deduped
+// stage-filtered ledger, evaluates, and appends stage_budget_exceeded and/or
+// cancels the run. Sixteen tests in all (T1–T16).
+// -----------------------------------------------------------------------------
+
+// newStageBudgetServer wires signing/tracestore/audit (via newTraceServer) plus
+// an approvalRunRepo for GetStage / resolveRunWorkflowDef / ListStagesForRun /
+// TransitionRun.
+func newStageBudgetServer(t *testing.T) (*Server, *signingFake, *auditFake, *approvalRunRepo) {
+	t.Helper()
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	s.cfg.RunRepo = rr
+	return s, sf, au, rr
+}
+
+// captureStageBudgetWarn swaps the server's logger for one writing WARN+ lines
+// into the returned buffer, so a stage-budget test can assert the SPECIFIC
+// fail-open WARN a read failure emits. This is the logger seam Approval
+// CONDITION 5 named: it is what makes T13's get_stage/list_stages arms
+// load-bearing — deleting the guard those arms name flips the emitted WARN to a
+// DIFFERENT fail-open branch's message, which the substring assertion catches
+// even where the run-level outcome (false / no entry / not cancelled) is
+// byte-identical across branches. checkStageBudget is called synchronously on
+// one goroutine in these direct tests, so the plain bytes.Buffer needs no lock.
+func captureStageBudgetWarn(s *Server) *bytes.Buffer {
+	buf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return buf
+}
+
+// seedCostRow appends a cost_recorded entry carrying usd + content_hash tied to
+// run+stage, so sumStageCostUSD reads it without the upload path.
+func seedCostRow(au *auditFake, runID, stageID uuid.UUID, usd float64, contentHash string) {
+	rid := runID
+	sid := stageID
+	payload, _ := json.Marshal(map[string]any{"usd": usd, "content_hash": contentHash})
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: "cost_recorded", Payload: payload,
+	})
+	au.mu.Unlock()
+}
+
+// countStageBudgetEntries counts appended stage_budget_exceeded entries.
+func countStageBudgetEntries(au *auditFake) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == "stage_budget_exceeded" {
+			n++
+		}
+	}
+	return n
+}
+
+// firstStageBudgetPayload decodes the first appended stage_budget_exceeded
+// entry's payload.
+func firstStageBudgetPayload(t *testing.T, au *auditFake) struct {
+	StageID       string  `json:"stage_id"`
+	StageType     string  `json:"stage_type"`
+	CostUSDTotal  float64 `json:"cost_usd_total"`
+	MaxStageUSD   float64 `json:"max_stage_usd"`
+	Enforcement   string  `json:"enforcement"`
+	TerminalState string  `json:"terminal_state"`
+} {
+	t.Helper()
+	var out struct {
+		StageID       string  `json:"stage_id"`
+		StageType     string  `json:"stage_type"`
+		CostUSDTotal  float64 `json:"cost_usd_total"`
+		MaxStageUSD   float64 `json:"max_stage_usd"`
+		Enforcement   string  `json:"enforcement"`
+		TerminalState string  `json:"terminal_state"`
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := range au.appended {
+		if au.appended[i].Category == "stage_budget_exceeded" {
+			if err := json.Unmarshal(au.appended[i].Payload, &out); err != nil {
+				t.Fatalf("decode stage_budget_exceeded payload: %v", err)
+			}
+			return out
+		}
+	}
+	t.Fatal("no stage_budget_exceeded entry appended")
+	return out
+}
+
+func fmtUSD(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
+
+// sbV0ImplementSpec is a v0 workflow whose implement stage carries a budget
+// (max_tokens + enforcement) — a v0 document CANNOT declare limit_usd
+// ($defs/budget is additionalProperties:false).
+func sbV0ImplementSpec() []byte {
+	return []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        budget:
+          max_tokens: 500000
+          enforcement: advisory
+`)
+}
+
+// sbV2ImplementSpec renders a v2 workflow [plan, implement]. When limitLit != ""
+// the implement stage declares limit_usd + enforcement; otherwise it declares a
+// max_tokens-only budget (a v2 stage with a budget but NO limit_usd).
+func sbV2ImplementSpec(limitLit, enforcement string) []byte {
+	var budget string
+	if limitLit != "" {
+		budget = "        budget:\n          limit_usd: " + limitLit + "\n"
+		if enforcement != "" {
+			budget += "          enforcement: " + enforcement + "\n"
+		}
+	} else {
+		budget = "        budget:\n          max_tokens: 500000\n"
+	}
+	return []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+` + budget)
+}
+
+// sbSeedRun seeds a run carrying the spec so resolveRunWorkflowDef succeeds.
+func sbSeedRun(rr *approvalRunRepo, runID uuid.UUID, workflowSpec []byte) {
+	rr.seedRun(&run.Run{
+		ID: runID, Repo: "kuhlman-labs/fishhawk",
+		WorkflowID: "feature_change", WorkflowSpec: workflowSpec,
+		State: run.StateRunning,
+	})
+}
+
+// sbUpload POSTs a signed raw bundle whose manifest carries the given model +
+// token split against run/stage, returning the response.
+func sbUpload(t *testing.T, s *Server, sf *signingFake, runID, stageID uuid.UUID, model string, in, out int) *httptest.ResponseRecorder {
+	t.Helper()
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runID.String(),
+		StageID:      stageID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  in,
+		OutputTokens: out,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+	priv, _ := sf.issue(t, runID)
+	return shipRequest(t, s, runID, stageID, "raw", priv, bundleBytes, "")
+}
+
+const sbModel = "claude-opus-4-8"
+
+const sbInTok, sbOutTok = 1000, 2000
+
+func sbBundleUSD(t *testing.T) float64 {
+	t.Helper()
+	usd, ok := pricing.Cost(sbModel, sbInTok, sbOutTok)
+	if !ok {
+		t.Fatalf("pricing.Cost(%q) ok=false — fixture model must be priced", sbModel)
+	}
+	return usd
+}
+
+// T1 — LegacyV0SpecDoesNotEnforce (the CONDITION 1(b) decidable server-level
+// assertion, and the C1 non-falsifiability vehicle). A v0 document cannot carry
+// limit_usd, so def.Budget.LimitUSD is 0 and the limit clause keeps enforcement
+// inert regardless of the version clause. A large seeded cost never fires.
+func TestCheckStageBudget_LegacyV0SpecDoesNotEnforce(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV0ImplementSpec())
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 100.00, "h1") // would breach any real ceiling
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned true for a v0 spec — legacy must not enforce")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (v0 cannot enforce)", n)
+	}
+}
+
+// T2 — Major2ZeroLimitNeverFires (isolates the limit clause at the server
+// level). A v2 stage with a budget but NO limit_usd: def.Budget != nil but
+// LimitUSD == 0, so StageEnforcementApplies is false via the limit clause.
+func TestCheckStageBudget_Major2ZeroLimitNeverFires(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("", ""))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 100.00, "h1")
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned true for a v2 spec with no limit_usd")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (no limit_usd)", n)
+	}
+}
+
+// T3 — AdvisoryBreachAuditsWithoutHalting (cross-boundary HTTP). A v2 stage with
+// a limit below the bundle cost, enforcement advisory (the default this repo
+// declares on every agent stage): exactly one advisory entry, run NOT
+// cancelled.
+func TestCheckStageBudget_AdvisoryBreachAuditsWithoutHalting(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost/2), "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	w := sbUpload(t, s, sf, runID, stage.ID, sbModel, sbInTok, sbOutTok)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if n := countStageBudgetEntries(au); n != 1 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 1", n)
+	}
+	p := firstStageBudgetPayload(t, au)
+	if p.Enforcement != "advisory" {
+		t.Errorf("enforcement = %q, want advisory", p.Enforcement)
+	}
+	if p.TerminalState != "" {
+		t.Errorf("terminal_state = %q, want empty (advisory does not cancel)", p.TerminalState)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("run was cancelled on an advisory breach")
+	}
+}
+
+// T4 — BlockingBreachHaltsAndAudits (cross-boundary HTTP). enforcement blocking,
+// TransitionRun enabled: the run row is cancelled AND exactly one entry with
+// terminal_state cancelled.
+func TestCheckStageBudget_BlockingBreachHaltsAndAudits(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost/2), "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	w := sbUpload(t, s, sf, runID, stage.ID, sbModel, sbInTok, sbOutTok)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if n := countStageBudgetEntries(au); n != 1 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 1", n)
+	}
+	p := firstStageBudgetPayload(t, au)
+	if p.Enforcement != "blocking" || p.TerminalState != "cancelled" {
+		t.Errorf("payload enforcement/terminal = %q/%q, want blocking/cancelled", p.Enforcement, p.TerminalState)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State != run.StateCancelled {
+		t.Errorf("run.State = %q, want cancelled", got.State)
+	}
+}
+
+// T5 — UnderCeilingNeverFires (direct). Cost $1 against limit $2.
+func TestCheckStageBudget_UnderCeilingNeverFires(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 1.00, "h1")
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned true under the ceiling")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0", n)
+	}
+}
+
+// T6 — ExactlyAtCeilingFires (direct). Cost $2 against limit $2 — exact equality
+// is a breach (EvaluateStage uses >=).
+func TestCheckStageBudget_ExactlyAtCeilingFires(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 2.00, "h1")
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("advisory breach must return false")
+	}
+	if n := countStageBudgetEntries(au); n != 1 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 1 (exact-at is over)", n)
+	}
+	p := firstStageBudgetPayload(t, au)
+	if p.MaxStageUSD != 2.00 || p.CostUSDTotal != 2.00 {
+		t.Errorf("payload cost/max = %v/%v, want 2/2", p.CostUSDTotal, p.MaxStageUSD)
+	}
+}
+
+// T7 — IdempotentOnRepeatedRawUpload (cross-boundary HTTP; the ITEM-1/C5
+// exposing shape). The same bundle uploaded twice appends TWO cost_recorded
+// rows (the handler does not dedup), but the content-hash dedup in
+// sumStageCostUSD counts the shared hash once, so the deduped sum stays at one
+// bundle's cost and the limit (strictly between C and 2C) is never breached.
+func TestCheckStageBudget_IdempotentOnRepeatedRawUpload(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost*1.5), "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	// Build the bundle ONCE and POST the IDENTICAL bytes twice — a runner retry
+	// re-ships the same bundle, so the two cost_recorded rows carry the same
+	// content_hash.
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runID.String(), StageID: stage.ID.String(),
+		Agent: "claude-code", Model: sbModel, InputTokens: sbInTok, OutputTokens: sbOutTok,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	priv, _ := sf.issue(t, runID)
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("first upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("second upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	// Two cost_recorded rows landed (the dedup path in sumStageCostUSD is
+	// genuinely exercised, not masked by a handler-side rejection).
+	au.mu.Lock()
+	costRows := 0
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" && au.appended[i].StageID != nil && *au.appended[i].StageID == stage.ID {
+			costRows++
+		}
+	}
+	au.mu.Unlock()
+	if costRows != 2 {
+		t.Fatalf("cost_recorded rows for stage = %d, want 2 (dedup must operate on two real rows)", costRows)
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (dedup keeps the sum at one bundle)", n)
+	}
+	if got := s.sumStageCostUSD(context.Background(), runID, stage.ID); got != cost {
+		t.Errorf("deduped sum = %v, want %v (one bundle's cost)", got, cost)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("run cancelled despite deduped sum under the ceiling")
+	}
+}
+
+// T8 — EvaluatedOncePerBundleAcrossVariants (cross-boundary HTTP). The probe
+// counts EVALUATIONS; a raw then a redacted POST of the same bundle must fire
+// checkStageBudget exactly once (raw-variant-only, #678).
+func TestCheckStageBudget_EvaluatedOncePerBundleAcrossVariants(t *testing.T) {
+	s, sf, _, rr := newStageBudgetServer(t)
+	var evals int
+	s.stageBudgetProbe = func(uuid.UUID) { evals++ }
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("1000.0", "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runID.String(), StageID: stage.ID.String(),
+		Agent: "claude-code", Model: sbModel, InputTokens: sbInTok, OutputTokens: sbOutTok,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	priv, _ := sf.issue(t, runID)
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("raw upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipRequest(t, s, runID, stage.ID, "redacted", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("redacted upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if evals != 1 {
+		t.Fatalf("checkStageBudget evaluated %d times, want 1 (raw-variant-only)", evals)
+	}
+}
+
+// T9 — CrossStageCostDoesNotLeak (cross-boundary HTTP; the ITEM-3/C4 fixture).
+// Stage A under a huge ceiling, stage B under its OWN ceiling on its own cost
+// alone; B crosses ONLY if A's cost leaks in. Assert sumStageCostUSD(B) is
+// exactly one bundle's cost and NO breach exists for B.
+func TestCheckStageBudget_CrossStageCostDoesNotLeak(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	// Spec: [plan, implement A (huge ceiling), implement B (1.5x one bundle)].
+	spec := []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement_a
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        budget:
+          limit_usd: 1000.0
+          enforcement: blocking
+      - id: implement_b
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        budget:
+          limit_usd: ` + fmtUSD(cost*1.5) + `
+          enforcement: blocking
+`)
+	sbSeedRun(rr, runID, spec)
+	stageA := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	stageB := rr.seedStageOnRunSeq(runID, 1, run.StageTypeImplement, run.StageStateRunning)
+
+	if w := sbUpload(t, s, sf, runID, stageA.ID, sbModel, sbInTok, sbOutTok); w.Code != http.StatusAccepted {
+		t.Fatalf("upload A status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if w := sbUpload(t, s, sf, runID, stageB.ID, sbModel, sbInTok, sbOutTok); w.Code != http.StatusAccepted {
+		t.Fatalf("upload B status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if got := s.sumStageCostUSD(context.Background(), runID, stageB.ID); got != cost {
+		t.Errorf("sumStageCostUSD(B) = %v, want %v (A's cost must not leak)", got, cost)
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (B under its own ceiling)", n)
+	}
+}
+
+// T10 — RecoveryChildResolvesByTypeOrdinal (cross-boundary HTTP; the ITEM-4/C6
+// test). Spec [plan, implement(10x), implement(0.5x)]; a recovery child whose
+// rows are the plan-FILTERED [implement(seq0), implement(seq1)]. Driving the
+// Sequence-1 implement row breaches ONLY the SECOND spec implement's ceiling.
+// Under slice indexing wf.Stages[1] is the FIRST implement (10x) and the cost
+// would not breach — so this discriminates in both directions.
+func TestCheckStageBudget_RecoveryChildResolvesByTypeOrdinal(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	spec := []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement_first
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        budget:
+          limit_usd: ` + fmtUSD(cost*10) + `
+          enforcement: blocking
+      - id: implement_second
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        budget:
+          limit_usd: ` + fmtUSD(cost/2) + `
+          enforcement: blocking
+`)
+	sbSeedRun(rr, runID, spec)
+	// Recovery child: plan filtered out, implements renumbered 0,1.
+	_ = rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	second := rr.seedStageOnRunSeq(runID, 1, run.StageTypeImplement, run.StageStateRunning)
+
+	if w := sbUpload(t, s, sf, runID, second.ID, sbModel, sbInTok, sbOutTok); w.Code != http.StatusAccepted {
+		t.Fatalf("upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countStageBudgetEntries(au); n != 1 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 1 (second implement breaches)", n)
+	}
+	p := firstStageBudgetPayload(t, au)
+	if p.MaxStageUSD != cost/2 {
+		t.Errorf("max_stage_usd = %v, want %v (the SECOND implement's ceiling)", p.MaxStageUSD, cost/2)
+	}
+}
+
+// T11 — UnresolvableOrdinalFailsOpen (direct). The workflow declares ONE
+// implement while the child has two implement rows; the second row's ordinal
+// has no spec counterpart -> fail open (no entry, run not cancelled, returns
+// false).
+func TestCheckStageBudget_UnresolvableOrdinalFailsOpen(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking")) // ONE implement in spec
+	_ = rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	second := rr.seedStageOnRunSeq(runID, 1, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, second.ID, 100.00, "h1") // would breach if resolved
+
+	if s.checkStageBudget(context.Background(), runID, second.ID) {
+		t.Fatal("checkStageBudget returned true for an unresolvable ordinal")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (fail open)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("run cancelled on an unresolvable ordinal")
+	}
+}
+
+// T12 — FailedTransitionLeavesNoAuditEntry (direct). enforcement blocking,
+// breach real, TransitionRun injected to fail -> NO stage_budget_exceeded entry
+// AND run NOT cancelled, while checkStageBudget still returns true (a detected
+// breach must never dispatch further work).
+func TestCheckStageBudget_FailedTransitionLeavesNoAuditEntry(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	rr.transitionRunErr = errors.New("run already terminal")
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 3.00, "h1")
+
+	if !s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned false on a real breach whose transition failed")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (no entry for a run we could not halt)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("run reported cancelled despite the transition failing")
+	}
+}
+
+// T13 — ReadFailuresFailOpen (direct; the [read-failures-fail-open] blocking
+// criterion — one FULLY-ARMED, decidable arm per named read). Each arm seeds a
+// running run, a v2 spec whose ceiling sits BELOW a seeded breaching cost row,
+// and an implement stage — a scenario that DOES breach (cancel + one entry +
+// return true) when every read succeeds — then injects exactly ONE read
+// failure. So the injected failure UNIQUELY determines the fail-open outcome:
+// remove the injection and the arm breaches (the ## Notes counterfactuals record
+// each observed flip). Each arm asserts checkStageBudget returns false, appends
+// NO stage_budget_exceeded entry, does NOT cancel the (seeded, readable) run,
+// and emits its read's SPECIFIC fail-open WARN.
+//
+// The WARN assertion is the load-bearing discriminator the routed test-vacuity
+// concerns and Approval CONDITION 5 demanded: for the get_stage and
+// list_stages arms, deleting the named guard in trace.go leaves the run-level
+// outcome (false / no entry / not cancelled) byte-identical — control flow falls
+// through to specStageForRunStage's !found fail-open (nil stage / nil rows) —
+// but the emitted WARN changes to "no resolvable spec definition", so the
+// wantWarn substring flips the arm RED where the run-level assertions alone stay
+// green. The seeded run also makes the not-cancelled assertion decidable
+// (GetRun succeeds, so there is no err==nil short-circuit skipping it).
+func TestCheckStageBudget_ReadFailuresFailOpen(t *testing.T) {
+	// breachingCost sits above the seeded ceiling (2.0), so a fully-read
+	// evaluation breaches; the seeded cost row is what makes each injection
+	// load-bearing rather than trivially green on an empty ledger.
+	const breachingCost = 100.00
+	arms := []struct {
+		name     string
+		wantWarn string
+		// setup fully arms a breaching scenario, then injects ONE read failure.
+		setup func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID)
+	}{
+		{
+			name:     "get_stage_error",
+			wantWarn: "get stage failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				rr.getErr = errors.New("get stage boom") // ONLY GetStage fails
+			},
+		},
+		{
+			name:     "workflow_def_unresolvable",
+			wantWarn: "resolve workflow def failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				// A running run with NO WorkflowSpec -> resolveRunWorkflowDef
+				// ok=false. GetRun still succeeds, so the not-cancelled assertion
+				// is reached; GetStage succeeds and a breaching cost is seeded, so
+				// the ONLY thing holding enforcement off is the unresolvable def.
+				rr.seedRun(&run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", State: run.StateRunning})
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+			},
+		},
+		{
+			name:     "list_stages_error",
+			wantWarn: "list stages failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				rr.listStagesErr = errors.New("list stages boom") // ONLY ListStagesForRun fails
+			},
+		},
+		{
+			name:     "cost_ledger_read_error",
+			wantWarn: "list cost_recorded entries failed",
+			setup: func(rr *approvalRunRepo, au *auditFake, runID, stageID uuid.UUID) {
+				sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+				seedCostRow(au, runID, stageID, breachingCost, "h1")
+				au.listByCategoryErrCategory = "cost_recorded" // ONLY the ledger read fails
+			},
+		},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
+			s, _, au, rr := newStageBudgetServer(t)
+			rr.transitionRunEnabled = true
+			warn := captureStageBudgetWarn(s)
+			runID := uuid.New()
+			stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+			arm.setup(rr, au, runID, stage.ID)
+
+			if s.checkStageBudget(context.Background(), runID, stage.ID) {
+				t.Fatalf("[%s] checkStageBudget returned true, want false (fail open)", arm.name)
+			}
+			if n := countStageBudgetEntries(au); n != 0 {
+				t.Fatalf("[%s] stage_budget_exceeded entries = %d, want 0", arm.name, n)
+			}
+			// The run is seeded and readable, so the not-cancelled assertion is
+			// always reached (no err==nil short-circuit skipping it).
+			got, err := rr.GetRun(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("[%s] GetRun error = %v; the arm must seed a readable run so not-cancelled is decidable", arm.name, err)
+			}
+			if got.State == run.StateCancelled {
+				t.Errorf("[%s] run cancelled on a read failure", arm.name)
+			}
+			// The arm's SPECIFIC fail-open WARN — the discriminator that makes
+			// get_stage/list_stages load-bearing where the run-level outcome
+			// alone is not.
+			if w := warn.String(); !strings.Contains(w, arm.wantWarn) {
+				t.Errorf("[%s] WARN log = %q, want substring %q", arm.name, w, arm.wantWarn)
+			}
+		})
+	}
+}
+
+// T14 — BlockingBreachAppendFailureStillCancels (direct; the audit-append
+// failure branch, the routed medium/verification + low/untested-path concerns).
+// A real BLOCKING breach whose cancel SUCCEEDS but whose stage_budget_exceeded
+// append FAILS: the run is cancelled, NO entry lands, checkStageBudget still
+// returns true (a detected breach never dispatches further work), and the
+// failure is WARN-logged — the best-effort posture checkRunBudget uses, now
+// pinned so the ledger distinguishes "halted but could not record" (T14) from
+// "could not halt" (T12, a failed transition). The injected append error is
+// load-bearing: remove it and exactly one entry lands (## Notes counterfactual).
+func TestCheckStageBudget_BlockingBreachAppendFailureStillCancels(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	warn := captureStageBudgetWarn(s)
+	au.appendErrCategory = "stage_budget_exceeded" // ONLY the breach append fails
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "blocking"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 3.00, "h1")
+
+	if !s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("checkStageBudget returned false on a real blocking breach whose append failed")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (append failed)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State != run.StateCancelled {
+		t.Errorf("run.State = %q, want cancelled (transition precedes the failed append)", got.State)
+	}
+	if w := warn.String(); !strings.Contains(w, "append stage_budget_exceeded audit entry failed") {
+		t.Errorf("WARN log = %q, want the append-failure message", w)
+	}
+}
+
+// T15 — AdvisoryBreachAppendFailureProceeds (direct; the audit-append failure
+// branch in ADVISORY mode, the routed medium/verification concern). A real
+// advisory breach whose append FAILS: no transition is attempted, NO entry
+// lands, checkStageBudget returns false (the run proceeds), and the failure is
+// WARN-logged. The injected append error is load-bearing: remove it and one
+// advisory entry lands (## Notes counterfactual).
+func TestCheckStageBudget_AdvisoryBreachAppendFailureProceeds(t *testing.T) {
+	s, _, au, rr := newStageBudgetServer(t)
+	rr.transitionRunEnabled = true
+	warn := captureStageBudgetWarn(s)
+	au.appendErrCategory = "stage_budget_exceeded"
+	runID := uuid.New()
+	sbSeedRun(rr, runID, sbV2ImplementSpec("2.0", "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+	seedCostRow(au, runID, stage.ID, 3.00, "h1")
+
+	if s.checkStageBudget(context.Background(), runID, stage.ID) {
+		t.Fatal("advisory breach must return false even when the append fails")
+	}
+	if n := countStageBudgetEntries(au); n != 0 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 0 (append failed)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("advisory breach cancelled the run")
+	}
+	if w := warn.String(); !strings.Contains(w, "append stage_budget_exceeded audit entry failed") {
+		t.Errorf("WARN log = %q, want the append-failure message", w)
+	}
+}
+
+// T16 — AdvisoryRepeatedOverCeilingAppendsPerUpload (cross-boundary HTTP; the
+// routed low/untested-path advisory-repeat concern). checkStageBudget has NO
+// per-stage dedup (unlike budget_alert's per-(period,tier) guard), so an
+// advisory stage already over its ceiling appends a FRESH stage_budget_exceeded
+// entry on EVERY evaluating raw upload. The SAME bundle uploaded twice, with the
+// ceiling below one bundle's cost so each evaluation breaches even after the
+// content-hash dedup collapses the repeated bundle to one bundle's cost, yields
+// exactly TWO entries — pinning "one entry per evaluating upload" as a DECISION
+// rather than an accident (also documented in budget/README.md). T7 covers the
+// dual: identical bundles UNDER a between-C-and-2C ceiling stay deduped to zero.
+func TestCheckStageBudget_AdvisoryRepeatedOverCeilingAppendsPerUpload(t *testing.T) {
+	s, sf, au, rr := newStageBudgetServer(t)
+	runID := uuid.New()
+	cost := sbBundleUSD(t)
+	// Ceiling below one bundle's cost -> every evaluating upload breaches even
+	// after content-hash dedup collapses the repeated bundle to one bundle's cost.
+	sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost/2), "advisory"))
+	stage := rr.seedStageOnRunSeq(runID, 0, run.StageTypeImplement, run.StageStateRunning)
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0", RunID: runID.String(), StageID: stage.ID.String(),
+		Agent: "claude-code", Model: sbModel, InputTokens: sbInTok, OutputTokens: sbOutTok,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	priv, _ := sf.issue(t, runID)
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("first upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipRequest(t, s, runID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("second upload status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countStageBudgetEntries(au); n != 2 {
+		t.Fatalf("stage_budget_exceeded entries = %d, want 2 (one advisory entry per over-ceiling upload — no per-stage dedup)", n)
+	}
+	got, _ := rr.GetRun(context.Background(), runID)
+	if got.State == run.StateCancelled {
+		t.Error("advisory breach cancelled the run")
 	}
 }

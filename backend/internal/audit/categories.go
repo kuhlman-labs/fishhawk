@@ -294,6 +294,7 @@ var KnownCategories = map[string]struct{}{
 	"split_filing_refused":                    {},
 	"split_parent_closed":                     {},
 	"spend_alert":                             {},
+	"stage_budget_exceeded":                   {},
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},

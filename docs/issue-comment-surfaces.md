@@ -792,6 +792,26 @@ Notes:
   rolled `cost_usd_total`; the token ceiling against the input+output tokens
   summed from the run's `cost_recorded` ledger. Listed here only so a future
   reader grepping the audit categories doesn't mistake it for a comment surface.
+- The per-stage budget audit kind — `stage_budget_exceeded` (#2328 / E48.55) —
+  is an **internal, system-actor audit kind, not an issue-comment surface**.
+  Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
+  method. The trace upload handler (`trace.go::checkStageBudget`, inside the raw
+  variant guard after `checkRunBudget`) writes it once, with a `system` actor and
+  payload `{stage_id, stage_type, cost_usd_total, max_stage_usd, enforcement
+  (advisory|blocking), terminal_state}`, when a single stage's summed
+  `cost_recorded` spend (deduped by bundle `content_hash`) reaches the stage's
+  workflow-declared `limit_usd` ceiling on a spec major ≥ 2. In `blocking` mode
+  the handler HALTS the run via the cancel transition (terminal state
+  `cancelled`) and short-circuits before stage advancement; in `advisory` mode
+  (the default this repo declares on every agent stage) it records the entry and
+  lets the run proceed. It is the stage-scoped sibling of `run_budget_exceeded`.
+  **Resolution against reusing `budget_alert`** (#2217 acceptance criterion 5):
+  `budget_alert` is the workflow-level PERIODIC surface (ADR-030 / #688) whose
+  semantics are a calendar-period crossing summed across many runs, deliberately
+  deduped per `(period_start, tier)`; a stage breach is a single stage execution
+  and carries no period, so reusing `budget_alert` would conflate two different
+  budget axes. A distinct kind is recorded instead. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The blocking periodic-budget admission audit kinds — `run_rejected_budget`
   and `run_admitted_budget_override` (#688 / ADR-030) — are **internal,
   admission-time global-chain audit entries, NOT issue-comment surfaces**.
