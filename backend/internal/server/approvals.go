@@ -2520,9 +2520,19 @@ func resolveSpecStageForRun(runRow *run.Run, stageType run.StageType) (spec.Work
 
 // checkPlanBudget enforces the budget gate on plan-stage approvals.
 // Returns true when the approval should proceed; returns false (and
-// writes the error response) when the plan's predicted runtime
+// writes the error response) when the plan's runtime estimate
 // exceeds the resolved implement-stage budget and neither
 // decomposition nor --override-budget is present in the comment.
+//
+// The estimate the gate reads is plan.GateRuntimeMinutes() —
+// max(predicted_runtime_minutes, raw_predicted_runtime_minutes) — NOT the
+// calibrated predicted value alone (#2862). Calibration may only ADD
+// structure: a fleet factor above 1.0 can still push a plan over the budget,
+// but a factor below 1.0 can no longer pull one under it and dissolve a
+// required decomposition. When the two estimates STRADDLE the budget the gate
+// also records a plan_budget_calibration_crossing audit entry on every outcome
+// branch — including the two that let the approval proceed — so a decision the
+// factor influenced is reconstructable from the trail.
 //
 // The budget is the IMPLEMENT stage's spec-resolved timeout widened by
 // resolvePlanGateBudget (#994) — max(spec, calibration p95×1.5) clamped
@@ -2570,7 +2580,46 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 		return true
 	}
 
-	if approvedPlan.PredictedRuntimeMinutes <= budgetMinutes {
+	// #2862: the gate reads max(predicted, raw), NOT predicted alone. The
+	// plan-stage calibration hint tells the planner to fold the fleet factor
+	// into predicted_runtime_minutes, so with a sub-1.0 factor a raw 90
+	// lands at ~50 and a required decomposition dissolves silently.
+	// GateRuntimeMinutes (backend/internal/plan) is the ONE place the
+	// structure-ADDING-direction rule lives: an absent or zero raw estimate
+	// returns PredictedRuntimeMinutes unchanged, so every legacy plan is
+	// gated byte-for-byte as before, while a factor ABOVE 1.0 can still push
+	// a plan over. The gate can only evaluate a raw estimate the planner
+	// actually REPORTS; an unreported one is made conspicuous to the
+	// approver by the plan_warnings unreported-raw advisory instead
+	// (server/plan_warnings.go), not silently trusted.
+	predictedMinutes := approvedPlan.PredictedRuntimeMinutes
+	rawMinutes := approvedPlan.RawPredictedRuntimeMinutes
+	gateMinutes := approvedPlan.GateRuntimeMinutes()
+
+	// crossed is true exactly when calibration moved the estimate ACROSS the
+	// budget threshold in either direction: one of the two values is over
+	// budget and the other is not. A crossing therefore ALWAYS implies
+	// gateMinutes > budgetMinutes (the gate takes the maximum, and one side
+	// is over), so the entry is never written on a within-budget approval —
+	// gate_outcome is one of the three over-budget branches and never
+	// within_budget. A plan that omits the raw estimate (rawMinutes == 0)
+	// can never cross: there is no second number to straddle with.
+	crossed := rawMinutes > 0 &&
+		((rawMinutes > budgetMinutes) != (predictedMinutes > budgetMinutes))
+	if crossed && s.cfg.AuditRepo != nil {
+		s.appendBudgetCalibrationCrossing(r.Context(), runRow, stage,
+			budgetCrossingFacts{
+				RawMinutes:        rawMinutes,
+				PredictedMinutes:  predictedMinutes,
+				GateMinutes:       gateMinutes,
+				BudgetMinutes:     budgetMinutes,
+				BudgetSource:      budgetSource,
+				SpecBudgetMinutes: specBudgetMinutes,
+				Outcome:           planBudgetOutcome(approvedPlan, comment),
+			})
+	}
+
+	if gateMinutes <= budgetMinutes {
 		return true
 	}
 
@@ -2584,13 +2633,20 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 	// pre-#994 entries (where budget_minutes WAS the spec value) stay
 	// interpretable. timeout_source keeps describing the spec value's
 	// provenance; budget_source says which term won the resolution.
+	// raw_predicted_minutes and gate_predicted_minutes (#2862) say which
+	// number the gate actually read: gate_predicted_minutes is
+	// max(predicted, raw), and a zero raw_predicted_minutes means the plan
+	// reported no pre-calibration estimate (the legacy shape, gated on
+	// predicted alone).
 	auditPayload, _ := json.Marshal(map[string]any{
-		"stage_id":            stage.ID.String(),
-		"predicted_minutes":   approvedPlan.PredictedRuntimeMinutes,
-		"budget_minutes":      budgetMinutes,
-		"budget_source":       budgetSource,
-		"spec_budget_minutes": specBudgetMinutes,
-		"timeout_source":      timeoutSource,
+		"stage_id":               stage.ID.String(),
+		"predicted_minutes":      approvedPlan.PredictedRuntimeMinutes,
+		"raw_predicted_minutes":  rawMinutes,
+		"gate_predicted_minutes": gateMinutes,
+		"budget_minutes":         budgetMinutes,
+		"budget_source":          budgetSource,
+		"spec_budget_minutes":    specBudgetMinutes,
+		"timeout_source":         timeoutSource,
 	})
 	systemKind := audit.ActorKind("system")
 
@@ -2626,16 +2682,106 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 	}
 
 	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_budget",
-		"plan predicted_runtime_minutes exceeds the resolved implement-stage budget; add decomposition.sub_plans or include --override-budget in the comment",
+		"plan runtime estimate exceeds the resolved implement-stage budget; the gate reads max(predicted_runtime_minutes, raw_predicted_runtime_minutes) — add decomposition.sub_plans or include --override-budget in the comment",
 		map[string]any{
-			"stage_id":            stage.ID.String(),
-			"predicted_minutes":   approvedPlan.PredictedRuntimeMinutes,
-			"budget_minutes":      budgetMinutes,
-			"budget_source":       budgetSource,
-			"spec_budget_minutes": specBudgetMinutes,
-			"timeout_source":      timeoutSource,
+			"stage_id":               stage.ID.String(),
+			"predicted_minutes":      approvedPlan.PredictedRuntimeMinutes,
+			"raw_predicted_minutes":  rawMinutes,
+			"gate_predicted_minutes": gateMinutes,
+			"budget_minutes":         budgetMinutes,
+			"budget_source":          budgetSource,
+			"spec_budget_minutes":    specBudgetMinutes,
+			"timeout_source":         timeoutSource,
 		})
 	return false
+}
+
+// planBudgetOutcome names the branch checkPlanBudget takes for an OVER-budget
+// plan (#2862). It is called only from the calibration-crossing emit, which
+// fires only when the two estimates straddle the budget — and a crossing
+// implies the gate maximum is over budget — so the within_budget branch is
+// unreachable here BY CONSTRUCTION and is deliberately not enumerated: the
+// three returns below are the complete set of outcomes a crossing entry can
+// carry. The precedence mirrors checkPlanBudget's own short-circuit order
+// (decomposition, then --override-budget, then refusal).
+func planBudgetOutcome(p *plan.Plan, comment string) string {
+	if p.Decomposition != nil {
+		return "decomposition_satisfied"
+	}
+	if strings.Contains(comment, "--override-budget") {
+		return "override_acknowledged"
+	}
+	return "refused"
+}
+
+// budgetCrossingFacts carries the numbers a plan_budget_calibration_crossing
+// entry records. Grouped into a struct so the emit helper's signature stays
+// readable and the payload keys have one definition site.
+type budgetCrossingFacts struct {
+	RawMinutes        int
+	PredictedMinutes  int
+	GateMinutes       int
+	BudgetMinutes     int
+	BudgetSource      string
+	SpecBudgetMinutes int
+	Outcome           string
+}
+
+// appendBudgetCalibrationCrossing writes the plan_budget_calibration_crossing
+// audit entry (#2862): the marker that the fleet calibration factor moved the
+// plan's runtime estimate ACROSS the resolved implement budget. It is emitted
+// on EVERY outcome branch — the two that let the approval proceed
+// (decomposition_satisfied, override_acknowledged) as well as the refusal — so
+// the trail records the crossing even where the gate did not stop the run.
+//
+// implied_factor is predicted/raw, the factor the planner actually applied,
+// reported as a float so an operator can compare it against the fleet ratio.
+// It is written only when RawMinutes > 0; every caller already guards on that
+// (a crossing requires a non-zero raw estimate), so the check here is the
+// division's own domain guard.
+//
+// fleet_calibration_ratio is best-effort: resolveCalibrationHint needs a
+// workflow's runtime_observed history, so a nil hint (too few samples) or a
+// resolution error simply OMITS the key rather than blocking. Like every
+// sibling emit in this gate, an append failure logs and never blocks the
+// approval — the audit entry is a record of the decision, not part of it.
+func (s *Server) appendBudgetCalibrationCrossing(ctx context.Context, runRow *run.Run, stage *run.Stage, f budgetCrossingFacts) {
+	payload := map[string]any{
+		"stage_id":               stage.ID.String(),
+		"raw_predicted_minutes":  f.RawMinutes,
+		"predicted_minutes":      f.PredictedMinutes,
+		"gate_predicted_minutes": f.GateMinutes,
+		"budget_minutes":         f.BudgetMinutes,
+		"budget_source":          f.BudgetSource,
+		"spec_budget_minutes":    f.SpecBudgetMinutes,
+		"gate_outcome":           f.Outcome,
+	}
+	if f.RawMinutes > 0 {
+		payload["implied_factor"] = float64(f.PredictedMinutes) / float64(f.RawMinutes)
+	}
+	if runRow != nil {
+		if hint, err := s.resolveCalibrationHint(ctx, runRow.WorkflowID); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "budget crossing: resolve calibration hint failed",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		} else if hint != nil {
+			payload["fleet_calibration_ratio"] = hint.CalibrationRatio
+		}
+	}
+	body, _ := json.Marshal(payload)
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     stage.RunID,
+		StageID:   &stage.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  "plan_budget_calibration_crossing",
+		ActorKind: &systemKind,
+		Payload:   body,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for budget calibration crossing",
+			"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+	}
 }
 
 // checkDecomposedAddScopeFiles enforces the single-owner-file invariant on a

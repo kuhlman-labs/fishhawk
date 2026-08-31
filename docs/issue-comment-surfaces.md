@@ -848,6 +848,26 @@ Notes:
   `plan_violates_budget` / `plan_budget_override_acknowledged` runtime-budget
   pattern. Listed here only so a future reader grepping the audit categories
   doesn't mistake them for comment surfaces.
+- The runtime-budget calibration-crossing audit kind —
+  `plan_budget_calibration_crossing` (#2862) — is an **internal, system-actor
+  audit kind, NOT an issue-comment surface**. Nothing in `issuecomment` posts
+  it; it has no Notifier method. The approval handler
+  (`approvals.go::checkPlanBudget`) writes one per plan-stage approve whose
+  pre-calibration `raw_predicted_runtime_minutes` and calibrated
+  `predicted_runtime_minutes` STRADDLE the resolved implement-stage budget —
+  i.e. the fleet calibration factor moved the estimate across the threshold. It
+  is written on EVERY outcome branch, including the two that let the approval
+  proceed, with payload `{stage_id, raw_predicted_minutes, predicted_minutes,
+  gate_predicted_minutes, implied_factor, fleet_calibration_ratio (omitted when
+  no hint resolves), budget_minutes, budget_source, spec_budget_minutes,
+  gate_outcome}`. `gate_outcome` is one of `refused` /
+  `decomposition_satisfied` / `override_acknowledged` and never
+  `within_budget`: a crossing is over budget by construction, because the gate
+  reads the maximum of the two estimates. It is the third member of the
+  `plan_violates_budget` / `plan_budget_override_acknowledged` runtime-budget
+  family above, and gates nothing — it records why a decision was what it was.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 - The fan-out re-drive parking audit kind — `parent_awaiting_redrive` (#698) —
   is an **internal, system-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
