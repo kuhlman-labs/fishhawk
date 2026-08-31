@@ -1707,10 +1707,11 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 	}
 	if acceptance != nil {
 		ap := &prompt.AcceptancePrecheckEvidence{
-			AcceptanceStageID: acceptance.AcceptanceStageID,
-			CriteriaCount:     acceptance.CriteriaCount,
-			BlockingCount:     acceptance.BlockingCount,
-			OutOfScopeCount:   acceptance.OutOfScopeCount,
+			AcceptanceStageID:   acceptance.AcceptanceStageID,
+			CriteriaCount:       acceptance.CriteriaCount,
+			BlockingCount:       acceptance.BlockingCount,
+			OutOfScopeCount:     acceptance.OutOfScopeCount,
+			AllSkipShortCircuit: acceptance.AllSkipShortCircuit,
 		}
 		for _, f := range acceptance.Findings {
 			ap.Findings = append(ap.Findings, prompt.AcceptanceFindingEvidence{

@@ -64,6 +64,30 @@ const (
 	// avoids a two-step in which an author applies the weaker remedy and only
 	// then learns it was insufficient.
 	RuleMissingLiveValidationMarker = "missing_live_validation_marker"
+	// RuleAllCriteriaSkipExpected flags a PLAN-LEVEL shape: the plan declares
+	// at least one acceptance criterion and EVERY one is marked skip_expected
+	// with a non-whitespace expectation_basis (#3026, E32.50). That is the
+	// #1748 condition the orchestrator short-circuits on, so the plan is
+	// already known AT APPROVAL TIME to skip acceptance entirely — no runner
+	// spawn, no preview, ZERO criteria verified, and a recorded not_validated
+	// verdict rather than a pass (#2347).
+	//
+	// It is ADVISORY and NEVER refuses a plan. A change may genuinely have no
+	// in-sandbox observable, and the issue's own counter-example (#2894) is
+	// exactly that case — the rule exists so the approver is asked the
+	// question, not so the shape is banned.
+	//
+	// It fires exactly when AcceptanceSkippableAllSkipWithBasis(v) is true and
+	// deliberately REUSES that predicate rather than re-deriving the condition,
+	// so the plan-gate advisory and the orchestrator's runtime short-circuit
+	// are the SAME boolean by construction and cannot drift — including on the
+	// whitespace-only expectation_basis edge, where both agree the plan is NOT
+	// all-skip and acceptance dispatches normally.
+	//
+	// Like the two rules above it applies NO cross-rule suppression: an
+	// all-skip plan whose criteria name a live target still draws its
+	// missing_live_validation_marker findings, one per criterion.
+	RuleAllCriteriaSkipExpected = "all_criteria_skip_expected"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -91,6 +115,10 @@ const (
 //     requires_live_validation. Its exemption is that marker ALONE:
 //     skip_expected-with-basis does not exempt, because only the marker files
 //     the tracked operator-validation walk (#2845). Advisory only.
+//   - all_criteria_skip_expected — the plan declares at least one acceptance
+//     criterion and EVERY one is skip_expected-with-basis, so acceptance will
+//     short-circuit to not_validated having verified ZERO criteria (#3026).
+//     One finding per PLAN, never one per criterion. Advisory only.
 func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	findings := []AcceptanceFinding{}
 
@@ -146,6 +174,22 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	// #2845 (E54.31): the live-validation-marker matcher rides the SAME call
 	// for the same reason — one evaluator, both surfaces, no second copy.
 	findings = append(findings, MissingLiveValidationMarker(v)...)
+
+	// #3026 (E32.50): the all-skip short-circuit advisory rides the same call,
+	// for the same single-source reason. It is PLAN-LEVEL, so it emits at most
+	// ONE finding with an empty CriterionID — the shape no_blocking_criterion
+	// already uses for a presence-level condition. The condition is READ from
+	// AcceptanceSkippableAllSkipWithBasis, the very predicate the orchestrator
+	// short-circuits on, so gate advisory and runtime behaviour are one boolean.
+	if AcceptanceSkippableAllSkipWithBasis(v) {
+		findings = append(findings, AcceptanceFinding{
+			Rule: RuleAllCriteriaSkipExpected,
+			Detail: "every acceptance criterion is marked skip_expected with an expectation_basis, so the acceptance stage " +
+				"will short-circuit server-side to a not_validated verdict with no runner spawn and no preview — ZERO criteria " +
+				"are verified. The run stays merge-eligible but this is NOT a validated pass (#2347). Author a drivable " +
+				"criterion if one genuinely exists; this finding is advisory and never refuses the plan.",
+		})
+	}
 
 	return findings
 }

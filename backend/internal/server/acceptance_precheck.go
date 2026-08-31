@@ -45,6 +45,17 @@ const categoryPlanAcceptancePrecheck = "plan_acceptance_precheck"
 // two rules answer different questions and deliberately do not suppress each
 // other: a wholly-unmarked live-target criterion is counted in BOTH. Also
 // ADVISORY — the pre-check never refuses a plan on it.
+//
+// AllSkipShortCircuit (#3026, E32.50) reports the PLAN-LEVEL all-skip shape:
+// the shared rule set flagged all_criteria_skip_expected, so the acceptance
+// stage is already known at approval time to short-circuit to not_validated
+// having verified ZERO criteria. It is a BOOL, not a count — the rule is
+// plan-level and emits at most one finding. Its json tag carries NO omitempty
+// DELIBERATELY: this is an additive AUDIT-WIRE change that adds the
+// all_skip_short_circuit key to EVERY plan_acceptance_precheck payload,
+// false ones included, so a machine reader can distinguish "checked, not
+// all-skip" (present and false) from "written by a pre-#3026 binary" (key
+// absent). Also ADVISORY — the pre-check never refuses a plan on it.
 type AcceptancePrecheckPayload struct {
 	WorkflowID        string              `json:"workflow_id"`
 	AcceptanceStageID string              `json:"acceptance_stage_id"`
@@ -55,6 +66,8 @@ type AcceptancePrecheckPayload struct {
 	UndecidableCount  int                 `json:"undecidable_count"`
 
 	LiveValidationMarkerCount int `json:"live_validation_marker_count"`
+
+	AllSkipShortCircuit bool `json:"all_skip_short_circuit"`
 }
 
 // AcceptanceFinding is one deterministic defect the acceptance pre-check
@@ -76,6 +89,7 @@ const (
 	acceptanceRuleDuplicateID                 = plan.RuleDuplicateID
 	acceptanceRuleUndecidableCriterion        = plan.RuleUndecidableCriterion
 	acceptanceRuleMissingLiveValidationMarker = plan.RuleMissingLiveValidationMarker
+	acceptanceRuleAllCriteriaSkipExpected     = plan.RuleAllCriteriaSkipExpected
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -172,14 +186,23 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 	// #2845 (E54.31): missing_live_validation_marker rides the same call and is
 	// counted the same way. The two counts are independent — the rules do not
 	// suppress each other, so an unmarked live-target criterion increments both.
+	//
+	// #3026 (E32.50): all_criteria_skip_expected rides the same call too, and
+	// the headline is read back off the FINDING rather than by calling
+	// plan.AcceptanceSkippableAllSkipWithBasis a second time here — the finding
+	// IS the evaluation, and re-deriving it in the server would reintroduce
+	// exactly the second copy this design exists to avoid.
 	undecidableCount := 0
 	liveValidationMarkerCount := 0
+	allSkipShortCircuit := false
 	for _, f := range findings {
 		switch f.Rule {
 		case acceptanceRuleUndecidableCriterion:
 			undecidableCount++
 		case acceptanceRuleMissingLiveValidationMarker:
 			liveValidationMarkerCount++
+		case acceptanceRuleAllCriteriaSkipExpected:
+			allSkipShortCircuit = true
 		}
 	}
 
@@ -193,6 +216,7 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 		UndecidableCount:  undecidableCount,
 
 		LiveValidationMarkerCount: liveValidationMarkerCount,
+		AllSkipShortCircuit:       allSkipShortCircuit,
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

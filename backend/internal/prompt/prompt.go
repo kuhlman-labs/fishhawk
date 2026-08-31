@@ -1405,12 +1405,30 @@ type GateViolation struct {
 // "checked and clean", which renders explicitly so the reviewer can tell
 // it apart from "never checked" (nil AcceptancePrecheck, i.e. no acceptance
 // stage configured).
+//
+// AllSkipShortCircuit (#3026) carries the plan-level all-skip headline: every
+// criterion is skip_expected-with-basis, so acceptance will short-circuit
+// having verified ZERO criteria. It renders one extra CONSEQUENCE line and
+// renders NOTHING when false, so the gate-evidence bytes stay byte-identical
+// for every other plan.
+//
+// INVARIANT: AllSkipShortCircuit is DERIVED from the all_criteria_skip_expected
+// finding by the server's runAcceptancePrecheck — it is never set
+// independently, so true implies Findings carries that finding. The renderer
+// deliberately does NOT re-check the findings list before writing the
+// CONSEQUENCE line, so a hand-constructed value that sets the flag true with an
+// empty Findings would render the consequence immediately followed by
+// "findings: none (checked and clean)". That block is self-contradictory and is
+// unreachable on the real path; a caller that ever populates this struct from
+// somewhere other than the finding must preserve the invariant or add the
+// guard.
 type AcceptancePrecheckEvidence struct {
-	AcceptanceStageID string
-	CriteriaCount     int
-	BlockingCount     int
-	OutOfScopeCount   int
-	Findings          []AcceptanceFindingEvidence
+	AcceptanceStageID   string
+	CriteriaCount       int
+	BlockingCount       int
+	OutOfScopeCount     int
+	AllSkipShortCircuit bool
+	Findings            []AcceptanceFindingEvidence
 }
 
 // AcceptanceFindingEvidence is one deterministic acceptance-criteria defect
@@ -3602,7 +3620,9 @@ func buildPlan(t Trigger) string {
 		"the orchestrator short-circuits acceptance dispatch straight to a NOT-VALIDATED verdict (basis `all-skip-with-basis`) with " +
 		"no runner spawn — there is nothing the sandboxed agent could observe. That outcome is merge-eligible, but it is recorded as " +
 		"having verified NOTHING (#2347): it is not a pass, and the operator is told so. Do not treat an all-skip plan as a cheap " +
-		"green — author a drivable criterion whenever one genuinely exists. The marker is OPTIONAL and the plan gate does not reject " +
+		"green — author a drivable criterion whenever one genuinely exists. The plan gate now flags that whole-plan shape up front as " +
+		"the ADVISORY `all_criteria_skip_expected` finding on the plan-review gate evidence, so the approver sees the zero-verification " +
+		"consequence before approving; it never refuses the plan. The marker is OPTIONAL and the plan gate does not reject " +
 		"a legacy unmarked plan.\n")
 	b.WriteString("Live-validation criteria rule: a NARROWER case of the above — when a criterion's true verification needs a LIVE " +
 		"forge/deploy/external target (a real GitHub API round-trip, a deployed environment, a third-party surface), not merely an " +
@@ -4192,6 +4212,12 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		b.WriteString("Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage):\n\n")
 		fmt.Fprintf(b, "- criteria: %d (blocking: %d)\n", ap.CriteriaCount, ap.BlockingCount)
 		fmt.Fprintf(b, "- out_of_scope entries: %d\n", ap.OutOfScopeCount)
+		if ap.AllSkipShortCircuit {
+			b.WriteString("- CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis, so the " +
+				"acceptance stage will short-circuit to a not_validated verdict with no runner spawn and no preview — ZERO " +
+				"criteria will be verified. The run stays merge-eligible, but this is NOT a validated pass (#2347). Ask whether " +
+				"a drivable criterion genuinely exists for this change; an all-skip plan is not a cheap green.\n")
+		}
 		if len(ap.Findings) == 0 {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {

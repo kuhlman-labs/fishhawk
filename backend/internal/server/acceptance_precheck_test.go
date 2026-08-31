@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -827,5 +829,265 @@ func TestShipPlan_MissingLiveValidationMarker_IsAdvisoryNotARefusal(t *testing.T
 	}
 	if entry.LiveValidationMarkerCount != 1 {
 		t.Errorf("persisted live_validation_marker_count = %d, want 1", entry.LiveValidationMarkerCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// all_criteria_skip_expected / all_skip_short_circuit (#3026, E32.50)
+// ---------------------------------------------------------------------------
+
+// allSkipCriterion builds a criterion marked skip_expected with a basis — the
+// shape whose whole-plan repetition is the all-skip short-circuit condition.
+func allSkipCriterion(id, statement, basis string) map[string]any {
+	return map[string]any{
+		"id":                id,
+		"statement":         statement,
+		"source":            "explicit",
+		"source_ref":        "#3026",
+		"skip_expected":     true,
+		"expectation_basis": basis,
+	}
+}
+
+// (#3026) An all-skip plan body sets AllSkipShortCircuit true and carries the
+// all_criteria_skip_expected finding.
+func TestAcceptancePrecheck_AllSkip_HeadlineTrue(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		allSkipCriterion("a1", "the renderer emits the consequence line", "covered by the prompt render unit test"),
+		allSkipCriterion("a2", "the payload records the headline", "covered by the server payload unit test"),
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if !got.AllSkipShortCircuit {
+		t.Errorf("AllSkipShortCircuit = false, want true on an all-skip plan")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected)
+	if f == nil {
+		t.Fatalf("want an all_criteria_skip_expected finding; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "" {
+		t.Errorf("CriterionID = %q, want empty (plan-level finding)", f.CriterionID)
+	}
+	if !entry.AllSkipShortCircuit {
+		t.Errorf("persisted all_skip_short_circuit = false, want true")
+	}
+}
+
+// (#3026) A MIXED-criteria body: one drivable criterion means acceptance
+// dispatches normally, so the headline is false and no finding fires.
+func TestAcceptancePrecheck_MixedCriteria_HeadlineFalse(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		allSkipCriterion("a1", "the renderer emits the consequence line", "covered by the prompt render unit test"),
+		{"id": "a2", "statement": "the plan gate admits the plan", "source": "explicit", "source_ref": "#3026"},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.AllSkipShortCircuit {
+		t.Errorf("AllSkipShortCircuit = true, want false when a drivable criterion exists")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("want no all_criteria_skip_expected finding on a mixed plan; got %+v", entry.Findings)
+	}
+}
+
+// (#3026) A ZERO-criteria body takes the disjoint empty-criteria short-circuit,
+// not this one: headline false, no finding.
+func TestAcceptancePrecheck_ZeroCriteria_HeadlineFalse(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, nil, []string{"a doc-only change authors no criteria"})
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.AllSkipShortCircuit {
+		t.Errorf("AllSkipShortCircuit = true, want false on a zero-criteria plan")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("want no all_criteria_skip_expected finding on a zero-criteria plan; got %+v", entry.Findings)
+	}
+}
+
+// (#3026, CONDITION 2) The audit record is a MACHINE-READ surface, so the wire
+// key is part of the contract. all_skip_short_circuit carries NO omitempty
+// deliberately: it is PRESENT on every plan_acceptance_precheck payload —
+// present-and-true on an all-skip plan, present-and-FALSE on a mixed one. That
+// is the additive audit-wire change the rollback note states, and this test is
+// what would go red if an omitempty were added behind the prose's back.
+func TestAcceptancePrecheck_AllSkipWireKey_PresentOnEveryPayload(t *testing.T) {
+	marshalled := func(t *testing.T, criteria []map[string]any) map[string]any {
+		t.Helper()
+		s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+		body := acceptancePlanBody(t, criteria, nil)
+		if got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body); got == nil {
+			t.Fatal("want a non-nil result")
+		}
+		au.mu.Lock()
+		defer au.mu.Unlock()
+		for _, ap := range au.appended {
+			if ap.Category != categoryPlanAcceptancePrecheck {
+				continue
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(ap.Payload, &raw); err != nil {
+				t.Fatalf("unmarshal raw payload: %v", err)
+			}
+			return raw
+		}
+		t.Fatal("no plan_acceptance_precheck entry appended")
+		return nil
+	}
+
+	allSkip := marshalled(t, []map[string]any{
+		allSkipCriterion("a1", "the renderer emits the consequence line", "covered by a unit test"),
+	})
+	v, ok := allSkip["all_skip_short_circuit"]
+	if !ok {
+		t.Fatalf("all-skip payload is missing the all_skip_short_circuit key: %v", allSkip)
+	}
+	if v != true {
+		t.Errorf("all_skip_short_circuit = %v, want true", v)
+	}
+
+	mixed := marshalled(t, []map[string]any{
+		allSkipCriterion("a1", "the renderer emits the consequence line", "covered by a unit test"),
+		{"id": "a2", "statement": "the plan gate admits the plan", "source": "explicit", "source_ref": "#3026"},
+	})
+	mv, ok := mixed["all_skip_short_circuit"]
+	if !ok {
+		t.Fatalf("mixed-criteria payload is missing the all_skip_short_circuit key — the tag must carry NO omitempty: %v", mixed)
+	}
+	if mv != false {
+		t.Errorf("all_skip_short_circuit = %v, want false (present-and-false, not absent)", mv)
+	}
+}
+
+// TestShipPlan_AllCriteriaSkipExpected_IsAdvisoryNotARefusal is CONDITION 1's
+// server-side half: the plan gate ADMITS an all-skip plan. The whole design
+// rests on all_criteria_skip_expected never refusing anything, and this asserts
+// the ADMIT/non-blocked OUTCOME directly — the committed stage state reaches
+// its normal approval state, no failure category is stamped, and the run is
+// alive — rather than merely that a findings slice contains the entry.
+//
+// The finding assertions at the end keep the admission from being vacuously
+// green on a plan that tripped no rule.
+func TestShipPlan_AllCriteriaSkipExpected_IsAdvisoryNotARefusal(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specWithAcceptanceStage
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := acceptancePlanBody(t, []map[string]any{
+		allSkipCriterion("a1", "the payload records the headline", "covered by the server payload unit test"),
+		allSkipCriterion("a2", "the renderer emits the consequence line", "covered by the prompt render unit test"),
+	}, nil)
+
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201 (an advisory finding must never refuse the upload):\n%s", w.Code, w.Body.String())
+	}
+
+	// COMMITTED state: the plan was ADMITTED — the stage walked to the operator
+	// gate, was never re-opened or failed, and the run is alive.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (all_criteria_skip_expected must never refuse the plan)\ntransitions: %+v",
+			got, rr.stageTransitions)
+	}
+	if got := rr.stagesByID[planStage.ID].FailureCategory; got != nil {
+		t.Errorf("stage carries failure category %q; the all_criteria_skip_expected rule must never fail a plan", *got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Error("run state = failed; an advisory acceptance finding must never terminate a run")
+	}
+
+	// The advisory genuinely fired on THIS upload.
+	if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+		t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+	if hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected) == nil {
+		t.Fatalf("want an all_criteria_skip_expected finding on the admitted plan; got %+v", entry.Findings)
+	}
+	if !entry.AllSkipShortCircuit {
+		t.Errorf("persisted all_skip_short_circuit = false, want true")
+	}
+}
+
+// TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt is the producer-to-
+// consumer JOIN test: starting from a REAL all-skip plan BODY, it runs the
+// ACTUAL runAcceptancePrecheck -> planGateEvidence -> prompt.Build("plan_review")
+// path with NO hand-constructed AcceptancePrecheckPayload and NO hand-
+// constructed prompt.AcceptancePrecheckEvidence anywhere, and asserts the
+// consequence line in the FINAL rendered bytes.
+//
+// A mis-wire at EITHER seam (payload -> evidence, or evidence -> render) fails
+// this test while the per-layer server and prompt tests both stay green — which
+// is exactly what it exists to cover.
+func TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt(t *testing.T) {
+	render := func(t *testing.T, criteria []map[string]any) string {
+		t.Helper()
+		s, _, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+		body := acceptancePlanBody(t, criteria, nil)
+
+		result := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+		if result == nil {
+			t.Fatal("want a non-nil pre-check result")
+		}
+		gateEv := planGateEvidence(nil, nil, nil, nil, result)
+		if gateEv == nil {
+			t.Fatal("planGateEvidence produced no evidence")
+		}
+		got, err := prompt.Build("plan_review", prompt.Trigger{
+			Repo:             "kuhlman-labs/example",
+			PlanGateEvidence: gateEv,
+		})
+		if err != nil {
+			t.Fatalf("prompt.Build: %v", err)
+		}
+		return got
+	}
+
+	const consequence = "CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis"
+
+	allSkip := render(t, []map[string]any{
+		allSkipCriterion("a1", "the payload records the headline", "covered by the server payload unit test"),
+		allSkipCriterion("a2", "the renderer emits the consequence line", "covered by the prompt render unit test"),
+	})
+	for _, want := range []string{
+		"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
+		consequence,
+		"ZERO",
+		"#2347",
+		"FINDING all_criteria_skip_expected",
+	} {
+		if !strings.Contains(allSkip, want) {
+			t.Errorf("rendered plan_review prompt missing %q — a seam between pre-check, evidence mapping and render is broken:\n%s", want, allSkip)
+		}
+	}
+
+	// NEGATIVE TWIN from a real mixed-criteria body: the line is absent.
+	mixed := render(t, []map[string]any{
+		allSkipCriterion("a1", "the payload records the headline", "covered by a unit test"),
+		{"id": "a2", "statement": "the plan gate admits the plan", "source": "explicit", "source_ref": "#3026"},
+	})
+	if strings.Contains(mixed, consequence) {
+		t.Errorf("mixed-criteria plan must not render the all-skip consequence line:\n%s", mixed)
+	}
+	if strings.Contains(mixed, "FINDING all_criteria_skip_expected") {
+		t.Errorf("mixed-criteria plan must not render the all_criteria_skip_expected finding:\n%s", mixed)
 	}
 }
