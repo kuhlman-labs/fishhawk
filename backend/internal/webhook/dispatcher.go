@@ -231,10 +231,23 @@ type CheckRunRef struct {
 // produces MULTIPLE runs per merge request by construction, so the iid
 // alone cannot select one. PipelineID is provenance for the audit payload.
 type PipelineRef struct {
-	PipelineID      int
-	Ref             string
-	SHA             string
-	Status          string
+	PipelineID int
+	Ref        string
+	SHA        string
+	Status     string
+	// Source is GitLab's object_attributes.source: the pipeline's TRIGGER
+	// KIND ("push", "merge_request_event", "schedule", "web", …). It is not a
+	// correlation input — it exists to DISCRIMINATE a merge-request pipeline
+	// from a first-stage default-ref pipeline (E45.30 / #2881), both of which
+	// carry a ref outside the run-branch namespace and would otherwise draw
+	// the same, and for an MR pipeline affirmatively WRONG, skip reason.
+	//
+	// The Job Hook (object_kind "build") carries no equivalent field at any
+	// level, so — unlike PipelineID / Ref / SHA / Status below — there is no
+	// top-level fallback assignment for it in matchGitLabCIFailure. A build
+	// payload therefore leaves Source empty, which is the honest value: the
+	// payload does not say. The build arm skips before correlation anyway.
+	Source          string
 	MergeRequestIID int
 }
 
@@ -990,6 +1003,10 @@ func matchGitLabCIFailure(ev Event) Match {
 			Ref    string `json:"ref"`
 			SHA    string `json:"sha"`
 			Status string `json:"status"`
+			// Source is the pipeline's trigger kind (E45.30 / #2881). Only the
+			// Pipeline Hook carries it; the Job Hook has no analogue, hence no
+			// top-level twin in the fallback block below.
+			Source string `json:"source"`
 		} `json:"object_attributes"`
 		// The Job Hook carries the same fields at the TOP level. Decoded so
 		// the build arm above is a real control rather than a decode accident.
@@ -1009,6 +1026,7 @@ func matchGitLabCIFailure(ev Event) Match {
 		Ref:             payload.ObjectAttributes.Ref,
 		SHA:             payload.ObjectAttributes.SHA,
 		Status:          payload.ObjectAttributes.Status,
+		Source:          payload.ObjectAttributes.Source,
 		MergeRequestIID: payload.MergeRequest.IID,
 	}
 	if pr.PipelineID == 0 {
