@@ -344,6 +344,28 @@ func TestRegisterInstallation_GitLabProjectPath(t *testing.T) {
 			wantSub: "<namespace>/<project>",
 		},
 		{
+			// Nesting is not a licence for empty components. GitLab never
+			// canonicalises a path_with_namespace carrying one, so a row
+			// recording one could never match a payload: the registration
+			// would report success and then refuse every trigger forever.
+			name: "empty_interior_component_refuses", provider: "gitlab", projectPath: "acme//widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			name: "empty_nested_interior_component_refuses", provider: "gitlab", projectPath: "acme/platform//widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			// The TERMINAL component: a trailing separator on an otherwise
+			// well-formed nested path.
+			name: "empty_terminal_component_refuses", provider: "gitlab", projectPath: "acme/platform/widgets/",
+			wantSub: "every component non-empty",
+		},
+		{
+			name: "all_empty_components_refuse", provider: "gitlab", projectPath: "acme//",
+			wantSub: "every component non-empty",
+		},
+		{
 			// The namespace-consistency check: a path outside the owning
 			// account's namespace is the mis-registration the authorizer's
 			// retained tenancy invariant exists to catch. Refuse it at the

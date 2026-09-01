@@ -358,9 +358,11 @@ The GitLab authorization gate now admits a trigger only when the payload's
 EXACTLY (migration `0078`), so a gitlab installations row carrying none is
 UNBOUND and refuses every trigger. `RegisterInstallation` therefore refuses to
 create one: `ValidateGitLabProjectPath` requires a non-empty trimmed path of the
-form `<namespace>/<project>` whose namespace segment equals the resolved
-`account_key`, each failure wrapping `ErrValidation` and naming the offending
-values. That keeps the fail-closed refusal a purely historical artifact — the
+form `<namespace>/<project>` with EVERY component non-empty (`acme//widgets`,
+`acme/platform//widgets` and `acme/widgets/` are refused, because GitLab never
+canonicalises a path carrying an empty component) whose namespace segment
+equals the resolved `account_key`, each failure wrapping `ErrValidation` and
+naming the offending values. That keeps the fail-closed refusal a purely historical artifact — the
 shape a pre-0078 row has — rather than something the supported write path can
 newly produce.
 

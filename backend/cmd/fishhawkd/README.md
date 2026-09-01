@@ -528,7 +528,12 @@ all applied BEFORE any row is written):
 - of the form `<namespace>/<project>`, split on the **FIRST** separator only —
   GitLab groups NEST, so `acme/platform/widgets` is valid and its namespace is
   `acme`. A validator demanding exactly two segments would make every
-  nested-group project unregisterable;
+  nested-group project unregisterable. Nesting is not a licence for empty
+  components: EVERY component — the namespace, each intermediate group, and the
+  terminal project — must be non-empty, so `acme//widgets`,
+  `acme/platform//widgets` and `acme/widgets/` are all refused (GitLab never
+  canonicalises a `path_with_namespace` carrying an empty component, so such a
+  row could only ever refuse every trigger);
 - its namespace segment must equal the resolved `--account-key`, and the error
   names both values.
 

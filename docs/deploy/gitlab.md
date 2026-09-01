@@ -145,7 +145,7 @@ Run creation from a GitLab trigger is live as of #2043. To turn it on for a depl
      --project-path acme/widgets
    ```
 
-   `--project-path` is **REQUIRED** for a `gitlab` registration (E45.26 / #2877) and is the project's full `path_with_namespace`. Its first segment must equal `--account-key`, and nested groups are supported — `--project-path acme/platform/widgets` under `--account-key acme` is valid, because the path is split on the FIRST separator only. It does not apply to `--provider github`, whose payload identity arrives HMAC-signed and resolves through the installation id.
+   `--project-path` is **REQUIRED** for a `gitlab` registration (E45.26 / #2877) and is the project's full `path_with_namespace`. Its first segment must equal `--account-key`, and nested groups are supported — `--project-path acme/platform/widgets` under `--account-key acme` is valid, because the path is split on the FIRST separator only. Every component must be non-empty, so `acme//widgets`, `acme/platform//widgets` and `acme/widgets/` are refused — GitLab never canonicalises a `path_with_namespace` carrying an empty component, so such a binding could only ever refuse every trigger. It does not apply to `--provider github`, whose payload identity arrives HMAC-signed and resolves through the installation id.
 
    `installation register` FAILS CLOSED if no `acme` account exists yet, naming the `account create` line to run first — it never conjures the account, because the account is the operator's authorization decision. Verify what is registered with `fishhawkd installation list`, which renders each `installation_ref` alongside its owning `account_key` and its `PROJECT_PATH` (a gitlab row recording none renders `(unbound)`).
 

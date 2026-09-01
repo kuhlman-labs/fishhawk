@@ -210,6 +210,14 @@ type RegisterInstallationRequest struct {
 // owner-segment convention account.Resolver uses, so splitting any other way
 // here would validate a shape the gate then rejects.
 //
+// Nesting is NOT a licence for empty components. EVERY component — the
+// namespace, each intermediate group, and the terminal project — must be
+// non-empty, so 'acme//widgets', 'acme/platform//widgets' and 'acme/widgets/'
+// are all refused. GitLab never canonicalises a path_with_namespace with an
+// empty component, so such a row could never match a payload: accepting one
+// would let a SUPPORTED registration mint a binding that permanently refuses
+// every trigger while reporting success.
+//
 // Comparison is EXACT and case-SENSITIVE, matching the authorizer. GitLab
 // canonicalises project path case, so a case difference means the payload does
 // not name the recorded project.
@@ -219,9 +227,9 @@ func ValidateGitLabProjectPath(accountKey, projectPath string) error {
 		return fmt.Errorf("account: gitlab registrations must record the project path (--project-path <namespace>/<project>): %w", ErrValidation)
 	}
 	namespace, project, ok := strings.Cut(path, "/")
-	if !ok || namespace == "" || project == "" {
+	if !ok || namespace == "" || !allComponentsNonEmpty(project) {
 		return fmt.Errorf(
-			"account: gitlab project path %q must be of the form <namespace>/<project> (nested groups allowed, e.g. acme/platform/widgets) (--project-path): %w",
+			"account: gitlab project path %q must be of the form <namespace>/<project> with every component non-empty (nested groups allowed, e.g. acme/platform/widgets) (--project-path): %w",
 			path, ErrValidation)
 	}
 	if namespace != accountKey {
@@ -230,6 +238,22 @@ func ValidateGitLabProjectPath(accountKey, projectPath string) error {
 			path, namespace, accountKey, ErrValidation)
 	}
 	return nil
+}
+
+// allComponentsNonEmpty reports whether remainder is a "/"-joined sequence of
+// non-empty components. An empty remainder (a trailing separator, as in
+// 'acme/'), an empty interior component ('acme/platform//widgets') and an
+// empty terminal component ('acme/platform/widgets/') all report false.
+func allComponentsNonEmpty(remainder string) bool {
+	if remainder == "" {
+		return false
+	}
+	for _, component := range strings.Split(remainder, "/") {
+		if component == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // RegisterInstallation validates its input, resolves the owning account by
