@@ -46,6 +46,13 @@ type stageCheckResponse struct {
 	GitHubCheckRunID *int64                      `json:"github_check_run_id,omitempty"`
 	Timestamp        time.Time                   `json:"ts,omitempty"`
 	Missing          []auditcomplete.MissingItem `json:"missing,omitempty"`
+	// Resolved carries the structured RESOLUTIONS behind a self-derived
+	// check — today only fishhawk_audit_complete's decomposition
+	// trace resolution (#3092), which names the child runs whose
+	// implement-stage traces satisfied the parent fan-out stage's
+	// requirement. Omitted entirely when empty, so a flat run's row is
+	// byte-identical to the pre-#3092 shape.
+	Resolved []auditcomplete.Resolution `json:"resolved,omitempty"`
 }
 
 // stageChecksListResponse is the envelope for GET /v0/stages/{id}/checks.
@@ -139,7 +146,7 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 	// can show "fail because: plan missing, redacted trace missing
 	// on stage X" without a secondary call.
 	if stage.Type == run.StageTypeReview && s.cfg.ArtifactRepo != nil && s.cfg.AuditRepo != nil {
-		state, missing, err := auditcomplete.Compute(r.Context(), stage.RunID, s.auditCompleteDeps())
+		res, err := auditcomplete.ComputeResult(r.Context(), stage.RunID, s.auditCompleteDeps())
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"derive audit-complete state failed",
@@ -148,16 +155,18 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, stageCheckResponse{
 			Name:      AuditCompleteCheckName,
-			State:     string(state),
+			State:     string(res.State),
 			Timestamp: time.Now().UTC(),
-			Missing:   missing,
+			Missing:   res.Missing,
+			Resolved:  res.Resolved,
 		})
 
 		// Publish the same state to GitHub as a Check Run (#231).
 		// Best-effort: a failure logs but doesn't fail the read —
 		// the in-Fishhawk gate enforcement still works without
-		// the GitHub publish.
-		s.publishAuditCheck(r.Context(), stage.RunID, state, missing)
+		// the GitHub publish. The RESOLUTIONS ride along (#3092) so
+		// the published pass summary names the satisfying child runs.
+		s.publishAuditCheck(r.Context(), stage.RunID, res.State, res.Missing, res.Resolved)
 	}
 
 	s.writeJSON(w, r, http.StatusOK, stageChecksListResponse{
@@ -179,11 +188,11 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 // audit_check_publish_degraded / _recovered run-chain entries
 // (#993), so a desynced merge gate is visible from
 // fishhawk_get_run_status and the SPA without a daemon-log grep.
-func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem) {
+func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution) {
 	if s.auditCheckPublisher == nil {
 		return
 	}
-	published, err := s.auditCheckPublisher.Publish(ctx, runID, state, missing)
+	published, err := s.auditCheckPublisher.PublishResult(ctx, runID, state, missing, resolved)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"audit-complete check-run publish failed",
@@ -380,7 +389,7 @@ func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uui
 	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
 		return
 	}
-	state, missing, err := auditcomplete.Compute(ctx, runID, s.auditCompleteDeps())
+	res, err := auditcomplete.ComputeResult(ctx, runID, s.auditCompleteDeps())
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"audit-complete recompute failed",
@@ -388,7 +397,7 @@ func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uui
 			slog.String("error", err.Error()))
 		return
 	}
-	s.publishAuditCheck(ctx, runID, state, missing)
+	s.publishAuditCheck(ctx, runID, res.State, res.Missing, res.Resolved)
 }
 
 // RepublishAuditCheck re-derives a run's audit-complete state and republishes

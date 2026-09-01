@@ -217,6 +217,21 @@ func New(d Deps) *Publisher {
 // The bool return is "did we actually publish to GitHub on this
 // call." Useful for tests; production callers usually ignore it.
 func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem) (bool, error) {
+	return p.PublishResult(ctx, runID, state, missing, nil)
+}
+
+// PublishResult is Publish plus the structured RESOLUTIONS auditcomplete
+// derived (#3092). When the state is a pass and `resolved` is non-empty, the
+// Check Run's summary NAMES the child runs whose traces satisfied the parent
+// implement stage, so an auditor can follow the resolution chain from the
+// forge itself instead of having to trust it. Publish delegates here with
+// resolved=nil, so every pre-#3092 call site is unchanged.
+//
+// Note the dedup cache keys on (forge, repo, head_sha, state) only, so the
+// resolution text lands with the FIRST pass publish at a given head — a pass
+// already published at that head is not re-published merely because its
+// summary would now name the child runs.
+func (p *Publisher) PublishResult(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution) (bool, error) {
 	if p == nil {
 		return false, nil
 	}
@@ -302,7 +317,7 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		return false, nil
 	}
 
-	params := buildParams(state, missing, headSHA, p.detailsURL(runID))
+	params := buildParams(state, missing, resolved, headSHA, p.detailsURL(runID))
 	if _, err := creator.CreateCheckRun(ctx, scope, repo, params); err != nil {
 		err = fmt.Errorf("auditcheckpublisher: create check run: %w", err)
 		p.recordFailure(ctx, runID, headSHA, err)
@@ -514,7 +529,7 @@ func parseRepo(s string) (forge.RepoRef, error) {
 // buildParams maps the (state, missing) tuple to GitHub's check-
 // run wire shape. Pending → in_progress; pass → success; fail →
 // failure with the missing list rendered as a markdown summary.
-func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, headSHA, detailsURL string) forge.CreateCheckRunParams {
+func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHA, detailsURL string) forge.CreateCheckRunParams {
 	params := forge.CreateCheckRunParams{
 		Name:       CheckName,
 		HeadSHA:    headSHA,
@@ -524,7 +539,7 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, he
 	case stagecheck.StatePass:
 		params.Status = forge.CheckRunStatusCompleted
 		params.Conclusion = forge.CheckRunConclusionSuccess
-		params.OutputSummary = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies."
+		params.OutputSummary = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies." + renderResolutions(resolved)
 	case stagecheck.StateFail:
 		params.Status = forge.CheckRunStatusCompleted
 		params.Conclusion = forge.CheckRunConclusionFailure
@@ -538,6 +553,35 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, he
 		params.OutputSummary = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
 	}
 	return params
+}
+
+// renderResolutions appends one line per resolution to the PASS summary,
+// naming the child runs that actually supplied the evidence (#3092). Empty
+// for a run with no resolutions, so an ordinary pass summary is byte-identical
+// to the pre-#3092 text.
+func renderResolutions(resolved []auditcomplete.Resolution) string {
+	if len(resolved) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range resolved {
+		if len(r.ChildRunIDs) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "\n\nImplement stage %s is a decomposition fan-out parent; its traces were resolved from child runs: %s.",
+			shortID(r.StageID), strings.Join(r.ChildRunIDs, ", "))
+	}
+	return b.String()
+}
+
+// shortID renders the first 8 characters of a uuid, matching
+// auditcomplete's own detail-string convention.
+func shortID(id uuid.UUID) string {
+	s := id.String()
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	return s
 }
 
 func renderFailureSummary(missing []auditcomplete.MissingItem) string {
