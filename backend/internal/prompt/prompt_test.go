@@ -12293,7 +12293,7 @@ func TestWriteGateEvidence_FixupCounterfactuals_RenderPerObserved(t *testing.T) 
 				t.Errorf("prompt missing %q:\n%s", tc.want, got)
 			}
 			for _, w := range []string{
-				"### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)",
+				"### Counterfactual self-report (agent CLAIM — not a runner observation)",
 				"The verify runs above are what the RUNNER MEASURED",
 				"only what the AGENT SAYS IT DID",
 				"`observed: red` does NOT establish that the control discriminates",
@@ -12312,8 +12312,14 @@ func TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty(t *testing.T) {
 	got := implementReviewWithGateEvidence(t, &GateEvidence{
 		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
 	})
-	if strings.Contains(got, "Fix-up counterfactual self-report") {
+	// The HEADING is the absence assertion. A bare "Counterfactual self-report"
+	// substring would false-match standing rule 8, which names the block by
+	// title when telling the reviewer where structured evidence appears.
+	if strings.Contains(got, "### Counterfactual self-report (agent CLAIM — not a runner observation)") {
 		t.Errorf("empty counterfactual slice must render nothing:\n%s", got)
+	}
+	if strings.Contains(got, "### Fix-up counterfactual self-report") {
+		t.Errorf("the old fix-up-only title must not survive anywhere:\n%s", got)
 	}
 }
 
@@ -12443,6 +12449,163 @@ func TestBuild_Plan_DecomposeRequired_NamesGateNumber(t *testing.T) {
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("decompose-required preamble missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// --- #2929 counterfactual sidecar + standing rule 8 ------------------------
+
+const (
+	cfSidecarRunID   = "aaaaaaaa-1111-2222-3333-444444444444"
+	cfSidecarStageID = "bbbbbbbb-5555-6666-7777-888888888888"
+)
+
+// TestBuild_Implement_CounterfactualSidecar_Rendered: the full implement prompt
+// names the run/stage-keyed sidecar path with the ids SUBSTITUTED (which is what
+// pins the format string against the runner's independent copy), and states the
+// diff-only / PR-body limitation that is the whole reason the sidecar exists.
+func TestBuild_Implement_CounterfactualSidecar_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		IssueNumber:      42,
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   cfSidecarRunID,
+		ImplementStageID: cfSidecarStageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"#### Also record each counterfactual in the machine-readable sidecar",
+		CounterfactualReportPath(cfSidecarRunID, cfSidecarStageID),
+		"/tmp/fishhawk-counterfactuals-" + cfSidecarRunID + "-" + cfSidecarStageID + ".json",
+		"The implement review is DIFF-ONLY",
+		"it does NOT receive the pull-request body",
+		"`observed` MUST be exactly `red`, `green`, or `not_run`",
+		"an absent `restored` is NOT the same claim as `false`",
+		"any entry past the first 20",
+		"unwitnessed CLAIMS",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing counterfactual sidecar string %q\n---\n%s", w, got)
+		}
+	}
+	// The PR `## Notes` obligation is NOT weakened by the sidecar.
+	if !strings.Contains(got, "Record the observed RED output for each cycle in your PR `## Notes`") {
+		t.Errorf("the sidecar must NOT displace the PR Notes reporting obligation\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_CounterfactualSidecar_OmittedWithoutIDs: with EMPTY
+// run/stage ids the sub-block is omitted entirely rather than naming a
+// malformed unkeyed path — while the unchanged PR-Notes counterfactual
+// discipline still renders. Self-paired: a presence and an absence over the
+// SAME prompt.
+func TestBuild_Implement_CounterfactualSidecar_OmittedWithoutIDs(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Counterfactual attainability — confirm in your PR Notes") {
+		t.Errorf("the unchanged PR-Notes discipline must still render without ids\n---\n%s", got)
+	}
+	if strings.Contains(got, "#### Also record each counterfactual in the machine-readable sidecar") {
+		t.Errorf("empty ids must OMIT the sidecar sub-block\n---\n%s", got)
+	}
+	if strings.Contains(got, "/tmp/fishhawk-counterfactuals-") {
+		t.Errorf("empty ids must never render an unkeyed sidecar path\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_CounterfactualSidecar_AbsentOnFixup: the fix-up prompt
+// does NOT render the sidecar sub-block — the fix-up agent is already told about
+// its own sidecar by writeFixupSelfReport, and a second instruction would split
+// one signal across two files. FixupSelfReportPath IS asserted present, which
+// proves the ids were populated on this fixture, so the absence is the
+// buildImplement-only call site and not an empty-id artifact.
+func TestBuild_Implement_CounterfactualSidecar_AbsentOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		IssueNumber:      42,
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+		ImplementRunID:   cfSidecarRunID,
+		ImplementStageID: cfSidecarStageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, FixupSelfReportPath(cfSidecarRunID, cfSidecarStageID)) {
+		t.Fatalf("fix-up fixture must carry populated ids (self-report path absent)\n---\n%s", got)
+	}
+	if strings.Contains(got, "#### Also record each counterfactual in the machine-readable sidecar") {
+		t.Errorf("the fix-up prompt must NOT render the initial-pass sidecar sub-block\n---\n%s", got)
+	}
+	if strings.Contains(got, CounterfactualReportPath(cfSidecarRunID, cfSidecarStageID)) {
+		t.Errorf("the fix-up prompt must NOT name the initial-pass sidecar path\n---\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_CounterfactualTitleIsPassAgnostic: the reviewer-facing
+// block renders under the pass-agnostic title, the row format is intact, and no
+// 'fix-up pass' wording survives in the block's lead sentence.
+func TestWriteGateEvidence_CounterfactualTitleIsPassAgnostic(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		FixupCounterfactuals: []GateFixupCounterfactual{
+			{ControlPath: "a/guard.go", Observed: "red", Restored: true},
+		},
+	})
+	if !strings.Contains(got, "### Counterfactual self-report (agent CLAIM — not a runner observation)") {
+		t.Errorf("missing the pass-agnostic block title\n---\n%s", got)
+	}
+	if strings.Contains(got, "### Fix-up counterfactual self-report") {
+		t.Errorf("the old fix-up-only title must not survive\n---\n%s", got)
+	}
+	if !strings.Contains(got, "For each control this pass added or tightened") {
+		t.Errorf("the lead sentence must be pass-agnostic\n---\n%s", got)
+	}
+	if !strings.Contains(got, "- a/guard.go — observed: red, restored: yes") {
+		t.Errorf("the row format must be unchanged\n---\n%s", got)
+	}
+}
+
+// TestImplementReview_StandingRule8_Rendered: rule 8 renders on the
+// implement-review prompt, is ORDERED after rule 7, and rules 1-7 are unmoved —
+// the verdict rule's "standing rule 7" cross-reference must still resolve.
+func TestImplementReview_StandingRule8_Rendered(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+	})
+	const rule7 = "7. **Do NOT reject on an unconfirmable absence (standing rule)**"
+	const rule8 = "8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**"
+	i7 := strings.Index(got, rule7)
+	i8 := strings.Index(got, rule8)
+	if i7 < 0 {
+		t.Fatalf("standing rule 7 must be unmoved and byte-identical\n---\n%s", got)
+	}
+	if i8 < 0 {
+		t.Fatalf("standing rule 8 must render\n---\n%s", got)
+	}
+	if i8 < i7 {
+		t.Errorf("standing rule 8 must follow rule 7 (got 8 at %d, 7 at %d)", i8, i7)
+	}
+	for _, w := range []string{
+		"4. **Scope adherence (flag-only)**",
+		"5. **Grounded citations**",
+		"6. **Style is out of scope**",
+		"standing rule 7",
+		"is NOT part of the material available to this review",
+		"'Counterfactual self-report' block above",
+		"do NOT reject on it",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement-review prompt missing %q\n---\n%s", w, got)
 		}
 	}
 }

@@ -278,6 +278,20 @@ The wording is deliberately NOT gated on the change looking security-relevant or
 
 Pinned by four tests in `prompt_test.go`: `TestBuild_Plan_CounterfactualAttainabilityRule`, `TestBuild_Implement_CounterfactualDiscipline_Rendered`, `TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup` (the #2453 fix-up-path pin), and `TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading` (a presence+absence pair over the same fix-up string). Because `_Rendered` and `_RenderedOnFixup` drive two different builders through two different call sites, deleting either single call site reddens exactly one of them.
 
+### Machine-readable carrier for the initial pass (#2929)
+
+`writeCounterfactualDiscipline` demands the RED transcripts be recorded in the PR `## Notes`, but the implement review is DIFF-ONLY and scope-bounded — it never receives the pull-request body. So every operator condition asking a reviewer to confirm counterfactual evidence could only ever be closed by the operator by hand. #3042 built the machine-readable carrier (a run/stage-keyed sidecar the runner validates fail-closed and folds into `gate_evidence`) but wired it to the FIX-UP pass only.
+
+`writeCounterfactualSidecar` gives the INITIAL implement pass the same channel. It is called from `buildImplement` ONLY, immediately after `writeCounterfactualDiscipline` (which stays byte-identical, so the #2453 two-call-site pins are untouched), and ONLY when both run/stage ids are populated — a trigger missing them omits the sub-block rather than naming a malformed unkeyed path the runner would never read. It renders `CounterfactualReportPath(runID, stageID)` with the ids substituted, states plainly that the review is diff-only and does not receive the PR body (so `## Notes` is for the human reader while the sidecar is what reaches the reviewer), shows the exact JSON shape, and restates the fail-closed per-entry rules in substance from `writeFixupSelfReport`. The PR `## Notes` obligation is NOT weakened — both are required.
+
+`buildImplementFixup` is deliberately untouched: its agent is already told about a sidecar by `writeFixupSelfReport`, and a second instruction would split one signal across two files.
+
+Pinned by `TestBuild_Implement_CounterfactualSidecar_Rendered` (the substituted path — which is what pins the format string against the runner's independent copy — plus the diff-only statement and the rules), `_OmittedWithoutIDs` (the empty-id guard, self-paired: the unchanged PR-Notes discipline still renders while the sub-block and any `/tmp/fishhawk-counterfactuals-` path are absent), and `_AbsentOnFixup` (which asserts `FixupSelfReportPath` IS present, proving the ids were populated, so the absence is the call-site guard and not an empty-id artifact).
+
+### Standing rule 8 — named absence for evidence with no structured carrier (#2929)
+
+Appended AFTER standing rule 7 in `buildImplementReview`, with rules 1-7 left byte-identical so the verdict rule's `standing rule 7` cross-reference and the numbered-lens assertions do not move. Rule 8 tells the reviewer plainly that verification evidence the agent reported in the PULL-REQUEST BODY — counterfactual RED transcripts, grep results, delete-observe-restore outputs — is NOT part of its material, which is scope-bounded and diff-only; that structured counterfactual evidence, where supplied, appears in the gate-evidence `Counterfactual self-report` block and IS in its material; and that where an operator condition asks it to confirm something whose evidence lives on a surface it cannot read, it must record an evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator — never counting it against the change, never treating it as a confirmed gap, and never rejecting on it. This covers the evidence classes (grep results, prose transcripts) for which no structured carrier exists. Pinned by `TestImplementReview_StandingRule8_Rendered`, which asserts the ordering after rule 7 and that rules 4-7 and the `standing rule 7` cross-reference are unmoved.
+
 ## Review grounding — conditional repository-access clause (#2486)
 
 Both review prompts (`buildPlanReview`, `buildImplementReview`) render a
@@ -485,7 +499,15 @@ honest-about-what-it-lacks, which is the whole point of the named literal.
 
 **Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
 `{control_path, observed, restored}` triples the runner validated out of the
-fix-up self-report sidecar (`runner/README.md` for the fail-closed drop rules).
+counterfactual sidecars (`runner/README.md` for the fail-closed drop rules).
+Since #2929 the carrier covers BOTH passes — the fix-up self-report sidecar and
+the initial implement pass's own `/tmp/fishhawk-counterfactuals-<run>-<stage>.json`,
+read through exactly complementary runner branches so a claim can never be
+double-counted — so the block is titled pass-agnostically,
+`### Counterfactual self-report (agent CLAIM — not a runner observation)`. The
+wire kind stays `fixup_counterfactuals` on purpose: the runner is an
+independently pinned module and a renamed kind would be silently dropped by a
+pinned older backend.
 The render says plainly that the verify runs above are what the RUNNER MEASURED
 while this block is only what the AGENT SAYS IT DID: the runner never witnessed
 the mutation and cannot tell a real counterfactual from a no-op one, so

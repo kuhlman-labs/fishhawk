@@ -1273,6 +1273,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// cannot bleed a stale claim into a fresh attempt. No-ops on every
 		// non-fix-up implement stage (the sidecar is fix-up-only).
 		sweepStaleFixupSelfReport(cfg, logSink)
+		// Pre-invoke counterfactual sidecar sweep (#2929): delete any leftover
+		// counterfactual sidecar at THIS run/stage's keyed path before the agent
+		// runs, so a same-keyed leftover from a prior retry of this run/stage
+		// cannot bleed a stale CLAIM into a fresh attempt. Unconditional — it
+		// no-ops on every stage whose agent wrote no sidecar.
+		sweepStaleCounterfactualReport(cfg, logSink, counterfactualSweepPreInvoke)
 		// Pre-invoke fix-up commit-message sweep (#1572): delete any leftover
 		// commit-message sidecar at THIS run/stage's keyed path before the agent
 		// runs, so a pass whose agent never re-writes the file falls back to the
@@ -2185,6 +2191,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if len(selfReport.counterfactuals) > 0 {
 			res.Events = append(res.Events, fixupCounterfactualsEvent(cfg, selfReport.counterfactuals))
 		}
+		// A fix-up pass carries its counterfactuals in the self-report sidecar
+		// above, so the #2929 sidecar is NOT read here. Sweep it anyway: an
+		// agent that wrote one on this pass would otherwise leave it unread in
+		// /tmp, where the next pass's keyed path could never reach it but a
+		// human reading /tmp would find a file that looks like live evidence.
+		// The body lives in a helper so a unit test can drive it and assert the
+		// file is GONE, not merely that a sweep call is textually present.
+		sweepUnreadCounterfactualReport(cfg, logSink)
+	}
+
+	// Initial-implement counterfactual self-report (#2929). The EXACT complement
+	// of the fix-up block above (`!cfg.fixup` against its `cfg.fixup`), so
+	// exactly ONE of the two channels reads per pass and a claim can never be
+	// double-counted into gate_evidence. Reuses the #3042 wire kind
+	// (fixup_counterfactuals) and payload shape ON PURPOSE: composeGateEvidence,
+	// bundle.GateEvidence and the backend's trace mapping are all already
+	// pass-agnostic, and the runner is an independently pinned module — a
+	// renamed kind would be silently DROPPED by a pinned older backend, losing
+	// evidence with no error. EVIDENCE ONLY: like its siblings this block NEVER
+	// touches res.OK / res.FailureCategory / budget. The body lives in
+	// emitInitialCounterfactuals so a unit test can DRIVE it and assert the
+	// event on res.Events, rather than only parsing this branch's text.
+	if stageType == "implement" && !cfg.fixup {
+		emitInitialCounterfactuals(cfg, scopePaths(cfg.scopeFiles), &res, logSink)
 	}
 
 	// Emit the GenAI observability span for this stage as soon as the
@@ -9241,6 +9271,245 @@ func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSel
 	out.obligations = validateFixupObligationReports(cfg, doc.Obligations, logSink)
 	out.counterfactuals = validateFixupCounterfactuals(cfg, doc.Counterfactuals, scope, logSink)
 	return out
+}
+
+// counterfactualReportDir is the directory the run/stage-keyed NON-fix-up
+// counterfactual sidecar lives in (#2929). var (not const) so tests can
+// redirect it to a t.TempDir, avoiding /tmp pollution / parallel-test races —
+// the same seam pattern as scopeJustificationDir / fixupSelfReportDir.
+var counterfactualReportDir = "/tmp"
+
+// counterfactualReportPath mirrors prompt.CounterfactualReportPath in the
+// backend: the run/stage-keyed path the INITIAL (non-fix-up) implement agent
+// writes its counterfactual self-report to and the runner reads it from
+// (#2929). The format string is hardcoded in both independent modules by
+// design — the same coordination as fixupSelfReportPath / FixupSelfReportPath —
+// so a ONE-SIDED edit to either copy silently disables the channel: the agent
+// writes a file nobody reads, and the runner reads a path nobody writes, with
+// no error on either side. It is caught by the prompt-render test (asserts the
+// literal substituted path) plus the runner load tests below.
+//
+// The FULL run + stage ids key the path so a leftover sidecar from another
+// run/stage can never collide — the first of three freshness defenses (the
+// others are the embedded-id validation in loadCounterfactualReport and the
+// pre-invoke sweep in run()).
+func counterfactualReportPath(runID, stageID string) string {
+	return filepath.Join(counterfactualReportDir, fmt.Sprintf("fishhawk-counterfactuals-%s-%s.json", runID, stageID))
+}
+
+// counterfactualReport is the agent's structured counterfactual self-report on
+// the INITIAL implement pass (#2929). It deliberately REUSES
+// fixupCounterfactualReport for its entries rather than declaring a parallel
+// type: the per-entry rules, the *bool Restored (absent != false) and the
+// validator are all shared, so the two channels can never drift into
+// disagreeing about what a valid entry is.
+type counterfactualReport struct {
+	RunID           string                      `json:"run_id"`
+	StageID         string                      `json:"stage_id"`
+	Counterfactuals []fixupCounterfactualReport `json:"counterfactuals"`
+}
+
+// maxSidecarIDBytes bounds ONE agent-authored sidecar id echoed into the runner
+// log. The ids are read out of a file the agent wrote, so they are unbounded
+// agent-controlled text; %q escapes control characters but does NOT bound
+// length, so without this an agent could push arbitrary-length text into the
+// runner log through the stale-path diagnostic.
+const maxSidecarIDBytes = 64
+
+// safeSidecarID renders one agent-authored sidecar id for the stale-path log,
+// bounded to maxSidecarIDBytes with a visible truncation marker. Combined with
+// the %q the caller applies, the emitted value is both escaped and bounded.
+func safeSidecarID(id string) string {
+	if len(id) <= maxSidecarIDBytes {
+		return id
+	}
+	return strings.ToValidUTF8(id[:maxSidecarIDBytes], "") + "…"
+}
+
+// The two counterfactual-sidecar sweep sites carry DISTINCT reasons (#2929
+// fix-up). A single shared literal conflated two situations an operator reading
+// the log must be able to tell apart: a leftover from a PRIOR attempt of this
+// same run/stage, versus a file THIS pass's agent authored that the fix-up
+// channel deliberately never reads. Both are logged under the same
+// counterfactual_report_swept event, so the reason field is what discriminates.
+const (
+	// counterfactualSweepPreInvoke: swept before the agent was invoked, so a
+	// removed file is a leftover from a prior retry of this run/stage and no
+	// agent on THIS attempt authored it.
+	counterfactualSweepPreInvoke = "pre_invoke_stale_leftover"
+	// counterfactualSweepFixupUnread: swept at the end of a FIX-UP pass, so a
+	// removed file is one THIS pass's agent wrote and the fix-up channel
+	// deliberately did not read (a fix-up carries its counterfactuals in the
+	// #3042 self-report sidecar instead).
+	counterfactualSweepFixupUnread = "fixup_pass_authored_unread"
+)
+
+// pathExists reports whether SOMETHING sits at path, WITHOUT following a
+// symlink (#2929 fix-up). os.Lstat is the deliberate choice over os.Stat: a
+// dangling symlink is present agent-authored state that must be cleaned up,
+// yet os.Stat (like os.ReadFile) resolves the link and reports the missing
+// TARGET's ENOENT, which would read as absence.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// sweepStaleCounterfactualReport deletes any leftover counterfactual sidecar at
+// this run/stage's keyed path (#2929), naming which of the two sweep sites it
+// is via reason (see the constants above).
+//
+// Removal is RECURSIVE (os.RemoveAll), matching loadCounterfactualReport's
+// unreadable branch: an agent can put a non-empty DIRECTORY at the sidecar
+// path, which a non-recursive os.Remove can never clear. Because os.RemoveAll
+// reports success for an ABSENT path, presence is decided by an os.Lstat first
+// rather than by the removal's error — otherwise the common no-op would log.
+//
+// A cleanup that FAILS is surfaced (counterfactual_report_sweep_failed) rather
+// than silently swallowed: a path that survives the sweep must never be
+// reported as successfully removed.
+func sweepStaleCounterfactualReport(cfg config, logSink io.Writer, reason string) {
+	path := counterfactualReportPath(cfg.runID, cfg.stageID)
+	if _, serr := os.Lstat(path); serr != nil {
+		// Absent (the overwhelmingly common case): silent no-op. Only an
+		// existing file's removal is worth a log line.
+		return
+	}
+	if rerr := os.RemoveAll(path); rerr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_sweep_failed","run_id":%q,"stage_id":%q,"path":%q,"reason":%q,"error":%q}`+"\n",
+			cfg.runID, cfg.stageID, path, reason, rerr.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"counterfactual_report_swept","run_id":%q,"stage_id":%q,"path":%q,"reason":%q}`+"\n",
+		cfg.runID, cfg.stageID, path, reason)
+}
+
+// emitInitialCounterfactuals IS the initial (non-fix-up) implement pass's
+// counterfactual channel body, extracted out of run() so a unit test can DRIVE
+// it (#2929 fix-up). run() takes (args []string, logSink io.Writer), spawns the
+// agent CLI and does real git work, so the branch body was previously pinned
+// only STRUCTURALLY (by parsing main.go) — which cannot tell a call that runs
+// from a call sitting under dead code. With the body in a helper,
+// TestEmitInitialCounterfactuals_* asserts the real thing: the event actually
+// appended to res.Events, and the sidecar actually gone from disk.
+//
+// EVIDENCE ONLY, like its two fix-up siblings: it appends to res.Events and
+// touches res.OK / res.FailureCategory / budget never.
+func emitInitialCounterfactuals(cfg config, scope []string, res *agent.Result, logSink io.Writer) {
+	if entries := loadCounterfactualReport(cfg, scope, logSink); len(entries) > 0 {
+		res.Events = append(res.Events, fixupCounterfactualsEvent(cfg, entries))
+	}
+}
+
+// sweepUnreadCounterfactualReport IS the fix-up branch's counterfactual body,
+// extracted for the same reason as emitInitialCounterfactuals: a structural pin
+// cannot distinguish a sweep that RUNS from one that runs and fails to remove
+// the file, and "the file is gone" is precisely the property the fix-up channel
+// owes. A fix-up pass carries its counterfactuals in the #3042 self-report
+// sidecar, so the #2929 sidecar is never read here — only swept, under the
+// fixup_pass_authored_unread reason, so an operator can tell an agent-authored
+// unread file from a pre-invoke leftover.
+func sweepUnreadCounterfactualReport(cfg config, logSink io.Writer) {
+	sweepStaleCounterfactualReport(cfg, logSink, counterfactualSweepFixupUnread)
+}
+
+// loadCounterfactualReport reads + validates the INITIAL implement pass's
+// counterfactual sidecar (#2929) fail-closed, mirroring loadFixupSelfReport's
+// whole-sidecar ladder with one deliberate improvement: the read-error branch
+// distinguishes ABSENT from PRESENT-BUT-UNREADABLE.
+//
+//   - ABSENT (os.ErrNotExist) → nil, silently. This is the common no-op: every
+//     stage whose agent wrote no sidecar takes it, so it must not log.
+//   - PRESENT BUT UNREADABLE (any other read error — a directory at the path, a
+//     permission failure) → the path is REMOVED and counterfactual_report_
+//     unreadable logged before returning nil. loadFixupSelfReport returns here
+//     BEFORE its deferred removal is installed, so an unreadable sidecar
+//     survives on disk contrary to its stated every-return-path cleanup
+//     invariant; this loader closes that gap.
+//   - MALFORMED JSON → nil + counterfactual_report_invalid.
+//   - STALE (embedded run_id/stage_id not matching cfg) → nil +
+//     counterfactual_report_stale, echoing the foreign ids through
+//     safeSidecarID so an unbounded agent-authored string cannot flood the log.
+//
+// On a successfully READ sidecar the file is removed on every return path, so
+// malformed / stale / consumed all clean up and nothing bleeds into a later
+// read.
+//
+// Per-entry validation REUSES validateFixupCounterfactuals unchanged — the same
+// scope-membership, closed observed enum, present-restored, non-empty-record
+// and cap rules, the same fixup_counterfactual_dropped log, and the same
+// discard of the agent-authored record text before the upload boundary. The
+// rules are deliberately NOT forked: one validator means the two channels
+// cannot drift.
+func loadCounterfactualReport(cfg config, scope []string, logSink io.Writer) []fixupCounterfactualEvidence {
+	path := counterfactualReportPath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && !pathExists(path) {
+			// The common no-op: the agent reported nothing. No log — only an
+			// existing file's content can claim anything.
+			//
+			// The pathExists (os.Lstat) re-check is load-bearing, NOT a
+			// tautology (#2929 fix-up): os.ReadFile FOLLOWS symlinks, so a
+			// DANGLING symlink at the keyed path — present agent-authored
+			// state — reports ENOENT for its missing TARGET. Trusting the read
+			// error alone would return here without cleanup and leave that
+			// symlink on disk, bypassing the present-but-unreadable removal
+			// below. os.Lstat does not follow the link, so it tells actual
+			// path absence from a present-but-broken link, and the latter
+			// falls through to be removed fail-closed.
+			return nil
+		}
+		// Present but unreadable: fail closed AND remove, so a path we could
+		// not read is never left behind to be retried by a later pass.
+		//
+		// The removal result is CHECKED, not discarded (#2929 fix-up). An agent
+		// can construct a path — a non-empty directory whose parent denies
+		// write — for which BOTH the read and the recursive removal fail; the
+		// blocking cleanup requirement is then unmet, and reporting only
+		// counterfactual_report_unreadable would let a PERSISTENT path be read
+		// as successfully removed. So a failed cleanup gets its own
+		// counterfactual_report_unremovable line naming the error, emitted
+		// BESIDE the unreadable line rather than instead of it: the read
+		// failure and the cleanup failure are two distinct facts and an
+		// operator needs both.
+		rmErr := os.RemoveAll(path)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_unreadable","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		if rmErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+				cfg.runID, cfg.stageID, path, rmErr.Error())
+		}
+		return nil
+	}
+	// A present sidecar is consumed regardless of outcome — and, as on the
+	// unreadable branch above, a consumption that FAILS is surfaced rather than
+	// discarded, so a file that survives is never read as removed.
+	defer func() {
+		if rmErr := os.Remove(path); rmErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+				cfg.runID, cfg.stageID, path, rmErr.Error())
+		}
+	}()
+
+	var doc counterfactualReport
+	if json.Unmarshal(raw, &doc) != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_invalid","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return nil
+	}
+	if doc.RunID != cfg.runID || doc.StageID != cfg.stageID {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_stale","run_id":%q,"stage_id":%q,"sidecar_run_id":%q,"sidecar_stage_id":%q}`+"\n",
+			cfg.runID, cfg.stageID, safeSidecarID(doc.RunID), safeSidecarID(doc.StageID))
+		return nil
+	}
+	return validateFixupCounterfactuals(cfg, doc.Counterfactuals, scope, logSink)
 }
 
 // fixupCommitMessageDir is the directory the run/stage-keyed fix-up commit-

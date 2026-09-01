@@ -185,6 +185,27 @@ func FixupSelfReportPath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-fixup-selfreport-%s-%s.json", runID, stageID)
 }
 
+// CounterfactualReportPath is the run/stage-keyed path the INITIAL (non-fix-up)
+// implement agent writes its counterfactual self-report sidecar to (#2929) and
+// the runner reads it from. Keyed by the FULL run id + stage id (same rationale
+// as FixupSelfReportPath) so a leftover sidecar from a different run/stage can
+// never collide — the first of three freshness defenses (the others being the
+// embedded-id validation and the pre-invoke delete in the runner).
+//
+// Deliberately NOT reusing FixupSelfReportPath: the two passes read different
+// sidecars through mutually exclusive runner branches, so a fix-up-written file
+// can never be mistaken for an initial-pass one and vice versa.
+//
+// The runner mirrors this EXACT format string in counterfactualReportPath
+// (runner/cmd/fishhawk-runner/main.go) — the same independent-module
+// coordination as FixupSelfReportPath / fixupSelfReportPath. A ONE-SIDED edit
+// to either format string silently disables the channel (the agent writes a
+// file nobody reads), so it is caught by the prompt-render test (asserts the
+// literal substituted path) plus the runner load tests.
+func CounterfactualReportPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-counterfactuals-%s-%s.json", runID, stageID)
+}
+
 // FixupCommitMessagePath is the run/stage-keyed path a fix-up agent writes the
 // Conventional-Commits commit message for THAT pass to, and the runner reads
 // the fix-up commit's subject+body from (#1572). Deliberately NOT reusing
@@ -1851,6 +1872,17 @@ func buildImplement(t Trigger) string {
 	// plan-prompt rule. Rendered on the full implement path here and — unlike
 	// writeFailureModeTestChecklist — ALSO on the fix-up path (see buildImplementFixup).
 	writeCounterfactualDiscipline(&b)
+
+	// Machine-readable carrier for the counterfactual evidence the block above
+	// demands (#2929). Full-implement path ONLY: the fix-up agent is already
+	// told about its own sidecar by writeFixupSelfReport, and a second sidecar
+	// instruction there would split one signal across two files. Guarded on the
+	// populated run/stage ids (same shape as writeScopeSelfExempt /
+	// writeFixupCommitMessage) so a trigger missing them omits the sub-block
+	// rather than naming a malformed, unkeyed path the runner will never read.
+	if t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeCounterfactualSidecar(&b, t)
+	}
 	return b.String()
 }
 
@@ -2192,6 +2224,57 @@ func writeCounterfactualDiscipline(b *strings.Builder) {
 		"control inside the test's own setup guard, so the RED lands on the behavioral assertion and not on a fixture-setup failure. If a test genuinely cannot " +
 		"serve as a counterfactual vehicle, prove that by running it under the deletion and say so — do not assert it. A control you invent in THIS pass gets the " +
 		"same treatment as one the plan named (#2444).\n")
+}
+
+// writeCounterfactualSidecar renders the machine-readable carrier sub-block for
+// the counterfactual evidence writeCounterfactualDiscipline demands (#2929).
+//
+// The problem it closes: the implement review is DIFF-ONLY and scope-bounded —
+// it never receives the pull-request body — so RED transcripts recorded only in
+// PR `## Notes` structurally cannot reach the reviewer, and every operator
+// condition asking a reviewer to confirm such evidence could previously be
+// closed by the operator alone. #3042 already built the carrier (a run/stage-
+// keyed JSON sidecar the runner validates fail-closed and folds into
+// gate_evidence under explicit agent-CLAIM authority) but wired it to the
+// FIX-UP pass only. This block gives the INITIAL implement pass the same
+// channel, at its own keyed path.
+//
+// The PR `## Notes` obligation is deliberately NOT weakened: the human reader
+// needs the narrative, and the sidecar carries only the {path, observed,
+// restored} triple. Both are required.
+//
+// Called ONLY from buildImplement, and only when the run/stage ids are
+// populated — the caller owns that guard so a trigger missing the ids omits the
+// sub-block rather than naming an unkeyed path no runner reads.
+func writeCounterfactualSidecar(b *strings.Builder, t Trigger) {
+	path := CounterfactualReportPath(t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("\n#### Also record each counterfactual in the machine-readable sidecar\n\n")
+	b.WriteString("The implement review is DIFF-ONLY: it receives the scope-bounded diff and this run's gate " +
+		"evidence, and it does NOT receive the pull-request body. So the `## Notes` record above reaches the " +
+		"HUMAN reader, but it cannot reach the reviewer at all. The sidecar below is what actually reaches the " +
+		"reviewer — write BOTH.\n\n")
+	fmt.Fprintf(b, "Write a JSON sidecar to `%s` with this shape:\n\n", path)
+	b.WriteString("```json\n")
+	fmt.Fprintf(b, "{\"run_id\":%q,\"stage_id\":%q,\n"+
+		"  \"counterfactuals\":[{\"control_path\":\"<a declared scope.files path>\",\"observed\":\"red\","+
+		"\"restored\":true,\"record\":\"<what you mutated and what you saw>\"}]}\n",
+		t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("```\n\n")
+	b.WriteString("Rules — each is fail-closed (a violation DROPS that entry, or the whole sidecar, and the " +
+		"evidence simply never reaches the reviewer):\n\n")
+	b.WriteString("- `run_id` and `stage_id` MUST be exactly the values shown above. A mismatch (a stale sidecar " +
+		"from another run/stage) is rejected wholesale, as is malformed JSON.\n")
+	b.WriteString("- Carry ONE entry per control this pass ADDED or TIGHTENED (any guard, validation, check, or " +
+		"refusal). `control_path` MUST be one of the declared scope.files paths; `observed` MUST be exactly " +
+		"`red`, `green`, or `not_run`; `restored` MUST be a boolean and MUST be PRESENT (an absent `restored` " +
+		"is NOT the same claim as `false`, so an entry omitting it is DROPPED rather than read as a " +
+		"no-restore); `record` MUST be non-empty and holds what you mutated and what you observed.\n")
+	b.WriteString("- An entry breaking any of these rules is DROPPED, and so is any entry past the first 20. The " +
+		"`record` TEXT is checked on the runner and then discarded — only `control_path`, `observed` and " +
+		"`restored` are transmitted — and the reviewer is told plainly that these are your unwitnessed CLAIMS, " +
+		"not runner observations.\n")
+	b.WriteString("- This sidecar is ADVISORY evidence. It does NOT fail, re-open, or re-budget this pass — " +
+		"report truthfully.\n")
 }
 
 // maxScopePathBytes caps ONE rendered carry-forward / dropped path (#2516).
@@ -4606,7 +4689,16 @@ func buildImplementReview(t Trigger) string {
 		"its absence by reading the repository. Treat an absence you cannot positively confirm as unverifiable and " +
 		"downgrade to approve_with_concerns — do not assert the absence of a file you could not actually inspect. " +
 		"(This is distinct from lens 2: a test that is PRESENT but vacuous is still a valid reject; this rule only " +
-		"forbids rejecting on a test that merely APPEARS absent.)\n\n")
+		"forbids rejecting on a test that merely APPEARS absent.)\n")
+	b.WriteString("8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect " +
+		"(standing rule)**: Verification evidence the agent reported in the PULL-REQUEST BODY — counterfactual " +
+		"RED transcripts, grep results, delete-observe-restore outputs — is NOT part of the material available " +
+		"to this review. Your material is scope-bounded and diff-only; you do not receive the PR body. Where the " +
+		"agent supplied STRUCTURED counterfactual evidence it appears in the gate-evidence 'Counterfactual " +
+		"self-report' block above, and that IS in your material — read it there. But where an operator condition " +
+		"asks you to confirm something whose evidence lives on a surface you cannot read, record it as an " +
+		"evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator. Do NOT " +
+		"count it against the change, do NOT treat it as a confirmed gap, and do NOT reject on it.\n\n")
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
@@ -5464,8 +5556,8 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	}
 
 	if len(ev.FixupCounterfactuals) > 0 {
-		b.WriteString("### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)\n\n")
-		b.WriteString("For each control the fix-up pass added or tightened, the agent reports below which " +
+		b.WriteString("### Counterfactual self-report (agent CLAIM — not a runner observation)\n\n")
+		b.WriteString("For each control this pass added or tightened, the agent reports below which " +
 			"declared-scope file it says it counterfactually tested (delete the control, re-run the guarding " +
 			"test), what it says it observed, and whether it says it restored the control.\n\n")
 		for _, cf := range ev.FixupCounterfactuals {
