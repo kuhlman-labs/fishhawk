@@ -14099,9 +14099,13 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Guarantee the fallback PR title/body (no agent-authored file leaks in
-	// from another run), so the produced bytes are deterministic.
-	_ = os.Remove(pullRequestDescriptionPath(verifiedTreeRunID, verifiedTreeStageID))
-	_ = os.Remove(legacyPullRequestDescriptionPath)
+	// from another run), so the produced bytes are deterministic. Isolation, NOT
+	// deletion: this used to os.Remove the production keyed AND shared legacy
+	// handoffs, which a concurrent real runner or test could be mid-use of. A
+	// per-test temp dir is absent by construction and touches nothing outside the
+	// test; substituteWireHandoffPath restores the production literal the fixture
+	// carries before the byte comparison.
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
 	cfg := config{
 		runID:      verifiedTreeRunID,
 		stageID:    verifiedTreeStageID,
@@ -14118,7 +14122,7 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	if fu.gotPRArgs == nil {
 		t.Fatal("ShipPullRequest not called")
 	}
-	produced := fu.gotPRArgs.Body
+	produced := substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed)
 	goldenPath := wireGoldenHeldCommitPath(t)
 
 	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {
@@ -24766,6 +24770,10 @@ type prBodyHandoffCase struct {
 	// agentAuthored is what prTitleAndBodyParts must report; a title-only
 	// handoff is agent-authored AND a body composition failure.
 	agentAuthored bool
+	// wantLogEvent, when set, is a runner-log event the branch must emit so the
+	// path that actually failed is named somewhere in the trace. Empty means the
+	// branch is fully described by the marker + pr_body_not_composed.
+	wantLogEvent string
 }
 
 func prBodyHandoffCases() []prBodyHandoffCase {
@@ -24788,6 +24796,25 @@ func prBodyHandoffCases() []prBodyHandoffCase {
 				}
 			},
 			want: prBodyReasonHandoffUnreadable,
+		},
+		{
+			name: "legacy_handoff_unreadable",
+			// The keyed path stays ABSENT so the legacy fallback is consulted,
+			// and a DIRECTORY at the legacy path makes ITS os.ReadFile fail
+			// EISDIR. Until the #3012 re-review this branch classified every
+			// legacy read error as handoff_absent, so an unreadable legacy
+			// handoff shipped a marker and an audit record falsely claiming
+			// neither path existed. withPRDescriptionPath has already redirected
+			// legacyPullRequestDescriptionPath into this test's temp dir, so
+			// nothing outside the test is touched.
+			arrange: func(t *testing.T, _ string) {
+				t.Helper()
+				if err := os.Mkdir(legacyPullRequestDescriptionPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:         prBodyReasonHandoffUnreadable,
+			wantLogEvent: "pr_description_legacy_unreadable",
 		},
 		{
 			name: "empty_file",
@@ -24994,6 +25021,11 @@ func TestOpenPRAndShipArtifact_NotComposedPerBranch(t *testing.T) {
 			if got := artifact["pr_body_fallback_reason"]; got != string(tc.want) {
 				t.Errorf("artifact pr_body_fallback_reason = %v, want %q", got, tc.want)
 			}
+			// The marker names the canonical run/stage-keyed path, so a branch
+			// that failed on a DIFFERENT path must name it in the trace itself.
+			if tc.wantLogEvent != "" && !strings.Contains(logs, `"event":"`+tc.wantLogEvent+`"`) {
+				t.Errorf("expected %s naming the path that actually failed:\n%s", tc.wantLogEvent, logs)
+			}
 		})
 	}
 }
@@ -25055,6 +25087,33 @@ const (
 	wireGoldenOrdinaryBaseSHA = "2222222222222222222222222222222222222222"
 )
 
+// wireGoldenProductionHandoffPath is the PRODUCTION run/stage-keyed handoff path
+// the committed wire fixtures name inside the not-composed marker. The golden
+// tests do NOT point the runner at it: they run against an isolated temp dir
+// (withPRDescriptionPath) so nothing can delete or read a live run's handoff, and
+// substituteWireHandoffPath rewrites the temp path back to this literal before
+// the byte comparison. The fixture keeps naming the path an operator will
+// actually see; the test keeps its hands off /tmp.
+func wireGoldenProductionHandoffPath() string {
+	return "/tmp/fishhawk-pr-" + verifiedTreeRunID + "-" + verifiedTreeStageID + ".md"
+}
+
+// substituteWireHandoffPath rewrites the isolated temp-dir handoff path out of a
+// shipped artifact and puts the production literal in its place, at the BYTE
+// level so no re-marshal can perturb the bytes under test.
+//
+// It FAILS when the temp path is absent: without the marker naming it, the
+// substitution would be a silent no-op and the golden comparison would pass on
+// bytes that never contained a handoff path at all — the vacuous-green shape
+// this whole issue is about.
+func substituteWireHandoffPath(t *testing.T, produced []byte, keyed string) []byte {
+	t.Helper()
+	if !bytes.Contains(produced, []byte(keyed)) {
+		t.Fatalf("shipped artifact does not name the isolated handoff path %q, so the golden comparison would be vacuous:\n%s", keyed, produced)
+	}
+	return bytes.ReplaceAll(produced, []byte(keyed), []byte(wireGoldenProductionHandoffPath()))
+}
+
 // normalizeOrdinaryWireArtifact makes the ordinary ship's bytes comparable
 // against a committed fixture. head_sha and base_sha are real commit hashes from
 // a freshly-created temp repo (the commit timestamp is now), so they cannot be
@@ -25104,14 +25163,16 @@ func TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Pin the handoff dir to the PRODUCTION value so the marker's handoff_path
-	// is deterministic, and guarantee both paths are absent so the reason is
-	// handoff_absent rather than whatever another run left behind.
-	origDir := pullRequestDescriptionDir
-	pullRequestDescriptionDir = "/tmp"
-	t.Cleanup(func() { pullRequestDescriptionDir = origDir })
-	_ = os.Remove(pullRequestDescriptionPath(verifiedTreeRunID, verifiedTreeStageID))
-	_ = os.Remove(legacyPullRequestDescriptionPath)
+	// Redirect BOTH handoff paths into a per-test temp dir. The earlier version
+	// of this test pinned the dir to the production /tmp and unconditionally
+	// os.Remove'd the keyed AND the shared legacy handoff, so running it beside a
+	// real runner (or another test) could delete an ACTIVE PR-description handoff
+	// and silently cost that run its Summary, Test plan and `Closes #N` — the
+	// very loss this issue exists to stop. An isolated dir is absent by
+	// construction, needs no deletion, and mutates no process-external state;
+	// substituteWireHandoffPath puts the production literal back before the
+	// comparison so the fixture is unchanged.
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
 
 	var logSink strings.Builder
 	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
@@ -25121,7 +25182,7 @@ func TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	if fu.gotPRArgs == nil {
 		t.Fatal("ShipPullRequest not called")
 	}
-	produced := normalizeOrdinaryWireArtifact(t, fu.gotPRArgs.Body)
+	produced := normalizeOrdinaryWireArtifact(t, substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed))
 	goldenPath := wireGoldenOrdinaryPath(t)
 
 	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {

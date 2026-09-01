@@ -3299,8 +3299,10 @@ components:
             `/tmp/fishhawk-pr-<run>-<stage>.md` handoff nor the legacy fixed path
             existed — the commonest branch, and the one that shipped a
             placeholder body with no Summary, no Test plan and no `Closes #N`
-            with nothing in the trace saying so), `handoff_unreadable` (the keyed
-            path existed but could not be read), `empty_file`, `empty_title`, or
+            with nothing in the trace saying so — BOTH reads must fail not-exist),
+            `handoff_unreadable` (a handoff path existed but could not be read:
+            the keyed path, or the legacy path when the keyed one is absent),
+            `empty_file`, `empty_title`, or
             `body_absent` (a title-only handoff: the agent's title is honoured
             but the PR opens footer-only). OMITTED entirely on every composed
             ship, so a pre-#3012 body is byte-identical.

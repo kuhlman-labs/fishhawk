@@ -9894,10 +9894,14 @@ const (
 	// prBodyReasonNone: the agent authored a non-empty title AND body.
 	prBodyReasonNone prBodyReason = ""
 	// prBodyReasonHandoffAbsent: neither the keyed nor the legacy handoff path
-	// exists. The commonest branch, and the silent one that shipped #3011.
+	// exists — BOTH reads failed not-exist, never merely "the legacy read
+	// errored". The commonest branch, and the silent one that shipped #3011.
 	prBodyReasonHandoffAbsent prBodyReason = "handoff_absent"
-	// prBodyReasonHandoffUnreadable: the keyed path exists but os.ReadFile
-	// failed for a reason other than not-exist (permissions, a directory).
+	// prBodyReasonHandoffUnreadable: a handoff path exists — the keyed one, or
+	// the legacy one when the keyed path is absent — but os.ReadFile failed for
+	// a reason other than not-exist (permissions, a directory). Both paths carry
+	// the SAME reason: the failure is identical and a sixth wire value would buy
+	// nothing the pr_description_legacy_unreadable event does not already say.
 	prBodyReasonHandoffUnreadable prBodyReason = "handoff_unreadable"
 	// prBodyReasonEmptyFile: the handoff was read but is empty after trimming.
 	prBodyReasonEmptyFile prBodyReason = "empty_file"
@@ -9991,6 +9995,27 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		// prompt render (an older agent/prompt) still lands its PR text.
 		legacyRaw, legacyErr := os.ReadFile(legacyPullRequestDescriptionPath)
 		if legacyErr != nil {
+			if !os.IsNotExist(legacyErr) {
+				// The legacy handoff EXISTS but could not be read (permissions,
+				// a directory yielding EISDIR). Classifying this as
+				// handoff_absent — as this branch did until the #3012 re-review
+				// — would put a marker and an audit record on the PR falsely
+				// claiming neither path existed: the same record-asserts-what-
+				// -did-not-happen defect this issue exists to close, one branch
+				// over. It is the SAME failure as an unreadable keyed handoff,
+				// so it carries the same reason rather than a sixth wire value.
+				//
+				// The reason is returned, not logged (the call site owns
+				// pr_body_not_composed once recovery resolves), but the FAILING
+				// path is logged here: the call site's marker names the
+				// canonical run/stage-keyed path, so without this line the
+				// legacy path that actually failed would appear nowhere in the
+				// trace.
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_legacy_unreadable","run_id":%q,"stage_id":%q,"path":%q,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, legacyErr.Error())
+				return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+			}
 			// Neither path present. Historically treated as a silent no-op
 			// ("the agent didn't follow the instruction, or a stage type that
 			// produces no PR"), which is precisely how #3011's placeholder body
