@@ -2015,6 +2015,17 @@ var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-re
 //
 //  9. Audit (ci_failure_retry_dispatched) + best-effort notify the
 //     originating issue.
+//
+// NO BLOCKING-BUDGET ADMISSION RUNS ON THIS PATH (ADR-030, E45.27 / #2878).
+// refusedByBlockingBudget is deliberately NOT called between steps 4 and 6:
+// admission gates whether NEW work starts, and a CI-failure retry is the
+// continuation of a lineage that already passed it. Gating here would strand a
+// red PR — the webhook path carries no budget_override — and the spend is
+// bounded by construction anyway: retry_attempt is parent-derived (step 6) and
+// runs_retry_child_once_idx caps a lineage at max_retries children regardless of
+// delivery volume. Contract: backend/internal/webhook/README.md ("Why the
+// CI-retry paths are exempt"). Pinned by
+// TestCIFailureRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption.
 func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match) error {
 	if m.CheckRunRef == nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
@@ -2694,6 +2705,16 @@ func (d *Dispatcher) writeReviewerMisconfiguredAudit(ctx context.Context, ev Eve
 // audit entry (system actor, AppendGlobalChained — no run row exists
 // yet), WARN-logs, and returns true so the caller skips CreateRun. No
 // HTTP response and no operator override are possible on this path.
+//
+// The CI-retry re-dispatch paths on BOTH forges — handleCIFailureRetry
+// (dispatcher.go) and handleGitLabCIRetry (gitlab_ciretry.go) — deliberately do
+// NOT call this. They continue an already-admitted lineage rather than starting
+// new work (ADR-030, E45.27 / #2878), and their spend is capped per lineage by
+// the parent-derived retry_attempt plus runs_retry_child_once_idx. That
+// exemption is a documented decision, not an omission: see
+// backend/internal/webhook/README.md ("Why the CI-retry paths are exempt"), and
+// the two *_BlockingBudgetExhausted_StillRetries_ADR030Exemption tests that go
+// red if a call is added here.
 func (d *Dispatcher) refusedByBlockingBudget(ctx context.Context, ev Event, m Match, workflow spec.Workflow, specSHA string, now time.Time) bool {
 	if len(workflow.Budgets) == 0 {
 		return false

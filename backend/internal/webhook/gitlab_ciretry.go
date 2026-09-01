@@ -84,6 +84,25 @@ import (
 // authorization binding: both values are readable from a public branch
 // listing.
 
+// BUDGET ADMISSION IS NOT RUN ON THIS PATH (E45.27 / #2878). Like the GitHub
+// retry handler, this one mints its child without calling
+// refusedByBlockingBudget. The blocking periodic-budget seams gate whether NEW
+// work starts; a CI-failure retry continues a lineage that already passed
+// admission, and ADR-030's position is that in-flight work finishes. Gating it
+// would strand a red merge request with no in-product path forward (a webhook
+// trigger cannot carry budget_override), and the fail-open sum would make that
+// stranding nondeterministic. The exemption is bounded by construction rather
+// than by trust: retry_attempt is parent-derived and runs_retry_child_once_idx
+// caps a lineage at on_ci_failure.max_retries children however many deliveries
+// arrive, while opening a NEW lineage still passes the gated create seam. This
+// complements the AUTHORIZATION paragraph above — the population able to reach
+// this path is bound to the installation row's EXACT recorded project path
+// (E45.26 / #2877), not a namespace. Parity with the GitHub path is deliberate
+// here, unlike the pre-flight divergence above. Contract:
+// backend/internal/webhook/README.md ("Why the CI-retry paths are exempt");
+// pinned by
+// TestGitLabCIRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption.
+
 // gitLabRunBranchNamespace is the prefix of every ADR-035 sole-writer run
 // branch. A pipeline ref that does not start with it cannot belong to any run
 // — the first-stage default-ref case.

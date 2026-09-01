@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,10 +17,28 @@ import (
 type budgetStubRuns struct {
 	*stubRuns
 	spent float64
+
+	// sumMu guards sumCalls, which counts every SumWorkflowCostInRange
+	// invocation. It is the sharpest assertion available to the ADR-030
+	// exemption tests below: a retry path that never consults the CostSummer
+	// cannot have been gated by it, whatever the run rows look like
+	// afterwards. Mutex-guarded because Handle may be driven concurrently and
+	// the package runs under -race.
+	sumMu    sync.Mutex
+	sumCalls int
 }
 
 func (s *budgetStubRuns) SumWorkflowCostInRange(_ context.Context, _, _ string, _, _ time.Time) (float64, error) {
+	s.sumMu.Lock()
+	s.sumCalls++
+	s.sumMu.Unlock()
 	return s.spent, nil
+}
+
+func (s *budgetStubRuns) sumCallCount() int {
+	s.sumMu.Lock()
+	defer s.sumMu.Unlock()
+	return s.sumCalls
 }
 
 // blockingBudgetSpec is validSpec's feature_change workflow at v0.4
@@ -250,4 +270,185 @@ func TestHandle_BlockingBudget_GitLabTrigger_UnderLimit_CreatesRun(t *testing.T)
 	if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 0 {
 		t.Errorf("run_rejected_budget audits = %d, want 0 under limit", n)
 	}
+}
+
+// --- ADR-030 continuation exemption, pinned per forge (E45.27 / #2878) ----
+//
+// The two tests below pin a DOCUMENTED DECISION rather than a control: neither
+// CI-failure retry handler runs blocking-budget admission, because a retry
+// continues an already-admitted lineage (ADR-030: in-flight work finishes) and
+// its spend is capped per lineage by the parent-derived retry_attempt plus
+// runs_retry_child_once_idx. The reasoning lives in README.md under "Why the
+// CI-retry paths are exempt"; CHANGING THIS BEHAVIOUR MEANS CHANGING THAT
+// DOCUMENT IN THE SAME COMMIT — inserting a refusedByBlockingBudget call into
+// either handler turns the matching test below red first.
+//
+// Each test proves its OWN over-budget precondition by driving the CREATE seam
+// with the SAME spec and the SAME spend and observing the refusal, so neither
+// can pass because the budget was never actually over. sumCallCount() == 0 is
+// the sharpest assertion: the CostSummer is not consulted at all on a retry.
+
+// TestCIFailureRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption is
+// the GitHub half.
+func TestCIFailureRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption(t *testing.T) {
+	const spent = 999.0 // ciBudgetSpec's weekly blocking limit is 50
+
+	// PRECONDITION, OBSERVED NOT BORROWED: the same spec at the same spend
+	// refuses on the CREATE seam. Without this, a retry that "was not gated"
+	// could simply be a budget that was never over.
+	t.Run("precondition_same_spec_same_spend_refuses_on_create", func(t *testing.T) {
+		d, _, runs, au := newBudgetDispatcher(t, ciBudgetSpec, spent)
+		if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(runs.created) != 0 {
+			t.Fatalf("runs created = %d, want 0 — the fixture's budget is NOT over, so the retry assertions below would be vacuous", len(runs.created))
+		}
+		if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 1 {
+			t.Fatalf("run_rejected_budget audits = %d, want 1 on the create seam", n)
+		}
+		if runs.sumCallCount() == 0 {
+			t.Fatal("CostSummer never consulted on the CREATE seam — the fixture does not reach the budget gate at all")
+		}
+	})
+
+	d, gh, runs, au := newBudgetDispatcher(t, ciBudgetSpec, spent)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs.stubRuns, "kuhlman-labs/fishhawk", ciBudgetSpec, 0)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// (1) the retry child exists at parent.RetryAttempt+1.
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + retry child)", len(runs.created))
+	}
+	child := runs.created[1]
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Fatalf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if child.RetryAttempt != parent.RetryAttempt+1 {
+		t.Errorf("child.RetryAttempt = %d, want %d (parent-derived)", child.RetryAttempt, parent.RetryAttempt+1)
+	}
+	// (2) it actually dispatched.
+	if gh.dispatchCalls != 1 {
+		t.Errorf("dispatch calls = %d, want 1 (the retry stage really fired)", gh.dispatchCalls)
+	}
+	// (3) no budget refusal was recorded.
+	if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 0 {
+		t.Errorf("run_rejected_budget audits = %d, want 0 (a continuation is never gated)", n)
+	}
+	// (4) the dispatch audit says dispatched.
+	if got := ciRetryAuditOutcome(t, au); got != "dispatched" {
+		t.Errorf("ci_failure_retry_dispatched outcome = %q, want %q", got, "dispatched")
+	}
+	// (5) the sharpest pin: the CostSummer was never consulted on this path.
+	if n := runs.sumCallCount(); n != 0 {
+		t.Errorf("SumWorkflowCostInRange calls = %d, want 0 — the CI-retry path must not reach the budget gate at all (ADR-030 / #2878)", n)
+	}
+}
+
+// TestGitLabCIRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption is
+// the GitLab half. Parity with the GitHub test above is the point: the
+// exemption must not be forge-specific in either direction.
+func TestGitLabCIRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption(t *testing.T) {
+	const spent = 999.0 // ciBudgetSpec's weekly blocking limit is 50
+
+	t.Run("precondition_same_spec_same_spend_refuses_on_create", func(t *testing.T) {
+		d, _, runs, au := newBudgetDispatcher(t, ciBudgetSpec, spent)
+		d.GitLabFiles = &stubFileFetcher{content: []byte(ciBudgetSpec), sha: "g1t1absha"}
+		d.GitLabProjects = registeredGitLabProject()
+		if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(runs.created) != 0 {
+			t.Fatalf("runs created = %d, want 0 — the fixture's budget is NOT over, so the retry assertions below would be vacuous", len(runs.created))
+		}
+		if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 1 {
+			t.Fatalf("run_rejected_budget audits = %d, want 1 on the GitLab create seam", n)
+		}
+		if runs.sumCallCount() == 0 {
+			t.Fatal("CostSummer never consulted on the GitLab CREATE seam — the fixture does not reach the budget gate at all")
+		}
+	})
+
+	d, _, runs, au := newBudgetDispatcher(t, ciBudgetSpec, spent)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.GitLabFiles = &stubFileFetcher{content: []byte(ciBudgetSpec), sha: "g1t1absha"}
+	d.GitLabProjects = registeredGitLabProject()
+	trigger := &stubPipelineTrigger{}
+	d.GitLabTrigger = trigger
+
+	parent := seedGitLabRun(t, runs.stubRuns, arts, "acme/widgets", "deadbeef", 0, 0)
+	// seedGitLabRun hardcodes ciRetrySpec (no budgets); the budget must be in
+	// the PARENT's cached spec because that is what resolveRetryPolicy reads.
+	// stubRuns retains the pointer it was handed (ListRuns returns the same
+	// *run.Run), so this overwrite is what the handler sees — verified rather
+	// than assumed, and the precondition sub-test plus the sumCallCount
+	// assertion would both fail loudly if it were not.
+	parent.WorkflowSpec = []byte(ciBudgetSpec)
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// (1) the retry child exists at parent.RetryAttempt+1.
+	children := retryChildren(runs.stubRuns, 1)
+	if len(children) != 1 {
+		t.Fatalf("retry children = %d, want 1 (retry NOT gated by an exhausted budget)", len(children))
+	}
+	child := children[0]
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Fatalf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if child.RetryAttempt != parent.RetryAttempt+1 {
+		t.Errorf("child.RetryAttempt = %d, want %d (parent-derived)", child.RetryAttempt, parent.RetryAttempt+1)
+	}
+	// (2) a pipeline was actually triggered.
+	if n := trigger.callCount(); n != 1 {
+		t.Errorf("pipeline trigger calls = %d, want 1 (the retry really fired)", n)
+	}
+	// (3) no budget refusal was recorded.
+	if n := countDispatchGlobalAudits(au, "run_rejected_budget"); n != 0 {
+		t.Errorf("run_rejected_budget audits = %d, want 0 (a continuation is never gated)", n)
+	}
+	// (4) the dispatch audit says dispatched.
+	if got := ciRetryAuditOutcome(t, au); got != "dispatched" {
+		t.Errorf("ci_failure_retry_dispatched outcome = %q, want %q", got, "dispatched")
+	}
+	// (5) the sharpest pin: the CostSummer was never consulted on this path.
+	if n := runs.sumCallCount(); n != 0 {
+		t.Errorf("SumWorkflowCostInRange calls = %d, want 0 — the GitLab CI-retry path must not reach the budget gate at all (ADR-030 / #2878)", n)
+	}
+}
+
+// ciRetryAuditOutcome returns the `outcome` recorded on the single
+// ci_failure_retry_dispatched chained audit row, failing if there is not
+// exactly one. Both exemption tests read it so a retry that was minted but
+// audited as dispatch_failed cannot pass as a healthy continuation.
+func ciRetryAuditOutcome(t *testing.T, au *stubAudit) string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	found := 0
+	outcome := ""
+	for _, a := range au.appended {
+		if a.Category != "ci_failure_retry_dispatched" {
+			continue
+		}
+		found++
+		var payload map[string]any
+		if err := json.Unmarshal(a.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal ci_failure_retry_dispatched payload: %v", err)
+		}
+		outcome, _ = payload["outcome"].(string)
+	}
+	if found != 1 {
+		t.Fatalf("ci_failure_retry_dispatched audit rows = %d, want 1", found)
+	}
+	return outcome
 }
