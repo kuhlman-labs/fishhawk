@@ -624,3 +624,94 @@ extraction risks perturbing `buildPlan`'s golden-pinned bytes.
 context and renders a groom stage as an ordinary plan. Widening the preview to
 resolve documents (and then fork) is #2804's, not this slice's; the preview stays
 byte-identical to today.
+
+## Live-validation markers in the review prompt (#2978)
+
+`writeAcceptanceCriteriaForReview` renders three acceptance-criterion markers
+the reviewer was previously never shown. Each is emitted only when set, in a
+fixed order, appended after the existing `verify_hint` segment on the criterion
+line:
+
+1. ` skip_expected: true` — when `SkipExpected`.
+2. ` expectation_basis: <text>` — when `ExpectationBasis` is non-empty.
+3. ` requires_live_validation: true (DECLARED OPERATOR WALK — …)` — when
+   `RequiresLiveValidation`, carrying the inline annotation
+   (`liveValidationCriterionAnnotation`) that names WHY no verification step
+   decides the criterion.
+
+**Why the reviewer needs it.** The markers were dropped on the floor: the line
+carried only id, statement, source, source_ref, blocking, rationale and
+verify_hint. A diff-only reviewer cannot infer a flag from the approach steps,
+so it read a correctly-flagged live-target criterion as an unverified blocking
+criterion and rejected — five identical rejects in one campaign (#2978, runs
+001c7d71, 4450a5d3, 8288446b, b9c22317, d2143e05).
+
+**Division of labour with the deterministic gate.** `backend/internal/plan`'s
+`missing_live_validation_marker` rule reports the UNFLAGGED shape (#2845) and
+already reaches the reviewer through the gate-evidence block. The prompt change
+explains the FLAGGED one. No gate rule changed; the two are complements, and
+`TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated` pins both halves
+in one prompt.
+
+**Instruction side.** `buildPlanReview` gains review-criteria item 13
+(`liveValidationChecklistItem`) and one verdict-decision-rule clause
+(`liveValidationVerdictClause`). The clause's suppression is deliberately
+NARROW and says so in its own words: it covers only coverage/verification-gap
+concerns arising from the MARKING ITSELF, and leaves testability, independence
+and falsifiability findings about the criterion's statement text untouched —
+over-correcting a reviewer into silence is the mirror image of the defect this
+closes. Item 13 names the three shapes that ARE still defects (an unmarked
+live-target criterion; a marked criterion whose `verify_hint` names no
+executable walk; a marker dodging a check the sandbox could perform). Both
+constants' verbatim text is asserted by
+`TestBuild_PlanReview_LiveValidationChecklistItem`, so a reword cannot quietly
+widen the suppression.
+
+**Byte-identity, scoped honestly.** The additive guarantee covers a
+MARKER-FREE criterion: a criterion with none of the three fields set renders
+byte-identical to the pre-#2978 line, which
+`TestBuild_PlanReview_LiveValidationRenderIsAdditive` pins by stripping exactly
+the three segments from the marked prompt and comparing to the unmarked one. It
+does NOT claim every existing prompt is unchanged — a plan CARRYING markers
+renders longer by construction, and the instruction block is unconditional, so
+`TestBuild_PlanReview_TrimmedBelowBaseline`'s `preTrimBaselineLen` moved by the
+1333 bytes item 13 and the verdict clause add (the same convention #1533 and
+#2290 followed).
+
+The marker-bearing-fixture enumeration approval condition (2) asked for has a
+short answer, and it corrects the condition's own premise. The condition named
+`TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders` (the all-skip
+consequence test, #3026) as a test that "necessarily sets both on every
+criterion". It does not: it sets `AllSkipShortCircuit` and an
+`all_criteria_skip_expected` finding on the GATE-EVIDENCE struct
+(`AcceptancePrecheckEvidence`) — the precheck's REPORT that the plan is all-skip
+— while its plan is a bare `fixturePlan()` whose criteria set none of
+`SkipExpected` / `ExpectationBasis` / `RequiresLiveValidation`. The two live on
+different structs, and only the criterion fields reach
+`writeAcceptanceCriteriaForReview`. Enumerating the package by grep on all three
+field names returns exactly one site: `planWithLiveValidationCriterion`, the
+helper this change added. `prompt_test.go` is the package's only test file. So
+the enumeration is empty, no existing test needed updating, and no existing
+assertion was touched.
+
+**Reach.** `writeAcceptanceCriteriaForReview` is called from
+`writePlanForReview`, which three builders use — plan review, implement review,
+and the scope-exemption review — so the marker rendering lands in all three.
+That is intended: the implement reviewer benefits from the same context. The
+item-13 instruction and verdict clause are plan-review only.
+`TestBuild_ImplementReview_LiveValidationFlagsRendered` pins the implement-review
+half directly — the marked criterion's line carries the three segments, and the
+marker-free control's line carries none — so the "all three" claim rests on an
+assertion rather than on reading the call graph. The scope-exemption builder
+remains covered by reading alone: it reaches the same
+`writePlanForReview` → `writeAcceptanceCriteriaForReview` path, and the two
+asserted builders are what make that shared writer's behaviour observable.
+
+Caveat worth stating plainly: this is a prompt INSTRUCTION to an LLM reviewer,
+not an enforced control. The tests prove the markers and the instruction render
+in the shipped prompt; they cannot prove a reviewer obeys them. The failure
+direction is unchanged and safe — at worst the next campaign reproduces today's
+spurious reject, which the operator already overrules. Falsifiable check: if a
+reject on the flagged-criterion premise recurs after this ships, the
+informational fix was insufficient and the next step is a deterministic
+gate-side suppression rather than more prompt text.

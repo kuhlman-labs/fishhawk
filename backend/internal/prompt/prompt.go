@@ -4211,13 +4211,19 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("11. **Independence**: criteria state observable outcomes, not restatements of the approach steps " +
 		"(a criterion that merely says 'the code in step N was written' flags).\n")
 	b.WriteString("12. **Falsifiability**: each criterion can concretely FAIL — a vacuously-true criterion (one no " +
-		"implementation could violate) flags.\n\n")
+		"implementation could violate) flags.\n")
+	// #2978: the reviewer is now shown the three acceptance-criterion markers
+	// on the criterion line, so it also needs to be told what a
+	// requires_live_validation marking MEANS — five identical rejects read a
+	// correctly-flagged live-target criterion as an unverified one.
+	b.WriteString(liveValidationChecklistItem)
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
 	b.WriteString("- `approve`: all criteria met or concerns cosmetic.\n")
 	b.WriteString("- `approve_with_concerns`: implementable with non-blocking gaps; record each as a concern.\n")
 	b.WriteString("- `reject`: one or more blocking problems; record each as a `high`-severity concern.\n\n")
+	b.WriteString(liveValidationVerdictClause)
 
 	b.WriteString("Emit your verdict now. JSON only, no surrounding prose.\n")
 	return b.String()
@@ -5707,6 +5713,44 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 	}
 }
 
+// liveValidationCriterionAnnotation is the criterion-line segment rendered for
+// a criterion marked requires_live_validation (#2978). It carries the marker
+// itself plus the inline DECLARED OPERATOR WALK annotation that tells a
+// diff-only reviewer why no verification step decides the criterion. The
+// annotation token is deliberately distinct from the review-criteria item 13
+// wording ("Declared operator walks") so a test can assert on the criterion
+// line without matching the instruction block.
+const liveValidationCriterionAnnotation = " requires_live_validation: true (DECLARED OPERATOR WALK — the sandbox cannot " +
+	"stand up this target; a tracked operator-validation walk is auto-filed on plan approval, so this is NOT a " +
+	"coverage defect)"
+
+// liveValidationChecklistItem is review-criteria item 13 in the plan-review
+// prompt (#2978): it tells the reviewer that a requires_live_validation
+// marking is a declared operator walk rather than a coverage gap, and names
+// the three shapes that ARE still defects so the instruction does not
+// over-correct the reviewer into silence.
+const liveValidationChecklistItem = "13. **Declared operator walks**: a criterion marked `requires_live_validation` " +
+	"(paired with `skip_expected` + `expectation_basis`) is a DECLARED operator-validation walk, not a coverage " +
+	"gap — the acceptance sandbox is default-deny and provably cannot reach a live forge, cluster, or deployed " +
+	"target, and the marking is what files the tracked walk. The absence of a verification step deciding such a " +
+	"criterion is NOT a defect and MUST NOT be recorded as a coverage concern. These ARE still defects — flag " +
+	"them: (a) a criterion that needs a live target but carries no `requires_live_validation` marker (the plan " +
+	"gate reports this as the `missing_live_validation_marker` finding); (b) a marked criterion whose " +
+	"`verify_hint` names no executable walk, so the operator cannot actually perform it; (c) a marker used to " +
+	"dodge a check the sandbox COULD perform.\n\n"
+
+// liveValidationVerdictClause is the plan-review verdict-decision-rule clause
+// that closes the observed failure (#2978): all five instances were rejects,
+// not concerns. The suppression is NARROW by construction — it covers only
+// coverage/verification-gap concerns arising from the MARKING ITSELF, and says
+// so explicitly, so a legitimate testability/independence/falsifiability
+// finding about the criterion's own statement text is still recorded.
+const liveValidationVerdictClause = "- A criterion's `requires_live_validation` marking is never, on its own, grounds " +
+	"for `reject`, nor on its own grounds for a coverage or verification-gap concern. That suppression is narrow: " +
+	"it covers ONLY coverage/verification-gap concerns arising from the MARKING ITSELF (record those only under " +
+	"the three cases in criterion 13). Concerns about the marked criterion's own statement text — testability, " +
+	"independence, falsifiability — are unaffected; keep recording them.\n\n"
+
 // writeAcceptanceCriteriaForReview renders a plan's typed
 // verification.acceptance_criteria (and out_of_scope) for the review-agent
 // prompt (#1533). One line per criterion carries id, statement, source
@@ -5715,6 +5759,15 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 // so the reviewer can decide the semantic checklist. Renders nothing when
 // the plan carries neither criteria nor out_of_scope, keeping older plans
 // byte-identical to the pre-#1533 output.
+//
+// The line also carries the three acceptance-criterion markers the reviewer
+// was previously never shown (#2978): skip_expected, expectation_basis and
+// requires_live_validation, the last with an inline DECLARED OPERATOR WALK
+// annotation. A diff-only reviewer cannot infer those flags from the approach
+// steps, so it read a correctly-flagged live-target criterion as an unverified
+// blocking criterion and rejected. Each segment is emitted ONLY when its
+// marker is set, in a fixed order, so a marker-free criterion's line stays
+// byte-identical to the pre-#2978 output and the rendering stays replay-stable.
 func writeAcceptanceCriteriaForReview(b *strings.Builder, v plan.Verification) {
 	if len(v.AcceptanceCriteria) == 0 && len(v.OutOfScope) == 0 {
 		return
@@ -5733,6 +5786,15 @@ func writeAcceptanceCriteriaForReview(b *strings.Builder, v plan.Verification) {
 			}
 			if c.VerifyHint != "" {
 				fmt.Fprintf(b, " verify_hint: %s", c.VerifyHint)
+			}
+			if c.SkipExpected {
+				b.WriteString(" skip_expected: true")
+			}
+			if c.ExpectationBasis != "" {
+				fmt.Fprintf(b, " expectation_basis: %s", c.ExpectationBasis)
+			}
+			if c.RequiresLiveValidation {
+				b.WriteString(liveValidationCriterionAnnotation)
 			}
 			b.WriteString("\n")
 		}

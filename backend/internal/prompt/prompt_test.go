@@ -4654,6 +4654,228 @@ func TestBuild_PlanReview_AcceptanceChecklistItems(t *testing.T) {
 	}
 }
 
+// planWithLiveValidationCriterion returns fixturePlan carrying ONE criterion
+// with all three acceptance-criterion markers set (#2978): the shape a
+// diff-only reviewer previously read as an unverified blocking criterion.
+// marked=false leaves the three fields at their zero values, giving the
+// unflagged control by construction rather than via a setup guard.
+func planWithLiveValidationCriterion(marked bool) *plan.Plan {
+	p := fixturePlan()
+	blocking := true
+	c := plan.AcceptanceCriterion{
+		ID:         "lv1",
+		Statement:  "helm install against a live cluster brings the release to Deployed",
+		Source:     plan.CriterionSourceInferred,
+		Rationale:  "the change ships a chart the sandbox cannot stand up",
+		Blocking:   &blocking,
+		VerifyHint: "operator runs scripts/dev k8s and reads helm status",
+	}
+	if marked {
+		c.SkipExpected = true
+		c.ExpectationBasis = "rendered output pinned by scripts/test-helm-render"
+		c.RequiresLiveValidation = true
+	}
+	p.Verification.AcceptanceCriteria = []plan.AcceptanceCriterion{c}
+	return p
+}
+
+// criterionLine returns the single rendered "Acceptance criteria:" line for
+// criterion id, so a negative assertion measures the CRITERION LINE and not
+// the review-criteria instruction block, which legitimately contains the same
+// marker tokens (binding approval condition 4).
+func criterionLine(t *testing.T, prompt, id string) string {
+	t.Helper()
+	prefix := "- [" + id + "] "
+	for _, ln := range strings.Split(prompt, "\n") {
+		if strings.HasPrefix(ln, prefix) {
+			return ln
+		}
+	}
+	t.Fatalf("no rendered criterion line for %q in prompt:\n%s", id, prompt)
+	return ""
+}
+
+// TestBuild_PlanReview_LiveValidationFlagsRendered pins that the three
+// acceptance-criterion markers reach the reviewer on the criterion line, in a
+// fixed order, with the DECLARED OPERATOR WALK annotation (#2978). Asserted
+// positionally so a reordering or a duplicated render fails.
+func TestBuild_PlanReview_LiveValidationFlagsRendered(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: planWithLiveValidationCriterion(true)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := criterionLine(t, got, "lv1")
+
+	segments := []string{
+		" verify_hint: operator runs scripts/dev k8s and reads helm status",
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		" requires_live_validation: true (DECLARED OPERATOR WALK",
+		"a tracked operator-validation walk is auto-filed on plan approval, so this is NOT a coverage defect)",
+	}
+	prev := -1
+	for _, seg := range segments {
+		i := strings.Index(line, seg)
+		if i < 0 {
+			t.Fatalf("criterion line missing segment %q:\n%s", seg, line)
+		}
+		if strings.Contains(line[i+len(seg):], seg) {
+			t.Errorf("segment %q rendered more than once:\n%s", seg, line)
+		}
+		if i <= prev {
+			t.Errorf("segment %q is out of order (index %d, previous %d):\n%s", seg, i, prev, line)
+		}
+		prev = i
+	}
+}
+
+// TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated pins the second
+// half of the done-means: the #2845 shape — a live-target criterion carrying
+// NONE of the markers — is still presented as an unverified criterion, and the
+// deterministic missing_live_validation_marker finding still reaches the
+// reviewer naming the criterion id. Negative assertions are scoped to the
+// criterion LINE (approval condition 4).
+func TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: planWithLiveValidationCriterion(false),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID: "acceptance",
+				CriteriaCount:     1,
+				BlockingCount:     1,
+				Findings: []AcceptanceFindingEvidence{{
+					Rule:        plan.RuleMissingLiveValidationMarker,
+					CriterionID: "lv1",
+					Detail:      "statement names a live target but the criterion carries no requires_live_validation marker",
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := criterionLine(t, got, "lv1")
+	for _, unwanted := range []string{"skip_expected", "expectation_basis", "requires_live_validation", "DECLARED OPERATOR WALK"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("unflagged criterion line must not carry %q:\n%s", unwanted, line)
+		}
+	}
+	wantFinding := "- FINDING " + plan.RuleMissingLiveValidationMarker + " (criterion: lv1): " +
+		"statement names a live target but the criterion carries no requires_live_validation marker"
+	if !strings.Contains(got, wantFinding) {
+		t.Errorf("gate evidence missing the unflagged-shape finding %q:\n%s", wantFinding, got)
+	}
+}
+
+// TestBuild_PlanReview_LiveValidationChecklistItem pins the SHIPPED WORDING of
+// review-criteria item 13 and of the verdict-rule clause (#2978). The exact
+// strings are asserted, not paraphrases, so a later reword cannot quietly
+// widen the narrow suppression (binding approval condition 3).
+func TestBuild_PlanReview_LiveValidationChecklistItem(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	const wantItem = "13. **Declared operator walks**: a criterion marked `requires_live_validation` " +
+		"(paired with `skip_expected` + `expectation_basis`) is a DECLARED operator-validation walk, not a coverage " +
+		"gap — the acceptance sandbox is default-deny and provably cannot reach a live forge, cluster, or deployed " +
+		"target, and the marking is what files the tracked walk. The absence of a verification step deciding such a " +
+		"criterion is NOT a defect and MUST NOT be recorded as a coverage concern. These ARE still defects — flag " +
+		"them: (a) a criterion that needs a live target but carries no `requires_live_validation` marker (the plan " +
+		"gate reports this as the `missing_live_validation_marker` finding); (b) a marked criterion whose " +
+		"`verify_hint` names no executable walk, so the operator cannot actually perform it; (c) a marker used to " +
+		"dodge a check the sandbox COULD perform.\n\n"
+	if !strings.Contains(got, wantItem) {
+		t.Errorf("plan_review prompt missing review-criteria item 13 verbatim:\n%s", got)
+	}
+
+	const wantClause = "- A criterion's `requires_live_validation` marking is never, on its own, grounds " +
+		"for `reject`, nor on its own grounds for a coverage or verification-gap concern. That suppression is narrow: " +
+		"it covers ONLY coverage/verification-gap concerns arising from the MARKING ITSELF (record those only under " +
+		"the three cases in criterion 13). Concerns about the marked criterion's own statement text — testability, " +
+		"independence, falsifiability — are unaffected; keep recording them.\n\n"
+	if !strings.Contains(got, wantClause) {
+		t.Errorf("plan_review prompt missing the verdict-rule live-validation clause verbatim:\n%s", got)
+	}
+
+	// The clause belongs to the verdict decision rule, after the reject bullet.
+	iReject := strings.Index(got, "- `reject`: one or more blocking problems")
+	iClause := strings.Index(got, wantClause)
+	iItem := strings.Index(got, wantItem)
+	if iItem < 0 || iReject < 0 || iClause < 0 || iItem >= iReject || iReject >= iClause {
+		t.Errorf("item 13 / reject bullet / verdict clause are misordered: item=%d reject=%d clause=%d", iItem, iReject, iClause)
+	}
+}
+
+// TestBuild_PlanReview_LiveValidationRenderIsAdditive pins the additive
+// property SCOPED TO A MARKER-FREE CRITERION (#2978): the marked prompt
+// reduces to the unmarked prompt when exactly the three rendered segments are
+// removed, so no other prompt byte moved for a plan carrying no markers.
+func TestBuild_PlanReview_LiveValidationRenderIsAdditive(t *testing.T) {
+	mk := func(marked bool) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: planWithLiveValidationCriterion(marked)})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+	on, off := mk(true), mk(false)
+	stripped := on
+	for _, seg := range []string{
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		liveValidationCriterionAnnotation,
+	} {
+		stripped = strings.Replace(stripped, seg, "", 1)
+	}
+	if stripped != off {
+		t.Error("the marker rendering is not a clean additive insertion over the marker-free prompt")
+	}
+}
+
+// TestBuild_ImplementReview_LiveValidationFlagsRendered pins the positive half
+// of the reach claim (#2978): the markers land in the implement-review prompt
+// too, because writeAcceptanceCriteriaForReview is reached from
+// writePlanForReview, which all three review builders call. Without this, only
+// the plan-review path was asserted and the README's "all three" claim rested
+// on reading rather than on a test. The marker-free control pins the other
+// half — an unmarked plan's implement_review criterion line is unchanged.
+func TestBuild_ImplementReview_LiveValidationFlagsRendered(t *testing.T) {
+	mk := func(marked bool) string {
+		t.Helper()
+		got, err := Build("implement_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: planWithLiveValidationCriterion(marked),
+			Diff:         "- M pkg/bar/bar.go\n",
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	marked := criterionLine(t, mk(true), "lv1")
+	for _, seg := range []string{
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		liveValidationCriterionAnnotation,
+	} {
+		if !strings.Contains(marked, seg) {
+			t.Errorf("implement_review criterion line missing segment %q:\n%s", seg, marked)
+		}
+	}
+
+	unmarked := criterionLine(t, mk(false), "lv1")
+	for _, unwanted := range []string{"skip_expected", "expectation_basis", "requires_live_validation", "DECLARED OPERATOR WALK"} {
+		if strings.Contains(unmarked, unwanted) {
+			t.Errorf("marker-free implement_review criterion line must not carry %q:\n%s", unwanted, unmarked)
+		}
+	}
+}
+
 func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// #606: the verbose verdict-schema / review-criteria / decision-rule
 	// preamble was trimmed to lower the per-call token cost on the local
@@ -4696,7 +4918,13 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// framing + BEGIN/END delimiters, minus the 36 bytes the raw body write
 	// used): the envelope is in the current (trimmed) prompt AND would be in
 	// the untrimmed version, so the baseline moves with it (5362 + 746).
-	const preTrimBaselineLen = 6108
+	// #2978 raised it by the 1333 bytes the live-validation instruction adds
+	// (review-criteria item 13 at 858 bytes plus the verdict-rule clause at 476,
+	// less the 1 byte item 12 gave up when its trailing blank line moved onto
+	// item 13): like the blocks above, both are in the current (trimmed) prompt
+	// AND would be in the untrimmed version, so the baseline moves with them
+	// (6108 + 1333).
+	const preTrimBaselineLen = 7441
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
