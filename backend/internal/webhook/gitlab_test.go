@@ -104,8 +104,10 @@ const (
 
 	// The three fixtures below pin the Pipeline Hook REF SHAPES the CI-retry
 	// classification turns on (E45.30 / #2881). Read what they do and do NOT
-	// prove: each pins a TRANSCRIPTION (or, where said so below, an INFERENCE)
-	// and the parse built on it. None of them independently confirms that GitLab
+	// prove: each pins a TRANSCRIPTION, an ADAPTATION of one, or an INFERENCE —
+	// stated per fixture below — and the parse built on it. Only
+	// glMergeRequestPipelineFixture is transcribed value-for-value from an
+	// upstream example. None of them independently confirms that GitLab
 	// emits that shape — no test in this repository observes a live delivery.
 	// The per-fixture URL is what makes a wrong transcription DETECTABLE by a
 	// reader checking it against upstream; it is a review aid, not an automated
@@ -113,9 +115,18 @@ const (
 	// matchers read.
 
 	// glBranchPipelineFixture — a BRANCH pipeline on a Fishhawk run branch.
-	// Transcribed from the "Pipeline events" example on GitLab's webhook events
-	// reference (https://docs.gitlab.com/user/project/integrations/webhook_events/):
-	// object_attributes.source = "push", and NO top-level merge_request block.
+	//
+	// THIS FIXTURE IS ADAPTED, NOT TRANSCRIBED VERBATIM. Its FIELD NAMES and
+	// structure are transcribed from the "Pipeline events" example on GitLab's
+	// webhook events reference
+	// (https://docs.gitlab.com/user/project/integrations/webhook_events/), but
+	// that page's single pipeline example is a MERGE-REQUEST pipeline, so two
+	// VALUES here are substitutions rather than fields lifted from it: ref is a
+	// Fishhawk-namespaced run branch ("fishhawk/run-abcdef12"), which no upstream
+	// example can contain, and source = "push" is set to exercise the run-branch
+	// arm. The absence of a top-level merge_request block follows from that
+	// substitution. Do not read this fixture as an upstream-confirmed branch
+	// pipeline payload; it is the documented SHAPE with run-branch values in it.
 	glBranchPipelineFixture = `{
 		"object_kind": "pipeline",
 		"object_attributes": {
