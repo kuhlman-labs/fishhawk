@@ -3090,6 +3090,95 @@ func TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading
 	}
 }
 
+// behaviorClaimSweepHeading is the single heading constant shared by the #3013
+// presence and absence assertions, so the absence half cannot pass vacuously on
+// a typo'd literal that never matches the rendered prompt either way.
+const behaviorClaimSweepHeading = "### Behavior-change claim sweep — confirm in your PR Notes"
+
+// TestBuild_Implement_BehaviorClaimSweep_Rendered pins the #3013 sweep block on
+// the FULL implement path. It asserts the heading AND five phrase-level wants
+// carrying the load-bearing content — not just the heading — so a comment-only
+// no-op touch of prompt.go that adds no WriteString leaves every want missing.
+// Deleting the writeBehaviorClaimSweep call in buildImplement reddens this.
+func TestBuild_Implement_BehaviorClaimSweep_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil: the block is unconditional.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		behaviorClaimSweepHeading,
+		"the RATIONALE is part of the claim",            // rule (a)
+		"sweep repo-wide, NOT file-local",               // rule (b)
+		"documented COMMAND is checkable by RUNNING it", // rule (c)
+		"NAME the sites you",                            // rule (d) left-alone sites
+		"pin the FACT it depends on with a test",        // escalation: pin the fact
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing behavior-claim-sweep string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_BehaviorClaimSweep_RenderedOnFixup pins the #3013 sweep on
+// the FIX-UP path (buildImplementFixup), deliberately unlike the fix-up-exempt
+// #1199 checklist. Because this test and _Rendered drive two DIFFERENT builders
+// through two DIFFERENT call sites, deleting either single call site reddens
+// exactly one of them — that is the discrimination.
+func TestBuild_Implement_BehaviorClaimSweep_RenderedOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, behaviorClaimSweepHeading) {
+		t.Errorf("fix-up prompt missing behavior-claim-sweep heading %q\n---\n%s", behaviorClaimSweepHeading, got)
+	}
+	if !strings.Contains(got, "Report BOTH the claims you corrected AND the sites you deliberately left alone") {
+		t.Errorf("fix-up prompt must carry the sweep's report-both instruction\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_BehaviorClaimSweep_AbsentFromPlanPrompt is the self-paired
+// presence/absence case (#3013): the block is implement-scoped, so it must be
+// ABSENT from the plan prompt (which carries the frozen
+// testdata/plan-prompt-pre-change.golden) and PRESENT on the implement prompt,
+// asserted with the SAME heading constant so a typo'd literal cannot green the
+// absence half vacuously.
+func TestBuild_Implement_BehaviorClaimSweep_AbsentFromPlanPrompt(t *testing.T) {
+	planPrompt, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if strings.Contains(planPrompt, behaviorClaimSweepHeading) {
+		t.Errorf("plan prompt must NOT carry the implement-scoped behavior-claim-sweep heading:\n%s", planPrompt)
+	}
+	implementPrompt, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	if !strings.Contains(implementPrompt, behaviorClaimSweepHeading) {
+		t.Errorf("implement prompt must carry the behavior-claim-sweep heading (proves the absence half is not vacuous):\n%s", implementPrompt)
+	}
+}
+
 func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
 	concerns := []FixupConcern{
 		{Text: "[high/security] missing authz check on the fixup endpoint"},

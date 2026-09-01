@@ -1883,6 +1883,11 @@ func buildImplement(t Trigger) string {
 	if t.ImplementRunID != "" && t.ImplementStageID != "" {
 		writeCounterfactualSidecar(&b, t)
 	}
+
+	// Behavior-change claim sweep (#3013): the no-assertion-at-all sibling of the
+	// counterfactual block. Rendered on the full implement path here and — like
+	// writeCounterfactualDiscipline — ALSO on the fix-up path (see buildImplementFixup).
+	writeBehaviorClaimSweep(&b)
 	return b.String()
 }
 
@@ -2275,6 +2280,43 @@ func writeCounterfactualSidecar(b *strings.Builder, t Trigger) {
 		"not runner observations.\n")
 	b.WriteString("- This sidecar is ADVISORY evidence. It does NOT fail, re-open, or re-budget this pass — " +
 		"report truthfully.\n")
+}
+
+// writeBehaviorClaimSweep renders the tail "### Behavior-change claim sweep"
+// block (#3013): the no-assertion-at-all sibling of writeCounterfactualDiscipline.
+// Where #2444 attacks a test that passes with its control deleted, #3013 attacks
+// a claim with NO assertion over it at all — prose or a code comment asserting the
+// OLD behavior, which a behavior change leaves standing and wrong because the
+// sentence is not in the diff and nothing anywhere fails on it. The five #3013
+// instances motivate the four rules: (1) reading a documented command instead of
+// running it; (2)/(5) a claim duplicated across sites so a file-local sweep misses
+// copies; (3) the same false claim living in six places; (4) correcting a
+// sentence's FACTS while leaving its now-hollow ARGUMENT standing.
+//
+// Like writeCounterfactualDiscipline it renders on BOTH the full implement path
+// AND the fix-up path (see the buildImplement / buildImplementFixup call sites):
+// a fix-up changes observable behavior too and sits downstream of every plan-gate
+// condition, so a claim a fix-up invalidates would otherwise escape the sweep
+// entirely — the same reasoning that put writeCounterfactualDiscipline on the
+// fix-up path for #2453. It is deliberately NOT rendered on the plan or review
+// paths (a plan proposes, it does not change behavior yet) and is nil-gated on
+// nothing.
+func writeBehaviorClaimSweep(b *strings.Builder) {
+	b.WriteString("\n### Behavior-change claim sweep — confirm in your PR Notes\n\n")
+	b.WriteString("When this pass changes observable behavior, the prose asserting the OLD behavior is not in your diff and nothing anywhere will fail on it — so it " +
+		"stays standing and wrong. For EACH behavior you changed, grep the WHOLE repository (docs/, package README.md files, AGENTS.md, code comments, and any " +
+		"documented command) for claims about the old behavior and correct every hit. Four rules drawn from the instances this closes: " +
+		"(a) the RATIONALE is part of the claim — a sentence whose facts you corrected but whose ARGUMENT has stopped holding is still wrong and now looks " +
+		"updated, so re-read what each corrected sentence is ARGUING, not just the number in it; " +
+		"(b) sweep repo-wide, NOT file-local — one claim is routinely duplicated across a code comment, a README and a doc, and correcting one copy leaves the rest " +
+		"standing; " +
+		"(c) a documented COMMAND is checkable by RUNNING it — run it rather than reading it, because a command that no longer does what its prose says is a claim too; " +
+		"(d) a site already correctly CONDITIONED on the new behavior needs NO edit, and knowing which site to leave alone is the harder half — so NAME the sites you " +
+		"inspected and deliberately left alone, not only the ones you changed. " +
+		"Where a claim is load-bearing, do not rely on this sweep next time: pin the FACT it depends on with a test whose failure message NAMES every prose site to " +
+		"update (the backend/internal/spec TestShippedSpecDeclaresWorkflowV2 shape), or DERIVE the prose from the canonical source (cli/internal/docgen + " +
+		"scripts/gen-site-reference) — never a brittle full-sentence assertion, which the next copy-edit silently deletes. " +
+		"Report BOTH the claims you corrected AND the sites you deliberately left alone in your PR `## Notes` (#3013).\n")
 }
 
 // maxScopePathBytes caps ONE rendered carry-forward / dropped path (#2516).
@@ -2985,6 +3027,13 @@ func buildImplementFixup(t Trigger) string {
 	// condition, so a control a fix-up introduces (e.g. #2453's cert/key
 	// correspondence check) needs the same execute-and-record discipline.
 	writeCounterfactualDiscipline(&b)
+
+	// Behavior-change claim sweep (#3013): DELIBERATELY rendered on the fix-up
+	// path too, for the same reason as writeCounterfactualDiscipline above — a
+	// fix-up changes observable behavior and sits downstream of every plan-gate
+	// condition. Kept BEFORE writeGitOpsProhibition so the git-ops prohibition
+	// stays last on this path.
+	writeBehaviorClaimSweep(&b)
 
 	writeGitOpsProhibition(&b)
 	return b.String()
