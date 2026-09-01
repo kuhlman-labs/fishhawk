@@ -367,12 +367,27 @@ Layered on top is a known-secret denylist (`gateEnvDeny`) plus a `GOOGLE_` deny
 credentials out even if a future allow-rule re-widens. There is no Go toolchain
 variable named `GOOGLE_*`, so the prefix is unambiguous.
 
+**Global/system git config is neutralized (`gateEnvGitConfigPins`, #912 / #3102).**
+After the allow-list loop, `sanitizeEnv` appends `GIT_CONFIG_GLOBAL=/dev/null`
+and `GIT_CONFIG_SYSTEM=/dev/null` so a gate child's temp-repo `git commit` reads
+an empty git configuration and cannot inherit the operator's global
+`commit.gpgsign` + `gpg.ssh.program` — whose signing agent may be down, which
+would fail every such commit and misclassify the stage category B (#3102).
+Default-deny alone does NOT achieve this: the loop drops any inherited
+`GIT_CONFIG_*` (neither key is on any allow-list), but `HOME` IS allow-listed, so
+git falls back to `$HOME/.gitconfig`; the pin closes that fallback. It is a no-op
+where the config files do not exist (e.g. CI) and matches what `scripts/test` —
+the command the verify gate runs — has exported since #912. It deliberately does
+NOT touch the runner's own git plumbing (worktree/rev-parse/reset/commit/push),
+which keeps the inherited env so push credentials still work.
+
 The CLI's `verifyEnv*` copy in `cli/cmd/fishhawk/doctor_verify.go` guards the
 `doctor` verify-command rung on the OPERATOR's own machine and is kept in
 lockstep with this file — the same allow-exact, allow-Go, allow-prefix,
-deny-exact and deny-prefix sets — by `TestGateEnvListsMatchCLICopy`, which reads
-the CLI source through the workspace root and fails on any divergence. **Adding
-a Go variable means adding it to BOTH copies**, or that test fails.
+deny-exact and deny-prefix sets, plus the `gateEnvGitConfigPins` slice — by
+`TestGateEnvListsMatchCLICopy`, which reads the CLI source through the workspace
+root and fails on any divergence. **Adding a Go variable or a pin means adding it
+to BOTH copies**, or that test fails.
 
 **Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
 contains the process and the environment; only a separate checkout contains

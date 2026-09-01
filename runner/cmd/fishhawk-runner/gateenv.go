@@ -150,6 +150,34 @@ var gateEnvDeny = map[string]struct{}{
 // credential) out of gate children even if a later allow-rule re-widens (#2504).
 var gateEnvDenyPrefix = []string{"GOOGLE_"}
 
+// gateEnvGitConfigPins neutralizes global and system git config for every gate
+// subprocess by pinning both git config-file environment variables at /dev/null
+// (git reads an empty configuration from an empty file rather than erroring;
+// git-config(1) ENVIRONMENT). It exists because #912 / #3102: a gate child's
+// temp-repo `git commit` must not inherit the OPERATOR's global
+// commit.gpgsign + gpg.ssh.program, whose signing agent may be unavailable —
+// when it is, every such commit fails and the stage is misclassified category B
+// (#3102, run 34252f17 / #2929).
+//
+// Default-deny alone does NOT achieve this: the allow-list loop drops any
+// inherited GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM (neither key is on any
+// allow-list), but HOME IS allow-listed, so with GIT_CONFIG_GLOBAL unset git
+// falls back to $HOME/.gitconfig and picks the operator's settings back up. The
+// pin closes that fallback. It is a no-op on CI, where neither config file
+// exists, and matches the mitigation scripts/test — the very command the
+// runner's verify gate runs — has exported since #912.
+//
+// It deliberately does NOT affect the runner's OWN git plumbing
+// (worktree/rev-parse/reset/commit/push), which keeps the inherited env so push
+// credentials still work and never assigns this sanitized slice.
+//
+// Kept IDENTICAL to cli/cmd/fishhawk/doctor_verify.go's verifyEnvGitConfigPins
+// by TestGateEnvListsMatchCLICopy — editing one copy fails the runner suite.
+var gateEnvGitConfigPins = []string{
+	"GIT_CONFIG_GLOBAL=/dev/null",
+	"GIT_CONFIG_SYSTEM=/dev/null",
+}
+
 // sanitizedGateEnv returns the allow-listed environment to assign to a gate
 // subprocess's cmd.Env. Assigning a non-nil cmd.Env replaces the child's
 // environment wholesale (os/exec.Cmd.Env: "If Env is nil, the new process uses
@@ -161,7 +189,7 @@ func sanitizedGateEnv() []string {
 // sanitizeEnv applies the default-deny allow-list to base (a slice of "KEY=VALUE"
 // entries). It is the testable inner core of sanitizedGateEnv.
 func sanitizeEnv(base []string) []string {
-	out := make([]string, 0, len(base))
+	out := make([]string, 0, len(base)+len(gateEnvGitConfigPins))
 	for _, kv := range base {
 		eq := strings.IndexByte(kv, '=')
 		if eq <= 0 {
@@ -183,7 +211,13 @@ func sanitizeEnv(base []string) []string {
 			out = append(out, kv)
 		}
 	}
-	return out
+	// Pin git config-file env to /dev/null AFTER the allow-list loop. GIT_CONFIG_*
+	// is on no allow-list, so the loop already dropped any inherited value — the
+	// append therefore REPLACES rather than duplicates it, and cannot produce a
+	// second entry the platform's undocumented Cmd.Env dedup could resolve to the
+	// ambient value. Do NOT add these keys to gateEnvAllowExact: admitting the
+	// inherited value would defeat the determinism the pin exists for.
+	return append(out, gateEnvGitConfigPins...)
 }
 
 // redactGoEnvUserinfo strips embedded URL userinfo from a GO* env value. The
