@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -17,16 +16,29 @@ import (
 //
 // The incident (run 8ae65577, PR #2883): a fix-up pass did its work, the runner
 // verify gate committed it as a throwaway `fishhawk verify wip` commit, that
-// commit was unwound by gitResetSoftHEAD1 (leaving it DANGLING — reachable from
-// neither the base tip nor the branch), the agent's edits ended up in a stash,
-// and the pass reported fixup_no_changes. The PR kept its original single
-// commit, yet the re-review certified fixes against the orphan sha. Two
-// controls close it: strandedFixupWork refuses fixup_no_changes when the pass
-// left work behind, and verifyFixupPushLanded refuses fixup_pushed unless the
-// remote branch tip reflects the pushed head.
+// commit was unwound by gitResetSoftHEAD1, the agent's edits ended up in a
+// stash, and the pass reported fixup_no_changes. The PR kept its original
+// single commit, yet the re-review certified fixes against work that is not on
+// it. The controls that close it: strandedFixupWork refuses fixup_no_changes
+// when the pass left work behind — a net-new stash (probe 1), an advanced local
+// HEAD (probe 2), or a verify-certified tree that reached neither the working
+// tree nor the branch (probe 3, verifiedFixupWorkStranded) — and
+// verifyFixupPushLanded refuses fixup_pushed unless the remote branch tip
+// reflects the pushed head.
+//
+// NO control here detects a DANGLING COMMIT as such, and none claims to. The
+// #2884 reflog provenance probe that did was removed in #3023 as provably
+// inert: its pre-pass snapshot is captured inside openPRAndShipArtifact, AFTER
+// runVerifyFixLoop has already created and unwound the gate's throwaway commit,
+// so every commit it could have flagged was already in its own baseline.
+// Repositioning the snapshot cannot fix that — an earlier snapshot fires on
+// every legitimate pass where verify ran, and a `fishhawk verify wip` subject
+// filter excludes exactly the commits of interest — because the incident's
+// residue is formally identical to the residue a healthy pass leaves. Probe 3's
+// certified-tree witness is what covers that shape instead.
 
-// stashEntry is one `git stash list` or `git reflog` record: the entry's commit
-// SHA and its subject line.
+// stashEntry is one `git stash list` record: the entry's commit SHA and its
+// subject line.
 type stashEntry struct {
 	SHA     string
 	Subject string
@@ -40,11 +52,9 @@ type stashEntry struct {
 var (
 	fixupStashList       = gitStashList
 	fixupLocalHead       = gitRevParseHEAD
-	fixupStrandedReflog  = reflogStrandedCommits
-	fixupReflogCommits   = gitReflogCommits
 	fixupRemoteBranchTip = gitops.RemoteBranchTipURL
 	// fixupBaseTreeOf resolves the fix-up base tip to its tree object hash, the
-	// witness probe 4 (verifiedFixupWorkStranded) compares the verify gate's
+	// witness probe 3 (verifiedFixupWorkStranded) compares the verify gate's
 	// certified tree against. Seamed for the same reason as the others: the
 	// fake-pusher run() tests default repoDir to "." (the runner's own source
 	// repo), so no probe may touch a real repo unseamed. gitRevParseTreeOf
@@ -65,19 +75,6 @@ func gitStashList(ctx context.Context, repoDir string) ([]stashEntry, error) {
 	return parseShaSubjectLines(string(out)), nil
 }
 
-// gitReflogCommits returns the HEAD reflog as {SHA, Subject} entries via
-// `git reflog --format=%H %gs`, newest first. It is the pre-pass snapshot and
-// the walk source for the dangling-commit provenance probe. The run worktree is
-// provisioned fresh per run, so the reflog is short and its noise bounded. A
-// repo with no HEAD reflog prints nothing and exits 0 → an empty slice, nil.
-func gitReflogCommits(ctx context.Context, repoDir string) ([]stashEntry, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "reflog", "--format=%H %gs").Output()
-	if err != nil {
-		return nil, fmt.Errorf("gitops: reflog: %w", err)
-	}
-	return parseShaSubjectLines(string(out)), nil
-}
-
 // parseShaSubjectLines parses `<sha> <subject>` lines (git's `%H %gs` format)
 // into entries, skipping blanks. The subject may be empty (an entry with no
 // reflog message), which is fine.
@@ -94,71 +91,13 @@ func parseShaSubjectLines(out string) []stashEntry {
 	return entries
 }
 
-// gitIsAncestor reports whether maybeAncestor is an ancestor of descendant via
-// `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = definitively not,
-// any other exit = a real error the caller must surface).
-func gitIsAncestor(ctx context.Context, repoDir, maybeAncestor, descendant string) (bool, error) {
-	err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"merge-base", "--is-ancestor", maybeAncestor, descendant).Run()
-	if err == nil {
-		return true, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return false, nil
-	}
-	return false, fmt.Errorf("gitops: merge-base --is-ancestor %s %s: %w", maybeAncestor, descendant, err)
-}
-
-// reflogStrandedCommits is the #2884 dangling-commit provenance probe (approval
-// condition 1). It walks the HEAD reflog and reports every commit that was
-// created DURING the pass (its SHA is not in the pre-pass snapshot) yet is NOT
-// reachable from the base tip — the dangling residue a `fishhawk verify wip`
-// commit leaves after gitResetSoftHEAD1 returns HEAD to the base tip. Probes 1
-// (net-new stash) and 2 (advanced HEAD) both MISS this shape: no stash is made
-// and HEAD is back at the base tip, so only a provenance walk surfaces it.
-//
-// The base tip and every commit reachable from it are ordinary history and are
-// never flagged; a commit that diverges from the base tip (the base tip is its
-// ancestor, not vice versa) is stranded. Results are deduplicated by SHA. A
-// merge-base error on any candidate is surfaced (fail closed), not swallowed.
-func reflogStrandedCommits(ctx context.Context, repoDir, baseTipSHA string, preReflog []stashEntry) ([]stashEntry, error) {
-	current, err := fixupReflogCommits(ctx, repoDir)
-	if err != nil {
-		return nil, err
-	}
-	pre := make(map[string]bool, len(preReflog))
-	for _, e := range preReflog {
-		pre[e.SHA] = true
-	}
-	seen := make(map[string]bool)
-	var stranded []stashEntry
-	for _, e := range current {
-		if e.SHA == "" || e.SHA == baseTipSHA || pre[e.SHA] || seen[e.SHA] {
-			continue
-		}
-		anc, aerr := gitIsAncestor(ctx, repoDir, e.SHA, baseTipSHA)
-		if aerr != nil {
-			return nil, aerr
-		}
-		if anc {
-			// Reachable from the base tip: ordinary history, not stranded.
-			continue
-		}
-		seen[e.SHA] = true
-		stranded = append(stranded, e)
-	}
-	return stranded, nil
-}
-
-// verifiedFixupWorkStranded is probe 4 (#3022): the "did this pass's work reach
+// verifiedFixupWorkStranded is probe 3 (#3022): the "did this pass's work reach
 // the branch" detector. It is the instrument for the incident's OWN shape — a
 // fix-up that commits its work, resets back to the base tip, leaves NO stash and
-// reports NO changes — which probes 1-3 all miss (no net-new stash, HEAD back at
-// the base tip, and the dangling `fishhawk verify wip` commit is already in the
-// pre-pass reflog snapshot, so probe 3 skips it: the snapshot is captured in
-// openPRAndShipArtifact AFTER runVerifyFixLoop has already committed and unwound
-// its throwaway commit).
+// reports NO changes — which probes 1 and 2 both miss (no net-new stash is made,
+// and HEAD is back at the base tip). The #2884 reflog provenance probe that
+// claimed to cover it missed it too, and was removed in #3023 (see the file
+// header).
 //
 // The instrument is deliberately NOT commit creation and NOT the reflog. It is
 // the runner's OWN verify witness: the committed-tree verify gate
@@ -208,28 +147,32 @@ func verifiedFixupWorkStranded(ctx context.Context, repoDir, baseTipSHA, verifie
 
 // strandedFixupWork returns one human-readable reason per detected stranding of
 // a fix-up pass that is about to report fixup_no_changes (#2884, #3022). It runs
-// four probes, all fail-closed (a probe error returns a non-nil err so the
+// three probes, all fail-closed (a probe error returns a non-nil err so the
 // caller fails category-C rather than falling through to a success report):
 //
 //  1. a net-new stash entry — present now, absent from the pre-pass snapshot.
 //     A stash is never a valid terminal fix-up artifact; the pre-pass snapshot
 //     comparison keeps a pre-existing operator stash from being flagged.
 //  2. a local HEAD that advanced past the base tip in unpushed commits.
-//  3. a dangling commit created during the pass, reachable from neither the
-//     base tip nor the branch (reflogStrandedCommits).
-//  4. verified work that did not reach the branch (verifiedFixupWorkStranded):
+//  3. verified work that did not reach the branch (verifiedFixupWorkStranded):
 //     the verify gate certified a non-base tree yet the pass reports no changes.
 //
-// Probe 4, NOT probe 3, is the instrument for the commit-reset-no-stash-
-// no-changes shape (#3022). Probe 3's pre-pass reflog snapshot is captured AFTER
-// the verify gate has already committed and unwound its throwaway commit, so
-// that `fishhawk verify wip` commit is in probe 3's baseline and is skipped;
-// probe 4 anchors to the gate's certified-tree witness instead, which no
-// snapshot ordering can blind.
+// Probe 3 is the instrument for the commit-reset-no-stash-no-changes shape
+// (#3022). A fourth probe — the #2884 reflog provenance walk — sat between
+// probes 2 and 3 until #3023 removed it as provably inert: strandedFixupWork
+// runs ONLY on the CommitAndPush NoChanges branch, and CommitAndPush documents
+// and implements NoChanges as a short-circuit "with no other side effects", so
+// the window between that probe's snapshot and its check contained no
+// commit-creating operation at all; the verify gate's own throwaway commit is
+// created and unwound BEFORE the snapshot is taken, so it landed in the
+// baseline and was skipped. No reflog instrument can separate stranded fix-up
+// work from ordinary verify-gate residue at ANY snapshot placement, because the
+// two are formally identical. Probe 3 anchors to the gate's certified-tree
+// witness instead, which no snapshot ordering can blind.
 //
 // An empty reasons slice with a nil err means the pass is genuinely clean and
 // fixup_no_changes may proceed.
-func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash, preReflog []stashEntry, verifiedTreeSHA string) (reasons []string, err error) {
+func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash []stashEntry, verifiedTreeSHA string) (reasons []string, err error) {
 	currentStash, serr := fixupStashList(ctx, repoDir)
 	if serr != nil {
 		return nil, fmt.Errorf("stash probe: %w", serr)
@@ -250,14 +193,6 @@ func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash
 	}
 	if baseTipSHA != "" && head != "" && head != baseTipSHA {
 		reasons = append(reasons, fmt.Sprintf("local HEAD advanced past the base tip in unpushed commits: expected=%s actual=%s", baseTipSHA, head))
-	}
-
-	dangling, derr := fixupStrandedReflog(ctx, repoDir, baseTipSHA, preReflog)
-	if derr != nil {
-		return nil, fmt.Errorf("reflog provenance probe: %w", derr)
-	}
-	for _, e := range dangling {
-		reasons = append(reasons, fmt.Sprintf("dangling commit %s (%s) created during the pass, on no branch and not reachable from the base tip", e.SHA, e.Subject))
 	}
 
 	verifiedReason, verr := verifiedFixupWorkStranded(ctx, repoDir, baseTipSHA, verifiedTreeSHA)

@@ -7059,21 +7059,26 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
 	// below on the isFixup path.
 	commitMessage := implementCommitMessage(cfg, title, body, logSink)
-	// #2884 fix-up landing snapshots. Captured on the isFixup path BEFORE
-	// CommitAndPush (and thus before the committed-tree verify gate's throwaway
-	// `fishhawk verify wip` commit + gitResetSoftHEAD1 unwind), so the post-pass
-	// stranded-work check can tell the pass's OWN residue (a net-new stash, an
-	// advanced HEAD, a dangling commit) from pre-existing state. Left zero-valued
-	// off the isFixup path.
+	// #2884 fix-up landing snapshot. Captured on the isFixup path BEFORE
+	// CommitAndPush, so the post-pass stranded-work check can tell the pass's OWN
+	// residue (a net-new stash, an advanced HEAD) from pre-existing state. Left
+	// zero-valued off the isFixup path.
 	//
-	// #3022: probe 4's witness is NOT one of these snapshots — it is the verify
-	// gate's certified verifiedTreeSHA (threaded in as a parameter), compared
-	// against the base tip's tree. So probe 4 is unaffected by fixupSnapshotErr
-	// and closes the exact shape probe 3's post-gate snapshot ordering misses.
+	// ORDERING, stated correctly (it was documented backwards until #3023): this
+	// is before CommitAndPush but AFTER the committed-tree verify gate has already
+	// created and unwound its throwaway `fishhawk verify wip` commit —
+	// runVerifyFixLoop runs in run() (main.go ~1987) and openPRAndShipArtifact,
+	// which owns this snapshot, is called after it (~2536 / ~2625). That is why
+	// the #2884 reflog provenance probe could never see a dangling verify-wip
+	// commit and was removed in #3023; no snapshot here detects one.
+	//
+	// #3022: probe 3's witness is NOT this snapshot — it is the verify gate's
+	// certified verifiedTreeSHA (threaded in as a parameter), compared against the
+	// base tip's tree. So probe 3 is unaffected by fixupSnapshotErr and closes the
+	// exact shape no reflog snapshot ordering can reach.
 	var (
 		fixupBaseTipSHA  string
 		fixupPreStash    []stashEntry
-		fixupPreReflog   []stashEntry
 		fixupSnapshotErr error
 	)
 	if isFixup {
@@ -7094,18 +7099,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		fixupBaseTipSHA = baseTipSHA
 		commitMessage = fixupCommitMessage(cfg, baseTipSHA, logSink)
 
-		// #2884: snapshot the stash stack and HEAD reflog before CommitAndPush.
-		// A snapshot read failure makes the later stranded-work check fail CLOSED
-		// (category C) rather than silently skip — with no baseline the runner
-		// cannot prove the work landed, which is the condition the incident
-		// exploited. Fold a reflog read failure into the same signal.
-		var stashErr, reflogErr error
-		fixupPreStash, stashErr = fixupStashList(ctx, repoDir)
-		fixupPreReflog, reflogErr = fixupReflogCommits(ctx, repoDir)
-		fixupSnapshotErr = stashErr
-		if fixupSnapshotErr == nil {
-			fixupSnapshotErr = reflogErr
-		}
+		// #2884: snapshot the stash stack before CommitAndPush. A snapshot read
+		// failure makes the later stranded-work check fail CLOSED (category C)
+		// rather than silently skip — with no baseline the runner cannot prove the
+		// work landed, which is the condition the incident exploited. Since #3023
+		// the STASH read is the sole input to this signal: the reflog is no longer
+		// read at all, so a reflog fault no longer fails the pass closed.
+		fixupPreStash, fixupSnapshotErr = fixupStashList(ctx, repoDir)
 		if fixupSnapshotErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_stash_snapshot_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
@@ -7709,7 +7709,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				return fmt.Errorf("%w: fix-up pre-push snapshot unavailable, cannot prove work landed: %v",
 					gitops.ErrVerifyInfraFailure, fixupSnapshotErr)
 			}
-			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, fixupPreReflog, verifiedTreeSHA)
+			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, verifiedTreeSHA)
 			if sErr != nil {
 				// A probe failure is infrastructure (category C): re-run in place
 				// rather than silently reporting success over unproven work.
