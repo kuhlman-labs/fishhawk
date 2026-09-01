@@ -4836,6 +4836,46 @@ func TestBuild_PlanReview_LiveValidationRenderIsAdditive(t *testing.T) {
 	}
 }
 
+// TestBuild_ImplementReview_LiveValidationFlagsRendered pins the positive half
+// of the reach claim (#2978): the markers land in the implement-review prompt
+// too, because writeAcceptanceCriteriaForReview is reached from
+// writePlanForReview, which all three review builders call. Without this, only
+// the plan-review path was asserted and the README's "all three" claim rested
+// on reading rather than on a test. The marker-free control pins the other
+// half — an unmarked plan's implement_review criterion line is unchanged.
+func TestBuild_ImplementReview_LiveValidationFlagsRendered(t *testing.T) {
+	mk := func(marked bool) string {
+		t.Helper()
+		got, err := Build("implement_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: planWithLiveValidationCriterion(marked),
+			Diff:         "- M pkg/bar/bar.go\n",
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	marked := criterionLine(t, mk(true), "lv1")
+	for _, seg := range []string{
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		liveValidationCriterionAnnotation,
+	} {
+		if !strings.Contains(marked, seg) {
+			t.Errorf("implement_review criterion line missing segment %q:\n%s", seg, marked)
+		}
+	}
+
+	unmarked := criterionLine(t, mk(false), "lv1")
+	for _, unwanted := range []string{"skip_expected", "expectation_basis", "requires_live_validation", "DECLARED OPERATOR WALK"} {
+		if strings.Contains(unmarked, unwanted) {
+			t.Errorf("marker-free implement_review criterion line must not carry %q:\n%s", unwanted, unmarked)
+		}
+	}
+}
+
 func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// #606: the verbose verdict-schema / review-criteria / decision-rule
 	// preamble was trimmed to lower the per-call token cost on the local

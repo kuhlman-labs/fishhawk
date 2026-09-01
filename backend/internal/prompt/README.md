@@ -654,14 +654,36 @@ does NOT claim every existing prompt is unchanged — a plan CARRYING markers
 renders longer by construction, and the instruction block is unconditional, so
 `TestBuild_PlanReview_TrimmedBelowBaseline`'s `preTrimBaselineLen` moved by the
 1333 bytes item 13 and the verdict clause add (the same convention #1533 and
-#2290 followed). No other test in this package sets any of the three fields on
-a criterion fixture, so nothing else needed updating.
+#2290 followed).
+
+The marker-bearing-fixture enumeration approval condition (2) asked for has a
+short answer, and it corrects the condition's own premise. The condition named
+`TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders` (the all-skip
+consequence test, #3026) as a test that "necessarily sets both on every
+criterion". It does not: it sets `AllSkipShortCircuit` and an
+`all_criteria_skip_expected` finding on the GATE-EVIDENCE struct
+(`AcceptancePrecheckEvidence`) — the precheck's REPORT that the plan is all-skip
+— while its plan is a bare `fixturePlan()` whose criteria set none of
+`SkipExpected` / `ExpectationBasis` / `RequiresLiveValidation`. The two live on
+different structs, and only the criterion fields reach
+`writeAcceptanceCriteriaForReview`. Enumerating the package by grep on all three
+field names returns exactly one site: `planWithLiveValidationCriterion`, the
+helper this change added. `prompt_test.go` is the package's only test file. So
+the enumeration is empty, no existing test needed updating, and no existing
+assertion was touched.
 
 **Reach.** `writeAcceptanceCriteriaForReview` is called from
 `writePlanForReview`, which three builders use — plan review, implement review,
 and the scope-exemption review — so the marker rendering lands in all three.
 That is intended: the implement reviewer benefits from the same context. The
 item-13 instruction and verdict clause are plan-review only.
+`TestBuild_ImplementReview_LiveValidationFlagsRendered` pins the implement-review
+half directly — the marked criterion's line carries the three segments, and the
+marker-free control's line carries none — so the "all three" claim rests on an
+assertion rather than on reading the call graph. The scope-exemption builder
+remains covered by reading alone: it reaches the same
+`writePlanForReview` → `writeAcceptanceCriteriaForReview` path, and the two
+asserted builders are what make that shared writer's behaviour observable.
 
 Caveat worth stating plainly: this is a prompt INSTRUCTION to an LLM reviewer,
 not an enforced control. The tests prove the markers and the instruction render
