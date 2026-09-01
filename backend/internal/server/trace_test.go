@@ -10462,27 +10462,36 @@ func TestCheckStageBudget_AdvisoryRepeatedOverCeilingAppendsPerUpload(t *testing
 	}
 }
 
-// TestInitialImplementCounterfactuals_BundleToPrompt_EndToEnd is the #2929
-// cross-boundary seam test. #3042's end-to-end pin drives the FIX-UP re-review
-// dispatch; this one proves the SAME wire bytes, produced by a NON-fix-up
-// implement stage, thread the whole backend chain — stored bundle wire bytes ->
+// TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd is the #2929
+// cross-boundary seam test, and its scope is deliberately narrower than its
+// earlier name (TestInitialImplementCounterfactuals_BundleToPrompt_EndToEnd)
+// claimed. It proves the backend chain — stored bundle wire bytes ->
 // pickRedactedTraceHash -> TraceStore.Get -> bundle.ExtractGateEvidence ->
 // resolveStageGateEvidence -> prompt.GateFixupCounterfactual -> the rendered
-// implement-review prompt — and render under the pass-agnostic block title.
+// implement-review prompt — is PASS-AGNOSTIC: the same wire bytes render under
+// the pass-neutral block title no matter which implement pass produced them.
+//
+// It does NOT prove anything about a non-fix-up implement stage, and cannot:
+// the `fixup_counterfactuals` wire representation carries NO pass-origin
+// property, which is the whole point of retaining it (composeGateEvidence,
+// bundle.GateEvidence and the trace mapping were already pass-agnostic, so the
+// initial pass needed no backend change, and a pinned older backend keeps
+// parsing a newer runner). That is also why the fixture is built with the
+// existing fix-up helpers — there is no pass-origin bit to vary.
+//
+// The claim this test used to make is carried behaviorally in the RUNNER
+// package, where the pass distinction actually lives:
+// TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar drives
+// the non-fix-up branch body and asserts the emitted fixup_counterfactuals
+// event, and TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent
+// drives the fix-up complement.
 //
 // It reuses the SHARED literal fixupCounterfactualsWireFixture, which is the
 // same literal the runner half asserts in
 // runner/cmd/fishhawk-runner/gateevidence_test.go, so the two independently
 // versioned modules meet on one fixture: a drift in either side's json tags
-// reddens one half or the other. The runner's own emission of that shape from
-// the non-fix-up branch is pinned by
-// TestCounterfactualChannels_AreExactComplements in the runner package (run()
-// has no seam for a behavioral drive — see that test's comment).
-//
-// Retaining the `fixup_counterfactuals` wire kind for the initial pass is what
-// makes this work with NO backend change: resolveStageGateEvidence and
-// gateEvidenceForReview were already pass-agnostic.
-func TestInitialImplementCounterfactuals_BundleToPrompt_EndToEnd(t *testing.T) {
+// reddens one half or the other.
+func TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd(t *testing.T) {
 	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
 	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
 
