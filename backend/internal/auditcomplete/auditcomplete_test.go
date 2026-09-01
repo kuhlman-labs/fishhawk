@@ -1538,6 +1538,24 @@ func (f *fakeAudit) appendChainedReset(t *testing.T, runID uuid.UUID, stageID *u
 	f.appendChained(t, runID, stageID, category, payload)
 }
 
+// tamperLastEntryOfRun rewrites the newest entry on runID's chain AFTER it was
+// hashed, exactly as TestCompute_FailWhenChainTampered does for the parent: the
+// stored EntryHash is left alone so the recomputation no longer matches. The
+// rewritten payload keeps its `variant` key, so the entry still READS as a
+// complete trace bundle — the point is a child that looks trace-complete while
+// its chain does not verify.
+func (f *fakeAudit) tamperLastEntryOfRun(t *testing.T, runID uuid.UUID) {
+	t.Helper()
+	for i := len(f.entries) - 1; i >= 0; i-- {
+		e := f.entries[i]
+		if e.RunID != nil && *e.RunID == runID {
+			e.Payload = json.RawMessage(`{"variant":"redacted","tampered":true}`)
+			return
+		}
+	}
+	t.Fatalf("tamperLastEntryOfRun: run %s has no audit entries to tamper", runID)
+}
+
 func (f *fakeAudit) dropEntry(pred func(*audit.Entry) bool) {
 	out := f.entries[:0]
 	for _, e := range f.entries {
@@ -1600,6 +1618,11 @@ type childSpec struct {
 	raw         bool
 	redacted    bool
 	noImplement bool
+	// tamperChain mutates the child's LAST audit entry payload after it was
+	// hashed, so the child's chain no longer recomputes — the trace-complete
+	// but chain-invalid shape. Seeded BY CONSTRUCTION in the fixture, not by
+	// invoking the control being tested.
+	tamperChain bool
 }
 
 func decomposedFixture(t *testing.T, specs ...childSpec) (uuid.UUID, uuid.UUID, []uuid.UUID, auditcomplete.Deps) {
@@ -1641,6 +1664,9 @@ func decomposedFixture(t *testing.T, specs ...childSpec) (uuid.UUID, uuid.UUID, 
 		}
 		if cs.redacted {
 			au.appendChained(t, childID, &childImpl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		}
+		if cs.tamperChain {
+			au.tamperLastEntryOfRun(t, childID)
 		}
 	}
 	return runID, impl.ID, childIDs, deps(runs, arts, au)
@@ -1970,6 +1996,70 @@ func TestCompute_WrapperMatchesComputeResult(t *testing.T) {
 			for i := range missing {
 				if missing[i] != res.Missing[i] {
 					t.Errorf("missing[%d] divergence: %+v vs %+v", i, missing[i], res.Missing[i])
+				}
+			}
+		})
+	}
+}
+
+// t11 (#3092 fix-up, high/security): a child that is TRACE-COMPLETE but whose
+// OWN audit chain does not verify must not supply evidence for the parent's
+// required merge check. Rule 4 verifies the parent run's chain only, and a
+// child run may never pass through a check that verifies its own chain, so
+// without the resolver's child-chain verification a tampered child's
+// raw/redacted entries would carry a decomposed parent to a passing
+// fishhawk_audit_complete — an audit-integrity hole that exists for decomposed
+// runs alone.
+//
+// The tampered chain is seeded BY CONSTRUCTION (a payload rewritten after
+// hashing, the same mutation TestCompute_FailWhenChainTampered uses on the
+// parent), so the RED lands on the behavioral assertion rather than on a
+// fixture-setup guard. The "with a healthy sibling" case is what discriminates
+// a real rejection from a fixture accident: a resolution built over the sibling
+// alone would still be a PASS, so the assertion is zero resolutions AND a
+// chain_invalid item naming the tampered child.
+func TestComputeResult_DecompositionChainInvalidChildRejected(t *testing.T) {
+	cases := map[string][]childSpec{
+		"only child": {
+			{implState: run.StageStateSucceeded, raw: true, redacted: true, tamperChain: true},
+		},
+		"with a healthy sibling": {
+			traceComplete(run.StageStateSucceeded),
+			{implState: run.StageStateSucceeded, raw: true, redacted: true, tamperChain: true},
+		},
+	}
+	for name, specs := range cases {
+		t.Run(name, func(t *testing.T) {
+			runID, _, kids, d := decomposedFixture(t, specs...)
+			bad := kids[len(kids)-1]
+			res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("ComputeResult: %v", err)
+			}
+			if res.State != stagecheck.StateFail {
+				t.Fatalf("state = %s, want fail on a chain-invalid child; missing=%+v resolved=%+v",
+					res.State, res.Missing, res.Resolved)
+			}
+			if len(res.Resolved) != 0 {
+				t.Fatalf("a chain-invalid child must yield NO resolution; got %+v", res.Resolved)
+			}
+			found := false
+			for _, m := range res.Missing {
+				if m.Kind == auditcomplete.MissingChain && strings.Contains(m.Detail, bad.String()[:8]) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("want a chain_invalid item naming the tampered child run %s; got %+v", bad, res.Missing)
+			}
+			// The tampered child's ID must not appear as a contributor
+			// anywhere — not merely "no resolution", but no claim that this
+			// child supplied anything.
+			for _, r := range res.Resolved {
+				for _, id := range r.ChildRunIDs {
+					if id == bad.String() {
+						t.Fatalf("tampered child %s was named as a contributor", bad)
+					}
 				}
 			}
 		})

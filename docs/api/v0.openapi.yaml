@@ -12033,9 +12033,12 @@ paths:
                             traces of the decomposition CHILD runs named in
                             `child_run_ids`. A positive evidentiary claim, never
                             an exemption: the array is never emitted with an
-                            empty `child_run_ids`, and a child genuinely missing
+                            empty `child_run_ids`, a child genuinely missing
                             a trace fails as a `trace_missing` entry naming that
-                            child instead. Absent when nothing was resolved.
+                            child instead, and a child whose own audit chain
+                            does not re-hash contributes nothing and fails as a
+                            `chain_invalid` / `chain_unrecoverable` entry naming
+                            that child. Absent when nothing was resolved.
                           items:
                             type: object
                             required: [kind, stage_id, child_run_ids, detail]

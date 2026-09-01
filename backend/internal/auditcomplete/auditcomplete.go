@@ -1069,6 +1069,25 @@ type childResolutionOutcome struct {
 //
 // Read failures are returned as transient errors, matching Rule 2's I/O
 // posture: the caller retries rather than under- or over-gating.
+//
+// AUDIT-INTEGRITY POSTURE of the child-derived evidence, in two parts:
+//
+//   - CHAIN. Child-chain verification is IN scope. Every child whose evidence
+//     is about to be read has its own audit chain verified first (see the
+//     verifyChain call below), so evidence from a child whose chain does not
+//     hash can never satisfy the parent's requirement. This is not implied by
+//     Rule 4, which verifies the parent run's chain alone.
+//
+//   - PROVENANCE. A run row carrying DecomposedFrom == parent is accepted as
+//     a legitimate child. That is sound because DecomposedFrom is NOT
+//     caller-settable: server.createRunRequest has no decomposed_from field,
+//     so no REST/MCP client can mint a run claiming this parentage. The only
+//     writers are the decomposition fan-out paths themselves (orchestrator's
+//     child mint, consolidate, the childcompletion sweeper), all of which
+//     already hold the parent run. Anyone who can write a run row directly
+//     already has backend/database access and could forge the parent's own
+//     evidence just as easily, so no additional check here would raise the
+//     bar.
 func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uuid.UUID, implementStage *run.Stage) (childResolutionOutcome, error) {
 	var out childResolutionOutcome
 
@@ -1143,6 +1162,41 @@ func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uu
 		if childImpl.State == run.StageStateCancelled {
 			// Cancelled before it ran anything: nothing to ship, nothing to
 			// contribute. Does not block.
+			continue
+		}
+
+		// CHILD-CHAIN INTEGRITY. Rule 4 verifies the PARENT run's chain only
+		// — verifyChain is scoped to a single run's entries — and a child run
+		// need never pass through any check that verifies its own chain
+		// before its rows are read here. So without this the resolution would
+		// satisfy the parent's REQUIRED merge check from raw/redacted entries
+		// of a child whose chain does not hash, weakening the audit-integrity
+		// boundary specifically for decomposed runs.
+		//
+		// The verification is deliberately placed BEFORE the trace read, not
+		// after it: the trace_uploaded rows below come out of that same
+		// chain, so they are exactly as trustworthy as it is. A child whose
+		// chain does not verify contributes NOTHING, no matter how complete
+		// its trace evidence looks.
+		//
+		// Categorization mirrors Rule 4 exactly — a recomputed-hash mismatch
+		// is chain_invalid, a read or recomputation failure is
+		// chain_unrecoverable. Neither kind is pending-flavored (see
+		// onlyPendingFlavored), and both land in childMisses, which takes
+		// assembly branch (d): the parent's own trace items are REPLACED by
+		// these child-named ones and the check FAILS. There is no path on
+		// which a chain-invalid child becomes a contributor.
+		if chainErr := verifyChain(ctx, deps.Audit, child.ID); chainErr != nil {
+			kind := MissingChainBroken
+			if errors.Is(chainErr, errChainInvalid) {
+				kind = MissingChain
+			}
+			out.childMisses = append(out.childMisses, MissingItem{
+				Kind: kind,
+				Detail: fmt.Sprintf(
+					"decomposition child run %s implement stage %s has an audit chain that does not verify, so its trace evidence cannot satisfy the parent implement stage: %v",
+					shortID(child.ID), shortID(childImpl.ID), chainErr),
+			})
 			continue
 		}
 
