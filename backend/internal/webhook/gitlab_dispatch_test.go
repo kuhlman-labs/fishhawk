@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
@@ -50,6 +52,15 @@ type stubGitLabProjects struct {
 	allow map[string]string
 	err   error
 	calls []stubGitLabAuthzCall
+}
+
+// unboundGitLabProject is the E45.26 / #2877 upgrade shape: the installation is
+// registered but records no project path, so the authorizer returns the
+// ErrGitLabProjectPathUnbound sentinel. It is a REFUSAL carried on an error
+// value, which is exactly why the dispatcher must classify it ahead of the
+// generic error arm.
+func unboundGitLabProject() *stubGitLabProjects {
+	return &stubGitLabProjects{err: ErrGitLabProjectPathUnbound}
 }
 
 type stubGitLabAuthzCall struct {
@@ -218,6 +229,25 @@ func TestHandle_GitLabTrigger_UnregisteredProject_PerformsNoForgeCall(t *testing
 			wantReason: gitLabAuthzLookupFailed,
 		},
 		{
+			// The installation IS registered but records no project path
+			// (every row predating migration 0078). Refused with its OWN
+			// reason, asserted against registry_lookup_fails and
+			// unregistered_project_id above so the new reason is provably
+			// DISTINGUISHABLE, not merely present: an operator who upgraded
+			// without re-registering must get a remedy, not a generic fault.
+			name:       "registered_project_path_unbound",
+			authorizer: unboundGitLabProject(),
+			wantReason: gitLabAuthzProjectPathUnbound,
+		},
+		{
+			// A wrapped sentinel is classified the same way: the production
+			// authorizer is free to annotate, and a bare == comparison would
+			// silently regress this to the generic fault reason.
+			name:       "registered_project_path_unbound_wrapped",
+			authorizer: &stubGitLabProjects{err: fmt.Errorf("registry: %w", ErrGitLabProjectPathUnbound)},
+			wantReason: gitLabAuthzProjectPathUnbound,
+		},
+		{
 			// No registry wired at all: nothing can be shown authorized.
 			name:       "registry_unwired",
 			authorizer: nil,
@@ -266,6 +296,52 @@ func TestHandle_GitLabTrigger_UnregisteredProject_PerformsNoForgeCall(t *testing
 			}
 			if len(paths) != 1 || paths[0] != gitLabAuthzPathCreate {
 				t.Errorf("refusal paths = %v, want [%s]", paths, gitLabAuthzPathCreate)
+			}
+		})
+	}
+}
+
+// TestAuthorizeGitLabProject_CIRetryPathNamesTheUnboundReason is binding
+// condition 3. The issue's gate covers TWO entry points — run creation and
+// CI-failure retry — and a new refusal reason wired into only one of them would
+// leave an unbound row auditing as the GENERIC lookup failure on the other,
+// contradicting the criterion that the refusal carries a NAMED reason.
+//
+// Both entry points route through the single shared authorizeGitLabProject
+// helper (gitlab_dispatch.go:205 for create, gitlab_ciretry.go:146 for retry),
+// which owns the ONLY reason-selection branch. This drives that helper directly
+// under the CI-retry path label and asserts the same named reason — so the
+// claim is tested rather than asserted from the call graph.
+func TestAuthorizeGitLabProject_CIRetryPathNamesTheUnboundReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		authorizer GitLabProjectAuthorizer
+		wantReason string
+	}{
+		{"unbound_project_path", unboundGitLabProject(), gitLabAuthzProjectPathUnbound},
+		// The paired control: a genuine fault on the SAME path still audits as
+		// the generic lookup failure, so the unbound reason is provably
+		// distinguishable on the retry path too, not a blanket relabel.
+		{"registry_fault", &stubGitLabProjects{err: errors.New("connection reset")}, gitLabAuthzLookupFailed},
+		{"unregistered", &stubGitLabProjects{allow: map[string]string{"gitlab:9999": "acme/widgets"}}, gitLabAuthzNotRegistered},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, _, _, au := newGitLabDispatcher(t, validSpec)
+			d.GitLabProjects = tc.authorizer
+
+			ev := gitlabIssueTriggerEvent()
+			if d.authorizeGitLabProject(context.Background(), ev, Match{WorkflowID: "feature_change"},
+				gitLabAuthzPathCIRetry, time.Now()) {
+				t.Fatal("authorizeGitLabProject admitted, want refusal")
+			}
+
+			reasons, paths := gitlabRefusalReasonsAndPaths(t, au)
+			if len(reasons) != 1 || reasons[0] != tc.wantReason {
+				t.Errorf("refusal reasons = %v, want [%s]", reasons, tc.wantReason)
+			}
+			if len(paths) != 1 || paths[0] != gitLabAuthzPathCIRetry {
+				t.Errorf("refusal paths = %v, want [%s]", paths, gitLabAuthzPathCIRetry)
 			}
 		})
 	}

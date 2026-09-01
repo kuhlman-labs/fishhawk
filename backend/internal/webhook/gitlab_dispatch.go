@@ -71,8 +71,32 @@ type GitLabProjectAuthorizer interface {
 	//
 	// A false answer is a REFUSAL, not an error. An error means the
 	// registry could not be consulted; the caller fails closed on both.
+	//
+	// An implementation MAY return ErrGitLabProjectPathUnbound to signal the
+	// one error that is a REFUSAL rather than a fault: the installation is
+	// registered but records no project path to bind against. It is
+	// classified as its own audit reason so an operator who upgraded without
+	// re-registering gets an actionable signal instead of a generic lookup
+	// failure. Every other error stays a fault; both fail closed.
 	AuthorizedGitLabProject(ctx context.Context, credentialRef, projectPath string) (bool, error)
 }
+
+// ErrGitLabProjectPathUnbound is the sentinel a GitLabProjectAuthorizer returns
+// when the credential ref resolves to a registered gitlab installation that
+// records NO project path (E45.26 / #2877) — the shape every row registered
+// before migration 0078 has.
+//
+// It is a REFUSAL, not a fault: the gate fails closed rather than falling back
+// to the pre-#2877 namespace-only admit, because that fallback is exactly the
+// within-tenant steering this change closes. It is distinguished from an
+// ordinary refusal only so the audit can NAME the condition
+// (gitLabAuthzProjectPathUnbound) and point the operator at re-registration.
+//
+// It lives HERE, beside the interface, rather than in the package that
+// implements the authorizer: the dispatcher must errors.Is it, and an authorizer
+// implementation in package main could not export a sentinel this package can
+// see.
+var ErrGitLabProjectPathUnbound = errors.New("webhook: gitlab installation records no project path")
 
 // gitLabAuthzRefusal names WHY a GitLab trigger was refused before any forge
 // call. They are audit-payload `reason` values on the existing run-less
@@ -91,6 +115,15 @@ const (
 	// gitLabAuthzNotRegistered is the refusal proper: the project is not one
 	// this deployment was authorized to act on.
 	gitLabAuthzNotRegistered = "gitlab_project_not_registered"
+	// gitLabAuthzProjectPathUnbound is the UPGRADE refusal (E45.26 / #2877):
+	// the installation IS registered, but it records no project path, so the
+	// exact-path binding cannot be evaluated. Distinct from
+	// gitLabAuthzNotRegistered (nothing is registered) and from
+	// gitLabAuthzLookupFailed (the registry could not be read) because the
+	// remedy is specific and operator-actionable: re-register the installation
+	// with --project-path. Without its own reason this surfaces as a generic
+	// fault and the operator has nothing to act on.
+	gitLabAuthzProjectPathUnbound = "gitlab_project_path_unbound"
 )
 
 // gitLabAuthzPath names WHICH gate refused. Both GitLab entry points — run
@@ -107,9 +140,15 @@ const (
 // point that acts on a payload-named project — run creation and CI-failure
 // retry alike. It returns true only when the registry positively vouches for
 // the payload's project; every other outcome — unwired registry, absent ref,
-// lookup fault, unknown project — refuses, writes the run-less rejection audit
-// naming which (and via `path`, which gate), and leaves ZERO forge calls
-// behind.
+// lookup fault, unbound project path, unknown project — refuses, writes the
+// run-less rejection audit naming which (and via `path`, which gate), and
+// leaves ZERO forge calls behind.
+//
+// Being the SOLE reason-selection branch is load-bearing: both entry points
+// route their refusal through here, so an unbound row audits as
+// gitlab_project_path_unbound on the CI-retry path exactly as it does on the
+// create path. A second per-path mapping would let one of them degrade to the
+// generic lookup-failure reason.
 //
 // It is deliberately shared rather than duplicated per path: an authorizer
 // applied to only one of two entry points is the asymmetry that made the retry
@@ -125,6 +164,11 @@ func (d *Dispatcher) authorizeGitLabProject(ctx context.Context, ev Event, m Mat
 	default:
 		ok, err := d.GitLabProjects.AuthorizedGitLabProject(ctx, ev.CredentialRef, ev.Repo)
 		switch {
+		case errors.Is(err, ErrGitLabProjectPathUnbound):
+			// A REFUSAL carried on an error value, not a fault: the row
+			// exists but is unbound. Classified ahead of the generic
+			// error arm so it keeps its own actionable reason.
+			reason = gitLabAuthzProjectPathUnbound
 		case err != nil:
 			reason = gitLabAuthzLookupFailed
 			d.logger().LogAttrs(ctx, slog.LevelWarn,

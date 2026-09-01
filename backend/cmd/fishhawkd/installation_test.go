@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns
@@ -50,7 +52,7 @@ func TestRunInstallationRegister_MissingFlags(t *testing.T) {
 		args    []string
 		wantSub string
 	}{
-		{"missing db", []string{"register", "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, "--db"},
+		{"missing db", []string{"register", "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets"}, "--db"},
 		{"missing provider", []string{"register", "--db", dummyDB, "--account-key", "acme", "--installation-ref", "gitlab:4242"}, "--provider required"},
 		{"missing account-key", []string{"register", "--db", dummyDB, "--provider", "gitlab", "--installation-ref", "gitlab:4242"}, "--account-key required"},
 		{"missing installation-ref", []string{"register", "--db", dummyDB, "--provider", "gitlab", "--account-key", "acme"}, "--installation-ref required"},
@@ -84,12 +86,20 @@ func TestRunInstallationRegister_ValidationErrors(t *testing.T) {
 		args    []string // appended after --db url
 		wantSub string
 	}{
-		{"unknown provider", []string{"--provider", "bitbucket", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, `"bitbucket"`},
-		{"malformed gitlab ref", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:abc"}, `"gitlab:abc"`},
-		{"non-positive gitlab id", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:0"}, `"gitlab:0"`},
+		{"unknown provider", []string{"--provider", "bitbucket", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets"}, `"bitbucket"`},
+		{"malformed gitlab ref", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:abc", "--project-path", "acme/widgets"}, `"gitlab:abc"`},
+		{"non-positive gitlab id", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:0", "--project-path", "acme/widgets"}, `"gitlab:0"`},
 		{"github ref wrong prefix", []string{"--provider", "github", "--account-key", "acme", "--installation-ref", "github:42"}, `"github:42"`},
-		{"non-https forge base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--forge-base-url", "http://insecure.example"}, "https"},
-		{"non-https oauth base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--oauth-base-url", "http://insecure.example"}, "https"},
+		// E45.26 / #2877: --project-path is REQUIRED for a gitlab registration
+		// and must live under the owning account_key. Both are DB-backed for
+		// the same reason as the rows above — they run after the pool opens —
+		// and both assert the installations table stays EMPTY, which is what
+		// makes them true counterfactual vehicles.
+		{"missing project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, "--project-path"},
+		{"namespaceless project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "widgets"}, "<namespace>/<project>"},
+		{"namespace-inconsistent project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "other/widgets"}, `"acme"`},
+		{"non-https forge base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets", "--forge-base-url", "http://insecure.example"}, "https"},
+		{"non-https oauth base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets", "--oauth-base-url", "http://insecure.example"}, "https"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,7 +154,7 @@ func TestRunInstallationRegister_WritesRowAndIsIdempotent(t *testing.T) {
 	mustCreateAccount(t, url, "gitlab", "acme")
 
 	var out bytes.Buffer
-	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, &out); got != exitOK {
+	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets"}, &out); got != exitOK {
 		t.Fatalf("register exit = %d, want %d; log:\n%s", got, exitOK, out.String())
 	}
 
@@ -171,7 +181,7 @@ func TestRunInstallationRegister_WritesRowAndIsIdempotent(t *testing.T) {
 	}
 
 	out.Reset()
-	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, &out); got != exitOK {
+	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets"}, &out); got != exitOK {
 		t.Fatalf("second register exit = %d; log:\n%s", got, out.String())
 	}
 	if err := pool.QueryRow(context.Background(),
@@ -195,7 +205,7 @@ func TestRunInstallationRegister_RefusesUnknownAccount(t *testing.T) {
 	url := pgtest.NewURL(t)
 
 	var out bytes.Buffer
-	got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "ghost", "--installation-ref", "gitlab:4242"}, &out)
+	got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "ghost", "--installation-ref", "gitlab:4242", "--project-path", "ghost/widgets"}, &out)
 	if got != exitFailure {
 		t.Fatalf("exit = %d, want %d (unknown account → failure); log:\n%s", got, exitFailure, out.String())
 	}
@@ -229,9 +239,13 @@ func TestRunInstallationRegister_RefusesUnknownAccount(t *testing.T) {
 func TestRunInstallationList_FiltersAndRendersAccountKey(t *testing.T) {
 	url := pgtest.NewURL(t)
 	mustCreateAccount(t, url, "gitlab", "acme")
-	mustCreateAccount(t, url, "github", "widgets")
-	mustRegisterInstallation(t, url, "gitlab", "acme", "gitlab:4242")
-	mustRegisterInstallation(t, url, "github", "widgets", "77")
+	// The github account key is deliberately NOT a substring of the gitlab
+	// row's project_path ("acme/widgets"): the leak assertion below is a
+	// substring match, and a key of "widgets" would make it pass on the
+	// gitlab row's own path and stop discriminating.
+	mustCreateAccount(t, url, "github", "octo-org")
+	mustRegisterInstallation(t, url, "gitlab", "acme", "gitlab:4242", "acme/widgets")
+	mustRegisterInstallation(t, url, "github", "octo-org", "77", "")
 
 	all := captureStdout(t, func() {
 		var log bytes.Buffer
@@ -242,7 +256,7 @@ func TestRunInstallationList_FiltersAndRendersAccountKey(t *testing.T) {
 	if !strings.Contains(all, "gitlab:4242") || !strings.Contains(all, "acme") {
 		t.Errorf("list %q missing the gitlab installation + its account_key", all)
 	}
-	if !strings.Contains(all, "77") || !strings.Contains(all, "widgets") {
+	if !strings.Contains(all, "77") || !strings.Contains(all, "octo-org") {
 		t.Errorf("list %q missing the github installation + its account_key", all)
 	}
 
@@ -255,7 +269,7 @@ func TestRunInstallationList_FiltersAndRendersAccountKey(t *testing.T) {
 	if !strings.Contains(filtered, "gitlab:4242") {
 		t.Errorf("gitlab-filtered list %q missing the gitlab installation", filtered)
 	}
-	if strings.Contains(filtered, "widgets") {
+	if strings.Contains(filtered, "octo-org") {
 		t.Errorf("gitlab-filtered list %q leaked the github installation", filtered)
 	}
 }
@@ -274,7 +288,7 @@ func TestInstallationRegister_AdmitsGitLabProjectThroughTheGate(t *testing.T) {
 		t.Fatalf("account create exit = %d; log:\n%s", got, out.String())
 	}
 	out.Reset()
-	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, &out); got != exitOK {
+	if got := runInstallation([]string{"register", "--db", url, "--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets"}, &out); got != exitOK {
 		t.Fatalf("installation register exit = %d; log:\n%s", got, out.String())
 	}
 
@@ -287,17 +301,173 @@ func TestInstallationRegister_AdmitsGitLabProjectThroughTheGate(t *testing.T) {
 	authorizer := gitLabProjectRegistry{q: accountdb.New(pool)}
 	ctx := context.Background()
 
-	// Registered id + matching namespace → admitted.
+	// Registered id + the EXACT registered path → admitted.
 	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/widgets"); err != nil || !ok {
 		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/widgets) = (%v, %v), want (true, nil)", ok, err)
 	}
-	// Registered id + WRONG namespace → refused (the namespace half of the bind).
+	// Registered id + a SIBLING project in the SAME namespace → refused. This
+	// is the E45.26 / #2877 tightening: the pre-change namespace-only binding
+	// ADMITTED this, leaving the workflow-spec read steerable within the tenant.
+	// It travels the whole stack — CLI flag, domain validation, sqlc column,
+	// real Postgres, shipped authorizer — so a per-layer green over a broken
+	// seam (a transposed Scan order, say) cannot pass it.
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/other-project"); err != nil || ok {
+		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/other-project) = (%v, %v), want (false, nil)", ok, err)
+	}
+	// Registered id + WRONG namespace → refused (the tenancy half of the bind).
 	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "other/widgets"); err != nil || ok {
 		t.Errorf("AuthorizedGitLabProject(gitlab:4242, other/widgets) = (%v, %v), want (false, nil)", ok, err)
 	}
-	// Unregistered id + registered namespace → refused (the ref half of the bind).
+	// A case difference is a refusal: GitLab canonicalises project path case,
+	// so this names a different project. Documented in docs/deploy/gitlab.md.
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/Widgets"); err != nil || ok {
+		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/Widgets) = (%v, %v), want (false, nil)", ok, err)
+	}
+	// Unregistered id + registered path → refused (the ref half of the bind).
 	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:9999", "acme/widgets"); err != nil || ok {
 		t.Errorf("AuthorizedGitLabProject(gitlab:9999, acme/widgets) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestInstallationRegister_NestedGroupAdmitsThroughTheGate is binding condition
+// 4 driven end to end: GitLab groups NEST, so a nested-group project must stay
+// registerable AND admittable. A validator splitting on every "/" would reject
+// the registration outright; an authorizer comparing only two segments would
+// refuse the admit. Both halves are exercised against real Postgres.
+func TestInstallationRegister_NestedGroupAdmitsThroughTheGate(t *testing.T) {
+	url := pgtest.NewURL(t)
+	mustCreateAccount(t, url, "gitlab", "acme")
+	mustRegisterInstallation(t, url, "gitlab", "acme", "gitlab:4242", "acme/platform/widgets")
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	authorizer := gitLabProjectRegistry{q: accountdb.New(pool)}
+	ctx := context.Background()
+
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/platform/widgets"); err != nil || !ok {
+		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/platform/widgets) = (%v, %v), want (true, nil)", ok, err)
+	}
+	// A sibling INSIDE the nested group is still refused — the bind is the
+	// whole path, not the group prefix.
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/platform/gadgets"); err != nil || ok {
+		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/platform/gadgets) = (%v, %v), want (false, nil)", ok, err)
+	}
+	// So is the parent group's own path.
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/platform"); err != nil || ok {
+		t.Errorf("AuthorizedGitLabProject(gitlab:4242, acme/platform) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestInstallationGate_UnboundRowRefusesWithTheNamedSentinel is the UPGRADE
+// case: a row inserted by raw SQL with project_path NULL — exactly the shape
+// every installations row registered before migration 0078 has, and one the CLI
+// can no longer produce. It must REFUSE through the shipped authorizer, and
+// carry the named sentinel so the dispatcher audits
+// gitlab_project_path_unbound rather than a generic lookup failure.
+//
+// Seeded BY CONSTRUCTION (raw INSERT), never through the register verb, so the
+// RED under a deleted unbound guard lands on the behavioral assertion and not
+// on fixture setup. The payload path is the one the PRE-#2877 namespace-only
+// binding would have ADMITTED, which is what makes "refuses" meaningful here.
+func TestInstallationGate_UnboundRowRefusesWithTheNamedSentinel(t *testing.T) {
+	url := pgtest.NewURL(t)
+	mustCreateAccount(t, url, "gitlab", "acme")
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var acctID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM accounts WHERE provider = 'gitlab' AND account_key = 'acme'`).Scan(&acctID); err != nil {
+		t.Fatalf("read seeded account: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES (gen_random_uuid(), $1, 'gitlab', 'gitlab:4242')`, acctID); err != nil {
+		t.Fatalf("seed pre-0078 installation row: %v", err)
+	}
+
+	authorizer := gitLabProjectRegistry{q: accountdb.New(pool)}
+	ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/widgets")
+	if ok {
+		t.Error("AuthorizedGitLabProject admitted an unbound row, want a refusal (no fallback to namespace-only)")
+	}
+	if !errors.Is(err, webhook.ErrGitLabProjectPathUnbound) {
+		t.Errorf("err = %v, want webhook.ErrGitLabProjectPathUnbound (the audit reason depends on this identity)", err)
+	}
+
+	// The operability half: `installation list` marks the row so an operator
+	// can ENUMERATE what needs re-registering. Both the upgrade remedy and the
+	// rollback recovery in docs/deploy/gitlab.md rest on this rendering.
+	listed := captureStdout(t, func() {
+		var log bytes.Buffer
+		if got := runInstallation([]string{"list", "--db", url}, &log); got != exitOK {
+			t.Fatalf("list exit = %d; log:\n%s", got, log.String())
+		}
+	})
+	if !strings.Contains(listed, "PROJECT_PATH") {
+		t.Errorf("list %q has no PROJECT_PATH column", listed)
+	}
+	if !strings.Contains(listed, unboundProjectPathMarker) {
+		t.Errorf("list %q does not mark the unbound gitlab row %q", listed, unboundProjectPathMarker)
+	}
+
+	// And re-registering REPAIRS the row in place (the documented remedy),
+	// after which the same payload admits and the marker is gone.
+	mustRegisterInstallation(t, url, "gitlab", "acme", "gitlab:4242", "acme/widgets")
+	if ok, err := authorizer.AuthorizedGitLabProject(ctx, "gitlab:4242", "acme/widgets"); err != nil || !ok {
+		t.Errorf("after re-registration, AuthorizedGitLabProject = (%v, %v), want (true, nil)", ok, err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM installations WHERE provider = 'gitlab' AND installation_ref = 'gitlab:4242'`).Scan(&count); err != nil {
+		t.Fatalf("recount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("installations row count after repair = %d, want 1 (the upsert repairs in place)", count)
+	}
+	repaired := captureStdout(t, func() {
+		var log bytes.Buffer
+		if got := runInstallation([]string{"list", "--db", url}, &log); got != exitOK {
+			t.Fatalf("list exit = %d; log:\n%s", got, log.String())
+		}
+	})
+	if strings.Contains(repaired, unboundProjectPathMarker) {
+		t.Errorf("list %q still marks the repaired row unbound", repaired)
+	}
+	if !strings.Contains(repaired, "acme/widgets") {
+		t.Errorf("list %q does not render the repaired project_path", repaired)
+	}
+}
+
+// TestRunInstallationList_RendersNoUnboundMarkerForGitHub is the paired control
+// for the marker above: a github installation records no project path BY
+// DESIGN, so marking it would manufacture a false alarm and send an operator
+// re-registering something that is already correct.
+func TestRunInstallationList_RendersNoUnboundMarkerForGitHub(t *testing.T) {
+	url := pgtest.NewURL(t)
+	mustCreateAccount(t, url, "github", "widgets")
+	mustRegisterInstallation(t, url, "github", "widgets", "77", "")
+
+	listed := captureStdout(t, func() {
+		var log bytes.Buffer
+		if got := runInstallation([]string{"list", "--db", url}, &log); got != exitOK {
+			t.Fatalf("list exit = %d; log:\n%s", got, log.String())
+		}
+	})
+	if !strings.Contains(listed, "77") {
+		t.Fatalf("list %q missing the github installation", listed)
+	}
+	if strings.Contains(listed, unboundProjectPathMarker) {
+		t.Errorf("list %q marks a github row unbound, want no marker", listed)
 	}
 }
 
@@ -309,10 +479,17 @@ func mustCreateAccount(t *testing.T, url, provider, key string) {
 	}
 }
 
-func mustRegisterInstallation(t *testing.T, url, provider, key, ref string) {
+// mustRegisterInstallation registers an installation, supplying --project-path
+// only when one is given — a github registration takes none, and supplying an
+// empty one would exercise a shape the flag does not have.
+func mustRegisterInstallation(t *testing.T, url, provider, key, ref, projectPath string) {
 	t.Helper()
+	args := []string{"register", "--db", url, "--provider", provider, "--account-key", key, "--installation-ref", ref}
+	if projectPath != "" {
+		args = append(args, "--project-path", projectPath)
+	}
 	var out bytes.Buffer
-	if got := runInstallation([]string{"register", "--db", url, "--provider", provider, "--account-key", key, "--installation-ref", ref}, &out); got != exitOK {
+	if got := runInstallation(args, &out); got != exitOK {
 		t.Fatalf("mustRegisterInstallation %s/%s/%s exit = %d; log:\n%s", provider, key, ref, got, out.String())
 	}
 }

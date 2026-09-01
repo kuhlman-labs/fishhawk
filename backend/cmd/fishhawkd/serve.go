@@ -3571,14 +3571,38 @@ type gitLabProjectRegistryQueries interface {
 // account that owns it. Both halves of the payload identity are bound:
 //
 //  1. the credential ref must resolve to a registered gitlab installation, and
-//  2. the project path's namespace segment must equal that installation's
-//     account_key — the same owner-segment convention account.Resolver uses.
+//  2. the project path must equal that installation's recorded project_path
+//     EXACTLY, byte for byte.
 //
 // Requiring (2) is what stops a registered project id from being paired with
 // some OTHER project's path: the two selectors address different projects (the
 // ref picks the credential and the pipeline target, the path picks the project
 // the workflow spec is read from), so binding only the ref would still leave
 // the spec read steerable.
+//
+// (2) is EXACT since E45.26 / #2877. It was previously NAMESPACE-level — the
+// path's first segment compared against the account_key — which admitted a
+// registered 'gitlab:4242' under account 'acme' paired with any 'acme/*' path,
+// leaving the spec read steerable to a sibling project inside the tenant.
+// Comparison is case-SENSITIVE: GitLab canonicalises project path case, so a
+// case difference means the payload does not name the recorded project.
+//
+// The namespace comparison is RETAINED alongside the exact compare as a tenancy
+// invariant, and it is NOT redundant: the write path validates that a recorded
+// path's namespace equals its account's key, but a row written BEFORE that
+// validation existed (the hand-written SQL docs/deploy/gitlab.md used to
+// prescribe), or one whose account was re-keyed afterwards, can carry a path
+// outside its account's namespace. The exact compare would admit such a row —
+// recorded and payload paths agree — while the tenancy invariant it violates
+// does not hold. The namespace check refuses it.
+//
+// A row recording NO project path (NULL, or an empty string — a *string has
+// three states and two of them are unbound) is the shape every installation
+// registered before migration 0078 has. It REFUSES with
+// webhook.ErrGitLabProjectPathUnbound rather than falling back to the old
+// namespace-only admit, so the dispatcher can name the condition in the audit
+// and point the operator at re-registration. Falling back would preserve
+// exactly the steering this change closes.
 //
 // A missing row is a REFUSAL (false, nil); a query fault is an ERROR the
 // dispatcher also fails closed on. Neither ever admits.
@@ -3611,7 +3635,17 @@ func (r gitLabProjectRegistry) AuthorizedGitLabProject(ctx context.Context, cred
 		}
 		return false, err
 	}
-	return acct.AccountKey == owner, nil
+	// The retained tenancy invariant: the payload path must live in the owning
+	// account's namespace, whatever the installation recorded.
+	if acct.AccountKey != owner {
+		return false, nil
+	}
+	// Fail closed on an unbound row rather than degrading to the pre-#2877
+	// namespace-only admit. NULL and empty are both unbound.
+	if inst.ProjectPath == nil || strings.TrimSpace(*inst.ProjectPath) == "" {
+		return false, webhook.ErrGitLabProjectPathUnbound
+	}
+	return strings.TrimSpace(*inst.ProjectPath) == projectPath, nil
 }
 
 var _ webhook.GitLabProjectAuthorizer = gitLabProjectRegistry{}

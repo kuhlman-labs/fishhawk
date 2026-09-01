@@ -245,6 +245,10 @@ caller, so operators were reduced to hand-written SQL. `CreateAccount` /
 thin flag-parsing shells over this domain surface so the logic is unit-testable
 against the `RegistryQueries` fake.
 
+Since E45.26 / #2877 that gate binds the payload's project PATH exactly rather
+than at namespace level, so `RegisterInstallation` additionally REQUIRES a
+`ProjectPath` for a gitlab registration — see below.
+
 Both validation vocabularies are reused from `singletenant.go`: `accountProviders`
 / `accountGranularities` (the `accounts_provider_check` /
 `accounts_granularity_check` mirrors) are now package-scoped and shared, so the
@@ -346,3 +350,31 @@ per branch plus committed-state / idempotence / auto_join-upgrade reads; the
 cross-boundary seam test (CLI → domain → sqlc → Postgres → the resolver with an
 **empty lister registry**, proving DB-only admission) lives in
 `backend/cmd/fishhawkd/member_test.go`. Operator guide: `docs/deploy/self-hosted.md`.
+
+### `RegisterInstallation` requires a `ProjectPath` for gitlab (E45.26 / #2877)
+
+The GitLab authorization gate now admits a trigger only when the payload's
+`path_with_namespace` equals the installation's recorded `project_path`
+EXACTLY (migration `0078`), so a gitlab installations row carrying none is
+UNBOUND and refuses every trigger. `RegisterInstallation` therefore refuses to
+create one: `ValidateGitLabProjectPath` requires a non-empty trimmed path of the
+form `<namespace>/<project>` whose namespace segment equals the resolved
+`account_key`, each failure wrapping `ErrValidation` and naming the offending
+values. That keeps the fail-closed refusal a purely historical artifact — the
+shape a pre-0078 row has — rather than something the supported write path can
+newly produce.
+
+The split is on the **FIRST** separator only. GitLab groups nest
+(`acme/platform/widgets`), and the authorizer derives the namespace with the
+same `strings.Cut`, so splitting any other way here would validate a shape the
+gate then rejects.
+
+The rule is **gitlab-only**. A github installation's identity arrives inside an
+HMAC-signed payload and resolves through the installation id, so it records no
+project path; any supplied one is ignored rather than persisted, and requiring
+the flag there would be a gratuitous CLI contract break.
+
+The path is stored **trimmed** and compared **case-sensitively**: GitLab
+canonicalises project path case, so a case difference names a different project.
+A stray flag-quoting space would otherwise produce a row that never admits
+anything.

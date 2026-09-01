@@ -191,6 +191,45 @@ type RegisterInstallationRequest struct {
 	InstallationRef string
 	ForgeBaseURL    string
 	OAuthBaseURL    string
+	// ProjectPath is the GitLab path_with_namespace this installation is
+	// authorized to act on. REQUIRED for provider 'gitlab' (E45.26 / #2877)
+	// and ignored for 'github', whose payload identity arrives HMAC-signed
+	// and is resolved through the installation id instead.
+	ProjectPath string
+}
+
+// ValidateGitLabProjectPath checks a GitLab path_with_namespace against the
+// shape the run-creation authorization gate binds, wrapping ErrValidation on
+// any mismatch. accountKey is the ALREADY-TRIMMED account_key the path must
+// live under.
+//
+// The split is on the FIRST separator only. GitLab groups NEST
+// ('acme/platform/widgets'), so a validator demanding exactly two segments
+// would make every nested-group project unregisterable — and the authorizer's
+// own namespace derivation is `strings.Cut(path, "/")`, the same
+// owner-segment convention account.Resolver uses, so splitting any other way
+// here would validate a shape the gate then rejects.
+//
+// Comparison is EXACT and case-SENSITIVE, matching the authorizer. GitLab
+// canonicalises project path case, so a case difference means the payload does
+// not name the recorded project.
+func ValidateGitLabProjectPath(accountKey, projectPath string) error {
+	path := strings.TrimSpace(projectPath)
+	if path == "" {
+		return fmt.Errorf("account: gitlab registrations must record the project path (--project-path <namespace>/<project>): %w", ErrValidation)
+	}
+	namespace, project, ok := strings.Cut(path, "/")
+	if !ok || namespace == "" || project == "" {
+		return fmt.Errorf(
+			"account: gitlab project path %q must be of the form <namespace>/<project> (nested groups allowed, e.g. acme/platform/widgets) (--project-path): %w",
+			path, ErrValidation)
+	}
+	if namespace != accountKey {
+		return fmt.Errorf(
+			"account: gitlab project path %q lives under namespace %q but the installation is owned by account_key %q; the namespace segment must equal the account key (--project-path): %w",
+			path, namespace, accountKey, ErrValidation)
+	}
+	return nil
 }
 
 // RegisterInstallation validates its input, resolves the owning account by
@@ -201,12 +240,20 @@ type RegisterInstallationRequest struct {
 // account — this is the load-bearing control (see ErrAccountNotFound). Every
 // input validation failure wraps ErrValidation. The upsert is idempotent on
 // (provider, installation_ref).
+//
+// For provider 'gitlab' a --project-path is REQUIRED and must live under the
+// resolved account_key (ValidateGitLabProjectPath): since E45.26 / #2877 the
+// run-creation authorization gate binds the payload's path EXACTLY against this
+// value, and a row carrying none is UNBOUND and refuses every trigger. Refusing
+// to create one is what keeps the fail-closed refusal an upgrade artifact
+// rather than something the supported write path can newly produce.
 func RegisterInstallation(ctx context.Context, q RegistryQueries, req RegisterInstallationRequest) (accountdb.Installation, error) {
 	provider := strings.TrimSpace(req.Provider)
 	accountKey := strings.TrimSpace(req.AccountKey)
 	ref := strings.TrimSpace(req.InstallationRef)
 	forgeBaseURL := strings.TrimSpace(req.ForgeBaseURL)
 	oauthBaseURL := strings.TrimSpace(req.OAuthBaseURL)
+	projectPath := strings.TrimSpace(req.ProjectPath)
 
 	if !slices.Contains(accountProviders, provider) {
 		return accountdb.Installation{}, fmt.Errorf("account: provider %q is not one of %s (--provider): %w",
@@ -239,6 +286,20 @@ func RegisterInstallation(ctx context.Context, q RegistryQueries, req RegisterIn
 		return accountdb.Installation{}, err
 	}
 
+	// The exact-path binding the GitLab authorization gate compares against
+	// (E45.26 / #2877). Validated AFTER the account lookup and against the same
+	// trimmed accountKey, so the namespace-consistency message names the key
+	// that was actually resolved. github is unaffected: its identity is
+	// HMAC-signed and resolved through the installation id, so no project path
+	// applies and any supplied one is ignored rather than persisted.
+	var projectPathPtr *string
+	if provider == "gitlab" {
+		if err := ValidateGitLabProjectPath(accountKey, projectPath); err != nil {
+			return accountdb.Installation{}, err
+		}
+		projectPathPtr = &projectPath
+	}
+
 	var forgePtr, oauthPtr *string
 	if forgeBaseURL != "" {
 		forgePtr = &forgeBaseURL
@@ -253,5 +314,6 @@ func RegisterInstallation(ctx context.Context, q RegistryQueries, req RegisterIn
 		InstallationRef: ref,
 		ForgeBaseUrl:    forgePtr,
 		OauthBaseUrl:    oauthPtr,
+		ProjectPath:     projectPathPtr,
 	})
 }
