@@ -619,6 +619,52 @@ This is the ORDINARY path, not the [#2570](https://github.com/kuhlman-labs/fishh
 
 **Obligation for a future call site.** The emit is at the call sites BY DESIGN, which means a third production caller of `prTitleAndBodyParts` added without its own emit would regain today's silence. Stated here so it is discoverable rather than folklore.
 
+## A base-rebase re-invoke replays the agent handoffs (E67.93 / [#2840](https://github.com/kuhlman-labs/fishhawk/issues/2840))
+
+Four PRs ([#2741](https://github.com/kuhlman-labs/fishhawk/pull/2741), [#2755](https://github.com/kuhlman-labs/fishhawk/pull/2755), [#2776](https://github.com/kuhlman-labs/fishhawk/pull/2776), [#2779](https://github.com/kuhlman-labs/fishhawk/pull/2779)) opened with the `chore: fishhawk implement stage <id>` placeholder title, a placeholder body and a placeholder commit message even though their agents had written a perfectly good PR description — so the trigger issue never auto-closed. The agent did nothing wrong; the stage hit a base-rebase conflict.
+
+**The mechanism is delete-after-read meeting a second pass.** Both agent handoffs are one-shot files under `/tmp`:
+
+| Handoff | Path | Loader |
+|---|---|---|
+| PR description | `/tmp/fishhawk-pr-<run>-<stage>.md` (plus the legacy fixed path) | `loadAgentAuthoredPR` |
+| Initial commit message | `/tmp/fishhawk-implement-commitmsg-<run>-<stage>.txt` | `loadImplementCommitMessage` |
+
+Each loader `os.Remove`s whichever path it read, on every return path, so a stale handoff can never bleed into a later run/stage. That is right ACROSS stages and wrong WITHIN one, because `openPRAndShipArtifact` resolves both handoffs BEFORE `CommitAndPush` can fail with `gitops.ErrBaseRebaseConflict` — and on that error `run()` re-invokes the agent (`reinvokeOnBaseRebaseConflict`, [#989](https://github.com/kuhlman-labs/fishhawk/issues/989)) and calls `openPRAndShipArtifact` a SECOND time. By then both files are gone, so the second pass falls through to the placeholder for the title, the body AND the commit message. The runner log was the only place this was observable at all, and it said nothing about it.
+
+**`agentHandoff` is a per-stage memo, armed lazily.** `cfg.handoff` is a runtime-set POINTER field on `config` (the `agentBinary`/`agentVersion` idiom), armed in `run()` immediately before the FIRST `openPRAndShipArtifact` call of an implement stage and nil everywhere else. `config` is passed by value, but copying a struct copies the pointer, not the pointee — so both calls share ONE memo without adding a 16th parameter to a function with 38 test call sites and two shared wire goldens that construct its args directly.
+
+Arming LAZILY rather than hoisting the capture above the retry is deliberate. A hoist would move the loaders' emits (`pr_template_warning`, `pr_description_legacy_path`, `implement_commitmsg_empty`) earlier in the runner log and break first-pass byte-identity. With a memo the FIRST read still happens inside `openPRAndShipArtifact`, at the same point, with the same emits in the same order; only a SECOND pass consults the memo. `TestAgentHandoff_ArmedNoConflictUnchanged` asserts an armed memo is indistinguishable from a nil one across every handoff shape, and the unedited `testdata/wire/ordinary_pr_artifact.json` golden is the independent byte-level detector.
+
+**Three rules, each its own control.**
+
+| Rule | Behaviour | Why | Pinned by |
+|---|---|---|---|
+| (a) fresh-first | ALWAYS attempt the fresh read; never short-circuit on a stored value | `baseRebaseConflictPrompt` re-requests both handoffs by absolute keyed path, so a compliant re-invoked agent re-writes them — and its text describes the RE-LANDED slice, so it must win | `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins` |
+| (b) store-on-success | Store only `prSourceAgent` / `ok` captures | a first-pass MISS must not poison a later pass that DOES find text, and a cached fallback would announce a replay that never happened | `TestAgentHandoff_LoadOrReplay`, `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack` |
+| (c) replay-on-miss | Replay the stored capture only when the fresh read yielded no agent text, and emit an event | the runner log is the only surface where this failure is visible | `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText`, `TestAgentHandoff_ReplayEmitsEvent` |
+
+Prefer-fresh, not replay-first, is the correct precedence: replay-first would silently discard the option-3 re-request this change also lands, and would ship a description of the slice the agent could NOT land. The cost is accepted and stated — a re-invoked agent that writes a WORSE description overwrites a good first-pass one.
+
+**Fresh-but-MALFORMED loses to stored.** "Fresh wins" under (a) is scoped to fresh AGENT TEXT — a `prSourceAgent` read — so a re-invoked agent that DID re-write the handoff but botched it (an empty title, an unreadable file: `empty_title`, `empty_file`, `handoff_unreadable`) is a miss under (c), and the stored first-pass capture replays, discarding the fresh read's classification. This is deliberate, not an oversight: the memo exists precisely because the second pass cannot re-derive the agent's text, and a `prBodyReasonEmptyTitle` fallback is strictly worse for the PR than the first pass's real description. The malformed write does not vanish from the trace — the loader's own `pr_template_invalid` / `pr_description_legacy_unreadable` warning is emitted by the fresh read that precedes the replay, so the log carries the warning AND `pr_description_replayed` in that order. Pinned by `TestAgentHandoff_LoadOrReplay`'s `fresh malformed loses to stored` case.
+
+A NIL receiver is a pure load that stores nothing, which is what keeps every un-armed path — the plan and acceptance stages, the held-commit resume, every fix-up pass — byte-identical.
+
+**Two events, and how they relate to [#3012](https://github.com/kuhlman-labs/fishhawk/issues/3012)'s vocabulary.**
+
+- `pr_description_replayed` — `{run_id, stage_id}`.
+- `implement_commitmsg_replayed` — `{run_id, stage_id}`.
+
+`pr_description_replayed` is the memo's sibling of `pr_body_recovered`: the same RESOLVED-STATE shape (composition fell back, then text was recovered, so record the recovery rather than a composition failure), reached by a different mechanism — an in-process memo across two `openPRAndShipArtifact` calls, versus backend-served text across a park/resume. They are distinct events because the mechanisms differ, but they must not disagree about what the audit records, so the memo REUSES #3012's vocabulary rather than growing a parallel one: a replay returns the stored `(title, body, kind, prBodyReason)` tuple VERBATIM, so the artifact's `pr_body_fallback_reason` resolves exactly as it did on the capturing pass. A full agent handoff replays reason `none`, which — because `emitPRBodyNotComposed` is keyed off the RETURNED reason — suppresses a spurious `pr_body_not_composed` by construction rather than by suppression machinery; `TestAgentHandoff_ReplayEmitsEvent` asserts that property rather than assuming it. A TITLE-ONLY handoff replays `body_absent` and is marked exactly as the capturing pass marked it — which means the call site emits `pr_body_not_composed reason=body_absent` a second time for the same stage, alongside `pr_description_replayed`. That double-emit is the accepted consequence of marking a replay identically to its capture rather than inventing a replay-only classification; it is pinned by `TestAgentHandoff_LoadOrReplay`'s `pr title-only replays body_absent` case so it stays a decision rather than an accident. When neither fresh nor stored text exists the FRESH fallback is returned verbatim, reason included, so a genuine absence still ships the marked placeholder and still emits `pr_body_not_composed reason=handoff_absent`.
+
+A replayed pass emits FEWER file-level events than a real read would — no `pr_template_warning`, no `pr_description_legacy_path` on the second pass. That is deliberate single-emission (the discipline #3012 applied to `pr_body_not_composed`), and the two replay events are what make it greppable.
+
+**`baseRebaseConflictPrompt` also re-requests both handoffs** (the issue's option 3), naming the exact absolute keyed paths via the runner's own `pullRequestDescriptionPath` / `implementCommitMessagePath` helpers so the prompt can never name a path the runner does not read, and stating that the previous attempt's handoffs were consumed. It takes `cfg` for that; the single call site in `reinvokeOnBaseRebaseConflict` is updated for the new signature. This is belt-and-braces only — the memo already closes the hole when the agent does not comply, which is the [#2658](https://github.com/kuhlman-labs/fishhawk/issues/2658) shape.
+
+**`runVerifyFixLoop` consumes NEITHER handoff** (the `verify_fix_reinvoke` question the issue asks to check rather than assume). Verified by a caller sweep: the only production consumers of `prTitleAndBody` / `prTitleAndBodyParts` / `implementCommitMessage` are `openPRAndShipArtifact` and `openHeldCommitPR`, and the verify-fix loop calls none of them. The memo makes the question moot for any future re-invoke path added on this stage.
+
+**Residual, deliberate.** A stage that opens a PR through any future THIRD pass inherits the memo automatically, because the memo lives on `config` rather than inside the retry block. A stage whose agent never writes a handoff at all still ships the #3012-marked placeholder, by design — the memo recovers text that existed, it does not invent text that did not.
+
 ## PR-open credential re-authentication (E67.62 / [#2730](https://github.com/kuhlman-labs/fishhawk/issues/2730))
 
 An implement stage that runs the full hour could reach PR-open holding a dead GitHub App installation token and fail the WHOLE stage `401 Bad credentials` — after the gate-verified commit was already pushed. The credential is minted at the top of `openPRAndShipArtifact`, but the forge write happens after `CommitAndPush`, whose committed-tree verify (plus the verify-fix loop) can run for minutes; App installation tokens live ~1 hour and the backend's `githubapp.CachedProvider` only guarantees `RefreshLeadTime` (5m) of remaining life at mint. So the push succeeds on that token and the PR-open 401s.

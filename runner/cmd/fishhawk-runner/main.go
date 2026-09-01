@@ -2546,6 +2546,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// branch, and passed into the failure report below so a retry_stage can
 			// resume the PR open with no agent re-invocation.
 			var prCheckpoint pushCheckpoint
+			// Arm the per-stage agent-handoff memo (#2840) immediately before
+			// the FIRST openPRAndShipArtifact call. Arming here — rather than
+			// capturing eagerly above the retry — is what keeps the first pass
+			// byte-identical: the first read still happens INSIDE
+			// openPRAndShipArtifact, at the same point in the log, with the same
+			// emits in the same order. Only a SECOND pass (the base-rebase
+			// re-invoke retry below, or any future third) consults the memo.
+			// Nothing else in the process is armed, so the plan/acceptance
+			// stages, the held-commit resume and the fix-up-only paths are
+			// unchanged.
+			cfg.handoff = &agentHandoff{}
 			// Migration-number collision park (#2748). Placed HERE, immediately
 			// before the ship, and NOT inside verifyCommit: by the time that
 			// closure runs, CommitAndPush has already staged the scope-only
@@ -4898,7 +4909,17 @@ green.`, verifyCmd, output)
 // already contains the newer commits — with the captured conflict context.
 // detail may be nil (a plain ErrBaseRebaseConflict with no typed context, or
 // a capture-degraded error); the prompt then omits the context sections.
-func baseRebaseConflictPrompt(detail *gitops.BaseRebaseConflictError) string {
+//
+// It also RE-REQUESTS both agent handoffs by absolute keyed path (#2840, the
+// issue's option 3): attempt 1's openPRAndShipArtifact already consumed them
+// (both loaders are delete-after-read), so a re-invoked agent that writes
+// nothing would otherwise ship the placeholder title/body/commit message. The
+// paths are built from the runner's OWN pullRequestDescriptionPath /
+// implementCommitMessagePath helpers, so the prompt can never name a path the
+// runner does not read. This is belt-and-braces: cfg.handoff already closes the
+// hole when the agent does not comply, and prefer-fresh means a compliant
+// agent's re-written text still wins over the memo.
+func baseRebaseConflictPrompt(cfg config, detail *gitops.BaseRebaseConflictError) string {
 	var b strings.Builder
 	b.WriteString(`Your previous edits did NOT land: the base branch moved while you worked —
 sibling or base commits landed after you started, and re-applying your changes
@@ -4913,6 +4934,15 @@ Re-land your full original slice on top of the current tree:
 - Stay within the approved scope.files — edit only the files you were already
   allowed to change.
 `)
+	fmt.Fprintf(&b, `
+Re-write BOTH of your handoff files. The ones you wrote on the previous attempt
+were CONSUMED by the attempt that failed, so they no longer exist on disk:
+- The pull-request description (first line the Conventional Commits title, blank
+  line, then the markdown body ending with your `+"`Closes #N`"+` line):
+  %s
+- The initial commit message (Conventional Commits header, blank line, body):
+  %s
+`, pullRequestDescriptionPath(cfg.runID, cfg.stageID), implementCommitMessagePath(cfg.runID, cfg.stageID))
 	if detail == nil {
 		return b.String()
 	}
@@ -4997,7 +5027,7 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 	}
 
 	reinvokeInv := baseInv
-	reinvokeInv.Prompt = baseRebaseConflictPrompt(detail)
+	reinvokeInv.Prompt = baseRebaseConflictPrompt(cfg, detail)
 
 	// Bounded infra-retry on the re-invocation, mirroring the verify-fix
 	// loop's maxFixInvokeInfraRetries pattern (#804): a transient agent-API/
@@ -9771,7 +9801,7 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 // sees no behavior change. title/body are the PR title/body sourced unchanged
 // from the run/stage-keyed PR-description handoff (#1777).
 func implementCommitMessage(cfg config, title, body string, logSink io.Writer) string {
-	if subject, sidecarBody, ok := loadImplementCommitMessage(cfg, logSink); ok {
+	if subject, sidecarBody, ok := cfg.handoff.commitMessage(cfg, logSink); ok {
 		// Warn-only conventional-commit header check on the sidecar subject,
 		// matching the PR-title warn — advisory, never a rewrite or hard failure.
 		if !conventionalCommitHeaderRe.MatchString(subject) {
@@ -10083,7 +10113,12 @@ func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body s
 // failure. Emitting here would manufacture exactly the record-asserts-what-did-
 // -not-happen defect this issue is about.
 func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool, reason prBodyReason) {
-	agentTitle, agentBody, kind, reason := loadAgentAuthoredPR(cfg, logSink)
+	// Routed through the per-stage memo (#2840) so a base-rebase re-invoke's
+	// SECOND openPRAndShipArtifact call does not fall through to the placeholder
+	// after the first call's delete-after-read consumed the handoff. cfg.handoff
+	// is nil on every un-armed path, and the method is nil-tolerant, so this is a
+	// plain loadAgentAuthoredPR call there.
+	agentTitle, agentBody, kind, reason := cfg.handoff.pullRequest(cfg, logSink)
 
 	if kind == prSourceAgent {
 		// A title-only handoff is still agent-authored — the agent's title is
@@ -10217,6 +10252,120 @@ func emitPRBodyNotComposed(logSink io.Writer, cfg config, reason prBodyReason, c
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"pr_body_not_composed","run_id":%q,"stage_id":%q,"reason":%q,"handoff_path":%q}`+"\n",
 		cfg.runID, cfg.stageID, string(reason), checkedPath)
+}
+
+// agentHandoff memoizes the implement agent's two /tmp handoffs — the
+// PR-description file (#1777) and the initial-commit-message sidecar (#1686) —
+// for the lifetime of ONE implement stage (#2840).
+//
+// Both loaders are DELETE-AFTER-READ: loadAgentAuthoredPR and
+// loadImplementCommitMessage os.Remove whichever path they read, on EVERY return
+// path, so a stale handoff can never bleed into a later run/stage. That is right
+// ACROSS stages and wrong WITHIN one, because a stage can reach
+// openPRAndShipArtifact TWICE: the bounded base-rebase-conflict re-invoke (#989)
+// retries the whole commit/push/open chain after the first attempt already
+// consumed both files. The second pass then found nothing and shipped the
+// `chore: fishhawk implement stage <id>` placeholder for the PR title, the PR
+// body AND the initial commit message — losing the agent's `Closes #N` and the
+// issue auto-close (PRs #2741/#2755/#2776/#2779).
+//
+// THREE RULES, each a separate control with its own counterfactual test:
+//
+//	(a) ALWAYS attempt the FRESH read first; never short-circuit on a stored
+//	    value. baseRebaseConflictPrompt re-requests both handoffs by absolute
+//	    keyed path, so a compliant re-invoked agent re-writes them — and its
+//	    text is the text that matches the RE-LANDED slice, so it must win.
+//	    Pinned by TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins.
+//	(b) STORE only a SUCCESSFUL capture (prSourceAgent for the PR handoff,
+//	    ok for the sidecar). A fallback or an absence is never cached, so a
+//	    first-pass MISS cannot poison a later pass that DOES find text.
+//	    Pinned by TestAgentHandoff_LoadOrReplay's no-poisoning cases.
+//	(c) REPLAY the stored capture only when the fresh read yielded no agent
+//	    text, and say so — pr_description_replayed / implement_commitmsg_replayed
+//	    — because the runner log is the only place this failure is observable at
+//	    all. Pinned by TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText
+//	    and TestAgentHandoff_ReplayEmitsEvent.
+//
+// VOCABULARY REUSE, not a parallel one (#2840 binding condition 2). When neither
+// fresh nor stored text exists the FRESH fallback is returned VERBATIM, its
+// prBodyReason included, so the #3012 marker, the pr_body_not_composed emit and
+// the artifact's pr_body_fallback_reason all keep classifying the real branch. A
+// REPLAY likewise returns the stored tuple verbatim, so the artifact's
+// pr_body_fallback_reason resolves exactly as it did on the pass that captured
+// it: a full agent handoff replays reason none — and emitPRBodyNotComposed is
+// keyed off the RETURNED reason, so a replayed pass emits no spurious
+// pr_body_not_composed by construction, asserted by TestAgentHandoff_ReplayEmitsEvent
+// — while a TITLE-ONLY handoff replays body_absent and is marked exactly as the
+// capturing pass marked it. pr_description_replayed is the memo's sibling of
+// openHeldCommitPR's pr_body_recovered: same resolved-state shape (composition
+// fell back, then text was recovered, so record the recovery and not a
+// composition failure), different mechanism (an in-process memo across two
+// openPRAndShipArtifact calls, vs backend-served text across a park/resume).
+//
+// A NIL receiver is a PURE LOAD: it delegates straight to the loader and stores
+// nothing. That is what keeps every un-armed path — the plan and acceptance
+// stages, the held-commit resume, every fix-up pass — byte-identical to before.
+type agentHandoff struct {
+	// Captured PR-description handoff (rule b: written only on prSourceAgent).
+	prTitle  string
+	prBody   string
+	prKind   prSource
+	prReason prBodyReason
+	prStored bool
+
+	// Captured initial-implement commit-message sidecar (rule b: written only
+	// on ok).
+	cmSubject string
+	cmBody    string
+	cmStored  bool
+}
+
+// pullRequest is loadAgentAuthoredPR with the load-or-replay rules above
+// applied. Signature-identical to the loader so the call site does not change
+// shape; nil-tolerant so an un-armed stage is a pure load.
+func (h *agentHandoff) pullRequest(cfg config, logSink io.Writer) (title, body string, kind prSource, reason prBodyReason) {
+	// Rule (a): the fresh read ALWAYS runs, and it runs FIRST — including its
+	// own delete-after-read, its pr_template_* warnings and its
+	// pr_description_legacy_path deprecation event. This is what makes the
+	// FIRST read of a stage byte-identical to the pre-memo behavior.
+	title, body, kind, reason = loadAgentAuthoredPR(cfg, logSink)
+	if h == nil {
+		return title, body, kind, reason
+	}
+	if kind == prSourceAgent {
+		// Rule (b): store only a successful capture.
+		h.prTitle, h.prBody, h.prKind, h.prReason, h.prStored = title, body, kind, reason, true
+		return title, body, kind, reason
+	}
+	if !h.prStored {
+		// No fresh text and nothing captured: return the fresh FALLBACK
+		// verbatim, reason included, so #3012's classification is untouched.
+		return title, body, kind, reason
+	}
+	// Rule (c): replay, and say so.
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pr_description_replayed","run_id":%q,"stage_id":%q}`+"\n",
+		cfg.runID, cfg.stageID)
+	return h.prTitle, h.prBody, h.prKind, h.prReason
+}
+
+// commitMessage is loadImplementCommitMessage with the same three rules.
+func (h *agentHandoff) commitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
+	subject, body, ok = loadImplementCommitMessage(cfg, logSink)
+	if h == nil {
+		return subject, body, ok
+	}
+	if ok {
+		h.cmSubject, h.cmBody, h.cmStored = subject, body, true
+		return subject, body, ok
+	}
+	if !h.cmStored {
+		return subject, body, ok
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"implement_commitmsg_replayed","run_id":%q,"stage_id":%q}`+"\n",
+		cfg.runID, cfg.stageID)
+	return h.cmSubject, h.cmBody, true
 }
 
 // loadAgentAuthoredPR tries to read the agent-authored PR file and
