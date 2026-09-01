@@ -1,11 +1,12 @@
 # backend/internal/auditcomplete
 
-Audit-complete derivation (#229, #282, #947): derives the `fishhawk_audit_complete` blocking-check state on demand via `Compute(ctx, runID, deps)`.
+Audit-complete derivation (#229, #282, #947, #3092): derives the `fishhawk_audit_complete` blocking-check state on demand via `ComputeResult(ctx, runID, deps) (Result, error)`, which returns `{State, Missing[], Resolved[]}`. `Compute(ctx, runID, deps) (state, missing, error)` is a signature-identical thin wrapper that drops `Resolved`, so every pre-#3092 call site compiles and behaves unchanged.
 
 ## Sub-topics (full detail in docs/architecture/audit-complete.md)
 
 - [The six rules](../../../docs/architecture/audit-complete.md#the-six-rules)
 - [Normalization for rule 4](../../../docs/architecture/audit-complete.md#normalization-rule-4-specifics) (#302/#308)
+- [Rule 2b decomposition trace resolution](../../../docs/architecture/audit-complete.md#rule-2b-decomposition-trace-resolution-3092-details) (#3092)
 - [Rule 5 live-HEAD check](../../../docs/architecture/audit-complete.md#rule-5-live-head-check-details) (#282)
 - [Rule 6 review-presence gate](../../../docs/architecture/audit-complete.md#rule-6-review-presence-gate-947-details) (#947)
 - [State output](../../../docs/architecture/audit-complete.md#state-output)
@@ -28,3 +29,20 @@ An acceptance stage the orchestrator short-circuited pre-spawn ships NO trace bu
 Because the key is the basis and not the verdict, #2347's change of that short-circuit verdict from `passed` to `not_validated` leaves the exemption firing exactly as before. That independence is a pinned regression test, not an assumption: `auditcomplete_test.go` asserts the exemption still applies to a `verdict: not_validated` entry carrying a known basis, and still does NOT apply to a validator-recorded verdict with no basis field.
 
 A read failure on either the skip-marker or the outcome-entry query is transient and returned to the caller, so the gate never silently under- or over-gates.
+
+## Rule 2b (#3092): decomposition trace resolution is NEVER an exemption
+
+A decomposed run's parent implement stage is the fan-out stage — it parks `awaiting_children`, spawns no agent, and by construction can never carry a trace — so rule 2 was unsatisfiable for every decomposed run and the required check could never go green.
+
+`ComputeResult` now RESOLVES that evidence through the fan-out instead of exempting the stage: when the parent implement stage has a trace gap and the run has decomposition children (`run.ListRunsFilter.DecomposedFrom`), it reads each child run's own implement-stage `trace_uploaded` entries and satisfies the parent's requirement only when every executed child is trace-complete. A child genuinely missing a trace still FAILS, naming the child run id and the child stage id. Only the implement stage is eligible — the misses are partitioned by owning stage id through a parallel slice returned by `missingTraces` (never a `Detail` string match, and never a new field on the wire-serialized `MissingItem`), so a plan/acceptance trace gap passes through verbatim.
+
+The four fail-closed branches:
+
+- **Non-terminal child implement stage** (`pending`, `running`, `awaiting_*`) → the parent's opaque `trace_missing` items are replaced by a single pending-flavored `children_pending` item. State `pending`: the requirement stays UNSATISFIED and the merge stays blocked exactly as `review_pending` blocks it today — it is not-yet, never a pass.
+- **Zero contributors** (every child cancelled, or carrying no implement stage) → NO `Resolution`. A `Resolution` is a positive claim naming the child runs that actually supplied the evidence, so it is CONSTRUCTED from a non-empty contributor set rather than checked after the fact; the parent's own items stand.
+- **Page-ceiling overflow** — the child query is paginated to exhaustion (`childPageSize` 100, `childPageCeiling` 100 pages) because the plan schema declares no `maxItems` on `decomposition.sub_plans`; reaching the ceiling without a short page means the child set was read only in PART, so no resolution is emitted and the parent's items stand. A truncated read can never become a pass.
+- **No children** (a flat run) → unchanged, byte-identically.
+
+Every read the rule performs (child query, child stages, child traces) surfaces a **transient error** so the caller retries — never a silent pass.
+
+`Resolution` is surfaced as evidence: the checks endpoint carries it as `resolved[]` on the audit-complete row and the published Check Run's pass summary names the satisfying child runs.

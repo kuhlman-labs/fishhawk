@@ -12014,6 +12014,46 @@ paths:
                                   - foreign_commit
                                   - head_fetch_failed
                                   - review_pending
+                                  - security_findings_unresolved
+                                  - security_findings_unverified
+                                  - children_pending
+                              detail:
+                                type: string
+                        resolved:
+                          type: array
+                          description: |
+                            Populated only on the `fishhawk_audit_complete`
+                            row, and only when the derivation RESOLVED a
+                            requirement the run could not satisfy on its own
+                            (#3092). Today the single kind is
+                            `trace_resolved_from_children`: a decomposed run's
+                            parent implement stage is the fan-out stage — it
+                            spawns no agent and can never ship a trace — so its
+                            trace requirement is satisfied by the implement-stage
+                            traces of the decomposition CHILD runs named in
+                            `child_run_ids`. A positive evidentiary claim, never
+                            an exemption: the array is never emitted with an
+                            empty `child_run_ids`, and a child genuinely missing
+                            a trace fails as a `trace_missing` entry naming that
+                            child instead. Absent when nothing was resolved.
+                          items:
+                            type: object
+                            required: [kind, stage_id, child_run_ids, detail]
+                            properties:
+                              kind:
+                                type: string
+                                enum:
+                                  - trace_resolved_from_children
+                              stage_id:
+                                type: string
+                                format: uuid
+                                description: The parent stage whose requirement was resolved.
+                              child_run_ids:
+                                type: array
+                                description: The child runs that actually supplied the evidence.
+                                items:
+                                  type: string
+                                  format: uuid
                               detail:
                                 type: string
         '400': { $ref: '#/components/responses/BadRequest' }

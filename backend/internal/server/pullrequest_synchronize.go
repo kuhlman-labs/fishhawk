@@ -72,7 +72,7 @@ func (s *Server) republishOnSynchronize(ctx context.Context, raw []byte) {
 	// without special-casing here.
 	target := runs[0]
 
-	state, missing, err := auditcomplete.Compute(ctx, target.ID, s.auditCompleteDeps())
+	res, err := auditcomplete.ComputeResult(ctx, target.ID, s.auditCompleteDeps())
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"pull_request.synchronize: compute failed",
@@ -83,14 +83,17 @@ func (s *Server) republishOnSynchronize(ctx context.Context, raw []byte) {
 
 	// Publish the fresh state to GitHub so branch protection
 	// re-evaluates. Nil-safe — `publishAuditCheck` short-circuits
-	// when the publisher isn't wired (dev posture).
-	s.publishAuditCheck(ctx, target.ID, state, missing)
+	// when the publisher isn't wired (dev posture). The decomposition
+	// RESOLUTIONS (#3092) ride along so a synchronize-triggered republish
+	// carries the same pass summary the read endpoint would.
+	s.publishAuditCheck(ctx, target.ID, res.State, res.Missing, res.Resolved)
 
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "pull_request.synchronize: republished audit-complete",
 		slog.String("pr_url", prURL),
 		slog.String("head_sha", p.PullRequest.Head.SHA),
 		slog.String("run_id", target.ID.String()),
-		slog.String("state", string(state)),
-		slog.Int("missing_count", len(missing)),
+		slog.String("state", string(res.State)),
+		slog.Int("missing_count", len(res.Missing)),
+		slog.Int("resolved_count", len(res.Resolved)),
 	)
 }

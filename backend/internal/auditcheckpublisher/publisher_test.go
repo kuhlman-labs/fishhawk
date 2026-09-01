@@ -1465,3 +1465,88 @@ type fakeArtifacts struct {
 func (f *fakeArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
 	return f.byStage[stageID], nil
 }
+
+// --- #3092: decomposition resolutions in the published summary ---
+
+// newResolutionPublisher builds the minimal pass-publishing fixture the three
+// resolution tests below share.
+func newResolutionPublisher(t *testing.T) (uuid.UUID, *fakeGitHub, *auditcheckpublisher.Publisher) {
+	t.Helper()
+	runID := uuid.New()
+	implID := uuid.New()
+	implRow := &run.Stage{ID: implID, Type: run.StageTypeImplement, RunID: runID}
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {implRow}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      gh,
+		Runs:        repoRuns,
+		Artifacts:   repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("expected publisher; got nil")
+	}
+	return runID, gh, pub
+}
+
+// A pass carrying a Resolution NAMES the satisfying child run ids in the Check
+// Run summary, so an auditor can follow the resolution chain from the forge.
+func TestPublishResult_PassSummaryNamesResolvingChildRuns(t *testing.T) {
+	runID, gh, pub := newResolutionPublisher(t)
+	childA, childB := uuid.New().String(), uuid.New().String()
+	res := []auditcomplete.Resolution{{
+		Kind:        auditcomplete.ResolvedTraceFromChildren,
+		StageID:     uuid.New(),
+		ChildRunIDs: []string{childA, childB},
+		Detail:      "resolved",
+	}}
+	if _, err := pub.PublishResult(context.Background(), runID, stagecheck.StatePass, nil, res); err != nil {
+		t.Fatalf("PublishResult: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(gh.calls))
+	}
+	summary := gh.calls[0].params.OutputSummary
+	for _, id := range []string{childA, childB} {
+		if !strings.Contains(summary, id) {
+			t.Errorf("pass summary must name child run %s; got:\n%s", id, summary)
+		}
+	}
+}
+
+// A pass with NO resolutions keeps the pre-#3092 summary byte-identical.
+func TestPublishResult_PassSummaryUnchangedWithoutResolutions(t *testing.T) {
+	runID, gh, pub := newResolutionPublisher(t)
+	if _, err := pub.PublishResult(context.Background(), runID, stagecheck.StatePass, nil, nil); err != nil {
+		t.Fatalf("PublishResult: %v", err)
+	}
+	const want = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies."
+	if got := gh.calls[0].params.OutputSummary; got != want {
+		t.Fatalf("no-resolution pass summary must be byte-identical to the pre-#3092 text.\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// A children_pending item renders through the existing failure-summary loop.
+func TestPublishResult_ChildrenPendingRendersInSummary(t *testing.T) {
+	runID, gh, pub := newResolutionPublisher(t)
+	missing := []auditcomplete.MissingItem{{
+		Kind:   auditcomplete.MissingChildrenPending,
+		Detail: "decomposition child run abcd1234 implement stage ef567890 is still running",
+	}}
+	if _, err := pub.PublishResult(context.Background(), runID, stagecheck.StateFail, missing, nil); err != nil {
+		t.Fatalf("PublishResult: %v", err)
+	}
+	summary := gh.calls[0].params.OutputSummary
+	if !strings.Contains(summary, string(auditcomplete.MissingChildrenPending)) ||
+		!strings.Contains(summary, "abcd1234") {
+		t.Fatalf("failure summary must render the children_pending kind and detail; got:\n%s", summary)
+	}
+}

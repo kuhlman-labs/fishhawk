@@ -1366,11 +1366,72 @@ type fakeRuns struct {
 	// leave it nil — GetRun falls back to a default issue-triggered
 	// run synthesized from stages[0].RunID.
 	runs map[uuid.UUID]*run.Run
+	// childPages serves ListRuns(DecomposedFrom) for the #3092
+	// decomposition-resolution rule. Keyed by parent run id; the value is
+	// the FULL child set, which ListRuns slices by the filter's
+	// Limit/Offset so the pagination-completeness test (t5) exercises the
+	// real page walk. A parent with no entry has no children — the flat-run
+	// posture every pre-#3092 test keeps.
+	childPages map[uuid.UUID][]*run.Run
+	// alwaysFullPage makes ListRuns return a FULL page forever, never a
+	// short one, so the page-ceiling OVERFLOW branch (t6) is reachable
+	// without minting 10 001 rows.
+	alwaysFullPage bool
+	// listRunsErr injects a ListRuns read failure (t8).
+	listRunsErr error
+	// childStages / childTraces are the per-child ListStagesForRun and
+	// trace_uploaded fixtures. childStagesErr / childTracesErr inject the
+	// respective read failures (t8).
+	childStages    map[uuid.UUID][]*run.Stage
+	childStagesErr error
+}
+
+// ListRuns serves the decomposition-child query the #3092 resolution walks.
+// Slices childPages by the filter's Limit/Offset so offset paging is really
+// exercised; alwaysFullPage short-circuits to a never-short page.
+func (f *fakeRuns) ListRuns(_ context.Context, filter run.ListRunsFilter) ([]*run.Run, error) {
+	if f.listRunsErr != nil {
+		return nil, f.listRunsErr
+	}
+	if filter.Limit <= 0 {
+		return nil, errors.New("list runs: limit must be > 0")
+	}
+	if filter.DecomposedFrom == nil {
+		return nil, nil
+	}
+	if f.alwaysFullPage {
+		out := make([]*run.Run, 0, filter.Limit)
+		for i := 0; i < filter.Limit; i++ {
+			out = append(out, &run.Run{ID: uuid.New()})
+		}
+		return out, nil
+	}
+	all := f.childPages[*filter.DecomposedFrom]
+	if filter.Offset >= len(all) {
+		return nil, nil
+	}
+	end := filter.Offset + filter.Limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[filter.Offset:end], nil
 }
 
 func (f *fakeRuns) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
+	}
+	// A decomposition child's stages come from childStages (#3092). Checked
+	// before the run-scoped/global fallbacks so a child id never picks up the
+	// parent's stage list.
+	if st, ok := f.childStages[runID]; ok {
+		if f.childStagesErr != nil {
+			return nil, f.childStagesErr
+		}
+		return st, nil
+	}
+	if f.childStagesErr != nil && f.childStages != nil {
+		return nil, f.childStagesErr
 	}
 	// When `runs` is seeded, scope the stages to the requested run
 	// (the chain walk hits multiple run ids). When it isn't, keep
@@ -1517,4 +1578,400 @@ func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, cat
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// --- #3092: decomposition trace resolution ---
+//
+// A decomposed run's PARENT implement stage is the fan-out stage: it parks
+// awaiting_children, spawns no agent, and by construction can never ship a
+// trace bundle. Rule 2 is therefore unsatisfiable for every decomposed run and
+// the required check can never go green. The resolution rule reads each CHILD
+// run's own implement-stage traces instead. Each test below pins exactly one
+// enumerated branch, and every fixture seeds its bad state BY CONSTRUCTION (a
+// child minted with no trace entries, a stage row minted `running`) rather than
+// by invoking the control in its own setup.
+
+// decomposedFixture builds a decomposed parent whose implement stage has NO
+// trace of its own — the #3092 shape — plus the requested children. Each child
+// is described by its implement-stage state and which trace variants it
+// shipped; a child with `noImplement` carries no implement stage at all.
+type childSpec struct {
+	implState   run.StageState
+	raw         bool
+	redacted    bool
+	noImplement bool
+}
+
+func decomposedFixture(t *testing.T, specs ...childSpec) (uuid.UUID, uuid.UUID, []uuid.UUID, auditcomplete.Deps) {
+	t.Helper()
+	runID := uuid.New()
+	planS := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
+	impl := mkStage(runID, 2, run.StageTypeImplement, run.StageStateSucceeded)
+	rev := mkStage(runID, 3, run.StageTypeReview, run.StageStateAwaitingApproval)
+
+	runs := &fakeRuns{
+		stages:      []*run.Stage{planS, impl, rev},
+		childPages:  map[uuid.UUID][]*run.Run{},
+		childStages: map[uuid.UUID][]*run.Stage{},
+	}
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planS.ID: {planArtifact(planS.ID, "standard_v1")},
+		impl.ID:  {pullRequestArtifact(impl.ID)},
+	}}
+	au := &fakeAudit{}
+	// The parent's PLAN stage is trace-complete; the parent's IMPLEMENT stage
+	// deliberately ships NOTHING — the fan-out stage runs no agent.
+	au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("raw"))
+	au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("redacted"))
+
+	var childIDs []uuid.UUID
+	for _, cs := range specs {
+		childID := uuid.New()
+		childIDs = append(childIDs, childID)
+		parent := runID
+		runs.childPages[runID] = append(runs.childPages[runID], &run.Run{ID: childID, DecomposedFrom: &parent})
+		if cs.noImplement {
+			runs.childStages[childID] = []*run.Stage{mkStage(childID, 1, run.StageTypePlan, run.StageStateSucceeded)}
+			continue
+		}
+		childImpl := mkStage(childID, 1, run.StageTypeImplement, cs.implState)
+		runs.childStages[childID] = []*run.Stage{childImpl}
+		if cs.raw {
+			au.appendChained(t, childID, &childImpl.ID, "trace_uploaded", traceVariantPayload("raw"))
+		}
+		if cs.redacted {
+			au.appendChained(t, childID, &childImpl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		}
+	}
+	return runID, impl.ID, childIDs, deps(runs, arts, au)
+}
+
+func traceComplete(state run.StageState) childSpec {
+	return childSpec{implState: state, raw: true, redacted: true}
+}
+
+func resolutionChildIDs(t *testing.T, res auditcomplete.Result) []string {
+	t.Helper()
+	if len(res.Resolved) != 1 {
+		t.Fatalf("want exactly 1 resolution; got %+v", res.Resolved)
+	}
+	if res.Resolved[0].Kind != auditcomplete.ResolvedTraceFromChildren {
+		t.Fatalf("resolution kind = %q, want trace_resolved_from_children", res.Resolved[0].Kind)
+	}
+	return res.Resolved[0].ChildRunIDs
+}
+
+func containsAll(hay []string, needles ...string) bool {
+	for _, n := range needles {
+		found := false
+		for _, h := range hay {
+			if h == n {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// t1: two trace-complete children resolve the parent's implement-stage trace
+// requirement, and the Resolution NAMES both child run ids.
+func TestComputeResult_DecompositionResolvesImplementTrace(t *testing.T) {
+	runID, implID, kids, d := decomposedFixture(t,
+		traceComplete(run.StageStateSucceeded), traceComplete(run.StageStateSucceeded))
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StatePass {
+		t.Fatalf("state = %s, want pass; missing=%+v", res.State, res.Missing)
+	}
+	if containsKind(res.Missing, auditcomplete.MissingTrace) {
+		t.Fatalf("parent implement trace_missing should be resolved away; got %+v", res.Missing)
+	}
+	got := resolutionChildIDs(t, res)
+	if !containsAll(got, kids[0].String(), kids[1].String()) {
+		t.Fatalf("resolution child ids = %v, want both %s and %s", got, kids[0], kids[1])
+	}
+	if res.Resolved[0].StageID != implID {
+		t.Errorf("resolution stage_id = %s, want the parent implement stage %s", res.Resolved[0].StageID, implID)
+	}
+}
+
+// t2: a child whose implement stage is NON-TERMINAL BLOCKS resolution. The
+// state is pending (children_pending) with ZERO resolutions — never a pass
+// while a child may still run and may still fail to upload its trace.
+func TestComputeResult_DecompositionPendingChildBlocksResolution(t *testing.T) {
+	for _, st := range []run.StageState{
+		run.StageStatePending,
+		run.StageStateRunning,
+		run.StageStateAwaitingChildren,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			runID, _, _, d := decomposedFixture(t,
+				traceComplete(run.StageStateSucceeded), traceComplete(st))
+			res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("ComputeResult: %v", err)
+			}
+			if res.State != stagecheck.StatePending {
+				t.Fatalf("state = %s, want pending while a child implement stage is %s; missing=%+v", res.State, st, res.Missing)
+			}
+			if !containsKind(res.Missing, auditcomplete.MissingChildrenPending) {
+				t.Fatalf("want a children_pending item; got %+v", res.Missing)
+			}
+			if len(res.Resolved) != 0 {
+				t.Fatalf("a pending child must yield ZERO resolutions; got %+v", res.Resolved)
+			}
+		})
+	}
+}
+
+// t3: a child set that contributes NO evidence (every child cancelled, or
+// carrying no implement stage) yields NO Resolution and leaves the parent's
+// own trace_missing standing. A Resolution is a positive claim; with no
+// contributor there is nothing to claim.
+func TestComputeResult_DecompositionZeroContributorsLeavesParentFailing(t *testing.T) {
+	cases := map[string][]childSpec{
+		"all cancelled":      {{implState: run.StageStateCancelled}, {implState: run.StageStateCancelled}},
+		"no implement stage": {{noImplement: true}},
+	}
+	for name, specs := range cases {
+		t.Run(name, func(t *testing.T) {
+			runID, implID, _, d := decomposedFixture(t, specs...)
+			res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("ComputeResult: %v", err)
+			}
+			if res.State != stagecheck.StateFail {
+				t.Fatalf("state = %s, want fail; missing=%+v resolved=%+v", res.State, res.Missing, res.Resolved)
+			}
+			if len(res.Resolved) != 0 {
+				t.Fatalf("zero contributors must yield NO resolution; got %+v", res.Resolved)
+			}
+			if !containsKind(res.Missing, auditcomplete.MissingTrace) {
+				t.Fatalf("parent's own trace_missing must stand; got %+v", res.Missing)
+			}
+			named := false
+			for _, m := range res.Missing {
+				if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, implID.String()[:8]) {
+					named = true
+				}
+			}
+			if !named {
+				t.Errorf("the standing trace_missing should name the parent implement stage %s; got %+v", implID, res.Missing)
+			}
+		})
+	}
+}
+
+// t4: a child whose implement stage succeeded but shipped only the RAW variant
+// fails, and the detail names BOTH the child run id and the child stage id.
+func TestComputeResult_DecompositionChildMissingTraceFails(t *testing.T) {
+	runID, _, kids, d := decomposedFixture(t,
+		traceComplete(run.StageStateSucceeded),
+		childSpec{implState: run.StageStateSucceeded, raw: true},
+	)
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StateFail {
+		t.Fatalf("state = %s, want fail; missing=%+v", res.State, res.Missing)
+	}
+	if len(res.Resolved) != 0 {
+		t.Fatalf("an incomplete child must yield NO resolution; got %+v", res.Resolved)
+	}
+	badChild := kids[1].String()[:8]
+	found := false
+	for _, m := range res.Missing {
+		if m.Kind == auditcomplete.MissingTrace &&
+			strings.Contains(m.Detail, badChild) &&
+			strings.Contains(m.Detail, "redacted") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want a trace_missing naming child run %s and the redacted variant; got %+v", badChild, res.Missing)
+	}
+	// The detail must also name the CHILD STAGE, not just the run.
+	for _, m := range res.Missing {
+		if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, badChild) {
+			if !strings.Contains(m.Detail, "implement stage ") {
+				t.Errorf("child trace_missing must name the child stage id; got %q", m.Detail)
+			}
+		}
+	}
+}
+
+// t5: a child set spanning MORE THAN ONE ListRuns page resolves over the FULL
+// set — the pagination-completeness pin. A single bounded read would inspect
+// only the first page and pass while a later child had no trace.
+func TestComputeResult_DecompositionPaginatesToExhaustion(t *testing.T) {
+	specs := make([]childSpec, 101) // childPageSize + 1
+	for i := range specs {
+		specs[i] = traceComplete(run.StageStateSucceeded)
+	}
+	runID, _, kids, d := decomposedFixture(t, specs...)
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StatePass {
+		t.Fatalf("state = %s, want pass; missing=%+v", res.State, res.Missing)
+	}
+	got := resolutionChildIDs(t, res)
+	if len(got) != len(kids) {
+		t.Fatalf("resolution names %d child ids, want all %d (the second page must be walked)", len(got), len(kids))
+	}
+	// The LAST child lives on page 2; a single-page read would omit it.
+	if !containsAll(got, kids[len(kids)-1].String()) {
+		t.Fatalf("resolution omits the page-2 child %s; got %v", kids[len(kids)-1], got)
+	}
+}
+
+// t6: a ListRuns that never returns a SHORT page drives the page-ceiling
+// OVERFLOW. A partially-read child set must never become a pass: no
+// resolution, the parent's trace_missing stands, state fail.
+func TestComputeResult_DecompositionPageCeilingOverflowFailsClosed(t *testing.T) {
+	runID, implID, _, d := decomposedFixture(t)
+	d.Runs.(*fakeRuns).alwaysFullPage = true
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StateFail {
+		t.Fatalf("state = %s, want fail on a truncated child read; missing=%+v resolved=%+v", res.State, res.Missing, res.Resolved)
+	}
+	if len(res.Resolved) != 0 {
+		t.Fatalf("an overflowed read must yield NO resolution; got %+v", res.Resolved)
+	}
+	// The parent's OWN opaque item must stand, byte-identically. Asserting
+	// merely "some trace_missing" would not discriminate: a fall-through that
+	// resolved over the truncated PREFIX also fails, but with CHILD-named
+	// details — a different, wrong verdict that would leave this test green.
+	want := "stage " + implID.String()[:8] + " (implement) has no trace_uploaded audit entry"
+	found := false
+	for _, m := range res.Missing {
+		if m.Kind == auditcomplete.MissingTrace && m.Detail == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("parent's own trace_missing %q must stand on overflow; got %+v", want, res.Missing)
+	}
+}
+
+// t7: a FLAT run (zero children) missing its implement trace still fails with
+// the ORIGINAL opaque detail — no silent exemption, and the pre-#3092 wire
+// text is byte-identical.
+func TestComputeResult_FlatRunMissingImplementTraceUnchanged(t *testing.T) {
+	runID, implID, _, d := decomposedFixture(t)
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StateFail {
+		t.Fatalf("state = %s, want fail; missing=%+v", res.State, res.Missing)
+	}
+	if len(res.Resolved) != 0 {
+		t.Fatalf("a flat run must carry NO resolution; got %+v", res.Resolved)
+	}
+	want := "stage " + implID.String()[:8] + " (implement) has no trace_uploaded audit entry"
+	found := false
+	for _, m := range res.Missing {
+		if m.Kind == auditcomplete.MissingTrace && m.Detail == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("flat-run detail must be byte-identical to the pre-#3092 text %q; got %+v", want, res.Missing)
+	}
+}
+
+// t8: every read the resolution performs surfaces as a TRANSIENT error, never
+// a silent pass.
+func TestComputeResult_DecompositionReadErrorsAreTransient(t *testing.T) {
+	t.Run("ListRuns", func(t *testing.T) {
+		runID, _, _, d := decomposedFixture(t, traceComplete(run.StageStateSucceeded))
+		d.Runs.(*fakeRuns).listRunsErr = errors.New("boom")
+		if _, err := auditcomplete.ComputeResult(context.Background(), runID, d); err == nil {
+			t.Fatal("want a transient error when the child query fails")
+		}
+	})
+	t.Run("child stages", func(t *testing.T) {
+		runID, _, _, d := decomposedFixture(t, traceComplete(run.StageStateSucceeded))
+		d.Runs.(*fakeRuns).childStagesErr = errors.New("boom")
+		if _, err := auditcomplete.ComputeResult(context.Background(), runID, d); err == nil {
+			t.Fatal("want a transient error when a child's stage read fails")
+		}
+	})
+	t.Run("child traces", func(t *testing.T) {
+		runID, _, _, d := decomposedFixture(t, traceComplete(run.StageStateSucceeded))
+		d.Audit.(*fakeAudit).catErr = map[string]error{"trace_uploaded": errors.New("boom")}
+		if _, err := auditcomplete.ComputeResult(context.Background(), runID, d); err == nil {
+			t.Fatal("want a transient error when a child's trace read fails")
+		}
+	})
+}
+
+// t9: only the IMPLEMENT stage is eligible for child resolution. A decomposed
+// parent whose PLAN stage is missing its trace still fails on that plan item
+// even when the implement resolution succeeds.
+func TestComputeResult_DecompositionNeverResolvesOtherStages(t *testing.T) {
+	runID, _, _, d := decomposedFixture(t, traceComplete(run.StageStateSucceeded))
+	// Drop the parent's plan-stage redacted bundle by construction.
+	au := d.Audit.(*fakeAudit)
+	au.dropEntry(func(e *audit.Entry) bool {
+		return e.RunID != nil && *e.RunID == runID && e.Category == "trace_uploaded" &&
+			strings.Contains(string(e.Payload), "redacted")
+	})
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	if res.State != stagecheck.StateFail {
+		t.Fatalf("state = %s, want fail on the unresolved plan gap; missing=%+v", res.State, res.Missing)
+	}
+	planGap := false
+	for _, m := range res.Missing {
+		if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "(plan)") {
+			planGap = true
+		}
+	}
+	if !planGap {
+		t.Fatalf("the plan-stage trace gap must survive the implement resolution; got %+v", res.Missing)
+	}
+}
+
+// t10: the Compute wrapper returns exactly ComputeResult's (state, missing)
+// pair — the 50+ pre-#3092 call sites keep their behavior.
+func TestCompute_WrapperMatchesComputeResult(t *testing.T) {
+	fixtures := map[string][]childSpec{
+		"resolved decomposition": {traceComplete(run.StageStateSucceeded)},
+		"flat run":               nil,
+	}
+	for name, specs := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			runID, _, _, d := decomposedFixture(t, specs...)
+			res, resErr := auditcomplete.ComputeResult(context.Background(), runID, d)
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+			if (resErr == nil) != (err == nil) {
+				t.Fatalf("error divergence: ComputeResult=%v Compute=%v", resErr, err)
+			}
+			if state != res.State {
+				t.Errorf("state divergence: Compute=%s ComputeResult=%s", state, res.State)
+			}
+			if len(missing) != len(res.Missing) {
+				t.Fatalf("missing divergence: Compute=%+v ComputeResult=%+v", missing, res.Missing)
+			}
+			for i := range missing {
+				if missing[i] != res.Missing[i] {
+					t.Errorf("missing[%d] divergence: %+v vs %+v", i, missing[i], res.Missing[i])
+				}
+			}
+		})
+	}
 }

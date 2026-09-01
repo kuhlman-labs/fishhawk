@@ -16,14 +16,16 @@ The GitLab lookup is **nil-safe**: an unconfigured GitLab forge (not registered,
 ## State mapping
 
 - `pending` → `status=in_progress`
-- `pass` → `status=completed, conclusion=success`
+- `pass` → `status=completed, conclusion=success`. When `PublishResult` is handed a non-empty `resolved[]` (#3092), the summary gains one line per resolution NAMING the child runs whose implement-stage traces satisfied the parent fan-out stage, so an auditor can follow the resolution chain from the forge itself. A pass with no resolutions renders the pre-#3092 summary byte-identically.
 - `fail` → `status=completed, conclusion=failure`, with the `missing[]` list rendered as a markdown summary on the check
 
 `details_url` points at `<ExternalURL>/runs/<id>` so a reviewer who clicks the check on github.com lands in Fishhawk.
 
 ## Hook points and failure posture
 
-`server/checks.go::publishAuditCheck` is called after every `auditcomplete.Compute` in both the read endpoint (`handleListStageChecks`) and the gate-enforcement path (`deriveAuditCompleteState`).
+`server/checks.go::publishAuditCheck` is called after every `auditcomplete.ComputeResult` in both the read endpoint (`handleListStageChecks`) and the recompute/republish path (`recomputeAndPublishAuditComplete`, which `republishOnSynchronize` and the merge reconciler both reach). It forwards the resolutions to `PublishResult`; `Publish` remains as a thin wrapper delegating with `resolved=nil`.
+
+The dedup cache is UNCHANGED by #3092 — it still keys on `(forge, repo, head_sha, state)` only, so the resolution text lands with the FIRST pass publish at a given head; a pass already published at that head is not re-published merely because its summary would now name the child runs.
 
 Best-effort: a publish failure logs at WARN but doesn't unwind the in-Fishhawk gate.
 A PERSISTENT failure (`auditcheckpublisher.DefaultDegradedThreshold` = 5 consecutive `CreateCheckRun` failures per `(run_id, head_sha)` episode, #993) additionally surfaces on the run chain as paired `audit_check_publish_degraded` / `audit_check_publish_recovered` audit entries via the publisher's `OnDegraded`/`OnRecovered` callbacks (wired in `server.New`; pairing is restart-proof because episode closure derives from the audit chain, not the in-memory counter — see `docs/architecture/audit-complete.md` § Reconcile sweep).
