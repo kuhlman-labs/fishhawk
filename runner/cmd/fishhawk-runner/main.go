@@ -6749,7 +6749,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// the placeholder half. The attribution footer is appended EXACTLY ONCE here —
 	// the served body is footer-free by contract (see prTitleAndBodyParts), and
 	// this is the runner that opens the PR, so it owns the footer.
-	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	title, body, agentAuthored, prBodyFallbackReason := prTitleAndBodyParts(cfg, branch, logSink)
 	if servedPRTitle != "" {
 		title = servedPRTitle
 	}
@@ -6767,6 +6767,35 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"held_commit_pr_text_recovered","run_id":%q,"stage_id":%q,"title_recovered":%t,"body_recovered":%t}`+"\n",
 			cfg.runID, cfg.stageID, servedPRTitle != "", servedPRBody != "")
+	}
+	// #3012 composition-failure signal, decided on the RESOLVED state — this is
+	// why prTitleAndBodyParts stays pure and the emit lives here. Three outcomes,
+	// and each records only what actually happened:
+	//
+	//   - composition SUCCEEDED (reason none): nothing to announce, whether or
+	//     not this resume also carried served text. Emitting pr_body_recovered
+	//     here would announce a recovery of nothing (binding condition 2).
+	//   - composition FELL BACK and the served body REPLACED the placeholder:
+	//     pr_body_recovered, and NO reason on the artifact. A resume that
+	//     recovered its text must never be recorded as a composition failure.
+	//   - composition FELL BACK and the placeholder survived (including the
+	//     title-recovered-body-missing case): mark the body and emit
+	//     pr_body_not_composed, exactly as the ordinary path does.
+	//
+	// So `grep pr_body_not_composed` never matches a run that recovered.
+	prHandoffPath := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
+	artifactFallbackReason := prBodyFallbackReason
+	switch {
+	case prBodyFallbackReason == prBodyReasonNone:
+		// Nothing failed; say nothing.
+	case servedPRBody != "":
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_body_recovered","run_id":%q,"stage_id":%q,"reason":%q,"title_recovered":%t,"body_recovered":true}`+"\n",
+			cfg.runID, cfg.stageID, string(prBodyFallbackReason), servedPRTitle != "")
+		artifactFallbackReason = prBodyReasonNone
+	default:
+		body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		emitPRBodyNotComposed(logSink, cfg, prBodyFallbackReason, prHandoffPath)
 	}
 	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
 	// --forge=gitlab exempt resolution opens a merge request via the GitLab
@@ -6804,7 +6833,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		`{"event":%q,"run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
 		openedEvent, cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, heldBaseSHA, branch)
 
-	artifactBody, _ := json.Marshal(map[string]any{
+	heldArtifactFields := map[string]any{
 		"pr_number": prRes.PRNumber,
 		"pr_url":    prRes.PRURL,
 		"branch":    branch,
@@ -6812,7 +6841,13 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		"base_sha":  heldBaseSHA,
 		"title":     title,
 		"body":      body,
-	})
+	}
+	// Same omit-when-empty rule as the ordinary ship (#3012): absent on a
+	// composed ship AND on a recovered resume, so those bytes are unchanged.
+	if artifactFallbackReason != prBodyReasonNone {
+		heldArtifactFields["pr_body_fallback_reason"] = string(artifactFallbackReason)
+	}
+	artifactBody, _ := json.Marshal(heldArtifactFields)
 	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
@@ -7044,7 +7079,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// unless the agent actually authored a PR description — the placeholder is
 	// never persisted, because persisting it would defeat the whole point of
 	// carrying text across the resume.
-	title, prBody, agentAuthoredPR := prTitleAndBodyParts(cfg, branch, logSink)
+	title, prBody, agentAuthoredPR, prBodyFallbackReason := prTitleAndBodyParts(cfg, branch, logSink)
 	body := prBody
 	var agentPRTitle, agentPRBody string
 	if agentAuthoredPR {
@@ -7059,6 +7094,21 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
 	// below on the isFixup path.
 	commitMessage := implementCommitMessage(cfg, title, body, logSink)
+	// #3012. ORDERING IS LOAD-BEARING: the marker is applied AFTER
+	// implementCommitMessage, which on the no-sidecar path composes the commit
+	// message from title + body. Marking first would stamp the marker into
+	// main's squash commit message; TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged
+	// pins that it does not.
+	//
+	// The condition is `reason != none`, NOT `!agentAuthoredPR` (binding
+	// condition 1): a TITLE-ONLY handoff is agent-authored yet ships a
+	// footer-only body with no `Closes #N` — the exact silent shape of #3012 —
+	// so it gets the marker too.
+	prHandoffPath := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
+	if prBodyFallbackReason != prBodyReasonNone {
+		body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		emitPRBodyNotComposed(logSink, cfg, prBodyFallbackReason, prHandoffPath)
+	}
 	// #2884 fix-up landing snapshot. Captured on the isFixup path BEFORE
 	// CommitAndPush, so the post-pass stranded-work check can tell the pass's OWN
 	// residue (a net-new stash, an advanced HEAD) from pre-existing state. Left
@@ -8017,6 +8067,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		"title":               title,
 		"body":                body,
 		"files_changed_count": filesChanged,
+	}
+	// #3012: ride the classification onto the artifact so the backend can fold
+	// it into the pull_request_opened audit payload. Omitted ENTIRELY on every
+	// composed ship (the #1218/#2570 omitempty discipline), so the happy path's
+	// artifact bytes, content hash and signature stay byte-identical.
+	if prBodyFallbackReason != prBodyReasonNone {
+		artifactFields["pr_body_fallback_reason"] = string(prBodyFallbackReason)
 	}
 	// Base-rebase re-invoke exemption delta (#1218): include the supplemental set
 	// ONLY when the re-invoke produced one, so every non-re-invoke ship omits the
@@ -9728,7 +9785,7 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // auditable provenance is preserved without requiring the agent to
 // remember to include it in every PR.
 func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body string) {
-	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	title, body, agentAuthored, _ := prTitleAndBodyParts(cfg, branch, logSink)
 	if !agentAuthored {
 		// Fallback attribution is rolled into the body itself, so don't double up.
 		return title, body
@@ -9748,18 +9805,42 @@ func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body s
 // openHeldCommitPR on the resume path. Persisting a footered body would either
 // double the footer on resume or stamp it with the wrong branch/audit URL, and
 // the size clamp could clip it.
-func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool) {
-	agentTitle, agentBody, kind := loadAgentAuthoredPR(cfg, logSink)
+// PURE with respect to the composition-failure signal (#3012 approval condition
+// 2 of the plan gate): it CLASSIFIES the failure into a bounded prBodyReason and
+// RETURNS it, emitting nothing itself. The two call sites own the emit, because
+// only they know whether a fallback was subsequently RECOVERED — the held-commit
+// resume replaces the placeholder from the backend-served text AFTER this
+// returns, and a composition failure that got recovered must not be logged as a
+// failure. Emitting here would manufacture exactly the record-asserts-what-did-
+// -not-happen defect this issue is about.
+func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool, reason prBodyReason) {
+	agentTitle, agentBody, kind, reason := loadAgentAuthoredPR(cfg, logSink)
 
 	if kind == prSourceAgent {
-		return agentTitle, agentBody, true
+		// A title-only handoff is still agent-authored — the agent's title is
+		// honoured — but its body is EMPTY, so the opened PR is footer-only with
+		// no summary, no test plan and no `Closes #N`. loadAgentAuthoredPR
+		// already returns prBodyReasonBodyAbsent for it, so the reason passes
+		// through unchanged and the call site marks it exactly as it marks a
+		// full fallback (#3012 binding condition 1: reason != none implies the
+		// body names the failure — NOT "the handoff was absent implies").
+		//
+		// INVARIANT this relies on, asserted by
+		// TestPRTitleAndBodyParts_ReasonClassification over every case: an
+		// agent-authored EMPTY body always carries body_absent. A re-classifying
+		// `if agentBody == ""` here would be unreachable defensive code — the
+		// parse TrimRights trailing newlines before splitting, so a
+		// separator-with-nothing-after-it (`title\n\n`) already takes the
+		// title-only branch and no other path can return an empty body with
+		// prSourceAgent — so the invariant is pinned by a test instead.
+		return agentTitle, agentBody, true, reason
 	}
 	return fmt.Sprintf("chore: fishhawk implement stage %s", shortID(cfg.stageID)),
 		fmt.Sprintf(
 			"Opened by Fishhawk for run `%s`, stage `%s`.\n\nBranch: `%s`\nAudit log: see `%s/v0/runs/%s/audit`.\n",
 			cfg.runID, cfg.stageID, branch,
 			strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
-		), false
+		), false, reason
 }
 
 // prAttributionFooter renders the Fishhawk attribution footer appended to an
@@ -9788,6 +9869,83 @@ const (
 	prSourceAgent
 )
 
+// prBodyReason names WHY the implement PR body is not the agent-composed one
+// (#3012). Before this existed, loadAgentAuthoredPR's commonest fallback branch
+// — neither the keyed nor the legacy handoff present — returned prSourceFallback
+// with a deliberate "don't log" and no reason at all, so a SKIPPED composition
+// was byte-indistinguishable from a deliberately terse body and from the four
+// other fallback branches. That is how #3011 shipped a placeholder PR body with
+// no Summary, no Test plan and no `Closes #N`, and nothing in the trace said so.
+//
+// prBodyReasonNone means composition SUCCEEDED (a non-empty agent title AND
+// body). Every other value means the shipped body is NOT what the agent wrote,
+// and the call site both marks the body and emits pr_body_not_composed.
+//
+// WIRE VALUES. These strings ride the pull_request artifact as
+// pr_body_fallback_reason and are MIRRORED in
+// backend/internal/server/pullrequest.go's prBodyFallbackReasons — the backend
+// is a separate Go module and cannot import this (the #1774/#2501 mirrored-
+// literal pattern). The shared testdata/wire goldens are what make a drift fail
+// a test rather than ship; #2558 tracks the shared wire package that would make
+// it compile-enforced.
+type prBodyReason string
+
+const (
+	// prBodyReasonNone: the agent authored a non-empty title AND body.
+	prBodyReasonNone prBodyReason = ""
+	// prBodyReasonHandoffAbsent: neither the keyed nor the legacy handoff path
+	// exists. The commonest branch, and the silent one that shipped #3011.
+	prBodyReasonHandoffAbsent prBodyReason = "handoff_absent"
+	// prBodyReasonHandoffUnreadable: the keyed path exists but os.ReadFile
+	// failed for a reason other than not-exist (permissions, a directory).
+	prBodyReasonHandoffUnreadable prBodyReason = "handoff_unreadable"
+	// prBodyReasonEmptyFile: the handoff was read but is empty after trimming.
+	prBodyReasonEmptyFile prBodyReason = "empty_file"
+	// prBodyReasonEmptyTitle: the handoff's first line is blank.
+	prBodyReasonEmptyTitle prBodyReason = "empty_title"
+	// prBodyReasonBodyAbsent: a TITLE-ONLY handoff. The agent's title is
+	// honoured, but the PR opens footer-only with no `Closes #N`, so it is a
+	// composition failure for the BODY and marked as one.
+	prBodyReasonBodyAbsent prBodyReason = "body_absent"
+)
+
+// prBodyReasons is the closed set of non-none reasons, in the order they are
+// documented. ONE list on the runner side; the backend mirrors it.
+var prBodyReasons = []prBodyReason{
+	prBodyReasonHandoffAbsent,
+	prBodyReasonHandoffUnreadable,
+	prBodyReasonEmptyFile,
+	prBodyReasonEmptyTitle,
+	prBodyReasonBodyAbsent,
+}
+
+// prBodyNotComposedMarker renders the leading block prepended to a PR body that
+// the agent did not compose. It is a SIGNAL, not a repair: the runner never
+// receives the trigger issue number (no issueNumber field exists anywhere in
+// this package), so it structurally cannot synthesize the missing `Closes #N`,
+// and there is no retro-edit path to add one later (#2782). Saying outright that
+// the merge will not auto-close is the honest substitute.
+func prBodyNotComposedMarker(cfg config, reason prBodyReason, checkedPath string) string {
+	return fmt.Sprintf(
+		"> **This pull-request body was not composed by the implement agent.**\n"+
+			"> Run `%s`, stage `%s`. Reason: `%s`.\n"+
+			"> Handoff checked: `%s`.\n"+
+			"> What this costs: the body below carries no summary, no test plan and no `Closes #N` reference, "+
+			"so merging will not auto-close the trigger issue — close it by hand.\n\n",
+		cfg.runID, cfg.stageID, reason, checkedPath,
+	)
+}
+
+// emitPRBodyNotComposed records a composition failure that was NOT recovered.
+// Called only from the two PR-opening call sites, after any recovery resolves,
+// so `grep pr_body_not_composed` never matches a run whose text was recovered —
+// that run emits pr_body_recovered instead.
+func emitPRBodyNotComposed(logSink io.Writer, cfg config, reason prBodyReason, checkedPath string) {
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pr_body_not_composed","run_id":%q,"stage_id":%q,"reason":%q,"handoff_path":%q}`+"\n",
+		cfg.runID, cfg.stageID, string(reason), checkedPath)
+}
+
 // loadAgentAuthoredPR tries to read the agent-authored PR file and
 // parse it into a (title, body) pair. Returns prSourceFallback when
 // the file is absent or malformed; prSourceAgent on success.
@@ -9811,7 +9969,15 @@ const (
 //   - Empty file.
 //   - First line empty.
 //   - No blank line separating title from body.
-func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource) {
+//
+// The returned prBodyReason (#3012) classifies WHICH of the fallback branches
+// was taken — the distinction that did not exist before, and whose absence made
+// a skipped composition byte-indistinguishable from a terse one. This function
+// does NOT log it: see prTitleAndBodyParts for why the emit lives at the call
+// sites. The pre-existing pr_template_invalid / pr_template_warning /
+// pr_description_legacy_path events are unchanged — they describe the FILE and
+// are already accurate.
+func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource, reason prBodyReason) {
 	keyed := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
 	raw, err := os.ReadFile(keyed)
 	path := keyed
@@ -9819,15 +9985,18 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		if !os.IsNotExist(err) {
 			// Unreadable keyed file (permissions, etc.): fall back to the
 			// generic template, same as the pre-#1777 absent-file no-op.
-			return "", "", prSourceFallback
+			return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
 		}
 		// Keyed path absent: fall back to the legacy fixed path so a fixed-path
 		// prompt render (an older agent/prompt) still lands its PR text.
 		legacyRaw, legacyErr := os.ReadFile(legacyPullRequestDescriptionPath)
 		if legacyErr != nil {
-			// Neither path present is the common no-op (agent didn't follow the
-			// instruction, or a stage type that produces no PR). Don't log.
-			return "", "", prSourceFallback
+			// Neither path present. Historically treated as a silent no-op
+			// ("the agent didn't follow the instruction, or a stage type that
+			// produces no PR"), which is precisely how #3011's placeholder body
+			// shipped unremarked. Still not logged HERE — the call site emits
+			// pr_body_not_composed once the recovery question is settled.
+			return "", "", prSourceFallback, prBodyReasonHandoffAbsent
 		}
 		raw = legacyRaw
 		path = legacyPullRequestDescriptionPath
@@ -9844,7 +10013,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
 			"empty file", path)
-		return "", "", prSourceFallback
+		return "", "", prSourceFallback, prBodyReasonEmptyFile
 	}
 
 	// Split into title (first line) + body (rest after blank line).
@@ -9855,7 +10024,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
 			"empty title line", path)
-		return "", "", prSourceFallback
+		return "", "", prSourceFallback, prBodyReasonEmptyTitle
 	}
 
 	// Warn-only conventional-commit header check (#1572): the title doubles as
@@ -9876,7 +10045,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
 			"title-only (no body)", path)
-		return title, "", prSourceAgent
+		return title, "", prSourceAgent, prBodyReasonBodyAbsent
 	}
 
 	rest := strings.TrimLeft(lines[1], "\n")
@@ -9889,5 +10058,5 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 			"no blank line between title and body", path)
 	}
 
-	return title, rest, prSourceAgent
+	return title, rest, prSourceAgent, prBodyReasonNone
 }

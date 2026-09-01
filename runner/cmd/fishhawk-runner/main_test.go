@@ -4713,7 +4713,7 @@ func TestLoadAgentAuthoredPR_DeleteAfterRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr strings.Builder
-	if _, _, kind := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &stderr); kind != prSourceAgent {
+	if _, _, kind, _ := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &stderr); kind != prSourceAgent {
 		t.Fatalf("kind = %v, want prSourceAgent", kind)
 	}
 	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
@@ -24745,5 +24745,507 @@ func TestLoadFixupSelfReport_WholeSidecarRulesStillDiscardCounterfactuals(t *tes
 				t.Errorf("expected %s, got %q", tc.event, logSink.String())
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3012: a non-composed implement PR body is LOUD, not silent.
+// ---------------------------------------------------------------------------
+
+// prBodyHandoffCase is one composition-failure mode: how to arrange the handoff
+// (or not) at the keyed path, and the prBodyReason the classification must
+// return for it. ONE table drives BOTH the pure-function reason assertions and
+// the ordinary-call-site marker/log assertions, so a branch cannot be covered in
+// one place and quietly skipped in the other — which is exactly how the
+// body_absent gap survived the plan gate (binding condition 3).
+type prBodyHandoffCase struct {
+	name string
+	// arrange puts the handoff (or a hostile substitute) at keyedPath.
+	arrange func(t *testing.T, keyedPath string)
+	want    prBodyReason
+	// agentAuthored is what prTitleAndBodyParts must report; a title-only
+	// handoff is agent-authored AND a body composition failure.
+	agentAuthored bool
+}
+
+func prBodyHandoffCases() []prBodyHandoffCase {
+	return []prBodyHandoffCase{
+		{
+			name:    "handoff_absent",
+			arrange: func(*testing.T, string) {}, // write nothing
+			want:    prBodyReasonHandoffAbsent,
+		},
+		{
+			name: "handoff_unreadable",
+			// A DIRECTORY at the keyed path makes os.ReadFile fail EISDIR — a
+			// non-IsNotExist error. Deliberately not chmod 0: that does not fail
+			// for a root euid, which would make this branch silently untested in
+			// a container.
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				if err := os.Mkdir(keyedPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: prBodyReasonHandoffUnreadable,
+		},
+		{
+			name: "empty_file",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "")
+			},
+			want: prBodyReasonEmptyFile,
+		},
+		{
+			name: "empty_title",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "   \n\nbody with no title\n")
+			},
+			want: prBodyReasonEmptyTitle,
+		},
+		{
+			name: "body_absent",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a title and nothing else\n")
+			},
+			want:          prBodyReasonBodyAbsent,
+			agentAuthored: true,
+		},
+		{
+			name: "body_absent via a separator with nothing after it",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a title\n\n\n")
+			},
+			want:          prBodyReasonBodyAbsent,
+			agentAuthored: true,
+		},
+		{
+			name: "none",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a real subject\n\n## Summary\n\n- real work\n\nCloses #3012\n")
+			},
+			want:          prBodyReasonNone,
+			agentAuthored: true,
+		},
+	}
+}
+
+// TestPRTitleAndBodyParts_ReasonClassification pins the reason VALUE each branch
+// returns — and only that. It drives the PURE composition function, which by
+// design cannot observe the call-site marker or the emitted event; the
+// marker/log behaviour is asserted through the real call site by
+// TestOpenPRAndShipArtifact_NotComposedPerBranch.
+func TestPRTitleAndBodyParts_ReasonClassification(t *testing.T) {
+	for _, tc := range prBodyHandoffCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			keyed := withPRDescriptionPath(t, "r", "s")
+			tc.arrange(t, keyed)
+			var logSink strings.Builder
+			_, body, agentAuthored, reason := prTitleAndBodyParts(
+				config{runID: "r", stageID: "s", backendURL: "https://x"}, "branch", &logSink)
+			if reason != tc.want {
+				t.Errorf("reason = %q, want %q", reason, tc.want)
+			}
+			if agentAuthored != tc.agentAuthored {
+				t.Errorf("agentAuthored = %t, want %t", agentAuthored, tc.agentAuthored)
+			}
+			// The pure function NEVER emits the new event — that is the whole
+			// point of keeping it pure (the resume recovers after it returns).
+			if strings.Contains(logSink.String(), "pr_body_not_composed") {
+				t.Errorf("prTitleAndBodyParts must not emit pr_body_not_composed; the call sites own it:\n%s", logSink.String())
+			}
+			// The INVARIANT binding condition 1 rests on, asserted in BOTH
+			// directions over every case: an agent-authored empty body always
+			// carries body_absent, and body_absent always means an empty body.
+			// prTitleAndBodyParts deliberately does not re-derive this (the
+			// re-derivation would be unreachable), so a future change to
+			// loadAgentAuthoredPR's classification fails HERE rather than
+			// silently shipping an unmarked footer-only PR again.
+			if tc.want == prBodyReasonBodyAbsent && body != "" {
+				t.Errorf("body_absent must carry an empty body, got %q", body)
+			}
+			if agentAuthored && body == "" && reason != prBodyReasonBodyAbsent {
+				t.Errorf("an agent-authored EMPTY body must be classified body_absent, got %q", reason)
+			}
+		})
+	}
+}
+
+// TestPRBodyReasons_ClosedSet pins the mirrored wire vocabulary. These strings
+// ride the artifact to a backend that cannot import this module, so the list is
+// asserted here and re-asserted against the same literals in
+// backend/internal/server (prBodyFallbackReasons) — the #1774/#2501 pattern.
+func TestPRBodyReasons_ClosedSet(t *testing.T) {
+	want := []string{"handoff_absent", "handoff_unreadable", "empty_file", "empty_title", "body_absent"}
+	if len(prBodyReasons) != len(want) {
+		t.Fatalf("prBodyReasons = %v, want %v", prBodyReasons, want)
+	}
+	for i, w := range want {
+		if string(prBodyReasons[i]) != w {
+			t.Errorf("prBodyReasons[%d] = %q, want %q", i, prBodyReasons[i], w)
+		}
+	}
+	if prBodyReasonNone != "" {
+		t.Errorf("prBodyReasonNone must be the empty string so omitempty drops it, got %q", prBodyReasonNone)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NotComposedPerBranch is binding condition 3: EVERY
+// named failure mode is driven through the ORDINARY call site — the real
+// openPRAndShipArtifact — and asserted on what actually ships: the marker on the
+// opened PR body, the pr_body_not_composed event, and the artifact's
+// pr_body_fallback_reason. The pure-function table above cannot make these
+// assertions, which is precisely why the body_absent gap (a title-only handoff
+// shipping a footer-only body with no marker) reached the gate uncaught.
+func TestOpenPRAndShipArtifact_NotComposedPerBranch(t *testing.T) {
+	for _, tc := range prBodyHandoffCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _ := verifiedTreeRepo(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+			tc.arrange(t, keyed)
+
+			var logSink strings.Builder
+			if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+				&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+				t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+			}
+			if fpr.gotArgs == nil {
+				t.Fatal("OpenPR not called")
+			}
+			shipped := fpr.gotArgs.Body
+			logs := logSink.String()
+
+			var artifact map[string]any
+			if fu.gotPRArgs == nil {
+				t.Fatal("ShipPullRequest not called")
+			}
+			if err := json.Unmarshal(fu.gotPRArgs.Body, &artifact); err != nil {
+				t.Fatalf("decode shipped artifact: %v", err)
+			}
+			// The PR the forge received and the artifact the backend receives
+			// must agree on the body, or the marker is cosmetic.
+			if artifact["body"] != shipped {
+				t.Errorf("artifact body != opened PR body:\nartifact: %v\nopened:   %q", artifact["body"], shipped)
+			}
+
+			if tc.want == prBodyReasonNone {
+				if strings.Contains(shipped, "was not composed by the implement agent") {
+					t.Errorf("a composed body must carry NO marker:\n%s", shipped)
+				}
+				if strings.Contains(logs, "pr_body_not_composed") {
+					t.Errorf("a composed ship must emit no pr_body_not_composed:\n%s", logs)
+				}
+				if _, present := artifact["pr_body_fallback_reason"]; present {
+					t.Errorf("a composed ship must OMIT pr_body_fallback_reason entirely, got %v", artifact["pr_body_fallback_reason"])
+				}
+				return
+			}
+
+			// Binding condition 1: reason != none implies the body NAMES the
+			// failure — including body_absent, which is agent-authored.
+			if !strings.HasPrefix(shipped, "> **This pull-request body was not composed by the implement agent.**") {
+				t.Errorf("shipped body must START with the marker, got:\n%s", shipped)
+			}
+			for _, want := range []string{
+				verifiedTreeRunID,
+				verifiedTreeStageID,
+				string(tc.want),
+				keyed,
+				"will not auto-close the trigger issue",
+			} {
+				if !strings.Contains(shipped, want) {
+					t.Errorf("marker missing %q:\n%s", want, shipped)
+				}
+			}
+			var emitted struct {
+				Event       string `json:"event"`
+				RunID       string `json:"run_id"`
+				StageID     string `json:"stage_id"`
+				Reason      string `json:"reason"`
+				HandoffPath string `json:"handoff_path"`
+			}
+			var found bool
+			for _, line := range strings.Split(logs, "\n") {
+				if strings.Contains(line, `"event":"pr_body_not_composed"`) {
+					if err := json.Unmarshal([]byte(line), &emitted); err != nil {
+						t.Fatalf("decode pr_body_not_composed %q: %v", line, err)
+					}
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("expected pr_body_not_composed in the log:\n%s", logs)
+			}
+			if emitted.Reason != string(tc.want) || emitted.HandoffPath != keyed ||
+				emitted.RunID != verifiedTreeRunID || emitted.StageID != verifiedTreeStageID {
+				t.Errorf("pr_body_not_composed = %+v, want reason=%q handoff_path=%q", emitted, tc.want, keyed)
+			}
+			if got := artifact["pr_body_fallback_reason"]; got != string(tc.want) {
+				t.Errorf("artifact pr_body_fallback_reason = %v, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged pins the ordering the
+// marker depends on (#3012): the marker is applied AFTER
+// implementCommitMessage, so main's squash commit message is byte-identical to
+// the pre-change fallback text. Without this test the leak is invisible until it
+// shows up in the repository history, where it cannot be un-shipped.
+func TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No handoff anywhere: the pure fallback path, which is the one whose
+	// commit message the marker could contaminate.
+	withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+		&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	out, err := exec.Command("git", "-C", bare, "log", "-1", "--format=%B", branch).Output()
+	if err != nil {
+		t.Fatalf("read pushed commit message: %v", err)
+	}
+	msg := string(out)
+	if strings.Contains(msg, "was not composed by the implement agent") {
+		t.Errorf("the marker must NOT reach the commit message:\n%s", msg)
+	}
+	if !strings.HasPrefix(msg, "chore: fishhawk implement stage ") {
+		t.Errorf("fallback commit subject changed:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Opened by Fishhawk for run") {
+		t.Errorf("fallback commit body changed:\n%s", msg)
+	}
+}
+
+// wireGoldenOrdinaryPath resolves the ORDINARY-path PR artifact fixture, the
+// second half of the cross-module seam (#3012). Anchored to this test source via
+// runtime.Caller for the same reason wireGoldenHeldCommitPath is.
+func wireGoldenOrdinaryPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
+}
+
+// Placeholders substituted for the two artifact values a real git fixture cannot
+// make deterministic. See normalizeOrdinaryWireArtifact.
+const (
+	wireGoldenOrdinaryHeadSHA = "1111111111111111111111111111111111111111"
+	wireGoldenOrdinaryBaseSHA = "2222222222222222222222222222222222222222"
+)
+
+// normalizeOrdinaryWireArtifact makes the ordinary ship's bytes comparable
+// against a committed fixture. head_sha and base_sha are real commit hashes from
+// a freshly-created temp repo (the commit timestamp is now), so they cannot be
+// pinned; every OTHER key — including any key a future change ADDS or REMOVES —
+// round-trips untouched through the decode/re-marshal, so the drift-detection
+// property the seam exists for is preserved: change the artifact map and these
+// bytes change.
+func normalizeOrdinaryWireArtifact(t *testing.T, produced []byte) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(produced, &m); err != nil {
+		t.Fatalf("decode produced artifact: %v", err)
+	}
+	for key, placeholder := range map[string]string{
+		"head_sha": wireGoldenOrdinaryHeadSHA,
+		"base_sha": wireGoldenOrdinaryBaseSHA,
+	} {
+		got, _ := m[key].(string)
+		if len(got) != 40 {
+			t.Fatalf("%s = %q, want a 40-char commit hash (the seam is meaningless without one)", key, got)
+		}
+		m[key] = placeholder
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden is the runner half of
+// the ORDINARY-path cross-module seam (#3012) — the path the reported bug
+// actually happened on, which the held-commit golden could not cover. It drives
+// the REAL openPRAndShipArtifact with NO handoff present and pins the shipped
+// artifact bytes to the shared fixture that backend/internal/server POSTs
+// through the real DisallowUnknownFields handler. Omitting
+// pr_body_fallback_reason from the ordinary artifact map reddens this test
+// instead of shipping silently.
+//
+// Regenerate after an intentional body change with
+// FISHHAWK_REGEN_WIRE_GOLDEN=1 go test -run ArtifactBodyMatchesWireGolden.
+func TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pin the handoff dir to the PRODUCTION value so the marker's handoff_path
+	// is deterministic, and guarantee both paths are absent so the reason is
+	// handoff_absent rather than whatever another run left behind.
+	origDir := pullRequestDescriptionDir
+	pullRequestDescriptionDir = "/tmp"
+	t.Cleanup(func() { pullRequestDescriptionDir = origDir })
+	_ = os.Remove(pullRequestDescriptionPath(verifiedTreeRunID, verifiedTreeStageID))
+	_ = os.Remove(legacyPullRequestDescriptionPath)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+		&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	produced := normalizeOrdinaryWireArtifact(t, fu.gotPRArgs.Body)
+	goldenPath := wireGoldenOrdinaryPath(t)
+
+	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {
+		if werr := os.WriteFile(goldenPath, produced, 0o644); werr != nil {
+			t.Fatalf("regen wire golden: %v", werr)
+		}
+		t.Logf("regenerated %s (%d bytes)", goldenPath, len(produced))
+		return
+	}
+	want, rerr := os.ReadFile(goldenPath)
+	if rerr != nil {
+		t.Fatalf("read wire golden %s: %v (regenerate with FISHHAWK_REGEN_WIRE_GOLDEN=1)", goldenPath, rerr)
+	}
+	if !bytes.Equal(produced, want) {
+		t.Errorf("shipped artifact body drifted from the shared wire fixture.\nproduced: %s\ngolden:   %s\n(regenerate intentionally with FISHHAWK_REGEN_WIRE_GOLDEN=1)", produced, want)
+	}
+}
+
+// heldCommitPRBodyOutcome drives the REAL openHeldCommitPR with the given served
+// text and returns the shipped artifact plus the log, so the three resume
+// outcomes can each be asserted on what actually shipped.
+func heldCommitPRBodyOutcome(t *testing.T, handoff string, servedTitle, servedBody string) (map[string]any, string) {
+	t.Helper()
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+	if handoff != "" {
+		mustWrite(t, keyed, handoff)
+	}
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), cfg,
+		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA,
+		"", servedTitle, servedBody, &logSink, fu, issued); code != exitOK {
+		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	var artifact map[string]any
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &artifact); err != nil {
+		t.Fatalf("decode shipped artifact: %v", err)
+	}
+	return artifact, logSink.String()
+}
+
+// TestOpenHeldCommitPR_RecoveredBodyLogsRecoveredNotFailed: composition FELL
+// BACK and the backend-served body replaced the placeholder. The resume must log
+// pr_body_recovered, NOT pr_body_not_composed, must carry no marker, and must
+// record no reason on the artifact — a resume that recovered its text is not a
+// composition failure. This is why the emit lives at the call site rather than
+// inside prTitleAndBodyParts.
+func TestOpenHeldCommitPR_RecoveredBodyLogsRecoveredNotFailed(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t, "",
+		"fix(runner): recovered subject", "## Summary\n\n- recovered narrative\n\nCloses #3012")
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("a recovered resume must NOT be recorded as a composition failure:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"pr_body_recovered"`) {
+		t.Errorf("expected pr_body_recovered:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"reason":"handoff_absent"`) {
+		t.Errorf("pr_body_recovered must name the reason that WOULD have applied:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if strings.Contains(body, "was not composed by the implement agent") {
+		t.Errorf("a recovered body must carry no marker:\n%s", body)
+	}
+	if _, present := artifact["pr_body_fallback_reason"]; present {
+		t.Errorf("a recovered resume must omit pr_body_fallback_reason, got %v", artifact["pr_body_fallback_reason"])
+	}
+}
+
+// TestOpenHeldCommitPR_TitleOnlyRecoveryStillNotComposed is the twin: only the
+// TITLE recovered, so the placeholder body survives. That IS a composition
+// failure and must be recorded as one — marker, event and artifact reason —
+// with no pr_body_recovered claiming otherwise.
+func TestOpenHeldCommitPR_TitleOnlyRecoveryStillNotComposed(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t, "", "fix(runner): recovered subject", "")
+	if !strings.Contains(logs, `"event":"pr_body_not_composed"`) {
+		t.Errorf("a surviving placeholder body IS a composition failure:\n%s", logs)
+	}
+	if strings.Contains(logs, "pr_body_recovered") {
+		t.Errorf("nothing about the BODY was recovered; pr_body_recovered must not be emitted:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if !strings.HasPrefix(body, "> **This pull-request body was not composed by the implement agent.**") {
+		t.Errorf("shipped body must start with the marker:\n%s", body)
+	}
+	if got := artifact["pr_body_fallback_reason"]; got != "handoff_absent" {
+		t.Errorf("artifact pr_body_fallback_reason = %v, want handoff_absent", got)
+	}
+}
+
+// TestOpenHeldCommitPR_ComposedWithServedTextLogsNeither is binding condition 2:
+// a resume whose composition SUCCEEDED (a same-host handoff survived) and which
+// ALSO carries served text must log NEITHER event. Emitting pr_body_recovered
+// here would announce a recovery of nothing — a third false record, in a change
+// whose entire purpose is that the trace stops asserting what did not happen.
+func TestOpenHeldCommitPR_ComposedWithServedTextLogsNeither(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t,
+		"fix(runner): agent subject\n\n## Summary\n\n- agent narrative\n",
+		"fix(runner): served subject", "## Summary\n\n- served narrative")
+	if strings.Contains(logs, "pr_body_recovered") {
+		t.Errorf("composition succeeded; there was no recovery to announce:\n%s", logs)
+	}
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("composition succeeded; nothing failed:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if strings.Contains(body, "was not composed by the implement agent") {
+		t.Errorf("a successful composition must carry no marker:\n%s", body)
+	}
+	if _, present := artifact["pr_body_fallback_reason"]; present {
+		t.Errorf("a successful composition must omit pr_body_fallback_reason, got %v", artifact["pr_body_fallback_reason"])
 	}
 }

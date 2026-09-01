@@ -581,6 +581,42 @@ Both zero-re-run resumes above — the #1231 scope-completeness `exempt` resolut
 
 **Never a new failure mode.** With no served text and nothing to synthesize from, the resume opens with today's placeholder and ships its artifact exactly as before. Unrecoverable PR text is a quality gap, never a reason to withhold a resume.
 
+## A non-composed PR body is loud (E52.30 / [#3012](https://github.com/kuhlman-labs/fishhawk/issues/3012))
+
+An implement pass shipped the generic placeholder PR body on its FIRST attempt — no Summary, no Test plan, no `Closes #N`, so merging never auto-closed the trigger issue — and nothing in the trace, the log or the audit chain said the agent's text had been skipped. `loadAgentAuthoredPR`'s commonest fallback branch (neither the run/stage-keyed `/tmp/fishhawk-pr-<run>-<stage>.md` handoff nor the legacy fixed path present) returned `prSourceFallback` with an explicit "don't log" and no reason, so a SKIPPED composition was byte-indistinguishable from a deliberately terse body and from the four other fallback branches.
+
+This is the ORDINARY path, not the [#2570](https://github.com/kuhlman-labs/fishhawk/issues/2570) held-commit resume. `prTitleAndBodyParts` is the ONE composition site, shared by `openPRAndShipArtifact` and `openHeldCommitPR`; #2570 changed only how the RESUME recovers text, so this is neither a #2570 regression nor a second composition path.
+
+**Six classifications, one bounded enum.** `prBodyReason` names why the shipped body is not the agent's:
+
+| Reason | Branch |
+|---|---|
+| `""` (`prBodyReasonNone`) | composition SUCCEEDED — a non-empty agent title AND body |
+| `handoff_absent` | neither the keyed nor the legacy path exists (the silent branch that shipped #3011) |
+| `handoff_unreadable` | the keyed path exists but `os.ReadFile` failed for a non-`IsNotExist` reason |
+| `empty_file` | the handoff is empty after trimming |
+| `empty_title` | the handoff's first line is blank |
+| `body_absent` | a TITLE-ONLY handoff — the agent's title is honoured, the PR opens footer-only |
+
+`body_absent` is classified on the body being EMPTY, not on which parse branch produced it, so `title\n\n` (a separator with nothing after it) is caught alongside a bare title line.
+
+**The composition function is PURE; the CALL SITES emit.** `prTitleAndBodyParts` classifies and RETURNS the reason, logging nothing. The emit lives at the two PR-opening call sites because only they know whether a fallback was subsequently RECOVERED — the held-commit resume replaces the placeholder from backend-served text AFTER composition returns, so emitting inside the composition function would log a composition failure on a resume that recovered successfully. That is the record-asserts-what-did-not-happen defect this issue is about, so reintroducing it here would be self-defeating.
+
+**Two events, mutually exclusive.**
+
+- `pr_body_not_composed` — `{run_id, stage_id, reason, handoff_path}`. Emitted when the reason is non-none AND nothing recovered the body.
+- `pr_body_recovered` — `{run_id, stage_id, reason, title_recovered, body_recovered}`. Emitted ONLY when BOTH hold: composition fell back, AND the served body replaced the placeholder. A resume whose composition SUCCEEDED and which also carries served text emits NEITHER — there was no recovery to announce. The pre-existing `held_commit_pr_text_recovered` is unchanged; `pr_body_recovered` is its greppable counterpart, so `grep pr_body_not_composed` never matches a run that recovered.
+
+**The marker is on the BODY, keyed to the REASON.** Whenever the reason is non-none — including `body_absent`, which is agent-authored — the call site prepends a block naming the run, the stage, the reason value and the handoff path checked, and stating outright that the body carries no `Closes #N` so the merge will not auto-close the trigger issue. The rule is *reason != none implies the body names the failure*, NOT *the handoff was absent implies it*: a title-only handoff shipping an unmarked footer-only body would be the original bug reproduced by its own fix.
+
+**The runner cannot repair the auto-close, only report it.** No `issueNumber` field exists anywhere in this package, so the runner structurally cannot synthesize the missing `Closes #N`, and there is no retro-edit path to add one after the PR opens ([#2782](https://github.com/kuhlman-labs/fishhawk/issues/2782)). Saying what it costs is the honest substitute for a repair that is not available.
+
+**ORDERING: the marker is applied AFTER `implementCommitMessage`.** On the ordinary path `body` feeds BOTH the PR/artifact and the no-sidecar commit-message fallback. Marking first would stamp the marker into `main`'s squash commit message, where it cannot be un-shipped. `TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged` pins the ordering.
+
+**The reason rides the artifact.** `pr_body_fallback_reason` is added to the `pull_request` artifact map ONLY when non-none, so every composed ship's bytes, content hash and signature are byte-identical (the #1218/#2570 omitempty discipline). The backend declares it on `pullRequestBody` (it must, or `DisallowUnknownFields` would 400 the ship AFTER the PR exists — the #2562/#2563 stranding shape), normalizes an unrecognized value to `unknown` rather than rejecting, and folds it into the `pull_request_opened` audit payload. Two shared wire goldens bind the modules: `testdata/wire/ordinary_pr_artifact.json` (produced by the real `openPRAndShipArtifact` with no handoff, POSTed by the backend suite through the real handler) and `testdata/wire/held_commit_pr_artifact.json`.
+
+**Obligation for a future call site.** The emit is at the call sites BY DESIGN, which means a third production caller of `prTitleAndBodyParts` added without its own emit would regain today's silence. Stated here so it is discoverable rather than folklore.
+
 ## PR-open credential re-authentication (E67.62 / [#2730](https://github.com/kuhlman-labs/fishhawk/issues/2730))
 
 An implement stage that runs the full hour could reach PR-open holding a dead GitHub App installation token and fail the WHOLE stage `401 Bad credentials` — after the gate-verified commit was already pushed. The credential is minted at the top of `openPRAndShipArtifact`, but the forge write happens after `CommitAndPush`, whose committed-tree verify (plus the verify-fix loop) can run for minutes; App installation tokens live ~1 hour and the backend's `githubapp.CachedProvider` only guarantees `RefreshLeadTime` (5m) of remaining life at mint. So the push succeeds on that token and the PR-open 401s.

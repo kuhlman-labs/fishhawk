@@ -3283,6 +3283,42 @@ components:
             and the agent re-derived), `apply_failed_reset_failed` (an apply
             failed AND the post-failure reset also failed). Persisted onto the
             fixup_pushed audit entry.
+        pr_body_fallback_reason:
+          type: string
+          enum:
+            - handoff_absent
+            - handoff_unreadable
+            - empty_file
+            - empty_title
+            - body_absent
+            - unknown
+          description: |
+            Present only on a success ship whose PR body is NOT the one the
+            implement agent composed (#3012). Names which composition-failure
+            branch the runner took: `handoff_absent` (neither the run/stage-keyed
+            `/tmp/fishhawk-pr-<run>-<stage>.md` handoff nor the legacy fixed path
+            existed — the commonest branch, and the one that shipped a
+            placeholder body with no Summary, no Test plan and no `Closes #N`
+            with nothing in the trace saying so), `handoff_unreadable` (the keyed
+            path existed but could not be read), `empty_file`, `empty_title`, or
+            `body_absent` (a title-only handoff: the agent's title is honoured
+            but the PR opens footer-only). OMITTED entirely on every composed
+            ship, so a pre-#3012 body is byte-identical.
+
+            ACCEPTED-SET vs RECORDED-SET, stated plainly because the two differ.
+            The `enum` above is the set of values the server can RECORD. It is
+            NOT a rejection contract: a value outside it is ACCEPTED (201) and
+            NORMALIZED to `unknown` rather than rejected 400. That is deliberate
+            and fail-open — this artifact arrives AFTER the pull request already
+            exists on the forge, so rejecting it over an advisory diagnostic
+            would strand the implement stage in `running`, which is strictly
+            worse than the diagnostic being lost. `unknown` is therefore a member
+            of the enum: it is what a newer runner's unrecognized reason is
+            recorded as. An operator reading `unknown` should check the runner
+            version rather than assume a further branch.
+
+            The normalized value is folded into the `pull_request_opened` audit
+            payload under the same key, omitted when absent.
         supplemental_scope_exemptions:
           type: array
           items:
