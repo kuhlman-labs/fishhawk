@@ -13272,6 +13272,87 @@ func TestVerifyCommittedTreeCompiles_GateSubprocessEnvStripped(t *testing.T) {
 	}
 }
 
+// TestVerifyCommittedTreeCompiles_GateNeutralizesGlobalGitConfig is the
+// end-to-end reproduction of #3102: with the operator's HOME/.gitconfig setting
+// commit.gpgsign=true and a NONEXISTENT gpg.ssh.program, a committed probe test
+// that itself creates a temp repo and `git commit`s into it (the
+// fixupland_test.go shape) would fail inside the gate's `go test` phase unless
+// the gate env pins GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM at /dev/null. The gate
+// must return nil; on failure the gate log names the signing error. Skips when
+// `go` or `git` is absent, matching the sibling gate tests.
+func TestVerifyCommittedTreeCompiles_GateNeutralizesGlobalGitConfig(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	// Capture the ambient Go caches BEFORE redirecting HOME so the gate's
+	// `go vet`/`go test` stay warm and hermetic (both keys are allow-listed, so
+	// they survive sanitization). A cold cache would only make this test slow,
+	// not incorrect.
+	goEnv := func(key string) string {
+		out, err := exec.Command("go", "env", key).Output()
+		if err != nil {
+			t.Fatalf("go env %s: %v", key, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	gocache := goEnv("GOCACHE")
+	gomodcache := goEnv("GOMODCACHE")
+
+	// Hostile HOME: a global git config that signs every commit with a signing
+	// program that definitionally does not exist — the #3102 shape. If the gate
+	// child inherits this, the probe's `git commit` fails with a signing error.
+	home := t.TempDir()
+	signer := filepath.Join(home, "does-not-exist-signer")
+	mustWrite(t, filepath.Join(home, ".gitconfig"),
+		"[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tprogram = "+signer+"\n")
+	t.Setenv("HOME", home)
+	t.Setenv("GOCACHE", gocache)
+	t.Setenv("GOMODCACHE", gomodcache)
+
+	// compileGateRepo sets repo-local commit.gpgsign=false, so the FIXTURE's own
+	// commits are unaffected by the hostile HOME.
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "probe.go"),
+		"package mod\n\nfunc Noop() {}\n")
+	// The probe test creates its OWN temp repo and commits into it. That commit
+	// inherits the gate subprocess's env; it fails iff the gate leaked the
+	// operator's global commit.gpgsign — the exact #3102 failure shape.
+	mustWrite(t, filepath.Join(repo, "mod", "probe_test.go"),
+		"package mod\n\n"+
+			"import (\n\t\"os/exec\"\n\t\"testing\"\n)\n\n"+
+			"func TestGitCommitInGateChild(t *testing.T) {\n"+
+			"\trepo := t.TempDir()\n"+
+			"\trun := func(args ...string) {\n"+
+			"\t\tcmd := exec.Command(\"git\", args...)\n"+
+			"\t\tcmd.Dir = repo\n"+
+			"\t\tif out, err := cmd.CombinedOutput(); err != nil {\n"+
+			"\t\t\tt.Fatalf(\"git %v: %v\\n%s\", args, err, out)\n\t\t}\n\t}\n"+
+			"\trun(\"init\")\n"+
+			"\trun(\"-c\", \"user.name=probe\", \"-c\", \"user.email=probe@example.com\", \"commit\", \"--allow-empty\", \"-m\", \"probe\")\n"+
+			"}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "git-config-leak probe")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	// Non-empty drift so the gate runs past the no-drift fast path; scope names
+	// the touched package so the test phase actually runs probe_test.go.
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"README.md"}, []string{"mod/probe.go", "mod/probe_test.go"}, &log)
+	if err != nil {
+		t.Fatalf("gate must pass with global git config neutralized, got %v\nlog: %s", err, log.String())
+	}
+}
+
 // TestVerifyCommittedTreeTests_DriftExcludedFailureBlocks is the #800/#780
 // proof: a committed tree that COMPILES (go vet passes) but has a FAILING
 // test in a touched package because a helper file was excluded as scope
