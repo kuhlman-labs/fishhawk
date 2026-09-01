@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 )
 
 // --- fixtures ------------------------------------------------------------
@@ -121,7 +122,51 @@ func newGitLabRetryDispatcher(t *testing.T) (*Dispatcher, *stubRuns, *stubAudit,
 	// Every test that expects a retry to happen registers the project
 	// gitlabPipelineEvent names; the refusal tests replace or clear this.
 	d.GitLabProjects = registeredGitLabProject()
+	// A RECORDING pipeline trigger by default (E45.25 / #2876). Before this,
+	// the harness left d.GitLabTrigger nil, so every positive test in this file
+	// asserted a `dispatched` stage and a `dispatched` audit outcome while the
+	// backend warn-skipped and fired NOTHING — which is precisely why the
+	// dispatched-with-no-pipeline defect survived its own test file. With the
+	// stub wired, those assertions become observed-trigger claims. Tests that
+	// need the recorder reach it with retryTrigger(t, d); the tests that install
+	// their own erroring stub, and the unconfigured-trigger test that clears it,
+	// keep overwriting this field unchanged.
+	d.GitLabTrigger = &stubPipelineTrigger{}
 	return d, runs, au, arts
+}
+
+// retryTrigger returns the recording stub newGitLabRetryDispatcher wired, so a
+// test can assert on the pipeline calls the dispatch actually made.
+func retryTrigger(t *testing.T, d *Dispatcher) *stubPipelineTrigger {
+	t.Helper()
+	s, ok := d.GitLabTrigger.(*stubPipelineTrigger)
+	if !ok {
+		t.Fatalf("d.GitLabTrigger = %T, want *stubPipelineTrigger", d.GitLabTrigger)
+	}
+	return s
+}
+
+// resolvedRetryTrigger reports the trigger the dispatcher's gitlab_ci backend
+// ACTUALLY resolves — the same field runnerbackend.GitLabCI.TriggerStage
+// consults, and the same one handleGitLabCIRetry's pre-flight guard reads.
+//
+// It exists so the unconfigured-trigger test can prove its OWN precondition
+// rather than assume it: clearing d.GitLabTrigger falls back to the
+// process-global forge.Get("gitlab") registry, which has no deregistration
+// verb, so anything that registers a gitlab forge — an init, or a test added
+// later — would silently turn the "unconfigured" branch into a live-trigger
+// path and make a red unattributable.
+func resolvedRetryTrigger(t *testing.T, d *Dispatcher) runnerbackend.PipelineTrigger {
+	t.Helper()
+	b, ok := d.backends().Backend(run.RunnerKindGitLabCI)
+	if !ok {
+		t.Fatal("no gitlab_ci backend registered")
+	}
+	gl, ok := b.(*runnerbackend.GitLabCI)
+	if !ok {
+		t.Fatalf("gitlab_ci backend = %T, want *runnerbackend.GitLabCI", b)
+	}
+	return gl.Trigger
 }
 
 // retryChildren returns the runs created BEYOND the seeded ones — i.e. the
@@ -439,6 +484,7 @@ func TestGitLabCIRetry_UnregisteredProject_PerformsNoCandidateLookup(t *testing.
 // asserts the ref+sha predicate picks the right one.
 func TestGitLabCIRetry_CorrelatesToRunByRefAndSHA(t *testing.T) {
 	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	trigger := retryTrigger(t, d)
 	// Three runs on merge request !31, each with its own branch and head.
 	_ = seedGitLabRun(t, runs, arts, "acme/widgets", "aaa111", 0, 31)
 	want := seedGitLabRun(t, runs, arts, "acme/widgets", "bbb222", 0, 31)
@@ -452,6 +498,23 @@ func TestGitLabCIRetry_CorrelatesToRunByRefAndSHA(t *testing.T) {
 	children := retryChildren(runs, 3)
 	if len(children) != 1 {
 		t.Fatalf("retry children = %d, want 1", len(children))
+	}
+	// THE POSITIVE CONTROL for the pre-flight guard (E45.25 / #2876). A
+	// pipeline was ACTUALLY created: the dispatched-stage and
+	// ci_failure_retry_dispatched assertions below are only truthful if
+	// something fired, and before the harness wired a recording trigger they
+	// passed against a nil trigger that fired nothing.
+	trigger.mu.Lock()
+	calls := append([]stubPipelineCall(nil), trigger.calls...)
+	trigger.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("pipeline trigger calls = %d, want exactly 1", len(calls))
+	}
+	if got, wantRef := calls[0].Ref, gitLabRunBranch(children[0]); got != wantRef {
+		t.Errorf("trigger ref = %q, want the CHILD's run branch %q", got, wantRef)
+	}
+	if got, wantScope := calls[0].Scope, gitLabRunScope(want).Ref(); got != wantScope {
+		t.Errorf("trigger scope = %q, want the PARENT's credential ref %q", got, wantScope)
 	}
 	if children[0].ParentRunID == nil || *children[0].ParentRunID != want.ID {
 		t.Fatalf("child parent = %v, want the ref+sha-matched run %s",
@@ -1207,5 +1270,136 @@ func TestGitLabCIRetry_HeadSHALookupFails_SkipsThatCandidate(t *testing.T) {
 	if got := skipReason(t, au); got != gitLabRetrySkipHeadSHAUnreadable {
 		t.Errorf("reason = %q, want %q (the head could not be READ; it was never compared)",
 			got, gitLabRetrySkipHeadSHAUnreadable)
+	}
+}
+
+// --- E45.25 / #2876: pre-flight dispatchability refusals ------------------
+
+// assertRefusedBeforeMinting asserts the COMMITTED state of a pre-flight
+// refusal: nothing was minted, nothing was dispatched, and the audit names why.
+//
+// Committed state, not the handler's return value: handleGitLabCIRetry returns
+// nil on every skip path, so a return-value assertion cannot distinguish a
+// refusal from a success. It is also the attributable half of the
+// unconfigured-trigger test — a stage that did NOT reach `dispatched` and an
+// audit row naming the reason are observable regardless of what the
+// process-global forge registry happens to hold.
+func assertRefusedBeforeMinting(t *testing.T, runs *stubRuns, au *stubAudit,
+	seeded int, parent *run.Run, wantReason string) {
+	t.Helper()
+	if got := retryChildren(runs, seeded); len(got) != 0 {
+		t.Errorf("retry children = %d, want 0 (refused before minting)", len(got))
+	}
+	runs.mu.Lock()
+	stages := append([]*run.Stage(nil), runs.createdStages...)
+	transitions := append([]stubStageTransition(nil), runs.transitions...)
+	runs.mu.Unlock()
+	for _, st := range stages {
+		if st.RunID != parent.ID {
+			t.Errorf("stage %s created for run %s; no stage rows may exist when the retry is refused",
+				st.ID, st.RunID)
+		}
+		if st.State == run.StageStateDispatched {
+			t.Errorf("stage %s reached %q with no pipeline behind it", st.ID, run.StageStateDispatched)
+		}
+	}
+	if len(transitions) != 0 {
+		t.Errorf("transitions = %+v, want none (nothing was dispatched)", transitions)
+	}
+	for _, c := range auditCategories(au) {
+		if c == "ci_failure_retry_dispatched" {
+			t.Error("audit records ci_failure_retry_dispatched; no pipeline was created")
+		}
+	}
+	p, chainedToRun := skipPayload(t, au)
+	if got, _ := p["reason"].(string); got != wantReason {
+		t.Errorf("ci_retry_skipped reason = %q, want %q", got, wantReason)
+	}
+	// ATTRIBUTION. Unlike the correlation-side skips, correlation has already
+	// SUCCEEDED here — a specific run is known to own both the pipeline's ref
+	// and its SHA — so the record has an honest anchor and must chain to it.
+	if !chainedToRun {
+		t.Error("skip was global-chained; the correlated parent is a known, honest anchor")
+	}
+	if got, _ := p["run_id"].(string); got != parent.ID.String() {
+		t.Errorf("payload run_id = %v, want the correlated parent %s", p["run_id"], parent.ID)
+	}
+}
+
+// TestGitLabCIRetry_UnconfiguredTrigger_RefusesBeforeMintingChild pins the
+// first warn-skip branch of runnerbackend.GitLabCI.TriggerStage: a deployment
+// with no GitLab pipeline trigger wired.
+//
+// Before the pre-flight guard, TriggerStage's nil-Trigger warn-skip returned
+// nil, the handler read that nil as a created pipeline, transitioned the first
+// retry stage to `dispatched` and audited outcome `dispatched` — a run left
+// waiting forever on a pipeline that was never created.
+//
+// The test PROVES ITS OWN PRECONDITION rather than assuming it. Clearing
+// d.GitLabTrigger falls back to the process-global forge.Get("gitlab")
+// registry, which offers no deregistration, so the assertion below reads the
+// RESOLVED trigger off the gitlab_ci backend the dispatcher actually builds —
+// the same field the guard reads and TriggerStage consults. If anything ever
+// registers a gitlab forge, this fails loudly at the precondition instead of
+// quietly becoming a live-trigger path under a name that says otherwise.
+func TestGitLabCIRetry_UnconfiguredTrigger_RefusesBeforeMintingChild(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	// The SINGLE injection point: the guard's view and the backend's captured
+	// field are necessarily the same value because backends() constructs the
+	// gitlab_ci entry from it and the guard reads that entry's own field.
+	d.GitLabTrigger = nil
+	if got := resolvedRetryTrigger(t, d); got != nil {
+		t.Fatalf("resolved gitlab_ci trigger = %#v, want nil; this test only exercises the "+
+			"unconfigured branch when the registry resolves nothing", got)
+	}
+
+	if err := d.Handle(context.Background(),
+		gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	assertRefusedBeforeMinting(t, runs, au, 1, parent, gitLabRetrySkipGitLabUnconfigured)
+}
+
+// TestGitLabCIRetry_NilInstallationRefParent_RefusesBeforeMintingChild pins the
+// SECOND warn-skip branch (p.Scope.IsZero()) — #2876's named reachable case: a
+// correlated legacy gitlab_ci parent whose installation_ref is nil or empty, a
+// row minted by the dormant #1861 plumbing before migration 0076 and missed by
+// its backfill. Both legs of gitLabRunScope's ladder reach the zero scope.
+//
+// The recording trigger stays WIRED so the refusal is attributable to the scope
+// precondition alone and cannot be satisfied by the unconfigured branch above.
+func TestGitLabCIRetry_NilInstallationRefParent_RefusesBeforeMintingChild(t *testing.T) {
+	empty := ""
+	cases := []struct {
+		name string
+		ref  *string
+	}{
+		{name: "nil_installation_ref", ref: nil},
+		{name: "empty_installation_ref", ref: &empty},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, runs, au, arts := newGitLabRetryDispatcher(t)
+			trigger := retryTrigger(t, d)
+			parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+			// stubRuns holds the seeded POINTER, so clearing the field here is
+			// what the candidate walk reads back.
+			parent.InstallationRef = tc.ref
+			if got := resolvedRetryTrigger(t, d); got == nil {
+				t.Fatal("resolved gitlab_ci trigger is nil; this test must isolate the SCOPE branch")
+			}
+
+			if err := d.Handle(context.Background(),
+				gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+
+			if n := trigger.callCount(); n != 0 {
+				t.Errorf("pipeline trigger calls = %d, want 0", n)
+			}
+			assertRefusedBeforeMinting(t, runs, au, 1, parent, gitLabRetrySkipNoCredentialScope)
+		})
 	}
 }

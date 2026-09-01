@@ -54,6 +54,25 @@ import (
 // default-branch build in the project would misattribute itself onto whichever
 // run happened to be newest.
 //
+// PRE-FLIGHT REFUSAL, AND HOW IT DIFFERS FROM THE GITHUB PATH (E45.25 /
+// #2876). runnerbackend.GitLabCI.TriggerStage returns nil on BOTH of its
+// fail-closed warn-skip branches — a nil Trigger (GitLab unconfigured) and a
+// zero p.Scope — which is indistinguishable from a created pipeline. So this
+// path checks both preconditions BEFORE minting the retry child and refuses
+// with a named `ci_retry_skipped` reason instead.
+//
+// The GitHub path is shaped differently ON PURPOSE. It mints the child and
+// CONVERTS each warn-skip into a dispatchErr (errCIRetryGitHubUnconfigured /
+// errCIRetryNoInstallation), leaving a persisted child with an untransitioned
+// stage and a `dispatch_failed` audit row. The GitLab path refuses BEFORE
+// minting, leaving no child at all and a `ci_retry_skipped` row. This
+// divergence in committed state is deliberate and operator-ratified: a minted
+// child consumes the single retry slot enforced by runs_retry_child_once_idx
+// (retry_attempt = parent.RetryAttempt + 1), so a child that never dispatched
+// permanently occupies the attempt a corrected deployment would otherwise use —
+// a worse artifact than no row at all, on a path whose entire subject is the
+// record telling the truth.
+//
 // AUTHORIZATION. This path runs the SAME GitLabProjectAuthorizer gate the
 // create path runs, before candidate lookup, child creation or any pipeline
 // trigger. A Pipeline Hook is authenticated only by the deployment-shared
@@ -101,6 +120,24 @@ const (
 	// could not be read, so the retry cap is unknown and a retry would risk a
 	// runaway loop.
 	gitLabRetrySkipNoRetryPolicy = "retry_policy_unresolvable_from_cached_spec"
+	// gitLabRetrySkipGitLabUnconfigured means the deployment has no GitLab
+	// pipeline trigger wired: the dispatcher's injected trigger is nil and
+	// forge.Get("gitlab") resolved nothing (or the gitlab_ci registry entry is
+	// absent / not a *runnerbackend.GitLabCI). It pre-empts
+	// GitLabCI.TriggerStage's FIRST warn-skip branch (E45.25 / #2876).
+	gitLabRetrySkipGitLabUnconfigured = "gitlab_pipeline_trigger_unconfigured"
+	// gitLabRetrySkipNoCredentialScope means the correlated parent carries a
+	// nil or empty installation_ref, so gitLabRunScope returns the zero scope
+	// and no pipeline can be created under it. It pre-empts
+	// GitLabCI.TriggerStage's SECOND warn-skip branch (p.Scope.IsZero()).
+	//
+	// Deliberately DISTINCT from gitLabRetrySkipGitLabUnconfigured: that one is
+	// a deployment misconfiguration an operator fixes once (wire the GitLab
+	// forge credentials); this one is a per-run legacy-row property fixed by
+	// backfilling THAT row's installation_ref — the shape a row minted by the
+	// dormant #1861 plumbing before migration 0076 and missed by its backfill
+	// carries. Collapsing them would send an operator to the wrong remedy.
+	gitLabRetrySkipNoCredentialScope = "run_has_no_credential_scope"
 )
 
 // gitLabRetryCandidateLimit bounds the candidate window. A retry lineage is a
@@ -211,6 +248,41 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 		return nil
 	}
 
+	// PRE-FLIGHT DISPATCHABILITY (E45.25 / #2876). Both of
+	// runnerbackend.GitLabCI.TriggerStage's fail-closed warn-skip branches
+	// return nil, which the code below cannot distinguish from a created
+	// pipeline — so without this guard a nil trigger or a zero credential scope
+	// transitioned the first retry stage to `dispatched` and audited outcome
+	// `dispatched` with nothing behind it. Refused HERE, before
+	// run.ChildParamsFrom and therefore before ANY mutation: no child run, no
+	// stage rows, no retry-index slot consumed.
+	//
+	// ONE RESOLUTION, ONE INSTANCE. The registry is built once and the guard
+	// reads the resolved instance's OWN Trigger field — the very field
+	// TriggerStage will consult on the very instance dispatched below. Calling
+	// d.gitLabTrigger() separately would work today (backends() constructs the
+	// gitlab_ci entry from it) but each call independently re-enters the
+	// process-global forge.Get("gitlab") when d.GitLabTrigger is nil, so
+	// agreement would rest on registry stability rather than construction.
+	// A nil `gl` (absent, or a non-*GitLabCI registry entry) folds into the
+	// unconfigured reason: neither state can demonstrate a wired trigger, and
+	// falling through would call TriggerStage on a nil interface.
+	glBackend, _ := d.backends().Backend(run.RunnerKindGitLabCI)
+	gl, _ := glBackend.(*runnerbackend.GitLabCI)
+	// Resolved once and reused for the dispatch below, so the value this guard
+	// cleared is byte-identically the value that is dispatched. Checked in the
+	// SAME order TriggerStage checks them, so each reason names the branch it
+	// pre-empts.
+	scope := gitLabRunScope(parent)
+	switch {
+	case gl == nil || gl.Trigger == nil:
+		d.writeGitLabRetrySkippedAudit(ctx, ev, parent, pr, gitLabRetrySkipGitLabUnconfigured, now)
+		return nil
+	case scope.IsZero():
+		d.writeGitLabRetrySkippedAudit(ctx, ev, parent, pr, gitLabRetrySkipNoCredentialScope, now)
+		return nil
+	}
+
 	params := run.ChildParamsFrom(parent)
 	// BC3: retry_attempt is derived from the PARENT row, never from the
 	// latest existing child. Two concurrent deliveries for one parent
@@ -245,14 +317,18 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 	}
 
 	firstStage := stages[0]
-	backend, _ := d.backends().Backend(run.RunnerKindGitLabCI)
-	dispatchErr := backend.TriggerStage(ctx, runnerbackend.TriggerParams{
+	// glBackend / scope come from the pre-flight guard above: one registry
+	// build, one trigger resolution, one instance. With both warn-skip
+	// preconditions refused upstream, a nil return here genuinely means a
+	// pipeline was created — which is what makes the `dispatched` transition
+	// and audit below truthful.
+	dispatchErr := glBackend.TriggerStage(ctx, runnerbackend.TriggerParams{
 		RunID:            child.ID,
 		StageID:          firstStage.ID,
 		WorkflowID:       parent.WorkflowID,
 		StageExecutorRef: firstStage.ExecutorRef,
 		Repo:             ev.Repo,
-		Scope:            gitLabRunScope(parent),
+		Scope:            scope,
 		Ref:              gitLabRunBranch(child),
 	})
 	if dispatchErr == nil {
