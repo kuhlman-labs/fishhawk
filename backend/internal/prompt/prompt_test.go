@@ -3112,11 +3112,13 @@ func TestBuild_Implement_BehaviorClaimSweep_Rendered(t *testing.T) {
 	}
 	wants := []string{
 		behaviorClaimSweepHeading,
-		"the RATIONALE is part of the claim",            // rule (a)
-		"sweep repo-wide, NOT file-local",               // rule (b)
-		"documented COMMAND is checkable by RUNNING it", // rule (c)
-		"NAME the sites you",                            // rule (d) left-alone sites
-		"pin the FACT it depends on with a test",        // escalation: pin the fact
+		"the RATIONALE is part of the claim",                               // rule (a)
+		"sweep repo-wide, NOT file-local",                                  // rule (b)
+		"documented COMMAND is checkable by RUNNING it",                    // rule (c)
+		"ONLY inside your sandbox under the project's existing",            // rule (c) egress bound (#3013 security)
+		"never a documented command that pushes, publishes, or reaches an", // rule (c) egress bound
+		"NAME the sites you",                                               // rule (d) left-alone sites
+		"pin the FACT it depends on with a test",                           // escalation: pin the fact
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
