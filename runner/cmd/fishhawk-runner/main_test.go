@@ -3713,17 +3713,15 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	}
 	// Stub the #2884 fix-up landing seams to a clean-and-landed default so a
 	// fake-pusher run() test never probes the runner's own source repo (".") or
-	// a live remote: no stash, an empty reflog, no dangling commits, and a
-	// remote tip that MATCHES the pushed head (so verifyFixupPushLanded lands).
-	// fixupLocalHead returns "" so the advanced-HEAD probe (guarded on head!="")
-	// never false-fires against the base tip captured from the real ".". Tests
-	// exercising a stranding or a not-landed push swap in recording fakes AFTER
-	// this via withFakeFixup* helpers.
-	origFixStash, origFixHead, origFixStranded := fixupStashList, fixupLocalHead, fixupStrandedReflog
-	origFixReflog, origFixRemoteTip := fixupReflogCommits, fixupRemoteBranchTip
+	// a live remote: no stash and a remote tip that MATCHES the pushed head (so
+	// verifyFixupPushLanded lands). fixupLocalHead returns "" so the
+	// advanced-HEAD probe (guarded on head!="") never false-fires against the
+	// base tip captured from the real ".". Tests exercising a stranding or a
+	// not-landed push swap in recording fakes AFTER this via withFakeFixup*
+	// helpers.
+	origFixStash, origFixHead := fixupStashList, fixupLocalHead
+	origFixRemoteTip := fixupRemoteBranchTip
 	fixupStashList = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
-	fixupReflogCommits = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
-	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) { return nil, nil }
 	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return "", nil }
 	fixupRemoteBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) {
 		if fp.result != nil && fp.result.HeadSHA != "" {
@@ -3734,8 +3732,6 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	t.Cleanup(func() {
 		fixupStashList = origFixStash
 		fixupLocalHead = origFixHead
-		fixupStrandedReflog = origFixStranded
-		fixupReflogCommits = origFixReflog
 		fixupRemoteBranchTip = origFixRemoteTip
 	})
 	t.Cleanup(func() {
@@ -5315,16 +5311,6 @@ func withFakeFixupLocalHead(t *testing.T, head string, err error) {
 	orig := fixupLocalHead
 	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return head, err }
 	t.Cleanup(func() { fixupLocalHead = orig })
-}
-
-// withFakeFixupStrandedReflog swaps the dangling-commit provenance seam.
-func withFakeFixupStrandedReflog(t *testing.T, dangling []stashEntry, err error) {
-	t.Helper()
-	orig := fixupStrandedReflog
-	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) {
-		return dangling, err
-	}
-	t.Cleanup(func() { fixupStrandedReflog = orig })
 }
 
 // withFakeFixupRemoteBranchTip swaps the fix-up remote-tip probe seam so a
@@ -8500,37 +8486,6 @@ func TestRun_Fixup_NoChanges_UnpushedLocalHead_FailsCategoryB(t *testing.T) {
 	}
 }
 
-// M2b (#2884, condition 1 — the incident shape BY CONSTRUCTION): a no-changes
-// fix-up that COMMITTED then reset back to the base tip with NO stash, leaving a
-// DANGLING commit. The stash probe and the HEAD probe both read clean; only the
-// reflog provenance probe surfaces it. This goes RED against the plan's original
-// two-probe design.
-func TestRun_Fixup_NoChanges_DanglingCommit_FailsCategoryB(t *testing.T) {
-	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	fu := newFakeUploader(t)
-	fu.promptResp = fixupLandingPrompt()
-	withFakeUploader(t, fu)
-	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
-	withFakeGitOps(t, fp, &fakePROpener{})
-	// Clean stash and clean HEAD; only the provenance walk finds the orphan.
-	withFakeFixupStrandedReflog(t, []stashEntry{{SHA: "0421daebb24df3d9338d5b28e52d164c7bf49bc1", Subject: "fishhawk verify wip"}}, nil)
-
-	var stderr strings.Builder
-	if got := runFixupLanding(t, &stderr); got != exitFailure {
-		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
-	}
-	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
-		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
-	}
-	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
-		t.Error("must NOT report fixup_no_changes when a dangling commit is stranded")
-	}
-	if !strings.Contains(stderr.String(), "0421daeb") {
-		t.Errorf("stranded log must name the dangling sha (the #2884 orphan):\n%s", stderr.String())
-	}
-}
-
 // M4 (#2884, condition 4): the stash pre-snapshot itself errors → fail CLOSED
 // category-C, never a fall-through to a success report.
 func TestRun_Fixup_NoChanges_StashProbeError_FailsClosedCategoryC(t *testing.T) {
@@ -8633,7 +8588,7 @@ func TestRun_Fixup_RemoteTipMatches_ReportsFixupPushed(t *testing.T) {
 	}
 }
 
-// fixupVerifyLandingPrompt is the shared fix-up prompt for the #3022 probe-4
+// fixupVerifyLandingPrompt is the shared fix-up prompt for the #3022 probe-3
 // tests: a real fix-up (Fixup + FixupBranch) with a verify command and ONE
 // in-scope file, so the REAL committed-tree verify gate produces verifiedTreeSHA
 // from production code rather than an injected value.
@@ -8731,7 +8686,7 @@ func TestRun_Fixup_NoChanges_VerifiedWorkVanished_FailsCategoryB(t *testing.T) {
 	if !strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) ||
 		!strings.Contains(stderr.String(), "verified work did not reach the branch") ||
 		!strings.Contains(stderr.String(), `"verified_tree_sha"`) {
-		t.Errorf("fixup_work_stranded log must name the certified tree and the probe-4 reason:\n%s", stderr.String())
+		t.Errorf("fixup_work_stranded log must name the certified tree and the probe-3 reason:\n%s", stderr.String())
 	}
 }
 
@@ -8739,7 +8694,7 @@ func TestRun_Fixup_NoChanges_VerifiedWorkVanished_FailsCategoryB(t *testing.T) {
 // residue): the SAME real verify gate really does create and unwind a
 // `fishhawk verify wip` commit, but the pass then pushes normally. A healthy
 // pass never reaches the no-changes branch (its edits stay in the working tree,
-// so CommitAndPush commits and pushes them), so probe 4 is never evaluated: the
+// so CommitAndPush commits and pushes them), so probe 3 is never evaluated: the
 // stage reports fixup_pushed and exits OK.
 func TestRun_Fixup_HealthyVerifyResidue_NoFalsePositive(t *testing.T) {
 	repo := verifyFixBaseRepo(t)
@@ -8774,13 +8729,13 @@ func TestRun_Fixup_HealthyVerifyResidue_NoFalsePositive(t *testing.T) {
 		t.Fatalf("report = %+v, want fixup_pushed", fu.gotPRArgs)
 	}
 	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
-		t.Errorf("probe 4 must NOT fire on a healthy pass with normal verify residue:\n%s", stderr.String())
+		t.Errorf("probe 3 must NOT fire on a healthy pass with normal verify residue:\n%s", stderr.String())
 	}
 	// Load-bearing anti-vacuity assertion (#3022 review, test_vacuity): prove the
 	// REAL committed-tree verify gate actually created, certified, AND unwound its
 	// throwaway `fishhawk verify wip` commit — otherwise this "no false positive"
 	// test would pass even if verification were skipped entirely (the fake pusher
-	// takes the push branch, where probe 4 is never evaluated). The gate records a
+	// takes the push branch, where probe 3 is never evaluated). The gate records a
 	// NON-EMPTY verifiedTreeSHA only when commitVerifyWIP committed a non-empty
 	// staged tree AND gitResetSoftHEAD1 unwound it (a reset failure zeroes it, see
 	// runVerifyFixLoop). That witness is carried onto the implement_fixup_pushed
@@ -8838,7 +8793,7 @@ func TestRun_Fixup_NoChanges_NoAgentWork_StillReportsNoChanges(t *testing.T) {
 		t.Fatalf("report = %+v, want fixup_no_changes", fu.gotPRArgs)
 	}
 	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
-		t.Errorf("probe 4 must abstain on an empty witness (no agent work):\n%s", stderr.String())
+		t.Errorf("probe 3 must abstain on an empty witness (no agent work):\n%s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
 		t.Errorf("missing implement_fixup_no_changes log:\n%s", stderr.String())
