@@ -3106,6 +3106,97 @@ func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_InstallationsProjectPathReversal pins 0078 (E45.26 / #2877)
+// in BOTH directions: installations.project_path EXISTS after MigrateUp and is
+// GONE after rolling back through 0078, with the installations table surviving
+// (0078 is an ALTER, never a DROP TABLE). Mirrors the 0076 column-reversal
+// shape.
+//
+// It also pins the two properties the migration's whole design rests on. The
+// column must be NULLABLE — the pre-0078 row shape the authorizer refuses
+// fail-closed is precisely "project_path IS NULL", and a NOT NULL column would
+// have blocked the ALTER on any existing row anyway. And it must carry NO
+// DEFAULT: a default would silently BACKFILL every pre-existing row with an
+// invented binding, which is the one thing this migration must not do — the
+// project path is an operator authorization decision, not something derivable
+// from the payload being authorized.
+func TestMigrateDown_InstallationsProjectPathReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	projectPathColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'installations' AND column_name = 'project_path'`).Scan(&n); err != nil {
+			t.Fatalf("query installations.project_path: %v", err)
+		}
+		return n
+	}
+
+	if n := projectPathColumn(); n != 1 {
+		t.Errorf("installations.project_path count after MigrateUp = %d, want 1 (0078 added it)", n)
+	}
+	var nullable string
+	var columnDefault *string
+	if err := pool.QueryRow(ctx,
+		`SELECT is_nullable, column_default FROM information_schema.columns
+		  WHERE table_name = 'installations' AND column_name = 'project_path'`).Scan(&nullable, &columnDefault); err != nil {
+		t.Fatalf("query installations.project_path attributes: %v", err)
+	}
+	if nullable != "YES" {
+		t.Errorf("installations.project_path is_nullable = %q, want YES (the unbound state is load-bearing)", nullable)
+	}
+	if columnDefault != nil {
+		t.Errorf("installations.project_path column_default = %q, want none (a default would backfill an invented binding)", *columnDefault)
+	}
+
+	// Additive, behaviorally: an INSERT that names no project_path — every
+	// pre-0078 writer's shape — still succeeds and lands NULL.
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'gitlab', 'acme-0078', 'group')`, acctID); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'gitlab', 'gitlab:78')`, uuid.New(), acctID); err != nil {
+		t.Fatalf("insert installation without project_path failed (column not nullable?): %v", err)
+	}
+	var landedNull bool
+	if err := pool.QueryRow(ctx,
+		`SELECT project_path IS NULL FROM installations WHERE installation_ref = 'gitlab:78'`).Scan(&landedNull); err != nil {
+		t.Fatalf("read back project_path: %v", err)
+	}
+	if !landedNull {
+		t.Error("project_path is not NULL on a row inserted without it, want NULL (no backfill / no default)")
+	}
+
+	// Roll back through 0078, the reversal under test. downThrough names the
+	// target so this stays a one-line target when a migration lands above it.
+	downThrough(t, url, "0078")
+	if n := projectPathColumn(); n != 0 {
+		t.Errorf("installations.project_path count after MigrateDown = %d, want 0 (0078 reverted)", n)
+	}
+	var installationsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`).Scan(&installationsTable); err != nil {
+		t.Fatalf("query installations table: %v", err)
+	}
+	if installationsTable != 1 {
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0078 is an ALTER)", installationsTable)
+	}
+}
+
 // accountsGranularityCheckDefSQL reads the accounts granularity CHECK
 // expression, whose admitted-value set 0077 (#2925) widens with 'user'.
 const accountsGranularityCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint

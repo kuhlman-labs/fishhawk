@@ -141,16 +141,41 @@ Run creation from a GitLab trigger is live as of #2043. To turn it on for a depl
 
    fishhawkd installation register \
      --db "$FISHHAWKD_DATABASE_URL" \
-     --provider gitlab --account-key acme --installation-ref gitlab:4242
+     --provider gitlab --account-key acme --installation-ref gitlab:4242 \
+     --project-path acme/widgets
    ```
 
-   `installation register` FAILS CLOSED if no `acme` account exists yet, naming the `account create` line to run first — it never conjures the account, because the account is the operator's authorization decision. Verify what is registered with `fishhawkd installation list` (it renders each `installation_ref` alongside its owning `account_key`).
+   `--project-path` is **REQUIRED** for a `gitlab` registration (E45.26 / #2877) and is the project's full `path_with_namespace`. Its first segment must equal `--account-key`, and nested groups are supported — `--project-path acme/platform/widgets` under `--account-key acme` is valid, because the path is split on the FIRST separator only. Every component must be non-empty, so `acme//widgets`, `acme/platform//widgets` and `acme/widgets/` are refused — GitLab never canonicalises a `path_with_namespace` carrying an empty component, so such a binding could only ever refuse every trigger. It does not apply to `--provider github`, whose payload identity arrives HMAC-signed and resolves through the installation id.
 
-   `gitlab:4242` is `gitlab:<numeric project id>` — the same string the run row's `installation_ref` carries. Without a matching row (or without a database at all) an admitted GitLab trigger is refused before the spec is read and before any pipeline is created, and a `run_rejected_misconfigured` audit row records the reason (`gitlab_project_not_registered`, `gitlab_project_registry_unwired`, or `gitlab_project_authorization_lookup_failed`). A registered project id paired with a project path OUTSIDE that account's namespace is refused too — both halves of the payload identity are bound.
+   `installation register` FAILS CLOSED if no `acme` account exists yet, naming the `account create` line to run first — it never conjures the account, because the account is the operator's authorization decision. Verify what is registered with `fishhawkd installation list`, which renders each `installation_ref` alongside its owning `account_key` and its `PROJECT_PATH` (a gitlab row recording none renders `(unbound)`).
+
+   `gitlab:4242` is `gitlab:<numeric project id>` — the same string the run row's `installation_ref` carries. Without a matching row (or without a database at all) an admitted GitLab trigger is refused before the spec is read and before any pipeline is created, and a `run_rejected_misconfigured` audit row records the reason (`gitlab_project_not_registered`, `gitlab_project_registry_unwired`, `gitlab_project_authorization_lookup_failed`, or `gitlab_project_path_unbound`). A registered project id paired with any project path other than the registered one is refused too — both halves of the payload identity are bound.
 
    The SAME gate runs on the CI-failure retry path, before any candidate lookup, retry child, or pipeline trigger. The audit payload's `path` field names which gate refused (`create_run` or `ci_failure_retry`), since both share the `run_rejected_misconfigured` category.
 
-   **Know the exact strength of the path binding.** The project *id* is bound EXACTLY — it must be a registered `installation_ref`. The project *path* is bound only at the NAMESPACE level: the check is `path_with_namespace`'s first segment == the installation's `account_key`. A registered `gitlab:4242` under account `acme` is therefore admitted when paired with any `acme/*` path, including `acme/other-project`, because `installations` records no project path to compare against. The consequence is bounded and within-tenant: the workflow-spec read (the only payload-path-selected forge call) can be aimed at a sibling project in a namespace you already registered, and the pipeline is still created against the registered *id*, never the sibling. This is the accepted contract, not an oversight — binding the path exactly would require carrying it on the installations row. Register one account per namespace you actually control, and treat every project in a registered namespace as trusted to supply a workflow spec.
+   **The path binding is EXACT.** Both selectors in the payload are bound exactly: the project *id* must be a registered `installation_ref`, and the project *path* must equal the installation's recorded `project_path` byte for byte. A registered `gitlab:4242` under account `acme` bound to `acme/widgets` is admitted ONLY with `acme/widgets` — `acme/other-project` is refused, as is `acme/platform/widgets`. The path's namespace segment must additionally still equal the owning `account_key`; that tenancy check is retained alongside the exact compare, so a row mis-registered outside its account's namespace by hand-written SQL is refused even though its recorded path matches the payload.
+
+   Comparison is **case-sensitive**. GitLab canonicalises project path case, so `acme/Widgets` and `acme/widgets` name different projects and a case difference is a refusal, not a match. Register the path exactly as GitLab reports `path_with_namespace`.
+
+   Before #2877 the path was bound only at the NAMESPACE level, which admitted a registered id paired with any sibling project in the same namespace and left the workflow-spec read (the only payload-path-selected forge call) steerable within the tenant. That is now closed.
+
+   **Upgrading a deployment with existing registrations.** `installations.project_path` is added NULLABLE by migration `0078` with **no backfill** — there is no correct value to invent, because the project path is an operator authorization decision and deriving it from the payload would derive the authorization from the thing being authorized. Every row registered before the upgrade is therefore **unbound**, and an unbound row **REFUSES** rather than falling back to the old namespace-only admit: that fallback would preserve exactly the steering this change closes. The refusal audits as `run_rejected_misconfigured` with reason `gitlab_project_path_unbound`, on both the run-creation and the CI-failure-retry gate.
+
+   The remedy is re-registration, per installation:
+
+   ```sh
+   # 1. Enumerate what needs repairing — unbound gitlab rows render "(unbound)".
+   fishhawkd installation list --db "$FISHHAWKD_DATABASE_URL" --provider gitlab
+
+   # 2. Re-register each. The upsert is idempotent on (provider, installation_ref),
+   #    so this REPAIRS the row in place rather than duplicating it.
+   fishhawkd installation register \
+     --db "$FISHHAWKD_DATABASE_URL" \
+     --provider gitlab --account-key acme --installation-ref gitlab:4242 \
+     --project-path acme/widgets
+   ```
+
+   The same procedure is the recovery path if migration `0078` is ever rolled back and later re-applied: the down migration DROPs the column and permanently discards every recorded binding (no other table holds a copy), so re-applying leaves every gitlab installation unbound. A code-only revert that LEAVES the migration applied is harmless by comparison — the pre-#2877 reads name explicit column lists, so the extra column is simply never selected and the recorded values sit dormant.
 2. **Register the GitLab forge.** Set the GitLab base URL and token so `forge.Get("gitlab")` resolves (see `resolveGitLabForge` in `backend/cmd/fishhawkd/serve.go`; the config gate is both-or-neither). The dispatcher's spec reader is `registeredFileFetcher("gitlab")` — with GitLab unconfigured, an admitted GitLab trigger logs `no GitLab file reader configured` and creates no run.
 3. **Configure the GitLab webhook secret** (`X-Gitlab-Token`) so deliveries authenticate, and enable at minimum the **Issue**, **Comment**, and **Pipeline** hooks. The **Job** hook may be enabled; Fishhawk skips it deliberately so one failing job drives at most one retry.
 4. **Commit `.fishhawk/workflows.yaml`** to the project's default branch. Fishhawk reads it through the GitLab Repository Files API at the deployment's default ref.
