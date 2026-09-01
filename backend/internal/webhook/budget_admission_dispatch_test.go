@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // budgetStubRuns adds the SumWorkflowCostInRange capability
@@ -385,11 +387,18 @@ func TestGitLabCIRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption(t *t
 	parent := seedGitLabRun(t, runs.stubRuns, arts, "acme/widgets", "deadbeef", 0, 0)
 	// seedGitLabRun hardcodes ciRetrySpec (no budgets); the budget must be in
 	// the PARENT's cached spec because that is what resolveRetryPolicy reads.
-	// stubRuns retains the pointer it was handed (ListRuns returns the same
-	// *run.Run), so this overwrite is what the handler sees — verified rather
-	// than assumed, and the precondition sub-test plus the sumCallCount
-	// assertion would both fail loudly if it were not.
 	parent.WorkflowSpec = []byte(ciBudgetSpec)
+	// OBSERVE that the overwrite reaches the handler, rather than asserting it
+	// from the stub's pointer semantics. Nothing else in this test would catch
+	// a non-propagating overwrite: the precondition sub-test drives a
+	// DIFFERENT dispatcher through the CREATE seam (whose spec comes from
+	// d.GitLabFiles, not the parent row), and if the handler saw ciRetrySpec
+	// it would find no budgets, never consult the CostSummer, and mint and
+	// dispatch the child — so (1)-(5) below would all pass GREEN for a fixture
+	// that never exercised the budget question at all. The GitHub twin needs
+	// no equivalent because seedParentRunForRetry takes the spec as a
+	// parameter.
+	assertParentSpecCarriesBudget(t, d, parent)
 
 	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
 	if err := d.Handle(context.Background(), ev); err != nil {
@@ -424,6 +433,45 @@ func TestGitLabCIRetry_BlockingBudgetExhausted_StillRetries_ADR030Exemption(t *t
 	if n := runs.sumCallCount(); n != 0 {
 		t.Errorf("SumWorkflowCostInRange calls = %d, want 0 — the GitLab CI-retry path must not reach the budget gate at all (ADR-030 / #2878)", n)
 	}
+}
+
+// assertParentSpecCarriesBudget re-reads the parent through the SAME store
+// call the GitLab retry path uses to find its candidates
+// (gitLabRetryCandidates -> Runs.ListRuns) and fails unless the row the
+// handler will hand to resolveRetryPolicy carries a workflow with at least one
+// budget. This is what makes the GitLab exemption test self-proving: its
+// fixture sets the budgeted spec by overwriting a field on the seeded run, and
+// whether the handler sees that depends on store semantics the test would
+// otherwise be assuming rather than observing.
+func assertParentSpecCarriesBudget(t *testing.T, d *Dispatcher, parent *run.Run) {
+	t.Helper()
+	kind := run.RunnerKindGitLabCI
+	rows, err := d.Runs.ListRuns(context.Background(), run.ListRunsFilter{
+		Repo:       parent.Repo,
+		RunnerKind: &kind,
+		Limit:      gitLabRetryCandidateLimit,
+	})
+	if err != nil {
+		t.Fatalf("ListRuns (the handler's candidate lookup): %v", err)
+	}
+	for _, r := range rows {
+		if r.ID != parent.ID {
+			continue
+		}
+		parsed, err := spec.ParseBytes(r.WorkflowSpec)
+		if err != nil {
+			t.Fatalf("parent spec as the handler sees it does not parse: %v", err)
+		}
+		wf, ok := parsed.Workflows[r.WorkflowID]
+		if !ok {
+			t.Fatalf("parent spec as the handler sees it declares no workflow %q", r.WorkflowID)
+		}
+		if len(wf.Budgets) == 0 {
+			t.Fatalf("parent workflow %q as the handler sees it declares 0 budgets — the budgeted-spec overwrite did NOT reach the handler, so the retry assertions would be vacuous", r.WorkflowID)
+		}
+		return
+	}
+	t.Fatalf("parent run %s is not among the %d candidates the handler's lookup returns", parent.ID, len(rows))
 }
 
 // ciRetryAuditOutcome returns the `outcome` recorded on the single
