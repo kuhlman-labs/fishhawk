@@ -311,7 +311,7 @@ Any reason → `ErrFixupWorkStranded` (category B), the failure path reports `{f
 
 The unit contract for the helpers is pinned in `cmd/fishhawk-runner/fixupland_test.go` (one case per probe mode + error identity, including probe 3's incident-shape reproduction, empty-witness / empty-base-tip / base-equal abstains, the base-tree-resolve fail-closed, a three-mode case asserting each probe's OWN reason substring so a silently dropped probe cannot hide behind a count, and `TestStrandedFixupWork_DanglingCommitResidual`, which builds the genuine post-unwind no-changes state in a real repo — asserting a clean status, a clean index, a clean working tree, HEAD at the base tip and no stash, with the dangling object proven present and unreachable — then pins BOTH halves of the gap above: zero reasons with no verify witness, and exactly one probe-3 reason once the gate's witness exists) and `internal/gitops/commit_test.go` (`RemoteBranchTipURL`'s absent-vs-failure discrimination); the end-to-end run() contract in `cmd/fishhawk-runner/main_test.go` (M1, M2 and M4–M7 for #2884 — M2b, which asserted run() wiring through the removed reflog seam while its name claimed incident detection, went with the probe in #3023 — plus M8–M10 for #3022: M8 drives the incident shape end to end through the REAL verify gate and asserts `{failed, B}`, M9 proves no false positive on healthy verify residue, M10 proves the empty-witness abstain — each with a deletion counterfactual).
 
-### Fix-up counterfactual self-report (E68.20 / #3042)
+### Counterfactual self-report — both passes (E68.20 / #3042, E68.9 / #2929)
 
 The fix-up self-report sidecar (`/tmp/fishhawk-fixup-selfreport-<run>-<stage>.json`, `#1210`) carries an OPTIONAL `counterfactuals` array beside `verify_status` and `obligations`: one entry per control the pass ADDED or TIGHTENED and then counterfactually tested. Each entry is `{"control_path": "...", "observed": "red|green|not_run", "restored": true, "record": "<what you mutated and saw>"}`.
 
@@ -332,6 +332,33 @@ The fix-up self-report sidecar (`/tmp/fishhawk-fixup-selfreport-<run>-<stage>.js
 **The `record` text NEVER crosses the upload boundary.** It is REQUIRED (it forces the agent to have actually run the mutation) and then DISCARDED on the runner, verbatim to #2737's rationale: the fix-up agent runs arbitrary repository commands, so it controls every byte of that text, and carrying it over the trace bundle into a reviewer prompt would be an egress path for repository content that never appears in the committed diff. What crosses is the `{control_path, observed, restored}` triple — a path the operator already declared, a closed enum, and a bool. `control_path` is constrained to the declared scope set for the same reason, not merely checked non-empty. The drop log echoes only sanitized values (`<not-in-scope>` / `<invalid>`).
 
 The surviving triples ride the `fixup_counterfactuals` trace event into `gate_evidence` (`gateevidence.go`), and the backend renders them to the implement re-review under explicitly AGENT-CLAIM authority — the runner never witnessed the mutation, so `observed: red` does NOT close the no-op-mutation class. EVIDENCE ONLY: the block never touches `res.OK`, `res.FailureCategory` or budget.
+
+**The INITIAL implement pass has its own sidecar (#2929).** #3042 wired the carrier to the FIX-UP pass only — `main.go` read the self-report under `stageType == "implement" && cfg.fixup` — while `writeCounterfactualDiscipline` renders on BOTH passes and told the initial implement agent to record its RED outputs in the PR `## Notes`. The implement review is diff-only and never receives the PR body, so that evidence structurally could not reach the reviewer. The initial pass now writes `/tmp/fishhawk-counterfactuals-<run>-<stage>.json`:
+
+```json
+{"run_id":"…","stage_id":"…",
+ "counterfactuals":[{"control_path":"…","observed":"red","restored":true,"record":"…"}]}
+```
+
+`loadCounterfactualReport` applies a WHOLE-SIDECAR fail-closed ladder before per-entry validation:
+
+| Sidecar state | Result | Log | File after |
+|---|---|---|---|
+| absent | `nil` | none (the common no-op) | still absent |
+| present but UNREADABLE (a directory at the path, a permission failure) | `nil` | `counterfactual_report_unreadable` | REMOVED |
+| malformed JSON | `nil` | `counterfactual_report_invalid` | REMOVED |
+| embedded `run_id`/`stage_id` not matching this stage | `nil` | `counterfactual_report_stale` | REMOVED |
+| well-formed and fresh | the validated triples | per-entry drops only | REMOVED (consumed) |
+
+The absent-vs-unreadable split is a deliberate improvement over `loadFixupSelfReport`, which returns on the read error BEFORE installing its deferred removal and so leaves an unreadable sidecar on disk contrary to its stated every-return-path cleanup invariant. The stale log echoes the AGENT-AUTHORED embedded ids through `safeSidecarID`, which bounds each to 64 bytes with a `…` marker: `%q` escapes control characters but does not bound length, so without it an agent could push arbitrary-length text into the runner log.
+
+**The per-entry drop table above is SHARED, not duplicated.** Both channels call the same `validateFixupCounterfactuals` with the same rules, the same `fixup_counterfactual_dropped` log and the same discard of the `record` text. One validator means the two channels cannot drift into disagreeing about what a valid entry is.
+
+**The two channels are EXACT COMPLEMENTS.** The initial-pass branch is guarded by `stageType == "implement" && !cfg.fixup`, the precise negation of the fix-up block's `cfg.fixup`, so exactly ONE channel reads per pass and a claim can never be double-counted into `gate_evidence`. `TestCounterfactualChannels_AreExactComplements` pins both conditions structurally (run() has no seam for a behavioral drive) along with the evidence-only invariant.
+
+**`sweepStaleCounterfactualReport` is called from TWO places and the single `counterfactual_report_swept` reason covers BOTH** — stated here plainly rather than split into two literals, so an operator reading the log knows the reason is ambiguous by design and disambiguates from WHERE in the stage it appears. (1) Pre-invoke, beside `sweepStaleFixupSelfReport`: a removed file is a leftover from a prior retry of this same run/stage. (2) Inside the fix-up branch: a removed file is one THIS pass's agent wrote, which the fix-up channel deliberately does not read (a fix-up carries its counterfactuals in the #3042 self-report sidecar instead) — swept rather than left unread in `/tmp`, where a human would find a file that looks like live evidence. `TestFixupBranch_SweepsTheInitialPassSidecar` asserts the sweep call is present in that branch and that `loadCounterfactualReport` is NOT.
+
+**The `fixup_counterfactuals` event kind is retained for the initial pass ON PURPOSE.** `composeGateEvidence`, `bundle.GateEvidence.FixupCounterfactuals` and the backend's `server/trace.go` mapping were already pass-agnostic, so reusing the kind means NO wire change and a pinned older backend keeps parsing a newer runner. Renaming it would be silently DROPPED by that backend's `composeGateEvidence` switch — evidence lost with no error, in both skew directions. The reviewer-facing block is correspondingly retitled pass-agnostically (`### Counterfactual self-report (agent CLAIM — not a runner observation)`).
 
 ## Releases
 

@@ -9592,7 +9592,7 @@ func TestBackstopFixupReReview_GateEvidence_EndToEnd(t *testing.T) {
 		"Verify summary: outcome=passed (iterations 2/3)",
 		// Half B: the agent's CLAIMED counterfactual rows, under their own
 		// explicitly weaker authority framing.
-		"### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)",
+		"### Counterfactual self-report (agent CLAIM — not a runner observation)",
 		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
 		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
 		"The verify runs above are what the RUNNER MEASURED",
@@ -10459,5 +10459,76 @@ func TestCheckStageBudget_AdvisoryRepeatedOverCeilingAppendsPerUpload(t *testing
 	got, _ := rr.GetRun(context.Background(), runID)
 	if got.State == run.StateCancelled {
 		t.Error("advisory breach cancelled the run")
+	}
+}
+
+// TestInitialImplementCounterfactuals_BundleToPrompt_EndToEnd is the #2929
+// cross-boundary seam test. #3042's end-to-end pin drives the FIX-UP re-review
+// dispatch; this one proves the SAME wire bytes, produced by a NON-fix-up
+// implement stage, thread the whole backend chain — stored bundle wire bytes ->
+// pickRedactedTraceHash -> TraceStore.Get -> bundle.ExtractGateEvidence ->
+// resolveStageGateEvidence -> prompt.GateFixupCounterfactual -> the rendered
+// implement-review prompt — and render under the pass-agnostic block title.
+//
+// It reuses the SHARED literal fixupCounterfactualsWireFixture, which is the
+// same literal the runner half asserts in
+// runner/cmd/fishhawk-runner/gateevidence_test.go, so the two independently
+// versioned modules meet on one fixture: a drift in either side's json tags
+// reddens one half or the other. The runner's own emission of that shape from
+// the non-fix-up branch is pinned by
+// TestCounterfactualChannels_AreExactComplements in the runner package (run()
+// has no seam for a behavioral drive — see that test's comment).
+//
+// Retaining the `fixup_counterfactuals` wire kind for the initial pass is what
+// makes this work with NO backend change: resolveStageGateEvidence and
+// gateEvidenceForReview were already pass-agnostic.
+func TestInitialImplementCounterfactuals_BundleToPrompt_EndToEnd(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	hash := strings.Repeat("e", 64)
+	s.cfg.TraceStore = &priorDiffTraceStore{body: buildFixupReReviewBundle(t)}
+	seedTraceUploaded(t, au, runRow.ID, implStage.ID, hash)
+
+	ev, reason := s.resolveStageGateEvidence(context.Background(), runRow.ID, implStage.ID)
+	if ev == nil {
+		t.Fatalf("resolveStageGateEvidence returned no evidence (reason=%q)", reason)
+	}
+	want := []prompt.GateFixupCounterfactual{
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+	}
+	if !reflect.DeepEqual(ev.FixupCounterfactuals, want) {
+		t.Fatalf("FixupCounterfactuals = %+v, want %+v", ev.FixupCounterfactuals, want)
+	}
+
+	got, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		IssueNumber:  2929,
+		IssueTitle:   "verification evidence the reviewer cannot see",
+		ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1", Summary: "counterfactual carrier e2e"},
+		Diff:         "- M runner/cmd/fishhawk-runner/main.go\n",
+		GateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Counterfactual self-report (agent CLAIM — not a runner observation)",
+		"For each control this pass added or tightened",
+		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
+		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
+		"The verify runs above are what the RUNNER MEASURED",
+		// Standing rule 8: the reviewer is told where structured evidence
+		// lives AND that PR-body evidence is not in its material.
+		"8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**",
+		"'Counterfactual self-report' block above",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement-review prompt missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "### Fix-up counterfactual self-report") {
+		t.Errorf("the old fix-up-only title must not survive on the wire path:\n%s", got)
 	}
 }
