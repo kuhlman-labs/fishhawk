@@ -8685,18 +8685,27 @@ func TestRun_Fixup_NoChanges_VerifiedWorkVanished_FailsCategoryB(t *testing.T) {
 	fu.promptResp = fixupVerifyLandingPrompt()
 	withFakeUploader(t, fu)
 
+	// Capture the fix-up base tip INDEPENDENTLY, before run() (and thus before the
+	// verify gate's throwaway commit + unwind), so the onCommit assertion below has
+	// a ground-truth base tip that a regressed unwind cannot move. Reading it from
+	// the post-gate worktree HEAD (the pre-#3022-review headBefore) would pass even
+	// if gitResetSoftHEAD1 left HEAD advanced, because headBefore would then BE the
+	// advanced value. The relocated worktree is a checkout of repo at this tip.
+	baseTip := gitHead(t, repo)
+
 	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
 	fp.onCommit = func(args gitops.CommitAndPushArgs) {
 		// Remove the verified work so it is absent from the working tree AND the
 		// branch, modelling the incident: commit → reset → no stash → no changes.
 		rd := args.RepoDir
-		headBefore := fixuplandGit(t, rd, "rev-parse", "HEAD")
 		fixuplandGit(t, rd, "reset", "--hard", "HEAD")
 		fixuplandGit(t, rd, "clean", "-fdx")
 		// Positively assert the incident shape BEFORE the no-changes path runs:
-		// HEAD still at the base tip, clean working tree, no stash entry.
-		if head := fixuplandGit(t, rd, "rev-parse", "HEAD"); head != headBefore {
-			t.Errorf("HEAD must stay at the base tip, got %q want %q", head, headBefore)
+		// HEAD at the fix-up base tip (asserted against the independently-captured
+		// base SHA, not the post-gate HEAD, so a regressed verify-gate unwind that
+		// left HEAD advanced would FAIL here), clean working tree, no stash entry.
+		if head := fixuplandGit(t, rd, "rev-parse", "HEAD"); head != baseTip {
+			t.Errorf("HEAD must be at the fix-up base tip, got %q want %q", head, baseTip)
 		}
 		if s := fixuplandGit(t, rd, "status", "--porcelain"); s != "" {
 			t.Errorf("working tree must be clean before the no-changes path, got %q", s)
@@ -8766,6 +8775,34 @@ func TestRun_Fixup_HealthyVerifyResidue_NoFalsePositive(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
 		t.Errorf("probe 4 must NOT fire on a healthy pass with normal verify residue:\n%s", stderr.String())
+	}
+	// Load-bearing anti-vacuity assertion (#3022 review, test_vacuity): prove the
+	// REAL committed-tree verify gate actually created, certified, AND unwound its
+	// throwaway `fishhawk verify wip` commit — otherwise this "no false positive"
+	// test would pass even if verification were skipped entirely (the fake pusher
+	// takes the push branch, where probe 4 is never evaluated). The gate records a
+	// NON-EMPTY verifiedTreeSHA only when commitVerifyWIP committed a non-empty
+	// staged tree AND gitResetSoftHEAD1 unwound it (a reset failure zeroes it, see
+	// runVerifyFixLoop). That witness is carried onto the implement_fixup_pushed
+	// event as verified_tree_sha, so a non-empty value here is proof the healthy
+	// verify residue was really produced and unwound before the push path ran.
+	var pushedLine string
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.Contains(line, `"event":"implement_fixup_pushed"`) {
+			pushedLine = line
+		}
+	}
+	if pushedLine == "" {
+		t.Fatalf("no implement_fixup_pushed event to prove the verify gate ran:\n%s", stderr.String())
+	}
+	var pushed struct {
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+	}
+	if err := json.Unmarshal([]byte(pushedLine), &pushed); err != nil {
+		t.Fatalf("parse implement_fixup_pushed line: %v\n%s", err, pushedLine)
+	}
+	if pushed.VerifiedTreeSHA == "" {
+		t.Fatalf("implement_fixup_pushed.verified_tree_sha is empty: the committed-tree verify gate did not create+certify+unwind a throwaway commit, so this test is vacuous:\n%s", pushedLine)
 	}
 }
 

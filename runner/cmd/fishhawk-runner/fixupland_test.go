@@ -431,6 +431,33 @@ func TestStrandedFixupWork_VerifiedTreeEqualsBaseReportsNothing(t *testing.T) {
 	}
 }
 
+// TestStrandedFixupWork_VerifiedTreeProbeErrorPropagates is the probe-4 analogue
+// of TestStrandedFixupWork_ProbeErrorPropagates (#3022 review, untested-path): a
+// fixupBaseTreeOf seam failure must propagate THROUGH strandedFixupWork wrapped
+// as "verified-tree probe:", so the category-C fail-closed path is pinned at the
+// call-site boundary (not only at the helper level in
+// TestVerifiedFixupWorkStranded_BaseTreeResolveErrorFailsClosed). Probes 1-3 read
+// clean and the witness/base-tip are non-empty, so probe 4 is the sole error
+// source.
+func TestStrandedFixupWork_VerifiedTreeProbeErrorPropagates(t *testing.T) {
+	sentinel := errors.New("rev-parse: bad object")
+	withFixupSeams(t,
+		func(context.Context, string) ([]stashEntry, error) { return nil, nil },
+		func(context.Context, string) (string, error) { return "base", nil },
+		cleanReflog,
+	)
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		return "", sentinel
+	})
+	_, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "verifiedtree")
+	if err == nil || !errors.Is(err, sentinel) {
+		t.Fatalf("want the probe-4 error propagated from the call site, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "verified-tree probe:") {
+		t.Errorf("want the caller's verified-tree probe wrap, got %v", err)
+	}
+}
+
 // --- verifyFixupPushLanded (seamed) — error IDENTITY per mode -------------
 
 func withFixupRemoteTip(t *testing.T, fn func(context.Context, string, string, string, string) (string, error)) {
