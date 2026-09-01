@@ -10483,7 +10483,7 @@ func TestCheckStageBudget_AdvisoryRepeatedOverCeilingAppendsPerUpload(t *testing
 // package, where the pass distinction actually lives:
 // TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar drives
 // the non-fix-up branch body and asserts the emitted fixup_counterfactuals
-// event, and TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent
+// event, and TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate
 // drives the fix-up complement.
 //
 // It reuses the SHARED literal fixupCounterfactualsWireFixture, which is the

@@ -24881,6 +24881,44 @@ func TestLoadCounterfactualReport_PresentButUnreadable(t *testing.T) {
 	}
 }
 
+// TestLoadCounterfactualReport_DanglingSymlinkIsPresentState: a DANGLING SYMLINK
+// at the keyed path is present agent-authored state, not absence (#2929 fix-up).
+//
+// os.ReadFile follows the link and reports ENOENT for its MISSING TARGET, which
+// is byte-indistinguishable from the genuine-absence error. A loader trusting
+// the read error alone returns on the silent no-op branch and leaves the symlink
+// on disk, bypassing the documented present-but-unreadable cleanup entirely. The
+// os.Lstat re-check (pathExists) is what separates the two, so deleting it —
+// reverting the branch to a bare errors.Is(err, os.ErrNotExist) — reddens here.
+//
+// This is the (a)-trap shape: the RETURN value is nil either way, so the
+// load-bearing assertions are the LOG and the COMMITTED on-disk state. The
+// absence check is os.Lstat, not os.Stat: os.Stat reports not-exist for a
+// surviving dangling symlink and would green the very bug under test.
+func TestLoadCounterfactualReport_DanglingSymlinkIsPresentState(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.Symlink(filepath.Join(filepath.Dir(path), "no-such-target.json"), path); err != nil {
+		t.Fatal(err)
+	}
+	// Fixture invariant: the link is PRESENT while the read fails ENOENT — the
+	// exact ambiguity the control resolves.
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("fixture invariant: the symlink must exist, lstat err = %v", err)
+	}
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("a dangling symlink must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_unreadable"`) {
+		t.Errorf("a present-but-unreadable path must be surfaced, got %q", logSink.String())
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("the dangling symlink must be removed, lstat err = %v", err)
+	}
+}
+
 // TestLoadCounterfactualReport_UnreadableAndUnremovableIsSurfaced: a path that
 // can be neither READ nor REMOVED must not be reported as if cleanup succeeded
 // (#2929 fix-up). An agent controls the sidecar path's contents, so it can build
@@ -25078,6 +25116,44 @@ func TestSweepStaleCounterfactualReport_ReasonsAreDistinct(t *testing.T) {
 	}
 }
 
+// TestSweepStaleCounterfactualReport_NonEmptyDirectoryIsRemovedRecursively is
+// the POSITIVE pin for the sweep's os.RemoveAll (#2929 fix-up). An agent
+// controls what sits at the sidecar path and can put a NON-EMPTY DIRECTORY
+// there, which a non-recursive os.Remove can never clear (ENOTEMPTY) — the case
+// the runner README's "Removal is RECURSIVE" claim rests on.
+//
+// The parent is WRITABLE here, which is what makes this discriminating and
+// TestSweepStaleCounterfactualReport_RemovalFailureIsSurfaced not: that fixture
+// denies the parent write, so BOTH os.Remove and os.RemoveAll fail on it and it
+// passes identically under either implementation. Reverting RemoveAll to Remove
+// reddens this test — the sweep would log counterfactual_report_sweep_failed and
+// the directory would survive.
+func TestSweepStaleCounterfactualReport_NonEmptyDirectoryIsRemovedRecursively(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logSink strings.Builder
+	sweepStaleCounterfactualReport(cfg, &logSink, counterfactualSweepPreInvoke)
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"counterfactual_report_swept"`) {
+		t.Errorf("a non-empty directory must be swept, got %q", out)
+	}
+	if strings.Contains(out, `"event":"counterfactual_report_sweep_failed"`) {
+		t.Errorf("the recursive removal must succeed on a writable parent, got %q", out)
+	}
+	// os.Lstat, not os.Stat: only committed on-disk state can tell a recursive
+	// removal from a non-recursive one that logged success it did not earn.
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("the directory must be gone after the sweep, lstat err = %v", err)
+	}
+}
+
 // TestSweepStaleCounterfactualReport_RemovalFailureIsSurfaced: a path the sweep
 // cannot clear must NOT be reported as swept. The fixture is a non-empty
 // directory whose PARENT denies write, which defeats os.RemoveAll — and it is
@@ -25213,29 +25289,41 @@ func TestEmitInitialCounterfactuals_NoSidecarEmitsNothing(t *testing.T) {
 	}
 }
 
-// TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent is the
+// TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate is the
 // BEHAVIORAL pin for the fix-up branch's half (#2929 fix-up). It drives the real
 // branch body and asserts the file's ABSENCE POSITIVELY via os.Stat rather than
 // inferring it from the absence of an event: "no event" is equally consistent
 // with the sidecar being left unread in /tmp, which is exactly the hygiene gap
 // this sweep closes.
-func TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent(t *testing.T) {
+//
+// It deliberately makes NO claim about res.Events (#2929 fix-up). An earlier
+// version constructed an agent.Result and asserted len(res.Events) == 1, which
+// was a TAUTOLOGY: sweepUnreadCounterfactualReport(cfg, logSink) never receives
+// res, so no implementation of it could change that count and the "emits no
+// event" half of the name could not go red. The mutual-exclusion property that
+// assertion was reaching for — the fix-up branch does not ALSO emit the initial
+// channel's event — is pinned where it is actually decidable: by
+// TestCounterfactualChannels_AreExactComplements on the branch CONDITIONS, and
+// by TestFixupBranch_SweepsTheInitialPassSidecar on the branch body's calls.
+//
+// What IS load-bearing here: the file is gone, and no fixup_counterfactual_
+// dropped line was logged — the latter is the observable signature of per-entry
+// VALIDATION, i.e. of the sweep having read the sidecar it must only delete.
+func TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate(t *testing.T) {
 	cfg := cfReportCfg()
+	// The entry is deliberately INVALID (an out-of-scope control_path), so a
+	// sweep that wrongly READ the sidecar would emit fixup_counterfactual_
+	// dropped and redden the log assertion below. A well-formed entry would
+	// validate silently and leave that half of the test unable to discriminate.
 	path := writeCounterfactualSidecarFile(t, cfg,
 		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
-			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"r"}]}`)
+			`{"control_path":"not/in/scope.go","observed":"red","restored":true,"record":"r"}]}`)
 
-	// The same res the fix-up branch would hold: driving the sweep must not add
-	// to it, or the fix-up self-report channel would be double-counted.
-	res := agent.Result{Events: []agent.Event{{Kind: "runner_started"}}}
 	var logSink strings.Builder
 	sweepUnreadCounterfactualReport(cfg, &logSink)
 
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("the fix-up pass must leave NO file at the sidecar path, stat err = %v", err)
-	}
-	if len(res.Events) != 1 {
-		t.Fatalf("the fix-up sweep must emit no counterfactual event, got %+v", res.Events)
 	}
 	if strings.Contains(logSink.String(), `"event":"fixup_counterfactual_dropped"`) {
 		t.Errorf("the fix-up sweep must not VALIDATE (that is reading), got %q", logSink.String())
@@ -25252,7 +25340,7 @@ func TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent(t *testin
 // extracted into emitInitialCounterfactuals and sweepUnreadCounterfactualReport
 // precisely so behavioral tests could drive them —
 // TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar and
-// TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent above assert
+// TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate above assert
 // the emitted event and the file's absence on disk, which a text match cannot:
 // a call under dead code, or a sweep that runs but fails to remove the file,
 // passes a structural assertion and fails those.
@@ -25324,7 +25412,7 @@ func TestCounterfactualChannels_AreExactComplements(t *testing.T) {
 // TestFixupBranch_SweepsTheInitialPassSidecar pins the WIRING: the fix-up branch
 // calls the sweep helper and does NOT call the loader (which would double-count
 // the two channels). That the sweep actually leaves no file on disk is asserted
-// behaviorally by TestSweepUnreadCounterfactualReport_RemovesTheFileAndEmitsNoEvent
+// behaviorally by TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate
 // above, which drives the helper and stats the path — this test only proves the
 // branch reaches it.
 func TestFixupBranch_SweepsTheInitialPassSidecar(t *testing.T) {

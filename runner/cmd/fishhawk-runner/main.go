@@ -9287,6 +9287,16 @@ const (
 	counterfactualSweepFixupUnread = "fixup_pass_authored_unread"
 )
 
+// pathExists reports whether SOMETHING sits at path, WITHOUT following a
+// symlink (#2929 fix-up). os.Lstat is the deliberate choice over os.Stat: a
+// dangling symlink is present agent-authored state that must be cleaned up,
+// yet os.Stat (like os.ReadFile) resolves the link and reports the missing
+// TARGET's ENOENT, which would read as absence.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
 // sweepStaleCounterfactualReport deletes any leftover counterfactual sidecar at
 // this run/stage's keyed path (#2929), naming which of the two sweep sites it
 // is via reason (see the constants above).
@@ -9379,9 +9389,19 @@ func loadCounterfactualReport(cfg config, scope []string, logSink io.Writer) []f
 	path := counterfactualReportPath(cfg.runID, cfg.stageID)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) && !pathExists(path) {
 			// The common no-op: the agent reported nothing. No log — only an
 			// existing file's content can claim anything.
+			//
+			// The pathExists (os.Lstat) re-check is load-bearing, NOT a
+			// tautology (#2929 fix-up): os.ReadFile FOLLOWS symlinks, so a
+			// DANGLING symlink at the keyed path — present agent-authored
+			// state — reports ENOENT for its missing TARGET. Trusting the read
+			// error alone would return here without cleanup and leave that
+			// symlink on disk, bypassing the present-but-unreadable removal
+			// below. os.Lstat does not follow the link, so it tells actual
+			// path absence from a present-but-broken link, and the latter
+			// falls through to be removed fail-closed.
 			return nil
 		}
 		// Present but unreadable: fail closed AND remove, so a path we could
