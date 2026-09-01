@@ -26019,3 +26019,510 @@ func TestOpenHeldCommitPR_ComposedWithServedTextLogsNeither(t *testing.T) {
 		t.Errorf("a successful composition must omit pr_body_fallback_reason, got %v", artifact["pr_body_fallback_reason"])
 	}
 }
+
+// --- #2840 agent-handoff memo across a base-rebase re-invoke ---------------
+
+// withAgentHandoffPaths redirects BOTH agent-handoff dirs (the PR-description
+// dir + its legacy fixed-path fallback, and the initial-commit-message dir) to
+// one temp dir for the duration of the test, restoring the production values via
+// t.Cleanup, and returns the run/stage-KEYED paths. Nothing under the production
+// /tmp is touched.
+func withAgentHandoffPaths(t *testing.T, runID, stageID string) (prPath, commitMsgPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	origPRDir, origLegacy, origCMDir := pullRequestDescriptionDir, legacyPullRequestDescriptionPath, implementCommitMessageDir
+	pullRequestDescriptionDir = dir
+	legacyPullRequestDescriptionPath = filepath.Join(dir, "legacy-fishhawk-pr.md")
+	implementCommitMessageDir = dir
+	t.Cleanup(func() {
+		pullRequestDescriptionDir = origPRDir
+		legacyPullRequestDescriptionPath = origLegacy
+		implementCommitMessageDir = origCMDir
+	})
+	return pullRequestDescriptionPath(runID, stageID), implementCommitMessagePath(runID, stageID)
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText is the
+// #2840 primary regression, driven END-TO-END through the real run() across the
+// whole seam the defect lives in: the agent writes both handoffs -> the FIRST
+// openPRAndShipArtifact consumes them (delete-after-read) -> CommitAndPush fails
+// ErrBaseRebaseConflict -> reinvokeOnBaseRebaseConflict runs an agent that
+// writes NOTHING (the non-compliant case option 3 alone cannot cover) -> the
+// SECOND openPRAndShipArtifact must still open the PR with the AGENT's title,
+// the agent's `Closes #N` body and the agent's commit message, not the
+// `chore: fishhawk implement stage <id>` placeholder that shipped on PRs
+// #2741/#2755/#2776/#2779. No unit test of either loader can see this: the
+// defect is in the seam BETWEEN the two calls.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	prPath, cmPath := withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(callIdx int, _ agent.Invocation) {
+			if callIdx != 0 {
+				// The re-invoked agent writes NOTHING — the memo is the only
+				// thing standing between this run and the placeholder.
+				return
+			}
+			if werr := os.WriteFile(prPath, []byte(
+				"fix(runner): replay the agent handoffs across a re-invoke\n\n## Summary\n\n- carry the text\n\nCloses #2840\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+			if werr := os.WriteFile(cmPath, []byte(
+				"fix(runner): replay the agent handoffs across a re-invoke\n\nCarry both handoffs across the base-rebase re-invoke.\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		},
+	}
+	withFakeInvoker(t, fi)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.calls != 2 {
+		t.Fatalf("CommitAndPush called %d times, want 2 (conflict + retry)", fp.calls)
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if fpr.gotArgs.Title != "fix(runner): replay the agent handoffs across a re-invoke" {
+		t.Errorf("PR title = %q, want the agent's title; the placeholder here is exactly the shipped defect", fpr.gotArgs.Title)
+	}
+	if strings.Contains(fpr.gotArgs.Title, "chore: fishhawk implement stage") {
+		t.Errorf("PR title fell through to the placeholder: %q", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "Closes #2840") {
+		t.Errorf("PR body must carry the agent's Closes #N (the issue auto-close), got:\n%s", fpr.gotArgs.Body)
+	}
+	if strings.Contains(fpr.gotArgs.Body, "was not composed by the implement agent") {
+		t.Errorf("a replayed agent body must carry no #3012 not-composed marker:\n%s", fpr.gotArgs.Body)
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush args not captured")
+	}
+	if !strings.HasPrefix(fp.gotArgs.CommitMessage, "fix(runner): replay the agent handoffs across a re-invoke\n\nCarry both handoffs") {
+		t.Errorf("commit message = %q, want the agent's replayed sidecar message", fp.gotArgs.CommitMessage)
+	}
+	if !strings.Contains(stderr.String(), `"event":"pr_description_replayed"`) {
+		t.Errorf("expected pr_description_replayed in the log:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_commitmsg_replayed"`) {
+		t.Errorf("expected implement_commitmsg_replayed in the log:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack
+// pins that the memo does not MASK the genuine-absence case (#2658/#3011/#3012):
+// an agent that never writes a handoff at all must still ship the marked
+// placeholder on BOTH passes, with pr_body_not_composed reason handoff_absent.
+// Store-only-on-success (rule b) is what makes this hold — a cached fallback
+// would replay silently and the trace would stop saying the composition was
+// skipped.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if !strings.HasPrefix(fpr.gotArgs.Title, "chore: fishhawk implement stage") {
+		t.Errorf("with no handoff at all the placeholder title must survive, got %q", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "was not composed by the implement agent") {
+		t.Errorf("a genuine absence must still carry the #3012 marker:\n%s", fpr.gotArgs.Body)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"handoff_absent"`) {
+		t.Errorf("expected pr_body_not_composed reason handoff_absent:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"pr_description_replayed"`) {
+		t.Errorf("nothing was ever captured, so nothing can be replayed:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins pins rule
+// (a), fresh-read-first: the re-invoked agent complies with the option-3
+// re-request and writes a DIFFERENT handoff pair for the re-landed slice. That
+// text — not the memoized first-pass text — must reach the PR and the commit,
+// because it is the text that describes what actually landed.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	prPath, cmPath := withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(callIdx int, _ agent.Invocation) {
+			title, note := "fix(runner): stale first-pass title", "stale first-pass body"
+			if callIdx != 0 {
+				title, note = "fix(runner): fresh re-landed title", "fresh re-landed body"
+			}
+			if werr := os.WriteFile(prPath, []byte(
+				title+"\n\n## Summary\n\n- "+note+"\n\nCloses #2840\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+			if werr := os.WriteFile(cmPath, []byte(title+"\n\n"+note+"\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		},
+	}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if fpr.gotArgs.Title != "fix(runner): fresh re-landed title" {
+		t.Errorf("PR title = %q, want the RE-INVOKED agent's fresh title (fresh-read-first, rule a)", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "fresh re-landed body") || strings.Contains(fpr.gotArgs.Body, "stale first-pass body") {
+		t.Errorf("PR body must be the fresh one, got:\n%s", fpr.gotArgs.Body)
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush args not captured")
+	}
+	if !strings.Contains(fp.gotArgs.CommitMessage, "fresh re-landed body") || strings.Contains(fp.gotArgs.CommitMessage, "stale first-pass body") {
+		t.Errorf("commit message must be the fresh sidecar, got %q", fp.gotArgs.CommitMessage)
+	}
+}
+
+// TestAgentHandoff_ArmedNoConflictUnchanged pins the byte-identical criterion
+// for the ordinary (no-conflict) SINGLE-pass path: an ARMED memo must be
+// indistinguishable from a nil one across every handoff shape. The memo only
+// ever changes a SECOND read, so a single pass must produce exactly the same
+// (title, body, agentAuthored, reason) and commit message either way.
+func TestAgentHandoff_ArmedNoConflictUnchanged(t *testing.T) {
+	cases := []struct {
+		name    string
+		handoff string // "" means write no file at all
+		sidecar string
+	}{
+		{"agent authored", "feat(x): agent title\n\n## Summary\n\nbody\n\nCloses #1\n", "feat(x): agent title\n\nsidecar body\n"},
+		{"handoff absent", "", ""},
+		{"empty title", "\n\nbody only\n", ""},
+		{"title only", "feat(x): title only\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := config{
+				runID:      "11111111-2222-3333-4444-555555555555",
+				stageID:    "22222222-3333-4444-5555-666666666666",
+				backendURL: "https://api.fishhawk.test",
+			}
+			type outcome struct {
+				title, body   string
+				agentAuthored bool
+				reason        prBodyReason
+				commitMessage string
+			}
+			// Each read CONSUMES the files, so seed them fresh for each arm.
+			seedAndRun := func(memo *agentHandoff) outcome {
+				prPath, cmPath := withAgentHandoffPaths(t, base.runID, base.stageID)
+				if tc.handoff != "" {
+					if err := os.WriteFile(prPath, []byte(tc.handoff), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.sidecar != "" {
+					if err := os.WriteFile(cmPath, []byte(tc.sidecar), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg := base
+				cfg.handoff = memo
+				var sink strings.Builder
+				title, body, agentAuthored, reason := prTitleAndBodyParts(cfg, "branch-x", &sink)
+				return outcome{title, body, agentAuthored, reason, implementCommitMessage(cfg, title, body, &sink)}
+			}
+			nilMemo := seedAndRun(nil)
+			armed := seedAndRun(&agentHandoff{})
+			if nilMemo != armed {
+				t.Errorf("armed memo changed the FIRST-pass outcome:\n nil   = %+v\n armed = %+v", nilMemo, armed)
+			}
+		})
+	}
+}
+
+// TestAgentHandoff_LoadOrReplay is the direct unit table on the memo's three
+// rules, for BOTH handoffs: a successful read stores and returns; a second call
+// with the file already consumed REPLAYS; a first-call MISS followed by a
+// now-present file takes the FRESH value (no poisoning — the store-only-on-
+// success guard, rule b); and a nil receiver is a pure load that stores nothing.
+func TestAgentHandoff_LoadOrReplay(t *testing.T) {
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}
+	const prText = "feat(x): memo title\n\n## Summary\n\nmemo body\n"
+	const cmText = "feat(x): memo title\n\nmemo commit body\n"
+
+	t.Run("pr stores then replays", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		title, body, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Fatalf("fresh read = (%q, %q, %v, %q), want the agent capture", title, body, kind, reason)
+		}
+		// The loader deleted the file; the second call must replay.
+		title2, body2, kind2, reason2 := h.pullRequest(cfg, &sink)
+		if kind2 != prSourceAgent || title2 != title || body2 != body {
+			t.Errorf("replay = (%q, %q, %v), want the stored capture", title2, body2, kind2)
+		}
+		if reason2 != prBodyReasonNone {
+			t.Errorf("replayed reason = %q, want none (a non-IsNotExist read error would surface handoff_unreadable)", reason2)
+		}
+	})
+
+	t.Run("pr miss does not poison", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, kind, reason := h.pullRequest(cfg, &sink); kind != prSourceFallback || reason != prBodyReasonHandoffAbsent {
+			t.Fatalf("first (absent) read = (%v, %q), want fallback/handoff_absent", kind, reason)
+		}
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		title, _, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Errorf("a cached MISS suppressed the now-present handoff: got (%q, %v, %q)", title, kind, reason)
+		}
+	})
+
+	t.Run("pr nil receiver is a pure load", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var h *agentHandoff
+		var sink strings.Builder
+		if _, _, kind, _ := h.pullRequest(cfg, &sink); kind != prSourceAgent {
+			t.Fatalf("nil receiver first read = %v, want prSourceAgent", kind)
+		}
+		if _, _, kind, reason := h.pullRequest(cfg, &sink); kind != prSourceFallback || reason != prBodyReasonHandoffAbsent {
+			t.Errorf("a nil receiver must store nothing, got (%v, %q)", kind, reason)
+		}
+		if strings.Contains(sink.String(), "pr_description_replayed") {
+			t.Errorf("a nil receiver must never replay:\n%s", sink.String())
+		}
+	})
+
+	t.Run("commitmsg stores then replays", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		subject, body, ok := h.commitMessage(cfg, &sink)
+		if !ok || subject != "feat(x): memo title" || body != "memo commit body" {
+			t.Fatalf("fresh read = (%q, %q, %t), want the sidecar capture", subject, body, ok)
+		}
+		subject2, body2, ok2 := h.commitMessage(cfg, &sink)
+		if !ok2 || subject2 != subject || body2 != body {
+			t.Errorf("replay = (%q, %q, %t), want the stored capture", subject2, body2, ok2)
+		}
+	})
+
+	t.Run("commitmsg miss does not poison", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, ok := h.commitMessage(cfg, &sink); ok {
+			t.Fatal("first (absent) read must be ok=false")
+		}
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if subject, _, ok := h.commitMessage(cfg, &sink); !ok || subject != "feat(x): memo title" {
+			t.Errorf("a cached MISS suppressed the now-present sidecar: got (%q, %t)", subject, ok)
+		}
+	})
+
+	t.Run("commitmsg nil receiver is a pure load", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var h *agentHandoff
+		var sink strings.Builder
+		if _, _, ok := h.commitMessage(cfg, &sink); !ok {
+			t.Fatal("nil receiver first read must succeed")
+		}
+		if _, _, ok := h.commitMessage(cfg, &sink); ok {
+			t.Error("a nil receiver must store nothing")
+		}
+		if strings.Contains(sink.String(), "implement_commitmsg_replayed") {
+			t.Errorf("a nil receiver must never replay:\n%s", sink.String())
+		}
+	})
+}
+
+// TestAgentHandoff_ReplayEmitsEvent pins the observability rule (c): a replayed
+// pass emits pr_description_replayed / implement_commitmsg_replayed carrying
+// run_id + stage_id — the runner log being the only place this failure is
+// observable at all.
+//
+// It ALSO pins #2840 binding condition 1: a replayed pass must NOT emit a
+// spurious pr_body_not_composed reason=handoff_absent just before the replay.
+// That holds by construction — prTitleAndBodyParts is pure (#3012) and
+// emitPRBodyNotComposed is keyed off the RETURNED reason, which a replay resolves
+// to none — but it is a property inherited from someone else's design, so it is
+// asserted here rather than assumed.
+func TestAgentHandoff_ReplayEmitsEvent(t *testing.T) {
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}
+	prPath, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+	if err := os.WriteFile(prPath, []byte("feat(x): title\n\n## Summary\n\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cmPath, []byte("feat(x): title\n\ncommit body\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &agentHandoff{}
+	cfg.handoff = h
+	var first strings.Builder
+	title, body, _, reason := prTitleAndBodyParts(cfg, "branch-x", &first)
+	_ = implementCommitMessage(cfg, title, body, &first)
+	if reason != prBodyReasonNone {
+		t.Fatalf("capture pass reason = %q, want none", reason)
+	}
+
+	var replay strings.Builder
+	title2, body2, _, reason2 := prTitleAndBodyParts(cfg, "branch-x", &replay)
+	_ = implementCommitMessage(cfg, title2, body2, &replay)
+	// The call site's #3012 emit is keyed off the RETURNED reason; mirror it
+	// here so the assertion below covers the real decision, not just the memo.
+	if reason2 != prBodyReasonNone {
+		emitPRBodyNotComposed(&replay, cfg, reason2, prPath)
+	}
+	logs := replay.String()
+	for _, want := range []string{
+		`"event":"pr_description_replayed"`,
+		`"event":"implement_commitmsg_replayed"`,
+		`"run_id":"` + cfg.runID + `"`,
+		`"stage_id":"` + cfg.stageID + `"`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("replay log missing %s:\n%s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("a replayed pass recovered its text; it must never be recorded as a composition failure:\n%s", logs)
+	}
+}
+
+// TestBaseRebaseConflictPrompt_ReRequestsHandoffs pins the option-3 half
+// (#2840): the re-invoke prompt names BOTH absolute keyed handoff paths, built
+// from cfg via the runner's own path helpers so the prompt can never name a path
+// the runner does not read, and says the previous attempt's handoffs were
+// consumed. The pre-existing conflict-context assertions are unchanged.
+func TestBaseRebaseConflictPrompt_ReRequestsHandoffs(t *testing.T) {
+	cfg := config{
+		runID:   "11111111-2222-3333-4444-555555555555",
+		stageID: "22222222-3333-4444-5555-666666666666",
+	}
+	withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+	detail := &gitops.BaseRebaseConflictError{
+		ConflictPaths: []string{"registry.txt"},
+		StashPatch:    "+child-two addition",
+	}
+	got := baseRebaseConflictPrompt(cfg, detail)
+	for _, want := range []string{
+		pullRequestDescriptionPath(cfg.runID, cfg.stageID),
+		implementCommitMessagePath(cfg.runID, cfg.stageID),
+		"CONSUMED",
+		"Closes #N",
+		// Unchanged conflict context.
+		"registry.txt",
+		"+child-two addition",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prompt missing %q:\n%s", want, got)
+		}
+	}
+	// A nil detail still re-requests the handoffs (the prompt only omits the
+	// conflict-context sections).
+	nilDetail := baseRebaseConflictPrompt(cfg, nil)
+	if !strings.Contains(nilDetail, pullRequestDescriptionPath(cfg.runID, cfg.stageID)) {
+		t.Errorf("nil-detail prompt must still re-request the PR description:\n%s", nilDetail)
+	}
+	if strings.Contains(nilDetail, "registry.txt") {
+		t.Errorf("nil-detail prompt must omit the conflict context:\n%s", nilDetail)
+	}
+}
