@@ -43,6 +43,14 @@ var (
 	fixupStrandedReflog  = reflogStrandedCommits
 	fixupReflogCommits   = gitReflogCommits
 	fixupRemoteBranchTip = gitops.RemoteBranchTipURL
+	// fixupBaseTreeOf resolves the fix-up base tip to its tree object hash, the
+	// witness probe 4 (verifiedFixupWorkStranded) compares the verify gate's
+	// certified tree against. Seamed for the same reason as the others: the
+	// fake-pusher run() tests default repoDir to "." (the runner's own source
+	// repo), so no probe may touch a real repo unseamed. gitRevParseTreeOf
+	// already exists in main.go (~5516); this is only an alias, not a second
+	// implementation.
+	fixupBaseTreeOf = gitRevParseTreeOf
 )
 
 // gitStashList returns the stash stack as {SHA, Subject} entries, newest first,
@@ -143,22 +151,85 @@ func reflogStrandedCommits(ctx context.Context, repoDir, baseTipSHA string, preR
 	return stranded, nil
 }
 
+// verifiedFixupWorkStranded is probe 4 (#3022): the "did this pass's work reach
+// the branch" detector. It is the instrument for the incident's OWN shape — a
+// fix-up that commits its work, resets back to the base tip, leaves NO stash and
+// reports NO changes — which probes 1-3 all miss (no net-new stash, HEAD back at
+// the base tip, and the dangling `fishhawk verify wip` commit is already in the
+// pre-pass reflog snapshot, so probe 3 skips it: the snapshot is captured in
+// openPRAndShipArtifact AFTER runVerifyFixLoop has already committed and unwound
+// its throwaway commit).
+//
+// The instrument is deliberately NOT commit creation and NOT the reflog. It is
+// the runner's OWN verify witness: the committed-tree verify gate
+// (runVerifyFixLoop / runVerifyGateCommitted) records verifiedTreeSHA — the tree
+// object hash of the scope-only throwaway commit it certified. If that certified
+// tree differs from the tree of the fix-up base tip yet CommitAndPush reports
+// NoChanges, the pass verifiably HAD in-scope work at verify time that is now on
+// neither the working tree nor the branch: its work did not reach the branch.
+//
+// It cannot false-fire on the verify gate's normal `fishhawk verify wip`
+// residue, because a HEALTHY pass never reaches the no-changes branch at all:
+// after gitResetSoftHEAD1 the gate leaves its edits staged in the working tree,
+// so CommitAndPush commits and pushes them and NoChanges is never returned. And
+// a genuinely-no-work pass carries an EMPTY verifiedTreeSHA (commitVerifyWIP
+// makes no commit when nothing is staged), which this probe treats as no witness
+// and never flags.
+//
+// Semantics, in order:
+//
+//	(a) verifiedTreeSHA == "" -> ("", nil): no verify witness for this pass
+//	    (verify unconfigured, skipped, budget exhausted, or nothing staged) — the
+//	    probe abstains rather than guessing.
+//	(b) baseTipSHA == "" -> ("", nil): no base to compare against; the
+//	    fixup_base_tip_unresolved log already records that degrade.
+//	(c) a base-tree resolve failure -> ("", err): fail CLOSED (category C at the
+//	    caller) rather than fall through to a clean verdict.
+//	(d) verifiedTreeSHA == baseTree -> ("", nil): the certified tree is
+//	    byte-identical to the branch tip, so the pass produced no in-scope work.
+//	(e) otherwise -> a reason naming both trees and the base tip.
+func verifiedFixupWorkStranded(ctx context.Context, repoDir, baseTipSHA, verifiedTreeSHA string) (reason string, err error) {
+	if verifiedTreeSHA == "" {
+		return "", nil
+	}
+	if baseTipSHA == "" {
+		return "", nil
+	}
+	baseTree, terr := fixupBaseTreeOf(ctx, repoDir, baseTipSHA)
+	if terr != nil {
+		return "", fmt.Errorf("resolving base tip tree of %s: %w", baseTipSHA, terr)
+	}
+	if verifiedTreeSHA == baseTree {
+		return "", nil
+	}
+	return fmt.Sprintf("verified work did not reach the branch: the committed-tree verify gate certified tree %s but the pass reports no changes and the base tip %s still carries tree %s — the pass's in-scope work is on neither the working tree nor the branch",
+		verifiedTreeSHA, baseTipSHA, baseTree), nil
+}
+
 // strandedFixupWork returns one human-readable reason per detected stranding of
-// a fix-up pass that is about to report fixup_no_changes (#2884). It runs three
-// probes, all fail-closed (a probe error returns a non-nil err so the caller
-// fails category-C rather than falling through to a success report):
+// a fix-up pass that is about to report fixup_no_changes (#2884, #3022). It runs
+// four probes, all fail-closed (a probe error returns a non-nil err so the
+// caller fails category-C rather than falling through to a success report):
 //
 //  1. a net-new stash entry — present now, absent from the pre-pass snapshot.
 //     A stash is never a valid terminal fix-up artifact; the pre-pass snapshot
 //     comparison keeps a pre-existing operator stash from being flagged.
 //  2. a local HEAD that advanced past the base tip in unpushed commits.
 //  3. a dangling commit created during the pass, reachable from neither the
-//     base tip nor the branch (reflogStrandedCommits) — the incident shape that
-//     probes 1 and 2 miss.
+//     base tip nor the branch (reflogStrandedCommits).
+//  4. verified work that did not reach the branch (verifiedFixupWorkStranded):
+//     the verify gate certified a non-base tree yet the pass reports no changes.
+//
+// Probe 4, NOT probe 3, is the instrument for the commit-reset-no-stash-
+// no-changes shape (#3022). Probe 3's pre-pass reflog snapshot is captured AFTER
+// the verify gate has already committed and unwound its throwaway commit, so
+// that `fishhawk verify wip` commit is in probe 3's baseline and is skipped;
+// probe 4 anchors to the gate's certified-tree witness instead, which no
+// snapshot ordering can blind.
 //
 // An empty reasons slice with a nil err means the pass is genuinely clean and
 // fixup_no_changes may proceed.
-func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash, preReflog []stashEntry) (reasons []string, err error) {
+func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash, preReflog []stashEntry, verifiedTreeSHA string) (reasons []string, err error) {
 	currentStash, serr := fixupStashList(ctx, repoDir)
 	if serr != nil {
 		return nil, fmt.Errorf("stash probe: %w", serr)
@@ -187,6 +258,14 @@ func strandedFixupWork(ctx context.Context, repoDir, baseTipSHA string, preStash
 	}
 	for _, e := range dangling {
 		reasons = append(reasons, fmt.Sprintf("dangling commit %s (%s) created during the pass, on no branch and not reachable from the base tip", e.SHA, e.Subject))
+	}
+
+	verifiedReason, verr := verifiedFixupWorkStranded(ctx, repoDir, baseTipSHA, verifiedTreeSHA)
+	if verr != nil {
+		return nil, fmt.Errorf("verified-tree probe: %w", verr)
+	}
+	if verifiedReason != "" {
+		reasons = append(reasons, verifiedReason)
 	}
 
 	return reasons, nil

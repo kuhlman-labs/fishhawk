@@ -7065,6 +7065,11 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// stranded-work check can tell the pass's OWN residue (a net-new stash, an
 	// advanced HEAD, a dangling commit) from pre-existing state. Left zero-valued
 	// off the isFixup path.
+	//
+	// #3022: probe 4's witness is NOT one of these snapshots — it is the verify
+	// gate's certified verifiedTreeSHA (threaded in as a parameter), compared
+	// against the base tip's tree. So probe 4 is unaffected by fixupSnapshotErr
+	// and closes the exact shape probe 3's post-gate snapshot ordering misses.
 	var (
 		fixupBaseTipSHA  string
 		fixupPreStash    []stashEntry
@@ -7704,7 +7709,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				return fmt.Errorf("%w: fix-up pre-push snapshot unavailable, cannot prove work landed: %v",
 					gitops.ErrVerifyInfraFailure, fixupSnapshotErr)
 			}
-			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, fixupPreReflog)
+			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, fixupPreReflog, verifiedTreeSHA)
 			if sErr != nil {
 				// A probe failure is infrastructure (category C): re-run in place
 				// rather than silently reporting success over unproven work.
@@ -7715,8 +7720,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				localHead, _ := fixupLocalHead(ctx, repoDir)
 				reasonsJSON, _ := json.Marshal(reasons)
 				_, _ = fmt.Fprintf(logSink,
-					`{"event":"fixup_work_stranded","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q,"reasons":%s}`+"\n",
-					cfg.runID, cfg.stageID, branch, fixupBaseTipSHA, localHead, reasonsJSON)
+					`{"event":"fixup_work_stranded","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q,"verified_tree_sha":%q,"reasons":%s}`+"\n",
+					cfg.runID, cfg.stageID, branch, fixupBaseTipSHA, localHead, verifiedTreeSHA, reasonsJSON)
 				return fmt.Errorf("%w: %s", gitops.ErrFixupWorkStranded, strings.Join(reasons, "; "))
 			}
 			_, _ = fmt.Fprintf(logSink,

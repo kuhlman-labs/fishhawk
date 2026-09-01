@@ -187,7 +187,7 @@ func TestStrandedFixupWork_NetNewStashOnly(t *testing.T) {
 		func(context.Context, string) (string, error) { return "base", nil },
 		cleanReflog,
 	)
-	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil)
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestStrandedFixupWork_AdvancedHeadOnly(t *testing.T) {
 		func(context.Context, string) (string, error) { return "advancedhead", nil },
 		cleanReflog,
 	)
-	reasons, err := strandedFixupWork(context.Background(), ".", "basetip", nil, nil)
+	reasons, err := strandedFixupWork(context.Background(), ".", "basetip", nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestStrandedFixupWork_DanglingCommitOnly(t *testing.T) {
 			return []stashEntry{{SHA: "danglingsha0000000000000000000000000000", Subject: "fishhawk verify wip"}}, nil
 		},
 	)
-	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil)
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestStrandedFixupWork_AllThreeModes(t *testing.T) {
 			return []stashEntry{{SHA: "danglingsha", Subject: "verify wip"}}, nil
 		},
 	)
-	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil)
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestStrandedFixupWork_CleanReportsNothing(t *testing.T) {
 		func(context.Context, string) (string, error) { return "base", nil },
 		cleanReflog,
 	)
-	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil)
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -269,9 +269,192 @@ func TestStrandedFixupWork_ProbeErrorPropagates(t *testing.T) {
 		func(context.Context, string) (string, error) { return "base", nil },
 		cleanReflog,
 	)
-	_, err := strandedFixupWork(context.Background(), ".", "base", nil, nil)
+	_, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "")
 	if err == nil || !errors.Is(err, sentinel) {
 		t.Fatalf("want the probe error propagated, got %v", err)
+	}
+}
+
+// --- verifiedFixupWorkStranded (probe 4, #3022) --------------------------
+
+// withFixupBaseTree swaps the probe-4 base-tree seam, restoring on cleanup.
+func withFixupBaseTree(t *testing.T, fn func(context.Context, string, string) (string, error)) {
+	t.Helper()
+	orig := fixupBaseTreeOf
+	fixupBaseTreeOf = fn
+	t.Cleanup(func() { fixupBaseTreeOf = orig })
+}
+
+// TestVerifiedFixupWorkStranded_CommitResetNoStashNoChanges reproduces the
+// #3022 incident shape BY CONSTRUCTION in a REAL temp repo: on the base tip,
+// write an edit, `git add`, `git commit` (the throwaway shape), capture that
+// commit's tree, then `git reset --hard` back to the base tip so NO stash
+// exists and HEAD equals the base tip. The verify gate's certified tree
+// (the captured commit tree) then differs from the base tip's tree, so the
+// probe must fire naming both tree hashes.
+func TestVerifiedFixupWorkStranded_CommitResetNoStashNoChanges(t *testing.T) {
+	dir, baseTip := fixuplandRepo(t)
+	baseTree := fixuplandGit(t, dir, "rev-parse", baseTip+"^{tree}")
+
+	// The pass: commit in-scope work, capture its tree, then hard-reset it away.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("verified fix work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fixuplandGit(t, dir, "add", "-A")
+	fixuplandGit(t, dir, "commit", "-m", "fishhawk verify wip")
+	verifiedTree := fixuplandGit(t, dir, "rev-parse", "HEAD^{tree}")
+	fixuplandGit(t, dir, "reset", "--hard", baseTip)
+
+	// Positively assert the incident shape: HEAD at the base tip, clean working
+	// tree, NO stash — the state probes 1 and 3 read as clean.
+	if head := fixuplandGit(t, dir, "rev-parse", "HEAD"); head != baseTip {
+		t.Fatalf("setup: HEAD should be the base tip, got %q want %q", head, baseTip)
+	}
+	if status := fixuplandGit(t, dir, "status", "--porcelain"); status != "" {
+		t.Fatalf("setup: working tree must be clean, got %q", status)
+	}
+	if stash := fixuplandGit(t, dir, "stash", "list"); stash != "" {
+		t.Fatalf("setup: no stash must exist, got %q", stash)
+	}
+	if verifiedTree == baseTree {
+		t.Fatalf("setup: the verified tree must differ from the base tree (got both %q)", baseTree)
+	}
+
+	reason, err := verifiedFixupWorkStranded(context.Background(), dir, baseTip, verifiedTree)
+	if err != nil {
+		t.Fatalf("verifiedFixupWorkStranded: %v", err)
+	}
+	if reason == "" {
+		t.Fatal("probe must fire: verified work is on neither the working tree nor the branch")
+	}
+	if !strings.Contains(reason, verifiedTree) || !strings.Contains(reason, baseTree) {
+		t.Errorf("reason must name both the certified tree and the base tree, got: %q", reason)
+	}
+}
+
+// TestVerifiedFixupWorkStranded_EmptyWitnessAbstains: an empty verifiedTreeSHA
+// (no verify gate ran / nothing staged) returns no reason and no error, and
+// never touches the repo.
+func TestVerifiedFixupWorkStranded_EmptyWitnessAbstains(t *testing.T) {
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		t.Fatal("base-tree resolve must not be called when the witness is empty")
+		return "", nil
+	})
+	reason, err := verifiedFixupWorkStranded(context.Background(), ".", "basetip", "")
+	if err != nil || reason != "" {
+		t.Fatalf("empty witness must abstain, got reason=%q err=%v", reason, err)
+	}
+}
+
+// TestVerifiedFixupWorkStranded_EmptyBaseTipAbstains: no base tip to compare
+// against abstains (the fixup_base_tip_unresolved log already records it).
+func TestVerifiedFixupWorkStranded_EmptyBaseTipAbstains(t *testing.T) {
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		t.Fatal("base-tree resolve must not be called when the base tip is empty")
+		return "", nil
+	})
+	reason, err := verifiedFixupWorkStranded(context.Background(), ".", "", "verifiedtree")
+	if err != nil || reason != "" {
+		t.Fatalf("empty base tip must abstain, got reason=%q err=%v", reason, err)
+	}
+}
+
+// TestVerifiedFixupWorkStranded_TreeEqualsBaseIsClean: the certified tree is
+// byte-identical to the base tip's tree, so the pass produced no in-scope work
+// and the probe abstains.
+func TestVerifiedFixupWorkStranded_TreeEqualsBaseIsClean(t *testing.T) {
+	dir, baseTip := fixuplandRepo(t)
+	baseTree := fixuplandGit(t, dir, "rev-parse", baseTip+"^{tree}")
+	reason, err := verifiedFixupWorkStranded(context.Background(), dir, baseTip, baseTree)
+	if err != nil {
+		t.Fatalf("verifiedFixupWorkStranded: %v", err)
+	}
+	if reason != "" {
+		t.Errorf("a tree equal to the base tree must abstain, got: %q", reason)
+	}
+}
+
+// TestVerifiedFixupWorkStranded_BaseTreeResolveErrorFailsClosed: an unresolvable
+// base tree FAILS CLOSED with the error propagated, never a silent clean verdict.
+func TestVerifiedFixupWorkStranded_BaseTreeResolveErrorFailsClosed(t *testing.T) {
+	sentinel := errors.New("rev-parse: bad object")
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		return "", sentinel
+	})
+	reason, err := verifiedFixupWorkStranded(context.Background(), ".", "basetip", "verifiedtree")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("a base-tree resolve failure must propagate (never a clean verdict), got reason=%q err=%v", reason, err)
+	}
+	if reason != "" {
+		t.Errorf("no reason must be returned on the fail-closed path, got: %q", reason)
+	}
+}
+
+// TestStrandedFixupWork_VerifiedTreeStrandedOnly proves probe 4 fires
+// INDEPENDENTLY of probes 1-3: a clean stash/HEAD/reflog with a certified tree
+// that differs from the base tree yields exactly ONE reason.
+func TestStrandedFixupWork_VerifiedTreeStrandedOnly(t *testing.T) {
+	withFixupSeams(t,
+		func(context.Context, string) ([]stashEntry, error) { return nil, nil },
+		func(context.Context, string) (string, error) { return "base", nil },
+		cleanReflog,
+	)
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		return "basetree", nil
+	})
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "verifiedtree")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "verifiedtree") || !strings.Contains(reasons[0], "basetree") {
+		t.Fatalf("want exactly one probe-4 reason naming both trees, got %v", reasons)
+	}
+}
+
+// TestStrandedFixupWork_VerifiedTreeEqualsBaseReportsNothing: the clean path
+// with a base-EQUAL certified tree still reports zero reasons.
+func TestStrandedFixupWork_VerifiedTreeEqualsBaseReportsNothing(t *testing.T) {
+	withFixupSeams(t,
+		func(context.Context, string) ([]stashEntry, error) { return nil, nil },
+		func(context.Context, string) (string, error) { return "base", nil },
+		cleanReflog,
+	)
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		return "basetree", nil
+	})
+	reasons, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "basetree")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(reasons) != 0 {
+		t.Fatalf("a base-equal certified tree must report no reasons, got %v", reasons)
+	}
+}
+
+// TestStrandedFixupWork_VerifiedTreeProbeErrorPropagates is the probe-4 analogue
+// of TestStrandedFixupWork_ProbeErrorPropagates (#3022 review, untested-path): a
+// fixupBaseTreeOf seam failure must propagate THROUGH strandedFixupWork wrapped
+// as "verified-tree probe:", so the category-C fail-closed path is pinned at the
+// call-site boundary (not only at the helper level in
+// TestVerifiedFixupWorkStranded_BaseTreeResolveErrorFailsClosed). Probes 1-3 read
+// clean and the witness/base-tip are non-empty, so probe 4 is the sole error
+// source.
+func TestStrandedFixupWork_VerifiedTreeProbeErrorPropagates(t *testing.T) {
+	sentinel := errors.New("rev-parse: bad object")
+	withFixupSeams(t,
+		func(context.Context, string) ([]stashEntry, error) { return nil, nil },
+		func(context.Context, string) (string, error) { return "base", nil },
+		cleanReflog,
+	)
+	withFixupBaseTree(t, func(context.Context, string, string) (string, error) {
+		return "", sentinel
+	})
+	_, err := strandedFixupWork(context.Background(), ".", "base", nil, nil, "verifiedtree")
+	if err == nil || !errors.Is(err, sentinel) {
+		t.Fatalf("want the probe-4 error propagated from the call site, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "verified-tree probe:") {
+		t.Errorf("want the caller's verified-tree probe wrap, got %v", err)
 	}
 }
 

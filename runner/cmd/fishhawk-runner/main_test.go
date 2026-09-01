@@ -3564,6 +3564,13 @@ type fakePusher struct {
 	// calls counts CommitAndPush invocations so tests can assert the retry
 	// is bounded.
 	calls int
+
+	// onCommit, when set, runs at the top of CommitAndPush with the args. The
+	// #3022 incident-reproduction test (M8) uses it to actually REMOVE the
+	// verified work from args.RepoDir (the relocated worktree) — modelling a
+	// pass that committed, reset and reported no changes — and to positively
+	// assert the resulting clean state before the no-changes path evaluates.
+	onCommit func(args gitops.CommitAndPushArgs)
 }
 
 func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error) {
@@ -3571,6 +3578,9 @@ func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushA
 	f.gotArgs = &a
 	idx := f.calls
 	f.calls++
+	if f.onCommit != nil {
+		f.onCommit(args)
+	}
 	if len(f.errSeq) > 0 {
 		if idx >= len(f.errSeq) {
 			idx = len(f.errSeq) - 1
@@ -8620,6 +8630,218 @@ func TestRun_Fixup_RemoteTipMatches_ReportsFixupPushed(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
 		t.Errorf("missing implement_fixup_pushed log:\n%s", stderr.String())
+	}
+}
+
+// fixupVerifyLandingPrompt is the shared fix-up prompt for the #3022 probe-4
+// tests: a real fix-up (Fixup + FixupBranch) with a verify command and ONE
+// in-scope file, so the REAL committed-tree verify gate produces verifiedTreeSHA
+// from production code rather than an injected value.
+func fixupVerifyLandingPrompt() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		Fixup:               true,
+		FixupBranch:         "fishhawk/run-11111111/stage-22222222",
+		VerifyCommand:       "true",
+		VerifyMaxIterations: 0,
+		ScopeFiles:          []upload.ScopeFile{{Path: "mod/reg.go", Operation: "create"}},
+	}
+}
+
+// M8 (#3022, blocking condition 2 — the incident shape end to end): a fix-up
+// that COMMITS its work, whose committed-tree verify gate certifies a non-base
+// tree (verifiedTreeSHA), then has that work REMOVED so it is absent from BOTH
+// the working tree AND the branch — a clean working tree, HEAD at the base tip,
+// NO stash — and reports NO changes. The stage MUST fail category-B with the
+// verified-tree-stranded reason. This is the property no earlier probe closes
+// and the false-assurance class this issue exists to prevent.
+//
+// The verify gate is REAL (--verify-cmd true runs runVerifyGateCommitted, which
+// stages the in-scope edit, throwaway-commits it, certifies its tree, and
+// soft-resets), so verifiedTreeSHA is produced by production code. The fake
+// pusher's onCommit hook then models the incident's residue: it hard-resets +
+// cleans the relocated worktree back to its base tip and positively asserts the
+// clean state before returning NoChanges.
+func TestRun_Fixup_NoChanges_VerifiedWorkVanished_FailsCategoryB(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect the agent edit into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			// The agent's in-scope work: a new scope file, so the committed
+			// scope-only tree the gate certifies differs from the base tree.
+			mustWrite(t, regPath, "package mod\n\n// verified fix work\n")
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	// Capture the fix-up base tip INDEPENDENTLY, before run() (and thus before the
+	// verify gate's throwaway commit + unwind), so the onCommit assertion below has
+	// a ground-truth base tip that a regressed unwind cannot move. Reading it from
+	// the post-gate worktree HEAD (the pre-#3022-review headBefore) would pass even
+	// if gitResetSoftHEAD1 left HEAD advanced, because headBefore would then BE the
+	// advanced value. The relocated worktree is a checkout of repo at this tip.
+	baseTip := gitHead(t, repo)
+
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fp.onCommit = func(args gitops.CommitAndPushArgs) {
+		// Remove the verified work so it is absent from the working tree AND the
+		// branch, modelling the incident: commit → reset → no stash → no changes.
+		rd := args.RepoDir
+		fixuplandGit(t, rd, "reset", "--hard", "HEAD")
+		fixuplandGit(t, rd, "clean", "-fdx")
+		// Positively assert the incident shape BEFORE the no-changes path runs:
+		// HEAD at the fix-up base tip (asserted against the independently-captured
+		// base SHA, not the post-gate HEAD, so a regressed verify-gate unwind that
+		// left HEAD advanced would FAIL here), clean working tree, no stash entry.
+		if head := fixuplandGit(t, rd, "rev-parse", "HEAD"); head != baseTip {
+			t.Errorf("HEAD must be at the fix-up base tip, got %q want %q", head, baseTip)
+		}
+		if s := fixuplandGit(t, rd, "status", "--porcelain"); s != "" {
+			t.Errorf("working tree must be clean before the no-changes path, got %q", s)
+		}
+		if st := fixuplandGit(t, rd, "stash", "list"); st != "" {
+			t.Errorf("no stash entry must exist, got %q", st)
+		}
+	}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Error("must NOT report fixup_no_changes when the verified work vanished")
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) ||
+		!strings.Contains(stderr.String(), "verified work did not reach the branch") ||
+		!strings.Contains(stderr.String(), `"verified_tree_sha"`) {
+		t.Errorf("fixup_work_stranded log must name the certified tree and the probe-4 reason:\n%s", stderr.String())
+	}
+}
+
+// M9 (#3022, blocking condition 3 — no false positive on healthy verify
+// residue): the SAME real verify gate really does create and unwind a
+// `fishhawk verify wip` commit, but the pass then pushes normally. A healthy
+// pass never reaches the no-changes branch (its edits stay in the working tree,
+// so CommitAndPush commits and pushes them), so probe 4 is never evaluated: the
+// stage reports fixup_pushed and exits OK.
+func TestRun_Fixup_HealthyVerifyResidue_NoFalsePositive(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			mustWrite(t, regPath, "package mod\n\n// verified fix work\n")
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	// Default fakePusher: a real push (NoChanges false, HeadSHA "head-sha-abc");
+	// withFakeGitOps's remote-tip stub echoes that head, so the push lands.
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Fatalf("report = %+v, want fixup_pushed", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
+		t.Errorf("probe 4 must NOT fire on a healthy pass with normal verify residue:\n%s", stderr.String())
+	}
+	// Load-bearing anti-vacuity assertion (#3022 review, test_vacuity): prove the
+	// REAL committed-tree verify gate actually created, certified, AND unwound its
+	// throwaway `fishhawk verify wip` commit — otherwise this "no false positive"
+	// test would pass even if verification were skipped entirely (the fake pusher
+	// takes the push branch, where probe 4 is never evaluated). The gate records a
+	// NON-EMPTY verifiedTreeSHA only when commitVerifyWIP committed a non-empty
+	// staged tree AND gitResetSoftHEAD1 unwound it (a reset failure zeroes it, see
+	// runVerifyFixLoop). That witness is carried onto the implement_fixup_pushed
+	// event as verified_tree_sha, so a non-empty value here is proof the healthy
+	// verify residue was really produced and unwound before the push path ran.
+	var pushedLine string
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.Contains(line, `"event":"implement_fixup_pushed"`) {
+			pushedLine = line
+		}
+	}
+	if pushedLine == "" {
+		t.Fatalf("no implement_fixup_pushed event to prove the verify gate ran:\n%s", stderr.String())
+	}
+	var pushed struct {
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+	}
+	if err := json.Unmarshal([]byte(pushedLine), &pushed); err != nil {
+		t.Fatalf("parse implement_fixup_pushed line: %v\n%s", err, pushedLine)
+	}
+	if pushed.VerifiedTreeSHA == "" {
+		t.Fatalf("implement_fixup_pushed.verified_tree_sha is empty: the committed-tree verify gate did not create+certify+unwind a throwaway commit, so this test is vacuous:\n%s", pushedLine)
+	}
+}
+
+// M10 (#3022 — the abstain branch): a fix-up that produces NO agent work stages
+// nothing, so commitVerifyWIP makes no throwaway commit and verifiedTreeSHA is
+// EMPTY. Probe 4 abstains on the empty witness, the other probes read clean, and
+// the pass reports fixup_no_changes at exit OK.
+func TestRun_Fixup_NoChanges_NoAgentWork_StillReportsNoChanges(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		// onInvoke writes nothing: no in-scope edit, so nothing is staged.
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_no_changes" {
+		t.Fatalf("report = %+v, want fixup_no_changes", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
+		t.Errorf("probe 4 must abstain on an empty witness (no agent work):\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Errorf("missing implement_fixup_no_changes log:\n%s", stderr.String())
 	}
 }
 
