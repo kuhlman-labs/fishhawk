@@ -26132,6 +26132,17 @@ func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText(t *testi
 	if !strings.Contains(stderr.String(), `"event":"implement_commitmsg_replayed"`) {
 		t.Errorf("expected implement_commitmsg_replayed in the log:\n%s", stderr.String())
 	}
+	// #2840 binding condition 1, pinned against the REAL call site rather than
+	// a test-local replica of it. Both openPRAndShipArtifact passes of this run
+	// resolve agent text — captured on pass 1, replayed on pass 2 — so the
+	// WHOLE stderr must be free of pr_body_not_composed. Asserting it here and
+	// not only in TestAgentHandoff_ReplayEmitsEvent matters: that unit test
+	// mirrors the call site's `if reason != none` decision itself, so it would
+	// still pass if the production emit were later re-keyed off something other
+	// than the returned reason. This assertion would not.
+	if strings.Contains(stderr.String(), "pr_body_not_composed") {
+		t.Errorf("both passes resolved agent text; neither may record a composition failure:\n%s", stderr.String())
+	}
 }
 
 // TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack
@@ -26342,6 +26353,73 @@ func TestAgentHandoff_LoadOrReplay(t *testing.T) {
 		}
 		if reason2 != prBodyReasonNone {
 			t.Errorf("replayed reason = %q, want none (a non-IsNotExist read error would surface handoff_unreadable)", reason2)
+		}
+	})
+
+	t.Run("pr title-only replays body_absent", func(t *testing.T) {
+		// Rule (b) stores ANY prSourceAgent capture, and a TITLE-ONLY handoff
+		// is one — it carries reason body_absent. So the replay returns that
+		// tuple verbatim and the real call site emits pr_body_not_composed
+		// reason=body_absent a SECOND time for the same stage, alongside
+		// pr_description_replayed. That double-emit is the DELIBERATE
+		// consequence of "marked exactly as the capturing pass marked it"
+		// (vocabulary reuse, #2840 binding condition 2) rather than an
+		// accident, so it is pinned here.
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte("feat(x): title only\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		title, body, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): title only" || body != "" || reason != prBodyReasonBodyAbsent {
+			t.Fatalf("capture = (%q, %q, %v, %q), want the title-only agent capture", title, body, kind, reason)
+		}
+		title2, body2, kind2, reason2 := h.pullRequest(cfg, &sink)
+		if kind2 != prSourceAgent || title2 != title || body2 != "" {
+			t.Errorf("replay = (%q, %q, %v), want the stored title-only capture", title2, body2, kind2)
+		}
+		if reason2 != prBodyReasonBodyAbsent {
+			t.Errorf("replayed reason = %q, want body_absent — the replayed pass must be marked exactly as the capturing pass was", reason2)
+		}
+		if !strings.Contains(sink.String(), `"event":"pr_description_replayed"`) {
+			t.Errorf("a title-only replay is still a replay and must say so:\n%s", sink.String())
+		}
+	})
+
+	t.Run("fresh malformed loses to stored", func(t *testing.T) {
+		// The (a)/(c) precedence for a FRESH-BUT-MALFORMED read: the re-invoked
+		// agent DID re-write the handoff but botched it (here an empty title
+		// line; handoff_unreadable behaves the same way). "Fresh wins" is
+		// scoped to fresh AGENT TEXT, so a malformed fresh read is a miss and
+		// the stored capture replays, discarding the fresh classification. The
+		// loader's own warning is what keeps that visible, so assert BOTH it
+		// and the replay event — the malformed write must not vanish from the
+		// trace just because the memo recovered.
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, kind, _ := h.pullRequest(cfg, &sink); kind != prSourceAgent {
+			t.Fatalf("capture pass = %v, want prSourceAgent", kind)
+		}
+		// The capture consumed the file; the "re-invoked agent" writes a
+		// malformed one in its place.
+		if err := os.WriteFile(prPath, []byte("\n\nbody with no title\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var replay strings.Builder
+		title, _, kind, reason := h.pullRequest(cfg, &replay)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Errorf("malformed fresh read = (%q, %v, %q), want the stored capture replayed", title, kind, reason)
+		}
+		if !strings.Contains(replay.String(), `"event":"pr_template_invalid"`) {
+			t.Errorf("the malformed fresh write must still be visible in the trace:\n%s", replay.String())
+		}
+		if !strings.Contains(replay.String(), `"event":"pr_description_replayed"`) {
+			t.Errorf("expected pr_description_replayed after the malformed fresh read:\n%s", replay.String())
 		}
 	})
 
