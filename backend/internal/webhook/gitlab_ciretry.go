@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -108,6 +109,59 @@ import (
 // — the first-stage default-ref case.
 const gitLabRunBranchNamespace = "fishhawk/run-"
 
+// gitLabMergeRequestRefPattern matches the two ref shapes a merge-request
+// pipeline is documented to present OUTSIDE the Pipeline Hook payload
+// (E45.30 / #2881):
+//
+//   - refs/merge-requests/<iid>/head — the DETACHED merge-request pipeline
+//     ref, the value of the CI_MERGE_REQUEST_REF_PATH predefined variable
+//     (https://docs.gitlab.com/ci/variables/predefined_variables/), and
+//   - refs/merge-requests/<iid>/merge — the MERGED-RESULTS pipeline ref
+//     (https://docs.gitlab.com/ci/pipelines/merged_results_pipelines/).
+//
+// BOTH shapes are INFERRED from that CI-variable / merged-results
+// documentation, NOT transcribed from a documented webhook example. The
+// documented Pipeline Hook payload carries object_attributes.ref as the MR's
+// TARGET BRANCH with source = "merge_request_event", so this ref arm may never
+// fire on a real Pipeline Hook. It is kept as defensive breadth — the cost is
+// one anchored regexp branch on a delivery that is already being skipped, and
+// the only effect is which reason string that skip carries. The SOURCE
+// discriminator below is the primary, documented signal.
+//
+// Anchored at both ends deliberately: an unanchored pattern would classify
+// refs/merge-requests/7/head/extra or a leading-garbage ref, widening a
+// classification whose whole purpose is to be more precise than the one it
+// replaces.
+var gitLabMergeRequestRefPattern = regexp.MustCompile(`^refs/merge-requests/[0-9]+/(head|merge)$`)
+
+// gitLabPipelineSourceMergeRequest is the object_attributes.source value
+// GitLab's documented Pipeline Hook carries for a merge-request pipeline
+// (https://docs.gitlab.com/user/project/integrations/webhook_events/).
+const gitLabPipelineSourceMergeRequest = "merge_request_event"
+
+// isGitLabMergeRequestPipeline reports whether a pipeline that is NOT on a run
+// branch is identifiably a merge-request pipeline (E45.30 / #2881).
+//
+// The OR is the point. Neither signal may be load-bearing alone: a delivery
+// carrying the source discriminator presents a plain target-branch ref, and a
+// delivery presenting a merge-request-shaped ref may carry no source at all.
+// Requiring both would leave each shape misclassified whenever the other
+// signal is absent.
+//
+// A non-zero MergeRequestIID is DELIBERATELY NOT a third signal. GitLab
+// attaches a merge_request block to a BRANCH pipeline that merely has an
+// associated open merge request, so treating the iid as sufficient would
+// reclassify ordinary default-ref first-stage pipelines as MR pipelines — the
+// exact mislabelling this predicate exists to fix, inverted. Pinned by the
+// "no source, non-zero iid -> false" row in TestIsGitLabMergeRequestPipeline.
+func isGitLabMergeRequestPipeline(pr *PipelineRef) bool {
+	if pr == nil {
+		return false
+	}
+	return pr.Source == gitLabPipelineSourceMergeRequest ||
+		gitLabMergeRequestRefPattern.MatchString(pr.Ref)
+}
+
 // ci_retry_skipped reasons. Each names a DISTINCT non-correlation so an
 // operator reading the audit can tell which one happened (BC1). They are
 // payload values, not categories: one category keeps the stream awaitable.
@@ -116,6 +170,17 @@ const (
 	// ran on a ref outside the run-branch namespace — the default ref a
 	// first-stage pipeline necessarily runs on.
 	gitLabRetrySkipFirstStageRef = "first_stage_pipeline_on_non_run_branch"
+	// gitLabRetrySkipMergeRequestRef is the same DEFERRAL as
+	// gitLabRetrySkipFirstStageRef, told truthfully for a merge-request
+	// pipeline (E45.30 / #2881). An MR pipeline's ref is the target branch (or,
+	// on other GitLab surfaces, refs/merge-requests/<iid>/{head,merge}), never a
+	// run branch, so it fell into the first-stage arm and drew a reason that
+	// asserts something affirmatively FALSE about it: it is neither the run's
+	// first pipeline nor a default-ref one. Under the #2860 principle the reason
+	// set exists to serve, a wrong reason is worse than a generic one — an
+	// operator debugging a missing retry reads "first stage on non-run branch",
+	// concludes the deferral was correct, and stops looking.
+	gitLabRetrySkipMergeRequestRef = "merge_request_pipeline_ref_not_a_run_branch"
 	// gitLabRetrySkipNoRunForRef means the ref IS a run branch but no
 	// candidate run in the narrowed set owns it (a run from another project
 	// view, or one aged out of the candidate window).
@@ -236,8 +301,14 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 	// default-ref pipeline belongs to no run by definition, so there is no
 	// run it could honestly be attributed to.
 	if !strings.HasPrefix(pr.Ref, gitLabRunBranchNamespace) {
-		d.writeGitLabRetrySkippedAudit(ctx, ev, nil, pr,
-			gitLabRetrySkipFirstStageRef, now)
+		// The DEFERRAL is unchanged; only the reason is selected. A pipeline
+		// identifiable as a merge-request pipeline is not the first-stage case,
+		// and saying so would be affirmatively wrong (E45.30 / #2881).
+		reason := gitLabRetrySkipFirstStageRef
+		if isGitLabMergeRequestPipeline(pr) {
+			reason = gitLabRetrySkipMergeRequestRef
+		}
+		d.writeGitLabRetrySkippedAudit(ctx, ev, nil, pr, reason, now)
 		return nil
 	}
 

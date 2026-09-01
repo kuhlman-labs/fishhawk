@@ -23,14 +23,27 @@ import (
 // the correlation inputs; iid is the merge-request narrowing hint (0 omits
 // the merge_request block, as a branch pipeline's payload does).
 func gitlabPipelineEvent(status, ref, sha string, pipelineID, iid int) Event {
+	return gitlabPipelineEventWithSource(status, ref, sha, "", pipelineID, iid)
+}
+
+// gitlabPipelineEventWithSource is gitlabPipelineEvent plus GitLab's
+// object_attributes.source discriminator (E45.30 / #2881). An EMPTY source
+// omits the field entirely rather than sending "", so a test can drive the
+// ref-shape signal with the source signal genuinely ABSENT — which is what
+// stops the source signal from masking the ref arm's deletion.
+func gitlabPipelineEventWithSource(status, ref, sha, source string, pipelineID, iid int) Event {
+	attrs := map[string]any{
+		"id":     pipelineID,
+		"ref":    ref,
+		"sha":    sha,
+		"status": status,
+	}
+	if source != "" {
+		attrs["source"] = source
+	}
 	body := map[string]any{
-		"object_kind": "pipeline",
-		"object_attributes": map[string]any{
-			"id":     pipelineID,
-			"ref":    ref,
-			"sha":    sha,
-			"status": status,
-		},
+		"object_kind":       "pipeline",
+		"object_attributes": attrs,
 	}
 	if iid > 0 {
 		body["merge_request"] = map[string]any{"iid": iid}
@@ -580,6 +593,161 @@ func TestGitLabCIRetry_FirstStagePipelineOnDefaultRefIsDeferred(t *testing.T) {
 	}
 	if _, ok := p["run_id"]; ok {
 		t.Errorf("payload carries run_id = %v; no run owns this pipeline", p["run_id"])
+	}
+}
+
+// TestIsGitLabMergeRequestPipeline table-drives the merge-request-pipeline
+// predicate, one row per NAMED shape (E45.30 / #2881).
+//
+// Two rows deliberately carry the ref shape with NO source and no other MR
+// signal — they are the only thing protecting the ref arm, so its deletion
+// cannot be masked by the source discriminator. The near-miss rows are the
+// anchors' own control: an unanchored pattern would classify each of them.
+func TestIsGitLabMergeRequestPipeline(t *testing.T) {
+	cases := []struct {
+		name string
+		pr   PipelineRef
+		want bool
+	}{
+		// The DOCUMENTED Pipeline Hook shape: target-branch ref + source.
+		{"source_only_target_branch_ref", PipelineRef{Ref: "master", Source: "merge_request_event", MergeRequestIID: 7}, true},
+		// Detached MR pipeline ref, source ABSENT: the ref arm alone.
+		{"head_ref_no_source", PipelineRef{Ref: "refs/merge-requests/7/head"}, true},
+		// MERGED-RESULTS ref, source ABSENT: the /merge alternative alone.
+		{"merge_ref_no_source", PipelineRef{Ref: "refs/merge-requests/7/merge"}, true},
+		{"both_signals", PipelineRef{Ref: "refs/merge-requests/7/head", Source: "merge_request_event"}, true},
+
+		{"run_branch_push", PipelineRef{Ref: "fishhawk/run-abcdef12", Source: "push"}, false},
+		{"default_ref_push", PipelineRef{Ref: "main", Source: "push"}, false},
+		// THE IID EXCLUSION. GitLab attaches a merge_request block to a BRANCH
+		// pipeline that merely has an associated open MR, so a non-zero iid must
+		// NOT classify on its own — doing so would relabel ordinary first-stage
+		// default-ref pipelines and re-break the defect this change fixes.
+		{"default_ref_no_source_with_iid", PipelineRef{Ref: "main", MergeRequestIID: 7}, false},
+
+		// Near misses: the anchored pattern's own rows.
+		{"near_miss_other_ending", PipelineRef{Ref: "refs/merge-requests/7/other"}, false},
+		{"near_miss_non_numeric_iid", PipelineRef{Ref: "refs/merge-requests/abc/head"}, false},
+		{"near_miss_trailing_segment", PipelineRef{Ref: "refs/merge-requests/7/head/extra"}, false},
+		{"near_miss_leading_garbage", PipelineRef{Ref: "x/refs/merge-requests/7/head"}, false},
+		{"empty", PipelineRef{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := tc.pr
+			if got := isGitLabMergeRequestPipeline(&pr); got != tc.want {
+				t.Errorf("isGitLabMergeRequestPipeline(%+v) = %v, want %v", pr, got, tc.want)
+			}
+		})
+	}
+	// The handler dereferences m.PipelineRef only after its own nil check, but
+	// the predicate is a package-level helper: a nil must not panic.
+	if isGitLabMergeRequestPipeline(nil) {
+		t.Error("isGitLabMergeRequestPipeline(nil) = true, want false")
+	}
+}
+
+// TestGitLabCIRetry_MergeRequestPipelineDrawsItsOwnSkipReason is the
+// END-TO-END test for the reason split (E45.30 / #2881). It drives a RAW
+// payload through the whole handleGitLabCIRetry path — matcher decode,
+// PipelineRef construction, the not-a-run-branch arm, reason selection, audit
+// append — and asserts on the AUDIT ROW, not an intermediate struct: per-layer
+// unit tests alone stay green if the source field never reaches the predicate.
+//
+// Row (iv) is the REGRESSION row. A plain default-ref push pipeline must keep
+// drawing first_stage_pipeline_on_non_run_branch, which is what proves the new
+// arm did not widen to swallow the first-stage case it is carved out of.
+func TestGitLabCIRetry_MergeRequestPipelineDrawsItsOwnSkipReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		ref    string
+		source string
+		iid    int
+		want   string
+	}{
+		// The documented Pipeline Hook shape: the SOURCE is the only signal.
+		{"source_only_target_branch", "master", "merge_request_event", 7, gitLabRetrySkipMergeRequestRef},
+		// Detached MR ref, no source: the REF is the only signal.
+		{"head_ref_no_source", "refs/merge-requests/7/head", "", 0, gitLabRetrySkipMergeRequestRef},
+		// Merged-results ref, no source: the /merge alternative is the only signal.
+		{"merge_ref_no_source", "refs/merge-requests/7/merge", "", 0, gitLabRetrySkipMergeRequestRef},
+		// REGRESSION: an actual first-stage pipeline is unchanged.
+		{"default_ref_push", "main", "push", 0, gitLabRetrySkipFirstStageRef},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, runs, au, arts := newGitLabRetryDispatcher(t)
+			// A candidate set is required: with none, the handler takes the
+			// silent no-candidates path and writes no skip row at all.
+			seedGitLabRun(t, runs, arts, "acme/widgets", "", 0, 0)
+
+			ev := gitlabPipelineEventWithSource("failed", tc.ref, "c0ffee01", tc.source, 9001, tc.iid)
+			if err := d.Handle(context.Background(), ev); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+
+			if got := retryChildren(runs, 1); len(got) != 0 {
+				t.Fatalf("retry children = %d, want 0 (a non-run-branch pipeline never retries)", len(got))
+			}
+			runs.mu.Lock()
+			transitions := len(runs.transitions)
+			runs.mu.Unlock()
+			if transitions != 0 {
+				t.Errorf("stage transitions = %d, want 0", transitions)
+			}
+			p, chainedToRun := skipPayload(t, au)
+			if got, _ := p["reason"].(string); got != tc.want {
+				t.Errorf("ci_retry_skipped reason = %q, want %q", got, tc.want)
+			}
+			// ATTRIBUTION is unchanged by the reason split: a pipeline outside the
+			// run-branch namespace owns no run, MR-sourced or not.
+			if chainedToRun {
+				t.Error("skip was chained to a run; a non-run-branch pipeline owns none")
+			}
+			if _, ok := p["run_id"]; ok {
+				t.Errorf("payload carries run_id = %v; no run owns this pipeline", p["run_id"])
+			}
+		})
+	}
+}
+
+// TestGitLabCIRetry_MergeRequestSourcedPipelineOnRunBranchStillRetries pins the
+// CONTRAST that bounds the change (E45.30 / #2881): correlation behaviour is
+// untouched. An MR-SOURCED pipeline whose ref IS a run branch and whose sha
+// matches the run's recorded head takes exactly the path it takes today — the
+// retry child is minted and a pipeline is actually triggered, and NO
+// ci_retry_skipped row is written.
+//
+// This is what proves the new predicate is evaluated only INSIDE the
+// not-a-run-branch arm and can never divert a correlating delivery.
+func TestGitLabCIRetry_MergeRequestSourcedPipelineOnRunBranchStillRetries(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	trigger := retryTrigger(t, d)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "bbb222", 0, 31)
+
+	ev := gitlabPipelineEventWithSource("failed", gitLabRunBranch(parent), "bbb222",
+		"merge_request_event", 9001, 31)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	children := retryChildren(runs, 1)
+	if len(children) != 1 {
+		t.Fatalf("retry children = %d, want 1", len(children))
+	}
+	if children[0].ParentRunID == nil || *children[0].ParentRunID != parent.ID {
+		t.Fatalf("child parent = %v, want %s", children[0].ParentRunID, parent.ID)
+	}
+	trigger.mu.Lock()
+	calls := len(trigger.calls)
+	trigger.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("pipeline trigger calls = %d, want exactly 1", calls)
+	}
+	for _, c := range auditCategories(au) {
+		if c == "ci_retry_skipped" {
+			t.Fatal("a correlating MR-sourced pipeline wrote ci_retry_skipped; correlation must be unchanged")
+		}
 	}
 }
 
