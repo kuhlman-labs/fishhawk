@@ -154,7 +154,15 @@ func TestShipAcceptance_HappyPath(t *testing.T) {
 // this stage. Without it acceptanceValidatedHeadSHA resolves "" and the #3091
 // unbound-head clamp records `undecidable` — correct behavior, but not what a
 // fixture standing in for an ordinarily-dispatched stage means to exercise.
+// It is IDEMPOTENT: a fixture that already carries this stage's dispatch anchor
+// is left alone, so a call site may state the precondition explicitly in its own
+// file without double-seeding a ledger a shared helper already wrote.
 func seedValidatedHead(au *auditFake, runID, stageID uuid.UUID) {
+	for _, e := range au.seeded {
+		if e.Category == CategoryAcceptanceDispatched && e.StageID != nil && *e.StageID == stageID {
+			return
+		}
+	}
 	seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "seededvalidatedhead"})
 	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
 }
