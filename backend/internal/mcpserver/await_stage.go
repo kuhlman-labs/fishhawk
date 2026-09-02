@@ -502,13 +502,28 @@ func (r *runResolver) awaitStageSettled(ctx context.Context, runID, stageUUID uu
 	if stageType != "implement" {
 		return out
 	}
-	rec := r.fixupRecoveryFor(ctx, runID, stageUUID)
-	if rec == nil {
+	return decorateSettledWithFixupRecovery(out, r.fixupRecoveryFor(ctx, runID, stageUUID))
+}
+
+// decorateSettledWithFixupRecovery attaches the #3081 marker to a settled
+// response. The structured block and the top-level message are ONE advisory in
+// two places, so they are attached TOGETHER or not at all: a response carrying
+// the prose without the block would hand a caller a warning it cannot act on
+// programmatically, and one carrying the block without the prose would let a
+// caller reading only the summary miss it.
+//
+// The StageWaitStatus nil arm is unreachable on today's code —
+// awaitStageSettledOutput always populates it from classifyStageWaitStatus,
+// which returns a non-nil *StageWaitStatus on every path — so this is
+// defence-in-depth against a future refactor that makes the field optional,
+// not a live branch. It is a pure function precisely so the pairing stays
+// falsifiable: the surrounding builder cannot produce a nil block, but a test
+// can hand one straight to this.
+func decorateSettledWithFixupRecovery(out AwaitStageOutput, rec *FixupRecovery) AwaitStageOutput {
+	if rec == nil || out.StageWaitStatus == nil {
 		return out
 	}
-	if out.StageWaitStatus != nil {
-		out.StageWaitStatus.FixupRecovered = rec
-	}
+	out.StageWaitStatus.FixupRecovered = rec
 	out.Message = rec.Message
 	return out
 }
