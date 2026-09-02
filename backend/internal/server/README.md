@@ -775,6 +775,27 @@ Mechanics:
   to BOTH the #858 report-boundary check (`verifyBranchLineage`) and
   the merge-resolution re-check (`ReverifyBranchLineage`) with no
   caller edits — un-wedging the run an operator commit had parked.
+- **Re-posts the `fishhawk_audit_complete` check at the vouched head
+  (E64.14 / #3109).** After the `operator_commit_vouched` entry is
+  durable, the handler calls
+  `checks.go::recomputeAndPublishAuditCompleteAtHead(runID, vouchedSHA)`,
+  which republishes the required Check Run AT the vouched commit via the
+  publisher's head override. This is load-bearing for the base-advance
+  wedge: an operator-pushed head appears in NO head-report audit category
+  (`fixup_pushed` / `child_pushed` / `pull_request_opened`), so the
+  publisher's normal `findHeadSHA` resolution would recompute correctly
+  and then publish against a STALE sha — leaving the check absent from
+  the merged head rather than red on it. The re-post is best-effort for
+  the vouch's success but its outcome is REPORTED on the response
+  (`audit_check_republished` / `audit_check_republish_warning`), NOT
+  swallowed — the merge reconciler's heal (`RepublishAuditCheck`) uses
+  the SAME operator-vouched-blind head resolution and so cannot retry it,
+  which is why the failure is surfaced and why re-invoking the vouch is
+  the sanctioned idempotent retry (the publisher's dedup cache records
+  only successes, so a re-vouch re-posts exactly the dropped check and
+  no-ops once it is live). The post-base-advance-conflict route is
+  therefore operator-resolve-then-vouch; a sanctioned rebase verb is
+  deferred to #3125.
 
 Invariants:
 
@@ -1398,7 +1419,8 @@ The operator recovery action that re-admits ANY terminal-`failed` run for anothe
 `backend/internal/server/merge_run.go::handleMergeRun` (route `POST /v0/runs/{run_id}/merge`, MCP verb `fishhawk_merge_run`). The one-verb operator merge path: it records the operator's merge verdict as a chained `merge_verdict_recorded` audit entry (modeled on `vouch.go`) and queues the squash merge through the SAME `s.cfg.GateMerger` seam the delegated `may_merge` arm of `AutoDriveRunGate` dispatches through — extracted into the shared `dispatchAcceptanceGatedMerge` helper (`autodrive.go`), so the human merge and the delegated merge converge on one path by construction. The PR-approval review itself stays a `gh pr review --approve` step under the operator's own GitHub identity (the 2026-07-15 option-a decision; App-identity approval deferred to E39).
 
 - **Auth ladder** (operator-only, mirrors `vouch.go`): anonymous → `401`; a run-bound `mcp:run:<uuid>` token → `403 run_token_forbidden` (even for its own run — an agent self-merging its PR would bypass the operator gate); any identity missing `write:approvals` → `403 insufficient_scope`, enforced UNCONDITIONALLY (no cookie-session bypass, since the verb queues a real squash merge).
-- **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
+- **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil; `409 merge_conflicting` when the PR has a merge conflict against its base. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
+- **Conflict precondition (E64.14 / #3109)**: `prMergeConflicting` runs AFTER the `GateMerger` guard and BEFORE the `merge_verdict_recorded` append (a durable verdict for a merge that structurally cannot queue is a false record). A conflicting PR can never fire GitHub's auto-merge, so queuing it would only time out at 360s with a message that says nothing about conflicts. The guard is BEST-EFFORT and FAIL-OPEN — it reuses the `lineage.go` resolution idiom (nil `GitHub`, nil/zero installation, unparseable repo/PR, or a `GetPullRequest` error all proceed) and refuses ONLY on an explicit forge signal: `MergeableState == "dirty"` OR a documented `Mergeable == false` (the `mergeable` boolean is kept load-bearing alongside the advisory `mergeable_state`, so the latter can never quietly become the only path). `mergeable_state` `blocked`/`behind`/`unstable`/`draft`/`unknown`/`""` and a `nil` `Mergeable` (GitHub's background mergeability job still running, returning JSON `null`) all proceed. Response `409 merge_conflicting` carries `details {run_id, pr_url, mergeable_state}`; the resolution path is operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge (a rebase verb is deferred to #3125). GitLab MRs are NOT classified — the `forge.PullRequest` mergeability fields are zero on that adapter, so a conflicting GitLab MR falls through to today's queue-then-timeout behavior (`merge_status`/`detailed_merge_status` would be the GitLab signal).
 - **Endpoint-side idempotence** (binding condition, #1954): a repeated POST that finds an existing `merge_verdict_recorded` row appends NO duplicate and responds `already_recorded:true`, but ALWAYS re-dispatches the merge helper — so a `502`-then-reinvoke re-queues the merge without ever duplicating the verdict. On a merge-helper error the handler branches on the cause: a checks-not-all-passed refusal (`forge.ErrPullRequestUnstableStatus` — GitHub reports the PR in UNSTABLE status, E67.56 / #2717) returns `409 merge_checks_pending` (`details` `{verdict_sequence, pr_url, reason:"checks_pending"}`) — an expected precondition, not a fault, whose message says the required checks have NOT all passed, that an immediate retry cannot succeed, and that a check which has already FAILED means inspecting the PR rather than waiting; EVERY other error returns `502 merge_dispatch_failed` stating the verdict row is durable and the queue step is retryable, so a genuine dispatch failure is never masked as "just waiting". The verdict row is durable across a `merge_checks_pending` refusal, so `fishhawk_merge_run` re-POSTs across a bounded wait with no duplicate row. Response `{run_id, merge_queued, verdict_sequence, already_recorded, pr_url}`.
 - The endpoint does NOT wait for the merge to land: the merge only ENABLES/queues GitHub's merge, and the `pr_merged` / run-completion settle is left to the `pull_request`-closed webhook — the MCP `fishhawk_merge_run` tool awaits the terminal state client-side.
 - `merge_verdict_recorded` is registered in `audit.KnownCategories` and is an internal, non-comment audit kind (see `docs/issue-comment-surfaces.md`).

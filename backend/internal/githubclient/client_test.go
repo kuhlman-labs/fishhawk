@@ -2486,6 +2486,58 @@ func TestGetPullRequest_DecodesBody(t *testing.T) {
 	}
 }
 
+// TestGetPullRequest_DecodesMergeable pins the E64.14 / #3109 conflict-signal
+// decode: GetPullRequest surfaces `mergeable` (a *bool, so a still-computing
+// JSON null stays distinguishable from false) and `mergeable_state`, the two
+// fields the merge endpoint's conflict precondition classifies on.
+func TestGetPullRequest_DecodesMergeable(t *testing.T) {
+	t.Run("conflict: mergeable false, state dirty", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"open","mergeable":false,"mergeable_state":"dirty","head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.Mergeable == nil || *pr.Mergeable {
+			t.Errorf("Mergeable = %v, want non-nil false", pr.Mergeable)
+		}
+		if pr.MergeableState != "dirty" {
+			t.Errorf("MergeableState = %q, want dirty", pr.MergeableState)
+		}
+	})
+	t.Run("clean: mergeable true, state clean", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"open","mergeable":true,"mergeable_state":"clean","head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.Mergeable == nil || !*pr.Mergeable {
+			t.Errorf("Mergeable = %v, want non-nil true", pr.Mergeable)
+		}
+		if pr.MergeableState != "clean" {
+			t.Errorf("MergeableState = %q, want clean", pr.MergeableState)
+		}
+	})
+	t.Run("computing: mergeable null stays nil, not false", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"open","mergeable":null,"mergeable_state":"unknown","head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.Mergeable != nil {
+			t.Errorf("Mergeable = %v, want nil (null-while-computing must not decode to false)", *pr.Mergeable)
+		}
+		if pr.MergeableState != "unknown" {
+			t.Errorf("MergeableState = %q, want unknown", pr.MergeableState)
+		}
+	})
+}
+
 func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`

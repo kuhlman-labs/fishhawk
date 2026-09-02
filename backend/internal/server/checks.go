@@ -189,10 +189,23 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 // (#993), so a desynced merge gate is visible from
 // fishhawk_get_run_status and the SPA without a daemon-log grep.
 func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution) {
+	_, _ = s.publishAuditCheckAtHead(ctx, runID, state, missing, resolved, "")
+}
+
+// publishAuditCheckAtHead is publishAuditCheck with an explicit head override
+// (the operator-vouch path, E64.14 / #3109). It returns whether the Check Run
+// was published and any publish error, so the vouch handler can surface a
+// failed re-post to the operator rather than swallowing it (binding condition
+// 1b). The zero-value ("" override) reproduces publishAuditCheck's head
+// resolution exactly, so publishAuditCheck delegates here and discards the
+// return. Best-effort semantics are unchanged: a failure logs at WARN and never
+// unwinds the caller — but is now also RETURNED so a caller that wants to
+// report it can.
+func (s *Server) publishAuditCheckAtHead(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHAOverride string) (bool, error) {
 	if s.auditCheckPublisher == nil {
-		return
+		return false, nil
 	}
-	published, err := s.auditCheckPublisher.PublishResult(ctx, runID, state, missing, resolved)
+	published, err := s.auditCheckPublisher.PublishResultAtHead(ctx, runID, state, missing, resolved, headSHAOverride)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"audit-complete check-run publish failed",
@@ -200,7 +213,7 @@ func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state s
 			slog.String("state", string(state)),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false, err
 	}
 	if published {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
@@ -209,6 +222,7 @@ func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state s
 			slog.String("state", string(state)),
 		)
 	}
+	return published, nil
 }
 
 // auditCheckPublishDegraded is the auditcheckpublisher's OnDegraded
@@ -386,8 +400,24 @@ func (s *Server) auditCompleteDeps() auditcomplete.Deps {
 // returns; the canonical state is recomputed again on the next SPA visit or
 // PR webhook.
 func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uuid.UUID) {
+	_, _ = s.recomputeAndPublishAuditCompleteAtHead(ctx, runID, "")
+}
+
+// recomputeAndPublishAuditCompleteAtHead is recomputeAndPublishAuditComplete
+// with an explicit head override (the operator-vouch path, E64.14 / #3109). It
+// re-derives the audit-complete state and republishes the Check Run AT the
+// given head (empty override = the pre-#3109 head resolution). It returns
+// whether the publish landed and any publish/compute error so the vouch handler
+// can tell the operator the required check did NOT re-post (binding condition
+// 1b) instead of the failure vanishing behind a 200 — the reconciler heal
+// canNOT retry this, because normal head resolution excludes operator-vouched
+// commits and would keep republishing at the stale audit-recorded sha. Every
+// current caller reaches this through the empty-override delegation above and
+// is byte-identical. Best-effort for the caller's control flow (never unwinds);
+// the return is advisory.
+func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, runID uuid.UUID, headSHAOverride string) (bool, error) {
 	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
-		return
+		return false, nil
 	}
 	res, err := auditcomplete.ComputeResult(ctx, runID, s.auditCompleteDeps())
 	if err != nil {
@@ -395,9 +425,9 @@ func (s *Server) recomputeAndPublishAuditComplete(ctx context.Context, runID uui
 			"audit-complete recompute failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return
+		return false, err
 	}
-	s.publishAuditCheck(ctx, runID, res.State, res.Missing, res.Resolved)
+	return s.publishAuditCheckAtHead(ctx, runID, res.State, res.Missing, res.Resolved, headSHAOverride)
 }
 
 // RepublishAuditCheck re-derives a run's audit-complete state and republishes

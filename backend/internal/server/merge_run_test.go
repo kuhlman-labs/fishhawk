@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -1087,5 +1089,229 @@ func TestMergeRun_AcceptanceUndecidable_Proceeds(t *testing.T) {
 	}
 	if merger.called != 1 {
 		t.Errorf("merger called %d times, want 1 (undecidable acceptance proceeds)", merger.called)
+	}
+}
+
+// --- E64.14 / #3109: merge-conflict precondition ---
+
+// mergeConflictGitHub serves GET /repos/{owner}/{repo}/pulls/{number} for the
+// merge endpoint's conflict precondition: it emits the mergeable /
+// mergeable_state pair under test (mergeable is a raw JSON token so a test can
+// drive "true"/"false"/"null"), or a non-2xx to exercise the GetPullRequest
+// fail-open path.
+type mergeConflictGitHub struct {
+	mergeable      string // raw JSON: "true" | "false" | "null"
+	mergeableState string
+	prStatus       int // 0 => 200
+}
+
+func newMergeConflictGitHubClient(t *testing.T, stub *mergeConflictGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			if stub.prStatus != 0 && stub.prStatus != http.StatusOK {
+				w.WriteHeader(stub.prStatus)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","mergeable":%s,"mergeable_state":%q,"head":{"sha":"H"},"base":{"ref":"main"}}`,
+				stub.mergeable, stub.mergeableState)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// seedMergeConflictRun seeds a merge-ready run with the repo + installation the
+// conflict precondition needs to reach GetPullRequest, and wires the GitHub stub
+// onto the server.
+func seedMergeConflictRun(t *testing.T, s *Server, repo *autoDriveRepo, runID uuid.UUID, gh *githubclient.Client) {
+	t.Helper()
+	runRow := seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	runRow.Repo = "x/y"
+	runRow.InstallationID = instID(42)
+	s.cfg.GitHub = gh
+}
+
+// TestMergeRunConflictingPRRefused (m1) pins the dirty-state refusal: a PR with
+// mergeable_state=="dirty" returns 409 merge_conflicting with the resolution
+// path. Counterfactual c1: deleting the prMergeConflicting call site in
+// handleMergeRun turns this RED (the POST returns 200 and dispatches).
+func TestMergeRunConflictingPRRefused(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "dirty"})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Error.Code != "merge_conflicting" {
+		t.Errorf("error code = %q, want merge_conflicting", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Message, "fishhawk_vouch_commit") {
+		t.Errorf("message must name the resolve-then-vouch path: %q", env.Error.Message)
+	}
+	if env.Error.Details["mergeable_state"] != "dirty" {
+		t.Errorf("details.mergeable_state = %v, want dirty", env.Error.Details["mergeable_state"])
+	}
+	if env.Error.Details["pr_url"] != mergePR {
+		t.Errorf("details.pr_url = %v, want %q", env.Error.Details["pr_url"], mergePR)
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (conflict refused before dispatch)", merger.called)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0 (refused before append)", len(rows))
+	}
+}
+
+// TestMergeRun_ConflictMergeableFalse (m2) pins the DOCUMENTED signal as
+// sufficient ON ITS OWN (binding condition 2): mergeable==false with a NON-dirty
+// mergeable_state still returns 409, so mergeable_state can never quietly become
+// the only path.
+func TestMergeRun_ConflictMergeableFalse(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	// mergeable:false but state is NOT "dirty" — only the boolean fires here.
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "unknown"})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (documented mergeable==false is sufficient):\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("merge_conflicting")) {
+		t.Errorf("body missing merge_conflicting: %s", w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", merger.called)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0", len(rows))
+	}
+}
+
+// TestMergeRun_NullMergeableProceeds (m3) pins the fail-open on a
+// still-computing PR: mergeable==null + mergeable_state=="unknown" dispatches
+// the merge (GitHub's background mergeability job has not finished — treating
+// null as a conflict would refuse every freshly-opened PR).
+func TestMergeRun_NullMergeableProceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "null", mergeableState: "unknown"})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (null mergeable fails open):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (null mergeable dispatches)", merger.called)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(rows))
+	}
+}
+
+// TestMergeRun_BlockedStateProceeds pins the predicate's narrowness (binding
+// condition 2 / risk assumption): mergeable_state=="blocked" with
+// mergeable==true still returns 200 and dispatches — a behind/blocked/unstable
+// branch is not a conflict and must merge as it does today.
+func TestMergeRun_BlockedStateProceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "true", mergeableState: "blocked"})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (blocked is not a conflict):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (blocked dispatches)", merger.called)
+	}
+}
+
+// TestMergeRun_GetPRErrorProceeds (m5) pins the fail-open on a GetPullRequest
+// error: a non-2xx PR read proceeds to dispatch rather than refusing on an
+// unresolved signal.
+func TestMergeRun_GetPRErrorProceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{prStatus: http.StatusInternalServerError})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (GetPullRequest error fails open):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (fail open dispatches)", merger.called)
+	}
+}
+
+// TestMergeRun_NoInstallationProceeds (m6) pins the fail-open when the run
+// carries no installation id: the guard cannot call GitHub, so it proceeds. (The
+// dirty stub would refuse if it were reached — proving the installation guard,
+// not the GitHub stub, is what lets the dispatch through.)
+func TestMergeRun_NoInstallationProceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "dirty"})
+	runRow := seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	runRow.Repo = "x/y"
+	runRow.InstallationID = nil // no installation → guard cannot reach GitHub
+	s.cfg.GitHub = gh
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no installation fails open):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1", merger.called)
+	}
+}
+
+// TestMergeRunConflictingRecordsNoVerdict (c2) is the COMMITTED-STATE
+// counterfactual: after a conflict refusal it reads the audit chain and asserts
+// ZERO merge_verdict_recorded rows. A refusal and a dispatch failure both return
+// an error envelope, so deleting the guard reddens on committed STATE (a verdict
+// row now appears), not on error identity — the pin binding condition c2
+// requires, and it must NOT be replaced by an error-string assertion.
+func TestMergeRunConflictingRecordsNoVerdict(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "dirty"})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	_ = postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d after a conflict refusal, want 0 (guard runs before the append)", len(rows))
 	}
 }
