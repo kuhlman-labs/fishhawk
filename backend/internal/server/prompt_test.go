@@ -1849,6 +1849,15 @@ func TestGetStagePrompt_StateGuard_Cancelled(t *testing.T) {
 	testPromptStateGuard(t, run.StageStateCancelled, http.StatusConflict)
 }
 
+// A merge-superseded stage is terminal (#3083): the merge made it unreachable,
+// so the runner-facing prompt endpoint must refuse it exactly as it refuses a
+// succeeded/failed/cancelled stage. Without the guard arm the endpoint would
+// hand a prompt to a stage that can never run, and the 409's current_state
+// detail is what tells the caller which terminal fact it hit.
+func TestGetStagePrompt_StateGuard_Superseded(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateSuperseded, http.StatusConflict)
+}
+
 func TestGetStagePrompt_StateGuard_Pending_Passes(t *testing.T) {
 	testPromptStateGuard(t, run.StageStatePending, http.StatusOK)
 }
@@ -1912,6 +1921,14 @@ func TestGetStagePromptRender_StateGuard_Failed(t *testing.T) {
 
 func TestGetStagePromptRender_StateGuard_Cancelled(t *testing.T) {
 	testPromptRenderStateGuard(t, run.StageStateCancelled, http.StatusConflict)
+}
+
+// The SPA-facing render endpoint carries its OWN copy of the state guard
+// (prompt.go has two switches, not one shared helper), so the superseded arm
+// needs its own assertion here — editing only one switch is invisible to the
+// compiler (#3083).
+func TestGetStagePromptRender_StateGuard_Superseded(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateSuperseded, http.StatusConflict)
 }
 
 func TestGetStagePromptRender_StateGuard_Pending_Passes(t *testing.T) {

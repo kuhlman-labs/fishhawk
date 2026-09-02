@@ -2784,3 +2784,229 @@ func TestIsRetryChildDuplicate_Sentinel(t *testing.T) {
 		t.Error("nil must NOT be recognized as the benign retry race")
 	}
 }
+
+// makeTypedStage creates a stage of an explicit type (makeStage hardcodes
+// `plan`). The merge-supersede pair table is TYPE-aware, so its tests need to
+// seed real acceptance/review/plan rows rather than reuse the plan default.
+func makeTypedStage(t *testing.T, repo run.Repository, runID uuid.UUID, seq int, typ run.StageType) *run.Stage {
+	t.Helper()
+	s, err := repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:        runID,
+		Sequence:     seq,
+		Type:         typ,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create %s stage: %v", typ, err)
+	}
+	return s
+}
+
+// TestPostgres_TransitionStage_AdmitsSupersedeForAdmittedPair is the POSITIVE
+// half of the pair-table counterfactual (E64.2 / #3083, operator condition 2a).
+// It drives acceptance@awaiting_host_dispatch → superseded DIRECTLY THROUGH THE
+// REPOSITORY and asserts the move landed: the ordinary transition table does
+// NOT contain this edge, so the ONLY thing that admits it is the
+// ValidStageMergeSupersedeTransition arm in transitionStage's union. Deleting
+// that arm turns this test RED.
+//
+// It also proves migration 0079's widened stages_state_check actually admits
+// the value: a no-op migration fails the UPDATE with SQLSTATE 23514 here, not
+// silently. And it pins terminal stamping — ended_at must be set, which is what
+// Orchestrator.completeRun's #968 guard and the run-detail UI both read.
+func TestPostgres_TransitionStage_AdmitsSupersedeForAdmittedPair(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeTypedStage(t, repo, r.ID, 0, run.StageTypeAcceptance)
+	// Park it the way a fix-up pass does: pending → awaiting_host_dispatch.
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
+		t.Fatalf("park awaiting_host_dispatch: %v", err)
+	}
+
+	got, err := repo.TransitionStage(ctx, s.ID, run.StageStateSuperseded, nil)
+	if err != nil {
+		t.Fatalf("acceptance@awaiting_host_dispatch → superseded refused: %v "+
+			"(the merge-supersede arm of transitionStage's union is what admits it)", err)
+	}
+	if got.State != run.StageStateSuperseded {
+		t.Errorf("returned state = %q, want superseded", got.State)
+	}
+	if got.EndedAt == nil {
+		t.Error("ended_at not stamped: superseded must be terminal or completeRun's #968 guard will refuse the run")
+	}
+
+	// Read the COMMITTED state back — the control's effect is persisted state,
+	// not just the returned value.
+	cur, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateSuperseded {
+		t.Errorf("persisted state = %q, want superseded (migration 0079 must admit the value)", cur.State)
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("failure metadata stamped on a supersede: cat=%v reason=%v (superseded is not a failure)",
+			cur.FailureCategory, cur.FailureReason)
+	}
+
+	// The second admitted row, review@awaiting_approval, on its own stage.
+	rev := makeTypedStage(t, repo, r.ID, 1, run.StageTypeReview)
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval} {
+		if _, err := repo.TransitionStage(ctx, rev.ID, to, nil); err != nil {
+			t.Fatalf("review → %s: %v", to, err)
+		}
+	}
+	if _, err := repo.TransitionStage(ctx, rev.ID, run.StageStateSuperseded, nil); err != nil {
+		t.Fatalf("review@awaiting_approval → superseded refused: %v", err)
+	}
+	curRev, err := repo.GetStage(ctx, rev.ID)
+	if err != nil {
+		t.Fatalf("get review stage: %v", err)
+	}
+	if curRev.State != run.StageStateSuperseded {
+		t.Errorf("review persisted state = %q, want superseded", curRev.State)
+	}
+}
+
+// TestTransitionStage_RefusesSupersedeForUnadmittedPair is the NEGATIVE half
+// (E64.2 / #3083, operator condition 2a). Its discriminating mutation is
+// DELETING THE TYPE CHECK INSIDE the predicate (the `p.StageType == stageType`
+// clause in run.MergeSupersedable), which degrades the pair table to a
+// state-only allow-list. Under that mutation plan@awaiting_approval is admitted
+// — it carries the review row's STATE — and this test goes RED.
+//
+// Error identity alone is INSUFFICIENT here because the control's effect is
+// COMMITTED STATE, so the row is re-read after the call to prove nothing moved.
+// If it had, Orchestrator.completeRun's #968 guard would pass the now-terminal
+// stage and stamp the run `succeeded` around a plan that never ran.
+func TestTransitionStage_RefusesSupersedeForUnadmittedPair(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	cases := []struct {
+		name      string
+		stageType run.StageType
+		park      []run.StageState // transitions to reach the from-state
+		wantState run.StageState
+	}{
+		{
+			// The state-only-degradation discriminator: plan carries REVIEW's
+			// admitted state. Green only while the predicate checks the type.
+			name:      "plan at awaiting_approval (review's admitted state, wrong type)",
+			stageType: run.StageTypePlan,
+			park:      []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval},
+			wantState: run.StageStateAwaitingApproval,
+		},
+		{
+			// Same shape against acceptance's admitted state.
+			name:      "implement at awaiting_host_dispatch (acceptance's admitted state, wrong type)",
+			stageType: run.StageTypeImplement,
+			park:      []run.StageState{run.StageStateAwaitingHostDispatch},
+			wantState: run.StageStateAwaitingHostDispatch,
+		},
+		{
+			// The #968 shape the plan names: work never done.
+			name:      "plan at pending",
+			stageType: run.StageTypePlan,
+			park:      nil,
+			wantState: run.StageStatePending,
+		},
+		{
+			// Right type, unadmitted state: acceptance mid-flight.
+			name:      "acceptance running",
+			stageType: run.StageTypeAcceptance,
+			park:      []run.StageState{run.StageStateDispatched, run.StageStateRunning},
+			wantState: run.StageStateRunning,
+		},
+	}
+
+	r := makeRun(t, repo)
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeTypedStage(t, repo, r.ID, i, tc.stageType)
+			for _, to := range tc.park {
+				if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+					t.Fatalf("park → %s: %v", to, err)
+				}
+			}
+
+			_, err := repo.TransitionStage(ctx, s.ID, run.StageStateSuperseded, nil)
+			if err == nil {
+				t.Fatalf("%s @ %s → superseded was ADMITTED; the pair table must deny it "+
+					"(a state-only predicate would admit it and let completeRun fabricate a succeeded run)",
+					tc.stageType, tc.wantState)
+			}
+			var ite run.InvalidTransitionError
+			if !errors.As(err, &ite) {
+				t.Fatalf("error = %v, want run.InvalidTransitionError via errors.As", err)
+			}
+			if ite.Kind != "stage" || ite.To != string(run.StageStateSuperseded) {
+				t.Errorf("InvalidTransitionError = %+v, want {Kind:stage To:superseded}", ite)
+			}
+
+			// COMMITTED STATE is the real assertion: re-read the row.
+			cur, err := repo.GetStage(ctx, s.ID)
+			if err != nil {
+				t.Fatalf("get stage: %v", err)
+			}
+			if cur.State != tc.wantState {
+				t.Errorf("persisted state = %q, want %q (the refused transition must mutate nothing)",
+					cur.State, tc.wantState)
+			}
+			if cur.EndedAt != nil {
+				t.Errorf("ended_at stamped on a refused supersede: %v", cur.EndedAt)
+			}
+		})
+	}
+}
+
+// TestPostgres_RecordStageProgress_RefusedOnSupersededStage is the done-means
+// for the RecordStageProgress terminal predicate (#3083). The predicate lives
+// in TWO places — queries.sql (the authority) and the hand-mirrored
+// `recordStageProgress` constant in db/queries.sql.go — and only the CONSTANT
+// is what actually executes. Editing one and not the other is invisible to the
+// compiler, so this asserts the observable behavior: a heartbeat against a
+// superseded stage matches ZERO rows (applied=false), exactly as against a
+// succeeded one, instead of silently mutating a terminal row.
+func TestPostgres_RecordStageProgress_RefusedOnSupersededStage(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	store := progressStore(t, repo)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeTypedStage(t, repo, r.ID, 0, run.StageTypeAcceptance)
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
+		t.Fatalf("park awaiting_host_dispatch: %v", err)
+	}
+
+	// Control: while parked (non-terminal) the heartbeat IS applied. Without
+	// this the assertion below could pass for an unrelated reason.
+	applied, err := store.RecordStageProgress(ctx, s.ID,
+		run.StageProgress{LastEvent: "assistant", ReportedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("RecordStageProgress on a parked stage: %v", err)
+	}
+	if !applied {
+		t.Fatal("heartbeat not applied on a parked (non-terminal) stage; the fixture is wrong")
+	}
+
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateSuperseded, nil); err != nil {
+		t.Fatalf("→ superseded: %v", err)
+	}
+
+	applied, err = store.RecordStageProgress(ctx, s.ID,
+		run.StageProgress{LastEvent: "tool_use", ReportedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("RecordStageProgress on a superseded stage: %v", err)
+	}
+	if applied {
+		t.Error("heartbeat APPLIED to a superseded stage: the RecordStageProgress terminal predicate " +
+			"is missing 'superseded' in queries.sql, in the hand-mirrored db/queries.sql.go constant, or both")
+	}
+}

@@ -1375,8 +1375,13 @@ func missingTraces(ctx context.Context, repo audit.Repository, runID uuid.UUID, 
 	for _, s := range nonReview {
 		// Only stages that actually executed need traces. A
 		// stage that was cancelled before dispatch has nothing
-		// to ship.
-		if s.State == run.StageStatePending || s.State == run.StageStateCancelled {
+		// to ship — and neither does one a merge SUPERSEDED
+		// (#3083), which was parked and unreachable, never
+		// dispatched. Without this arm every merge-superseded
+		// run's audit-complete check goes red demanding a trace
+		// from a stage that never executed.
+		if s.State == run.StageStatePending || s.State == run.StageStateCancelled ||
+			s.State == run.StageStateSuperseded {
 			continue
 		}
 		v, ok := got[s.ID]

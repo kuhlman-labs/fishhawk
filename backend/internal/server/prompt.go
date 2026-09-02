@@ -961,7 +961,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 
 	switch stage.State {
 	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
-		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled,
+		// A merge-superseded stage is terminal (#3083): the merge made it
+		// unreachable, so it must be refused a prompt rather than served one.
+		run.StageStateSuperseded:
 		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
 			"stage is not in a runnable state",
 			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})
@@ -1619,7 +1622,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 
 	switch stage.State {
 	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
-		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled,
+		// A merge-superseded stage is terminal (#3083): the merge made it
+		// unreachable, so it must be refused a prompt rather than served one.
+		run.StageStateSuperseded:
 		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
 			"stage is not in a runnable state",
 			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})

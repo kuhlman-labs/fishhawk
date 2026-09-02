@@ -4935,3 +4935,98 @@ func TestMigrateUp_DirtyErrorNamesRecovery(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrateDown_StagesSupersededReversal pins 0079 (E64.2 / #3083) in BOTH
+// directions against REAL ROWS, not against the rendered constraint text: a
+// CHECK that merely MENTIONS 'superseded' (in a negated or misspelled clause)
+// would satisfy a text search while still rejecting the row the product must
+// write.
+//
+// Up: a stage row carrying state='superseded' INSERTs. Without the widening it
+// is uninsertable with SQLSTATE 23514, so a no-op migration fails here rather
+// than passing silently.
+//
+// Down: the NORMALIZE-THEN-NARROW order is the load-bearing property. The
+// rollback maps every 'superseded' row to 'cancelled' BEFORE re-adding the
+// narrower 0053 CHECK; if the ordering were inverted the ADD CONSTRAINT would
+// raise 23514 against the surviving row and MigrateDown would fail outright —
+// which is precisely what downThrough would surface. This asserts both that the
+// rollback SUCCEEDS and that the row normalized to 'cancelled' (the closest
+// pre-0079 legal value) rather than being deleted or left behind.
+func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runID, supersededID, cancelledID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	// The row the widening exists for: acceptance, superseded by a merge.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'acceptance', 'agent', 'claude-code', 'superseded')`,
+		supersededID, runID,
+	); err != nil {
+		t.Fatalf("INSERT a superseded stage failed (0079 did not widen stages_state_check?): %v", err)
+	}
+	// A genuinely cancelled sibling, so the down-direction assertion below
+	// distinguishes "normalized" from "was already cancelled".
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 1, 'review', 'human', 'operator', 'cancelled')`,
+		cancelledID, runID,
+	); err != nil {
+		t.Fatalf("seed cancelled stage: %v", err)
+	}
+	// An out-of-set value is still refused — the widening is ADDITIVE, not a
+	// removal of the CHECK.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 2, 'plan', 'agent', 'claude-code', 'obsoleted')`,
+		uuid.New(), runID,
+	); err == nil {
+		t.Error("INSERT with an out-of-set state succeeded; 0079 must widen stages_state_check, not drop it")
+	}
+
+	// Roll back through 0079, the reversal under test. downThrough names the
+	// target so this stays a one-line target when a migration lands above it.
+	// This call FAILS if the down migration narrows before normalizing (the
+	// ADD CONSTRAINT would raise 23514 against the superseded row).
+	downThrough(t, url, "0079")
+
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM stages WHERE id = $1`, supersededID).Scan(&state); err != nil {
+		t.Fatalf("read back the formerly-superseded stage: %v", err)
+	}
+	if state != "cancelled" {
+		t.Errorf("formerly-superseded stage state after rollback = %q, want cancelled "+
+			"(the down migration normalizes to the closest pre-0079 legal value)", state)
+	}
+	// The sibling is untouched and the row was normalized, not deleted.
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count stages: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("stage count after rollback = %d, want 2 (normalize, never delete)", n)
+	}
+	// And the narrowed CHECK is back in force: 'superseded' is uninsertable.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 3, 'acceptance', 'agent', 'claude-code', 'superseded')`,
+		uuid.New(), runID,
+	); err == nil {
+		t.Error("INSERT of a superseded stage succeeded after rollback; the 0053 CHECK was not restored")
+	}
+}

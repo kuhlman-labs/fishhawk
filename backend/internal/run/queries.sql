@@ -285,10 +285,17 @@ RETURNING *;
 -- returns 0), so the handler answers 409 without a prior read — there is no
 -- check-then-write window (#2536). Touches ONLY the progress column, so no
 -- existing stages SELECT list expands and the sqlc Stage model is unchanged.
+--
+-- 'superseded' (#3083) is part of that terminal set: a stage a merge made
+-- unreachable has settled, so a late heartbeat must be refused exactly like one
+-- against a succeeded stage rather than silently mutating a terminal row. This
+-- .sql is the AUTHORITY for the predicate; the generated constant in
+-- db/queries.sql.go carries a hand-mirrored copy (see the preserve-on-
+-- regeneration note there) and the two MUST match.
 UPDATE stages
    SET progress = $2
  WHERE id = $1
-   AND state NOT IN ('succeeded', 'failed', 'cancelled');
+   AND state NOT IN ('succeeded', 'failed', 'cancelled', 'superseded');
 
 -- name: GetStageProgress :one
 -- Reads back just the heartbeat payload for one stage (#2541). Progress-only

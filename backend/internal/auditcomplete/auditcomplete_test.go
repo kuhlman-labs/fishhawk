@@ -2065,3 +2065,95 @@ func TestComputeResult_DecompositionChainInvalidChildRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestCompute_SupersededStageExemptsTraceRule pins the merge-supersede arm of
+// the trace-sweep skip (E64.2 / #3083). A stage a merge SUPERSEDED was parked
+// and unreachable — it never dispatched and never ran an agent, so it ships no
+// trace bundle. Without the skip arm, every merge-superseded run's
+// audit-complete check goes red demanding a trace from a stage that never
+// executed, which would make the whole recovery path unusable.
+//
+// The negative control is what makes this a real assertion rather than a
+// tautology: the byte-identical acceptance stage left `succeeded` (terminal,
+// NOT superseded) is NOT skipped and still fails trace_missing. So the
+// exemption is keyed to the superseded state specifically, not to "acceptance
+// stages ship no trace".
+//
+// The third case pins the precondition the skip depends on: superseded must be
+// TERMINAL to reach rule 2 at all. The same stage left at
+// awaiting_host_dispatch (non-terminal) short-circuits the whole check to
+// PENDING at the mid-flight guard — which is exactly today's stranding shape
+// and why a non-terminal state could never have served as the negative control.
+func TestCompute_SupersededStageExemptsTraceRule(t *testing.T) {
+	build := func(t *testing.T, accState run.StageState) (uuid.UUID, auditcomplete.Deps) {
+		t.Helper()
+		runID := uuid.New()
+		planS := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
+		impl := mkStage(runID, 2, run.StageTypeImplement, run.StageStateSucceeded)
+		rev := mkStage(runID, 3, run.StageTypeReview, run.StageStateSucceeded)
+		acc := mkStage(runID, 4, run.StageTypeAcceptance, accState)
+
+		runs := &fakeRuns{stages: []*run.Stage{planS, impl, rev, acc}}
+		arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+			planS.ID: {planArtifact(planS.ID, "standard_v1")},
+			impl.ID:  {pullRequestArtifact(impl.ID)},
+		}}
+		au := &fakeAudit{}
+		// Plan + implement ship both trace variants; the acceptance stage
+		// deliberately ships NONE — a parked stage runs no agent.
+		au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("raw"))
+		au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("raw"))
+		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		return runID, deps(runs, arts, au)
+	}
+
+	t.Run("superseded -> no MissingTrace item", func(t *testing.T) {
+		runID, d := build(t, run.StageStateSuperseded)
+		res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+		if err != nil {
+			t.Fatalf("ComputeResult: %v", err)
+		}
+		for _, m := range res.Missing {
+			if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
+				t.Fatalf("a superseded acceptance stage produced a MissingTrace item: %+v", m)
+			}
+		}
+		if res.State != stagecheck.StatePass {
+			t.Fatalf("state = %s, want pass; missing=%+v", res.State, res.Missing)
+		}
+	})
+
+	t.Run("negative control: succeeded -> still MissingTrace", func(t *testing.T) {
+		runID, d := build(t, run.StageStateSucceeded)
+		res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+		if err != nil {
+			t.Fatalf("ComputeResult: %v", err)
+		}
+		found := false
+		for _, m := range res.Missing {
+			if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("a SUCCEEDED acceptance stage shipping no trace must still fail trace_missing; "+
+				"the skip must be keyed to superseded, not blanket. missing=%+v", res.Missing)
+		}
+		if res.State != stagecheck.StateFail {
+			t.Fatalf("state = %s, want fail", res.State)
+		}
+	})
+
+	t.Run("terminality precondition: awaiting_host_dispatch short-circuits to pending", func(t *testing.T) {
+		runID, d := build(t, run.StageStateAwaitingHostDispatch)
+		res, err := auditcomplete.ComputeResult(context.Background(), runID, d)
+		if err != nil {
+			t.Fatalf("ComputeResult: %v", err)
+		}
+		if res.State != stagecheck.StatePending {
+			t.Fatalf("state = %s, want pending: a non-terminal acceptance stage must short-circuit "+
+				"at the mid-flight guard (this is #3083's stranding shape)", res.State)
+		}
+	})
+}
