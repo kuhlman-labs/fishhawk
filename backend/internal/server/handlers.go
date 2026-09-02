@@ -140,6 +140,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", s.requireRunAccount(readAccess, s.handleListScopeAmendments))
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", s.requireRunAccount(memberWrite, s.handleDecideScopeAmendment))
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-completeness/decision", s.requireRunAccount(memberWrite, s.handleDecideScopeCompleteness))
+	// Merge-supersede recovery (E64.2 / #3083): supersede the pair-table-
+	// admissible stages a merge left parked and re-run completion. memberWrite
+	// mirrors the sibling operator-decision writes — it is a RECOVERY verb, not
+	// a destructive one: it refuses unless the run's PR is observably merged,
+	// and the default-deny pair table bounds what it can terminalize.
+	mux.HandleFunc("POST /v0/runs/{run_id}/reconcile-merge", s.requireRunAccount(memberWrite, s.handleReconcileMerge))
 	mux.HandleFunc("GET /v0/stages/{stage_id}", s.requireStageAccount(readAccess, s.handleGetStage))
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.requireStageAccount(readAccess, s.handleListStageArtifacts))
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.requireStageAccount(readAccess, s.handleGetStagePrompt))
