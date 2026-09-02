@@ -1230,3 +1230,187 @@ func TestAwaitStageProgressMessage(t *testing.T) {
 		t.Errorf("awaitStageProgressMessage = %q", got)
 	}
 }
+
+// --- fix-up recovery marker on the settled response (E68.31 / #3081) ---
+
+// TestAwaitStage_SettledCarriesFixupRecoveryMarker is the DONE-MEANS assertion
+// on the shipped await_stage response: an implement stage whose latest fix-up
+// pass FAILED and was recovered settles as `succeeded` — true of the stage,
+// misleading about the fix-up — so the response must carry the marker on
+// stage_wait_status AND repeat its advisory at the top level.
+func TestAwaitStage_SettledCarriesFixupRecoveryMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "succeeded", true)
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	seedFixupRecoveredPayload(fb, runID, stageID, "A", "the fix-up agent exited non-zero")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(),
+		Stage: "implement",
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" {
+		t.Fatalf("Status/State = %q/%q, want settled/succeeded", out.Status, out.State)
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.FixupRecovered == nil {
+		t.Fatalf("stage_wait_status.fixup_recovered is absent; want the #3081 marker (status=%+v)", out.StageWaitStatus)
+	}
+	rec := out.StageWaitStatus.FixupRecovered
+	if rec.SourceFailureCategory != "A" {
+		t.Errorf("source_failure_category = %q, want A", rec.SourceFailureCategory)
+	}
+	if rec.SourceFailureReason != "the fix-up agent exited non-zero" {
+		t.Errorf("source_failure_reason = %q", rec.SourceFailureReason)
+	}
+	if !rec.DetailsAvailable {
+		t.Error("details_available = false, want true")
+	}
+	if out.Message == "" {
+		t.Error("top-level message is empty; a recovered fix-up must not settle silently")
+	}
+	if out.Message != rec.Message {
+		t.Errorf("top-level message differs from the marker's:\n top: %s\n rec: %s", out.Message, rec.Message)
+	}
+}
+
+// TestAwaitStage_SucceededFixupCarriesNoMarker is the CONTROL: a fix-up that
+// genuinely LANDED writes no stage_fixup_recovered entry, so the settled
+// response must be byte-identical to today — no marker, no message.
+func TestAwaitStage_SucceededFixupCarriesNoMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "succeeded", true)
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(),
+		Stage: "implement",
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatal("stage_wait_status is nil")
+	}
+	if out.StageWaitStatus.FixupRecovered != nil {
+		t.Errorf("fixup_recovered = %+v, want absent for a fix-up that landed", out.StageWaitStatus.FixupRecovered)
+	}
+	if out.Message != "" {
+		t.Errorf("message = %q, want empty on an ordinary settled response", out.Message)
+	}
+}
+
+// TestAwaitStage_NonImplementStageNeverProbes pins the cost gate: only an
+// implement stage can carry a fix-up, so a plan wait must issue NO audit read
+// at all. Asserted on the fake's per-category read counters, not on the output
+// alone — an output-only assertion would pass even if the probe ran and found
+// nothing.
+func TestAwaitStage_NonImplementStageNeverProbes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "plan", "succeeded", true)
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(),
+		Stage: "plan",
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.StageWaitStatus != nil && out.StageWaitStatus.FixupRecovered != nil {
+		t.Errorf("fixup_recovered = %+v, want absent on a plan stage", out.StageWaitStatus.FixupRecovered)
+	}
+	fb.mu.Lock()
+	triggerReads := fb.perRunAuditCategoryReads[categoryStageFixupTriggered]
+	recoveredReads := fb.perRunAuditCategoryReads[categoryStageFixupRecovered]
+	fb.mu.Unlock()
+	if triggerReads != 0 || recoveredReads != 0 {
+		t.Errorf("audit reads on a plan wait = %d trigger / %d recovered, want 0/0 (the probe is implement-only)", triggerReads, recoveredReads)
+	}
+}
+
+// TestAwaitStage_AuditErrorStillReturnsTheSettledResponse is the operator's
+// BINDING CONDITION 3 case, at the boundary where the wait actually happens:
+// the audit read fails while the stage settles normally. The whole reason the
+// probe is best-effort is that a multi-hour wait must never fail on an
+// advisory, so the settled response must come back INTACT with the marker
+// simply absent — not an error, not a degraded status.
+func TestAwaitStage_AuditErrorStillReturnsTheSettledResponse(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "succeeded", true)
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	seedFixupRecoveredPayload(fb, runID, stageID, "C", "commit/push onto PR branch failed")
+	// The audit endpoint now 500s: the probe cannot read the recovery it would
+	// otherwise report.
+	fb.mu.Lock()
+	fb.perRunAuditStatus = 500
+	fb.mu.Unlock()
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(),
+		Stage: "implement",
+	})
+	if err != nil {
+		t.Fatalf("awaitStage returned an error on a failing audit read: %v (the probe must be best-effort)", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" || !out.Terminal {
+		t.Fatalf("settled response degraded: Status/State/Terminal = %q/%q/%v, want settled/succeeded/true", out.Status, out.State, out.Terminal)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("StageID = %q, want %s (the settled response must be intact)", out.StageID, stageID)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatal("stage_wait_status is nil; the settled response must be intact")
+	}
+	if out.StageWaitStatus.FixupRecovered != nil {
+		t.Errorf("fixup_recovered = %+v, want absent when the audit read failed", out.StageWaitStatus.FixupRecovered)
+	}
+	if out.Message != "" {
+		t.Errorf("message = %q, want empty when the marker could not be resolved", out.Message)
+	}
+}
+
+// TestAwaitStage_MarkerSurvivesTheMidPollSettlePath proves the decoration is
+// wired on the POLL path too, not just the fast path: the three settled call
+// sites all route through awaitStageSettled, so a stage that settles mid-poll
+// carries the marker as well.
+func TestAwaitStage_MarkerSurvivesTheMidPollSettlePath(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	seedFixupRecoveredPayload(fb, runID, stageID, "B", "scope drift refused")
+	fb.stageWaitFlip = settleStageWaitAt(fb, stageID, 2, "succeeded")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" {
+		t.Fatalf("Status = %q, want settled", out.Status)
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.FixupRecovered == nil {
+		t.Fatal("fixup_recovered is absent on the mid-poll settle path")
+	}
+	if out.StageWaitStatus.FixupRecovered.SourceFailureCategory != "B" {
+		t.Errorf("source_failure_category = %q, want B", out.StageWaitStatus.FixupRecovered.SourceFailureCategory)
+	}
+}

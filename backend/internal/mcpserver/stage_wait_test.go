@@ -661,3 +661,60 @@ func TestStageStateIsTerminal_Superseded(t *testing.T) {
 		t.Errorf("PollIntervalSeconds = %d, want 0: a terminal status must not advertise a poll cadence", got.PollIntervalSeconds)
 	}
 }
+
+// TestStageWaitStatus_FixupRecoveredIsOmittedWhenAbsent is the byte-level
+// backward-compatibility control for the E68.31 / #3081 marker: a
+// StageWaitStatus with no recovery must serialize with NO `fixup_recovered` key
+// at all, so every consumer that read this block before reads byte-identical
+// output. It also pins the positive direction — the key IS present, with its
+// nested detail fields, once the marker is set — so the omitempty tag cannot be
+// "proved" by a field that never serializes.
+func TestStageWaitStatus_FixupRecoveredIsOmittedWhenAbsent(t *testing.T) {
+	bare, err := json.Marshal(&StageWaitStatus{Stage: "implement", Status: "succeeded"})
+	if err != nil {
+		t.Fatalf("marshal bare: %v", err)
+	}
+	if strings.Contains(string(bare), "fixup_recovered") {
+		t.Fatalf("a marker-less StageWaitStatus serialized a fixup_recovered key: %s", bare)
+	}
+
+	withMarker, err := json.Marshal(&StageWaitStatus{
+		Stage:  "implement",
+		Status: "succeeded",
+		FixupRecovered: &FixupRecovery{
+			SourceFailureReason:   "commit/push onto PR branch failed",
+			SourceFailureCategory: "C",
+			RestoredState:         "succeeded",
+			DetailsAvailable:      true,
+			Message:               "the fix-up pass FAILED and pushed no commit",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal with marker: %v", err)
+	}
+	for _, want := range []string{
+		`"fixup_recovered"`,
+		`"source_failure_reason"`,
+		`"source_failure_category":"C"`,
+		`"restored_state":"succeeded"`,
+		`"details_available":true`,
+	} {
+		if !strings.Contains(string(withMarker), want) {
+			t.Errorf("marshalled marker missing %s\ngot: %s", want, withMarker)
+		}
+	}
+}
+
+// TestFixupRecovery_DetailsAvailableIsNotOmitempty pins the one field that must
+// serialize even at its zero value: details_available=false is the load-bearing
+// signal that the recovery happened but its payload could not be decoded. An
+// omitempty there would drop exactly the case the operator most needs named.
+func TestFixupRecovery_DetailsAvailableIsNotOmitempty(t *testing.T) {
+	raw, err := json.Marshal(&FixupRecovery{Message: "x"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"details_available":false`) {
+		t.Errorf("details_available:false was dropped from the wire: %s", raw)
+	}
+}

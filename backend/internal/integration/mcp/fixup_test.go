@@ -2851,3 +2851,251 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 		t.Errorf("stage_fixup_triggered entries = %d, want 3 (the ceiling refusal writes no fourth trigger)", len(triggeredFinal))
 	}
 }
+
+// --- E68.31 / #3081: the fix-up-recovery marker on the MCP wait/status surfaces ---
+
+// fixupRecoveredView is the local decode-only mirror of the #3081 marker the
+// MCP surfaces carry on a stage wait status. Hand-mirrored (as the sibling
+// views in this file are) so a json-tag drift on either side fails HERE.
+type fixupRecoveredView struct {
+	SourceFailureReason   string `json:"source_failure_reason"`
+	SourceFailureCategory string `json:"source_failure_category"`
+	RestoredState         string `json:"restored_state"`
+	RestoredReviewStageID string `json:"restored_review_stage_id"`
+	DetailsAvailable      bool   `json:"details_available"`
+	Message               string `json:"message"`
+}
+
+type stageWaitStatusView struct {
+	Stage          string              `json:"stage"`
+	Status         string              `json:"status"`
+	FixupRecovered *fixupRecoveredView `json:"fixup_recovered"`
+}
+
+type awaitStageView struct {
+	Status          string               `json:"status"`
+	State           string               `json:"state"`
+	Terminal        bool                 `json:"terminal"`
+	Message         string               `json:"message"`
+	StageWaitStatus *stageWaitStatusView `json:"stage_wait_status"`
+}
+
+type runStatusWaitView struct {
+	ImplementStageWaitStatus *stageWaitStatusView `json:"implement_stage_wait_status"`
+}
+
+// driveFixupToPushGate sets a run up in the push_and_open_pr shape (implement
+// SUCCEEDED, review parked at its gate), records an implement-review concern,
+// triggers the fix-up through the REAL fishhawk-mcp binary, and ships the
+// re-dispatched implement's push_fixup trace so the stage sits `running` behind
+// the #794 forward gate — the exact point from which a /pull-request report
+// decides whether the pass LANDED or was RECOVERED. Returns the two stage rows.
+func driveFixupToPushGate(t *testing.T, ctx context.Context, fx *e2eFixture, session *mcp.ClientSession, auditRepo audit.Repository) (*runpkg.Stage, *runpkg.Stage) {
+	t.Helper()
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 1, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 2, Type: runpkg.StageTypeReview,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+	return impl, review
+}
+
+// callAwaitStageImplement calls fishhawk_await_stage for the run's implement
+// stage through the REAL MCP binary and decodes the response.
+func callAwaitStageImplement(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) awaitStageView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_await_stage",
+		Arguments: map[string]any{
+			"run_id":          runID.String(),
+			"stage":           "implement",
+			"timeout_seconds": 30,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_await_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fishhawk_await_stage returned error: %s", toolContentString(t, result))
+	}
+	var out awaitStageView
+	decodeStructured(t, result, &out)
+	return out
+}
+
+// callGetRunStatusWait calls fishhawk_get_run_status through the REAL MCP
+// binary and decodes just the implement wait-status block.
+func callGetRunStatusWait(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) runStatusWaitView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fishhawk_get_run_status returned error: %s", toolContentString(t, result))
+	}
+	var out runStatusWaitView
+	decodeStructured(t, result, &out)
+	return out
+}
+
+// TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces is the executable form
+// of #3081's done-means, and the seam per-layer units structurally cannot cover:
+// backend recovery writer → Postgres audit chain → MCP audit probe → tool
+// response. It drives a REAL fix-up → re-dispatch FAILURE → backend recovery
+// through the real MCP binary against real Postgres, then asserts BOTH surfaces
+// an operator acts on report the recovery rather than a bare `succeeded`.
+//
+// Without the change, both surfaces report `succeeded` / `terminal: true` and
+// are indistinguishable from a fix-up that landed a commit — the exact defect.
+func TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	impl, review := driveFixupToPushGate(t, ctx, fx, session, auditRepo)
+
+	// The re-dispatched implement FAILS its commit/push step — the backend
+	// recovers the stage to its pre-fix-up good state and writes
+	// stage_fixup_recovered.
+	failPushPRViaBackend(t, ctx, fx, impl.ID)
+
+	// Precondition: the stage really is back to `succeeded`, which is what makes
+	// the bare status misleading.
+	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement): %v", err)
+	}
+	if curImpl.State != runpkg.StageStateSucceeded {
+		t.Fatalf("implement state = %q, want succeeded (restored)", curImpl.State)
+	}
+
+	// Surface 1: fishhawk_await_stage.
+	awaited := callAwaitStageImplement(t, ctx, session, fx.runID)
+	if awaited.Status != "settled" || awaited.State != string(runpkg.StageStateSucceeded) {
+		t.Fatalf("await_stage status/state = %q/%q, want settled/succeeded", awaited.Status, awaited.State)
+	}
+	if awaited.StageWaitStatus == nil || awaited.StageWaitStatus.FixupRecovered == nil {
+		t.Fatalf("await_stage carried no fixup_recovered marker: %+v", awaited.StageWaitStatus)
+	}
+	rec := awaited.StageWaitStatus.FixupRecovered
+	if rec.SourceFailureCategory != "C" {
+		t.Errorf("await_stage source_failure_category = %q, want C", rec.SourceFailureCategory)
+	}
+	if !strings.Contains(rec.SourceFailureReason, "commit/push onto PR branch failed") {
+		t.Errorf("await_stage source_failure_reason = %q, want the backend-recorded reason", rec.SourceFailureReason)
+	}
+	if rec.RestoredState != string(runpkg.StageStateSucceeded) {
+		t.Errorf("await_stage restored_state = %q, want succeeded", rec.RestoredState)
+	}
+	if rec.RestoredReviewStageID != review.ID.String() {
+		t.Errorf("await_stage restored_review_stage_id = %q, want %s", rec.RestoredReviewStageID, review.ID)
+	}
+	if !rec.DetailsAvailable {
+		t.Error("await_stage details_available = false, want true for a well-formed recovery payload")
+	}
+	if awaited.Message == "" {
+		t.Error("await_stage top-level message is empty; a recovered fix-up must not settle silently")
+	}
+
+	// Surface 2: fishhawk_get_run_status.
+	status := callGetRunStatusWait(t, ctx, session, fx.runID)
+	if status.ImplementStageWaitStatus == nil {
+		t.Fatal("get_run_status carried no implement_stage_wait_status")
+	}
+	if status.ImplementStageWaitStatus.Status != "succeeded" {
+		t.Errorf("get_run_status status = %q, want succeeded (the bucket vocabulary must NOT move)", status.ImplementStageWaitStatus.Status)
+	}
+	srec := status.ImplementStageWaitStatus.FixupRecovered
+	if srec == nil {
+		t.Fatalf("get_run_status carried no fixup_recovered marker: %+v", status.ImplementStageWaitStatus)
+	}
+	if srec.SourceFailureCategory != "C" {
+		t.Errorf("get_run_status source_failure_category = %q, want C", srec.SourceFailureCategory)
+	}
+	if !strings.Contains(srec.SourceFailureReason, "commit/push onto PR branch failed") {
+		t.Errorf("get_run_status source_failure_reason = %q", srec.SourceFailureReason)
+	}
+}
+
+// TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker is the companion CONTROL
+// on the SAME path: a fix-up that genuinely LANDS a commit must leave both
+// surfaces byte-identical to today. Without it, a marker that fired
+// unconditionally would pass the test above.
+func TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	impl, _ := driveFixupToPushGate(t, ctx, fx, session, auditRepo)
+
+	// The fix-up LANDS: the /pull-request report carries fixup_pushed, driving
+	// the stage terminal with no recovery entry written.
+	succeedFixupPushViaBackend(t, ctx, fx, impl.ID)
+
+	recovered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(recovered): %v", err)
+	}
+	if len(recovered) != 0 {
+		t.Fatalf("stage_fixup_recovered entries = %d, want 0 for a fix-up that landed", len(recovered))
+	}
+
+	awaited := callAwaitStageImplement(t, ctx, session, fx.runID)
+	if awaited.Status != "settled" {
+		t.Fatalf("await_stage status = %q, want settled", awaited.Status)
+	}
+	if awaited.StageWaitStatus != nil && awaited.StageWaitStatus.FixupRecovered != nil {
+		t.Errorf("await_stage carried a fixup_recovered marker for a fix-up that LANDED: %+v", awaited.StageWaitStatus.FixupRecovered)
+	}
+	if awaited.Message != "" {
+		t.Errorf("await_stage message = %q, want empty on an ordinary settled response", awaited.Message)
+	}
+
+	status := callGetRunStatusWait(t, ctx, session, fx.runID)
+	if status.ImplementStageWaitStatus != nil && status.ImplementStageWaitStatus.FixupRecovered != nil {
+		t.Errorf("get_run_status carried a fixup_recovered marker for a fix-up that LANDED: %+v", status.ImplementStageWaitStatus.FixupRecovered)
+	}
+}

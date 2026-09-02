@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 234 identifiers, not 3
+## Exported surface: why 270 identifiers, not 3
 
-The package presents **234** exported top-level identifiers, but only the three
-above are intended entry points. The other 231 are the tool I/O
+The package presents **270** exported top-level identifiers, but only the three
+above are intended entry points. The other 267 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -49,7 +49,7 @@ main` their exportedness was cosmetic; the move to a library package makes it
 real. They are deliberately NOT unexported (that refusal is correct — see
 #2408); instead `export_surface_test.go` pins the full sorted surface against a
 baseline generated from the tree, so a NEW export is caught in either direction
-while the pre-existing 231 are grandfathered.
+while the pre-existing ones are grandfathered. (The figure above is a snapshot; `TestExportedSurfaceMatchesBaseline`'s count-mismatch message names this heading as a site to update when it moves.)
 
 ## Tool reference and internals
 
@@ -123,6 +123,20 @@ The six-value `stage_wait_status.status` is a coarser **BUCKET** than the raw st
 The table enumerates every state that exists today, but the mapping is a **rule**, not an enumeration: `running` maps to `running`, the four terminal states map to themselves, and every other state — including one added after this table was written — falls to `pending`, the conservative keep-polling default, so a new backend state never strands a caller on a bucket it does not recognize. `stage_wait_test.go`'s `TestClassifyStageWaitStatus_MappingTable` pins the table against the `run.StageState` constants themselves (a renamed state breaks the build, a re-bucketed one fails the test) and `tools_test.go`'s `TestToolDescriptions_CursorAndStageVocabulary` asserts every pair is on the wire description. `docs/api/v0.openapi.yaml` and `docs/api/v0.md` carry the reciprocal pointer back here.
 
 `superseded` (E64.2 / [#3083](https://github.com/kuhlman-labs/fishhawk/issues/3083)) gets its OWN terminal bucket rather than being laundered into `succeeded` or `cancelled`. A merge made the stage UNREACHABLE — it neither passed nor was halted by an operator, and reporting either would be the same dishonesty the state exists to end. Two consequences worth naming. It is a **wire-visible addition to a documented enum**: additive (no existing value changes meaning), but a strict client that switch-exhausts on the bucket set sees a value it does not know. And `stage_wait.go`'s `stageStateIsTerminal` carries its own string literals — it deliberately does NOT import `backend/internal/run`, so `run.StageState.IsTerminal()` cannot keep it honest — which is why a terminal state the backend learns must be added here BY HAND; without it `fishhawk_await_stage` polls its whole timeout on a stage that can never move again. `TestStageStateIsTerminal_Superseded` pins both halves (the terminal predicate AND the bucket).
+
+### `fixup_recovered`: a fix-up that never landed still reads `succeeded` (E68.31 / [#3081](https://github.com/kuhlman-labs/fishhawk/issues/3081))
+
+When a fix-up re-dispatch FAILS, the backend RESTORES the implement stage to its prior good state and appends a truthful `stage_fixup_recovered` audit entry ([#788](https://github.com/kuhlman-labs/fishhawk/issues/788)). The stage genuinely is `succeeded` again — so `fishhawk_await_stage` and `fishhawk_get_run_status` reported a bare `succeeded` / `terminal: true`, **indistinguishable from a fix-up that landed a commit**, while the PR head still carried the pre-fix-up commit and the routed concerns were never addressed. The truth was already in the audit chain; only the reporting surface was at fault.
+
+`StageWaitStatus` therefore carries an OPTIONAL `fixup_recovered` block (`FixupRecovery`: `source_failure_reason`, `source_failure_category`, `restored_state`, `restored_review_stage_id`, `details_available`, `message`). Because that block is the one `implement_stage_wait_status` (get_run_status), `stage_wait_status` (await_stage) and the dispatch/run verbs already carry, ONE field reaches every surface. `fishhawk_await_stage` additionally promotes the marker's advisory to the response's top-level `message` on a settled implement stage, so a caller reading only the settled summary cannot miss it.
+
+- **Firing rule (`latestFixupRecovery`, pure).** The marker fires IFF a `stage_fixup_recovered` entry for the stage is sequenced **strictly after** the most-recent `stage_fixup_triggered` entry for that same stage; the NEWEST such entry wins. It is nil with no triggers, nil with no recovery entries (**the primary control** — a fix-up that genuinely landed writes none, so its output is byte-identical to before), and nil when every recovery predates the latest trigger (**the self-clearing control** — a LATER pass superseded it, so an operator who retried and succeeded sees the marker disappear rather than a stale warning). The sequence-window scoping mirrors what `server.countFixupInfraRefunds` and this package's `fixupInfraRefunds` already do.
+- **The `status` bucket was deliberately NOT changed.** Re-bucketing `succeeded` into a new value would be a breaking wire change for every consumer that switch-exhausts on the mapping table above — which is total and pinned against the `run.StageState` constants. Honesty belongs in a new field, not in redefining an existing enum value, so the marker is purely ADDITIVE and `omitempty`: a marker-less block serializes with no `fixup_recovered` key at all.
+- **An UNDECODABLE payload still FIRES the marker**, with `details_available: false` and empty detail fields. The recovery demonstrably happened (the entry exists); suppressing on a bad payload would restore exactly the silence this closes. `details_available` is deliberately NOT `omitempty` — the `false` is the load-bearing signal.
+- **Best-effort probe.** `runResolver.fixupRecoveryFor` reuses the EXISTING `ListRunAudit` reads, the EXISTING `categoryStageFixupTriggered` / `categoryStageFixupRecovered` constants and the EXISTING `fixupPassesAndLatestSeq` helper — no new REST surface, no new audit category. ANY list error returns nil, so a transient audit failure LOSES the advisory rather than failing an hours-long `fishhawk_await_stage` or a status snapshot. The per-entry `stage_id` double-check mirrors every sibling fix-up helper, so a recovery on a DIFFERENT stage is never attributed here. The `source_failure_reason` is capped at `fixupRecoveryReasonCap` (512 bytes) so a long runner error cannot perturb the `get_run_status` byte budget.
+- **Implement-only cost gate.** No other stage type can carry a fix-up, so the probe runs only when the awaited/resolved stage type is `implement`; an ordinary plan / review / acceptance wait issues no extra audit read at all.
+- **Budget: the marker STATES the current rule, it does not change it.** The message says a category-A (agent) or category-B (policy) fix-up failure **CONSUMES** a fix-up pass, and only a category-C failure that delivered nothing to the PR branch is refunded ([#1957](https://github.com/kuhlman-labs/fishhawk/issues/1957) — the delivered-nothing invariant). Whether a failed pass SHOULD consume budget is a separate tracked question; nothing here alters the accounting.
+- **Honest residual.** The marker is MCP-DERIVED. The REST stage row (`GET /v0/runs/{run_id}` `stages[].state`) still reads a plain `succeeded`, so a REST-only consumer is unchanged by this — it must read the `stage_fixup_recovered` audit entry itself.
 
 ### `run.completion_blocked`: why a merged run is still `running` (E64.2 / [#3083](https://github.com/kuhlman-labs/fishhawk/issues/3083))
 
