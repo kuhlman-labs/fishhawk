@@ -590,6 +590,64 @@ func TestAutoDriveRunGate_RouteFixupBudgetExhausted(t *testing.T) {
 	}
 }
 
+// TestAutoFixup_CrashRefundAdmitsPass: the auto-driver's route_fixup arm must
+// agree with the HTTP handler on the NEW #3085 category-A refund. One prior pass
+// that died category-A having pushed nothing is refunded against the normal
+// budget, so the delegated arm ACTS rather than parking the operator with
+// decision_required fixup_budget_exhausted.
+func TestAutoFixup_CrashRefundAdmitsPass(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	seedFixupPass(t, au, runID, impl.ID, 1) // trigger at sequence 1000
+	seedFixupRecoveredC(au, runID, impl.ID, run.FailureA, 1002)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (the category-A death refunds the pass)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+}
+
+// TestAutoFixup_InfraRefundAdmitsPass exists SPECIFICALLY because an
+// implementation could satisfy the category-A test above while still omitting
+// category C: before #3085 the auto-driver counted ONLY the #967 no-change
+// refund (countFixupNoChangeRefunds), so it already diverged from the HTTP
+// handler by missing the #1957 category-C refund entirely. Routing it through
+// the shared chokepoint fixes that pre-existing gap; this test is what detects a
+// regression of it.
+func TestAutoFixup_InfraRefundAdmitsPass(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	seedFixupPass(t, au, runID, impl.ID, 1) // trigger at sequence 1000
+	seedFixupRecoveredC(au, runID, impl.ID, run.FailureC, 1002)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (the category-C death refunds the pass)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+}
+
 // TestAutoDriveRunGate_RouteFixupCeilingReached asserts the DISTINCT hard-ceiling
 // sentinel maps to DecisionState=fixup_ceiling_reached (nil error) — the state
 // the operator override can never push past — rather than being collapsed into

@@ -43,7 +43,7 @@ func seedFixupNoChangesAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
 
 // seedDispatchReaperFailedAudit appends a dispatch_reaper_failed audit entry
 // keyed to stageID carrying failure_category — the #1747 spawn-phase reaper
-// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// death signal fixupRefundedPasses evaluates against a trigger window (#1957). A
 // failure_category of "C" refunds a normal pass; any other category does not.
 func seedDispatchReaperFailedAudit(fb *fakeBackend, runID, stageID uuid.UUID, failureCategory string) {
 	sid := stageID.String()
@@ -61,7 +61,7 @@ func seedDispatchReaperFailedAudit(fb *fakeBackend, runID, stageID uuid.UUID, fa
 
 // seedStageFixupRecoveredAudit appends a stage_fixup_recovered audit entry keyed
 // to stageID carrying source_failure_category — the #788 post-agent-work recovery
-// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// death signal fixupRefundedPasses evaluates against a trigger window (#1957). A
 // source_failure_category of "C" refunds a normal pass; any other does not.
 func seedStageFixupRecoveredAudit(fb *fakeBackend, runID, stageID uuid.UUID, sourceFailureCategory string) {
 	sid := stageID.String()
@@ -79,7 +79,7 @@ func seedStageFixupRecoveredAudit(fb *fakeBackend, runID, stageID uuid.UUID, sou
 
 // seedInfraSignalUnparseable appends a dispatch_reaper_failed audit entry whose
 // payload is a JSON array — it fails to decode into the failure_category struct,
-// so fixupInfraRefunds must skip it without error and never refund (#1957).
+// so fixupRefundedPasses must skip it without error and never refund (#1957).
 func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
 	sid := stageID.String()
 	fb.mu.Lock()
@@ -96,7 +96,7 @@ func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
 
 // seedRecoveredSignalUnparseable appends a stage_fixup_recovered audit entry
 // whose payload is a JSON array — it fails to decode into the
-// source_failure_category struct, so fixupInfraRefunds must skip it without
+// source_failure_category struct, so fixupRefundedPasses must skip it without
 // error and never refund (#1957). The recovered-shape analog of
 // seedInfraSignalUnparseable, so the skip guard is exercised on BOTH signal
 // branches, not just the reaper one.
@@ -417,19 +417,35 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:           true,
 		},
 		{
-			// #1957 (d'): the category gate guards the RECOVERED branch too,
-			// not just the reaper branch — a non-C (category A)
-			// stage_fixup_recovered signal inside a window must NOT refund.
-			// Without this, a recovered-block regression that refunded
-			// regardless of source_failure_category would still pass case (b)
-			// (recovered-C refunds) and case (d) (which only exercises the
-			// reaper branch), leaving the recovered category-gate untested.
-			name:                "recovered category-A in window does not refund -> override",
+			// #3085: the recovered branch's category gate now admits "A"
+			// alongside "C" — a harness death that pushed nothing delivered
+			// nothing, which is the same invariant #1957 encodes with a
+			// different cause. This case previously asserted the OPPOSITE
+			// (category A does not refund); it is updated deliberately, and the
+			// gate is still pinned in the non-refunding direction by the
+			// category-B case below.
+			name:                "recovered category-A in window refunds -> normal budget",
 			status:              completeStatus(),
 			seedConcerns:        1,
 			infraRounds:         1,
 			infraSignalKind:     "recovered",
 			infraSignalCategory: "A",
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       1,
+			wantOverride:        false,
+		},
+		{
+			// #3085: category B (policy) is a verdict on DELIVERED work, not a
+			// delivery failure, so it must still CONSUME a pass. This is what
+			// keeps the widened category gate from being written so broadly
+			// that it swallows B — the direction the case above no longer pins.
+			name:                "recovered category-B in window does not refund -> override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         1,
+			infraSignalKind:     "recovered",
+			infraSignalCategory: "B",
 			wantNil:             false,
 			wantConcerns:        1,
 			wantRemaining:       0,
@@ -616,7 +632,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			}
 			// Interleaved infra rounds: each trigger immediately followed by a
 			// signal sequenced strictly inside its window, so the per-window
-			// pairing in fixupInfraRefunds can match it (consecutive triggers
+			// pairing in fixupRefundedPasses can match it (consecutive triggers
 			// would leave no integer sequence between them).
 			infraCat := tc.infraSignalCategory
 			if infraCat == "" {
@@ -851,14 +867,123 @@ func TestReviewActionHintFor_LegacyPeerNoScalar(t *testing.T) {
 	}
 }
 
-// TestFixupInfraRefunds_OneRefundPerTriggerWindow pins the #1987 round-2
-// review concern (761fb56d): fixupInfraRefunds must count AT MOST ONE refund
-// per trigger window, even when multiple category-C death signals land inside
-// the SAME window. Two reaper-death signals are seeded, both sequenced inside
-// the first trigger window (the second window is empty); without the inner
-// break at review_action_hint.go:520 every signal in a window would count,
-// yielding 2 refunds for one fix-up pass instead of 1.
-func TestFixupInfraRefunds_OneRefundPerTriggerWindow(t *testing.T) {
+// seedFixupPushedAudit appends a fixup_pushed audit entry keyed to stageID — the
+// PUSH VETO signal (#3085). A trigger window holding one of these DELIVERED a
+// commit to the PR branch, so fixupRefundedPasses must refund nothing for that
+// window however the pass later died.
+func seedFixupPushedAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryFixupPushed,
+		Payload:  map[string]any{"head_sha": "cafebabe"},
+	})
+	fb.mu.Unlock()
+}
+
+// TestFixupRefundedPasses_MixedSignalWindowRefundsOnce is the MCP mirror of the
+// backend's mixed-signal test (#3085) — the defect the SUMMED design could not
+// pass. One trigger window holding BOTH a category-A recovery and a category-C
+// reaper death must refund exactly ONCE; two independently summed counters
+// contribute 2 and surface a budget the backend refuses to honor. TWO raw
+// triggers are used so a clamp against priorPasses cannot mask the double count.
+func TestFixupRefundedPasses_MixedSignalWindowRefundsOnce(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// Both signals land at sequences 1 and 2; window (0, 3) holds both and
+	// window (3, +inf) is empty.
+	seedStageFixupRecoveredAudit(fb, runID, stageID, "A")
+	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+
+	r := newResolver(srv, nil)
+	refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{0, 3})
+	if err != nil {
+		t.Fatalf("fixupRefundedPasses: %v", err)
+	}
+	if refunds != 1 {
+		t.Errorf("refunds = %d, want 1 (one window refunds ONCE however many signal KINDS land in it)", refunds)
+	}
+}
+
+// TestReviewActionHint_CategoryARefundSurfacesBudget: a category-A
+// delivered-nothing recovery must surface remaining_fixup_budget 1 and
+// override_available false — agreeing with the backend, which ADMITS the next
+// pass without force_additional_pass (#3085). Before this change the mirror read
+// remaining 0 / override true and taught the operator to burn the override.
+func TestReviewActionHint_CategoryARefundSurfacesBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	seedStageFixupRecoveredAudit(fb, runID, stageID, "A")
+	seedImplementReviewedAudit(fb, runID, stageID, 1)
+
+	r := newResolver(srv, nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+	if err != nil {
+		t.Fatalf("reviewActionHintFor: %v", err)
+	}
+	if hint == nil {
+		t.Fatal("hint = nil, want a route-back pointer")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("RemainingFixupBudget = %d, want 1 (the category-A death refunded the pass)", hint.RemainingFixupBudget)
+	}
+	if hint.OverrideAvailable {
+		t.Errorf("OverrideAvailable = true, want false — the normal budget is intact, no override is needed")
+	}
+}
+
+// TestReviewActionHint_PushVetoesRefund pins the mirror's PUSH VETO on BOTH the
+// A and the C signal, so the hint's veto matches the backend's (#3085). A pass
+// that landed a commit and then died delivered SOMETHING, so it consumes budget:
+// the mirror must surface remaining 0 / override available, not a phantom
+// refunded pass the backend would refuse.
+func TestReviewActionHint_PushVetoesRefund(t *testing.T) {
+	for _, cat := range []string{"A", "C"} {
+		t.Run("category_"+cat, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			stageID := uuid.New()
+
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedFixupPushedAudit(fb, runID, stageID)
+			seedStageFixupRecoveredAudit(fb, runID, stageID, cat)
+			seedImplementReviewedAudit(fb, runID, stageID, 1)
+
+			r := newResolver(srv, nil)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+			if err != nil {
+				t.Fatalf("reviewActionHintFor: %v", err)
+			}
+			if hint == nil {
+				t.Fatal("hint = nil, want a budget-exhausted pointer")
+			}
+			if hint.RemainingFixupBudget != 0 {
+				t.Errorf("RemainingFixupBudget = %d, want 0 (the pass PUSHED, so it consumes budget)", hint.RemainingFixupBudget)
+			}
+			if !hint.OverrideAvailable {
+				t.Errorf("OverrideAvailable = false, want true — the budget is spent and the ceiling has headroom")
+			}
+		})
+	}
+}
+
+// TestFixupRefundedPasses_OneRefundPerTriggerWindow pins the #1987 round-2
+// review concern (761fb56d), re-pointed at the unioned helper (#3085):
+// fixupRefundedPasses must count AT MOST ONE refund per trigger window, even
+// when multiple category-C death signals land inside the SAME window. Two
+// reaper-death signals are seeded, both sequenced inside the first trigger
+// window (the second window is empty); without the inner break every signal in
+// a window would count, yielding 2 refunds for one fix-up pass instead of 1.
+func TestFixupRefundedPasses_OneRefundPerTriggerWindow(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -869,9 +994,9 @@ func TestFixupInfraRefunds_OneRefundPerTriggerWindow(t *testing.T) {
 	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
 
 	r := newResolver(srv, nil)
-	refunds, err := r.fixupInfraRefunds(context.Background(), runID, stageID, []int64{0, 3})
+	refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{0, 3})
 	if err != nil {
-		t.Fatalf("fixupInfraRefunds: %v", err)
+		t.Fatalf("fixupRefundedPasses: %v", err)
 	}
 	if refunds != 1 {
 		t.Errorf("refunds = %d, want 1 (at most one refund per trigger window despite two in-window signals)", refunds)
