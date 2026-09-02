@@ -279,8 +279,12 @@ What IS claimed, and what the hermetic tests assert:
 > it was deliberately given and that home's contents.
 
 A reported value is a ROUTE iff its resolved form EQUALS the resolved real
-`CODEX_HOME` or is UNDER it, or embeds it as a path token inside a composite
-value (`--config=<real home>/auth.json`, a `PATH`-style list, a path in JSON).
+`CODEX_HOME` or is UNDER it, or some path-shaped TOKEN extracted from a
+composite value (`--config=<real home>/auth.json`, a `PATH`-style list, a path
+in JSON) does. The order is EXTRACT, then CLEAN/RESOLVE, then apply the
+exemption — never elide the synthesized home's TEXT first, which would accept
+`--config=<confined home>/../auth.json` (the exempt prefix substituted away, the
+`..` never resolved) and an embedded symlink pointing back into the real home.
 An ANCESTOR is NOT a route: `${TMPDIR}` does not grant access to a credential
 nested inside it, and the child legitimately reports `TMPDIR`, `HOME` and other
 ancestors.

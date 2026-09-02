@@ -188,11 +188,13 @@ func TestHelperProcess(t *testing.T) {
 		// it sees and that directory's entries, the config files it would load
 		// and the filesystem grants it parses out of them), ATTEMPT the read of
 		// $CODEX_HOME/auth.json (recording bytes + sha256, never the bytes
-		// themselves), and then — in the two mutating variants — rewrite its own
-		// copy of auth.json so the copy-back controls have something to observe.
-		// The child is told NO path it could not derive itself; the PARENT owns
-		// every comparison. Then emit the normal happy transcript so the adapter
-		// still decodes a verdict.
+		// themselves), and — in the two mutating variants — rewrite its own copy
+		// of auth.json so the copy-back controls have something to observe. The
+		// mutation runs BEFORE the report is serialized and its OUTCOME is
+		// carried in the report, so the parent can prove the attack HAPPENED
+		// before asserting it was refused. The child is told NO path it could
+		// not derive itself; the PARENT owns every comparison. Then emit the
+		// normal happy transcript so the adapter still decodes a verdict.
 		mutate := ""
 		switch os.Getenv("HELPER_MODE") {
 		case "confinement_probe_refresh":

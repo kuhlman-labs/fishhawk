@@ -93,6 +93,24 @@ type authRead struct {
 	Err    string `json:"err"`
 }
 
+// mutationResult is the OUTCOME of the child's attempt to rewrite its OWN copy
+// of auth.json, and it is LOAD-BEARING rather than decorative. A copy-back
+// refusal test that asserts only "the operator's file still holds the fixture
+// bytes" passes IDENTICALLY when the guard correctly refuses the write and when
+// the write never happened at all — the helper's mode mapping removed, or the
+// os.WriteFile failing. Those two are indistinguishable from the operator's file
+// alone, which makes such a test a shape assertion wearing a behavioural name.
+// So the child reports whether the bad-shape bytes actually LANDED in its
+// confined copy (with a read-back digest), and the parent asserts the ATTACK
+// OCCURRED before it asserts the attack was REFUSED. Order matters.
+type mutationResult struct {
+	Attempted bool   `json:"attempted"`
+	OK        bool   `json:"ok"`
+	Bytes     int    `json:"bytes"`
+	SHA256    string `json:"sha256"`
+	Err       string `json:"err"`
+}
+
 // probeReport is what the fake `codex` child records about ITSELF. It is told no
 // path it could not derive on its own; the parent owns every comparison.
 type probeReport struct {
@@ -106,7 +124,8 @@ type probeReport struct {
 	CodexHome  pathPair   `json:"codex_home"`
 	Entries    []string   `json:"entries"`
 	Configs    []configLoad
-	Auth       authRead `json:"auth"`
+	Auth       authRead       `json:"auth"`
+	Mutation   mutationResult `json:"mutation"`
 }
 
 // resolvePair records s raw plus its EvalSymlinks form (empty when unresolvable).
@@ -192,15 +211,35 @@ func writeConfinementProbeReport(mutate string) {
 		rep.Auth = authRead{OK: true, Bytes: len(data), SHA256: hex.EncodeToString(sum[:])}
 	}
 
+	// The mutation runs BEFORE the report is serialized so its outcome can be
+	// carried in the report. Written the other way round the parent has no way
+	// to tell a refused write from a write that was never attempted.
+	if mutate != "" {
+		rep.Mutation.Attempted = true
+		switch err := os.WriteFile(authPath, []byte(mutate), 0o600); {
+		case err != nil:
+			rep.Mutation.Err = "write: " + err.Error()
+		default:
+			back, rerr := os.ReadFile(authPath)
+			switch {
+			case rerr != nil:
+				rep.Mutation.Err = "read-back: " + rerr.Error()
+			case string(back) != mutate:
+				rep.Mutation.Err = "read-back did not match the bytes written"
+			default:
+				sum := sha256.Sum256(back)
+				rep.Mutation.OK = true
+				rep.Mutation.Bytes = len(back)
+				rep.Mutation.SHA256 = hex.EncodeToString(sum[:])
+			}
+		}
+	}
+
 	body, err := json.Marshal(rep)
 	if err != nil {
 		return
 	}
 	_ = os.WriteFile(dest, body, 0o600)
-
-	if mutate != "" {
-		_ = os.WriteFile(authPath, []byte(mutate), 0o600)
-	}
 }
 
 // envValues returns the VALUE half of each KEY=VALUE entry. Names are not
@@ -303,9 +342,10 @@ func newRouteSpec(realHome string, confinedHome pathPair) routeSpec {
 // A reported value is a ROUTE iff, for some spelling R of the resolved real
 // CODEX_HOME:
 //
-//	PATH FORM      — v's own resolved (or cleaned) form EQUALS R, or is UNDER R;
-//	COMPOSITE FORM — v CONTAINS R as a substring, after every occurrence of the
-//	                 synthesized home has been elided.
+//	PATH FORM      — v's own cleaned (or symlink-resolved) form EQUALS R, or is
+//	                 UNDER R;
+//	COMPOSITE FORM — some path-shaped TOKEN extracted from v, once cleaned and
+//	                 symlink-resolved, EQUALS R or is UNDER R.
 //
 // An ANCESTOR IS NOT A ROUTE. ${TMPDIR} does not grant access to a credential
 // nested inside it, and the child legitimately reports TMPDIR, HOME and other
@@ -316,85 +356,107 @@ func newRouteSpec(realHome string, confinedHome pathPair) routeSpec {
 // a PATH-style list, or a path embedded in JSON — yet the claim covers exactly
 // those.
 //
-// THE SINGLE EXEMPTION is the synthesized home and its contents: it is elided
-// before the substring test, and a path under it is not a finding.
+// THE SINGLE EXEMPTION is the synthesized home and its contents, and it is
+// applied ONLY AFTER the candidate path has been normalised — never to the raw
+// TEXT of the value. Eliding the confined home's text first would accept
+// `--config=<confined home>/../auth.json`: the exempt prefix is substituted away
+// and the `..` is never resolved, though the parsed path lands squarely in the
+// real CODEX_HOME. The same blind spot swallows an embedded SYMLINK, which only
+// resolves once it has been extracted from its surroundings. So the order is
+// EXTRACT, then CLEAN/RESOLVE, then decide.
 func (rs routeSpec) isRoute(v pathPair) (bool, string) {
 	for _, form := range []string{v.Raw, v.Resolved} {
 		if form == "" {
 			continue
 		}
-		cleaned := filepath.Clean(form)
-		exempt := false
-		for _, c := range rs.confined {
-			if coversPath(c, cleaned) {
-				exempt = true
-				break
+		if route, why := rs.classify(form); route {
+			return true, "path form " + why + ": " + form
+		}
+		for _, tok := range pathTokens(form) {
+			if tok == form {
+				continue // already decided by the path form above
 			}
-		}
-		if !exempt {
-			for _, r := range rs.real {
-				if coversPath(r, cleaned) {
-					return true, "path form resolves under the real CODEX_HOME " + r + ": " + form
-				}
-			}
-		}
-
-		// Composite: elide the exempt synthesized home, then look for the real
-		// home anywhere inside what remains.
-		elided := form
-		for _, c := range rs.confined {
-			elided = strings.ReplaceAll(elided, c, "<exempt-synthesized-home>")
-		}
-		for _, r := range rs.real {
-			if containsPathToken(elided, r) {
-				return true, "composite value embeds the real CODEX_HOME " + r + ": " + form
+			if route, why := rs.classify(tok); route {
+				return true, "composite value embeds " + tok + ", which " + why + ": " + form
 			}
 		}
 	}
 	return false, ""
 }
 
-// containsPathToken reports whether token occurs inside s as a whole path token
-// rather than as a bare substring: the occurrence must be bounded on BOTH sides
-// by something that does not continue a filename segment (a separator, a quote,
-// a list delimiter, whitespace, or the ends of the string).
+// classify NORMALISES p first — cleaning `..` traversals, and resolving symlinks
+// where the path exists — and only then applies the exemption and the route
+// test. It reports why p is a route, or false.
 //
-// This is what keeps the composite check from firing on "/home/u/.codex-backup"
-// for the token "/home/u/.codex" — a sibling directory the real home does not
-// cover. Without it the substring test would produce a FALSE RED, which trains
-// the next reader to disbelieve the sweep.
-func containsPathToken(s, token string) bool {
-	if token == "" {
-		return false
+// Every form of p is judged independently: a path whose CLEANED form sits inside
+// the synthesized home but whose RESOLVED form escapes into the real home is a
+// route on the strength of the resolved form. Exemption suppresses only the form
+// it actually covers.
+func (rs routeSpec) classify(p string) (bool, string) {
+	if p == "" {
+		return false, ""
 	}
-	for i := 0; ; {
-		j := strings.Index(s[i:], token)
-		if j < 0 {
-			return false
+	for _, form := range normalizations(p) {
+		exempt := false
+		for _, c := range rs.confined {
+			if coversPath(c, form) {
+				exempt = true
+				break
+			}
 		}
-		at := i + j
-		end := at + len(token)
-		if !continuesSegment(s, at-1) && !continuesSegment(s, end) {
-			return true
+		if exempt {
+			continue
 		}
-		i = at + 1
+		for _, r := range rs.real {
+			if coversPath(r, form) {
+				return true, "normalises to " + form + ", under the real CODEX_HOME " + r
+			}
+		}
 	}
+	return false, ""
 }
 
-// continuesSegment reports whether the byte at index i (out of range = no) is a
-// character that continues a filename segment.
-func continuesSegment(s string, i int) bool {
-	if i < 0 || i >= len(s) {
+// normalizations returns p cleaned, plus its EvalSymlinks form when the path
+// exists and differs. Cleaning is what turns a `..` traversal into the path it
+// actually names; symlink resolution is what turns a link inside the confined
+// home into the real-home path it points at.
+func normalizations(p string) []string {
+	out := []string{filepath.Clean(p)}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		if c := filepath.Clean(r); c != out[0] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// pathTokens splits a composite value into the candidate filesystem paths
+// embedded in it, cutting on the characters that separate a path from its
+// surroundings in the shapes this claim covers: a flag's `=` assignment, a
+// `:`-delimited PATH-style list, JSON punctuation and quoting, and whitespace.
+// Only tokens carrying a separator are returned — the rest cannot be paths.
+//
+// Tokenizing rather than substring-matching is also what keeps the composite
+// check off "/home/u/.codex-backup/auth.json" for a real home of
+// "/home/u/.codex": the token is compared COMPONENT-WISE by coversPath, so a
+// sibling directory sharing a string prefix is not a finding and the clean
+// baseline stays GREEN.
+func pathTokens(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', '=', ':', ',', ';', '"', '\'', '`',
+			'{', '}', '[', ']', '(', ')', '<', '>', '|', '&', '?', '*':
+			return true
+		}
 		return false
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if strings.ContainsRune(f, filepath.Separator) {
+			out = append(out, f)
+		}
 	}
-	b := s[i]
-	switch {
-	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
-		return true
-	case b == '-', b == '_', b == '.', b == '~', b == '+', b == '@':
-		return true
-	}
-	return false
+	return out
 }
 
 // sweepRoutes returns one finding per reported value that is a route to the real
@@ -527,6 +589,27 @@ func (r *probeRun) assertExemptionHolds(t *testing.T) {
 	}
 	if !strings.HasPrefix(filepath.Base(home), "fishhawk-confined-") {
 		t.Fatalf("child CODEX_HOME base = %q, want the `fishhawk-confined-` prefix", filepath.Base(home))
+	}
+}
+
+// assertProbeMutationLanded proves THE ATTACK HAPPENED, and must be called
+// before any assertion that the attack was refused. Without it, a refusal test
+// reading only the operator's file cannot distinguish "the guard refused" from
+// "no mutation was ever attempted" — the helper's mode mapping deleted, or the
+// child's os.WriteFile failing — and would stay GREEN in both.
+func (r *probeRun) assertProbeMutationLanded(t *testing.T, want string) {
+	t.Helper()
+	m := r.report.Mutation
+	if !m.Attempted {
+		t.Fatalf("the probe attempted NO mutation of its confined auth.json: nothing was refused, so a refusal assertion here would pass VACUOUSLY (helper mode mapping missing?)")
+	}
+	if !m.OK {
+		t.Fatalf("the probe's mutation of its confined auth.json did NOT land (%s): nothing was refused, so a refusal assertion here would pass VACUOUSLY", m.Err)
+	}
+	sum := sha256.Sum256([]byte(want))
+	if wantSum := hex.EncodeToString(sum[:]); m.Bytes != len(want) || m.SHA256 != wantSum {
+		t.Fatalf("the probe wrote %d bytes sha256 %s into its confined auth.json, want the %d-byte %s — the mutation under test is not the one this test names",
+			m.Bytes, m.SHA256, len(want), wantSum)
 	}
 }
 
@@ -698,8 +781,12 @@ func TestCredentialCopyBack_ProbeMutationReachesOperatorFile(t *testing.T) {
 // the mutually-unsatisfiable twin: the probe writes a CHANGED top-level key set,
 // which guardCredentialShape must refuse BEFORE the credential lock is taken. No
 // single implementation state passes both this and the refresh case.
+//
+// ORDER IS THE POINT: prove the attack HAPPENED, then prove it was REFUSED. The
+// operator's file alone cannot tell the two apart — see mutationResult.
 func TestCredentialCopyBack_ProbeShapeViolationLeavesOperatorFileByteIdentical(t *testing.T) {
 	r := runConfinementProbe(t, "confinement_probe_badshape")
+	r.assertProbeMutationLanded(t, probeAuthBadShape)
 
 	got, err := os.ReadFile(r.authPath)
 	if err != nil {
@@ -801,10 +888,56 @@ func TestSweepRoutes_NoticesWholeValueAndCompositeExposures(t *testing.T) {
 			name:   "resolved-only exposure (raw form is clean)",
 			report: probeReport{Env: []pathPair{{Raw: "/link", Resolved: realHome + "/auth.json"}}},
 		},
+		{
+			// The exemption must be applied AFTER normalisation. Eliding the
+			// confined home's TEXT first substitutes the exempt prefix away and
+			// never resolves the `..`, so this traversal — which lands in the
+			// real home — would be accepted.
+			name:   "composite `..` traversal out of the confined home into the real one",
+			report: probeReport{Args: []pathPair{{Raw: "--config=" + confined + "/../auth.json"}}},
+		},
+		{
+			name:   "PATH-style list whose entry traverses out of the confined home",
+			report: probeReport{Env: []pathPair{{Raw: "/usr/bin:" + confined + "/../bin:/bin"}}},
+		},
 	}
 	for _, c := range exposures {
 		if got := spec.sweepRoutes(c.report, c.argv); len(got) == 0 {
 			t.Errorf("%s: the sweep saw NO route — this exposure is unpinned", c.name)
 		}
+	}
+
+	// A composite whose EMBEDDED path is a SYMLINK resolving into the real home.
+	// This one needs a real filesystem: EvalSymlinks over the WHOLE composite
+	// never resolves (it is not a path), and the link only resolves once it has
+	// been extracted from `--config=`. Eliding the confined home's text first
+	// hides it completely — the link's own spelling is inside the exempt home.
+	realDir := filepath.Join(t.TempDir(), ".codex")
+	confinedDir := filepath.Join(realDir, "fishhawk-confined-abc")
+	if err := os.MkdirAll(confinedDir, 0o700); err != nil {
+		t.Fatalf("mkdir confined dir: %v", err)
+	}
+	realAuth := filepath.Join(realDir, "auth.json")
+	if err := os.WriteFile(realAuth, []byte(probeAuthFixture), 0o600); err != nil {
+		t.Fatalf("plant real auth.json: %v", err)
+	}
+	link := filepath.Join(confinedDir, "operator-auth-link")
+	if err := os.Symlink(realAuth, link); err != nil {
+		t.Fatalf("symlink into the real home: %v", err)
+	}
+	liveSpec := newRouteSpec(realDir, pathPair{Raw: confinedDir})
+
+	// Control: the confined home's own real contents stay GREEN under the same
+	// spec, so the case below cannot be green-by-accident on a spec that flags
+	// everything.
+	ownFile := filepath.Join(confinedDir, "config.toml")
+	if err := os.WriteFile(ownFile, []byte("# confined\n"), 0o600); err != nil {
+		t.Fatalf("plant confined config.toml: %v", err)
+	}
+	if got := liveSpec.sweepRoutes(probeReport{Args: []pathPair{{Raw: "--config=" + ownFile}}}, nil); len(got) != 0 {
+		t.Errorf("a composite naming the confined home's OWN file produced findings (a FALSE RED): %v", got)
+	}
+	if got := liveSpec.sweepRoutes(probeReport{Args: []pathPair{{Raw: "--config=" + link}}}, nil); len(got) == 0 {
+		t.Error("composite whose embedded path is a symlink resolving into the real home: the sweep saw NO route — this escape is unpinned")
 	}
 }
