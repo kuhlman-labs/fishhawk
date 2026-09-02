@@ -263,14 +263,72 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 			t.Errorf("warning = %q, want a note naming %s", warn, acceptancePreviewCmdEnv)
 		}
 	})
-	t.Run("empty expected head SHA -> proceed with warning", func(t *testing.T) {
+	// (l) #3091: an unresolvable expectation REFUSES. The assertion is on the
+	// refusal IDENTITY (the named reason) and on an EMPTY warning, not merely on
+	// non-nil: a warning-plus-nil-refusal is exactly the shipped defect this
+	// closes, so a test asserting only "something came back" would stay green
+	// against it.
+	t.Run("empty expected head SHA -> refuse", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: ""}
 		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
-		if refusal != nil {
-			t.Fatalf("refusal = %+v, want proceed (never hard-fail a missing expectation)", refusal)
+		if refusal == nil {
+			t.Fatalf("refusal = nil (warn=%q), want an %s refusal", warn, acceptanceReasonHeadUnresolved)
 		}
-		if warn == "" {
-			t.Error("warning = empty, want a proceed-unverified warning")
+		if warn != "" {
+			t.Errorf("warning = %q, want empty — a refusal must not also warn-and-proceed", warn)
+		}
+		if !strings.Contains(refusal.Detail, acceptanceReasonHeadUnresolved) {
+			t.Errorf("detail = %q, want it to name %s", refusal.Detail, acceptanceReasonHeadUnresolved)
+		}
+		if refusal.TargetHost != "localhost:8090" {
+			t.Errorf("refusal.TargetHost = %q, want the declared host", refusal.TargetHost)
+		}
+		if refusal.ExpectedHeadSHA != "" {
+			t.Errorf("refusal.ExpectedHeadSHA = %q, want empty (there is none)", refusal.ExpectedHeadSHA)
+		}
+		if refusal.Remediation == "" {
+			t.Error("remediation = empty, want the operator action that unblocks the dispatch")
+		}
+	})
+	// (m) ORDERING: the preview-cmd proceed branch must NOT outrank the
+	// unresolved-head refusal — a provision command cannot provision an unknown
+	// head. Same inputs as (l) plus the env var set.
+	t.Run("empty expected head SHA with preview cmd set -> still refuse", func(t *testing.T) {
+		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: ""}
+		env := map[string]string{acceptancePreviewCmdEnv: "scripts/dev preview"}
+		refusal, warn := newResolver(env).checkAcceptanceTarget(context.Background(), adm)
+		if refusal == nil {
+			t.Fatalf("refusal = nil (warn=%q), want the %s refusal to outrank the preview-cmd proceed branch",
+				warn, acceptanceReasonHeadUnresolved)
+		}
+		if !strings.Contains(refusal.Detail, acceptanceReasonHeadUnresolved) {
+			t.Errorf("detail = %q, want it to name %s", refusal.Detail, acceptanceReasonHeadUnresolved)
+		}
+		if strings.Contains(warn, acceptancePreviewCmdEnv) {
+			t.Errorf("warning = %q, want no preview-cmd proceed note on a refusal", warn)
+		}
+	})
+	// (n) the #3091 stale-slot criterion at the verb layer: a REACHABLE in-test
+	// /healthz serving head A against an admission expecting head B must draw a
+	// refusal naming BOTH SHAs. The target is reachable by construction, so an
+	// unreachable-address explanation cannot green this either way.
+	t.Run("stale slot -> refuse naming expected vs got", func(t *testing.T) {
+		const servedSHA = "9f2c1ab" // head A: a valid >=7-char sha, NOT a prefix of probeExpectedSHA
+		ts := healthzServer(t, http.StatusOK, `{"git_sha":"`+servedSHA+`"}`)
+		host := hostOf(ts.URL)
+		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		if refusal == nil {
+			t.Fatalf("refusal = nil (warn=%q), want a stale refusal against a REACHABLE target", warn)
+		}
+		if !strings.Contains(refusal.Detail, probeExpectedSHA) {
+			t.Errorf("detail = %q, want it to name the EXPECTED head %s", refusal.Detail, probeExpectedSHA)
+		}
+		if !strings.Contains(refusal.Detail, servedSHA) {
+			t.Errorf("detail = %q, want it to name the GOT git_sha %s", refusal.Detail, servedSHA)
+		}
+		if refusal.TargetHost != host || refusal.ExpectedHeadSHA != probeExpectedSHA {
+			t.Errorf("refusal = %+v, want host %q + expected head %q", refusal, host, probeExpectedSHA)
 		}
 	})
 	t.Run("probe verified -> proceed", func(t *testing.T) {

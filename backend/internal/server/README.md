@@ -3078,6 +3078,97 @@ positive `TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable
 and is present whenever the two differ, for either reason; `downgrade_basis` and
 `retired_criterion_ids` stay gated on an actual retirement.
 
+### Head binding: the consolidated fan-in fallback and the unbound-head clamp (#3091)
+
+An acceptance verdict is only meaningful if it names the tree it validated. Two
+holes let a `passed` be recorded with `head_sha: ""`, and both are closed here.
+
+**Why a decomposed parent resolved no head at all.** `resolveNewestReportedHeadSHA`
+(and therefore `resolveAcceptanceExpectedHeadSHA`) reads the run's OWN
+reported-head ledger — `pull_request_opened` / `child_pushed` / `fixup_pushed`.
+A DECOMPOSED PARENT writes NONE of them on its own chain: each child's push
+lands on the CHILD's chain (see the decomposition-awareness note on
+`buildReportedHeadLedger`), and the consolidated PR is opened by
+`orchestrator.maybeOpenConsolidatedPR`, whose `consolidated_pr_opened` payload
+carries a `pull_request_url` and no SHA. So the ledger answered `""`, the
+acceptance-admission endpoint shipped an empty `expected_head_sha`, and the
+dispatch gates warned-and-proceeded.
+
+`resolveConsolidatedFanInHeadSHA` supplies the missing head from the parent's own
+`integration_commit_recorded` entries (`lineageIntegrationCommitCategory`, #1806):
+the fan-in emits one per "Integrate slice N" merge the instant it is created, and
+each such merge commit becomes the consolidated branch tip, so the
+highest-SEQUENCE `merge_sha` IS the consolidated head. Ordering is by sequence,
+not timestamp — the fan-in writes these within one pass, and the dispatch-anchored
+caller compares against a sequence anchor.
+
+Three properties are deliberate:
+
+- **Strictly SUBORDINATE.** `acceptanceHeadForRun` returns the reported head
+  verbatim whenever one resolves; the fallback fires only on `""`. A
+  non-decomposed run's answer is byte-identical to before
+  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`).
+- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` and
+  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened — they are
+  shared with the branch-lineage guard and the audit-check publisher, and
+  widening them would silently change head resolution for surfaces this has
+  nothing to do with. `resolveFixupExpectedHeadSHA` is unaffected
+  (`TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry`).
+- **DISPATCH-SEQUENCE-BOUNDED on the validated-head path.**
+  `acceptanceValidatedHeadSHA` applies the fallback with `bounded=true` against
+  the same `dispatchSeq` anchor its reported-head walk uses, so a fan-in merge
+  recorded AFTER the acceptance dispatch can never re-bind the verdict to a tree
+  the stage did not validate
+  (`TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`).
+
+**The unbound-head clamp.** Resolution can still legitimately answer `""` — a
+bare operator ship with no `acceptance_dispatched` anchor, an unreadable ledger,
+a fan-in that recorded no merge. `handleShipAcceptance` therefore runs one final
+rewrite after the #2581 retirement downgrade and the #2512 row aggregation: when
+`validatedHead == ""` the recorded verdict is raised through the SAME
+severity-monotone `acceptanceVerdictAtLeast` ladder to `undecidable`, and
+`undecidable_basis: head_unresolved` is attached to the
+`acceptance_outcome_recorded` payload.
+
+- **Ladder position and DIRECTION.** `passed (0) < undecidable (1) < failed (2)`.
+  Because the clamp is a `max` against `undecidable`, a shipped `failed` can
+  never be softened — that is a property of the operation, not of a branch that
+  could be inverted. Pinned in both directions by
+  `TestShipAcceptance_EmptyHead_PassClampedToUndecidable` and
+  `TestShipAcceptance_EmptyHead_FailedNotSoftened`.
+- **It runs LAST** because an unbound head invalidates whatever the row
+  aggregation concluded about the tree.
+- **It does NOT override a #2581 retirement neutralization.** When the downgrade
+  fired, the recorded `passed` is not the agent's claim about a tree — it is the
+  operator's approval-time decision that the failing criteria no longer apply,
+  and #2581 fixes its outcome at `passed`; clamping it would silently undo a
+  decision the operator already governed
+  (`TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_...` in
+  `backend/internal/integration/mcp` pins that arm end to end). The residual is
+  deliberate and stated plainly: a neutralized pass can still be recorded on a
+  run whose validated head did not resolve. Every OTHER unbound `passed` — the
+  agent's own — is clamped.
+- **The basis is attached only when the clamp rewrote the verdict,** so a shipped
+  `failed` on an unbound head carries no `undecidable_basis` it did not earn.
+- **`undecidable_basis` is its own key,** distinct from the #2581
+  `downgrade_basis`, which keeps its retirement meaning; both are omitted when
+  they did not fire, so an outcome with a resolvable head marshals
+  byte-identically to before. `effectiveVerdict` is recomputed AFTER the clamp,
+  so `verdict_reported` carries the agent's shipped verdict on a clamped outcome.
+- **No new downstream state.** `undecidable` already maps to the
+  `undecidable` render vocabulary, routes no triage (#2512), and is
+  merge-eligible-with-acknowledgement — so the operator-visible change is that an
+  unbound run must be acknowledged at the merge gate instead of reading
+  "accepted".
+
+**Both dispatch gates now fail CLOSED on an unresolvable expectation.** The
+verb-side gate (`backend/internal/mcpserver/acceptance_target.go`) refuses with
+`acceptance_expected_head_unresolved` BEFORE its `FISHHAWK_ACCEPTANCE_PREVIEW_CMD`
+proceed branch (a provision command cannot provision an unknown head), and the
+runner's `acceptanceTargetGate` fails the stage category-C with the same reason
+before provisioning. A refused acceptance is recoverable in seconds; an
+unfalsifiable `passed` is not recoverable at all.
+
 **`undecidable` is SERVER-DERIVED and UNFORGEABLE.** The ship endpoint's
 top-level verdict enum still admits only `passed`/`failed` — that switch is
 deliberately INCOMPLETE with respect to the `acceptanceVerdict*` constant set, and

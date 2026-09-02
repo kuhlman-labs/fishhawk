@@ -763,8 +763,11 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				// stale STOPS the drive resumably (acceptance_needs_target) without
 				// record-act or spawn, so the stage stays awaiting_host_dispatch and a
 				// re-invocation with the same run_id dispatches cleanly once the
-				// operator provisions the target. Verified/unverifiable/no-hosts/
-				// preview-cmd-set/empty-SHA all proceed (nil refusal).
+				// operator provisions the target. An UNRESOLVED expected head stops
+				// the drive the same way (#3091,
+				// acceptance_expected_head_unresolved) instead of proceeding
+				// unverified. Verified/unverifiable/no-hosts/preview-cmd-set all
+				// proceed (nil refusal).
 				if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
 					out.StepsTaken = append(out.StepsTaken, DriveStep{
 						Kind: "dispatch", Stage: "acceptance", Delegated: false,

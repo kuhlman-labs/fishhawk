@@ -352,8 +352,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		// THIS HOST BEFORE recording any spawn evidence. Unreachable/stale refuses
 		// here, ahead of the (5a) record-act AND the (5c) host-dispatch marker, so
 		// nothing is recorded and the stage stays awaiting_host_dispatch/pending
-		// for a clean re-dispatch. Every proceed outcome (verified / unverifiable /
-		// no hosts / preview-cmd-set / empty-SHA) returns nil and falls through.
+		// for a clean re-dispatch. An UNRESOLVED expected head refuses here too
+		// (#3091, acceptance_expected_head_unresolved) — it used to fall through
+		// with a warning, which let the stage record a verdict bound to no tree.
+		// Every proceed outcome (verified / unverifiable / no hosts /
+		// preview-cmd-set) returns nil and falls through.
 		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
 			var stageWaitStatus *StageWaitStatus
 			if fetchErr := func() error {

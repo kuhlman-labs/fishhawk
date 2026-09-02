@@ -534,9 +534,11 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// HOST (the runner's network position) BEFORE spawning. Unreachable/stale
 		// refuses to spawn here, ahead of the host-dispatch marker and any spawn
 		// evidence, so the stage stays awaiting_host_dispatch/pending for a clean
-		// re-dispatch. Verified / unverifiable / no-hosts / preview-cmd-set /
-		// empty-SHA all proceed (checkAcceptanceTarget returns nil), preserving
-		// runner parity and the #1928 fail-open contract.
+		// re-dispatch. An UNRESOLVED expected head refuses here too (#3091,
+		// acceptance_expected_head_unresolved) rather than proceeding unverified.
+		// Verified / unverifiable / no-hosts / preview-cmd-set all proceed
+		// (checkAcceptanceTarget returns nil), preserving runner parity and the
+		// #1928 fail-open contract for the branches that remain fail-open.
 		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
 			stageState := ""
 			var stageWaitStatus *StageWaitStatus
