@@ -393,3 +393,83 @@ func TestVouchCommit_RepublishFailure_Still200WithWarning(t *testing.T) {
 		t.Error("operator_commit_vouched entry not recorded; the vouch must succeed independently of the re-post")
 	}
 }
+
+// vouchAuditCount returns how many operator_commit_vouched entries were appended.
+func vouchAuditCount(au *auditFake) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryOperatorCommitVouched {
+			n++
+		}
+	}
+	return n
+}
+
+// TestVouchCommit_RepeatVouchRetriesRepublish pins binding condition 1c — the
+// sanctioned idempotent retry — end to end through handleVouchCommit, which
+// diff-only review could not confirm: re-invoking fishhawk_vouch_commit on an
+// ALREADY-VOUCHED sha REACHES a second republish attempt (the handler neither
+// refuses nor dedups a repeat vouch short of the re-post). The first vouch's
+// re-post fails (200, republished:false, warning); the second vouch of the SAME
+// sha succeeds (200, republished:true, no warning) and re-fires the Check Run at
+// the vouched head. Without a reachable second attempt the documented first-class
+// recovery would be unreachable behind a doc claim.
+func TestVouchCommit_RepeatVouchRetriesRepublish(t *testing.T) {
+	creator := &vouchCheckCreator{err: errBoom}
+	s, au, runID := newVouchRepublishServer(t, creator)
+
+	// First vouch: the re-post fails; the vouch still succeeds with a warning.
+	w1 := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "sync-schemas remediation commit"}, withVouchOperator)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first vouch status = %d, want 200:\n%s", w1.Code, w1.Body.String())
+	}
+	var resp1 vouchCommitResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal first: %v", err)
+	}
+	if resp1.AuditCheckRepublished {
+		t.Fatalf("first vouch audit_check_republished = true, want false (re-post failed):\n%s", w1.Body.String())
+	}
+
+	// The publisher records only SUCCESSES, so the failed first attempt left the
+	// dedup cache empty. The seam recovers; re-invoke the vouch on the SAME sha.
+	creator.mu.Lock()
+	creator.err = nil
+	callsAfterFirst := len(creator.calls)
+	creator.mu.Unlock()
+
+	w2 := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "retry the dropped audit-check re-post"}, withVouchOperator)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second vouch status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var resp2 vouchCommitResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal second: %v", err)
+	}
+	if !resp2.AuditCheckRepublished {
+		t.Errorf("second vouch audit_check_republished = false, want true (re-vouch retries the re-post):\n%s", w2.Body.String())
+	}
+	if resp2.AuditCheckRepublishWarning != "" {
+		t.Errorf("second vouch warning non-empty on success: %q", resp2.AuditCheckRepublishWarning)
+	}
+
+	creator.mu.Lock()
+	defer creator.mu.Unlock()
+	// The repeat vouch REACHED a second republish attempt — not refused/deduped.
+	if len(creator.calls) <= callsAfterFirst {
+		t.Fatalf("check run creations did not increase on re-vouch: %d then %d (repeat vouch never reached the re-post)",
+			callsAfterFirst, len(creator.calls))
+	}
+	if got := creator.calls[len(creator.calls)-1].HeadSHA; got != vouchedSHA {
+		t.Errorf("re-vouch check run head_sha = %q, want the vouched sha %q", got, vouchedSHA)
+	}
+	// Two operator_commit_vouched entries were recorded: the handler does not
+	// refuse a repeat vouch of the same sha (which would make 1c unreachable).
+	if n := vouchAuditCount(au); n != 2 {
+		t.Errorf("operator_commit_vouched entries = %d, want 2 (repeat vouch is not refused)", n)
+	}
+}

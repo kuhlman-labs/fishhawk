@@ -1139,15 +1139,22 @@ func seedMergeConflictRun(t *testing.T, s *Server, repo *autoDriveRepo, runID uu
 	s.cfg.GitHub = gh
 }
 
-// TestMergeRunConflictingPRRefused (m1) pins the dirty-state refusal: a PR with
-// mergeable_state=="dirty" returns 409 merge_conflicting with the resolution
-// path. Counterfactual c1: deleting the prMergeConflicting call site in
-// handleMergeRun turns this RED (the POST returns 200 and dispatches).
+// TestMergeRunConflictingPRRefused (m1) pins the dirty-state refusal AS A
+// DISCRIMINATING signal: a PR with mergeable==TRUE (so the documented boolean
+// does NOT indicate a conflict) and mergeable_state=="dirty" still returns 409
+// merge_conflicting with the resolution path. Because mergeable is true here,
+// `dirty` is the ONLY conflicting signal — deleting the `MergeableState ==
+// "dirty"` predicate in prMergeConflicting turns THIS test RED (the POST returns
+// 200 and dispatches), which the earlier mergeable:false fixture could not show
+// (mergeable:false independently fired the refusal, and is pinned separately by
+// m2 / TestMergeRun_ConflictMergeableFalse). Counterfactual c1: deleting the
+// prMergeConflicting call site OR the dirty predicate turns this RED.
 func TestMergeRunConflictingPRRefused(t *testing.T) {
 	merger := &fakeMerger{}
 	s, repo, au := newAutoDriveMergeServer(t, merger)
 	runID := uuid.New()
-	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "dirty"})
+	// mergeable:TRUE with state "dirty" — dirty is the SOLE conflicting signal.
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "true", mergeableState: "dirty"})
 	seedMergeConflictRun(t, s, repo, runID, gh)
 
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
