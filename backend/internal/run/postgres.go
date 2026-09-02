@@ -685,10 +685,20 @@ func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to Sta
 		// `failed → succeeded` is admissible ONLY through the recovery
 		// table — it must never leak into the ordinary path, where it would
 		// fake success.
+		// The merge-supersede edge (→ superseded, #3083) is admitted here
+		// too, and it is the one arm of this union that is TYPE-AWARE: it
+		// is consulted with the ROW-LOCKED stage's own stage_type, so the
+		// default-deny (stage_type, state) pair table is enforced at this
+		// boundary rather than only inside the sweep that calls it. That
+		// matters because `superseded` is terminal — completeRun's #968
+		// guard passes it — so a caller reaching the repository directly
+		// with a state-only premise could otherwise sweep a `pending` plan
+		// stage and fabricate a `succeeded` run around work never done.
 		if !ValidStageTransition(from, to) &&
 			!ValidStageFixupTransition(from, to) &&
 			!ValidStageFixupRecoveryTransition(from, to) &&
-			!ValidStageReviseTransition(from, to) {
+			!ValidStageReviseTransition(from, to) &&
+			!ValidStageMergeSupersedeTransition(StageType(current.StageType), from, to) {
 			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
 		}
 
