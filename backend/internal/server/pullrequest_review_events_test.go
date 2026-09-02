@@ -54,6 +54,16 @@ type prEventsRunRepo struct {
 	// children). Left nil, a DecomposedFrom query returns no children — the
 	// single-run economics path every existing consumer of this fake relies on.
 	decomposedResult []*run.Run
+
+	// beforeCAS, when non-nil, runs inside TransitionStageFrom BEFORE the
+	// compare-and-swap evaluates its expected-vs-current check, holding r.mu.
+	// It is how the transition-first-then-audit ordering test seeds a CAS
+	// refusal BY CONSTRUCTION: the hook flips the stage's current state in the
+	// window between the sweep's classification and its CAS, exactly as a
+	// concurrent writer would, so the RED lands on the behavioral assertion
+	// (zero audit rows) and never on a fixture-setup failure. Mirrors
+	// run.casMemRepo's hook in failure_test.go.
+	beforeCAS func(id uuid.UUID)
 }
 
 type prEventsTransition struct {
@@ -159,6 +169,16 @@ func (r *prEventsRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to ru
 		// Same-state no-op: not recorded as an effective transition.
 		return &run.Stage{ID: id, State: to}, nil
 	}
+	if cur.IsTerminal() {
+		// Terminal is terminal (E64.2 / #3083). The real repository's
+		// ValidStageTransition has no arc OUT of a terminal state, so a fake
+		// that silently relabels one is more permissive than production —
+		// and that permissiveness is not neutral: it makes a reordering that
+		// supersedes a stage the merge path is about to mark `succeeded`
+		// invisible to every test here, because the later relabel would
+		// quietly paper over it. Refusing keeps the fake honest.
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(cur), To: string(to)}
+	}
 	r.curState[id] = to
 	r.transitions = append(r.transitions, prEventsTransition{StageID: id, To: to})
 	return &run.Stage{ID: id, State: to}, nil
@@ -176,6 +196,44 @@ func (r *prEventsRunRepo) seedStateLocked(id uuid.UUID) run.StageState {
 	}
 	return ""
 }
+
+// TransitionStageFrom is the compare-and-swap sibling of TransitionStage,
+// modelling run.StageCASTransitioner (repository.go): it refuses with a typed
+// run.StageStateChangedError when the row's current state is not the `from`
+// the caller pinned, and applies the move otherwise. The merge-supersede sweep
+// (merge_supersede.go) REQUIRES this capability — a repo that does not
+// implement it sweeps nothing — so the fake must provide it for the sweep to
+// be exercised at all.
+func (r *prEventsRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.beforeCAS != nil {
+		// Concurrent-writer window: runs BEFORE the expected-vs-current check.
+		r.beforeCAS(id)
+	}
+	if r.transErr != nil {
+		return nil, r.transErr
+	}
+	if r.curState == nil {
+		r.curState = map[uuid.UUID]run.StageState{}
+	}
+	cur, ok := r.curState[id]
+	if !ok {
+		cur = r.seedStateLocked(id)
+		r.curState[id] = cur
+	}
+	if cur != from {
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: cur}
+	}
+	r.curState[id] = to
+	r.transitions = append(r.transitions, prEventsTransition{StageID: id, To: to})
+	return &run.Stage{ID: id, State: to}, nil
+}
+
+// compile-time proof that the fake carries the capability the sweep requires.
+// Without it supersedeParkedStagesOnMerge warn-logs and sweeps NOTHING, so
+// every sweep assertion below would pass vacuously against an inert sweep.
+var _ run.StageCASTransitioner = (*prEventsRunRepo)(nil)
 
 // prEventsAuditRepo captures AppendChained calls so tests can assert
 // on category + payload shape. It also serves a seeded chain via ListForRun
@@ -1576,5 +1634,347 @@ func TestStampEconomicsIntoPRBody_MissingPRURLSkips(t *testing.T) {
 	defer stub.mu.Unlock()
 	if stub.getCalled || stub.patchCalled {
 		t.Errorf("run without PR URL must skip GitHub; get=%v patch=%v", stub.getCalled, stub.patchCalled)
+	}
+}
+
+// --- E64.2 / #3083: the merge-supersede sweep on the merged paths ---
+//
+// A merge can leave a stage permanently unreachable rather than failed: a
+// fix-up pass re-parks acceptance at awaiting_host_dispatch, the PR then
+// merges, nothing re-dispatches the stage, and Orchestrator.completeRun's
+// #968 guard correctly refuses to complete the run around it. The sweep
+// terminalizes exactly the default-deny-table-admissible parked stages as
+// `superseded` so the Advance on the same pass completes the run.
+
+// The supersede assertions below reuse countCategory (above) and are
+// EXACTLY-ONE assertions, not at-least-one: a duplicated row is as much a
+// defect as a missing one.
+
+// stageStateByID reads the fake repo's live stage state, which is what the
+// transitions actually committed — asserting on COMMITTED STATE rather than
+// on a returned error, per the counterfactual contract's trap (a).
+func stageStateByID(t *testing.T, rr *prEventsRunRepo, runID, stageID uuid.UUID) run.StageState {
+	t.Helper()
+	sts, err := rr.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, st := range sts {
+		if st.ID == stageID {
+			return st.State
+		}
+	}
+	t.Fatalf("stage %s not found on run %s", stageID, runID)
+	return ""
+}
+
+// mergeSweepFixture seeds the shape the issue describes and returns a server
+// wired with a REAL orchestrator, so the completion re-evaluation the sweep
+// exists to unblock is genuinely exercised rather than stubbed.
+func mergeSweepFixture(t *testing.T, stages []*run.Stage) (*Server, *prEventsRunRepo, *prEventsAuditRepo, uuid.UUID) {
+	t.Helper()
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	for _, st := range stages {
+		st.RunID = runID
+	}
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, State: run.StateRunning, PullRequestURL: &prURL}},
+		stages:     map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	ar := &prEventsAuditRepo{}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    ar,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, rr, ar, runID
+}
+
+// TestResolveReviewStageOnMerge_SupersedesParkedAcceptanceAndCompletesRun is
+// THE primary shape — the exact situation that stranded four live runs. It
+// asserts across every layer the sweep touches in one pass: the acceptance
+// stage's COMMITTED state is `superseded`, exactly one
+// stage_superseded_by_merge row names it with its from-state and the
+// merge_observed reason, and the RUN reached terminal succeeded on the same
+// pass (which is only possible because the sweep ran BEFORE the Advance).
+func TestResolveReviewStageOnMerge_SupersedesParkedAcceptanceAndCompletesRun(t *testing.T) {
+	acceptanceID := uuid.New()
+	reviewID := uuid.New()
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateAwaitingHostDispatch},
+		{ID: reviewID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage state = %q, want superseded", got)
+	}
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 1 {
+		t.Fatalf("stage_superseded_by_merge rows = %d, want exactly 1", n)
+	}
+	row := findCategory(ar.appended, CategoryStageSupersededByMerge)
+	if row.StageID == nil || *row.StageID != acceptanceID {
+		t.Errorf("audit row stage_id = %v, want the acceptance stage %s", row.StageID, acceptanceID)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal supersede payload: %v", err)
+	}
+	if payload["stage_type"] != string(run.StageTypeAcceptance) {
+		t.Errorf("payload stage_type = %v, want acceptance", payload["stage_type"])
+	}
+	if payload["from_state"] != string(run.StageStateAwaitingHostDispatch) {
+		t.Errorf("payload from_state = %v, want awaiting_host_dispatch", payload["from_state"])
+	}
+	if payload["reason"] != supersedeReasonMergeObserved {
+		t.Errorf("payload reason = %v, want %s", payload["reason"], supersedeReasonMergeObserved)
+	}
+	// THE POINT: the run completes on this same pass. Without the sweep the
+	// #968 guard refuses around the parked acceptance stage and the run stays
+	// `running` with a merged PR — the defect this change closes.
+	if got := rr.runStates[runID]; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded", got)
+	}
+}
+
+// TestResolveReviewStageOnMerge_ReviewStageSucceededNotSuperseded pins that
+// the review stage this path resolves itself ends `succeeded`, never
+// `superseded` — the two are NOT interchangeable, one says the change was
+// accepted and the other says the gate was dissolved.
+//
+// COUNTERFACTUAL RECORD (approval condition 2(b)). The operator was right,
+// and it was settled empirically rather than by argument: an earlier draft
+// passed the resolved review stage's id as skipStageID, and DELETING that
+// argument left this test GREEN. The sweep runs AFTER the review stage has
+// already transitioned to `succeeded`, and the default-deny table admits
+// review only at `awaiting_approval`, so the classification denies the stage
+// whether or not it was skipped. The dead argument was therefore NOT shipped
+// — the call site passes nil.
+//
+// This test survives that removal because it pins the OUTCOME, not the
+// mechanism, and it is attainable against two live mutations:
+//
+//  1. Hoisting the sweep ABOVE the review-stage transition in
+//     resolveReviewStageOnMerge. That is the one reordering that makes the
+//     stage classifiable (review@awaiting_approval IS a table row): the sweep
+//     supersedes it, the subsequent transition to `succeeded` is then an
+//     invalid transition out of a terminal state, and this goes RED.
+//  2. Widening the sweep's default-deny check (merge_supersede.go's
+//     run.MergeSupersedable call) to a state-only or unconditional predicate,
+//     which claims the review stage too. That is the mutation the sibling
+//     TestResolveReviewStageOnMerge_LeavesRunningImplementStageUntouched
+//     pins from the other side.
+func TestResolveReviewStageOnMerge_ReviewStageSucceededNotSuperseded(t *testing.T) {
+	acceptanceID := uuid.New()
+	reviewID := uuid.New()
+	s, rr, _, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateAwaitingHostDispatch},
+		{ID: reviewID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if got := stageStateByID(t, rr, runID, reviewID); got != run.StageStateSucceeded {
+		t.Errorf("review stage state = %q, want succeeded (the merge path resolves it; the sweep must not claim it)", got)
+	}
+	// The sibling stage the sweep IS meant to take, so a vacuously-inert
+	// sweep cannot green the assertion above.
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage state = %q, want superseded (sweep must be live for this test to discriminate)", got)
+	}
+}
+
+// TestResolveReviewStageOnMerge_LeavesRunningImplementStageUntouched is the
+// #968 invariant pinned FROM THE SWEEP SIDE. A merge must never terminalize a
+// stage that is genuinely still working: an implement stage at `running` is
+// not unreachable, it is in flight, and superseding it would let completeRun
+// stamp the run `succeeded` around work that never finished.
+//
+// Discriminating mutation: widening the default-deny table (or dropping the
+// run.MergeSupersedable check in the sweep) to admit `running`.
+func TestResolveReviewStageOnMerge_LeavesRunningImplementStageUntouched(t *testing.T) {
+	implementID := uuid.New()
+	reviewID := uuid.New()
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: implementID, Type: run.StageTypeImplement, State: run.StageStateRunning},
+		{ID: reviewID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if got := stageStateByID(t, rr, runID, implementID); got != run.StageStateRunning {
+		t.Errorf("implement stage state = %q, want running (a merge must not terminalize in-flight work)", got)
+	}
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 0 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 0", n)
+	}
+	// And the run correctly does NOT complete: the #968 guard still refuses
+	// around the non-terminal implement stage.
+	if got := rr.runStates[runID]; got == run.StateSucceeded {
+		t.Errorf("run state = %q, want the completion guard to still refuse around the running implement stage", got)
+	}
+}
+
+// TestResolveReviewStageOnMerge_NoAuditRowWhenCASRefuses pins TRANSITION-FIRST
+// ORDERING. The audit chain is append-only, so a row written before a
+// compare-and-swap that then refuses would be an immutable record of a
+// supersession that never happened. The failure mode must be a MISSING row,
+// never a false one.
+//
+// The refusal is seeded BY CONSTRUCTION, not by calling the control: the
+// beforeCAS hook flips the acceptance stage to `failed` inside
+// TransitionStageFrom, in exactly the window a concurrent writer would use,
+// so the CAS finds a current state that is not the `from` the sweep pinned.
+//
+// Discriminating mutation: moving appendStageSupersededAudit ahead of the
+// TransitionStageFrom call in merge_supersede.go.
+func TestResolveReviewStageOnMerge_NoAuditRowWhenCASRefuses(t *testing.T) {
+	acceptanceID := uuid.New()
+	reviewID := uuid.New()
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateAwaitingHostDispatch},
+		{ID: reviewID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	})
+	rr.beforeCAS = func(id uuid.UUID) {
+		if id != acceptanceID {
+			return
+		}
+		// Concurrent writer lands between the sweep's classification and
+		// its CAS. Caller holds r.mu, so write curState directly.
+		if rr.curState == nil {
+			rr.curState = map[uuid.UUID]run.StageState{}
+		}
+		rr.curState[acceptanceID] = run.StageStateFailed
+	}
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 0 {
+		t.Fatalf("stage_superseded_by_merge rows = %d, want 0 — a refused CAS must leave a MISSING row, never a false one", n)
+	}
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateFailed {
+		t.Errorf("acceptance stage state = %q, want failed (the CAS must refuse rather than overwrite the concurrent writer)", got)
+	}
+	// The merge itself still resolved — the sweep is a best-effort tail and
+	// never unwinds the resolution or its audit row.
+	if findCategory(ar.appended, "pr_merged") == nil {
+		t.Error("pr_merged row missing: a refused sweep must not unwind the merge resolution")
+	}
+}
+
+// TestResolveReviewStageOnMerge_ClosedWithoutMergeSweepsNothing pins that the
+// sweep is bound to MERGE, not to PR closure. A change that was closed
+// without merging leaves no stage unreachable-because-merged: the run
+// resolves to cancelled and the parked acceptance stage must keep its state,
+// so a reopened-and-remerged change is still dispatchable.
+//
+// Discriminating mutation: hoisting the sweep out of the merged branch to the
+// top of resolveReviewStageOnMerge (or adding it to the closed-unmerged tail).
+func TestResolveReviewStageOnMerge_ClosedWithoutMergeSweepsNothing(t *testing.T) {
+	acceptanceID := uuid.New()
+	reviewID := uuid.New()
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateAwaitingHostDispatch},
+		{ID: reviewID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		false, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("acceptance stage state = %q, want awaiting_host_dispatch (a close without merge sweeps nothing)", got)
+	}
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 0 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 0", n)
+	}
+	if got := stageStateByID(t, rr, runID, reviewID); got != run.StageStateCancelled {
+		t.Errorf("review stage state = %q, want cancelled", got)
+	}
+}
+
+// TestResolveReviewStageOnMerge_NoReviewStage_SupersedesParkedAcceptance
+// covers the SECOND merged path — the implement-only shape (routine_change
+// and friends) that has no review stage at all. It can still hold an
+// acceptance stage re-parked at awaiting_host_dispatch by a fix-up pass, and
+// it strands for exactly the same reason, so the same sweep runs there with a
+// nil skipStageID (this path owns no stage).
+func TestResolveReviewStageOnMerge_NoReviewStage_SupersedesParkedAcceptance(t *testing.T) {
+	acceptanceID := uuid.New()
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateAwaitingHostDispatch},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage state = %q, want superseded", got)
+	}
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 1 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want exactly 1", n)
+	}
+	// The conditional Advance fired because the sweep moved something, so the
+	// run completes on this same pass rather than waiting for an operator.
+	if got := rr.runStates[runID]; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded", got)
+	}
+}
+
+// TestResolveReviewStageOnMerge_NoReviewStage_NothingSwept_NoAdvance pins the
+// CONDITIONAL on that path's Advance. The no-review-stage branch has never
+// driven the orchestrator — an implement-only run completes when its last
+// stage settles — so an unconditional Advance here would be a behavior change
+// for every implement-only merge. Gating it on a non-empty sweep keeps the
+// untouched shape byte-identical.
+//
+// Discriminating mutation: dropping the `if len(moved) > 0` guard so the
+// Advance runs unconditionally — this run's stages are all terminal, so the
+// orchestrator would complete it and rr.runStates would gain an entry,
+// turning the assertion below RED.
+func TestResolveReviewStageOnMerge_NoReviewStage_NothingSwept_NoAdvance(t *testing.T) {
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 0 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 0 (nothing was supersedable)", n)
+	}
+	if _, advanced := rr.runStates[runID]; advanced {
+		t.Errorf("orchestrator Advance ran on a merge that swept nothing (run state recorded as %q); the implement-only shape must stay byte-identical", rr.runStates[runID])
+	}
+	// The merge itself still resolved.
+	if findCategory(ar.appended, "pr_merged") == nil {
+		t.Error("pr_merged row missing on the no-review-stage merged path")
 	}
 }
