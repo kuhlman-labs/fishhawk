@@ -8754,10 +8754,22 @@ func loadScopeExemptions(cfg config, declared []string, logSink io.Writer) []sco
 	raw, err := readSidecarBounded(path)
 	if err != nil {
 		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file —
+			// a parent directory that denies write, a filesystem error — would
+			// otherwise survive silently and be re-read by a later pass, so a failed
+			// removal gets its own scope_justification_unremovable line BESIDE the
+			// oversize line: a path we could not read and could not remove are two
+			// distinct facts an operator needs both of. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"scope_justification_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 				cfg.runID, cfg.stageID, path, maxSidecarBytes)
-			_ = os.Remove(path)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"scope_justification_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
 			return nil
 		}
 		// Absent sidecar is the common no-op (strict gate, no exemptions); any
@@ -9294,11 +9306,21 @@ func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSel
 			// Over the ceiling (E64.12 / #3106): log the named diagnostic AND
 			// remove the sidecar by hand — this return is reached BEFORE the
 			// deferred removal below is installed, so an oversize file would
-			// otherwise survive on disk. The fail-closed zero result is unchanged.
+			// otherwise survive on disk. The removal result is CHECKED (#3106
+			// fix-up): a readable-but-unremovable file would otherwise survive
+			// silently and be re-read by a later pass, so a failed removal gets its
+			// own fixup_selfreport_unremovable line BESIDE the oversize line — a
+			// path we could not read and could not remove are two distinct facts.
+			// The fail-closed zero result is unchanged.
+			rmErr := os.Remove(path)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_selfreport_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 				cfg.runID, cfg.stageID, path, maxSidecarBytes)
-			_ = os.Remove(path)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_selfreport_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
 			return fixupSelfReportResult{}
 		}
 		// Absent sidecar is the common no-op (the agent reported nothing); any
@@ -9650,10 +9672,20 @@ func loadFixupCommitMessage(cfg config, logSink io.Writer) (subject, body string
 	raw, err := readSidecarBounded(path)
 	if err != nil {
 		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file
+			// would otherwise survive silently and be re-read by a later pass, so a
+			// failed removal gets its own fixup_commitmsg_unremovable line BESIDE
+			// the oversize line. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 				cfg.runID, cfg.stageID, path, maxSidecarBytes)
-			_ = os.Remove(path)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_commitmsg_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
 			return "", "", false
 		}
 		// Absent sidecar is the common no-op (the agent wrote nothing); any
@@ -9840,10 +9872,20 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 	raw, err := readSidecarBounded(path)
 	if err != nil {
 		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file
+			// would otherwise survive silently and be re-read by a later pass, so a
+			// failed removal gets its own implement_commitmsg_unremovable line
+			// BESIDE the oversize line. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"implement_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 				cfg.runID, cfg.stageID, path, maxSidecarBytes)
-			_ = os.Remove(path)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"implement_commitmsg_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
 			return "", "", false
 		}
 		// Absent sidecar is the common no-op (an older agent wrote nothing); any
@@ -10504,11 +10546,20 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 			// unusable. Remove it, name the keyed path in the diagnostic, and
 			// return the same reason an unreadable keyed handoff carries — NOT a
 			// sixth wire value. Does not fall through to the legacy path (the
-			// keyed-unreadable branch below does not either).
+			// keyed-unreadable branch below does not either). The removal result is
+			// CHECKED (#3106 fix-up): a readable-but-unremovable file would
+			// otherwise survive silently and be re-read by a later pass, so a failed
+			// removal gets its own pr_description_unremovable line BESIDE the
+			// oversize line, naming the keyed path.
+			rmErr := os.Remove(keyed)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 				cfg.runID, cfg.stageID, keyed, maxSidecarBytes)
-			_ = os.Remove(keyed)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, keyed, rmErr.Error())
+			}
 			return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
 		}
 		if !os.IsNotExist(err) {
@@ -10525,11 +10576,18 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 				// keyed oversize branch, naming the LEGACY path (the call site's
 				// marker names only the canonical keyed path, so without this the
 				// path that actually failed would appear nowhere in the trace —
-				// mirroring pr_description_legacy_unreadable below).
+				// mirroring pr_description_legacy_unreadable below). The removal
+				// result is CHECKED (#3106 fix-up), emitting pr_description_unremovable
+				// naming the legacy path on a failed removal BESIDE the oversize line.
+				rmErr := os.Remove(legacyPullRequestDescriptionPath)
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
 					cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, maxSidecarBytes)
-				_ = os.Remove(legacyPullRequestDescriptionPath)
+				if rmErr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"pr_description_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+						cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, rmErr.Error())
+				}
 				return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
 			}
 			if !os.IsNotExist(legacyErr) {

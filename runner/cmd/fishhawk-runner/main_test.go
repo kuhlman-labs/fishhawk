@@ -26857,3 +26857,184 @@ func TestLoadAgentAuthoredPR_OversizeLegacy(t *testing.T) {
 		t.Errorf("oversize legacy handoff must be removed, stat err = %v", err)
 	}
 }
+
+// The *_oversize-AND-unremovable cases (#3106 fix-up). Each mirrors its plain
+// oversize sibling above but makes the sidecar's PARENT DIRECTORY non-writable
+// (chmod 0500) AFTER the oversize file is written, so the loader can still READ
+// the file (open-for-read needs only r-x on the dir) yet os.Remove FAILS. A
+// readable-but-unremovable file is a state an agent can construct — a parent
+// directory it denies write on — so the loader must SURFACE the failed cleanup
+// (`*_unremovable`) rather than swallow it, mirroring loadCounterfactualReport's
+// TestLoadCounterfactualReport_ConsumptionFailureIsSurfaced. This is the (a)-trap
+// case from the counterfactual rules: the RETURN value is byte-identical whether
+// or not the removal succeeded, so each assertion reads the LOG and the surviving
+// path — committed state — not the error. mustDenyParentWrites SKIPS the test on
+// a filesystem that does not enforce directory write permission (root), since
+// such a fixture would pass with the check deleted and so proves nothing.
+
+// TestLoadScopeExemptions_OversizeUnremovable: an oversize scope-justification
+// sidecar whose parent denies write fails closed (nil), emits BOTH
+// scope_justification_oversize AND scope_justification_unremovable, and survives.
+func TestLoadScopeExemptions_OversizeUnremovable(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[`+
+			`{"path":"a.go","reason":"`+oversizePad()+`"}]}`)
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"scope_justification_oversize"`) {
+		t.Errorf("expected scope_justification_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"scope_justification_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_OversizeUnremovable: an oversize fix-up self-report
+// whose parent denies write fails closed (zero result), emits BOTH
+// fixup_selfreport_oversize AND fixup_selfreport_unremovable, and survives.
+func TestLoadFixupSelfReport_OversizeUnremovable(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"`+oversizePad()+`"}]}`)
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"fixup_selfreport_oversize"`) {
+		t.Errorf("expected fixup_selfreport_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"fixup_selfreport_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupCommitMessage_OversizeUnremovable: an oversize fix-up commit-message
+// sidecar whose parent denies write fails closed (ok=false), emits BOTH
+// fixup_commitmsg_oversize AND fixup_commitmsg_unremovable, and survives.
+func TestLoadFixupCommitMessage_OversizeUnremovable(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg,
+		"fix: guard nil pool in retry path\n\n"+oversizePad())
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if _, _, ok := loadFixupCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"fixup_commitmsg_oversize"`) {
+		t.Errorf("expected fixup_commitmsg_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"fixup_commitmsg_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_OversizeUnremovable: an oversize initial-implement
+// commit-message sidecar whose parent denies write fails closed (ok=false), emits
+// BOTH implement_commitmsg_oversize AND implement_commitmsg_unremovable, survives.
+func TestLoadImplementCommitMessage_OversizeUnremovable(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg,
+		"feat(runner): add minio-init target\n\n"+oversizePad())
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if _, _, ok := loadImplementCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"implement_commitmsg_oversize"`) {
+		t.Errorf("expected implement_commitmsg_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"implement_commitmsg_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeKeyedUnremovable: an oversize KEYED PR handoff
+// whose parent denies write fails closed to the fallback with
+// prBodyReasonHandoffUnreadable, emits BOTH pr_description_oversize AND
+// pr_description_unremovable naming the keyed path, and survives.
+func TestLoadAgentAuthoredPR_OversizeKeyedUnremovable(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(keyed,
+		[]byte("feat(runner): add minio-init target\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustDenyParentWrites(t, keyed)
+
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize keyed handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) {
+		t.Errorf("expected pr_description_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"pr_description_unremovable"`) || !strings.Contains(out, keyed) {
+		t.Errorf("a cleanup failure must be surfaced naming the keyed path, got %q", out)
+	}
+	if _, err := os.Lstat(keyed); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeLegacyUnremovable: the LEGACY oversize branch is
+// a distinct removal site from the keyed one, so it earns its own case. With the
+// keyed path ABSENT, an oversize legacy handoff whose parent denies write fails
+// closed to the fallback, emits BOTH pr_description_oversize AND
+// pr_description_unremovable naming the legacy path, and survives.
+func TestLoadAgentAuthoredPR_OversizeLegacyUnremovable(t *testing.T) {
+	withPRDescriptionPath(t, "r", "s") // redirect dirs; keyed stays absent
+	if err := os.WriteFile(legacyPullRequestDescriptionPath,
+		[]byte("feat(runner): legacy handoff\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustDenyParentWrites(t, legacyPullRequestDescriptionPath)
+
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize legacy handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) || !strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("expected pr_description_oversize naming the legacy path, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"pr_description_unremovable"`) || !strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("a cleanup failure must be surfaced naming the legacy path, got %q", out)
+	}
+	if _, err := os.Lstat(legacyPullRequestDescriptionPath); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
