@@ -3775,3 +3775,39 @@ func TestRunStageAuditWindow_EqualsAuditLimitMax(t *testing.T) {
 			runStageAuditWindow, auditLimitMax)
 	}
 }
+
+// --- runner self-host bootstrap advisory (E64.5 / #3086), verb boundary ---
+
+// TestRunStage_RunnerScope_SurfacesBootstrapWarning is the run_stage parity
+// mirror of the dispatch e2e: it drives the real runStage handler end to end
+// (fake backend -> guard -> RunStageOutput) with the runStageCommand /
+// runStageLookPath stub seams, asserting the advisory string reaches
+// RunStageOutput.Warnings while the stage runs to completion (no tool error).
+func TestRunStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID, "runner/internal/agent/claudecode/claudecode.go")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("the self-host advisory must NOT block run_stage: %v", err)
+	}
+	found := false
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "runner/README.md") && strings.Contains(w, "fix-up budget") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("advisory not surfaced in RunStageOutput.Warnings: %v", out.Warnings)
+	}
+}

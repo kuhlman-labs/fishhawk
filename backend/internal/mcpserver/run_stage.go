@@ -448,6 +448,14 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	guardWarnings = append(guardWarnings, noPRWarnings...)
 
+	// Runner self-host bootstrap advisory (#3086), the parity mirror of the
+	// dispatch_stage call site. Advisory-only — it returns no error and cannot
+	// block — so its warning merges straight into guardWarnings and this blocking
+	// verb surfaces it in RunStageOutput.Warnings. COST: up to (2 plan-resolution
+	// reads + 1 GetRun) per visited run, capped at retryPlanChainDepth, and ZERO
+	// reads on a plan-stage dispatch.
+	guardWarnings = append(guardWarnings, r.guardRunnerSelfHost(ctx, runUUID, in.Stage)...)
+
 	// (1z) Resolve working_dir transport-conditionally BEFORE the runner-binary
 	// resolution, the acceptance short-circuit admission call, the host-dispatch
 	// marker and the spawn (#2479). An omitted/relative working_dir over HTTP
