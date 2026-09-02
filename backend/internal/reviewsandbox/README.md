@@ -281,13 +281,29 @@ What IS claimed, and what the hermetic tests assert:
 A reported value is a ROUTE iff its resolved form EQUALS the resolved real
 `CODEX_HOME` or is UNDER it, or some path-shaped TOKEN extracted from a
 composite value (`--config=<real home>/auth.json`, a `PATH`-style list, a path
-in JSON) does. The order is EXTRACT, then CLEAN/RESOLVE, then apply the
-exemption — never elide the synthesized home's TEXT first, which would accept
+in JSON) does, or — the SUPPLEMENTARY check — the value's RAW TEXT carries the
+real `CODEX_HOME` spelling at a path boundary and the remainder from that point
+does. The order is EXTRACT, then CLEAN/RESOLVE, then apply the exemption —
+never elide the synthesized home's TEXT first, which would accept
 `--config=<confined home>/../auth.json` (the exempt prefix substituted away, the
 `..` never resolved) and an embedded symlink pointing back into the real home.
 An ANCESTOR is NOT a route: `${TMPDIR}` does not grant access to a credential
 nested inside it, and the child legitimately reports `TMPDIR`, `HOME` and other
 ancestors.
+
+The supplementary raw-substring locate exists because the tokenizer cuts on a
+FIXED delimiter set that includes whitespace and colon, so a real `CODEX_HOME`
+whose own path contains one of those characters is fragmented and unmatchable by
+token — `--config=/Users/Jane Doe/.codex/auth.json` splits at the space and a
+token-only sweep stays GREEN on a value that literally embeds the credential
+path. Home directories with spaces are ordinary on macOS. Widening the delimiter
+set would only move the boundary to the next character, so the set is
+deliberately left alone and the substring locate covers the remainder. It runs
+LAST, after token-level exemption is decided, and classifies the MAXIMAL
+remainder rather than the bare spelling — which is what keeps the synthesized
+home (whose path carries the real home as a literal prefix) exempt, still
+catches a `..` traversal out of it, and leaves a string-prefix sibling like
+`<real home>-backup/auth.json` GREEN.
 
 **THE CREDENTIAL IS NOT IN THE GRANT.** The `filesystem` table above lists the
 export and the schema — **not** the synthesized home. codex-cli reads its own

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewsandbox"
 )
@@ -345,6 +346,9 @@ func newRouteSpec(realHome string, confinedHome pathPair) routeSpec {
 //	PATH FORM      — v's own cleaned (or symlink-resolved) form EQUALS R, or is
 //	                 UNDER R;
 //	COMPOSITE FORM — some path-shaped TOKEN extracted from v, once cleaned and
+//	                 symlink-resolved, EQUALS R or is UNDER R;
+//	EMBEDDED FORM  — v's raw text CONTAINS the spelling R at a path boundary, and
+//	                 the remainder of v from that point, once cleaned and
 //	                 symlink-resolved, EQUALS R or is UNDER R.
 //
 // An ANCESTOR IS NOT A ROUTE. ${TMPDIR} does not grant access to a credential
@@ -356,6 +360,18 @@ func newRouteSpec(realHome string, confinedHome pathPair) routeSpec {
 // a PATH-style list, or a path embedded in JSON — yet the claim covers exactly
 // those.
 //
+// The EMBEDDED form is SUPPLEMENTARY to the composite one and exists because
+// pathTokens cuts on a FIXED delimiter set that includes whitespace and colon.
+// A real CODEX_HOME whose own path contains one of those characters is therefore
+// FRAGMENTED by the tokenizer and no token can equal or fall under it:
+// `--config=/Users/Jane Doe/.codex/auth.json` splits at the space, no fragment
+// is a route, and a token-only sweep stays GREEN while the value literally
+// embeds the credential path. Home directories with spaces are ordinary on
+// macOS, so that is reachable in production rather than hypothetical. Widening
+// the delimiter set would only move the boundary to the next character, so the
+// answer is to locate R by RAW SUBSTRING instead — a net no tokenizer blind spot
+// can slip through — and then decide on the located remainder.
+//
 // THE SINGLE EXEMPTION is the synthesized home and its contents, and it is
 // applied ONLY AFTER the candidate path has been normalised — never to the raw
 // TEXT of the value. Eliding the confined home's text first would accept
@@ -363,7 +379,9 @@ func newRouteSpec(realHome string, confinedHome pathPair) routeSpec {
 // and the `..` is never resolved, though the parsed path lands squarely in the
 // real CODEX_HOME. The same blind spot swallows an embedded SYMLINK, which only
 // resolves once it has been extracted from its surroundings. So the order is
-// EXTRACT, then CLEAN/RESOLVE, then decide.
+// EXTRACT (by token, or by substring boundary), then CLEAN/RESOLVE, then decide
+// — and that ordering is what lets the supplementary check keep the exemption
+// intact rather than re-opening the traversal hole it closed.
 func (rs routeSpec) isRoute(v pathPair) (bool, string) {
 	for _, form := range []string{v.Raw, v.Resolved} {
 		if form == "" {
@@ -378,6 +396,49 @@ func (rs routeSpec) isRoute(v pathPair) (bool, string) {
 			}
 			if route, why := rs.classify(tok); route {
 				return true, "composite value embeds " + tok + ", which " + why + ": " + form
+			}
+		}
+		if route, why := rs.embedsRealHomeSpelling(form); route {
+			return true, "composite value embeds the real CODEX_HOME spelling in text no path token could isolate — " + why + ": " + form
+		}
+	}
+	return false, ""
+}
+
+// embedsRealHomeSpelling is the SUPPLEMENTARY raw-substring half of the
+// composite check, and it runs LAST — after token-level extraction has already
+// decided every exemption and normalisation it can. Its job is only the
+// remainder the tokenizer cannot see.
+//
+// It locates each occurrence of a real-CODEX_HOME spelling in the RAW text, then
+// hands the text FROM that occurrence TO THE END OF THE VALUE to classify. Two
+// details carry the whole design:
+//
+//   - The occurrence must sit at a path boundary — start of value, or preceded
+//     by one of pathTokens' delimiters. Without it `/opt/home/u/.codex/auth.json`
+//     would be read as a route to `/home/u/.codex`, which it is not.
+//   - The candidate is the MAXIMAL remainder, never the bare spelling. The bare
+//     spelling always equals the real home and would flag the confined home's own
+//     files (whose paths carry the real home as a literal prefix — see the file
+//     header) as routes, a false RED on every legitimate value. Classifying the
+//     remainder instead keeps the confined-home exemption intact, still catches
+//     `<confined>/../auth.json` because cleaning resolves the traversal, and
+//     leaves "/home/u/.codex-backup/auth.json" GREEN because coversPath compares
+//     components rather than string prefixes.
+func (rs routeSpec) embedsRealHomeSpelling(form string) (bool, string) {
+	for _, r := range rs.real {
+		for i := 0; i+len(r) <= len(form); i++ {
+			if !strings.HasPrefix(form[i:], r) {
+				continue
+			}
+			if i > 0 {
+				prev, _ := utf8.DecodeLastRuneInString(form[:i])
+				if !isPathDelimiter(prev) {
+					continue // a proper substring of a LONGER path component
+				}
+			}
+			if route, why := rs.classify(form[i:]); route {
+				return true, why
 			}
 		}
 	}
@@ -441,15 +502,15 @@ func normalizations(p string) []string {
 // "/home/u/.codex": the token is compared COMPONENT-WISE by coversPath, so a
 // sibling directory sharing a string prefix is not a finding and the clean
 // baseline stays GREEN.
+//
+// The delimiter set is FIXED, and that is a known, bounded blind spot rather
+// than an oversight: a real CODEX_HOME whose own path contains one of these
+// characters (a space is ordinary on macOS) is fragmented and unmatchable here.
+// embedsRealHomeSpelling covers exactly that remainder, which is why this set is
+// deliberately NOT widened — widening only moves the boundary to the next
+// character.
 func pathTokens(s string) []string {
-	fields := strings.FieldsFunc(s, func(r rune) bool {
-		switch r {
-		case ' ', '\t', '\n', '\r', '=', ':', ',', ';', '"', '\'', '`',
-			'{', '}', '[', ']', '(', ')', '<', '>', '|', '&', '?', '*':
-			return true
-		}
-		return false
-	})
+	fields := strings.FieldsFunc(s, isPathDelimiter)
 	out := make([]string, 0, len(fields))
 	for _, f := range fields {
 		if strings.ContainsRune(f, filepath.Separator) {
@@ -457,6 +518,19 @@ func pathTokens(s string) []string {
 		}
 	}
 	return out
+}
+
+// isPathDelimiter reports whether r separates a path from its surroundings in a
+// composite value. It is shared by pathTokens (which cuts on it) and
+// embedsRealHomeSpelling (which requires a located spelling to be preceded by
+// one), so the two halves of the composite check agree on one boundary notion.
+func isPathDelimiter(r rune) bool {
+	switch r {
+	case ' ', '\t', '\n', '\r', '=', ':', ',', ';', '"', '\'', '`',
+		'{', '}', '[', ']', '(', ')', '<', '>', '|', '&', '?', '*':
+		return true
+	}
+	return false
 }
 
 // sweepRoutes returns one finding per reported value that is a route to the real
@@ -904,6 +978,55 @@ func TestSweepRoutes_NoticesWholeValueAndCompositeExposures(t *testing.T) {
 	for _, c := range exposures {
 		if got := spec.sweepRoutes(c.report, c.argv); len(got) == 0 {
 			t.Errorf("%s: the sweep saw NO route — this exposure is unpinned", c.name)
+		}
+	}
+
+	// A real CODEX_HOME whose own path carries one of pathTokens' delimiters.
+	// The tokenizer FRAGMENTS such a home — `--config=/Users/Jane Doe/.codex/
+	// auth.json` splits at the space and no fragment equals or falls under the
+	// real home — so a token-only sweep stays GREEN on a value that literally
+	// embeds the credential path. These rows are load-bearing on
+	// embedsRealHomeSpelling: delete it and the whole block goes green.
+	//
+	// A space is ordinary in a macOS home directory; a colon is a legal byte in a
+	// POSIX path and the customary PATH-list separator, which is what makes it the
+	// second-worst case. Both are pure strings here — no filesystem is involved,
+	// so neither depends on what the host allows in a filename.
+	for _, home := range []struct{ label, real string }{
+		{"a real CODEX_HOME containing a SPACE", "/Users/Jane Doe/.codex"},
+		{"a real CODEX_HOME containing a COLON", "/home/j:doe/.codex"},
+	} {
+		conf := home.real + "/fishhawk-confined-abc"
+		dspec := routeSpec{real: []string{home.real}, confined: []string{conf}}
+
+		// The clean control FIRST: the supplementary check must not turn the
+		// exempt confined home — whose path carries the real home as a literal
+		// prefix — or a string-prefix sibling into a false RED.
+		dclean := probeReport{
+			Env: []pathPair{
+				{Raw: conf},
+				{Raw: conf + "/auth.json"},
+				{Raw: "--config=" + conf + "/config.toml"},
+				{Raw: home.real + "-backup/auth.json"},
+				{Raw: "/opt" + home.real + "/auth.json"}, // a DIFFERENT home that merely ends in the same spelling
+				{Raw: "/tmp"},
+				{Raw: filepath.Dir(home.real)},
+			},
+			Cwd: pathPair{Raw: "/tmp/tree"},
+		}
+		if got := dspec.sweepRoutes(dclean, nil); len(got) != 0 {
+			t.Errorf("%s: clean report produced findings (a FALSE RED): %v", home.label, got)
+		}
+
+		for _, c := range []struct{ name, value string }{
+			{"composite argv element", "--config=" + home.real + "/auth.json"},
+			{"PATH-style list", "/usr/bin:" + home.real + "/bin:/bin"},
+			{"path embedded in JSON", `{"creds":"` + home.real + `/auth.json"}`},
+			{"composite `..` traversal out of the confined home", "--config=" + conf + "/../auth.json"},
+		} {
+			if got := dspec.sweepRoutes(probeReport{Args: []pathPair{{Raw: c.value}}}, nil); len(got) == 0 {
+				t.Errorf("%s / %s: the sweep saw NO route in %q — this escape is unpinned", home.label, c.name, c.value)
+			}
 		}
 	}
 
