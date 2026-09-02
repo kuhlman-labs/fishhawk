@@ -263,6 +263,28 @@ denied root. So it is created inside the resolved real `CODEX_HOME` at 0700, and
 that resolves outside every applicable deny root (an operator with
 `CODEX_HOME=/tmp/foo` gets a loud refusal, never a silent egress path).
 
+**What that placement COSTS, stated plainly (#3082).** Because the synthesized
+home sits inside the real `CODEX_HOME`, the child's own `CODEX_HOME` carries the
+real path as its literal prefix and one `filepath.Dir` call recovers it.
+**NON-DISCLOSURE OF THE REAL `CODEX_HOME` IS THEREFORE NOT AVAILABLE AND IS NOT
+CLAIMED** — not here, not in a doc comment, and not in a test name. The trade is
+deliberate and it is the right one: a `${TMPDIR}` placement would buy
+non-disclosure by moving a copied live credential out of the only root the
+claude blocklist denies.
+
+What IS claimed, and what the hermetic tests assert:
+
+> The child's environment, argv, cwd and resolved config lookups contain NO
+> ROUTE to any path under the real `CODEX_HOME`, other than the synthesized home
+> it was deliberately given and that home's contents.
+
+A reported value is a ROUTE iff its resolved form EQUALS the resolved real
+`CODEX_HOME` or is UNDER it, or embeds it as a path token inside a composite
+value (`--config=<real home>/auth.json`, a `PATH`-style list, a path in JSON).
+An ANCESTOR is NOT a route: `${TMPDIR}` does not grant access to a credential
+nested inside it, and the child legitimately reports `TMPDIR`, `HOME` and other
+ancestors.
+
 **THE CREDENTIAL IS NOT IN THE GRANT.** The `filesystem` table above lists the
 export and the schema — **not** the synthesized home. codex-cli reads its own
 `CODEX_HOME` config and auth as the PROCESS, outside the profile's tool layer
@@ -270,14 +292,28 @@ export and the schema — **not** the synthesized home. codex-cli reads its own
 normally under the profile"), so authentication survives while the copied
 credential stays OUTSIDE the reviewer-readable set.
 
-Two tests carry that claim, and they prove DIFFERENT things — read the split
-literally, because the first one alone would be a documented protection that does
-not hold:
+THREE tests carry that claim, and they prove DIFFERENT things — read the split
+literally, because any one of them alone would be a documented protection that
+does not hold:
 
 - `TestCodexConfinedHome_CredentialNotGrantedToToolLayer` (hermetic, blocking)
-  asserts that no emitted grant covers `auth.json` while the export and schema
-  grants ARE present. That is a statement about what the BUILDER writes, and
-  says nothing about what codex-cli enforces.
+  asserts that no emitted grant covers the real `CODEX_HOME`, the copied
+  `auth.json` or the synthesized home, while the export and schema grants ARE
+  present. That is a statement about what the BUILDER writes, and says nothing
+  about what codex-cli enforces.
+- `TestConfinementBoundary_ChildRoutesNameOnlyTheSynthesizedHome` (hermetic,
+  blocking, `backend/internal/codex`) drives the real adapter into an actually
+  spawned child and sweeps what THAT child observed of itself — every env value,
+  argv element, cwd, resolved config path and parsed grant, raw and
+  symlink-resolved — against the parent-held real `CODEX_HOME`. It is a claim
+  about ROUTES. It is NOT a non-disclosure claim (see the placement note above)
+  and it is NOT a claim about denial. Its siblings cover the rest of the
+  hermetic surface: `_ExactlyOneCodexHomeEntry` (the inherited entry is
+  STRIPPED, not shadowed, with distinct diagnostics for a duplicate entry versus
+  an exposed directory), `_ChildReadsTheCopiedCredential` (the child can
+  actually READ the credential it was handed — the copy is only worth making if
+  it can), and `_GrantSetExcludesRealHomeAndCredential` (the grant set the child
+  would LOAD is exactly `":minimal"` + export + schema).
 - `TestLive_CodexCredentialUnreadableWhileAuthenticated` (opt-in, NON-blocking)
   is the behavioural half: it asks a real confined reviewer to read the copied
   credential by its literal path AND through `$CODEX_HOME/auth.json` in the
@@ -304,6 +340,23 @@ not hold:
     model to echo verbatim what it read from `auth.json`, so the branch that
     fires when the in-tree read failed is the branch most likely to be holding a
     real credential. Pinned by `TestRedactedOutput_ReproducesNoInputBytes`.
+
+**THE RESIDUAL, as a finding rather than a hedge (#3082).** Everything the
+hermetic layer proves is CONFIGURATION: what the builder writes, what the
+child's environment routes to, and what the child could read. Whether the
+operating-system sandbox turns the grant set into an actual DENIAL is not
+observable without a real codex binary. Kernel enforcement of the grant set is
+declared `requires_live_validation` and is carried by the opt-in harness —
+`FISHHAWK_LIVE_CONFINEMENT=1 go test ./internal/reviewsandbox/ -run TestLive -v`,
+tracked as the live walk under #3059. That is weaker than the boundary one might
+want, and it is recorded here rather than papered over.
+
+The decision procedure that harness uses is NOT itself opt-in: `classifyDenial`
+is a pure four-outcome function (`outcomeNoToolEvidence`, `outcomeSentinelLeaked`,
+`outcomeDenialConfirmed`, `outcomeIndeterminate`) with a hermetic table
+(`TestClassifyDenial_FourOutcomes`) that runs in CI with no live binary, and
+`TestLive_HarnessSkipsByDefault` drives the real `requireLive` and OBSERVES the
+skip across all three of its branches.
 
 **Credential copy-back — what it guarantees and what it does not.** The source
 hash is snapshotted at copy-in. On cleanup, if the confined copy changed, the
