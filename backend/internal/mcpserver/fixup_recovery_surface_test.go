@@ -357,22 +357,34 @@ func TestNeutralizeUntrustedFailureText_DefangsStructureAndKeepsWords(t *testing
 }
 
 // TestNeutralizeUntrustedFailureText_ExhaustiveDelimiterRuns is the property
-// half of the control: for EVERY run length of '<' or '>' from 1 to 12, the
-// output must carry no live delimiter and must be idempotent. A pairwise
-// ReplaceAll implementation fails this at run length 4.
+// half of the control, and it covers ALL FOUR structural runes: for EVERY run
+// length from 1 to 12 of '<', '>', '`' or '~', the output must carry no live
+// envelope delimiter AND no live code fence, and must be idempotent.
+//
+// The fence runes are here because a pairwise ReplaceAll fence-breaker passed
+// the exact triple-backtick case while leaving a LIVE triple-backtick fence at
+// run length 5 (#3081 fix-up) — the same non-overlapping left-to-right trap
+// that makes a pairwise ReplaceAll("<<<", "<< <") fail at run length 4. One
+// property test over one uniform primitive is what keeps the two from
+// diverging again.
 func TestNeutralizeUntrustedFailureText_ExhaustiveDelimiterRuns(t *testing.T) {
-	for _, c := range []string{"<", ">"} {
+	for _, c := range []string{"<", ">", "`", "~"} {
 		for n := 1; n <= 12; n++ {
 			in := "pre " + strings.Repeat(c, n) + " post"
 			got := neutralizeUntrustedFailureText(in)
-			if strings.Contains(got, "<<<") || strings.Contains(got, ">>>") {
-				t.Errorf("run of %d %q: output %q still carries a live delimiter", n, c, got)
+			for _, live := range []string{"<<<", ">>>", "```", "~~~"} {
+				if strings.Contains(got, live) {
+					t.Errorf("run of %d %q: output %q still carries a live %q", n, c, got, live)
+				}
 			}
 			if again := neutralizeUntrustedFailureText(got); again != got {
 				t.Errorf("run of %d %q: not idempotent (%q vs %q)", n, c, again, got)
 			}
 			if !strings.HasPrefix(got, "pre ") || !strings.HasSuffix(got, " post") {
 				t.Errorf("run of %d %q: surrounding words lost: %q", n, c, got)
+			}
+			if strings.Count(got, c) != n {
+				t.Errorf("run of %d %q: %d survived, want all %d — no character may be deleted: %q", n, c, strings.Count(got, c), n, got)
 			}
 		}
 	}

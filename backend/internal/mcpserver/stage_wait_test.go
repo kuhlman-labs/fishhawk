@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -701,6 +702,66 @@ func TestStageWaitStatus_FixupRecoveredIsOmittedWhenAbsent(t *testing.T) {
 	} {
 		if !strings.Contains(string(withMarker), want) {
 			t.Errorf("marshalled marker missing %s\ngot: %s", want, withMarker)
+		}
+	}
+}
+
+// TestFixupRecoverySchemaDisclosesNeutralization pins the DISCLOSURE half of
+// the untrusted-detail handling (#3081 fix-up). latestFixupRecovery
+// neutralizes and caps source_failure_reason / source_failure_category before
+// they ship, so the value under a field named after an audit payload key is a
+// MODIFIED copy of that key. Keeping the neutralization is right — the field is
+// read by an agent on a routine poll — but a field whose name promises the
+// audit's value while its content quietly differs is the same
+// surface-says-one-thing defect this marker exists to close.
+//
+// So the schema description must SAY the value is structure-neutralized and
+// bounded rather than verbatim, and must NAME where the exact bytes live (the
+// stage_fixup_recovered audit entry, via fishhawk_list_audit). Asserted against
+// the reflected struct tag rather than prose, so the disclosure cannot rot away
+// from the behaviour: a future edit that drops it fails here.
+func TestFixupRecoverySchemaDisclosesNeutralization(t *testing.T) {
+	rt := reflect.TypeOf(FixupRecovery{})
+	for _, tc := range []struct{ jsonName string }{
+		{"source_failure_reason"},
+		{"source_failure_category"},
+	} {
+		var desc string
+		var found bool
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			if strings.Split(f.Tag.Get("json"), ",")[0] == tc.jsonName {
+				desc, found = f.Tag.Get("jsonschema"), true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("FixupRecovery has no field tagged json:%q", tc.jsonName)
+		}
+		// The neutralized-not-verbatim disclosure, and the pointer to the
+		// unaltered evidence. Substring assertions on the load-bearing WORDS,
+		// not a full-sentence match a copy-edit would silently delete.
+		for _, want := range []string{
+			"STRUCTURE-NEUTRALIZED",
+			"bounded",
+			"stage_fixup_recovered",
+			"fishhawk_list_audit",
+		} {
+			if !strings.Contains(desc, want) {
+				t.Errorf("%s schema description does not disclose %q: %s", tc.jsonName, want, desc)
+			}
+		}
+	}
+
+	// The same disclosure rides on the model-facing prose, so an agent reading
+	// only the message is not told it holds a transcript either.
+	msg := fixupRecoveryMessage(&FixupRecovery{
+		DetailsAvailable:    true,
+		SourceFailureReason: "verify failed",
+	})
+	for _, want := range []string{"STRUCTURE-NEUTRALIZED", "stage_fixup_recovered", "fishhawk_list_audit"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("quarantine preamble does not disclose %q: %s", want, msg)
 		}
 	}
 }
