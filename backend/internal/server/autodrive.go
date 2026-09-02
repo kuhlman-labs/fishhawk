@@ -623,7 +623,13 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	if err != nil {
 		return false, err
 	}
-	refunded, err := s.countFixupNoChangeRefunds(ctx, runRow.ID, impl.ID)
+	// Routed through the SHARED chokepoint (#3085) rather than the old
+	// no-change-only counter, which counted ONLY the #967 signal and so already
+	// diverged from the HTTP handler by missing the #1957 category-C refund
+	// entirely. The crash count is discarded — the auto-drive path has no 422
+	// body to carry it. Pinned by TestAutoFixup_InfraRefundAdmitsPass (category
+	// C) and TestAutoFixup_CrashRefundAdmitsPass (category A).
+	refunded, _, err := s.fixupRefundedPasses(ctx, runRow.ID, impl.ID)
 	if err != nil {
 		return false, err
 	}

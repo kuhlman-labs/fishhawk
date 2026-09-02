@@ -224,10 +224,12 @@ func latestFixupRecovery(triggerSeqs []int64, recoveries []fixupRecoverySignal) 
 // wrong: the fix-up pass FAILED and pushed no commit; the stage was RESTORED to
 // its prior state, which is why the status reads succeeded; the PR head still
 // carries the pre-fix-up commit and the routed concerns were NOT addressed; and
-// the fix-up BUDGET rule as it stands today — a category-A or category-B
-// failure CONSUMES a pass, only a category-C delivered-nothing failure is
-// refunded (#1957). The budget sentence is a statement of the CURRENT rule; it
-// is not a claim that the rule is wrong or is changing.
+// the fix-up BUDGET rule as it stands today — a pass that delivered NOTHING to
+// the PR branch is refunded whether it died category-A (harness, #3085) or
+// category-C (infrastructure, #1957), or produced no commit at all (#967),
+// while a category-B policy failure still CONSUMES a pass, as does any pass that
+// pushed. The budget sentence is a statement of the CURRENT rule; it is not a
+// claim that the rule is wrong or is changing.
 func fixupRecoveryMessage(rec *FixupRecovery) string {
 	if rec == nil {
 		return ""
@@ -258,7 +260,7 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		b.WriteString(" " + fixupRecoveryUntrustedClose)
 	}
 	b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
-	b.WriteString(" Fix-up budget, as it stands today: a category-A (agent) or category-B (policy) failure CONSUMES a fix-up pass; only a category-C failure that delivered nothing to the PR branch is refunded (#1957).")
+	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. No refund extends the hard ceiling of 3 total passes.")
 	return b.String()
 }
 
@@ -305,7 +307,7 @@ func (r *runResolver) fixupRecoveryFor(ctx context.Context, runID, stageID uuid.
 			continue
 		}
 		sig := fixupRecoverySignal{Sequence: e.Sequence}
-		// Marshal-then-unmarshal, matching fixupInfraRefunds' idiom: the client
+		// Marshal-then-unmarshal, matching fixupRefundedPasses' idiom: the client
 		// decodes Payload as a generic any, so this is the shortest path to a
 		// typed read. A failure on either leg leaves Parsed false, which still
 		// FIRES the marker (details_available=false) rather than dropping it.

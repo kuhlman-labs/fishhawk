@@ -13788,6 +13788,26 @@ paths:
         sole-writer lineage gate without breaking ADR-035 (#1068/#1044).
         Otherwise merge with a follow-up, or start a fresh run. The operator
         still owns the merge.
+
+        **Delivered-nothing refund (#967 / #1957 / #3085).** A fix-up pass
+        that landed NOTHING on the PR branch is refunded against the NORMAL
+        budget, so the next trigger is admitted WITHOUT
+        `force_additional_pass`. The server computes the stage's
+        `stage_fixup_triggered` windows once and asks ONE question per window
+        — does it hold at least one delivered-nothing signal and NO
+        `fixup_pushed` entry? A window refunds AT MOST ONCE however many
+        signals of however many kinds land inside it. Four signal shapes are
+        unioned: `fixup_no_changes` (the re-dispatch produced no commit — not
+        a crash), `dispatch_reaper_failed` with `failure_category` `C` (a
+        pre-agent spawn-phase death), `stage_fixup_recovered` with
+        `source_failure_category` `C` (a post-agent-work death on the
+        push/report), and `stage_fixup_recovered` with
+        `source_failure_category` `A` (a harness death that pushed nothing).
+        A category-B (policy) failure still CONSUMES a pass — it is a verdict
+        on delivered work, not a delivery failure — and the PUSH VETO applies
+        UNIFORMLY: a pass that pushed a commit delivered something, so it
+        consumes budget however it later died. No refund ever extends the
+        absolute 3-pass ceiling, which keeps counting RAW triggered passes.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -14023,7 +14043,13 @@ paths:
             or carries no recorded `approve_with_concerns` concerns
             (`fixup_not_applicable`); the NORMAL bounded pass count is already
             spent and no override was requested (`fixup_budget_exhausted` —
-            one more pass is available via `force_additional_pass: true`); or
+            one more pass is available via `force_additional_pass: true`; its
+            `details` carry `max_passes`, `used`, `refunded_passes` and
+            `crashed_without_push`, the last counting the refunding windows
+            whose delivered-nothing signal was a DEATH — a category-A or
+            category-C crash that pushed nothing — and reporting 0 for a
+            window refunded only on `fixup_no_changes`, so an operator can see
+            whether they are overriding a real limit or a crash, #3085); or
             the hard ceiling of 3 total passes is reached and the override can
             no longer help (`fixup_ceiling_reached`, distinct from
             `fixup_budget_exhausted`; its `details` carry a `remediation`

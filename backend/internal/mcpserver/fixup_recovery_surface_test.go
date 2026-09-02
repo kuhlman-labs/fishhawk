@@ -122,9 +122,12 @@ func TestLatestFixupRecovery_Branches(t *testing.T) {
 
 // TestFixupRecoveryMessage_NamesTheConsequencesAndTheBudgetRule pins the four
 // facts an operator acting on a bare `succeeded` would get wrong, including the
-// CURRENT fix-up budget rule (#1957): category A/B consume a pass, only a
-// delivered-nothing category C is refunded. Stating the rule is in scope;
-// changing it is not.
+// CURRENT fix-up budget rule. It is a DONE-MEANS assertion on SHIPPED text
+// (#3085): the scope-completeness gate only proves this file was touched, so a
+// comment-only edit would satisfy presence while leaving the now-FALSE sentence
+// in the operator's face. The absence assertion is what makes that impossible —
+// the message must no longer claim that ONLY a category-C failure is refunded,
+// because a category-A harness death that pushed nothing is refunded too.
 func TestFixupRecoveryMessage_NamesTheConsequencesAndTheBudgetRule(t *testing.T) {
 	msg := fixupRecoveryMessage(&FixupRecovery{
 		SourceFailureReason:   "commit/push onto PR branch failed",
@@ -139,12 +142,28 @@ func TestFixupRecoveryMessage_NamesTheConsequencesAndTheBudgetRule(t *testing.T)
 		"git log",
 		"commit/push onto PR branch failed",
 		"Source failure category: C",
-		"CONSUMES a fix-up pass",
+		// The corrected rule: a delivered-nothing category-A death refunds,
+		// category B still consumes, and a pass that pushed consumes.
+		"category-A",
 		"category-C",
 		"refunded",
+		"CONSUMES a pass",
+		"pushed a commit",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message missing %q\nmessage: %s", want, msg)
+		}
+	}
+	// The now-FALSE clause must be GONE. Its two shipped forms (the sentence
+	// itself, and the category-A-consumes claim it rested on) are both asserted
+	// absent, because correcting one and leaving the other standing would leave
+	// the message arguing the old rule with new facts.
+	for _, forbidden := range []string{
+		"only a category-C failure that delivered nothing to the PR branch is refunded",
+		"a category-A (agent) or category-B (policy) failure CONSUMES a fix-up pass",
+	} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("message still carries the now-false clause %q\nmessage: %s", forbidden, msg)
 		}
 	}
 }
