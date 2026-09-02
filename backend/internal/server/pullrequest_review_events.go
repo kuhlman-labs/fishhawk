@@ -199,9 +199,28 @@ type reviewMergeMeta struct {
 // followed by a reconciler poll (or vice versa, or a redelivery) on the
 // same review stage converge on a single effective transition.
 //
+// On a MERGE (and only on a merge), both resolution paths additionally
+// run the merge-supersede sweep (E64.2 / #3083) before the run is
+// advanced: a merge can leave a fix-up-re-parked acceptance stage
+// permanently unreachable, and completeRun's #968 guard then correctly
+// refuses to complete the run around it. (The sweep's table also admits
+// a review stage at awaiting_approval, which is not reachable for the
+// stage THIS path resolved — it is already succeeded by then — but is
+// reachable for a review stage findReviewStage did not return: a second
+// review stage on the run, or any stage at all when its list read
+// transiently failed and the sweep's own read then succeeded. Both are
+// the right outcome: the human gate on an already-merged change can no
+// longer alter it.) The sweep
+// terminalizes exactly the default-deny-table-admissible parked stages
+// as `superseded` so the Advance completes the run on the same pass.
+// Nothing is swept on the closed-without-merge path: a change that was
+// not accepted leaves no stage unreachable-because-merged, and the run
+// resolves to cancelled.
+//
 // Best-effort throughout: a missing run shape (routine_change-style
 // implement-only workflows) still records the audit row; a
-// state-machine transition reject logs without rolling back the audit.
+// state-machine transition reject logs without rolling back the audit;
+// a sweep failure logs and never unwinds the merge resolution.
 func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run, merged bool, meta reviewMergeMeta) {
 	reviewStage := s.findReviewStage(ctx, target.ID)
 	var stageID *uuid.UUID
@@ -247,6 +266,25 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 				"pull_request merged: no review stage on run; audit-only",
 				slog.String("pr_url", meta.prURL),
 				slog.String("run_id", target.ID.String()))
+			// E64.2 / #3083 — the same merge-supersede sweep on the
+			// implement-only shape. This run has no review stage, but it
+			// CAN still hold an acceptance stage re-parked at
+			// awaiting_host_dispatch by a fix-up pass, which strands the
+			// run in `running` for exactly the same reason. skipStageID is
+			// nil: there is no stage this path owns.
+			//
+			// The Advance is CONDITIONAL on the sweep having actually
+			// moved something. Unlike the review path above, this branch
+			// has never driven the orchestrator — an implement-only run
+			// completes when its last stage settles — so calling Advance
+			// unconditionally would be a behavior change for every
+			// implement-only merge. Gating it on a non-empty sweep keeps
+			// the untouched shape byte-identical while still completing
+			// the run on this same pass when the sweep did terminalize the
+			// stage that was blocking it.
+			if moved := s.supersedeParkedStagesOnMerge(ctx, target.ID, nil, supersedeReasonMergeObserved); len(moved) > 0 {
+				s.advanceRunAfterReviewResolve(ctx, target.ID)
+			}
 			// Sticky status comment (E20.4 / #330) — the audit row
 			// reflects the merge; the comment should too.
 			s.notifyStatusUpdate(ctx, target.ID, "pr_merged_no_review")
@@ -281,6 +319,42 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			slog.String("stage_id", reviewStage.ID.String()),
 			slog.String("merger", meta.actorLogin),
 		)
+		// E64.2 / #3083 — THE AUTOMATIC HALF of the merge-supersede fix.
+		// The review stage is terminal now, but a fix-up pass may have
+		// re-parked the ACCEPTANCE stage at awaiting_host_dispatch. Once
+		// the PR has merged nothing will ever re-dispatch it, and
+		// dispatching it anyway would run the acceptance agent against a
+		// preview bound to a commit that is no longer the change — so
+		// Advance below would find a non-terminal stage and completeRun's
+		// #968 guard would correctly refuse, stranding the run in
+		// `running` with a merged PR (the four live stranded runs the
+		// issue names). The sweep terminalizes exactly the pair-table-
+		// admissible parked stages FIRST, so the Advance immediately
+		// after sees an all-terminal stage set and completes the run on
+		// this same pass rather than leaving it for an operator verb.
+		//
+		// skipStageID is nil here, DELIBERATELY. The obvious thing to pass
+		// is the review stage this path owns, but that argument would be a
+		// dead control: by this point the stage is already `succeeded`, and
+		// the default-deny table admits review only at
+		// `awaiting_approval`, so the sweep's classification denies it
+		// whether or not it was skipped. That was not reasoned — it was
+		// RUN: passing &reviewStage.ID and then deleting it left
+		// TestResolveReviewStageOnMerge_ReviewStageSucceededNotSuperseded
+		// observably GREEN, so the argument proves nothing and is not
+		// shipped (#3083 approval condition 2(b)).
+		//
+		// What actually pins the outcome is that test, and it pins it
+		// independently of the mechanism: it asserts the review stage ends
+		// `succeeded`, so hoisting this call ABOVE the transition —
+		// the one reordering that WOULD make the stage classifiable —
+		// turns it RED. The skipStageID parameter itself stays exercised
+		// by the primitive's own unit test in merge_supersede_test.go.
+		//
+		// Best-effort, matching every other tail on this path: the sweep
+		// never returns an error and never unwinds the merge resolution
+		// or its audit row.
+		s.supersedeParkedStagesOnMerge(ctx, target.ID, nil, supersedeReasonMergeObserved)
 		// The review stage is now terminal but the RUN is still
 		// running — Advance walks the now-all-terminal stages to
 		// completeRun, which yields succeeded on merge. Mirror the
