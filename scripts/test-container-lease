@@ -18,14 +18,24 @@ fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 tmproot=$(mktemp -d)
 trap 'rm -rf "$tmproot"' EXIT
 
-# Fake docker on PATH that records `rm` invocations to a log (one line each).
+# Fake docker on PATH that records `rm` invocations to a log (one line each) and
+# serves the current testcontainers-labelled container id set from an injectable
+# file ($psfile) for `docker ps -aq --filter label=...` — so a case can script
+# which containers "exist" on the daemon at each step (#3122 sweep contract).
 bindir="$tmproot/bin"
 mkdir -p "$bindir"
 rmlog="$tmproot/docker-rm.log"
+psfile="$tmproot/docker-ps.txt"
+: > "$psfile"
 cat > "$bindir/docker" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "rm" ]; then
   printf '%s\n' "\$*" >> "$rmlog"
+  exit 0
+fi
+if [ "\$1" = "ps" ]; then
+  [ -f "$psfile" ] && cat "$psfile"
+  exit 0
 fi
 exit 0
 EOF
@@ -37,11 +47,15 @@ export PATH="$bindir:$PATH"
 FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
 set +e
 
-# Per-case reset: fresh lease dir, no lock, empty docker-rm log.
+# Per-case reset: fresh lease dir, no lock, no snapshot, empty docker-rm log and
+# an empty labelled-container set. Resetting $psfile is what keeps the #3122 sweep
+# (now wired into the last-holder reap) from removing a prior case's leftover ids
+# and perturbing the existing rm-count assertions.
 reset_case() {
   LEASE_DIR="$tmproot/case-$1"
-  rm -rf "$LEASE_DIR" "$LEASE_DIR.lock"
+  rm -rf "$LEASE_DIR" "$LEASE_DIR.lock" "$LEASE_DIR.snapshot" "$LEASE_DIR.snapshot.tmp."* 2>/dev/null
   : > "$rmlog"
+  : > "$psfile"
 }
 
 # Number of docker rm invocations recorded so far.
@@ -188,6 +202,135 @@ else
   fail "register-timeout: expected no lease + reap unarmed + 0 docker rm (reg_rc=$reg_rc, rm=$(rm_count))"
 fi
 unset FISHHAWK_TEST_LEASE_LOCK_CAP
+
+# ---------------------------------------------------------------------------
+# #3122 generation-keyed orphan snapshot + sweep cases. These drive the SHIPPED
+# _register_lease / _reap_shared_container end to end (not a leaf helper), with
+# the fake docker's labelled set scripted per step via $psfile.
+# ---------------------------------------------------------------------------
+
+# (i) INTERLEAVING — the case that would have caught a per-INVOCATION snapshot.
+# Holder A opens the generation (snapshot empty); container cA is created DURING
+# the generation; holder B joins and REUSES A's snapshot (does NOT capture cA as
+# pre-existing); A exits ref-held (sweeps nothing); B exits last-holder and MUST
+# sweep cA. Reverting to a per-invocation snapshot leaves B snapshotting cA as
+# pre-existing, sparing it → this reddens naming cA's surviving id.
+reset_case i
+sleep 60 & pidA=$!; disown "$pidA" 2>/dev/null || true
+sleep 60 & pidB=$!; disown "$pidB" 2>/dev/null || true
+unset FISHHAWK_TEST_LEASE_TOKEN
+: > "$psfile"                                        # daemon starts with no labelled containers
+FISHHAWK_TEST_LEASE_TOKEN=$pidA _register_lease      # A opens the generation, snapshot empty
+printf 'cA\n' > "$psfile"                            # cA created mid-generation
+FISHHAWK_TEST_LEASE_TOKEN=$pidB _register_lease      # B joins, reuses A's snapshot
+FISHHAWK_TEST_LEASE_TOKEN=$pidA _reap_shared_container  # A ref-held (B live) → no rm, no sweep
+a_rm=$(rm_count)
+kill "$pidA" 2>/dev/null
+FISHHAWK_TEST_LEASE_TOKEN=$pidB _reap_shared_container  # B last-holder → sweep cA
+kill "$pidB" 2>/dev/null
+unset FISHHAWK_TEST_LEASE_TOKEN
+if [ "$a_rm" -eq 0 ] && grep -qx 'rm -f cA' "$rmlog"; then
+  pass "interleaving: cA created mid-generation is swept by the last holder"
+else
+  fail "interleaving: expected A ref-held (0 rm) + B sweeps cA (a_rm=$a_rm, rmlog=[$(tr '\n' ';' < "$rmlog")])"
+fi
+
+# (ii) PRE-GENERATION SPARING — a container that predates the first holder is in
+# the snapshot and is NOT swept, and the preflight reports it. Proves the sweep is
+# not "remove everything labelled".
+reset_case ii
+printf 'cPre\n' > "$psfile"                          # predates the generation
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+export FISHHAWK_TEST_ORPHAN_WARN_AT=0                # force the preflight to warn
+warnout=$(_register_lease 2>&1)                      # opens generation, snapshots cPre, warns
+unset FISHHAWK_TEST_ORPHAN_WARN_AT
+printf 'cPre\ncNew\n' > "$psfile"                    # cNew appears during the generation
+_reap_shared_container                               # last-holder sweep
+unset FISHHAWK_TEST_LEASE_TOKEN
+if grep -qx 'rm -f cNew' "$rmlog" && ! grep -qx 'rm -f cPre' "$rmlog" \
+   && printf '%s' "$warnout" | grep -q 'pre-existing'; then
+  pass "pre-generation sparing: cPre spared + reported, cNew swept"
+else
+  fail "pre-generation sparing: expected cNew swept, cPre spared+reported (rmlog=[$(tr '\n' ';' < "$rmlog")], warn=[$warnout])"
+fi
+
+# (iii) SNAPSHOT PLACEMENT — the snapshot is a SIBLING of $LEASE_DIR, not inside
+# it, so the last-holder rmdir still succeeds. Moving the snapshot inside
+# $LEASE_DIR makes rmdir fail (non-empty dir), the last-holder branch never runs,
+# and this reddens (no rm, dir survives).
+reset_case iii
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease
+placement_ok=0
+if [ -f "$LEASE_DIR.snapshot" ] && [ ! -e "$LEASE_DIR/snapshot" ] && [ ! -e "$LEASE_DIR/$(basename "$LEASE_DIR").snapshot" ]; then
+  placement_ok=1
+fi
+_reap_shared_container
+unset FISHHAWK_TEST_LEASE_TOKEN
+if [ "$placement_ok" -eq 1 ] && [ ! -d "$LEASE_DIR" ] && [ "$(rm_count)" -ge 1 ]; then
+  pass "snapshot placement: sibling path, last-holder rmdir still succeeds"
+else
+  fail "snapshot placement: expected sibling snapshot + successful rmdir (placement_ok=$placement_ok, dir exists: $([ -d "$LEASE_DIR" ] && echo yes || echo no), rm=$(rm_count))"
+fi
+
+# (iv) NO-SNAPSHOT DEGRADE — a last holder with the snapshot deleted (crash
+# leftover) sweeps NOTHING: only fishhawk-test-postgres is removed. Deleting the
+# snapshot-missing guard in _sweep_generation_orphans makes it grep a missing file
+# for every id, sweeping cX → this reddens.
+reset_case iv
+printf 'cX\n' > "$psfile"
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease
+rm -f "$LEASE_DIR.snapshot"                           # snapshot gone (crash / missing)
+_reap_shared_container
+unset FISHHAWK_TEST_LEASE_TOKEN
+if grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cX' "$rmlog"; then
+  pass "no-snapshot degrade: sweep is a no-op, only the shared container removed"
+else
+  fail "no-snapshot degrade: expected only fishhawk-test-postgres removed (rmlog=[$(tr '\n' ';' < "$rmlog")])"
+fi
+
+# (v) OPT-OUT — FISHHAWK_TEST_NO_ORPHAN_SWEEP=1 disables the sweep; a mid-
+# generation container is left in place.
+reset_case v
+printf 'cY\n' > "$psfile"
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease
+export FISHHAWK_TEST_NO_ORPHAN_SWEEP=1
+_reap_shared_container
+unset FISHHAWK_TEST_NO_ORPHAN_SWEEP
+unset FISHHAWK_TEST_LEASE_TOKEN
+if grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cY' "$rmlog"; then
+  pass "opt-out: FISHHAWK_TEST_NO_ORPHAN_SWEEP sweeps nothing"
+else
+  fail "opt-out: expected no sweep of cY (rmlog=[$(tr '\n' ';' < "$rmlog")])"
+fi
+
+# (vi) SNAPSHOT LIFECYCLE — the snapshot is RETAINED after a ref-held exit and
+# DELETED after the last-holder branch.
+reset_case vi
+sleep 60 & other=$!; disown "$other" 2>/dev/null || true
+unset FISHHAWK_TEST_LEASE_TOKEN
+FISHHAWK_TEST_LEASE_TOKEN=$other _register_lease      # opens generation, writes snapshot
+export FISHHAWK_TEST_LEASE_TOKEN=6000001             # our token: no lease of its own
+_reap_shared_container                               # ref-held (other's lease live) → retain snapshot
+retained=0; [ -f "$LEASE_DIR.snapshot" ] && retained=1
+kill "$other" 2>/dev/null
+FISHHAWK_TEST_LEASE_TOKEN=$other _reap_shared_container  # last-holder → delete snapshot
+deleted=0; [ ! -f "$LEASE_DIR.snapshot" ] && deleted=1
+unset FISHHAWK_TEST_LEASE_TOKEN
+if [ "$retained" -eq 1 ] && [ "$deleted" -eq 1 ]; then
+  pass "snapshot lifecycle: retained after ref-held, deleted after last-holder"
+else
+  fail "snapshot lifecycle: expected retain-then-delete (retained=$retained, deleted=$deleted)"
+fi
+
+# (vii) BRANCH INVARIANCE — the pre-existing ref-held / last-holder / stale-lease
+# / stale-lock / fail-safe / register-timeout cases (a)-(h) above still assert the
+# unchanged refcount behaviour; adding the sweep did not perturb them because
+# reset_case keeps $psfile empty and those cases write no snapshot. This marker
+# records that invariance is covered by the cases already run.
+pass "branch invariance: cases (a)-(h) exercise the unchanged refcount branches"
 
 # (f) parse-clean: scripts/test itself parses with no syntax errors.
 if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then

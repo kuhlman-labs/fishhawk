@@ -306,7 +306,11 @@ sourcing `scripts/test` lib-only with an overridden `ROOT`). They are
 standalone in the `scripts/test-*` style AND `scripts/test verify` runs
 them via `_verify_gate_harnesses` (right after the schema-sync check),
 alongside `scripts/test-dev` since #2455 — the three together take the
-loop to ~26s, from ~11s for the two coverage harnesses. "Must be green"
+loop to ~26s, from ~11s for the two coverage harnesses.
+`scripts/test-container-lease` (the #1792 lease + #3122 generation-keyed
+orphan sweep contract, no Docker — it uses a fake `docker` on PATH) is
+also wired into `_verify_gate_harnesses` and adds well under a second.
+"Must be green"
 is machine-enforced rather than asserted in prose, because a
 Python/shell-only diff otherwise takes the no-changed-Go-packages SKIP
 path and exercises neither the gate nor its harnesses. A
@@ -387,6 +391,81 @@ failed emit (t10) and a failed digest anchor (t11) — each aborting the
 coverage loop non-zero. The (e2)/(e3) unit cases pin the same no-profiles
 integrity re-check directly on `_verify_patch_coverage`, and (e) that a
 skip-snapshot with zero profiles still skips.
+
+## Container lease + generation-keyed orphan sweep ([#1792](https://github.com/kuhlman-labs/fishhawk/issues/1792) / [#3122](https://github.com/kuhlman-labs/fishhawk/issues/3122))
+
+`scripts/test` disables the testcontainers ryuk reaper
+(`TESTCONTAINERS_RYUK_DISABLED=true`) so the shared `fishhawk-test-postgres`
+persists across the package processes that reuse it, and reaps it via an EXIT
+trap that is lease-refcounted across concurrent invocations (#1792). But
+`backend/internal/postgres/postgres_test.go` is the documented pgtest exemption —
+it needs raw, un-migrated throwaway databases, so it starts its OWN anonymous
+testcontainers Postgres containers rather than reusing the shared one. Nothing
+reaped those: ryuk is off and the lease trap only knew the named container, so
+they accumulated across invocations until a loaded daemon failed a verify gate
+category-A against packages the change never touched (the #3122 signature).
+
+The root repair is Go-side (`postgres_test.go`'s `terminateStartFailure` on the
+start-error path). Layered on top, `scripts/test` sweeps orphans keyed to the
+LEASE GENERATION:
+
+- **The generation boundary is the lease's own.** A generation OPENS when
+  `$LEASE_DIR` first comes into existence (`_register_lease` sees it absent) and
+  CLOSES on the successful `rmdir "$LEASE_DIR"` the last-holder reap already uses.
+- **First holder writes the snapshot, later holders reuse it.** The first holder
+  to arm records the testcontainers-labelled container set that PREDATES the
+  generation into `$LEASE_DIR.snapshot`; a holder joining an already-open
+  generation reuses it UNCHANGED. Per-INVOCATION keying was the bug this fixes: A
+  arms and creates cA, B arms later and would snapshot cA as pre-existing, A exits
+  ref-held sweeping nothing, B exits last-holder and spares cA — so cA leaks.
+  Generation keying makes cA absent from the (empty) snapshot B reuses, so B
+  sweeps it.
+- **Sibling path, NOT inside `$LEASE_DIR`.** The snapshot is `$LEASE_DIR.snapshot`
+  (a sibling, exactly as `$LEASE_DIR.lock` is), because the last-holder proof is
+  `rmdir` succeeding, and `rmdir` requires an EMPTY directory — a file inside
+  `$LEASE_DIR` would make it fail and silently disable BOTH the shared-container
+  reap and the sweep. It is written atomically (temp sibling then `mv`).
+- **Last holder sweeps, INSIDE the lock.** The last-holder branch removes every
+  labelled container ABSENT from the snapshot (created DURING the generation,
+  including by an overlapping invocation that exited ref-held) and then deletes
+  the snapshot — both held under the lease lock across `rmdir` → sweep → removal,
+  so a concurrent invocation cannot arm between the `rmdir` and the removal, open
+  a new generation, write a fresh snapshot, and have the outgoing holder delete it
+  (the sweep would then be quietly dead for a whole generation).
+- **Preflight warning.** When a holder OPENS a generation on a daemon already
+  carrying more than `FISHHAWK_TEST_ORPHAN_WARN_AT` (default 4) labelled
+  containers, `scripts/test` prints a one-line stderr WARNING naming the count and
+  the removal command. Stderr is captured — the runner runs these commands with
+  `CombinedOutput`, so the warning reaches the category-A `FailureReason` (#3122
+  proposals 3/4) with no runner change.
+
+**What this guarantees, precisely.** A container created at any point DURING the
+lease generation is reaped by the last holder — including one created by an
+overlapping invocation that exited ref-held and swept nothing, and one whose test
+binary was SIGKILLed before its `t.Cleanup` ran. It does NOT reap a container that
+predates the generation (spared by design, reported by the preflight instead), one
+created after the last holder's comparison, or anything when the sweep degrades.
+
+**Residuals, stated not papered over.** (1) The preflight fires ONLY for the
+invocation that OPENS a generation; one joining an already-open generation on a
+littered daemon warns nothing. (2) Attribution is by the `org.testcontainers=true`
+label — the only signal available with ryuk disabled — so a container created by
+an UNRELATED testcontainers workload on the same daemon during the generation
+would be swept; `FISHHAWK_TEST_NO_ORPHAN_SWEEP` is the documented opt-out for an
+operator running such workloads concurrently. (3) The sweep degrades to a NO-OP
+(never remove-everything) when the snapshot is missing/unreadable, docker is
+absent, or the opt-out is set. `FISHHAWK_TEST_NO_ORPHAN_SWEEP` /
+`FISHHAWK_TEST_ORPHAN_WARN_AT` are DEV-ONLY: the runner's gate env is a
+default-deny allow-list, so neither reaches the in-loop gate.
+
+Pinned by `scripts/test-container-lease` (sourcing `scripts/test` lib-only with a
+fake `docker` on PATH serving an injectable labelled-container set): the
+interleaving case (the per-invocation-snapshot counterfactual), pre-generation
+sparing + preflight report, sibling-path placement + successful rmdir, the
+no-snapshot degrade, the opt-out, snapshot lifecycle (retained after ref-held,
+deleted after last-holder), and the unchanged #1792 refcount branches. That
+harness is now run in-loop by `scripts/test verify` via `_verify_gate_harnesses`,
+adding well under a second (it needs no Docker).
 
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 
