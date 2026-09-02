@@ -33,10 +33,11 @@ import "time"
 //	succeeded                 -> succeeded
 //	failed                    -> failed
 //	cancelled                 -> cancelled
+//	superseded                -> superseded
 //
 // The table enumerates every run.StageState that exists today, but the
 // mapping is stated as a RULE so it stays total as the backend grows:
-// `running` maps to "running", the three terminal states map to themselves,
+// `running` maps to "running", the FOUR terminal states map to themselves,
 // and EVERY other state — including one added after this comment was written
 // — falls to "pending", the conservative keep-polling default, so a new
 // backend state never strands a caller on a bucket it does not recognize.
@@ -61,6 +62,13 @@ import "time"
 //   - "succeeded" — terminal: the stage completed successfully.
 //   - "failed"    — terminal: the stage failed.
 //   - "cancelled" — terminal: the stage was cancelled.
+//   - "superseded" — terminal: the merge of the change the stage was
+//     gating made the stage UNREACHABLE (E64.2 / #3083). It is its OWN
+//     bucket, deliberately not laundered into "succeeded" or "cancelled":
+//     the stage neither passed nor was halted by an operator, and
+//     reporting either would be the same dishonesty the state exists to
+//     end. A caller that switch-exhausts on this bucket set sees a new
+//     value; it is additive — no existing value changed meaning.
 //
 // PollIntervalSeconds is a server-suggested poll cadence: it is populated
 // ONLY while the status is non-terminal (pending/running) — the states where
@@ -79,7 +87,7 @@ import "time"
 // stageWaitPollCeilingSeconds]. See stageWaitPollIntervalSeconds.
 type StageWaitStatus struct {
 	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', 'review', or 'acceptance'"`
-	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled. This is a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled. Any state added later also buckets to pending (the conservative keep-polling default)"`
+	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled, superseded. This is a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded. superseded is TERMINAL: a merge made the stage unreachable (E64.2 / #3083), so a wait on it resolves rather than polling forever. Any state added later also buckets to pending (the conservative keep-polling default)"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status is non-terminal (pending/running); present only while non-terminal, omitted on terminal. Poll get_run_status on this cadence as the authoritative path to a terminal stage status"`
 	// ElapsedSeconds / AgentTimeoutSeconds / DeadlineSecondsRemaining are the
 	// stage's remaining-budget observability (#2540): how long the stage has been
@@ -236,14 +244,20 @@ func stageDeadlineRemaining(agentTimeoutSeconds int, elapsed time.Duration) *int
 
 // stageStateIsTerminal reports whether a backend stage state is one past which
 // the stage can no longer make progress. The terminal set —
-// succeeded / failed / cancelled — is compared INLINE here against the
-// fishhawk-mcp-local Stage.State string (client.go); the backend's
+// succeeded / failed / cancelled / superseded — is compared INLINE here against
+// the fishhawk-mcp-local Stage.State string (client.go); the backend's
 // run.StageState type and its IsTerminal() method are deliberately NOT
 // imported, mirroring review.go's runStateIsTerminal (which avoided #875's
 // compile trap by not depending on backend/internal/run).
+//
+// That deliberate non-import is exactly why `superseded` (E64.2 / #3083) has to
+// be added HERE by hand: this set does not track run.StageState.IsTerminal()
+// automatically, so a terminal state the backend learns and this list does not
+// leaves fishhawk_await_stage polling a stage that can never move again — it
+// would block for its whole timeout on a run that is already settled.
 func stageStateIsTerminal(state string) bool {
 	switch state {
-	case "succeeded", "failed", "cancelled":
+	case "succeeded", "failed", "cancelled", "superseded":
 		return true
 	default:
 		return false
@@ -259,7 +273,7 @@ func stageStateIsTerminal(state string) bool {
 //
 // Non-terminal states (pending | awaiting_host_dispatch | dispatched |
 // awaiting_approval | awaiting_children) map to "pending"; running maps to
-// "running"; the three terminal states map to themselves. A non-terminal status
+// "running"; the four terminal states map to themselves. A non-terminal status
 // carries the DERIVED poll interval (see stageWaitPollIntervalSeconds); a
 // terminal status omits it, as does the ADR-036 run-terminal backstop.
 //
@@ -273,7 +287,7 @@ func classifyStageWaitStatus(stageType, stageState, runState string, startedAt *
 	switch stageState {
 	case "running":
 		status = "running"
-	case "succeeded", "failed", "cancelled":
+	case "succeeded", "failed", "cancelled", "superseded":
 		status = stageState
 	}
 

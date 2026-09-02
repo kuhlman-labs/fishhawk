@@ -237,6 +237,7 @@ var documentedStageWaitMapping = []struct {
 	{runpkg.StageStateSucceeded, "succeeded"},
 	{runpkg.StageStateFailed, "failed"},
 	{runpkg.StageStateCancelled, "cancelled"},
+	{runpkg.StageStateSuperseded, "superseded"},
 }
 
 // TestClassifyStageWaitStatus_MappingTable pins the documented backend-state
@@ -266,8 +267,8 @@ func TestClassifyStageWaitStatus_MappingTable(t *testing.T) {
 		t.Errorf("%d distinct buckets over %d states — the bucket vocabulary must be strictly coarser",
 			len(buckets), len(documentedStageWaitMapping))
 	}
-	if len(buckets) != 5 {
-		t.Errorf("distinct wait-status buckets = %d, want 5", len(buckets))
+	if len(buckets) != 6 {
+		t.Errorf("distinct wait-status buckets = %d, want 6", len(buckets))
 	}
 
 	// An unrecognized backend state falls to the keep-polling default.
@@ -291,7 +292,7 @@ func TestClassifyStageWaitStatus_Derived(t *testing.T) {
 		t.Errorf("PollIntervalSeconds = %d, want 375 ((115*60 - 5400) / 4)", got.PollIntervalSeconds)
 	}
 
-	for _, terminal := range []string{"succeeded", "failed", "cancelled"} {
+	for _, terminal := range []string{"succeeded", "failed", "cancelled", "superseded"} {
 		got := classifyStageWaitStatus("implement", terminal, "running", started, 115, waitBase)
 		if got.PollIntervalSeconds != 0 {
 			t.Errorf("[%s] PollIntervalSeconds = %d, want 0 (terminal omits it even with a prediction)",
@@ -620,5 +621,43 @@ func TestStageWaitStatusFor_Acceptance(t *testing.T) {
 
 	if none := stageWaitStatusFor([]Stage{{Type: "implement", State: "running"}}, "acceptance", "running", 0, waitBase); none != nil {
 		t.Errorf("acceptance = %+v, want nil (no acceptance stage)", none)
+	}
+}
+
+// TestStageStateIsTerminal_Superseded is the E64.2 / #3083 seam test for the
+// defect the plan calls out by name: stage_wait.go carries its OWN
+// string-literal terminal set (it deliberately does NOT import
+// backend/internal/run, so run.StageState.IsTerminal() cannot keep it honest),
+// and fishhawk_await_stage RESOLVES on that set. A `superseded` stage is
+// terminal in the backend and can never move again — if this set does not know
+// it, the wait polls until its whole timeout expires on a run that is already
+// settled.
+//
+// It asserts BOTH halves of the contract, because the terminal predicate and
+// the bucket are separate code paths and teaching only one leaves a terminal
+// status reported as the keep-polling `pending` bucket:
+//
+//  1. stageStateIsTerminal("superseded") is true;
+//  2. the wait status buckets to its OWN `superseded` value and — the observable
+//     consequence of (1) — omits poll_interval_seconds, which is what makes a
+//     polling caller stop.
+//
+// The bucket is deliberately NOT laundered into `succeeded` or `cancelled`:
+// either would report something untrue about a stage that neither passed nor
+// was halted by an operator, which is the dishonesty #3083 exists to end.
+func TestStageStateIsTerminal_Superseded(t *testing.T) {
+	if !stageStateIsTerminal("superseded") {
+		t.Fatal("stageStateIsTerminal(\"superseded\") = false; fishhawk_await_stage would block forever on a stage that can never move again (#3083)")
+	}
+
+	// A large prediction and a long-running stage would both produce a big
+	// interval if the terminal guard did not fire — so a zero here is the
+	// terminal guard, not an accident of the derivation.
+	got := classifyStageWaitStatus("acceptance", "superseded", "running", startedAgo(5400*time.Second), 115, waitBase)
+	if got.Status != "superseded" {
+		t.Errorf("Status = %q, want superseded (its own bucket, never laundered into succeeded/cancelled)", got.Status)
+	}
+	if got.PollIntervalSeconds != 0 {
+		t.Errorf("PollIntervalSeconds = %d, want 0: a terminal status must not advertise a poll cadence", got.PollIntervalSeconds)
 	}
 }

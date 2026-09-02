@@ -75,6 +75,13 @@ import "sort"
 // stage's effective scope, and it is ALSO read as an invalidator by
 // server/prompt.go::resolveHeldCommitExemption, which demotes a stale
 // `exempted` decision when an amend supersedes it.
+// E64.2 / #3083 added stage_superseded_by_merge, the merge-supersede sweep's
+// per-stage marker: one chained entry per stage a merge terminalized as
+// `superseded` because the merge made it unreachable, naming the stage, its
+// type, the state it was parked in and the reason (merge_observed |
+// operator_reconcile | repair). It is APPENDED ONLY AFTER the compare-and-swap
+// that moved the stage actually succeeded, so a refused sweep leaves a MISSING
+// row rather than a false record of a supersession that never happened.
 // E55.1 / #2242 added the two document-injection markers written by
 // backend/internal/repodoc: document_injected (one per repo-authored document
 // injected into an agent prompt, naming the resolved path, the PINNED commit,
@@ -314,6 +321,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_override_retried":                  {},
 	"stage_permissions_declared":              {},
 	"stage_retried":                           {},
+	"stage_superseded_by_merge":               {},
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},

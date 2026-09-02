@@ -462,6 +462,23 @@ Notes:
   `plan_review_backstop_elapsed`: it exists so a reviewer that dies emitting no
   terminal verdict can never strand a merge resolution, and so the degrade is
   auditable.
+- The merge-supersede audit kind — `stage_superseded_by_merge` (E64.2 / #3083),
+  written by the shared merge-supersede sweep
+  (`server/merge_supersede.go::supersedeParkedStagesOnMerge`) once per stage a
+  merge terminalized as `superseded`, from BOTH writers (the automatic merged
+  path and `POST /v0/runs/{run_id}/reconcile-merge`) — is an **internal,
+  fact-record audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; the run's sticky status comment
+  already reflects the stage's new state through the shared `stageStateIcon`
+  glyph. Payload: `{run_id, stage_id, stage_type, from_state, reason}`, where
+  `reason` is `merge_observed` | `operator_reconcile` | `repair`. It is the
+  durable record of WHY a run completed around a stage that never executed —
+  the honesty the state exists for, since the pre-existing escape hatches
+  recorded `failed` (work never attempted) or `cancelled` (a change that
+  shipped). The entry is appended ONLY AFTER the compare-and-swap that moved the
+  stage succeeded, so a refused sweep leaves a MISSING row rather than a false
+  one; the reconcile endpoint's `repair` reason is what closes that window from
+  the other side.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
   written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
   immediately after `plan_generated` and before plan review — is an **internal,

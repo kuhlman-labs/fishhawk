@@ -25,7 +25,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **114 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **115 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -141,6 +141,7 @@ The v0 REST API exposes **114 operations** across the paths below, generated fro
 | `GET` | `/v0/runs/{run_id}/scope-amendments` | List a run's scope amendments |
 | `POST` | `/v0/runs/{run_id}/scope-amendments/{amendment_id}/decision` | Approve or deny a scope amendment (operator) |
 | `POST` | `/v0/runs/{run_id}/scope-completeness/decision` | Exempt, amend or fail a parked scope-completeness shortfall (operator) |
+| `POST` | `/v0/runs/{run_id}/reconcile-merge` | Supersede the stages a merge left parked and complete the run (operator) |
 | `POST` | `/webhooks/github` | GitHub App webhook receiver |
 | `POST` | `/webhooks/gitlab` | GitLab webhook receiver |
 

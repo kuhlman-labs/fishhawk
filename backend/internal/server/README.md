@@ -3485,3 +3485,48 @@ so an operator-configured target keeps its own parameters. `url.Values.Set`
 returns the FIRST, so an operator-set `reason` would shadow the branch code and
 the page would name the wrong denial — precisely the failure this change exists
 to fix.
+
+## Merge-supersede sweep + `reconcile-merge` recovery (`merge_supersede.go`, E64.2 / #3083)
+
+A merge can leave a stage parked in a state nothing will ever re-dispatch — a fix-up pass re-parks `acceptance` at `awaiting_host_dispatch`, or the human `review` gate is still `awaiting_approval` when the PR merges. `Orchestrator.completeRun`'s #968 guard then CORRECTLY refuses to stamp the run `succeeded` around a non-terminal stage, and every pre-existing escape hatch records something untrue: `reap_stage` writes `failed` for work that was never attempted, `cancel_run` writes `cancelled` for a change that shipped, and re-dispatching acceptance runs the agent against a preview bound to a commit that is no longer the change.
+
+`superseded` (the state itself lives in `backend/internal/run`) records the fact instead: the merge made the stage UNREACHABLE. It is terminal, so the #968 guard passes it — which is exactly why what may enter it is bounded.
+
+### The sweep primitive
+
+`supersedeParkedStagesOnMerge(ctx, runID, skipStageID, reason)` is THE shared primitive. Both writers call it — the operator recovery endpoint here and the automatic merged-path invocation in `pullrequest_review_events.go` — so the two can never disagree about which stages a merge may terminalize.
+
+Four properties carry the design:
+
+- **DEFAULT DENY, and type-aware.** Admission is `run.MergeSupersedable(stageType, state)` — a `(stage_type, state)` pair table with exactly two rows. A state-only allow-list would admit a `pending` plan stage and complete a run `succeeded` around work never planned, defeating precisely the invariant #968 protects. The table is ALSO enforced at the repository transition boundary (`run/postgres.go` consults it with the ROW-LOCKED stage's own `stage_type`), so it is not advisory guidance a caller reaching the repository directly could bypass.
+- **Compare-and-swap, not a bare transition.** The move goes through `run.StageCASTransitioner.TransitionStageFrom` pinned to the state the sweep classified, closing the classify→transition race atomically under the stage row lock: a concurrent writer that re-parks or fails the stage in that window is refused with a typed `run.StageStateChangedError` instead of having its state destroyed. The capability is REQUIRED, not optional — a repository without it sweeps NOTHING rather than degrading to the non-CAS `TransitionStage`, mirroring `reap_failure.go`'s refusal (#2672).
+- **TRANSITION FIRST, THEN AUDIT.** The chain is append-only, so a `stage_superseded_by_merge` row written before a CAS that then refuses would be an IMMUTABLE record of a supersession that never happened. The failure mode must be a MISSING row, never a false one. `TestSupersedeParkedStages_NoAuditRowWhenCASRefuses` seeds the premise mismatch by construction (a stale stage snapshot against a moved DB row) and asserts ZERO rows.
+- **Best-effort throughout.** Every failure warn-logs and the sweep continues; it never returns an error, because both callers are tails on a merge resolution that has already committed and must not be unwound.
+
+`skipStageID` exempts the caller's own stage. It is genuinely load-bearing at the primitive: `review@awaiting_approval` is itself a pair-table row, so a caller that resolves the review stage itself must hand its id in or the sweep would race the transition that caller owns (`TestSupersedeParkedStages_SkipStageIDIsHonored`).
+
+### `POST /v0/runs/{run_id}/reconcile-merge`
+
+The operator recovery verb. `memberWrite` (an operator-decision write, not a destructive one — the merged-PR precondition and the pair table bound what it can do). Refusals, all evaluated BEFORE any write so a refused reconcile moves zero stages and writes zero rows:
+
+| status | code | condition |
+| --- | --- | --- |
+| 400 | `validation_failed` | non-UUID `run_id` |
+| 503 | `reconcile_merge_unconfigured` | run/audit repositories unwired |
+| 404 | `run_not_found` | — |
+| 409 | `reconcile_merge_pr_not_merged` | no `pr_merged` / `post_merge_observed` entry on the run's chain |
+| 409 | `reconcile_merge_not_applicable` | no pair-table-admissible parked stage AND no already-superseded stage to repair |
+
+The merged-PR precondition is what stops the verb manufacturing a `succeeded` run for a change that never shipped; a chain-read failure is a 500, never a write (fail closed on unknown evidence).
+
+**Idempotent, and self-repairing.** A second POST finds the stage already `superseded` — not a pair-table state — moves nothing, and returns 200 with two empty lists. The **repair scan** closes the missing-row window the transition-first ordering deliberately allows: a stage that is `superseded` but carries no audit row (a sweep whose CAS committed and whose append then failed) gets a row back with reason `repair`, transitioning nothing. That scan compares against a **PRE-sweep** snapshot of the chain, which is exactly why the same-invocation exclusion is load-bearing rather than decorative: without it the stages this very invocation moved would look un-recorded and draw a SECOND row. `TestReconcileMerge_ExactlyOneAuditRowPerSweptStage` asserts EXACTLY one row per swept stage across two sequential POSTs, not at-least-one.
+
+After the sweep the handler re-runs `advanceRunAfterReviewResolve`, so the now-all-terminal stage set routes through `completeRun` on the same request.
+
+### `completion_blocked` on `GET /v0/runs/{id}`
+
+The read half (`runs.go`'s `completionBlockedForRun`). Populated on the single-run read ONLY — the same best-effort posture as `Concerns` / `DerivedStatus` / `SliceDependsOn`, so the list endpoint pays no per-row stage + audit reads — and `omitempty`, so every unblocked run keeps a byte-identical response.
+
+It names the **lowest-sequence** non-terminal stage (the run's own order, so the answer is stable and names the stage an operator reaches for first) and DISCRIMINATES the recovery: `reconcile-merge` ONLY when the blocker is pair-table-admissible AND the run's PR is observably merged — the endpoint's own preconditions, read through the same helper, so the surface and the verb cannot disagree — and `none` otherwise, with `reason` naming the state. Pointing an operator at a verb guaranteed to refuse is #3083's own complaint about `merge_run`.
+
+A merge-evidence read failure does NOT omit the field: it degrades `recovery` to `none` (fail closed — never advertise a verb we cannot confirm would work) and still names the blocking stage, the half of the answer that does not depend on the chain.

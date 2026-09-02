@@ -1584,8 +1584,8 @@ type GetRunStatusOutput struct {
 	// terminal per the ADR-036 #874 backstop). Distinct from the *ReviewStatus
 	// pair above, which tracks a stage's REVIEW rather than its execution.
 	// Omitted (nil) when no stage of that type exists in the run.
-	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, and any state added later also buckets to pending). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no plan stage exists"`
-	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, and any state added later also buckets to pending). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — a filed scope amendment needs at least the amendment poll window of remaining budget to be decidable. Omitted when no implement stage exists"`
+	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no plan stage exists"`
+	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — a filed scope amendment needs at least the amendment poll window of remaining budget to be decidable. Omitted when no implement stage exists"`
 	// AcceptanceStageWaitStatus summarizes the acceptance stage's EXECUTION
 	// lifecycle (E31.9 / ADR-049), computed via the same generic
 	// stageWaitStatusFor helper. Omitted (nil) when the workflow declares no
@@ -1593,7 +1593,7 @@ type GetRunStatusOutput struct {
 	// FAILED acceptance VERDICT leaves the stage 'succeeded' — this field
 	// tracks stage EXECUTION, not the verdict; read the acceptance_outcome_recorded
 	// audit entry (and next_actions) for the verdict + triage disposition.
-	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, and any state added later also buckets to pending). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
+	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -1729,23 +1729,32 @@ fishhawk_list_audit.
 
 Also returns plan_stage_wait_status + implement_stage_wait_status — each a
 StageWaitStatus whose status is one of
-pending/running/succeeded/failed/cancelled, derived from the durable
-(run_id, stage_id) handle. That five-value wait status is a coarser BUCKET
+pending/running/succeeded/failed/cancelled/superseded, derived from the durable
+(run_id, stage_id) handle. That six-value wait status is a coarser BUCKET
 than the raw stage 'state' the REST API reports, and the mapping is total:
 pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending,
 awaiting_approval -> pending, awaiting_children -> pending,
 awaiting_input -> pending, awaiting_scope_decision -> pending,
 awaiting_deploy_approval -> pending, awaiting_deployment -> pending,
 running -> running, succeeded -> succeeded, failed -> failed,
-cancelled -> cancelled. Any state added later also buckets to 'pending', the
-conservative keep-polling default. Neither vocabulary is
+cancelled -> cancelled, superseded -> superseded. Any state added later also
+buckets to 'pending', the conservative keep-polling default. 'superseded' is
+TERMINAL and is its own bucket: a merge made the stage unreachable (#3083), so
+it is neither a success nor an operator cancellation and a wait on it resolves
+rather than polling forever. Neither vocabulary is
 renamed — the bucket answers "should I keep polling?", the raw state answers
 "where exactly is this stage?". Re-polling this tool is the AUTHORITATIVE way to
 await a stage's terminal status: while the status is non-terminal
 (pending/running) the StageWaitStatus carries a server-suggested
 poll_interval_seconds (30s) — re-call get_run_status on that cadence until
 the status goes terminal. (The interval is dropped once the run itself is
-terminal, so the wait never strands.) A non-terminal StageWaitStatus also
+terminal, so the wait never strands.) When a 'running' run is held open by a
+non-terminal stage, run.completion_blocked names that stage and DISCRIMINATES
+the recovery: recovery='reconcile-merge' means POST
+/v0/runs/{run_id}/reconcile-merge can supersede it and complete the run (a
+merge-supersedable park on an observably merged PR), while recovery='none' means
+no verb applies and reason says what the stage needs instead — branch on it
+rather than suggesting the endpoint unconditionally. A non-terminal StageWaitStatus also
 carries the stage's remaining agent budget when the wall clock is known —
 elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — so an
 operator can see how much runtime is left; a mid-stage scope amendment needs at

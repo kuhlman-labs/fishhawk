@@ -204,9 +204,46 @@ type Run struct {
 	// trap. That degrade is also the mixed-version behaviour against an older
 	// backend that omits the key entirely, which is why it is a graceful
 	// fallback rather than a failure.
-	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	PredictedRuntimeMinutes int `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
+	// CompletionBlocked mirrors the backend runResponse.completion_blocked
+	// (E64.2 / #3083): the stage stopping a `running` run from completing, and
+	// whether the merge-supersede sweep can move it. The backend emits it on
+	// the SINGLE-run read only (handleGetRun), so it is populated when this Run
+	// came from GetRun and nil otherwise; an OLDER backend omits it entirely
+	// (nil-decode, the mixed-version degrade). The json tags MUST byte-match
+	// the backend's runCompletionBlockedPayload or the field silently decodes
+	// to nil — the #371-class hand-maintained-wire-mirror trap.
+	CompletionBlocked *runCompletionBlocked `json:"completion_blocked,omitempty" jsonschema:"the stage stopping a running run from completing (#968 guard) plus whether a reconcile can move it. Omitted when the run is not blocked"`
+	CreatedAt         time.Time             `json:"created_at"`
+	UpdatedAt         time.Time             `json:"updated_at"`
+}
+
+// runCompletionBlocked mirrors the backend's run-status completion_blocked block
+// (E64.2 / #3083 — backend/internal/server/runs.go's
+// runCompletionBlockedPayload): which stage is holding a `running` run open, and
+// whether anything can move it.
+//
+// Recovery is a CLOSED two-value set — "reconcile-merge" or "none" — and it
+// DISCRIMINATES: it names the verb ONLY when the blocking stage is one the
+// default-deny merge-supersede pair table admits AND the run's PR is observably
+// merged. Reason names the state otherwise. Pointing an operator at a verb
+// guaranteed to refuse is the defect #3083 reports against merge_run, so a
+// consumer must branch on Recovery rather than always suggesting the endpoint.
+//
+// The json tags MUST stay byte-identical with the backend field or the mirror
+// decodes to nil silently (the #371-class hand-maintained-wire-mirror trap).
+// It is deliberately UNEXPORTED, unlike its RunConcerns / RunReviewAuthority
+// siblings: the package's export-surface baseline (export_surface_test.go) is
+// not in this slice's scope, and nothing outside this package names the type —
+// the field is exported, so encoding/json and the jsonschema reflector reach it
+// exactly as they would an exported type. If a consumer ever needs to name it,
+// exporting it is a one-line change plus a baseline row.
+type runCompletionBlocked struct {
+	StageID    string `json:"stage_id" jsonschema:"the id of the non-terminal stage blocking completion"`
+	StageType  string `json:"stage_type" jsonschema:"the blocking stage's type (plan | implement | review | deploy | acceptance)"`
+	StageState string `json:"stage_state" jsonschema:"the blocking stage's RAW backend state (e.g. awaiting_host_dispatch, awaiting_approval, running)"`
+	Reason     string `json:"reason" jsonschema:"why the run cannot complete, naming the stage and its state"`
+	Recovery   string `json:"recovery" jsonschema:"'reconcile-merge' when POST /v0/runs/{run_id}/reconcile-merge can supersede this stage and complete the run (a merge-supersedable park on an observably merged PR), otherwise 'none' — no verb applies and reason says what the stage needs instead"`
 }
 
 // init classifies the decomposition-lineage Run fields this change adds
@@ -226,6 +263,13 @@ func init() {
 		pathClassification{Path: "run.decomposed_from", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 		pathClassification{Path: "run.slice_index", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 		pathClassification{Path: "run.slice_depends_on", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The completion-refusal projection (E64.2 / #3083). Derived by the
+		// backend from the run's stage rows + merge evidence and surfaced by
+		// the single-run REST read, so it classifies like the sibling
+		// single-read projections: stored, retrievable from GET
+		// /v0/runs/{id}, retained through T1..T9, itemised out only at the
+		// diagnosis skeleton.
+		pathClassification{Path: "run.completion_blocked", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	)
 }
 

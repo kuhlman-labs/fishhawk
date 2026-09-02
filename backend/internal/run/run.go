@@ -81,8 +81,8 @@ func (s State) IsTerminal() bool {
 // deliberately excluded from IsSettled.
 type StageState string
 
-// Stage states. Terminal states (Succeeded, Failed, Cancelled) admit
-// no further transitions; see transition.go for the table.
+// Stage states. Terminal states (Succeeded, Failed, Cancelled,
+// Superseded) admit no further transitions; see transition.go for the table.
 const (
 	StageStatePending StageState = "pending"
 	// StageStateAwaitingHostDispatch is the parked-for-host-spawn state (#1912):
@@ -114,12 +114,30 @@ const (
 	StageStateSucceeded          StageState = "succeeded"
 	StageStateFailed             StageState = "failed"
 	StageStateCancelled          StageState = "cancelled"
+	// StageStateSuperseded records the fact that a stage was made
+	// UNREACHABLE by the merge of the change it was gating (#3083). It is
+	// deliberately distinct from the two terminal states an operator would
+	// otherwise be forced to lie with:
+	//
+	//   - `failed` says the work was ATTEMPTED and did not pass. A stage the
+	//     merge superseded was never attempted at all — re-parked acceptance
+	//     never re-dispatched, or a review gate on an already-merged change.
+	//   - `cancelled` says an OPERATOR halted the run. Nobody halted anything;
+	//     the merge simply removed the stage's reason to exist.
+	//
+	// Terminal (so ended_at is stamped and Orchestrator.completeRun's #968
+	// guard accepts it) and therefore settled. Which (stage_type, state) pairs
+	// may ENTER it is a default-deny table in transition.go — a `pending` plan
+	// or implement stage must never be swept here, because completing a run
+	// `succeeded` around one would defeat exactly the invariant #968 protects.
+	StageStateSuperseded StageState = "superseded"
 )
 
 // IsTerminal reports whether the state admits no further transitions.
 func (s StageState) IsTerminal() bool {
 	switch s {
-	case StageStateSucceeded, StageStateFailed, StageStateCancelled:
+	case StageStateSucceeded, StageStateFailed, StageStateCancelled,
+		StageStateSuperseded:
 		return true
 	default:
 		return false
@@ -128,7 +146,7 @@ func (s StageState) IsTerminal() bool {
 
 // IsSettled reports whether the stage has stopped making forward
 // progress on its own — it is either terminal (succeeded, failed,
-// cancelled) or parked awaiting an operator action (awaiting_approval,
+// cancelled, superseded) or parked awaiting an operator action (awaiting_approval,
 // awaiting_children, awaiting_input, awaiting_scope_decision,
 // awaiting_deploy_approval, awaiting_host_dispatch). The in-flight states
 // (pending, dispatched, running, awaiting_deployment) are NOT settled —
@@ -141,11 +159,13 @@ func (s StageState) IsTerminal() bool {
 // stage terminal-wait long-poll (GET /v0/runs/{run_id}/stages/{stage_id}
 // ?wait, #1252) to decide when to stop blocking: a detached watcher
 // wants to release the moment the stage needs operator attention, not
-// only when the run is fully done. IsTerminal is left untouched for its
-// narrower callers (transition tables, run-reduction).
+// only when the run is fully done. IsTerminal carries the narrower
+// terminal-only semantics for its own callers (transition tables,
+// run-reduction, the #968 completion guard).
 func (s StageState) IsSettled() bool {
 	switch s {
 	case StageStateSucceeded, StageStateFailed, StageStateCancelled,
+		StageStateSuperseded,
 		StageStateAwaitingApproval, StageStateAwaitingChildren,
 		StageStateAwaitingInput, StageStateAwaitingScopeDecision,
 		StageStateAwaitingDeployApproval, StageStateAwaitingHostDispatch:
