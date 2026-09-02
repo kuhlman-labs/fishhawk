@@ -8741,12 +8741,25 @@ func sweepStaleScopeJustification(cfg config, logSink io.Writer) {
 //     (trailing-slash directory entries and unknown paths excluded) or whose
 //     reason is empty/whitespace, logging scope_justification_entry_ignored.
 //
+// Over the ceiling (E64.12 / #3106) it fails closed (nil), logging
+// scope_justification_oversize and removing the file by hand (this return
+// precedes the deferred removal below). DIAGNOSIS: an oversize read is already a
+// non-ErrNotExist read error the fail-closed return below covers; the named
+// event tells an operator an oversize sidecar from a malformed one.
+//
 // `declared` is the declared scope.files path set (scopePaths(cfg.scopeFiles)).
 // Returns the surviving validated entries.
 func loadScopeExemptions(cfg config, declared []string, logSink io.Writer) []scopeExemption {
 	path := scopeJustificationPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"scope_justification_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			_ = os.Remove(path)
+			return nil
+		}
 		// Absent sidecar is the common no-op (strict gate, no exemptions); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can exempt anything, so no log on the not-exist path.
@@ -9246,6 +9259,15 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 // present sidecar it deletes the file on EVERY return path (consumed/malformed/
 // stale all clean up, so an invalid sidecar is never left behind to bleed into a
 // later read), and:
+//   - fails closed (zero result) when the sidecar exceeds maxSidecarBytes
+//     (E64.12 / #3106), logging fixup_selfreport_oversize and REMOVING the file
+//     by hand — this loader returns on the read-error path BEFORE its deferred
+//     removal is installed, so the oversize branch must write the removal out
+//     itself to satisfy the sidecar-removed requirement. The removal is the one
+//     thing this branch buys beyond diagnosis: the fail-closed return is already
+//     there (an oversize read is a non-ErrNotExist error), so a deleted
+//     event-name assertion would go red while a deleted removal would leave the
+//     file on disk;
 //   - fails closed ("") on malformed JSON, logging fixup_selfreport_invalid;
 //   - fails closed ("") when the embedded run_id/stage_id do not match cfg,
 //     logging fixup_selfreport_stale (a leftover from another run/stage);
@@ -9266,8 +9288,19 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 // the surviving obligation reports.
 func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSelfReportResult {
 	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): log the named diagnostic AND
+			// remove the sidecar by hand — this return is reached BEFORE the
+			// deferred removal below is installed, so an oversize file would
+			// otherwise survive on disk. The fail-closed zero result is unchanged.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_selfreport_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			_ = os.Remove(path)
+			return fixupSelfReportResult{}
+		}
 		// Absent sidecar is the common no-op (the agent reported nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can claim anything, so no log on the not-exist path.
@@ -9457,6 +9490,16 @@ func sweepUnreadCounterfactualReport(cfg config, logSink io.Writer) {
 //     BEFORE its deferred removal is installed, so an unreadable sidecar
 //     survives on disk contrary to its stated every-return-path cleanup
 //     invariant; this loader closes that gap.
+//   - OVER-CEILING (readSidecarBounded returned errSidecarTooLarge — the read
+//     was refused before the bytes were materialized, E64.12 / #3106) → the
+//     path is REMOVED (reusing the same checked-removal shape as the unreadable
+//     branch) and counterfactual_report_oversize logged before returning nil.
+//     This is DIAGNOSIS, not the control: the security property is the ceiling
+//     inside readSidecarBounded, and even with no oversize branch here this
+//     loader would still fail closed (an errSidecarTooLarge is a non-ErrNotExist
+//     read error, so the unreadable branch below already returns nil). The named
+//     event is what lets an operator tell an oversize sidecar from a malformed
+//     one.
 //   - MALFORMED JSON → nil + counterfactual_report_invalid.
 //   - STALE (embedded run_id/stage_id not matching cfg) → nil +
 //     counterfactual_report_stale, echoing the foreign ids through
@@ -9474,8 +9517,27 @@ func sweepUnreadCounterfactualReport(cfg config, logSink io.Writer) {
 // cannot drift.
 func loadCounterfactualReport(cfg config, scope []string, logSink io.Writer) []fixupCounterfactualEvidence {
 	path := counterfactualReportPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, reusing
+			// the checked-removal shape the unreadable branch uses below — a path
+			// we could not read and could not remove are two distinct facts, each
+			// logged. DIAGNOSIS, not the control: errSidecarTooLarge is already a
+			// non-ErrNotExist read error, so the unreadable branch would fail
+			// closed even without this branch; the named event is what an
+			// operator needs to tell an oversize sidecar from a malformed one.
+			rmErr := os.RemoveAll(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return nil
+		}
 		if errors.Is(err, os.ErrNotExist) && !pathExists(path) {
 			// The common no-op: the agent reported nothing. No log — only an
 			// existing file's content can claim anything.
@@ -9576,14 +9638,24 @@ func sweepStaleFixupCommitMessage(cfg config, logSink io.Writer) {
 // loadFixupCommitMessage reads the agent's fix-up commit-message sidecar (#1572)
 // and splits it into (subject, body). It deletes the file on EVERY return path
 // (delete-after-read) so a stale sidecar can never bleed into a later pass.
-// Returns ok=false when the sidecar is absent, unreadable, or empty/whitespace-
-// only — the fallback cases the caller resolves to a conventional-shaped
-// synthetic subject. On success the first line is the subject (the Conventional-
-// Commits header) and the remainder after it is the body.
+// Returns ok=false when the sidecar is absent, unreadable, over the ceiling, or
+// empty/whitespace-only — the fallback cases the caller resolves to a
+// conventional-shaped synthetic subject. Over the ceiling (E64.12 / #3106) it
+// also logs fixup_commitmsg_oversize and removes the file by hand (this return
+// precedes the deferred removal below); DIAGNOSIS on top of the already-present
+// fail-closed return. On success the first line is the subject (the
+// Conventional-Commits header) and the remainder after it is the body.
 func loadFixupCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
 	path := fixupCommitMessagePath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			_ = os.Remove(path)
+			return "", "", false
+		}
 		// Absent sidecar is the common no-op (the agent wrote nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can supply a message, so no log on the not-exist path.
@@ -9756,14 +9828,24 @@ func sweepStalePullRequestDescription(cfg config, logSink io.Writer) bool {
 // loadImplementCommitMessage reads the agent's initial-implement commit-message
 // sidecar (#1686) and splits it into (subject, body). It deletes the file on
 // EVERY return path (delete-after-read) so a stale sidecar can never bleed into a
-// later run/stage. Returns ok=false when the sidecar is absent, unreadable, or
-// empty/whitespace-only — the fallback cases the caller resolves to today's
-// title + "\n\n" + body. On success the first line is the subject (the
+// later run/stage. Returns ok=false when the sidecar is absent, unreadable, over
+// the ceiling, or empty/whitespace-only — the fallback cases the caller resolves
+// to today's title + "\n\n" + body. Over the ceiling (E64.12 / #3106) it also
+// logs implement_commitmsg_oversize and removes the file by hand (this return
+// precedes the deferred removal below); DIAGNOSIS on top of the already-present
+// fail-closed return. On success the first line is the subject (the
 // Conventional-Commits header) and the remainder after it is the body.
 func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
 	path := implementCommitMessagePath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			_ = os.Remove(path)
+			return "", "", false
+		}
 		// Absent sidecar is the common no-op (an older agent wrote nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can supply a message, so no log on the not-exist path.
@@ -10386,6 +10468,19 @@ func (h *agentHandoff) commitMessage(cfg config, logSink io.Writer) (subject, bo
 //   - Blank line.
 //   - Remaining lines are the body (markdown).
 //
+// Over the ceiling (E64.12 / #3106): a keyed OR legacy handoff that exceeds
+// maxSidecarBytes is refused before decode, logging pr_description_oversize
+// (naming the over-ceiling path), removing that file, and returning
+// prBodyReasonHandoffUnreadable — the SAME reason an unreadable handoff carries,
+// deliberately NOT a sixth wire value: an oversize handoff is a present-but-
+// unusable one, exactly what handoff_unreadable already means, and the distinct
+// pr_description_oversize log carries the discrimination an operator needs. An
+// oversize KEYED handoff does NOT fall through to the legacy path — it is
+// present-but-unusable, and the keyed-unreadable branch already returns rather
+// than falling through, so ordering is preserved. DIAGNOSIS: the fail-closed
+// fallback return is already there; the named event and the removal are what the
+// branch adds.
+//
 // Malformed cases (logged as a `pr_template_invalid` policy event
 // but non-fatal):
 //   - Empty file.
@@ -10401,9 +10496,21 @@ func (h *agentHandoff) commitMessage(cfg config, logSink io.Writer) (subject, bo
 // are already accurate.
 func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource, reason prBodyReason) {
 	keyed := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(keyed)
+	raw, err := readSidecarBounded(keyed)
 	path := keyed
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): the keyed handoff is present but
+			// unusable. Remove it, name the keyed path in the diagnostic, and
+			// return the same reason an unreadable keyed handoff carries — NOT a
+			// sixth wire value. Does not fall through to the legacy path (the
+			// keyed-unreadable branch below does not either).
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, keyed, maxSidecarBytes)
+			_ = os.Remove(keyed)
+			return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+		}
 		if !os.IsNotExist(err) {
 			// Unreadable keyed file (permissions, etc.): fall back to the
 			// generic template, same as the pre-#1777 absent-file no-op.
@@ -10411,8 +10518,20 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		}
 		// Keyed path absent: fall back to the legacy fixed path so a fixed-path
 		// prompt render (an older agent/prompt) still lands its PR text.
-		legacyRaw, legacyErr := os.ReadFile(legacyPullRequestDescriptionPath)
+		legacyRaw, legacyErr := readSidecarBounded(legacyPullRequestDescriptionPath)
 		if legacyErr != nil {
+			if errors.Is(legacyErr, errSidecarTooLarge) {
+				// Over the ceiling on the legacy path: same treatment as the
+				// keyed oversize branch, naming the LEGACY path (the call site's
+				// marker names only the canonical keyed path, so without this the
+				// path that actually failed would appear nowhere in the trace —
+				// mirroring pr_description_legacy_unreadable below).
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+					cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, maxSidecarBytes)
+				_ = os.Remove(legacyPullRequestDescriptionPath)
+				return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+			}
 			if !os.IsNotExist(legacyErr) {
 				// The legacy handoff EXISTS but could not be read (permissions,
 				// a directory yielding EISDIR). Classifying this as

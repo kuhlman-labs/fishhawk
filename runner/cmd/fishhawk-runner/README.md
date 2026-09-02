@@ -608,7 +608,7 @@ This is the ORDINARY path, not the [#2570](https://github.com/kuhlman-labs/fishh
 |---|---|
 | `""` (`prBodyReasonNone`) | composition SUCCEEDED — a non-empty agent title AND body |
 | `handoff_absent` | neither the keyed nor the legacy path exists — BOTH reads failed `IsNotExist` (the silent branch that shipped #3011) |
-| `handoff_unreadable` | a handoff path exists but `os.ReadFile` failed for a non-`IsNotExist` reason — the keyed path, or the legacy path when the keyed one is absent |
+| `handoff_unreadable` | a handoff path exists but the bounded read (`readSidecarBounded`, E64.12) failed for a non-`IsNotExist` reason — a permission error, a directory, OR an over-ceiling `errSidecarTooLarge` — on the keyed path, or the legacy path when the keyed one is absent (the oversize case also emits `pr_description_oversize`; see the bounded-reads subsection below) |
 | `empty_file` | the handoff is empty after trimming |
 | `empty_title` | the handoff's first line is blank |
 | `body_absent` | a TITLE-ONLY handoff — the agent's title is honoured, the PR opens footer-only |
@@ -802,3 +802,60 @@ one-sided edit silently DISABLES the signal, so both sides are pinned against
 one shared literal JSON fixture. EVIDENCE ONLY: this block never touches
 `res.OK`, `res.FailureCategory`, or the budget. Long-form contract:
 `backend/internal/fixupobligation/README.md`.
+
+## Bounded reads of agent-authored sidecars (E64.12 / [#3106](https://github.com/kuhlman-labs/fishhawk/issues/3106))
+
+Every sidecar in the family is written by an untrusted coding agent, so its size
+is agent-controlled input. `readSidecarBounded` (`sidecarread.go`) is the one
+shared reader they now all go through: an `io.LimitReader` over an `os.Open`,
+capped at `maxSidecarBytes` (**1 MiB**), returning a distinct `errSidecarTooLarge`
+sentinel when the file exceeds the ceiling. It returns the `os.Open`/read error
+UNWRAPPED so every caller's `os.ErrNotExist` / `os.IsNotExist` ladder,
+`loadCounterfactualReport`'s dangling-symlink `os.Lstat` re-check, and the
+keyed-first-legacy-fallback ordering all keep working; over the ceiling it
+returns NIL bytes, never the truncated prefix, so no caller can partially decode.
+
+**The security property lives ENTIRELY in the ceiling, not in the per-loader
+branches.** Every one of these loaders ALREADY fails closed on a non-`ErrNotExist`
+read error today — silently returning its zero value or taking a
+present-but-unreadable branch — and `errSidecarTooLarge` is such an error, so all
+seven sites would fail closed even with no oversize branch written at all. What
+each per-loader branch adds is (1) DIAGNOSIS — a named `*_oversize` event so an
+operator can tell an oversize sidecar from a malformed one — and (2) at the
+loaders that return on the read-error path BEFORE their deferred delete-after-read
+is installed (`loadFixupSelfReport`, `loadScopeExemptions`,
+`loadFixupCommitMessage`, `loadImplementCommitMessage`, `loadAgentAuthoredPR`),
+the removal the early return would otherwise skip. Deleting a branch therefore
+costs the named event everywhere, and additionally the on-disk cleanup at those
+five; it never re-opens the fail-closed hole.
+
+The seven governed loaders and their events: `loadCounterfactualReport`
+(`counterfactual_report_oversize`), `loadFixupSelfReport`
+(`fixup_selfreport_oversize`), `loadScopeExemptions`
+(`scope_justification_oversize`), `loadFixupCommitMessage`
+(`fixup_commitmsg_oversize`), `loadImplementCommitMessage`
+(`implement_commitmsg_oversize`), `loadAgentAuthoredPR` (keyed AND legacy paths,
+`pr_description_oversize`), and `captureAcceptanceVerdict` (keyed AND legacy
+paths, `acceptance_verdict_oversize`). All except the acceptance loader REMOVE the
+oversize file (`loadAgentAuthoredPR` reuses `prBodyReasonHandoffUnreadable` — an
+oversize handoff is a present-but-unusable one, so no sixth wire reason is
+added; the distinct log event carries the discrimination).
+
+ONE documented deviation: `captureAcceptanceVerdict` does NOT remove the oversize
+verdict. It has never removed on read — removal for the acceptance verdict is
+owned by the PRE-INVOKE `sweepStaleAcceptanceVerdict`, which fails the stage
+category-C when it cannot unlink. So this stage's oversize verdict survives on
+disk until the NEXT acceptance stage's pre-invoke sweep clears it; folding a
+removal in here would move that ownership and could mask a sweep failure. The
+oversize verdict returns a wrapped non-`nil` error that is NOT
+`errAcceptanceVerdictMissing` (the verdict is present-but-oversize, not missing),
+so the stage fails closed exactly as for any other verdict read error.
+
+**Severity, honestly:** this is defense-in-depth on an already-documented
+fail-closed boundary, NOT a live vulnerability. The writer is the coding agent
+already executing in the same sandbox, and every path is run/stage-keyed. The
+ceiling bounds what an agent can materialize into runner memory before any cap or
+validation applies; the diagnostic events make a dropped honest sidecar (the
+too-low-ceiling failure mode) visible rather than silent. `maxSidecarBytes` is a
+plain `const`, never a test-injectable var, so the tests exercise the SHIPPED
+value; `TestSidecarCeilingValue` pins the number.

@@ -26685,3 +26685,175 @@ func TestBaseRebaseConflictPrompt_ReRequestsHandoffs(t *testing.T) {
 		t.Errorf("nil-detail prompt must omit the conflict context:\n%s", nilDetail)
 	}
 }
+
+// --- E64.12 / #3106: over-ceiling sidecar reads --------------------------
+
+// oversizePad returns a legal filler string strictly longer than
+// maxSidecarBytes, so a fixture embedding it is over the ceiling by
+// construction. Each over-ceiling fixture below is OTHERWISE COMPLETELY VALID
+// for its loader — matching ids, a well-formed entry/subject/body — and padded
+// with this filler, so that with the bound in readSidecarBounded deleted the
+// loader SUCCEEDS and returns real content (the RED lands on the behavioral
+// assertion, not a setup error).
+func oversizePad() string {
+	return strings.Repeat("x", int(maxSidecarBytes)+4096)
+}
+
+// TestLoadCounterfactualReport_Oversize: a valid-but-oversize counterfactual
+// sidecar fails closed (nil), emits counterfactual_report_oversize, and is
+// removed. With the ceiling deleted the padded-but-valid entry parses and the
+// loader returns one evidence entry instead.
+func TestLoadCounterfactualReport_Oversize(t *testing.T) {
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red",`+
+			`"restored":true,"record":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_oversize"`) {
+		t.Errorf("expected counterfactual_report_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_Oversize: a valid-but-oversize fix-up self-report
+// fails closed (zero result), emits fixup_selfreport_oversize, and is removed.
+// The removal is the load-bearing half here: this loader returns on the read-
+// error path BEFORE its deferred removal is installed, so the branch must remove
+// by hand.
+func TestLoadFixupSelfReport_Oversize(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_oversize"`) {
+		t.Errorf("expected fixup_selfreport_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadScopeExemptions_Oversize: a valid-but-oversize scope-justification
+// sidecar fails closed (nil), emits scope_justification_oversize, and is removed.
+func TestLoadScopeExemptions_Oversize(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[`+
+			`{"path":"a.go","reason":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_oversize"`) {
+		t.Errorf("expected scope_justification_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupCommitMessage_Oversize: a valid-but-oversize fix-up commit-message
+// sidecar fails closed (ok=false), emits fixup_commitmsg_oversize, and is removed.
+func TestLoadFixupCommitMessage_Oversize(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg,
+		"fix: guard nil pool in retry path\n\n"+oversizePad())
+
+	var logSink strings.Builder
+	if _, _, ok := loadFixupCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_commitmsg_oversize"`) {
+		t.Errorf("expected fixup_commitmsg_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_Oversize: a valid-but-oversize initial-implement
+// commit-message sidecar fails closed (ok=false), emits implement_commitmsg_oversize,
+// and is removed.
+func TestLoadImplementCommitMessage_Oversize(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg,
+		"feat(runner): add minio-init target\n\n"+oversizePad())
+
+	var logSink strings.Builder
+	if _, _, ok := loadImplementCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	if !strings.Contains(logSink.String(), `"event":"implement_commitmsg_oversize"`) {
+		t.Errorf("expected implement_commitmsg_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeKeyed: a valid-but-oversize KEYED PR handoff
+// fails closed to the fallback with prBodyReasonHandoffUnreadable, emits
+// pr_description_oversize naming the keyed path, and is removed. It does NOT fall
+// through to the legacy path.
+func TestLoadAgentAuthoredPR_OversizeKeyed(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(keyed,
+		[]byte("feat(runner): add minio-init target\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	title, body, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize keyed handoff must FAIL CLOSED to fallback, got kind %v (title=%q body=%q)", kind, title, body)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_description_oversize"`) {
+		t.Errorf("expected pr_description_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(keyed); !os.IsNotExist(err) {
+		t.Errorf("oversize keyed handoff must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeLegacy: with the keyed path ABSENT, a valid-
+// but-oversize LEGACY PR handoff fails closed to the fallback with
+// prBodyReasonHandoffUnreadable, emits pr_description_oversize naming the legacy
+// path, and is removed.
+func TestLoadAgentAuthoredPR_OversizeLegacy(t *testing.T) {
+	withPRDescriptionPath(t, "r", "s") // redirect dirs; keyed stays absent
+	if err := os.WriteFile(legacyPullRequestDescriptionPath,
+		[]byte("feat(runner): legacy handoff\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize legacy handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) ||
+		!strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("expected pr_description_oversize naming the legacy path, got %q", out)
+	}
+	if _, err := os.Stat(legacyPullRequestDescriptionPath); !os.IsNotExist(err) {
+		t.Errorf("oversize legacy handoff must be removed, stat err = %v", err)
+	}
+}
