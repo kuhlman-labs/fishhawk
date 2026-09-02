@@ -169,6 +169,13 @@ const (
 	// exclusive.
 	acceptanceVerdictUndecidable = plan.AcceptanceVerdictUndecidable
 
+	// acceptanceUndecidableBasisHeadUnresolved is the acceptance_outcome_recorded
+	// `undecidable_basis` value the #3091 unbound-head clamp records: the stage's
+	// validated head could not be resolved, so the verdict names no tree and a
+	// `passed` is laddered to undecidable. Deliberately a SEPARATE key from the
+	// #2581 `downgrade_basis`, which keeps its retirement meaning.
+	acceptanceUndecidableBasisHeadUnresolved = "head_unresolved"
+
 	acceptanceFailureError         = "error"
 	acceptanceFailureAssertionFail = "assertion_fail"
 
@@ -836,10 +843,44 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	if len(nonRetired) > 0 {
 		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, aggregateAcceptanceResults(nonRetired))
 	}
+	// Step (4), UNBOUND-HEAD CLAMP (#3091). A verdict whose validated head could
+	// not be resolved names no tree: nothing ties the AGENT'S claimed pass to the
+	// commit that was validated, so it can never be recorded as a pass. It is
+	// laddered through the SAME severity-monotone acceptanceVerdictAtLeast
+	// machinery, so the direction is fixed by construction: passed (0) <
+	// undecidable (1) is raised, and a shipped failed (2) is NEVER softened. The
+	// clamp is the LAST rewrite, after the retirement downgrade and the row
+	// aggregation, because an unbound head invalidates whatever those two
+	// concluded about the tree.
+	//
+	// It is deliberately SCOPED OUT of the #2581 retirement neutralization
+	// (downgradedVerdict != ""): that `passed` is not the agent's claim about a
+	// tree at all — it is the OPERATOR's approval-time decision that the failing
+	// criteria no longer apply, whose outcome #2581 fixes at `passed`. Raising it
+	// here would silently undo that decision on runs the operator has already
+	// governed. The residual is honest and named in the README: a neutralized
+	// pass can still be recorded on a run whose head did not resolve.
+	undecidableBasis := ""
+	if validatedHead == "" && downgradedVerdict == "" {
+		if clamped := acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictUndecidable); clamped != recordedVerdict {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"acceptance: validated head unresolvable — clamping the recorded verdict to undecidable",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("shipped_verdict", acc.Verdict))
+			recordedVerdict = clamped
+			// The basis is attached only when the clamp actually rewrote the
+			// verdict, so a shipped `failed` (which the ladder leaves alone) never
+			// carries an undecidable basis it did not earn.
+			undecidableBasis = acceptanceUndecidableBasisHeadUnresolved
+		}
+	}
+
 	// effectiveVerdict stays the "differs from what the agent shipped" signal the
 	// #2581 response field and the replay echo already carry: empty when the
 	// recorded verdict IS the shipped one, so an unaffected outcome marshals
-	// byte-identically to today.
+	// byte-identically to today. It is computed AFTER the clamp so it reflects
+	// the verdict actually recorded.
 	effectiveVerdict := ""
 	if recordedVerdict != acc.Verdict {
 		effectiveVerdict = recordedVerdict
@@ -888,6 +929,13 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		if downgradeBasis != "" {
 			fields["downgrade_basis"] = downgradeBasis
 			fields["retired_criterion_ids"] = downgradeRetiredIDs
+		}
+		// undecidable_basis is the #3091 clamp's own key, DISTINCT from
+		// downgrade_basis (which keeps its #2581 retirement meaning). It is
+		// emitted only when the clamp actually fired, so an outcome with a
+		// resolvable head marshals byte-identically to before.
+		if undecidableBasis != "" {
+			fields["undecidable_basis"] = undecidableBasis
 		}
 		p, _ := json.Marshal(fields)
 		return p
@@ -1557,12 +1605,21 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 // dispatch, so the verdict binds to the commit the validator checked out —
 // never a later commit that has not been validated.
 //
+// A decomposed PARENT writes no reported-head entry on its own chain at all
+// (see resolveConsolidatedFanInHeadSHA), so when the reported-head walk finds
+// nothing the resolver falls back to the parent's own incremental fan-in
+// ledger (integration_commit_recorded.merge_sha), BOUNDED by the same dispatch
+// anchor (#3091).
+//
 // A re-opened acceptance stage carries more than one acceptance_dispatched
 // entry; the highest-sequence one is the current validation episode. Returns
 // ("", false) when no head is recorded at-or-before dispatch, or when the stage
 // has no dispatch entry (a bare operator ship with no orchestrator dispatch, or
-// a read error) — the caller records an empty head_sha and Option C fails
-// closed to today's 422 for such an unanchored verdict.
+// a read error) — the caller then CLAMPS the recorded verdict (#3091): a
+// `passed` the AGENT shipped whose validated head cannot be resolved is recorded
+// `undecidable` with undecidable_basis=head_unresolved (a #2581
+// retirement-neutralized pass is exempt — see the clamp's own comment), and
+// Option C still fails closed to today's 422 for such an unanchored verdict.
 func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) (string, bool) {
 	if s.cfg.AuditRepo == nil {
 		return "", false
@@ -1583,7 +1640,16 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 			}
 		}
 	}
-	return auditcomplete.LatestReportedHeadSHA(candidates)
+	if sha, ok := auditcomplete.LatestReportedHeadSHA(candidates); ok {
+		return sha, true
+	}
+	// Consolidated fan-in fallback (#3091), strictly SUBORDINATE to the
+	// reported-head walk above and BOUNDED by the same dispatch anchor: a
+	// decomposed parent's own chain carries no reported head at all, so the
+	// verdict would otherwise bind to nothing. Bounding on dispatchSeq is what
+	// stops a fan-in merge recorded AFTER the acceptance dispatch re-binding
+	// the verdict to a tree the stage never validated.
+	return s.resolveConsolidatedFanInHeadSHA(ctx, runID, dispatchSeq, true)
 }
 
 // latestAcceptanceDispatchSeq returns the highest audit sequence among the

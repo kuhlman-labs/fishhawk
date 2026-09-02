@@ -11482,16 +11482,24 @@ paths:
                       `head_sha` across the run's reported-head ledger
                       entries (`pull_request_opened` / `child_pushed` /
                       `fixup_pushed`, the same ADR-035 lineage source as
-                      `fixup_expected_head_sha`) — served ONLY on acceptance
-                      stages (E31.18 / #1569). The runner's pre-spawn
+                      `fixup_expected_head_sha`), falling back to the newest
+                      `integration_commit_recorded` `merge_sha` on the run's
+                      own chain when that ledger is empty (#3091), which is
+                      how a DECOMPOSED PARENT — whose children report their
+                      pushes on their own chains — resolves its consolidated
+                      branch tip. Served ONLY on acceptance stages
+                      (E31.18 / #1569). The runner's pre-spawn
                       target-identity gate compares the declared acceptance
                       target's `/healthz` `git_sha` against it before
                       spawning the acceptance agent, so acceptance validates
                       the merge candidate rather than whatever build answers
                       at the declared host. Absent on every other stage type
-                      and when backend-side ledger resolution fails — the
-                      runner then treats the target as unverifiable and
-                      warns-and-proceeds.
+                      and when backend-side resolution fails — the runner
+                      then fails the stage pre-spawn, category C, reason
+                      `acceptance_expected_head_unresolved`, rather than
+                      proceeding unverified (#3091): with no expectation
+                      there is nothing to verify the target against, so a
+                      recorded verdict would bind to no tree.
                   open_pr_from_held_commit:
                     type: boolean
                     description: |
@@ -11794,7 +11802,7 @@ paths:
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
                   acceptance_expected_head_sha:
                     type: string
-                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when ledger resolution fails (the runner then warns-and-proceeds as unverifiable).
+                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
                   open_pr_from_held_commit:
                     type: boolean
                     description: True ONLY when this implement stage's scope-completeness park (#1231) was resolved `exempt` (#2501) — the runner then opens the PR from the held commit with NO agent re-invocation. Absent on every other dispatch, including an undecided or `fail`-decided park.
@@ -13453,7 +13461,9 @@ paths:
         workflow spec declares egress `target_hosts`, the response adds
         `needs_target: true` plus `target_hosts` (verbatim spec-declared
         hosts) and `expected_head_sha` (the resolved merge-candidate head
-        SHA; may be empty when the ledger resolution fails). The dispatch verb
+        SHA; empty only when the backend could not resolve one, which both
+        dispatch gates now REFUSE on — see that field's description). The
+        dispatch verb
         reads this to probe the first target host FROM THE DISPATCH HOST (the
         same network position the local runner would probe from) using the
         runner's `/healthz` `git_sha` identity semantics, and REFUSES to spawn
@@ -13525,8 +13535,17 @@ paths:
                     description: |
                       The resolved merge-candidate head SHA the target's
                       `/healthz` `git_sha` must match. Present with
-                      `needs_target: true`; may be empty when the backend could
-                      not resolve it (the verb then proceeds with a warning).
+                      `needs_target: true`. Empty when the backend could not
+                      resolve one (an empty reported-head ledger with no
+                      consolidated fan-in record, or a read error), in which
+                      case the dispatch verb REFUSES to spawn — it returns the
+                      structured `needs_target` refusal with an empty
+                      `expected_head_sha` and a `detail` naming
+                      `acceptance_expected_head_unresolved`, ahead of its
+                      `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` proceed branch (#3091).
+                      The runner's own gate fails the stage category-C with the
+                      same reason, so a dispatch that bypasses the verb refuses
+                      too.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |

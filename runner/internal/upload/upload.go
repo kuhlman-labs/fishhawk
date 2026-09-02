@@ -655,17 +655,24 @@ type FetchedPrompt struct {
 	// compares the declared target's /healthz git_sha against it before
 	// spawning the acceptance agent, so acceptance validates the merge
 	// candidate rather than whatever build answers at the declared host.
-	// Empty (older backend, or backend-side ledger resolution failure) means
-	// the gate treats the target as unverifiable and warns-and-proceeds
-	// rather than blocking the stage. Decoded here; the gate consumer in
-	// main.go's acceptance pre-spawn block is the E31.18 sibling slice.
+	// Empty (older backend, or backend-side resolution failure) means the
+	// gate FAILS the stage pre-spawn, category C, reason
+	// acceptance_expected_head_unresolved, whenever the spec declares a
+	// target host (#3091) — with no expectation there is nothing to verify
+	// the target against, so the stage would otherwise validate whatever
+	// build answers at the shared slot and record a verdict bound to no
+	// tree. A stage declaring NO target hosts is unaffected: the gate skips
+	// before that check. Decoded here; the gate consumer in main.go's
+	// acceptance pre-spawn block is the E31.18 sibling slice.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tag
 	// (acceptance_expected_head_sha) MUST stay byte-identical to the
 	// backend's promptResponse.AcceptanceExpectedHeadSHA
 	// (backend/internal/server/prompt.go), the same convention as
-	// EgressTargetHosts above. A tag drift silently drops the expectation
-	// and the identity gate degrades to unverifiable-warn on every dispatch.
+	// EgressTargetHosts above. A tag drift silently drops the expectation —
+	// which since #3091 HARD-FAILS every declared-target acceptance dispatch
+	// category-C rather than degrading it to an unverifiable warn, so the
+	// drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
 }
 

@@ -38,6 +38,13 @@ import (
 // proceeds to spawn WITHOUT probing.
 const acceptancePreviewCmdEnv = "FISHHAWK_ACCEPTANCE_PREVIEW_CMD"
 
+// acceptanceReasonHeadUnresolved names the #3091 fail-closed refusal: the
+// backend resolved no merge-candidate head, so the target's identity cannot be
+// verified against anything. It byte-mirrors the runner gate's category-C
+// reason constant of the same name (runner/cmd/fishhawk-runner/previewprobe.go)
+// so a dispatch that bypasses this verb refuses for the same named reason.
+const acceptanceReasonHeadUnresolved = "acceptance_expected_head_unresolved"
+
 // acceptanceProbeHTTPClient dials the /healthz probe DIRECT (Proxy explicitly
 // nil: the verb must never route its own probe through an ambient operator
 // proxy, matching the runner's direct-dial probe so a proxy cannot fake
@@ -134,6 +141,11 @@ func acceptanceProbeSchemeOrder(host string) []string {
 // most informative outcome wins (verified > stale > unverifiable >
 // unreachable). Mirrors the runner's probeTargetIdentity.
 func probeAcceptanceTargetIdentity(ctx context.Context, host, expectedSHA string) acceptanceProbeResult {
+	// Defensive only since #3091: checkAcceptanceTarget now REFUSES an empty
+	// expectation before it ever probes, so this branch is unreachable from the
+	// gate. It is kept because the probe is a standalone classifier and an
+	// unverifiable answer is the right one for a direct caller with no
+	// expectation — it must never classify as verified.
 	if expectedSHA == "" {
 		return acceptanceProbeResult{
 			outcome: acceptanceProbeUnverifiable,
@@ -245,31 +257,46 @@ func acceptanceSleepCtx(ctx context.Context, d time.Duration) bool {
 //     result, proceed silently.
 //   - FISHHAWK_ACCEPTANCE_PREVIEW_CMD set: the spawned runner inherits it and
 //     provisions the target itself (#1569) — proceed with an informational note.
-//   - empty ExpectedHeadSHA: the backend could not resolve the expectation;
-//     mirror the runner gate's never-hard-fail-on-missing-expectation early
-//     return — proceed with a warning.
 //   - probe VERIFIED: the target serves the merge candidate — proceed.
 //   - probe UNVERIFIABLE: the target answered but exposes no comparable build
 //     identity — proceed with the probe detail as a warning.
 //
-// Refuse paths (non-nil refusal): probe STALE or UNREACHABLE — the target is up
-// on the wrong build or not up at all; refuse so no doomed runner spawns.
+// Refuse paths (non-nil refusal):
+//   - empty ExpectedHeadSHA (#3091): the backend could not resolve the
+//     merge-candidate head, so there is nothing to verify the target against
+//     and a recorded verdict would bind to no tree. Checked BEFORE the
+//     preview-cmd branch — a provision command cannot provision an unknown
+//     head, so that proceed path must not outrank this refusal.
+//   - probe STALE or UNREACHABLE — the target is up on the wrong build or not
+//     up at all; refuse so no doomed runner spawns.
 func (r *runResolver) checkAcceptanceTarget(ctx context.Context, admission *AcceptanceAdmissionResult) (refusal *AcceptanceNeedsTarget, warning string) {
 	if admission == nil || !admission.NeedsTarget || len(admission.TargetHosts) == 0 {
 		return nil, ""
 	}
 	host := admission.TargetHosts[0]
 
+	// Unresolvable expectation → REFUSE (#3091). Ordered AHEAD of the
+	// preview-cmd branch deliberately: a provision command cannot provision an
+	// UNKNOWN head, so proceeding there is the same unfalsifiable-pass hazard —
+	// the acceptance stage would validate whatever answers at the shared slot
+	// and the verdict would bind to no tree at all. This replaces the earlier
+	// warn-and-proceed, which reported success while unable to fail for the
+	// reason it named.
+	if admission.ExpectedHeadSHA == "" {
+		return &AcceptanceNeedsTarget{
+			TargetHost:      host,
+			ExpectedHeadSHA: "",
+			Detail: fmt.Sprintf(
+				"%s: acceptance target %q is declared but the backend could not resolve the merge-candidate head from the run's reported-head ledger or its consolidated fan-in; a verdict validated against an unknown head names no tree",
+				acceptanceReasonHeadUnresolved, host),
+			Remediation: "re-dispatch once the run has reported a head (a PR-open, child or fix-up push); for a decomposed parent, confirm the fan-in recorded its integration commits (integration_commit_recorded)",
+		}, ""
+	}
+
 	if r.getenv(acceptancePreviewCmdEnv) != "" {
 		return nil, fmt.Sprintf(
 			"acceptance target %q needs the merge candidate (expected head %s); %s is set so the spawned runner will provision it (#1569).",
 			host, admission.ExpectedHeadSHA, acceptancePreviewCmdEnv)
-	}
-
-	if admission.ExpectedHeadSHA == "" {
-		return nil, fmt.Sprintf(
-			"acceptance target %q is declared but the backend sent no expected head SHA (older backend or ledger resolution failure); proceeding to spawn unverified.",
-			host)
 	}
 
 	res := awaitAcceptanceTargetReady(ctx, host, admission.ExpectedHeadSHA)
