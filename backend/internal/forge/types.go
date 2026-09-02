@@ -187,6 +187,25 @@ type PullRequest struct {
 	// into the existing body idempotently. Empty on CreatePullRequest /
 	// ListOpenPullRequestsByHead results (they don't read it back).
 	Body string
+	// Mergeable is GitHub's `mergeable` boolean — true when the PR can be
+	// merged, false on a merge conflict (E64.14 / #3109). It is a POINTER
+	// because GitHub computes mergeability in a BACKGROUND job and returns
+	// JSON `null` while that job is still running, so absent (nil) must stay
+	// distinguishable from false: a nil Mergeable means UNKNOWN, never clean.
+	// Populated by GetPullRequest; nil on CreatePullRequest /
+	// ListOpenPullRequestsByHead results (they don't read it back). The GitLab
+	// adapter (gitlab.go) leaves it nil, so every consumer MUST fail open on
+	// the zero value — a nil Mergeable is never treated as a conflict.
+	Mergeable *bool
+	// MergeableState is GitHub's `mergeable_state` string (E64.14 / #3109):
+	// "dirty" is the merge-conflict value; "clean", "blocked", "behind",
+	// "unstable", "draft", "unknown" and "" are the other documented/observed
+	// states. It is an undocumented-but-stable REST field, treated as ADVISORY
+	// and paired with the documented Mergeable boolean rather than trusted
+	// alone. Populated by GetPullRequest; "" on the other constructors and on
+	// the GitLab adapter (which has no equivalent field), so a zero value means
+	// UNKNOWN, never CLEAN — every consumer must fail open on it.
+	MergeableState string
 }
 
 // PullRequestRef is the thin PR identity ListPullRequestsForCommit

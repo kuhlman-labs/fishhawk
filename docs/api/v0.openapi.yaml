@@ -7521,6 +7521,22 @@ paths:
         commit still fails category-B at the report boundary and still blocks
         merge resolution.
 
+        **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109).**
+        After the declaration is durable, the endpoint recomputes audit-complete
+        and republishes the required Check Run AT the vouched commit. An
+        operator-pushed commit appears in no head-report audit category, so the
+        publisher's normal head resolution would re-post against a stale sha and
+        leave the check absent from the live merge head — the exact base-advance
+        wedge this closes. The re-post is best-effort for the vouch's success but
+        its outcome is REPORTED on the response
+        (`audit_check_republished` / `audit_check_republish_warning`) rather than
+        swallowed; the merge reconciler's heal CANNOT retry it (it uses the same
+        operator-vouched-blind head resolution), so re-invoking the vouch is the
+        sanctioned idempotent retry (the publisher dedups on success). The
+        post-change route for a base-advance conflict is therefore still
+        operator-resolve-then-vouch — a sanctioned rebase verb is deferred to
+        #3125.
+
         **Authorization.** Operator-token-only by design (ADR-035 sole-writer
         invariant). Requires `write:stages`. A run-bound MCP token (subject
         `mcp:run:<uuid>`) is REJECTED OUTRIGHT 403 (`run_token_forbidden`),
@@ -7564,6 +7580,21 @@ paths:
                   run_id: { $ref: '#/components/schemas/UUID' }
                   vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage.' }
                   reason: { type: string }
+                  audit_check_republished:
+                    type: boolean
+                    description: |
+                      True when the `fishhawk_audit_complete` Check Run was
+                      successfully re-posted at the vouched head (E64.14 /
+                      #3109). False when the re-post did not land — see
+                      `audit_check_republish_warning` — or when no publisher is
+                      wired. Re-invoke the vouch to retry the re-post idempotently.
+                  audit_check_republish_warning:
+                    type: string
+                    description: |
+                      Present only when the audit-complete re-post did NOT land:
+                      names the failure so the operator knows the required check
+                      may be absent from the merge head rather than discovering
+                      it at a blocked merge. Omitted when the re-post succeeded.
         '400':
           description: |
             Malformed body or an empty `sha`/`reason`. Body's `error` is
@@ -7627,9 +7658,26 @@ paths:
         **Fail-closed.** The merge is refused (no verdict recorded) when the
         run has no PR url or is failed/cancelled (`409 run_not_mergeable`),
         when the acceptance gate does not admit a merge
-        (`409 acceptance_gate_not_passed`), or when the merge seam is
-        unconfigured (`503 merge_seam_unconfigured`). It deliberately does NOT
-        block on a review stage awaiting approval (that stage settles ON merge).
+        (`409 acceptance_gate_not_passed`), when the pull request has a merge
+        conflict against its base (`409 merge_conflicting`, E64.14 / #3109), or
+        when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
+        deliberately does NOT block on a review stage awaiting approval (that
+        stage settles ON merge).
+
+        **Conflict precondition (E64.14 / #3109).** Before recording the
+        verdict, the endpoint checks the PR's mergeability and refuses a
+        conflicting PR with `409 merge_conflicting` — GitHub can never fire the
+        auto-merge on a conflicting PR, so queuing it would only time out. The
+        check is BEST-EFFORT and FAIL-OPEN: it refuses ONLY on an explicit
+        GitHub signal (`mergeable_state == "dirty"` or a documented
+        `mergeable == false`) and proceeds on every uncertainty (GitHub
+        unwired, no installation, unparseable repo/PR, a PR-read error, or a
+        still-computing `mergeable: null`). The post-refusal route is
+        operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge (a
+        sanctioned rebase verb is deferred to #3125). GitLab MRs are NOT
+        classified here (the mergeability fields are GitHub-only, so a
+        conflicting GitLab MR falls through to today's queue-then-timeout
+        behavior — `merge_status`/`detailed_merge_status` would be the signal).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -7686,7 +7734,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of three cases. (1) The run cannot be merged: no PR url or a
+            One of four cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -7697,6 +7745,13 @@ paths:
             retry CANNOT succeed. If the checks are still pending, re-invoke once
             they complete; but if a required check has already FAILED the merge
             will never queue — inspect the pull request instead of waiting.
+            (4) The pull request has a merge conflict against its base
+            (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
+            (the guard runs before the append) and `details` carry
+            `{run_id, pr_url, mergeable_state}`. Waiting cannot resolve it:
+            resolve the conflict on the run branch, vouch the resulting commit
+            with `vouch-commit` so the `fishhawk_audit_complete` check re-posts,
+            re-approve the pull request, and re-invoke the merge.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

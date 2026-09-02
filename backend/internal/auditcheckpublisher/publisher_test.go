@@ -1550,3 +1550,136 @@ func TestPublishResult_ChildrenPendingRendersInSummary(t *testing.T) {
 		t.Fatalf("failure summary must render the children_pending kind and detail; got:\n%s", summary)
 	}
 }
+
+// --- E64.14 / #3109: head-override publish (operator-vouch path) ---
+
+// TestPublishResultAtHeadOverridesResolvedHead proves the override branch: with
+// a DIFFERENT head-report entry recorded, a non-empty override publishes the
+// Check Run AT the override sha, not the audit-recorded head. The override sha
+// is seeded BY CONSTRUCTION as a value distinct from every head-report entry so
+// the RED under a deleted override branch lands on the head assertion, not on
+// fixture setup.
+func TestPublishResultAtHeadOverridesResolvedHead(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "auditrecordedhead")},
+	}}
+	aud := &fakeAuditReader{byCat: map[string][]*audit.Entry{
+		"pull_request_opened": {headEntry("pull_request_opened", "auditrecordedhead", 1)},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts, Audit: aud,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+
+	const override = "operatorvouchedsha"
+	published, err := pub.PublishResultAtHead(context.Background(), runID, stagecheck.StatePass, nil, nil, override)
+	if err != nil {
+		t.Fatalf("PublishResultAtHead: %v", err)
+	}
+	if !published {
+		t.Fatal("expected published=true")
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(gh.calls))
+	}
+	if got := gh.calls[0].params.HeadSHA; got != override {
+		t.Errorf("head_sha = %q; want the override %q (not the audit-recorded head)", got, override)
+	}
+}
+
+// TestPublishResultAtHeadEmptyOverrideUnchanged proves the delegation is
+// byte-identical: an empty override resolves the head exactly as the pre-#3109
+// PublishResult did (the newest audit-recorded head), so every current caller
+// is unaffected.
+func TestPublishResultAtHeadEmptyOverrideUnchanged(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "stalehead")},
+	}}
+	aud := &fakeAuditReader{byCat: map[string][]*audit.Entry{
+		"fixup_pushed": {headEntry("fixup_pushed", "freshhead", 5)},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts, Audit: aud,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if _, err := pub.PublishResultAtHead(context.Background(), runID, stagecheck.StatePass, nil, nil, ""); err != nil {
+		t.Fatalf("PublishResultAtHead: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(gh.calls))
+	}
+	if got := gh.calls[0].params.HeadSHA; got != "freshhead" {
+		t.Errorf("head_sha = %q; want the resolved fixup_pushed head %q (empty override must not change resolution)", got, "freshhead")
+	}
+}
+
+// TestPublishResultAtHeadOverrideDedupsAtOverride proves the dedup cache keys on
+// the RESOLVED (overridden) head: a second publish at the same override + state
+// is a no-op, and the episode/dedup machinery follows the override with no
+// special-casing.
+func TestPublishResultAtHeadOverrideDedupsAtOverride(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "auditrecordedhead")},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	const override = "operatorvouchedsha"
+	first, err := pub.PublishResultAtHead(context.Background(), runID, stagecheck.StatePass, nil, nil, override)
+	if err != nil || !first {
+		t.Fatalf("first PublishResultAtHead = (%v, %v), want (true, nil)", first, err)
+	}
+	second, err := pub.PublishResultAtHead(context.Background(), runID, stagecheck.StatePass, nil, nil, override)
+	if err != nil {
+		t.Fatalf("second PublishResultAtHead: %v", err)
+	}
+	if second {
+		t.Error("second identical override publish should dedup to a no-op")
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("expected 1 forge call (dedup on the overridden head), got %d", len(gh.calls))
+	}
+}

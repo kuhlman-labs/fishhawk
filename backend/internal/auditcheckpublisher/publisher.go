@@ -232,6 +232,27 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 // already published at that head is not re-published merely because its
 // summary would now name the child runs.
 func (p *Publisher) PublishResult(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution) (bool, error) {
+	return p.PublishResultAtHead(ctx, runID, state, missing, resolved, "")
+}
+
+// PublishResultAtHead is PublishResult with an explicit head override
+// (E64.14 / #3109). When headSHAOverride is non-empty the Check Run is
+// published AT THAT SHA instead of the head findHeadSHA would resolve;
+// everything downstream — repo/forge resolution, the (forge, repo, head_sha,
+// state) dedup cache, the (run_id, head_sha) degraded-episode tracking, and
+// buildParams — keys on the RESOLVED head, so an override publishes and dedups
+// against the overridden sha with no special-casing. PublishResult delegates
+// here with an empty override, so every pre-#3109 caller's behavior (and its
+// head resolution, dedup, and episode keys) is byte-identical.
+//
+// The override exists for the operator-vouch path (server/vouch.go): the live
+// PR head there is an operator-pushed commit that by construction appears in
+// NO head-report audit category (fixup_pushed / child_pushed /
+// pull_request_opened), so findHeadSHA would resolve the stale audit-recorded
+// head and republish the required check against a sha the operator's merge
+// commit is not on. Passing the vouched sha as the override re-posts the check
+// on the live head.
+func (p *Publisher) PublishResultAtHead(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHAOverride string) (bool, error) {
 	if p == nil {
 		return false, nil
 	}
@@ -264,12 +285,20 @@ func (p *Publisher) PublishResult(ctx context.Context, runID uuid.UUID, state st
 		return false, nil
 	}
 
-	headSHA, ok, err := p.findHeadSHA(ctx, runID)
-	if err != nil {
-		return false, fmt.Errorf("auditcheckpublisher: find head_sha: %w", err)
-	}
-	if !ok {
-		return false, nil
+	// An explicit override (the operator-vouch path, #3109) publishes AT that
+	// sha, bypassing the head-report resolution — an operator-pushed commit is
+	// in no head-report category, so findHeadSHA would resolve a stale head.
+	// An empty override keeps the pre-#3109 resolution exactly.
+	headSHA := strings.TrimSpace(headSHAOverride)
+	if headSHA == "" {
+		var ok bool
+		headSHA, ok, err = p.findHeadSHA(ctx, runID)
+		if err != nil {
+			return false, fmt.Errorf("auditcheckpublisher: find head_sha: %w", err)
+		}
+		if !ok {
+			return false, nil
+		}
 	}
 
 	// Resolve the check-run creator + credential scope now that a head

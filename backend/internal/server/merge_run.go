@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -70,7 +71,16 @@ type mergeRunResponse struct {
 //   - 409 when the run is failed or cancelled (terminal-not-succeeded);
 //   - 409 when the acceptance gate does not admit a merge (pending / failed /
 //     settled-outcome-unknown / read error — ADR-049 decision #6);
-//   - 503 when the merge seam (GateMerger) is unconfigured.
+//   - 503 when the merge seam (GateMerger) is unconfigured;
+//   - 409 merge_conflicting when the PR has a merge conflict against its base
+//     (E64.14 / #3109). This guard is BEST-EFFORT and FAIL-OPEN — it refuses
+//     ONLY on an explicit forge signal (mergeable_state=="dirty" or a
+//     documented mergeable==false) and proceeds on every uncertainty (GitHub
+//     unwired, no installation, unparseable repo/PR, a GetPullRequest error, or
+//     a still-computing null mergeable). It runs AFTER the GateMerger guard and
+//     BEFORE the merge_verdict_recorded append, so a merge that structurally
+//     cannot queue records no verdict; the post-resolution route is
+//     operator-resolve-then-vouch-then-re-merge.
 //
 // It deliberately does NOT block on a review stage parked at awaiting_approval:
 // in feature_change that stage settles ON merge via resolveReviewStageOnMerge,
@@ -226,6 +236,29 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Conflict precondition (E64.14 / #3109): a PR whose base has advanced into
+	// a merge conflict can never fire GitHub's auto-merge, so queuing it would
+	// only time out at 360s with a message that says nothing about conflicts.
+	// Refuse BEFORE the merge_verdict_recorded append (binding-ratified
+	// ordering): a durable verdict for a merge that structurally cannot queue is
+	// a false record. A re-POST after the operator resolves the conflict records
+	// the verdict normally. This guard is BEST-EFFORT / FAIL-OPEN — it reports a
+	// conflict ONLY on an explicit forge signal (see prMergeConflicting); every
+	// uncertainty (GitHub unwired, no installation, unparseable repo/PR, a
+	// GetPullRequest error, a still-computing null mergeable) proceeds exactly as
+	// today. GitLab is unclassified here: the forge fields stay zero on that
+	// adapter, so a conflicting GitLab MR falls through to today's timeout
+	// behavior (merge_status / detailed_merge_status would be the GitLab signal).
+	if conflicting, mergeableState := s.prMergeConflicting(r.Context(), runRow); conflicting {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: pull request is conflicting; refusing before verdict",
+			slog.String("run_id", runID.String()),
+			slog.String("mergeable_state", mergeableState))
+		s.writeError(w, r, http.StatusConflict, "merge_conflicting",
+			"the pull request has a merge conflict against its base and GitHub can never queue the merge; resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit so the fishhawk_audit_complete check re-posts on the new head, re-approve the pull request, and re-invoke the merge",
+			map[string]any{"run_id": runID.String(), "pr_url": prURL, "mergeable_state": mergeableState})
+		return
+	}
+
 	// Idempotence on the ENDPOINT (binding condition 1): an existing
 	// merge_verdict_recorded row means a prior POST already recorded the
 	// verdict; do NOT append a duplicate. Either way the merge helper is
@@ -353,6 +386,62 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		AlreadyRecorded: alreadyRecorded,
 		PRURL:           prURL,
 	})
+}
+
+// prMergeConflicting reports whether the run's pull request has a merge
+// conflict against its base (E64.14 / #3109) — a state in which GitHub can
+// never fire the queued auto-merge. It is BEST-EFFORT and FAIL-OPEN: it reuses
+// the established lineage.go resolution idiom (nil GitHub client, nil/zero
+// installation id, unparseable repo, non-positive PR number, or a
+// GetPullRequest error all return (false, "") plus a warn log — i.e. behave
+// exactly as before this guard existed), and reports conflicting ONLY on an
+// explicit forge signal.
+//
+// The signal is MergeableState == "dirty" (GitHub's merge-conflict value) OR a
+// documented Mergeable == false. mergeable_state "blocked" / "behind" /
+// "unstable" / "draft" / "unknown" / "" and a nil Mergeable (GitHub's
+// background mergeability job is still running, returning JSON null) all
+// proceed unchanged — a behind-but-clean or checks-pending branch still merges
+// as it does today. The documented boolean is kept load-bearing alongside the
+// advisory mergeable_state (binding condition 2): mergeable_state can never
+// quietly become the only path.
+//
+// GitLab: the forge fields are zero on that adapter, so a conflicting GitLab MR
+// is not classified here and falls through to today's queue-then-timeout
+// behavior. Fail-open on an unknown signal is deliberate.
+func (s *Server) prMergeConflicting(ctx context.Context, runRow *run.Run) (conflicting bool, mergeableState string) {
+	if s.cfg.GitHub == nil {
+		return false, ""
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return false, ""
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: conflict precondition: unparseable repo; proceeding (fail open)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()))
+		return false, ""
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return false, ""
+	}
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: conflict precondition: get pr failed; proceeding (fail open)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("pr_number", prNumber),
+			slog.String("error", err.Error()))
+		return false, ""
+	}
+	if pr.MergeableState == "dirty" || (pr.Mergeable != nil && !*pr.Mergeable) {
+		return true, pr.MergeableState
+	}
+	return false, ""
 }
 
 // earliestMergeVerdictSequence returns the smallest Sequence among the given
