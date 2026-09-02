@@ -109,17 +109,28 @@ LEASE_DIR="${FISHHAWK_TEST_LEASE_DIR:-${TMPDIR:-/tmp}/fishhawk-test-postgres.lea
 # FISHHAWK_TEST_LEASE_DIR override.
 
 # _labelled_container_ids: the current testcontainers-labelled container id set,
-# one id per line. A no-op (empty output, success) when docker is absent so every
-# caller degrades cleanly.
+# one id per line. Two DISTINCT outcomes, never conflated: docker ABSENT is a
+# clean no-op (empty output, exit 0) so every caller degrades to a no-op; a docker
+# PRESENT-but-failing query (daemon down, transient error) PROPAGATES docker's
+# non-zero exit — deliberately NOT `|| true`. A snapshot writer must be able to
+# tell a genuine empty set from a failed query and DECLINE to publish an empty
+# snapshot on failure (#3122): swallowing the failure would let a later daemon
+# recovery make the last-holder sweep treat every labelled container as
+# generation-created and remove unrelated testcontainers workloads.
 _labelled_container_ids() {
   command -v docker >/dev/null 2>&1 || return 0
-  docker ps -aq --filter label=org.testcontainers=true 2>/dev/null || true
+  docker ps -aq --filter label=org.testcontainers=true 2>/dev/null
 }
 
 # _write_generation_snapshot: record the labelled-container set that exists at
 # generation-open time, written atomically (temp sibling then mv) so a concurrent
 # reader never sees a partial file. Guarded to never fail the run. Callers hold
-# the lock.
+# the lock. DECLINE-TO-PUBLISH on a failed query (#3122): _labelled_container_ids
+# propagates docker's non-zero exit when the daemon is present but the query
+# fails, so the `if` goes false and NO snapshot is published — leaving any prior
+# snapshot untouched and, when none exists, leaving the sweep to degrade to a
+# no-op rather than publishing an EMPTY snapshot that a later daemon recovery
+# would turn into a remove-everything sweep.
 _write_generation_snapshot() {
   command -v docker >/dev/null 2>&1 || return 0
   local tmp="$LEASE_DIR.snapshot.tmp.$$"

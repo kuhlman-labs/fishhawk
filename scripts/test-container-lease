@@ -22,18 +22,35 @@ trap 'rm -rf "$tmproot"' EXIT
 # serves the current testcontainers-labelled container id set from an injectable
 # file ($psfile) for `docker ps -aq --filter label=...` — so a case can script
 # which containers "exist" on the daemon at each step (#3122 sweep contract).
+#
+# Two extra hooks pin the concerns this pass closes:
+#   * $psfail exists  → `docker ps` exits NON-ZERO (a present-but-failing daemon),
+#     so a case can drive the decline-to-publish transition in
+#     _write_generation_snapshot / _labelled_container_ids.
+#   * on every `rm`, whether the lease lock symlink named by
+#     $FAKE_DOCKER_LOCK_PATH exists AT THAT INSTANT is recorded to $locklog as
+#     "<argv> <held|free>" — so a case can assert the sweep's `docker rm` runs
+#     while the lease lock is still held (condition 4: sweep INSIDE the lock).
 bindir="$tmproot/bin"
 mkdir -p "$bindir"
 rmlog="$tmproot/docker-rm.log"
+locklog="$tmproot/docker-rm-lockstate.log"
 psfile="$tmproot/docker-ps.txt"
+psfail="$tmproot/docker-ps.fail"
 : > "$psfile"
 cat > "$bindir/docker" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "rm" ]; then
   printf '%s\n' "\$*" >> "$rmlog"
+  lockstate=free
+  if [ -n "\${FAKE_DOCKER_LOCK_PATH:-}" ] && [ -L "\${FAKE_DOCKER_LOCK_PATH}" ]; then
+    lockstate=held
+  fi
+  printf '%s %s\n' "\$*" "\$lockstate" >> "$locklog"
   exit 0
 fi
 if [ "\$1" = "ps" ]; then
+  [ -f "$psfail" ] && exit 1
   [ -f "$psfile" ] && cat "$psfile"
   exit 0
 fi
@@ -55,7 +72,10 @@ reset_case() {
   LEASE_DIR="$tmproot/case-$1"
   rm -rf "$LEASE_DIR" "$LEASE_DIR.lock" "$LEASE_DIR.snapshot" "$LEASE_DIR.snapshot.tmp."* 2>/dev/null
   : > "$rmlog"
+  : > "$locklog"
   : > "$psfile"
+  rm -f "$psfail" 2>/dev/null      # clear the docker-ps-fails sentinel
+  unset FAKE_DOCKER_LOCK_PATH      # clear the per-case lock-state probe
 }
 
 # Number of docker rm invocations recorded so far.
@@ -291,17 +311,21 @@ else
 fi
 
 # (v) OPT-OUT — FISHHAWK_TEST_NO_ORPHAN_SWEEP=1 disables the sweep; a mid-
-# generation container is left in place.
+# generation container is left in place. cY is added AFTER _register_lease so it
+# is ABSENT from the (empty) snapshot — i.e. it would be swept as generation-
+# created WITHOUT the opt-out. Adding cY before registration (the earlier vacuous
+# shape) captured it in the snapshot, sparing it regardless of the opt-out, so the
+# case asserted nothing about the opt-out; this ordering makes it load-bearing.
 reset_case v
-printf 'cY\n' > "$psfile"
 export FISHHAWK_TEST_LEASE_TOKEN=$$
-_register_lease
+_register_lease                     # opens generation, snapshot empty
+printf 'cY\n' > "$psfile"           # cY created mid-generation, NOT in the snapshot
 export FISHHAWK_TEST_NO_ORPHAN_SWEEP=1
 _reap_shared_container
 unset FISHHAWK_TEST_NO_ORPHAN_SWEEP
 unset FISHHAWK_TEST_LEASE_TOKEN
 if grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cY' "$rmlog"; then
-  pass "opt-out: FISHHAWK_TEST_NO_ORPHAN_SWEEP sweeps nothing"
+  pass "opt-out: FISHHAWK_TEST_NO_ORPHAN_SWEEP spares a mid-generation container"
 else
   fail "opt-out: expected no sweep of cY (rmlog=[$(tr '\n' ';' < "$rmlog")])"
 fi
@@ -325,12 +349,64 @@ else
   fail "snapshot lifecycle: expected retain-then-delete (retained=$retained, deleted=$deleted)"
 fi
 
-# (vii) BRANCH INVARIANCE — the pre-existing ref-held / last-holder / stale-lease
-# / stale-lock / fail-safe / register-timeout cases (a)-(h) above still assert the
-# unchanged refcount behaviour; adding the sweep did not perturb them because
-# reset_case keeps $psfile empty and those cases write no snapshot. This marker
-# records that invariance is covered by the cases already run.
-pass "branch invariance: cases (a)-(h) exercise the unchanged refcount branches"
+# (viii) DECLINE-TO-PUBLISH ON A FAILED QUERY (#3122 high/regression). When docker
+# is PRESENT but its `ps` query FAILS at generation-open, _write_generation_snapshot
+# must NOT publish an empty snapshot: otherwise a later daemon recovery makes the
+# last-holder sweep treat every labelled container as generation-created and remove
+# it. Assert (1) no snapshot is published while the query fails, and (2) after the
+# daemon "recovers" (cZ now visible), the last-holder sweep degrades to a NO-OP and
+# spares cZ. Restoring `|| true` in _labelled_container_ids reddens this: the empty
+# snapshot publishes and cZ is swept.
+reset_case viii
+: > "$psfail"                                         # docker present, ps query FAILS
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease                                      # opens generation; snapshot must NOT publish
+published_on_failure=0; [ -f "$LEASE_DIR.snapshot" ] && published_on_failure=1
+rm -f "$psfail"                                      # daemon recovers
+printf 'cZ\n' > "$psfile"                            # cZ now visible to the sweep
+_reap_shared_container                               # last-holder: no snapshot → no-op sweep
+unset FISHHAWK_TEST_LEASE_TOKEN
+if [ "$published_on_failure" -eq 0 ] && grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" \
+   && ! grep -qx 'rm -f cZ' "$rmlog"; then
+  pass "decline-to-publish: failed ps writes no snapshot, recovered daemon not swept"
+else
+  fail "decline-to-publish: expected no snapshot on failure + cZ spared (published=$published_on_failure, rmlog=[$(tr '\n' ';' < "$rmlog")])"
+fi
+
+# (ix) SWEEP RUNS INSIDE THE LOCK (#3122 condition 4 / verification concern). The
+# last holder must run _sweep_generation_orphans and the snapshot deletion while
+# still HOLDING the lease lock, so a concurrent invocation cannot arm between the
+# rmdir and the snapshot removal and have its fresh snapshot deleted. The fake
+# docker records, at each `rm`, whether the lock symlink still exists; assert the
+# sweep's `docker rm cW` fired with the lock HELD. Moving the sweep/snapshot
+# deletion after _lease_unlock reddens this — at rm time the lock is gone (free).
+reset_case ix
+export FAKE_DOCKER_LOCK_PATH="$LEASE_DIR.lock"       # probe the real lock path
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease                                      # opens generation, snapshot empty
+printf 'cW\n' > "$psfile"                            # cW created mid-generation
+_reap_shared_container                               # last-holder: sweeps cW under the lock
+unset FISHHAWK_TEST_LEASE_TOKEN
+unset FAKE_DOCKER_LOCK_PATH
+if grep -qx 'rm -f cW held' "$locklog" && grep -qx 'rm -f fishhawk-test-postgres held' "$locklog"; then
+  pass "sweep-under-lock: sweep + shared-container rm run while the lease lock is held"
+else
+  fail "sweep-under-lock: expected 'rm -f cW held' + 'rm -f fishhawk-test-postgres held' (locklog=[$(tr '\n' ';' < "$locklog")])"
+fi
+
+# (vii) BRANCH INVARIANCE — a LOAD-BEARING check (was a vacuous unconditional
+# `pass`). The pre-existing refcount cases (a)-(h) and the #3122 sweep cases
+# (i)-(vi),(viii),(ix) all run in this same harness against the modified
+# _register_lease/_reap_shared_container, so their green status IS the invariance
+# evidence. Asserting the EXACT count of prior passes with zero failures turns the
+# marker into a gate: a silently-skipped or reddened prior case drops PASS below
+# the expected total here. Bump expected_prior when adding a case above.
+expected_prior=15   # (a)(b)(c)(d)(e)(g)(h)=7 + (i)(ii)(iii)(iv)(v)(vi)(viii)(ix)=8
+if [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$expected_prior" ]; then
+  pass "branch invariance: all $expected_prior prior refcount+sweep cases ran and passed"
+else
+  fail "branch invariance: expected $expected_prior prior passes and 0 failures (PASS=$PASS, FAIL=$FAIL)"
+fi
 
 # (f) parse-clean: scripts/test itself parses with no syntax errors.
 if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then

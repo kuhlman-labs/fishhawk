@@ -420,6 +420,16 @@ LEASE GENERATION:
   ref-held sweeping nothing, B exits last-holder and spares cA — so cA leaks.
   Generation keying makes cA absent from the (empty) snapshot B reuses, so B
   sweeps it.
+- **Decline to publish on a FAILED query, not just an absent daemon.**
+  `_labelled_container_ids` distinguishes docker ABSENT (clean no-op, exit 0)
+  from a docker PRESENT-but-failing query (daemon down / transient error), which
+  PROPAGATES the non-zero exit rather than `|| true`-swallowing it. On that
+  failure `_write_generation_snapshot` writes NO snapshot — it leaves any prior
+  snapshot untouched and, when none exists, leaves the sweep to degrade to a
+  no-op. Publishing an EMPTY snapshot on a transient failure would, after the
+  daemon recovers, make the last holder treat every labelled container as
+  generation-created and remove unrelated testcontainers workloads — the
+  destructive expansion this guard exists to prevent.
 - **Sibling path, NOT inside `$LEASE_DIR`.** The snapshot is `$LEASE_DIR.snapshot`
   (a sibling, exactly as `$LEASE_DIR.lock` is), because the last-holder proof is
   `rmdir` succeeding, and `rmdir` requires an EMPTY directory — a file inside
@@ -459,13 +469,20 @@ absent, or the opt-out is set. `FISHHAWK_TEST_NO_ORPHAN_SWEEP` /
 default-deny allow-list, so neither reaches the in-loop gate.
 
 Pinned by `scripts/test-container-lease` (sourcing `scripts/test` lib-only with a
-fake `docker` on PATH serving an injectable labelled-container set): the
-interleaving case (the per-invocation-snapshot counterfactual), pre-generation
-sparing + preflight report, sibling-path placement + successful rmdir, the
-no-snapshot degrade, the opt-out, snapshot lifecycle (retained after ref-held,
-deleted after last-holder), and the unchanged #1792 refcount branches. That
-harness is now run in-loop by `scripts/test verify` via `_verify_gate_harnesses`,
-adding well under a second (it needs no Docker).
+fake `docker` on PATH serving an injectable labelled-container set, an injectable
+`ps`-fails sentinel, and a per-`rm` lock-state probe): the interleaving case (the
+per-invocation-snapshot counterfactual), pre-generation sparing + preflight
+report, sibling-path placement + successful rmdir, the no-snapshot degrade, the
+opt-out (with the candidate container added AFTER registration so it is absent
+from the snapshot — the case would be vacuous otherwise), the decline-to-publish
+transition (a failing `ps` at generation-open writes no snapshot and a recovered
+daemon is not swept), the sweep-runs-INSIDE-the-lock ordering (the `docker rm`
+fires with the lease lock still held — reddens if the sweep moves after
+`_lease_unlock`), snapshot lifecycle (retained after ref-held, deleted after
+last-holder), and a load-bearing branch-invariance count assertion over the
+unchanged #1792 refcount branches. That harness is now run in-loop by
+`scripts/test verify` via `_verify_gate_harnesses`, adding well under a second (it
+needs no Docker).
 
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 
