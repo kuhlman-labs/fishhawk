@@ -153,6 +153,29 @@ Or from this directory directly:
 
 To mirror the implement-stage verify gate locally, run the repo-root wrapper (`scripts/test lint` for golangci-lint per module, `scripts/test verify` for lint + tests).
 
+## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
+
+`fishhawk-runner` is a **separate binary**, built from `main`, respawned fresh from `bin/` on every host dispatch (the same design that lets the escape below work). So a run whose job is to **fix a defect in the runner itself** executes under the *unfixed* runner: the stage runs `bin/fishhawk-runner` built from `main`, hits the very defect the run is fixing, and cannot pass its own gates. This is a bootstrap deadlock.
+
+**Failure signature an operator actually sees:** the same stage fails **category-A repeatedly** with the same `source_failure_reason`; `stage_fixup_triggered` increments while `fixup_pushed` stays `0` — fix-up budget burns with nothing landing, four identical failures in a row.
+
+**The escape — build the runner from the run branch into a scratch worktree, then re-dispatch:**
+
+```sh
+# From the main checkout. <run-branch> is the run's feature branch; <repo> its root.
+git worktree add --detach /tmp/fishhawk-runner-fix <run-branch>
+( cd /tmp/fishhawk-runner-fix/runner && go build -o <repo>/bin/fishhawk-runner ./cmd/fishhawk-runner )
+# Verify the new code is in the binary (e.g. grep the fix, or check a version string),
+# then re-dispatch the stage. Clean up when done:
+git worktree remove /tmp/fishhawk-runner-fix
+```
+
+**Use a scratch worktree, NOT a checkout of the run branch in the main checkout.** The runner **owns the run's lineage worktree**, so checking the run branch out in the main checkout would contaminate the base the run executes from (the #1866 class). A `git worktree add --detach` touches no branch, makes no commit, and leaves the tree under verification untouched.
+
+**Advisory + its bypass residual.** `fishhawk_dispatch_stage` / `fishhawk_run_stage` detect this at dispatch time and print a one-line warning pointing here (`guardRunnerSelfHost`, see `backend/internal/mcpserver/README.md`). **That warning reaches you ONLY through those two MCP verbs** — a direct `bin/fishhawk-runner` invocation, or a stage spawned by the auto-drive loop's own path, gets **nothing**. The warning also fires on the run's *declared* plan scope, so a `runner/` path added later by an approved scope amendment will not trigger it.
+
+**Residual, stated honestly:** the binary that verifies the change is then built from an **unmerged branch**, which is exactly why doing this automatically (option 2 in #3086) is deferred to its own discussion — see [#3086](https://github.com/kuhlman-labs/fishhawk/issues/3086).
+
 ## Local invocation
 
 The same binary the action runs can be invoked locally for development:
