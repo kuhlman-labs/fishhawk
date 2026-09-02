@@ -273,16 +273,27 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// run in `running` for exactly the same reason. skipStageID is
 			// nil: there is no stage this path owns.
 			//
-			// The Advance is CONDITIONAL on the sweep having actually
-			// moved something. Unlike the review path above, this branch
-			// has never driven the orchestrator — an implement-only run
-			// completes when its last stage settles — so calling Advance
-			// unconditionally would be a behavior change for every
-			// implement-only merge. Gating it on a non-empty sweep keeps
-			// the untouched shape byte-identical while still completing
-			// the run on this same pass when the sweep did terminalize the
-			// stage that was blocking it.
-			if moved := s.supersedeParkedStagesOnMerge(ctx, target.ID, nil, supersedeReasonMergeObserved); len(moved) > 0 {
+			// The Advance is CONDITIONAL on the run holding a superseded
+			// stage. Unlike the review path above, this branch has never
+			// driven the orchestrator — an implement-only run completes when
+			// its last stage settles — so calling Advance unconditionally
+			// would be a behavior change for every implement-only merge.
+			//
+			// It is gated on `moved > 0 OR the run already has a superseded
+			// stage`, NOT on `moved > 0` alone (#3083 fix-up). An earlier
+			// invocation could have committed the awaiting_host_dispatch →
+			// superseded transition and then stopped before advancing (a crash
+			// or an Advance error); a merge redelivery then sweeps NOTHING
+			// (superseded is not a pair-table state), and gating on moved
+			// alone would skip the advance again and strand the run in
+			// `running` forever. Re-evaluating whenever a superseded stage is
+			// present drives that stranded run to completion on the retry,
+			// while still keeping the untouched implement-only shape (no
+			// superseded stage ever) byte-identical: moved is empty AND there
+			// is no superseded stage, so Advance is not called. The
+			// short-circuit keeps the extra stage list off the common path.
+			moved := s.supersedeParkedStagesOnMerge(ctx, target.ID, nil, supersedeReasonMergeObserved)
+			if len(moved) > 0 || s.runHasSupersededStage(ctx, target.ID) {
 				s.advanceRunAfterReviewResolve(ctx, target.ID)
 			}
 			// Sticky status comment (E20.4 / #330) — the audit row

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -941,6 +942,162 @@ func TestReconcileMerge_ReadFailuresFailClosed(t *testing.T) {
 			t.Errorf("rows = %d, want 0", len(rows))
 		}
 	})
+}
+
+// seedSupersededAcceptanceNoRow drives the acceptance stage to `superseded`
+// through the real CAS and asserts the chain carries no supersede row yet — the
+// residue of a sweep whose transition committed and whose append then failed,
+// the exact missing-row state the repair scan restores. The review stage is
+// left `succeeded` (the fixture default) so the sweep has nothing to move and
+// the repair path is isolated.
+func (f *supersedeFixture) seedSupersededAcceptanceNoRow(t *testing.T) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	acc := f.stages[run.StageTypeAcceptance]
+	cas, ok := f.runRepo.(run.StageCASTransitioner)
+	if !ok {
+		t.Fatal("postgres run repository must implement run.StageCASTransitioner")
+	}
+	if _, err := cas.TransitionStageFrom(ctx, acc.ID,
+		run.StageStateAwaitingHostDispatch, run.StageStateSuperseded, nil); err != nil {
+		t.Fatalf("seed superseded acceptance: %v", err)
+	}
+	if rows := f.supersedeRows(t); len(rows) != 0 {
+		t.Fatalf("fixture already has %d supersede rows; the repair case needs none", len(rows))
+	}
+	return acc.ID
+}
+
+// TestReconcileMerge_RepairResponseExcludesUndurableAppend pins CONCERN 1
+// (#3083 fix-up): the repaired list must carry ONLY stages whose audit row was
+// DURABLY persisted. appendStageSupersededAudit is best-effort and swallows the
+// append failure, so reporting a stage as repaired before checking that return
+// would let POST /reconcile-merge claim a row was restored when none persisted —
+// the response-contract violation this fix closes.
+//
+// The append is forced to fail with msAppendErrAudit AFTER the merge evidence
+// and the superseded seed are in place, so the ONLY thing that fails is the
+// repair's own append. The stage is superseded but its row cannot be written.
+//
+// COUNTERFACTUAL (run by deletion). Removing the `if aerr != nil { continue }`
+// durability guard in repairMissingSupersedeRows.appendStageSupersededAudit
+// check makes the stage be appended to `repaired` unconditionally, so
+// resp.Repaired gains the acceptance stage despite the failed append and the
+// len(resp.Repaired) == 0 assertion goes RED. Observed with the guard removed:
+//
+//	repaired = 1 entries, want 0 (a swallowed append failure must not be
+//	reported as a durable repair)
+func TestReconcileMerge_RepairResponseExcludesUndurableAppend(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	f.observeMerge(t)
+	accID := f.seedSupersededAcceptanceNoRow(t)
+
+	// Every subsequent AppendChained fails — including the repair's own — while
+	// reads (merge evidence, prior rows, the fresh re-read) still delegate to
+	// the real chain.
+	f.s.cfg.AuditRepo = &msAppendErrAudit{Repository: f.audit, err: errors.New("chain down")}
+
+	w := f.postReconcile(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reconcileMergeResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Repaired) != 0 {
+		t.Fatalf("repaired = %d entries, want 0 (a swallowed append failure must not be reported as a durable repair): %+v", len(resp.Repaired), resp.Repaired)
+	}
+
+	// And the durable truth matches the response: no row persisted.
+	f.s.cfg.AuditRepo = f.audit
+	byStage := map[uuid.UUID]int{}
+	for _, e := range f.supersedeRows(t) {
+		if e.StageID != nil {
+			byStage[*e.StageID]++
+		}
+	}
+	if byStage[accID] != 0 {
+		t.Errorf("acceptance supersede rows = %d, want 0 (the append failed)", byStage[accID])
+	}
+}
+
+// TestReconcileMerge_ConcurrentRepairsWriteExactlyOneRow pins CONCERN 3 (#3083
+// fix-up): the missing-audit repair must be idempotent against CONCURRENT
+// reconcile requests, not only sequential ones. Two requests that both captured
+// the pre-sweep snapshot before either wrote would each observe the row missing
+// and each append one, breaking the documented exactly-one-row guarantee.
+//
+// The two racing requests are modelled by invoking repairMissingSupersedeRows
+// directly from two goroutines with the SAME stale pre-sweep snapshot (empty
+// priorRows, empty movedThisInvocation) — the exact input both concurrent
+// handlers would carry into the repair, and the deterministic reproduction the
+// handler-level race is not: nothing but the internal serialization gates the
+// two goroutines from both reaching the append, so without the fix BOTH append
+// regardless of scheduling.
+//
+// The fix serializes the repair under s.supersedeRepairMu AND re-reads the
+// current rows INSIDE the lock, so the second goroutine observes the first's
+// committed row and skips the stage: exactly one durable row, and exactly one
+// goroutine returns the repair.
+//
+// COUNTERFACTUAL (run by deletion). Removing the s.supersedeRepairMu
+// Lock/Unlock and the fresh under-lock `current` re-read in
+// repairMissingSupersedeRows (reverting to the pre-sweep priorRows snapshot
+// alone) lets both goroutines append, so f.supersedeRows returns 2 and the
+// `== 1` assertion goes RED. Observed with the serialization removed:
+//
+//	acceptance supersede rows = 2, want exactly 1 across concurrent repairs
+func TestReconcileMerge_ConcurrentRepairsWriteExactlyOneRow(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	f.observeMerge(t)
+	accID := f.seedSupersededAcceptanceNoRow(t)
+
+	const n = 2
+	var wg sync.WaitGroup
+	results := make([][]supersededStage, n)
+	wg.Add(n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start // release both goroutines together to maximise the overlap
+			results[i] = f.s.repairMissingSupersedeRows(context.Background(), f.runID,
+				map[uuid.UUID]struct{}{}, map[uuid.UUID]struct{}{})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Exactly one durable row for the acceptance stage, no matter how the two
+	// repairs interleaved.
+	byStage := map[uuid.UUID]int{}
+	for _, e := range f.supersedeRows(t) {
+		if e.StageID != nil {
+			byStage[*e.StageID]++
+		}
+	}
+	if byStage[accID] != 1 {
+		t.Fatalf("acceptance supersede rows = %d, want exactly 1 across concurrent repairs", byStage[accID])
+	}
+
+	// And exactly one goroutine reported the repair — the loser's fresh re-read
+	// saw the row and skipped it.
+	repairedTotal := 0
+	for _, r := range results {
+		for _, rep := range r {
+			if rep.StageID == accID {
+				repairedTotal++
+			}
+		}
+	}
+	if repairedTotal != 1 {
+		t.Errorf("acceptance reported repaired %d times across the two goroutines, want exactly 1", repairedTotal)
+	}
 }
 
 // TestRepairMissingSupersedeRows_ReListFailureRepairsNothing pins the repair

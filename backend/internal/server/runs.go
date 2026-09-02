@@ -263,7 +263,7 @@ type runResponse struct {
 // runCompletionBlockedPayload is the completion-refusal projection on the wire
 // (E64.2 / #3083). The MCP client mirror decodes it; the json tags MUST
 // byte-match their counterparts (backend/internal/mcpserver/client.go's
-// RunCompletionBlocked) or the field silently decodes to nil — the #371-class
+// runCompletionBlocked) or the field silently decodes to nil — the #371-class
 // hand-maintained-wire-mirror trap.
 type runCompletionBlockedPayload struct {
 	StageID    string `json:"stage_id"`

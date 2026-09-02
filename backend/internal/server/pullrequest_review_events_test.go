@@ -1978,3 +1978,58 @@ func TestResolveReviewStageOnMerge_NoReviewStage_NothingSwept_NoAdvance(t *testi
 		t.Error("pr_merged row missing on the no-review-stage merged path")
 	}
 }
+
+// TestResolveReviewStageOnMerge_NoReviewStage_AlreadySuperseded_ReEvaluatesToCompletion
+// pins the #3083 fix-up regression fix: the no-review-stage merged path must
+// re-drive a run to completion on a merge REDELIVERY even when this pass sweeps
+// nothing, provided the run already holds a superseded stage.
+//
+// The stranding scenario: an earlier invocation committed the
+// awaiting_host_dispatch → superseded transition and then stopped BEFORE the
+// Advance (a crash, or an Advance error). The stage is now terminal but the run
+// is still `running`. A merge redelivery sees the stage already superseded
+// (not a pair-table state), so the sweep moves NOTHING — and the prior
+// `if len(moved) > 0` gate skipped the Advance, leaving the run stranded in
+// `running` forever until an operator ran reconcile-merge. The fix gates the
+// Advance on `moved > 0 OR the run has a superseded stage`, so the redelivery
+// re-evaluates the run to completion automatically.
+//
+// COUNTERFACTUAL (approval condition — run by deletion). Reverting the gate in
+// pullrequest_review_events.go to `if len(moved) > 0` makes the redelivery
+// sweep nothing, skip the Advance, and leave rr.runStates without a succeeded
+// entry for the run — turning the completion assertion RED. Observed:
+//
+//	run state = "running", want succeeded (already-superseded run must
+//	re-evaluate to completion on a merge redelivery)
+func TestResolveReviewStageOnMerge_NoReviewStage_AlreadySuperseded_ReEvaluatesToCompletion(t *testing.T) {
+	acceptanceID := uuid.New()
+	// The residue a partial prior invocation left: the acceptance stage is
+	// ALREADY superseded (terminal), the run is still running, and no supersede
+	// sweep runs this pass because superseded is not a pair-table state.
+	s, rr, ar, runID := mergeSweepFixture(t, []*run.Stage{
+		{ID: uuid.New(), Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceID, Type: run.StageTypeAcceptance, State: run.StageStateSuperseded},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID,
+		true, "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+
+	// The sweep moved nothing (the stage was already superseded), so no NEW
+	// supersede row is written on the redelivery.
+	if n := countCategory(ar.appended, CategoryStageSupersededByMerge); n != 0 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 0 (the stage was already superseded; the redelivery moves nothing)", n)
+	}
+	// THE POINT: the run is driven to completion anyway, because it holds a
+	// superseded stage. Without the fix the Advance is skipped and the run
+	// stays `running` with a merged PR — stranded.
+	if got := rr.runStates[runID]; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded (an already-superseded run must re-evaluate to completion on a merge redelivery)", got)
+	}
+	// The stage stays superseded — the redelivery re-drives completion, it does
+	// not re-transition the stage.
+	if got := stageStateByID(t, rr, runID, acceptanceID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage state = %q, want superseded (unchanged by the redelivery)", got)
+	}
+}

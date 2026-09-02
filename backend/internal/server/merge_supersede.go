@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +14,24 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// supersedeRepairMu serializes the missing-audit-row repair in
+// repairMissingSupersedeRows (E64.2 / #3083 fix-up). The repair is a
+// read-then-append (is a row present? if not, write one), which two concurrent
+// reconcile-merge requests would otherwise both pass — each writing a row for
+// the same stage and breaking the documented exactly-one-row guarantee. Holding
+// this lock across the fresh re-read AND the append makes the pair atomic within
+// the process: the second request's re-read observes the first's committed row
+// and skips it.
+//
+// It is a package-level lock (not a Server field) so the whole change stays
+// within the files this fix-up owns; there is one fishhawkd Server per process,
+// so this is equivalent to a per-Server lock in practice. It serializes repair
+// across ALL runs (a single lock, not keyed by run) — acceptable because
+// reconcile-merge is a rare operator recovery path — and does NOT serialize
+// across separate fishhawkd replicas, which would need a DB-level guard
+// (advisory lock or a per-stage unique constraint) tracked separately.
+var supersedeRepairMu sync.Mutex
 
 // CategoryStageSupersededByMerge is the audit-log category for the chained
 // entry the merge-supersede sweep writes per stage it terminalized (E64.2 /
@@ -154,7 +173,11 @@ func (s *Server) supersedeParkedStagesOnMerge(ctx context.Context, runID uuid.UU
 			FromState: string(from),
 			Reason:    reason,
 		}
-		s.appendStageSupersededAudit(ctx, runID, rec)
+		// The CAS already committed, so this stage IS moved regardless of
+		// whether the audit append lands — a swallowed append failure leaves a
+		// MISSING row the reconcile repair scan restores later, which is why
+		// the error is intentionally discarded here (unlike the repair path).
+		_ = s.appendStageSupersededAudit(ctx, runID, rec)
 		moved = append(moved, rec)
 	}
 	return moved
@@ -165,9 +188,16 @@ func (s *Server) supersedeParkedStagesOnMerge(ctx context.Context, runID uuid.UU
 // the transition is durable and must not be unwound by an audit failure, so a
 // failed append warn-logs and leaves a missing row the reconcile endpoint's
 // repair scan can restore later.
-func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID, rec supersededStage) {
+//
+// It returns the append error (nil on success, and nil when no audit repository
+// is wired so a sweep whose transition committed still counts as moved). The
+// repair scan reads this return to decide whether a row was DURABLY restored: a
+// swallowed failure must not let the reconcile response claim a repair that
+// never persisted (#3083 fix-up — the Repaired list is confirmed durable
+// repairs only).
+func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID, rec supersededStage) error {
 	if s.cfg.AuditRepo == nil {
-		return
+		return nil
 	}
 	stageID := rec.StageID
 	payload, _ := json.Marshal(map[string]any{
@@ -191,7 +221,9 @@ func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", rec.StageID.String()),
 			slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }
 
 // reconcileMergeResponse reports what the operator recovery verb did.
@@ -351,21 +383,52 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 
 // repairMissingSupersedeRows re-appends a stage_superseded_by_merge entry for
 // every stage that is `superseded` on the CURRENT stage rows but carries no row
-// in priorRows — the missing-row residue the transition-first ordering
-// deliberately allows.
+// yet — the missing-row residue the transition-first ordering deliberately
+// allows.
 //
-// movedThisInvocation is the LOAD-BEARING exclusion. priorRows is a PRE-sweep
-// snapshot, so a stage this invocation just moved is superseded in the re-read
-// and absent from that snapshot; without the exclusion it would draw a SECOND
+// movedThisInvocation is the LOAD-BEARING exclusion. A stage this invocation
+// just moved is superseded in the re-read but its row (if any) was written by
+// this same invocation's sweep; without the exclusion it would draw a SECOND
 // row for the same supersession, and "exactly one row per swept stage" would
 // become "one or two, depending on whether an operator ran the verb".
+//
+// priorRows is the PRE-sweep snapshot the handler read; it is one of the two
+// membership guards (a stage recorded before the sweep is never repaired).
+//
+// ATOMICITY (#3083 fix-up). The check-then-append is serialized under
+// s.supersedeRepairMu AND re-reads the CURRENT audit rows inside the lock, so
+// two concurrent reconcile-merge requests can no longer both observe a missing
+// row and both append: the second acquires the lock after the first commits,
+// its fresh read sees the row, and it skips the stage. The pre-sweep priorRows
+// snapshot alone could not close this — both requests captured it before either
+// wrote — so the fresh under-lock read is what makes the guarantee hold.
+//
+// DURABILITY (#3083 fix-up). A stage is added to the returned Repaired list
+// ONLY when its audit append SUCCEEDS. appendStageSupersededAudit swallows the
+// failure (best-effort), so reporting a repair before checking its return would
+// let the response claim a row was restored when none persisted — the exact
+// contract violation this fix closes.
 func (s *Server) repairMissingSupersedeRows(ctx context.Context, runID uuid.UUID, movedThisInvocation map[uuid.UUID]struct{}, priorRows map[uuid.UUID]struct{}) []supersededStage {
+	supersedeRepairMu.Lock()
+	defer supersedeRepairMu.Unlock()
+
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge supersede: re-list stages for repair scan failed; repairing nothing",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
+		return nil
+	}
+	// Fresh read UNDER THE LOCK: this observes any row a concurrent reconcile
+	// committed before we acquired the mutex, which is what makes the repair
+	// idempotent against a racing request rather than only a sequential one.
+	current, cerr := s.supersededStageIDsWithAuditRow(ctx, runID)
+	if cerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge supersede: re-read audit rows for repair scan failed; repairing nothing",
+			slog.String("run_id", runID.String()),
+			slog.String("error", cerr.Error()))
 		return nil
 	}
 	var repaired []supersededStage
@@ -379,13 +442,25 @@ func (s *Server) repairMissingSupersedeRows(ctx context.Context, runID uuid.UUID
 		if _, has := priorRows[st.ID]; has {
 			continue
 		}
+		if _, has := current[st.ID]; has {
+			continue
+		}
 		rec := supersededStage{
 			StageID:   st.ID,
 			StageType: string(st.Type),
 			FromState: string(run.StageStateSuperseded),
 			Reason:    supersedeReasonRepair,
 		}
-		s.appendStageSupersededAudit(ctx, runID, rec)
+		if aerr := s.appendStageSupersededAudit(ctx, runID, rec); aerr != nil {
+			// The append failed and swallowed the error; the row is NOT
+			// durable, so it must not be reported as repaired. Leave it for a
+			// later reconcile to retry.
+			continue
+		}
+		// Record it in the fresh set so a duplicate stage id in the same scan
+		// (there should be none, but the guard is cheap) cannot draw a second
+		// row within this invocation.
+		current[st.ID] = struct{}{}
 		repaired = append(repaired, rec)
 	}
 	return repaired
@@ -419,6 +494,37 @@ func (s *Server) supersededStageIDsWithAuditRow(ctx context.Context, runID uuid.
 		}
 	}
 	return out, nil
+}
+
+// runHasSupersededStage reports whether the run currently holds at least one
+// stage in the `superseded` terminal state. The no-review-stage merged path
+// (pullrequest_review_events.go) uses it to decide whether to re-drive the run
+// to completion on a merge redelivery even when THIS pass's sweep moved nothing
+// (#3083 fix-up): an earlier invocation may have committed the
+// awaiting_host_dispatch → superseded transition and then stopped before
+// advancing the run — a crash, or an Advance error — leaving the run stranded
+// in `running`. A later merge observation must re-evaluate it to completion
+// rather than skip the advance again. Best-effort: a list failure logs and
+// returns false, so a transient read error degrades to the prior (advance-only-
+// when-moved) behavior rather than a spurious advance.
+func (s *Server) runHasSupersededStage(ctx context.Context, runID uuid.UUID) bool {
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge supersede: list stages for superseded-stage check failed; assuming none",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	for _, st := range stages {
+		if st != nil && st.State == run.StageStateSuperseded {
+			return true
+		}
+	}
+	return false
 }
 
 // runPRObservablyMerged reports whether the run's chain carries a merge
