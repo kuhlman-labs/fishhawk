@@ -2,7 +2,10 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -264,5 +267,64 @@ func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
 	// path, and the codex grant is written in canonical form.
 	if cmd.Dir != treeDir {
 		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, treeDir)
+	}
+}
+
+// TestReviewGrounded_ConfinedHomeReachesTheChild is the reviewer-to-adapter seam
+// assertion (#3082). Production reaches the confined path through the Reviewer,
+// not the Client, and TestReviewGrounded_RoutesTreeDir pins only the tree dir —
+// so a regression that dropped the confined CODEX_HOME on the Reviewer path
+// would leave every Client-level test green. It deliberately does not restate
+// the containment sweep, which lives in confinement_boundary_test.go.
+func TestReviewGrounded_ConfinedHomeReachesTheChild(t *testing.T) {
+	hp := testHostPaths(t)
+	treeDir := t.TempDir()
+	reportPath := filepath.Join(t.TempDir(), "probe-report.json")
+
+	t.Setenv("GO_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", "confinement_probe")
+	t.Setenv(probeReportEnv, reportPath)
+	t.Setenv("CODEX_HOME", hp.CodexHome)
+
+	cfg := testConfig()
+	cfg.EnvPassthrough = []string{"GO_HELPER_PROCESS", "HELPER_MODE", probeReportEnv}
+	r := NewReviewer(cfg)
+	// passEnv=false leaves cmd.Env nil so the ADAPTER builds the child environment.
+	r.client.Cmd = capturingHelper("confinement_probe", false, nil, nil)
+	r.client.HostPaths = hp
+	r.client.GOOS = "linux"
+
+	verdict, _, err := r.ReviewGrounded(context.Background(), "review", treeDir)
+	if err != nil {
+		t.Fatalf("ReviewGrounded: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want approve", verdict.Verdict)
+	}
+
+	body, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("the probe wrote no report to %q: %v", reportPath, err)
+	}
+	var rep probeReport
+	if err := json.Unmarshal(body, &rep); err != nil {
+		t.Fatalf("decode probe report: %v", err)
+	}
+
+	var entries []string
+	for _, kv := range rep.RawEnviron {
+		if strings.HasPrefix(kv, "CODEX_HOME=") {
+			entries = append(entries, kv)
+		}
+	}
+	if len(entries) != 1 {
+		t.Fatalf("child environ carries %d CODEX_HOME entries, want exactly 1: %q", len(entries), entries)
+	}
+	got := strings.TrimPrefix(entries[0], "CODEX_HOME=")
+	if !coversPath(hp.CodexHome, got) || filepath.Clean(got) == filepath.Clean(hp.CodexHome) {
+		t.Fatalf("child CODEX_HOME = %q, want a PROPER subdirectory of the injected real CODEX_HOME %q", got, hp.CodexHome)
+	}
+	if !strings.HasPrefix(filepath.Base(got), "fishhawk-confined-") {
+		t.Errorf("child CODEX_HOME base = %q, want the `fishhawk-confined-` prefix", filepath.Base(got))
 	}
 }
