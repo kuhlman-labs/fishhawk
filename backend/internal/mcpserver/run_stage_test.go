@@ -3782,11 +3782,30 @@ func TestRunStageAuditWindow_EqualsAuditLimitMax(t *testing.T) {
 // mirror of the dispatch e2e: it drives the real runStage handler end to end
 // (fake backend -> guard -> RunStageOutput) with the runStageCommand /
 // runStageLookPath stub seams, asserting the advisory string reaches
-// RunStageOutput.Warnings while the stage runs to completion (no tool error).
+// RunStageOutput.Warnings while the stage runs to completion (no tool error)
+// AND that the runner command seam was actually INVOKED. The spawn count is the
+// load-bearing assertion for the acceptance criterion that the advisory still
+// spawns the stage: without it the test would keep passing if a future non-error
+// short-circuit returned the warning without spawning the stage (the advisory is
+// meant to be non-blocking, not stage-suppressing).
 func TestRunStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	withFakeRunner(t, "exit 0")
+
+	// A spawn-counting runner stub (rather than withFakeRunner) so the test can
+	// assert the runner command seam fired exactly once.
+	spawned := 0
+	origCmd := runStageCommand
+	origLook := runStageLookPath
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = origLook
+	})
 
 	runID := uuid.New()
 	planScopeForRun(fb, runID, "runner/internal/agent/claudecode/claudecode.go")
@@ -3799,6 +3818,12 @@ func TestRunStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("the self-host advisory must NOT block run_stage: %v", err)
+	}
+	// The advisory is non-blocking: the stage must still SPAWN. A count of 0
+	// would mean the warning short-circuited the run — exactly the regression
+	// this assertion pins at the verb boundary.
+	if spawned != 1 {
+		t.Errorf("runner command seam invoked %d times, want 1 — the advisory must not suppress the spawn", spawned)
 	}
 	found := false
 	for _, w := range out.Warnings {

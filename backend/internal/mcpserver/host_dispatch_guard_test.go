@@ -788,3 +788,129 @@ func TestRunnerBinaryAffectingScopePath(t *testing.T) {
 		}
 	}
 }
+
+// --- resolvePlanScopePathsForRun fail-open branches (E64.5 / #3086) -----------
+//
+// The resolver backs an ADVISORY that must never strand a dispatch, so EVERY
+// error path returns nil with NO error. The artifact-list 500 mode is pinned by
+// TestGuardRunnerSelfHost_ArtifactReadError_FailsOpenSilent above; these cases
+// cover the remaining distinct fail-open branches the guard-boundary tests do not
+// exercise, so a regression that turned any one of them into a non-nil error (or
+// a panic) is caught here rather than surfacing as a stranded local dispatch.
+
+// A stage-list read error (the ListRunStages failure inside tryGetPlanForRun)
+// resolves to nil, not an error.
+func TestResolvePlanScopePathsForRun_StageListError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.stagesStatusByRun[runID] = http.StatusInternalServerError
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a stage-list read error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A plan artifact whose content is valid JSON but does not decode into
+// PlanContent (the json.Unmarshal failure inside tryGetPlanForRun) resolves to
+// nil, not an error.
+func TestResolvePlanScopePathsForRun_PlanDecodeError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	// scope must decode to an object; a string forces a json.Unmarshal type error
+	// into PlanContent, exercising the decode-failure fail-open branch.
+	v := "standard_v1"
+	fb.mu.Lock()
+	fb.artifactsByStage[planStageID] = []Artifact{{
+		ID:            uuid.New().String(),
+		StageID:       planStageID.String(),
+		Kind:          "plan",
+		SchemaVersion: &v,
+		ContentHash:   "h",
+		Content:       map[string]any{"plan_version": "standard_v1", "scope": "not-an-object"},
+		CreatedAt:     time.Now().UTC(),
+	}}
+	fb.mu.Unlock()
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a plan decode error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A GetRun failure during the parent walk (the run has no plan of its own, so the
+// walk reads its run row to find the parent, and that read 500s) resolves to nil.
+func TestResolvePlanScopePathsForRun_ParentGetRunError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	// No plan stage, so tryGetPlanForRun returns found=false and the walk reads
+	// the run row next — which 500s.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "running"},
+	}
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a parent-walk GetRun error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// An unparseable ParentRunID (the uuid.Parse failure in the walk) resolves to nil.
+func TestResolvePlanScopePathsForRun_UnparseableParentID_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	bad := "not-a-uuid"
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "running"},
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), ParentRunID: &bad, State: "running", Repo: "x/y"}
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("an unparseable parent id must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A parent chain deeper than retryPlanChainDepth resolves to nil even though a
+// runner-touching plan exists BEYOND the cap: the walk stops at the cap without
+// reaching it, so the guard stays silent. This pins the cap-exhaustion branch
+// specifically — a plan seeded one level past the cap is deliberately NOT found.
+func TestResolvePlanScopePathsForRun_CapExhaustion_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	// Build a chain of retryPlanChainDepth+2 runs, each pointing at the next.
+	ids := make([]uuid.UUID, retryPlanChainDepth+2)
+	for i := range ids {
+		ids[i] = uuid.New()
+	}
+	for i := 0; i < len(ids); i++ {
+		fb.stagesByRun[ids[i]] = []Stage{
+			{ID: uuid.NewString(), RunID: ids[i].String(), Type: "implement", State: "running"},
+		}
+		var parent *string
+		if i+1 < len(ids) {
+			p := ids[i+1].String()
+			parent = &p
+		}
+		fb.getRunByID[ids[i]] = Run{ID: ids[i].String(), ParentRunID: parent, State: "running", Repo: "x/y"}
+	}
+	// Seed a runner-touching plan on the LAST run — one level beyond the cap, so
+	// the walk from ids[0] must NOT reach it.
+	last := ids[len(ids)-1]
+	planScopeForRun(fb, last, "runner/internal/upload/upload.go")
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), ids[0]); got != nil {
+		t.Errorf("a chain deeper than retryPlanChainDepth must resolve to nil (cap-exhausted), got %v", got)
+	}
+}
