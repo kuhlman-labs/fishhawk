@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,45 +25,131 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// startContainer spins up a throwaway Postgres 16 container and
-// returns its connection URL. Skips the test if Docker isn't
-// reachable so devs without Docker still pass `go test`.
+// fataler is the subset of *testing.T that startContainerWith needs. Isolating
+// it lets startcontainer_test.go drive the container-start ERROR BRANCH — the
+// branch that decides whether the leaked container is terminated — through a
+// fake, so the load-bearing test exercises the call site and not just the leaf
+// helper (#3122). A real *testing.T's Fatalf/Skipf ends the goroutine; a fake's
+// records the call and RETURNS, which is why startContainerWith has explicit
+// post-Fatalf returns below.
+type fataler interface {
+	Helper()
+	Skipf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
+// connStringFunc resolves a started container's connection URL. The run closure
+// returns it (capturing the concrete *tcpostgres.PostgresContainer, whose
+// ConnectionString is not on the testcontainers.Container interface) so
+// startContainerWith can call ConnectionString only on the success path, after
+// registering the terminate cleanup — preserving the original ordering.
+type connStringFunc func(context.Context) (string, error)
+
+// startContainer spins up a throwaway Postgres 16 container and returns its
+// connection URL. Skips the test if Docker isn't reachable so devs without
+// Docker still pass `go test`. It is a one-line wrapper over startContainerWith,
+// which contains the error-branch leak fix (#3122); the ~30 existing callers see
+// an unchanged `func startContainer(t *testing.T) string`.
 func startContainer(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
+	return startContainerWith(t, t.Cleanup, ctx, func(ctx context.Context) (testcontainers.Container, connStringFunc, error) {
+		c, err := tcpostgres.Run(ctx,
+			"postgres:16-alpine",
+			tcpostgres.WithDatabase("fishhawk"),
+			tcpostgres.WithUsername("fishhawk"),
+			tcpostgres.WithPassword("fishhawk"),
+			testcontainers.WithWaitStrategy(
+				wait.ForAll(
+					wait.ForLog("database system is ready to accept connections").
+						WithOccurrence(2).
+						WithStartupTimeout(60*time.Second),
+					wait.ForListeningPort("5432/tcp"),
+				),
 			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
+		)
+		if err != nil {
+			// c is non-nil (or a typed-nil *PostgresContainer) even on error —
+			// testcontainers-go's generic.go returns the handle alongside the
+			// error so the caller can Destroy it. Hand it back for termination.
+			return c, nil, err
 		}
-		t.Fatalf("start postgres: %v", err)
+		return c, func(ctx context.Context) (string, error) {
+			return c.ConnectionString(ctx, "sslmode=disable")
+		}, nil
+	})
+}
+
+// startContainerWith is the injectable seam under startContainer. It runs the
+// container start via run, and on error TERMINATES the returned handle before
+// skipping/fataling — the #3122 leak fix — then, on success, registers the
+// terminate cleanup and resolves the connection URL. Splitting run/cleanup out
+// of *testing.T is what makes the error branch drivable by startcontainer_test.go
+// without Docker; startContainer passes t, t.Cleanup and a real tcpostgres.Run.
+func startContainerWith(
+	f fataler,
+	cleanup func(func()),
+	startCtx context.Context,
+	run func(context.Context) (testcontainers.Container, connStringFunc, error),
+) string {
+	f.Helper()
+	c, connString, err := run(startCtx)
+	if err != nil {
+		terminateStartFailure(startCtx, c)
+		if isDockerUnavailable(err) {
+			f.Skipf("Docker not available; skipping integration test: %v", err)
+			return "" // fake fataler returns; real *testing.T.Skipf never reaches here
+		}
+		f.Fatalf("start postgres: %v", err)
+		return "" // fake fataler returns; real *testing.T.Fatalf never reaches here
 	}
-	t.Cleanup(func() {
+	cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = c.Terminate(ctx)
 	})
 
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
+	url, err := connString(startCtx)
 	if err != nil {
-		t.Fatalf("conn string: %v", err)
+		f.Fatalf("conn string: %v", err)
+		return ""
 	}
 	return url
+}
+
+// terminateStartFailure terminates a container handle returned ALONGSIDE a start
+// error. testcontainers-go returns a non-nil, already-created, already-running
+// container even when Run reports an error (generic.go: "At this point `c` might
+// not be nil. Give the caller an opportunity to call Destroy on the container."),
+// and with ryuk disabled (scripts/test sets TESTCONTAINERS_RYUK_DISABLED=true)
+// nothing else reaps it — so this raw-container exemption must terminate it here
+// or every start timeout leaks a Postgres container (#3122). Three properties,
+// each pinned by a test in startcontainer_test.go:
+//
+//   - TYPED-NIL guard: postgres.Run returns a nil *PostgresContainer boxed in a
+//     non-nil testcontainers.Container interface when the inner container is nil,
+//     so a bare `c != nil` is insufficient — the interface is non-nil. reflect
+//     catches the typed nil before Terminate dereferences it and panics.
+//   - FRESH context, NOT startCtx: startCtx is the start's own deadline, and the
+//     budget left on it when a start fails LATE is unpredictable and can be near
+//     zero, so cleanup gets its OWN bounded 30s deadline rather than an unknown
+//     remainder. startCtx is deliberately not derived from — passing it keeps the
+//     choice visible at the call site (and is the counterfactual seam).
+//   - Terminate error SWALLOWED: the ORIGINAL start error must reach the caller's
+//     Fatalf/Skipf verbatim — the #3122 diagnostic signature must not be replaced
+//     by a cleanup error.
+func terminateStartFailure(startCtx context.Context, c testcontainers.Container) {
+	_ = startCtx // deliberately NOT the cleanup deadline; see the fresh-context note above.
+	if c == nil {
+		return
+	}
+	if v := reflect.ValueOf(c); v.Kind() == reflect.Pointer && v.IsNil() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = c.Terminate(ctx)
 }
 
 func isDockerUnavailable(err error) bool {

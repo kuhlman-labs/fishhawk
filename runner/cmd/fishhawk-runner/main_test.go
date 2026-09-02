@@ -11268,6 +11268,21 @@ FAIL
 FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	111.660s
 ?   	github.com/kuhlman-labs/fishhawk/backend/internal/audit/db	[no test files]`
 
+// flakeOutput3122 is the #3122 issue body's Observed failure block: two
+// TestMigrateDown_* failures in backend/internal/postgres (the raw-container
+// pgtest EXEMPTION, run 9e9996c4, 2026-09-01) with the testcontainers Docker-
+// socket deadline signature, embedded in surrounding ok-package lines so the
+// fixture is shaped like real full-suite output. The `.../json` path is the
+// issue body's own elision — the marker set the matcher keys on
+// (`%2Fvar%2Frun%2Fdocker.sock`, `mapped port`, `wait until ready`,
+// `context deadline exceeded`) is present verbatim regardless.
+const flakeOutput3122 = `ok  	github.com/kuhlman-labs/fishhawk/backend/internal/server	4.021s
+--- FAIL: TestMigrateDown_StagesDispatchedAtReversal (63.18s)
+    postgres_test.go:3823: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/.../json": context deadline exceeded
+--- FAIL: TestMigrateDown_NormalizesPausedRows (63.19s)
+    postgres_test.go:3901: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/.../json": context deadline exceeded
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/postgres	131.402s`
+
 func TestIsTestcontainersStartFlake(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -11276,6 +11291,16 @@ func TestIsTestcontainersStartFlake(t *testing.T) {
 	}{
 		{"verbatim #972 approval-package failure", flakeOutputApproval, true},
 		{"verbatim #972 audit-package failure", flakeOutputAudit, true},
+		// #3122 asserted this testcontainers deadline signature "is not an entry,
+		// so the absorb cannot fire" — that assertion is FALSE: it matches
+		// isTestcontainersStartFlake today (the `mapped port` / `wait until ready`
+		// / `%2Fvar%2Frun%2Fdocker.sock` + `context deadline exceeded` markers),
+		// and the issue's own Observed section records verify_infra_flake_retry
+		// firing on iteration 1. The real limitation is the ONE-SHOT-per-stage
+		// absorb, a different defect. This verbatim-#3122 row pins the claim: a
+		// future narrowing of the matcher (dropping `mapped port` / `wait until
+		// ready`) reddens this test rather than silently reopening #3122's concern.
+		{"verbatim #3122 postgres-exemption leak failure", flakeOutput3122, true},
 		// The #2718 classes are DISTINCT, not a loosening of this matcher: the
 		// deadline matcher must keep refusing both new signatures.
 		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, false},
